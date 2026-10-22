@@ -1,0 +1,6 @@
+*.fasl
+*.lisp-tmp
+__pycache__/
+tmp-cli-*.wasm
+*~
+.\#*

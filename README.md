@@ -1,0 +1,70 @@
+# WASMDOWN
+
+A Common Lisp–native WebAssembly runtime, implemented per `PLAN.md`.
+
+**Status: `partial` (per PLAN.md §2 support-declaration policy).**
+
+This repository contains a working vertical slice of the plan: binary
+decoding, validation, a reference interpreter, baseline SBCL code
+generation, a public Lisp API and CLI for the **core Wasm subset** below.
+It is **not** a conformant Core 3.0 implementation and makes no conformance
+claim. No Component Model, WIT, WASI, SIMD, GC, exception-handling or
+threads support yet — those are PLAN.md milestones M5, M7–M12.
+
+## Implemented surface
+
+| Subsystem | File | State |
+| --- | --- | --- |
+| Binary decoder | `src/binary.lisp` | MVP + bulk-memory + sign-ext + non-trapping sat conversions + multi-value + reference types. Bounds-checked reader; padded LEB128 per spec; failure phase = `decode-error` with byte offset. |
+| Binary encoder | `src/binary-encode.lisp` | Canonical minimal encodings; round-trip tested. |
+| Numeric semantics | `src/numops.lisp` | Exact i32/i64/f32/f64 primitive semantics: traps, NaN/±0 rules, saturating + trapping conversions, reinterpret, little-endian memory helpers. |
+| Validation | `src/validate.lisp` | Operand/control-stack algorithm with unreachable-polymorphism; module-level invariants; const-expr rules. |
+| Runtime | `src/runtime.lisp` | Module instantiation, memories (64 KiB pages), tables, globals, import matching, elem/data segments, start functions. |
+| Interpreter | `src/interp.lisp` | Reference evaluator; guest recursion traps `:call-stack-exhausted` before host stack exhaustion. |
+| Codegen | `src/codegen.lisp` | Baseline backend: SBCL `COMPILE` of emitted `LET`/`TAGBODY`/`GO` forms; interp-vs-compiled parity tests. |
+| API / CLI | `src/api.lisp`, `src/cli.lisp` | `read-module`, `validate-module`, `instantiate`, `invoke`, …; CLI `validate`/`inspect`/`compile`/`run`. |
+
+Not implemented (see `PLAN.md` for the full contract): SIMD (v128),
+Wasm GC, exception handling (`try_table`), tail calls, memory64,
+multi-memory runtime (decode accepts memidx forms), text/WAT format,
+Component Model, Canonical ABI, WASI (all versions), threads/atomics,
+FASL cache, the `.wast` spec runner, conformance reporting.
+
+## Error/phase taxonomy (PLAN.md §12.2)
+
+`decode-error` (malformed binary; byte offset) → `validation-error`
+(bad typing) → `link-error` (import mismatch) → `instantiation-error`
+(segment bounds etc.) → `wasm-trap` (runtime; kinds include
+`:unreachable :out-of-bounds-memory :out-of-bounds-table
+:integer-divide-by-zero :integer-overflow :invalid-conversion
+:null-reference :indirect-call-type-mismatch :call-stack-exhausted`).
+These classes are never interchangeable.
+
+## Usage
+
+```sh
+make test                 # full unit/integration suite (139+ tests)
+sbcl --script tools/wasmdown.lisp validate file.wasm
+sbcl --script tools/wasmdown.lisp inspect file.wasm
+sbcl --script tools/wasmdown.lisp run file.wasm --invoke add 42 13
+```
+
+```commonlisp
+(let* ((module (wasmdown:read-module #P"example.wasm"))
+       (checked (wasmdown:validate-module module))
+       (instance (wasmdown:instantiate checked)))
+  (wasmdown:invoke instance "add" 42 13))
+```
+
+## Repository layout
+
+Mirrors PLAN.md §11.3 (subset): `src/` (one file per subsystem),
+`tests/`, `tools/` (test runner + CLI launcher), `docs/CONTRACTS.md`
+(binding cross-slice contracts), `docs/adr/` (decision records),
+`Makefile`, `wasmdown.asd`.
+
+## Dependencies
+
+SBCL (developed against 2.6.4, Linux ARM64). Zero third-party Lisp
+libraries; no ASDF ecosystem dependencies. ANSI-portable core logic with
+SBCL-specific numeric internals where documented.
