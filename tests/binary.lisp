@@ -664,3 +664,18 @@ Returns the canonical encoding."
                                                   (i :select)
                                                   (i :drop)
                                                   (i :end)))))))
+
+(wasmdown.test:test binary/flags1-elemkind-byte-emitted
+  ;; Regression (loop 15): the elem decoder skipped the ELEMKIND byte
+  ;; for flags 1/2/3 (only flag 0 omits it per decode.ml) and the
+  ;; encoder had the matching bug — consistent round-trips masked
+  ;; both; binary-leb128's section-size asserts caught it. A flags-1
+  ;; passive funcref segment round-trips WITH the 0x00 elemkind
+  ;; consumed/emitted exactly once.
+  (assert-roundtrip
+   (mmod :types (vector (ft nil nil))
+         :tables (vector (tab :funcref))
+         :funcs (vector (fn 0 nil (vector (i :end))))
+         :elems (vector (wasmdown.types:make-wasm-elem
+                         '(:passive) :funcref
+                         (list (ref-func-expr 0)))))))

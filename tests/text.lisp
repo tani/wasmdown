@@ -721,3 +721,39 @@ EQUALP (canonical-encode agreement oracle)."
     ;; and executing f yields 0 (the local default), not the argument.
     (let ((inst (wasmdown:instantiate m)))
       (wasmdown.test:is (equal '(0) (wasmdown:invoke inst "f" 42))))))
+
+(wasmdown.test:test text/typeuse-bounds-phase-correct
+  ;; Regression (loop 15): out-of-range (type N) WITHOUT inline
+  ;; (param)/(result) parses and the VALIDATOR rejects; WITH inline
+  ;; declarations it is malformed at DECODE (per parser.mly).
+  (wasmdown.test:assert-raises wasmdown:validation-error
+    (wasmdown:validate-module
+     (%wat "(module (type $t (func)) (func (type 99)))")))
+  (wasmdown.test:assert-raises wasmdown:decode-error
+    (%wat "(module (type $t (func)) (func (type 99) (param i32)))")))
+
+(wasmdown.test:test text/duplicate-named-local-rejected
+  ;; Regression (loop 15): duplicate $id across params/locals is a
+  ;; decode error (func.wast ::172-174 passed 18 asserts wrongly).
+  (wasmdown.test:assert-raises wasmdown:decode-error
+    (%wat "(module (func (param $x i32) (param $x i32)))"))
+  (wasmdown.test:assert-raises wasmdown:decode-error
+    (%wat "(module (func (param $x i32) (local $x i32)))")))
+
+(wasmdown.test:test text/string-form-id-grammar
+  ;; Regression (loop 15): $"..." ids per lexer.mll — decoded
+  ;; content is the id name; empty and bare $ are 'empty identifier';
+  ;; raw control chars in string literals are illegal (only escapes
+  ;; may produce them).
+  (let ((m (%wat "(module (func $\"a b\" (export \"f\") (result i32) (i32.const 1)))")))
+    (wasmdown.test:is (= 1 (length (wasm-module-funcs m)))))
+  (wasmdown.test:assert-raises wasmdown:decode-error
+    (%wat "(module (func $ (result i32)))"))
+  (wasmdown.test:assert-raises wasmdown:decode-error
+    (%wat "(module (func $\"\" (result i32)))")))
+
+(wasmdown.test:test text/string-adjacency-reserved
+  ;; Regression (loop 15): reserved = (idchar|string)+ — an atom
+  ;; abutting a quote is ONE reserved token ('unknown operator').
+  (wasmdown.test:assert-raises wasmdown:decode-error
+    (%wat "(module (memory 1) (data\"a\"))")))

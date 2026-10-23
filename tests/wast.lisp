@@ -187,3 +187,17 @@
                             (f64.reinterpret_i64 (i64.const 0x7ff4000000000000))))
               (assert_return (invoke \"g\") (f64.const nan:0x4000000000000))")))
     (wasmdown.test:is (equal '(:pass :pass) os))))
+
+(wasmdown.test:test wast/definition-instance-unsupported
+  ;; Regression (loop 15): (module definition $M ...) / (module
+  ;; instance $I $M) are Core 3.0 named-form script commands outside
+  ;; this engine slice; they must classify :unsupported BEFORE decode
+  ;; (not crash parse-wat on a NIL payload), the $id is recorded, and
+  ;; a register naming the recorded id classifies :unsupported too.
+  (let ((os (%outcomes
+             "(module definition $M
+                (global (export \"glob\") (mut i32) (i32.const 0)))
+              (module instance $I1 $M)
+              (register \"I1\" $I1)")))
+    (wasmdown.test:is (equal '(:unsupported :unsupported :unsupported)
+                             os))))
