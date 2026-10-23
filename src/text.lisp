@@ -917,7 +917,6 @@ the trailing-id matching rule. Returns (values instr rest-items)."
 Returns (values bt skipped)."
   (multiple-value-bind (params results typeidx)
       (%typeuse items penv)
-    (declare (ignore params))
     (let ((skipped 0)
           (scan items))
       (loop while (and scan (tok-elem-p (car scan))
@@ -928,8 +927,9 @@ Returns (values bt skipped)."
       (let ((bt (cond
                  (typeidx (cons :typeidx typeidx))
                  ((null results) nil)
-                 ((= (length results) 1) (car results))
-                 (t (cons :typeidx (%find-or-add-type '() results penv))))))
+                 ((and (null params) (= (length results) 1)) (car results))
+                 (t (cons :typeidx
+                          (%find-or-add-type params results penv))))))
         (values bt skipped)))))
 
 (defun %imm-tok-p (x)
@@ -1003,7 +1003,7 @@ rest of the plain sequence."
         ;; NOTE: multi-memory (memidx before the memarg) is not in
         ;; this slice; memidx stays 0. A bare number after the memarg
         ;; keywords is a folded operand (e.g. the address of a load).
-        (let* ((width (gethash k *memarg-op-keywords*))
+        (let* ((width (second (assoc k *memarg-ops* :test #'string=)))
                (align (or align-hint width)))
           (values (make-wasm-instr
                    op-key
@@ -1157,7 +1157,6 @@ list NODE: returns (values id bt body-items). Does NOT push the label
       (pop items))
     (multiple-value-bind (params results typeidx)
         (%typeuse items penv)
-      (declare (ignore params))
       (let ((skipped 0)
             (scan items))
         (loop while (and scan (tok-elem-p (car scan))
@@ -1169,9 +1168,9 @@ list NODE: returns (values id bt body-items). Does NOT push the label
               (bt (cond
                    (typeidx (cons :typeidx typeidx))
                    ((null results) nil)
-                   ((= (length results) 1) (car results))
+                   ((and (null params) (= (length results) 1)) (car results))
                    (t (cons :typeidx
-                            (%find-or-add-type '() results penv))))))
+                            (%find-or-add-type params results penv))))))
           (values id bt body-items))))))
 
 (defun %fold-block (node penv op)
@@ -1227,7 +1226,7 @@ operand stack)."
               (setf else b)))
            (t (%text-error (if (tok-p x) (tok-pos x) 0)
                            "bad if item"))))
-        (when (penv-labels penv) (pop (penv-labels penv)))
+        (when id (when (penv-labels penv) (pop (penv-labels penv))))
         (append conds
                 (list (make-wasm-instr
                        :if

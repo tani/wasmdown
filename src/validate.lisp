@@ -364,9 +364,12 @@ exclusive upper bound of global indices referenceable via global.get
     (nth labelidx ctrls)))
 
 (defun %unreachable (fv)
-  (setf (fv-vals fv)
-        (subseq (fv-vals fv) 0 (ctrl-frame-val-height (%cur-frame fv))))
-  (setf (ctrl-frame-unreachable (%cur-frame fv)) t))
+  ;; (fv-vals fv) is a push-down list (element 0 = stack top); the
+  ;; frame's base is the OLDEST vh values, so keep the LAST vh entries.
+  (let ((vh (ctrl-frame-val-height (%cur-frame fv))))
+    (setf (fv-vals fv) (last (fv-vals fv) vh))
+    (setf (ctrl-frame-unreachable (%cur-frame fv)) t)))
+
 
 (defun %types= (a b)
   "Result-type list equality with :bot wildcards per element."
