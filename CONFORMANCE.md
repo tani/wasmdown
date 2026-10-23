@@ -13,8 +13,8 @@ now classify as :unsupported instead of crashing as harness-errors.
 
 | Outcome | Count |
 | --- | --- |
-| pass | 21111 |
-| fail | 16 |
+| pass | 21117 |
+| fail | 10 |
 | skip | 0 |
 | unsupported | 133 |
 | timeout | 0 |
@@ -106,7 +106,7 @@ including unsupported — honest per PLAN.md §12.9).
 | start | 20 | 0 | 0 | 0 |
 | store | 68 | 0 | 0 | 0 |
 | switch | 28 | 0 | 0 | 0 |
-| table | 40 | 6 | 0 | 0 |
+| table | 46 | 0 | 0 | 0 |
 | table_get | 16 | 0 | 0 | 0 |
 | table_grow | 61 | 0 | 0 | 0 |
 | table_set | 26 | 0 | 0 | 0 |

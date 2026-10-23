@@ -1390,6 +1390,29 @@ surface here as 'unknown type' (the vctx slot holds NIL for them)."
                (when (consp (wasm-table-type table))
                  (check-valtype (wasm-table-type table) types
                                 (format nil "table ~a" i)))
+               ;; a DEFINED table without an initializer expression
+               ;; must have a DEFAULTABLE element type: the implicit
+               ;; fill is null, so a non-nullable typed element type
+               ;; rejects (table.wast ::70-80's (table 0 (ref func))
+               ;; assert_invalid batch — min=0 included). A table
+               ;; WITH an inline initializer desugars to a
+               ;; from-table-init elem segment, which exempts it.
+               (unless (or (wasmdown.types:defaultable-valtype-p
+                            (wasm-table-type table))
+                           ;; imported tables carry no initializer
+                           ;; requirement (the instance provides
+                           ;; elements) — only DEFINED tables here
+                           ;; (the tables vector is the module's own)
+                           (loop for e across (wasm-module-elems module)
+                                 thereis (and (wasmdown.types:wasm-elem-from-table-init e)
+                                              (consp (wasm-elem-mode e))
+                                              (eq (first (wasm-elem-mode e))
+                                                  :active)
+                                              (= (second (wasm-elem-mode e))
+                                                 (+ i (imported-kind-count
+                                                       module :table))))))
+                 (verr "table ~a: non-defaultable element type ~a requires an initializer"
+                       i (wasm-table-type table)))
                (check-limits (wasm-table-limits table)
                              (format nil "table ~a" i)
                              *max-table-size*)))

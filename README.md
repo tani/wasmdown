@@ -20,9 +20,15 @@ The official core suite (97 `.wast` files, pinned at
 executed through the stateful runner with failure-phase classification:
 
 ```
-pass 21110 | fail 17 | unsupported 133 | harness-error 0 | total 21260
-pass rate 99.3% of rows pass; 17 fail (see below); denominator = all executed, incl. unsupported
+pass 21110 | fail 16 | unsupported 133 | harness-error 0 | total 21260
+pass rate 99.2% (denominator = all executed, incl. unsupported)
 ```
+
+The 16 fails: 10 type-canonicalization (type-equivalence.wast 8,
+type-rec.wast 1, type.wast 1 — structurally-equal functypes get
+distinct indices; needs the `rec`-group canonical-representative
+pass, next loop) and 6 table.wast assert_invalid over-permission
+(::29-31, ::40-42 — one relaxed channel, its own follow-up).
 
 Regenerate with `make report-conformance` (writes `CONFORMANCE.md` +
 `tests/spec-core-results.jsonl`, one JSONL line per command); the full
@@ -125,3 +131,25 @@ Mirrors PLAN.md §11.3 (subset): `src/` (one file per subsystem),
 SBCL (developed against 2.6.4, Linux ARM64). Zero third-party Lisp
 libraries; no ASDF ecosystem dependencies. ANSI-portable core logic with
 SBCL-specific numeric internals where documented.
+
+## Roadmap (residual families, in loop order)
+
+1. **table.wast over-permission (6 rows)** — one relaxed
+   assert_invalid channel, `::29-31`/`::40-42`; a small follow-up
+   slice, not part of a larger feature loop.
+2. **`rec` type groups + canonicalization (10 rows)** —
+   iso-recursive type equivalence: structurally-equal functypes
+   share one canonical representative; the lattice's nominal
+   typeuse comparison then matches across differently-declared
+   equal types (type-equivalence.wast 8, type-rec.wast 1,
+   type.wast 1).
+3. **GC values (struct/array/i31)** — the largest remaining
+   `unsupported` family; struct/array/i31 heap types, `struct.new`
+   and friends, `ref.cast`/`br_on_cast`.
+4. **memory64 / multi-memory runtime / SIMD** — the remaining
+   Core 3.0 feature gaps after GC.
+
+The 133 `unsupported` rows: annotations 73, `rec`-group/carrier
+fixtures (type-rec 26, type-equivalence 20, elem 8, binary 2,
+type-canon 2, plus GC-value opcode fixtures); every non-pass is
+attributed per file in `CONFORMANCE.md`.
