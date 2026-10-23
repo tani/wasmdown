@@ -13,15 +13,15 @@ now classify as :unsupported instead of crashing as harness-errors.
 
 | Outcome | Count |
 | --- | --- |
-| pass | 20298 |
-| fail | 18 |
+| pass | 20322 |
+| fail | 0 |
 | skip | 0 |
-| unsupported | 865 |
+| unsupported | 938 |
 | timeout | 0 |
-| harness-error | 6 |
-| **total** | **21187** |
+| harness-error | 0 |
+| **total** | **21260** |
 
-Executed: 21187 commands; pass rate 95.8% (denominator = all executed,
+Executed: 21260 commands; pass rate 95.6% (denominator = all executed,
 including unsupported — honest per PLAN.md §12.9).
 
 ## Per-file counts
@@ -30,7 +30,7 @@ including unsupported — honest per PLAN.md §12.9).
 | --- | --- | --- | --- | --- |
 | address | 260 | 0 | 0 | 0 |
 | align | 165 | 0 | 0 | 0 |
-| annotations | 0 | 0 | 0 | 1 |
+| annotations | 1 | 0 | 73 | 0 |
 | binary-leb128 | 91 | 0 | 0 | 0 |
 | binary | 125 | 0 | 4 | 0 |
 | block | 223 | 0 | 0 | 0 |
@@ -45,15 +45,15 @@ including unsupported — honest per PLAN.md §12.9).
 | comments | 8 | 0 | 0 | 0 |
 | const | 778 | 0 | 0 | 0 |
 | conversions | 619 | 0 | 0 | 0 |
-| custom | 9 | 0 | 1 | 1 |
+| custom | 10 | 0 | 1 | 0 |
 | data | 68 | 0 | 0 | 0 |
-| elem | 132 | 4 | 18 | 0 |
+| elem | 136 | 0 | 18 | 0 |
 | endianness | 69 | 0 | 0 | 0 |
 | exports | 96 | 0 | 1 | 0 |
-| f32 | 2512 | 2 | 0 | 0 |
+| f32 | 2514 | 0 | 0 | 0 |
 | f32_bitwise | 364 | 0 | 0 | 0 |
 | f32_cmp | 2407 | 0 | 0 | 0 |
-| f64 | 2512 | 2 | 0 | 0 |
+| f64 | 2514 | 0 | 0 | 0 |
 | f64_bitwise | 364 | 0 | 0 | 0 |
 | f64_cmp | 2407 | 0 | 0 | 0 |
 | fac | 8 | 0 | 0 | 0 |
@@ -70,7 +70,7 @@ including unsupported — honest per PLAN.md §12.9).
 | id | 7 | 0 | 0 | 0 |
 | if | 241 | 0 | 0 | 0 |
 | imports | 159 | 0 | 59 | 0 |
-| inline-module | 0 | 0 | 0 | 1 |
+| inline-module | 1 | 0 | 0 | 0 |
 | instance | 0 | 0 | 23 | 0 |
 | int_exprs | 108 | 0 | 0 | 0 |
 | int_literals | 51 | 0 | 0 | 0 |
@@ -83,7 +83,7 @@ including unsupported — honest per PLAN.md §12.9).
 | local_set | 53 | 0 | 0 | 0 |
 | local_tee | 97 | 0 | 1 | 0 |
 | loop | 121 | 0 | 0 | 0 |
-| memory | 87 | 2 | 1 | 0 |
+| memory | 89 | 0 | 1 | 0 |
 | memory_grow | 109 | 0 | 0 | 0 |
 | memory_redundancy | 8 | 0 | 0 | 0 |
 | memory_size | 42 | 0 | 0 | 0 |
@@ -111,7 +111,7 @@ including unsupported — honest per PLAN.md §12.9).
 | table_grow | 61 | 0 | 0 | 0 |
 | table_set | 26 | 0 | 0 | 0 |
 | table_size | 39 | 0 | 0 | 0 |
-| token | 50 | 8 | 0 | 3 |
+| token | 61 | 0 | 0 | 0 |
 | traps | 36 | 0 | 0 | 0 |
 | type-canon | 0 | 0 | 2 | 0 |
 | type-equivalence | 2 | 0 | 30 | 0 |

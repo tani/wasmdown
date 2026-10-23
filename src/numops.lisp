@@ -237,16 +237,35 @@ canonical NaN (e.g. hardware propagation from -nan operands) matches."
     (single-float (f32-from-bits #x7fc00000))
     (double-float (f64-from-bits #x7ff8000000000000))))
 
+;;; Unary NaN quieting (spec exec/fxx.ml determine_unary_nan +
+;;; canonicalize_nan): when a unary float op's operand is a NaN, the
+;;; result is that NaN with the quiet bit FORCED — sign and payload
+;;; preserved, always an arithmetic NaN. SBCL's ftruncate/fceiling/
+;;; ffloor already quiet via hardware, but fnearest short-circuits
+;;; NaN inputs and must not return an unquieted sNaN (f32.wast/f64.wast
+;;; nearest nan:0x200000 -> nan:arithmetic cases).
+(declaim (inline quiet-nan))
+(defun quiet-nan (x)
+  "The arithmetic-NaN form of X: quiet bit forced, payload preserved."
+  (etypecase x
+    (single-float
+     (f32-from-bits (logior (f32-bits x) #x00400000)))
+    (double-float
+     (f64-from-bits (logior (f64-bits x) #x0008000000000000)))))
+
 ;;; Wasm trunc: toward zero.  FTRUNCATE is exactly that for floats.
 (declaim (inline ftrunc))
-(defun ftrunc (x) (ftruncate x))
+(defun ftrunc (x)
+  (if (nan-p x)
+      (quiet-nan x)
+      (ftruncate x)))
 
 ;;; Wasm nearest: round-half-to-even.  FROUND is ties-to-even.
 (declaim (inline fnearest))
 (defun fnearest (x)
-  (if (or (zerop x) (sb-ext:float-infinity-p x) (nan-p x))
-      x
-      (fround x)))
+  (cond ((nan-p x) (quiet-nan x))
+        ((or (zerop x) (sb-ext:float-infinity-p x)) x)
+        (t (fround x))))
 
 (declaim (inline fmin fmax %negzero-p))
 (defun %negzero-p (x)
@@ -280,8 +299,12 @@ canonical NaN (e.g. hardware propagation from -nan operands) matches."
 
 (defun f32-abs (x) (declare (type single-float x)) (abs x))
 (defun f32-neg (x) (declare (type single-float x)) (- x))
-(defun f32-ceil (x) (declare (type single-float x)) (fceiling x))
-(defun f32-floor (x) (declare (type single-float x)) (ffloor x))
+(defun f32-ceil (x)
+  (declare (type single-float x))
+  (if (nan-p x) (quiet-nan x) (fceiling x)))
+(defun f32-floor (x)
+  (declare (type single-float x))
+  (if (nan-p x) (quiet-nan x) (ffloor x)))
 (defun f32-trunc (x) (declare (type single-float x)) (ftrunc x))
 (defun f32-nearest (x) (declare (type single-float x)) (fnearest x))
 (defun f32-sqrt (x)
@@ -312,8 +335,12 @@ canonical NaN (e.g. hardware propagation from -nan operands) matches."
 
 (defun f64-abs (x) (declare (type double-float x)) (abs x))
 (defun f64-neg (x) (declare (type double-float x)) (- x))
-(defun f64-ceil (x) (declare (type double-float x)) (fceiling x))
-(defun f64-floor (x) (declare (type double-float x)) (ffloor x))
+(defun f64-ceil (x)
+  (declare (type double-float x))
+  (if (nan-p x) (quiet-nan x) (fceiling x)))
+(defun f64-floor (x)
+  (declare (type double-float x))
+  (if (nan-p x) (quiet-nan x) (ffloor x)))
 (defun f64-trunc (x) (declare (type double-float x)) (ftrunc x))
 (defun f64-nearest (x) (declare (type double-float x)) (fnearest x))
 (defun f64-sqrt (x)

@@ -60,6 +60,28 @@
   (or (%digit-p c)
       (and (char>= c #\a) (char<= c #\f))
       (and (char>= c #\A) (char<= c #\F))))
+(declaim (inline %reserved-char-p))
+(defun %reserved-char-p (c)
+  "Whether C can continue a reserved token after a string's closing
+quote: any idchar (atom material) or another quote. Per spec lexer.mll
+reserved = (idchar | string)+, so `\"a\"\"b\"` and `\"a\"x` are ONE
+reserved token, not two."
+  (not (or (member c '(#\space #\tab #\newline #\return #\page #\null))
+           (char= c (code-char 40)) (char= c (code-char 41))
+           (char= c #\;) (char= c #\,))))
+
+(defun %reject-string-adjacency (s start next)
+  "Signal 'unknown operator' when the string (or $\"...\" id) closing
+at S[NEXT-1] abuts more reserved material. START is the token's first
+index (the opening quote or the $). token.wast: a string lexed alone
+is fine (only ( ) whitespace , ; and comments delimit); adjacent
+strings / atoms are malformed at DECODE."
+  (declare (type (integer 0) start next))
+  (let ((n (length s)))
+    (when (and (< next n)
+               (let ((c (char s next)))
+                 (or (char= c #\") (%reserved-char-p c))))
+      (%text-error start "unknown operator ~s..." (subseq s start (min n (+ start 10)))))))
 
 (defun %tokenize (s)
   "Tokenize WAT text S. Returns a flat vector of (kind . text) tokens
@@ -101,11 +123,19 @@ with :lparen/:rparen balanced; strings are decoded (with escapes)."
            ;; parens
            ((char= c (code-char 40)) (emit :lparen "(") (advance 1))
            ((char= c (code-char 41)) (emit :rparen ")") (advance 1))
-           ;; string with escapes
+           ;; string with escapes. spec lexer.mll:
+           ;; reserved = (idchar | string)+ — a string ABUTTING
+           ;; another string or an atom char with no delimiter is
+           ;; ONE reserved token, 'unknown operator' malformed text
+           ;; (token.wast 'Space required between strings and
+           ;; non-parenthesis tokens': `(data "a""b")`, `(func
+           ;; "a"x)`). Only ( ) whitespace and comments close a
+           ;; string token.
            ((char= c #\")
             (multiple-value-bind (decoded next)
                 (%read-string s i)
               (emit :string decoded)
+              (%reject-string-adjacency s i next)
               (setf i next)))
            ;; reserved chars are errors in atom position
            ;; '#' is reserved (never valid); '=' only starts atoms in
@@ -126,6 +156,10 @@ with :lparen/:rparen balanced; strings are decoded (with escapes)."
                 (when (zerop (length name))
                   (%text-error i "empty identifier"))
                 (emit :id (concatenate 'string "$" name))
+                ;; $"l"0 / $"l"$l: the id-string's closing quote
+                ;; abuts more reserved material — one reserved token,
+                ;; 'unknown operator' (token.wast ::23/:26).
+                (%reject-string-adjacency s i next)
                 (setf i next))))
            ;; id $... / keyword op / number
            (t
@@ -1455,18 +1489,28 @@ rest of the plain sequence."
           (setf table (%id-or-num (car items) (penv-tables penv) "table")
                 items (cdr items)))
         (values (make-wasm-instr op-key (list :table table) #() 0) items)))
-     ;; table.init: elemidx then optional tableidx
+     ;; table.init: optional tableidx then elemidx (text order is
+     ;; table-first: table.init $t $e; the one-index abbreviation is
+     ;; elemidx with table 0)
      ((string= k "table.init")
-      (multiple-value-bind (elem items)
-          (%take-index rest (penv-elems penv) "elem")
-        (let ((table 0))
+      (let ((table 0) (elem 0) (items rest) (one nil))
+        ;; first optional index token: tableidx if a second index
+        ;; token follows, else elemidx (the one-index abbreviation
+        ;; table.init x ≡ table.init 0 x)
+        (when (and items (tok-p (car items))
+                   (member (tok-kind (car items)) '(:id :nat)))
+          (setf one (car items) items (cdr items))
           (when (and items (tok-p (car items))
                      (member (tok-kind (car items)) '(:id :nat)))
-            (setf table (%id-or-num (car items) (penv-tables penv) "table")
+            (setf table (%id-or-num one (penv-tables penv) "table")
+                  elem (%id-or-num (car items) (penv-elems penv) "elem")
+                  one nil
                   items (cdr items)))
-          (values (make-wasm-instr op-key
-                                   (list :elem elem :table table) #() 0)
-                  items))))
+        (when one
+          (setf elem (%id-or-num one (penv-elems penv) "elem")))
+        (values (make-wasm-instr op-key
+                                 (list :elem elem :table table) #() 0)
+                items))))
      ;; table.copy: two optional table indices (dst src)
      ((string= k "table.copy")
       (let ((dst 0) (src 0) (items rest))
@@ -2208,8 +2252,10 @@ import, then limits (n [n]) or the (data ...) abbreviation."
                 (let* ((datalist (car rest))
                        (bytes (%data-bytes (cddr datalist))))
                   (let ((pages (ash (+ (length bytes) #xFFFF) -16)))
+                    ;; no min-1 floor: (memory (data)) is a valid
+                    ;; 0-page memory (memory.wast ::8/:10).
                     (push (make-wasm-memory
-                           (make-wasm-limits (max 1 pages)))
+                           (make-wasm-limits pages))
                           (penv-mems-list penv))
                     ;; active data segment at offset 0
                     (let ((memidx (+ (penv-n-imported-mems penv)

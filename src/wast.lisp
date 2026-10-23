@@ -87,7 +87,18 @@ whitespace, parens, quote, semicolon, comma and NUL)."
                        (char= (char s (1+ i)) #\) ))
                   (incf i 2) (decf depth)
                   (when (zerop depth) (return)))
-                 (t (incf i))))))
+               (t (incf i))))))
+           ;; (@ ...) annotation form (unadopted annotations
+           ;; proposal): skip the whole form like the reference
+           ;; lexer.mll `annot` rule — nested groups, comments,
+           ;; strings and reserved atoms (incl , ; [ ] { }) are legal
+           ;; inside, and the form emits NO token (recorded and
+           ;; stripped in the reference too). Tolerance is only enough
+           ;; to STRUCTURE the file: any module text still containing
+           ;; `(@` classifies :unsupported (see %unsupported-feature-p)
+           ;; since this engine implements no annotation semantics.
+           ((and (char= c #\( ) (< (1+ i) n) (char= (char s (1+ i)) #\@))
+            (setf i (%skip-annotation s i)))
            ((char= c #\( ) (emit :lparen "(" start (1+ start)) (incf i))
            ((char= c #\) ) (emit :rparen ")" start (1+ start)) (incf i))
            ((char= c #\")
@@ -103,6 +114,66 @@ whitespace, parens, quote, semicolon, comma and NUL)."
               (emit (%atom-kind text) text start i))))))
       (coerce (nreverse tokens) 'vector))))
 
+(defun %skip-annotation (s i)
+  "Skip an annotation form starting at S[I] = #\\( with #\\@ at I+1.
+Returns the index past the closing paren. Mirrors the reference
+lexer.mll `annot` rule structurally: inside an annotation, balanced
+groups nest, nested (@ ...) annotations are skipped too, strings may
+carry any escape or raw char, comments nest, and atoms may include
+the reserved characters , ; [ ] { } (annotations.wast ::14 uses them
+as bare atoms). An unterminated form fails 'unclosed annotation' —
+a catchable decode error, matching the reference message."
+  (let ((n (length s))
+        (open i)
+        (depth 1))                         ; already inside "(@"
+    (declare (type (integer 0) open))
+    (incf i 2)                             ; past "(@"
+    (loop
+      (when (>= i n) (%werr open "unclosed annotation"))
+      (let ((c (char s i)))
+        (cond
+         ((char= c #\) )
+          (decf depth)
+          (incf i)
+          (when (zerop depth) (return i)))
+         ((char= c #\( )
+          (cond
+           ;; nested block comment (; ... ;), nestable
+           ((and (< (1+ i) n) (char= (char s (1+ i)) #\;))
+            (incf i 2)
+            (let ((cdepth 1))
+              (loop
+                (when (>= i n) (%werr open "unclosed annotation"))
+                (cond
+                 ((and (< (1+ i) n) (char= (char s i) #\( )
+                       (char= (char s (1+ i)) #\;))
+                  (incf i 2) (incf cdepth))
+                 ((and (< (1+ i) n) (char= (char s i) #\;)
+                       (char= (char s (1+ i)) #\) ))
+                  (incf i 2) (decf cdepth)
+                  (when (zerop cdepth) (return)))
+                 (t (incf i))))))
+           ;; nested group or (@...) annotation: depth-tracked
+           (t (incf depth) (incf i))))
+         ;; string literal: escapes may carry any char incl. quotes
+         ((char= c #\")
+          (incf i)
+          (loop
+            (when (>= i n) (%werr open "unclosed string literal"))
+            (let ((sc (char s i)))
+              (cond
+               ((char= sc #\") (incf i) (return))
+               ((char= sc #\\)
+                (when (>= (1+ i) n)
+                  (%werr open "unclosed string literal"))
+                (incf i 2))
+               (t (incf i))))))
+         ;; line comment ;; ... to end of line
+         ((and (< (1+ i) n) (char= c #\;) (char= (char s (1+ i)) #\;))
+          (loop while (and (< i n) (char/= (char s i) #\newline))
+                do (incf i)))
+         ;; any other char (reserved , ; [ ] { } included) is atom
+         (t (incf i)))))))
 (defun %read-string (s i)
   "Decode a \"...\" literal starting at S[I]; returns the decoded text
 and the index past the closing quote. Escapes: \t \n \r \" \' \\
@@ -625,73 +696,121 @@ Returns (values kind mod-id name args)."
         (values mid (%byte-string-to-string (stoken-text name-tok))
                 (mapcar #'%const-value (rest rest)))))))
 
+(defun %module-field-head-p (head)
+  "Whether HEAD names a WAT module field (type/import/func/table/
+memory/global/export/start/elem/data). The script grammar's
+inline-module short form (parser.mly `script : list(cmd) EOF |
+inline_module1 EOF`, `inline_module : module_fields`): a .wast file
+may consist of BARE module fields at top level, wrapping into ONE
+implicit (module ...) command (inline-module.wast)."
+  (and head
+       (member head '("type" "import" "func" "table" "memory"
+                      "global" "export" "start" "elem" "data")
+               :test #'string=)))
 (defun parse-script (source)
   "Parse script source into a list of wast-cmd."
+  ;; Implicit-module short form: a run of consecutive top-level module
+  ;; FIELD forms wraps into ONE implicit (module ...) command (script
+  ;; grammar, parser.mly `script : list(cmd) EOF | inline_module1 EOF`,
+  ;; `inline_module : module_fields`; the implicit text is the raw
+  ;; source span of the whole run re-wrapped as "(module ...)").
   (let* ((tokens (%tokenize source))
          (nodes (%parse-tree tokens source))
-         (cmds '()))
-    (loop for node in nodes
-          for idx from 0
-          do (let ((head (%head-keyword node)))
-               (unless head
-                 (%werr (second node) "expected a command form"))
-               (flet ((mk (&rest args)
-                        (push (apply #'make-wast-cmd
-                                     :name (intern (string-upcase head)
-                                                   :keyword)
-                                     :index idx
-                                     :start (second node)
-                                     args)
-                              cmds)))
-                 (macrolet
-                     ((with-msg ((mvar) &body body)
-                        `(let ((,mvar (car (last (%node-children node)))))
-                           (unless (and (stoken-p ,mvar)
-                                        (eq (stoken-kind ,mvar) :string))
-                             (%werr 0 "expected a message string"))
-                           ,@body)))
-                   (cond
-                    ((string= head "module")
-                     (multiple-value-bind (kind id payload)
-                         (%parse-module-form node source)
-                       (ecase kind
-                         (:text (mk :id id :text payload))
-                         (:binary (mk :id id :bytes payload))
-                         (:quote (mk :id id :text payload))
-                         (:definition (mk :id id :message "unsupported: module definition"))
-                         (:instance (mk :id id :message "unsupported: module instance")))))
-                    ((string= head "register")
-                     (let* ((items (rest (%node-children node)))
-                            (name (first items)))
-                       (unless (and name (stoken-p name)
-                                    (eq (stoken-kind name) :string))
-                         (%werr 0 "register needs a string name"))
-                       (multiple-value-bind (id rest)
-                           (%opt-id (rest items))
-                       (mk :name-arg (%byte-string-to-string (stoken-text name)) :id id))))
-                    ((string= head "invoke")
-                     (multiple-value-bind (mid name args)
-                         (%parse-action node)
-                       (mk :module-arg mid :name-arg name :args args)))
-                    ((string= head "get")
-                     (multiple-value-bind (mid name args)
-                         (%parse-action node)
-                       (mk :module-arg mid :name-arg name)))
-                    ((string= head "assert_return")
-                     (let ((action (%action-node node))
-                           (results (%results-of node)))
-                       (mk :module-arg action :results results)))
-                    ((member head '("assert_malformed" "assert_invalid"
-                                    "assert_unlinkable" "assert_trap"
-                                    "assert_exhaustion")
-                             :test #'string=)
-                     (with-msg (msg)
-                       (let ((first (%action-or-module node)))
-                         (mk :module-arg first
-                             :message (stoken-text msg)))))
-                    (t (%werr (second node) "unknown script command ~a"
-                              head)))))))
+         (cmds '())
+         (implicit-start nil)               ; first node of pending run
+         (implicit-end nil))                ; last node of pending run
+    (flet ((flush-implicit ()
+             "Close a pending implicit-module run into one command."
+             (when implicit-start
+               (push (make-wast-cmd
+                       :name :module :index 0
+                       :start (second implicit-start)
+                       :text (concatenate
+                              'string "(module "
+                              (subseq source (second implicit-start)
+                                       (1+ (third implicit-end)))
+                              ")"))
+                     cmds)
+               (setf implicit-start nil implicit-end nil))))
+      (loop for node in nodes
+            for idx from 0
+            do (let ((head (%head-keyword node)))
+                 (cond
+                  ;; bare module field: extend (or start) the run
+                  ((%module-field-head-p head)
+                   (setf implicit-start (or implicit-start node)
+                         implicit-end node))
+                  (t
+                   (flush-implicit)
+                   (setf cmds (parse-command-node node idx source cmds))))))
+      (flush-implicit))
     (nreverse cmds)))
+
+(defun parse-command-node (node idx source cmds)
+  "Parse one top-level COMMAND node, returning CMDS extended with its
+wast-cmd. Signals a catchable decode error on unknown/malformed
+command shape."
+  (let ((head (%head-keyword node)))
+    (unless head
+      (%werr (second node) "expected a command form"))
+    (flet ((mk (&rest args)
+             (cons (apply #'make-wast-cmd
+                          :name (intern (string-upcase head) :keyword)
+                          :index idx
+                          :start (second node)
+                          args)
+                   cmds)))
+      (macrolet
+          ((with-msg ((mvar) &body body)
+             `(let ((,mvar (car (last (%node-children node)))))
+                (unless (and (stoken-p ,mvar)
+                             (eq (stoken-kind ,mvar) :string))
+                  (%werr 0 "expected a message string"))
+                ,@body)))
+        (cond
+         ((string= head "module")
+          (multiple-value-bind (kind id payload)
+              (%parse-module-form node source)
+            (ecase kind
+              (:text (mk :id id :text payload))
+              (:binary (mk :id id :bytes payload))
+              (:quote (mk :id id :text payload))
+              (:definition (mk :id id :message "unsupported: module definition"))
+              (:instance (mk :id id :message "unsupported: module instance")))))
+         ((string= head "register")
+          (let* ((items (rest (%node-children node)))
+                 (name (first items)))
+            (unless (and name (stoken-p name)
+                         (eq (stoken-kind name) :string))
+              (%werr 0 "register needs a string name"))
+            (multiple-value-bind (id rest)
+                (%opt-id (rest items))
+              (declare (ignore rest))
+              (mk :name-arg (%byte-string-to-string (stoken-text name))
+                  :id id))))
+         ((string= head "invoke")
+          (multiple-value-bind (mid name args)
+              (%parse-action node)
+            (mk :module-arg mid :name-arg name :args args)))
+         ((string= head "get")
+          (multiple-value-bind (mid name args)
+              (%parse-action node)
+            (declare (ignore args))
+            (mk :module-arg mid :name-arg name)))
+         ((string= head "assert_return")
+          (let ((action (%action-node node))
+                (results (%results-of node)))
+            (mk :module-arg action :results results)))
+         ((member head '("assert_malformed" "assert_invalid"
+                         "assert_unlinkable" "assert_trap"
+                         "assert_exhaustion")
+                  :test #'string=)
+          (with-msg (msg)
+            (let ((first (%action-or-module node)))
+              (mk :module-arg first
+                  :message (stoken-text msg)))))
+         (t (%werr (second node) "unknown script command ~a"
+                   head)))))))
 
 (defun %action-node (node)
   "The second child of an assert_return form (the action)."
@@ -866,6 +985,15 @@ the classification is honest, never a silent pass."
   (flet ((has (s) (and (search s text :test #'char-equal) t))
          (tok (s) (%token-present-p text s)))
     (cond
+     ;; annotations proposal (@-prefixed forms, annotations.wast):
+     ;; unadopted, out of engine slice. The script lexer SKIPS (@...)
+     ;; forms so the file's STRUCTURE parses, but a module's own text
+     ;; (plain, quote or implicit) still carries them, so any module
+     ;; text containing "(@" classifies :unsupported — the honest
+     ;; result, never a parse crash. Forms WITHOUT the adjacency
+     ;; (annotations.wast ::47's quote "( @a)" — two reserved tokens,
+     ;; malformed in any engine) keep their real DECODE outcome.
+     ((has "(@") :annotations)
      ((or (tok "v128") (tok "i8x16") (tok "i16x8") (tok "i32x4")
           (tok "i64x2") (tok "f32x4") (tok "f64x2")) :simd)
      ((has "return_call") :tail-calls)

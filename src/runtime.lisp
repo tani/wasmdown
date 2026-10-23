@@ -604,7 +604,21 @@ IMPORTS-ALIST maps ((\"mod\" \"field\") . value)."
                             offset (length refs) (table-size table)))
                          (loop for i from 0
                                for ref in refs
-                               do (table-set table (+ offset i) ref))))
+                               do (table-set table (+ offset i) ref))
+                         ;; the spec implicitly drops ACTIVE segments
+                         ;; after initialization: table.init from
+                         ;; them traps OOB ever after (elem.wast
+                         ;; ::80). DECLARATIVE segments are dropped
+                         ;; without ever initializing anything
+                         ;; (elem.wast ::82).
+                         (setf (elem-seg-state-dropped-p state) t
+                               (elem-seg-state-refs state) '())))
+            (loop for elem across (wasm-module-elems module)
+                  for state across estates
+                  for mode = (wasm-elem-mode elem)
+                  when (and (consp mode) (eq (first mode) :declarative))
+                    do (setf (elem-seg-state-dropped-p state) t
+                             (elem-seg-state-refs state) '()))
             ;; active data segments -> memories
             (loop for data across (wasm-module-datas module)
                   for state across dstates

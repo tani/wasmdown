@@ -291,3 +291,280 @@
                 (table 1 funcref)
                 (elem (i32.const 0) funcref (global.get 0)))")))
     (wasmdown.test:is (equal '(:pass :pass :pass) os))))
+
+(wasmdown.test:test wast/elem-active-seg-implicitly-dropped
+  ;; Regression (loop 17, M3): ACTIVE element segments are implicitly
+  ;; dropped after instantiation — table.init from them traps OOB
+  ;; (elem.wast ::706). DECLARATIVE segments are dropped without
+  ;; initializing anything (elem.wast ::716); PASSIVE segments stay
+  ;; initable (elem.wast ::1119 positive case below).
+  (let ((os (%outcomes
+             "(module
+                (table 10 funcref)
+                (elem $e (i32.const 0) func $f)
+                (func $f)
+                (func (export \"init\")
+                  (table.init $e (i32.const 0) (i32.const 0) (i32.const 1))))
+              (assert_trap (invoke \"init\") \"out of bounds table access\")
+              (module
+                (table 10 funcref)
+                (elem $e declare func $f)
+                (func $f)
+                (func (export \"init\")
+                  (table.init $e (i32.const 0) (i32.const 0) (i32.const 1))))
+              (assert_trap (invoke \"init\") \"out of bounds table access\")")))
+    (wasmdown.test:is (equal '(:pass :pass :pass :pass) os))))
+
+(wasmdown.test:test wast/passive-elem-still-initable
+  ;; Counterpart to wast/elem-active-seg-implicitly-dropped: a PASSIVE
+  ;; elem segment remains table.init-able after instantiation
+  ;; (elem.wast ::1113-1125 — the inline-table module's passive $e).
+  (let ((os (%outcomes
+             "(module
+                (func $f (result i32) i32.const 0xAB)
+                (func $g (result i32) i32.const 0xCD)
+                (table funcref (elem (ref.func $f)))
+                (elem $e funcref (ref.func $g))
+                (func (export \"init\")
+                  (table.init $e (i32.const 0) (i32.const 0) (i32.const 1)))
+                (func (export \"run\") (result i32)
+                  (call_indirect (result i32) (i32.const 0))))
+              (invoke \"init\")
+              (assert_return (invoke \"run\") (i32.const 0xCD))")))
+    (wasmdown.test:is (equal '(:pass :pass :pass) os))))
+
+(wasmdown.test:test wast/table-init-immediate-order
+  ;; Regression (loop 17, M4): the WAT grammar is
+  ;; table.init tableidx elemidx — the TABLE index comes FIRST
+  ;; (elem.wast ::988/:997 assert_invalid: a $t table id in the first
+  ;; slot must resolve against the table namespace, not elem). The
+  ;; one-index abbreviation table.init x ≡ table.init 0 x keeps the
+  ;; elem-only form working (elem.wast ::703).
+  (let ((os (%outcomes
+             "(assert_invalid
+                (module
+                  (func $f)
+                  (table $t 1 externref)
+                  (elem $e funcref (ref.func $f))
+                  (func (table.init $t $e (i32.const 0) (i32.const 0) (i32.const 1))))
+                \"type mismatch\")
+              (assert_invalid
+                (module
+                  (table $t 1 funcref)
+                  (elem $e externref (ref.null extern))
+                  (func (table.init $t $e (i32.const 0) (i32.const 0) (i32.const 1))))
+                \"type mismatch\")")))
+    (wasmdown.test:is (equal '(:pass :pass) os))))
+
+(wasmdown.test:test wast/memory-data-abbrev-zero-pages
+  ;; Regression (loop 17, M5): the (memory (data ...)) abbreviation
+  ;; sizes the memory to the data — empty data must produce a 0-page
+  ;; memory with NO min-1 floor (memory.wast ::12/:14 expect
+  ;; memory.size 0; ::16 expects 1 for one byte). The active data
+  ;; segment at offset 0 still initializes normally.
+  (let ((os (%outcomes
+             "(module (memory (data)) (func (export \"memsize\") (result i32) (memory.size)))
+              (assert_return (invoke \"memsize\") (i32.const 0))
+              (module (memory (data \"\")) (func (export \"memsize\") (result i32) (memory.size)))
+              (assert_return (invoke \"memsize\") (i32.const 0))
+              (module (memory (data \"x\")) (func (export \"memsize\") (result i32) (memory.size)))
+              (assert_return (invoke \"memsize\") (i32.const 1))")))
+    (wasmdown.test:is (equal '(:pass :pass :pass :pass :pass :pass) os))))
+
+(wasmdown.test:test wast/token-string-adjacency-malformed
+  ;; Regression (loop 17, M1): spec lexer.mll reserved = (idchar |
+  ;; string)+ — a string ABUTTING another string or an atom with no
+  ;; delimiter is ONE reserved token: 'unknown operator' malformed at
+  ;; DECODE (token.wast ::23/:26 `$"l"0`, ::46-::56 `(data "a""b")`,
+  ;; ::57/:58/:60 `(func "a"x)`). Previously string-string lexed as
+  ;; two strings (module unexpectedly succeeded) and string-atom
+  ;; crashed the name parser (`#(97) is not a string designator`).
+  ;; The string-then-delimiter shapes stay valid (::21 `(func nop(nop))`,
+  ;; ::45 `(data (i32.const 0)"a")`, ::48 `(import "m" "f"(func))`).
+  (let ((os (%outcomes
+             "(assert_malformed
+                (module quote \"(data \\\"a\\\"\\\"b\\\")\") \"unknown operator\")
+              (assert_malformed
+                (module quote \"(data \\\"a \\\"\\\"b\\\")\") \"unknown operator\")
+              (assert_malformed
+                (module quote \"(func \\\"a\\\"x)\") \"unknown operator\")
+              (assert_malformed
+                (module quote \"(func \\\"a\\\"0)\") \"unknown operator\")
+              (assert_malformed
+                (module quote \"(func \\\"a\\\"$x)\") \"unknown operator\")
+              (assert_malformed
+                (module quote
+                  \"(func (block $l (i32.const 0) (br_table $\\\"l\\\"0)))\")
+                \"unknown operator\")
+              (assert_malformed
+                (module quote
+                  \"(func (block $l (i32.const 0) (br_table $\\\"l\\\"$l)))\")
+                \"unknown operator\")
+              (module (memory 1) (data (i32.const 0)\"a\"))
+              (module (data \"a\" \"b\"))
+              (module (func $\"l\") (func (export \"call\") nop))
+              (assert_return (invoke \"call\") )
+              (module (import \"spectest\" \"print\"(func)))")))
+    (wasmdown.test:is (equal '(:pass :pass :pass :pass :pass :pass :pass
+                               :pass :pass :pass :pass :pass)
+                            os))))
+
+(wasmdown.test:test wast/atom-string-adjacency-still-malformed
+  ;; Counterpart (loop 15's rule, must not regress under M1): an ATOM
+  ;; abutting a string is likewise one reserved token — token.wast
+  ;; ::59 `(func 0"a")` and the `(data "a")`-family of
+  ;; atom-string pairs (token.wast ::30-::44) stay 'unknown operator'.
+  (let ((os (%outcomes
+             "(assert_malformed
+                (module quote \"(func 0\\\"a\\\")\") \"unknown operator\")
+              (assert_malformed
+                (module quote \"(data\\\"a\\\")\") \"unknown operator\")
+              (assert_malformed
+                (module quote \"(data $l\\\"a\\\")\") \"unknown operator\")
+              (assert_malformed
+                (module quote
+                  \"(func (block $l (i32.const 0) (br_table 0$\\\"l\\\")))\")
+                \"unknown operator\")")))
+    (wasmdown.test:is (equal '(:pass :pass :pass :pass) os))))
+
+(wasmdown.test:test wast/float-unary-nan-quieting
+  ;; Regression (loop 17, M2): trunc/ceil/floor/nearest with a NaN
+  ;; operand return that NaN QUIETED — payload and sign preserved,
+  ;; quiet bit forced (spec exec/fxx.ml determine_unary_nan +
+  ;; canonicalize_nan; f32.wast/f64.wast ::2498/:2500 nearest
+  ;; nan:0x200000 -> nan:arithmetic). fnearest used to return the
+  ;; sNaN unquieted; the comparator rejected it as not-arithmetic.
+  ;; Canonical NaN in stays canonical (::2497/:2499, nan ->
+  ;; nan:canonical) and non-NaN behavior is unchanged (ties-to-even).
+  (let ((os (%outcomes
+             "(module
+                (func (export \"nearest\") (param $x f32) (result f32)
+                  (f32.nearest (local.get $x)))
+                (func (export \"trunc\") (param $x f32) (result f32)
+                  (f32.trunc (local.get $x)))
+                (func (export \"ceil\") (param $x f32) (result f32)
+                  (f32.ceil (local.get $x)))
+                (func (export \"floor\") (param $x f32) (result f32)
+                  (f32.floor (local.get $x))))
+              (assert_return (invoke \"nearest\" (f32.const nan:0x200000))
+                             (f32.const nan:arithmetic))
+              (assert_return (invoke \"nearest\" (f32.const -nan:0x200000))
+                             (f32.const nan:arithmetic))
+              (assert_return (invoke \"nearest\" (f32.const nan))
+                             (f32.const nan:canonical))
+              (assert_return (invoke \"trunc\" (f32.const nan:0x200000))
+                             (f32.const nan:arithmetic))
+              (assert_return (invoke \"ceil\" (f32.const nan:0x200000))
+                             (f32.const nan:arithmetic))
+              (assert_return (invoke \"floor\" (f32.const nan:0x200000))
+                             (f32.const nan:arithmetic))
+              (assert_return (invoke \"nearest\" (f32.const 0x1.921fb6p+2))
+                             (f32.const 0x1.8p+2))
+              (assert_return (invoke \"nearest\" (f32.const -0x1p-1))
+                             (f32.const -0x0p+0))")))
+    (wasmdown.test:is (equal '(:pass :pass :pass :pass :pass :pass
+                               :pass :pass :pass)
+                            os))))
+
+(wasmdown.test:test wast/f64-unary-nan-quieting
+  ;; f64 counterpart of wast/float-unary-nan-quieting: f64.wast
+  ;; ::2498/:2500 (nearest nan:0x4000000000000 -> nan:arithmetic)
+  ;; plus trunc/ceil/floor payload-NaN quieting and the exact-value
+  ;; nearest cases (f64.wast ::2502/:2504 subnormal ties).
+  (let ((os (%outcomes
+             "(module
+                (func (export \"nearest\") (param $x f64) (result f64)
+                  (f64.nearest (local.get $x)))
+                (func (export \"trunc\") (param $x f64) (result f64)
+                  (f64.trunc (local.get $x)))
+                (func (export \"ceil\") (param $x f64) (result f64)
+                  (f64.ceil (local.get $x)))
+                (func (export \"floor\") (param $x f64) (result f64)
+                  (f64.floor (local.get $x))))
+              (assert_return (invoke \"nearest\" (f64.const nan:0x4000000000000))
+                             (f64.const nan:arithmetic))
+              (assert_return (invoke \"nearest\" (f64.const -nan:0x4000000000000))
+                             (f64.const nan:arithmetic))
+              (assert_return (invoke \"nearest\" (f64.const nan))
+                             (f64.const nan:canonical))
+              (assert_return (invoke \"trunc\" (f64.const nan:0x4000000000000))
+                             (f64.const nan:arithmetic))
+              (assert_return (invoke \"ceil\" (f64.const nan:0x4000000000000))
+                             (f64.const nan:arithmetic))
+              (assert_return (invoke \"floor\" (f64.const nan:0x4000000000000))
+                             (f64.const nan:arithmetic))
+              (assert_return (invoke \"nearest\" (f64.const 0x1.921fb54442d18p+2))
+                             (f64.const 0x1.8p+2))
+              (assert_return (invoke \"nearest\" (f64.const 0x1p-1022))
+                             (f64.const 0x0p+0))")))
+    (wasmdown.test:is (equal '(:pass :pass :pass :pass :pass :pass
+                               :pass :pass :pass)
+                            os))))
+
+(wasmdown.test:test wast/custom-section-zero-size-bounded
+  ;; Regression (loop 17, M6): a custom section's name and payload
+  ;; must fit the section's DECLARED size. For "\00\00" (id 0, size
+  ;; 0) the name-length read used to run on the whole-module reader,
+  ;; consuming bytes of the NEXT section and computing a NEGATIVE
+  ;; payload span, which crashed make-array as a harness error
+  ;; (custom.wast ::5: -1 is not of type (OR LIST
+  ;; (UNSIGNED-BYTE 41))). The sub-reader now bounds the decode at
+  ;; the declared end: the case fails 'truncated' at DECODE — the
+  ;; honest assert_malformed outcome ("unexpected end").
+  (let ((os (%outcomes
+             ";; custom.wast ::0's first module: multiple custom sections
+              (module binary
+                \"\\00asm\\01\\00\\00\\00\"
+                \"\\00\\24\\10\" \"a custom section\" \"this is the payload\")
+              ;; custom.wast ::3 (case ::5): the zero-size custom
+              ;; section's name read must fail TRUNCATED at DECODE
+              ;; inside the declared section end — never eat the next
+              ;; section's bytes (the make-array crash)
+              (assert_malformed
+                (module binary \"\\00asm\\01\\00\\00\\00\" \"\\00\\00\")
+                \"unexpected end\")
+              ;; custom.wast ::4: two zero-size custom sections
+              (assert_malformed
+                (module binary \"\\00asm\\01\\00\\00\\00\" \"\\00\\00\\00\")
+                \"unexpected end\")
+              ;; custom.wast ::6: custom name length 0x26 exceeds the
+              ;; section's declared size 0x10 — 'length out of bounds'
+              (assert_malformed
+                (module binary
+                  \"\\00asm\\01\\00\\00\\00\"
+                  \"\\00\\26\\10\" \"a custom section\" \"this is the payload\")
+                \"length out of bounds\")")))
+    (wasmdown.test:is (equal '(:pass :pass :pass :pass) os))))
+
+(wasmdown.test:test wast/annotation-forms-unsupported
+  ;; Regression (loop 17, M7): (@...) annotation forms are the
+  ;; unadopted annotations proposal. The SCRIPT lexer previously
+  ;; crashed on the reserved characters legal inside annotations
+  ;; (annotations.wast ::14's , ; ] [ }} }x{ ({) ,{{};}] ;) — a
+  ;; whole-file harness error. It now skips (@...) forms like the
+  ;; reference lexer.mll `annot` rule (nestable groups, comments,
+  ;; strings), so the file PARSES; a module whose text contains "(@"
+  ;; classifies :unsupported honestly (annotations.wast: 74 results,
+  ;; no harness error).
+  (let ((os (%outcomes
+             "(module (@a) (@a , ; ] [ }} }x{ ({) ,{{};}] ;) (func))
+              (assert_malformed (module quote \"( @a)\") \"unknown operator\")")))
+    (wasmdown.test:is (equal '(:unsupported :pass) os))))
+
+(wasmdown.test:test wast/implicit-module-script-short-form
+  ;; Regression (loop 17, M7): the script grammar's inline-module
+  ;; short form (parser.mly `script : list(cmd) EOF | inline_module1
+  ;; EOF`, `inline_module : module_fields`): consecutive top-level
+  ;; module FIELD forms wrap into ONE implicit (module ...) command
+  ;; (inline-module.wast = \"(func) (memory 0) (func (export \\\"f\\\"))\").
+  ;; Previously 'unknown script command func' crashed the whole file.
+  ;; The wrapped module must instantiate and be invocable, and a
+  ;; field run interrupted by a command stays separate from a later
+  ;; run.
+  (let ((os (%outcomes
+             "(func (export \"f\") (result i32) (i32.const 42))
+              (memory 0)
+              (invoke \"f\")
+              (assert_return (invoke \"f\") (i32.const 42))
+              (func) (table 1 funcref)")))
+    (wasmdown.test:is (equal '(:pass :pass :pass :pass) os))))

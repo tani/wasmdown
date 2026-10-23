@@ -438,8 +438,8 @@ markers (keywords) for the block terminators."
              ;; memory.copy x1 x2: dst memidx then src memidx
              (10 (mk :memory.copy (list :dst (read-u32 r) :src (read-u32 r))))
              (11 (mk :memory.fill (list :memidx (read-u32 r))))
-             ;; table.init x y: elemidx then tableidx (imms match the
-             ;; textual form table.init x y)
+            ;; table.init x y: elemidx then tableidx — the BINARY
+            ;; order (the text form is reversed: tableidx first)
              (12 (mk :table.init (list :elem (read-u32 r) :table (read-u32 r))))
              (13 (mk :elem.drop (list :elem (read-u32 r))))
              (14 (mk :table.copy (list :dst (read-u32 r) :src (read-u32 r))))
@@ -718,8 +718,21 @@ wasmdown:decode-error (with :offset) on any malformation."
                              id size))
           (cond
             ((= id 0)
-             (let* ((name (read-name r))
-                    (data (read-bytes r (- content-end (reader-offset r)))))
+             ;; The name and payload must fit the section's DECLARED
+             ;; content: decode through a sub-reader bounded at
+             ;; CONTENT-END. A zero-size section then fails "truncated"
+             ;; reading the name length (custom.wast ::5, "unexpected
+             ;; end") and an over-long name fails the bounds check —
+             ;; previously the whole-module reader let the name length
+             ;; eat bytes of the NEXT section, and the payload span
+             ;; (- CONTENT-END OFFSET) went NEGATIVE, crashing
+             ;; make-array as a harness error.
+             (let* ((sub (make-reader (reader-bytes r)
+                                      (reader-offset r) content-end))
+                    (name (read-name sub))
+                    (data (read-bytes sub (- (reader-limit sub)
+                                             (reader-offset sub)))))
+               (setf (reader-offset r) (reader-offset sub))
                (push (make-wasm-custom :name name :bytes data
                                        :offset sec-start)
                      customs)))
