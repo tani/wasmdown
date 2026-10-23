@@ -869,8 +869,12 @@ the trailing-id matching rule. Returns (values instr rest-items)."
     (multiple-value-bind (bt skipped)
         (%parse-block-typeuse-items cursor penv)
       (setf cursor (nthcdr skipped cursor))
-      (when id (push id (penv-labels penv)))
-      (flet ((pop-label () (when (and (penv-labels penv) id)
+      ;; Every structured instruction — named or not — occupies a label
+      ;; depth: unnamed scopes push a non-string sentinel that no $id
+      ;; can EQUAL, so named-label depths stay correct beneath them
+      ;; (spec: label indices count ALL enclosing blocks).
+      (push (or id :unnamed) (penv-labels penv))
+      (flet ((pop-label () (when (penv-labels penv)
                              (pop (penv-labels penv)))))
         (cond
          ((or (string= k "block") (string= k "loop"))
@@ -1179,13 +1183,13 @@ for the body; folded blocks contain no plain end (their own closing
 parenthesis closes them)."
   (multiple-value-bind (id bt items)
       (%block-label-and-type node penv)
-    (when id (push id (penv-labels penv)))
+    (push (or id :unnamed) (penv-labels penv))
     (multiple-value-bind (body term rest)
         (%instr-list items penv)
       (declare (ignore rest))
       (when term
         (%text-error 0 "unexpected ~a inside folded block" (car term)))
-      (when id (pop (penv-labels penv)))
+    (when (penv-labels penv) (pop (penv-labels penv)))
       (make-wasm-instr op (list :bt bt) (coerce body 'vector) 0))))
 
 (defun %fold-if (node penv)
@@ -1196,7 +1200,7 @@ an optional (else ...). Condition instructions are emitted BEFORE the
 operand stack)."
   (multiple-value-bind (id bt items)
       (%block-label-and-type node penv)
-    (when id (push id (penv-labels penv)))
+    (push (or id :unnamed) (penv-labels penv))
     ;; condition operands: folded lists before (then ...)
     (let ((conds '()))
       (loop while (and items (tok-elem-p (car items))
@@ -1226,7 +1230,7 @@ operand stack)."
               (setf else b)))
            (t (%text-error (if (tok-p x) (tok-pos x) 0)
                            "bad if item"))))
-        (when id (when (penv-labels penv) (pop (penv-labels penv))))
+        (when (penv-labels penv) (pop (penv-labels penv)))
         (append conds
                 (list (make-wasm-instr
                        :if
@@ -1241,13 +1245,18 @@ operand stack)."
 ;;; the leading keyword token) plus the shared PENV, registers ids,
 ;;; and appends to the PENV's accumulation lists.
 
-(defun %register-id (id table what pos)
-  "Register $ID -> next index in TABLE, signaling on duplicates."
+(defun %register-id (id table what pos idx)
+  "Register $ID -> IDX in TABLE. The index-space pre-scan
+(%prescan-ids) already registered every top-level id with its FINAL
+index, so a pre-registered id is kept as-is; IDX (the caller's true
+list position, never a hash count) is used only for ids the prescan
+could not know."
+  (declare (ignore what pos))
   (when id
-    (when (gethash (tok-text id) table)
-      (%text-error pos "duplicate identifier ~a" (tok-text id)))
-    (setf (gethash (tok-text id) table)
-          (hash-table-count table))))
+    (multiple-value-bind (present value) (gethash (tok-text id) table)
+      (declare (ignore present))
+      (unless value
+        (setf (gethash (tok-text id) table) idx)))))
 
 (defun %string-tok (x)
   "The decoded string of a :string token X, or decode-error."
@@ -1285,22 +1294,28 @@ nat token is the max (a reftype/id after the min is NOT a max)."
                  (string= (%tok-keyword (%first-tok funclist)) "func"))
       (%text-error (or (and id (tok-p id) (tok-pos id)) 0)
                    "(type) needs a (func ...) list"))
-    ;; register BEFORE resolving inner typeuses (recursion allowed:
-    ;; the spec forbids it, but textually a typeuse inside a type
-    ;; field's functype is impossible anyway)
-    (when (and id (tok-p id) (eq (tok-kind id) :id))
-      (%register-id id (penv-types penv) "type" (tok-pos id)))
+    ;; register the $id AFTER pushing: the types index space counts
+    ;; implicit types created by earlier typeuses (find-or-add), which
+    ;; occupy list slots without hash entries, so the id's index is
+    ;; the list length, not the hash count.
     (multiple-value-bind (params results typeidx)
         (%typeuse (cddr funclist) penv)
       (when typeidx
         (%text-error 0 "(type) functype cannot reference another type"))
       (push (make-wasm-func-type params results)
-            (penv-types-list penv)))))
+            (penv-types-list penv))
+      (when (and id (tok-p id) (eq (tok-kind id) :id))
+        (when (gethash (tok-text id) (penv-types penv))
+          (%text-error (tok-pos id) "duplicate identifier ~a"
+                       (tok-text id)))
+        (setf (gethash (tok-text id) (penv-types penv))
+              (1- (length (penv-types-list penv))))))))
 
 (defun %import-desc (desc penv kind)
   "Parse an import descriptor list ((func|table|memory|global) $id?
 type...) for KIND, returning the type payload: typeidx for funcs,
-wasm-table/wasm-memory/(type . mut) otherwise. Registers the id."
+wasm-table/wasm-memory/(type . mut) otherwise. Registers the id at
+the kind's running import count (its true index-space position)."
   (let* ((head (%first-tok desc))
          (k (and head (%tok-keyword head)))
          (items (cddr desc)))
@@ -1310,12 +1325,13 @@ wasm-table/wasm-memory/(type . mut) otherwise. Registers the id."
                    (:table (penv-n-imported-tables penv))
                    (:memory (penv-n-imported-mems penv))
                    (:global (penv-n-imported-globals penv)))))
-        (when id (%register-id id (case kind
-                                    (:func (penv-funcs penv))
-                                    (:table (penv-tables penv))
-                                    (:memory (penv-mems penv))
-                                    (:global (penv-globals penv)))
-                                  (string-downcase kind) (tok-pos id)))
+        (when id
+          (%register-id id (case kind
+                             (:func (penv-funcs penv))
+                             (:table (penv-tables penv))
+                             (:memory (penv-mems penv))
+                             (:global (penv-globals penv)))
+                           (string-downcase kind) (tok-pos id) idx))
         (ecase kind
           (:func
            (setf (penv-n-imported-funcs penv) (1+ idx))
@@ -1402,7 +1418,7 @@ An inline (import) turns the func into an import entry instead."
             do (let* ((ex (car rest))
                       (name (%string-tok (third ex)))
                       (idx (+ (penv-n-imported-funcs penv)
-                              (hash-table-count (penv-funcs penv)))))
+                              (length (penv-funcs-list penv)))))
                  (declare (ignore id))
                  (push (make-wasm-export name :func idx)
                        (penv-exports-list penv))
@@ -1415,7 +1431,8 @@ An inline (import) turns the func into an import entry instead."
                  (field (%string-tok (fourth im)))
                  (body-items (cdr rest)))
             (when id
-              (%register-id id (penv-funcs penv) "func" (tok-pos id)))
+              (%register-id id (penv-funcs penv) "func" (tok-pos id)
+                             (penv-n-imported-funcs penv)))
             ;; the typeuse (and locals?) of an inline-imported func:
             ;; per the abbreviation, (type/param/result) only, no body
             (let ((typeidx (%resolve-typeuse body-items penv)))
@@ -1423,10 +1440,11 @@ An inline (import) turns the func into an import entry instead."
               (push (make-wasm-import module field :func typeidx)
                     (penv-imports-list penv))))
           ;; ordinary defined func
-          (let* ((idx (hash-table-count (penv-funcs penv)))
-                 (abs-idx (+ (penv-n-imported-funcs penv) idx)))
-            (when id
-              (%register-id id (penv-funcs penv) "func" (tok-pos id)))
+          (progn
+            ;; $id -> funcidx was pre-registered by %prescan-ids with
+            ;; its FINAL index (imports + defined, field order); the
+            ;; inline-export loop above used the same list-length
+            ;; computation. Nothing to register here.
             (%reset-locals penv)
             (multiple-value-bind (params results typeidx)
                 (%typeuse rest penv)
@@ -1493,8 +1511,8 @@ An inline (import) turns the func into an import entry instead."
 
 (defun %inline-exports (rest penv kind table)
   "Consume leading (export \"n\") items from REST, pushing export
-entries for the NEXT index of KIND (imports counted via TABLE's
-hash-count + the defined list length). Returns the remaining items."
+entries for the NEXT index of KIND (defined list length + imports).
+Returns the remaining items."
   (loop while (and rest (tok-elem-p (car rest))
                    (string= (%tok-keyword (%first-tok (car rest)))
                             "export"))
@@ -1506,7 +1524,7 @@ hash-count + the defined list length). Returns the remaining items."
                             (:memory (penv-n-imported-mems penv))
                             (:global (penv-n-imported-globals penv)))
                           (ecase kind
-                            (:func (hash-table-count (penv-funcs penv)))
+                            (:func (length (penv-funcs-list penv)))
                             (:table (length (penv-tables-list penv)))
                             (:memory (length (penv-mems-list penv)))
                             (:global (length (penv-globals-list penv)))))))
@@ -1564,7 +1582,8 @@ abbreviation (which also emits the elem segment)."
                  (field (%string-tok (fourth im)))
                  (tail (cdr rest)))
             (when id
-              (%register-id id (penv-tables penv) "table" (tok-pos id)))
+              (%register-id id (penv-tables penv) "table" (tok-pos id)
+                             (penv-n-imported-tables penv)))
             (incf (penv-n-imported-tables penv))
             (let ((ty (%import-table-type "table" tail (tok-pos id))))
               (push (make-wasm-import module field :table ty)
@@ -1572,7 +1591,9 @@ abbreviation (which also emits the elem segment)."
           ;; defined table
           (progn
             (when id
-              (%register-id id (penv-tables penv) "table" (tok-pos id)))
+              (%register-id id (penv-tables penv) "table" (tok-pos id)
+                             (+ (penv-n-imported-tables penv)
+                                (length (penv-tables-list penv)))))
             (multiple-value-bind (tab inits)
                 (%table-type-items rest pos)
               (push tab (penv-tables-list penv))
@@ -1604,7 +1625,8 @@ import, then limits (n [n]) or the (data ...) abbreviation."
                  (field (%string-tok (fourth im)))
                  (tail (cdr rest)))
             (when id
-              (%register-id id (penv-mems penv) "memory" (tok-pos id)))
+              (%register-id id (penv-mems penv) "memory" (tok-pos id)
+                             (penv-n-imported-mems penv)))
             (incf (penv-n-imported-mems penv))
             (let ((ty (%import-memory-type tail (tok-pos id))))
               (push (make-wasm-import module field :memory
@@ -1612,7 +1634,9 @@ import, then limits (n [n]) or the (data ...) abbreviation."
                     (penv-imports-list penv))))
           (progn
             (when id
-              (%register-id id (penv-mems penv) "memory" (tok-pos id)))
+              (%register-id id (penv-mems penv) "memory" (tok-pos id)
+                             (+ (penv-n-imported-mems penv)
+                                (length (penv-mems-list penv)))))
             ;; (data "...") abbreviation: memory sized to the data
             (if (and rest (tok-elem-p (car rest))
                      (string= (%tok-keyword (%first-tok (car rest)))
@@ -1667,7 +1691,8 @@ single folded list or a plain instruction sequence ending with end)."
                  (field (%string-tok (fourth im)))
                  (tail (cdr rest)))
             (when id
-              (%register-id id (penv-globals penv) "global" (tok-pos id)))
+              (%register-id id (penv-globals penv) "global" (tok-pos id)
+                             (penv-n-imported-globals penv)))
             (incf (penv-n-imported-globals penv))
             (multiple-value-bind (type mut) (%global-type (car tail) pos)
               (push (make-wasm-import module field :global (cons type mut))
@@ -1675,7 +1700,9 @@ single folded list or a plain instruction sequence ending with end)."
           ;; defined global: type then init expr
           (progn
             (when id
-              (%register-id id (penv-globals penv) "global" (tok-pos id)))
+              (%register-id id (penv-globals penv) "global" (tok-pos id)
+                             (+ (penv-n-imported-globals penv)
+                                (length (penv-globals-list penv)))))
             (unless (and rest (or (tok-p (car rest)) (tok-elem-p (car rest))))
               (%text-error pos "global needs a type and init"))
             (multiple-value-bind (type mut) (%global-type (car rest) pos)
@@ -1804,7 +1831,8 @@ list, or an (offset expr) wrapper. Returns (values expr rest)."
          (pos (or (and items (tok-p (car items)) (tok-pos (car items))) 0)))
     (multiple-value-bind (id rest) (%opt-id items)
       (when id
-        (%register-id id (penv-elems penv) "elem" (tok-pos id)))
+        (setf (gethash (tok-text id) (penv-elems penv))
+              (length (penv-elems-list penv))))
       ;; declare form
       (cond
        ((and rest (tok-p (car rest))
@@ -1892,11 +1920,8 @@ list, or an (offset expr) wrapper. Returns (values expr rest)."
                            :funcref
                            (%elem-items tail2 :funcref penv))
                           (penv-elems-list penv)))))))))))
-      ;; keep the elem index space in sync: unnamed segments occupy
-      ;; an index too (numeric elemidx references count all fields)
-      (setf (gethash (symbol-name (gensym "ELEM-UNUSED"))
-                     (penv-elems penv))
-            (hash-table-count (penv-elems penv)))))
+      ;; (index space bookkeeping is by list length; nothing to sync)
+      ))
 
 (defun %parse-data-field (node penv)
   "Parse a (data ...) field:
@@ -1905,7 +1930,9 @@ list, or an (offset expr) wrapper. Returns (values expr rest)."
   (let* ((items (cddr node))
          (pos (or (and items (tok-p (car items)) (tok-pos (car items))) 0)))
     (multiple-value-bind (id rest) (%opt-id items)
-      (declare (ignore id))
+      (when id
+        (setf (gethash (tok-text id) (penv-datas penv))
+              (length (penv-datas-list penv))))
       (let ((memidx 0) (tail rest) (mem-p nil))
         (when (and tail (tok-elem-p (car tail))
                    (string= (%tok-keyword (%first-tok (car tail))) "memory"))
@@ -1929,6 +1956,71 @@ list, or an (offset expr) wrapper. Returns (values expr rest)."
 
 ;;; ---------------------------------------------------------------
 ;;; Module assembly and entry points.
+(defun %prescan-ids (nodes penv)
+  "Pre-register every top-level $id -> final index for the six index
+spaces BEFORE parsing field bodies, so forward references (legal WAT)
+resolve. Imports count toward their kind's index space in field
+order, interleaved with defined entities. Type ids stay deferred
+(implicit typeuses shift the list during body parsing)."
+  (let ((nfuncs 0) (ntables 0) (nmems 0) (nglobals 0)
+        (nelems 0) (ndatas 0))
+    (flet ((reg (id table idx)
+             (when (and id (tok-p id) (eq (tok-kind id) :id))
+               (when (gethash (tok-text id) table)
+                 (%text-error (tok-pos id) "duplicate identifier ~a"
+                              (tok-text id)))
+               (setf (gethash (tok-text id) table) idx)))
+           (node-id (node)
+             (let ((t3 (third node)))
+               (and (tok-p t3) (eq (tok-kind t3) :id) t3))))
+      (dolist (node nodes)
+        (let* ((head (%first-tok node))
+               (k (and head (%tok-keyword head))))
+          (cond
+           ((string= k "func")
+            ;; every func (inline-import or defined) occupies the next
+            ;; index in field order; inline-imports also bump the
+            ;; n-imported counter the field parser uses.
+            (let* ((items (cddr node))
+                   (rest (multiple-value-bind (id r) (%opt-id items)
+                           (declare (ignore id))
+                           r)))
+              (loop while (and rest (tok-elem-p (car rest))
+                                (string= (%tok-keyword (%first-tok (car rest)))
+                                         "export"))
+                    do (pop rest))
+              (reg (node-id node) (penv-funcs penv) nfuncs)
+              (incf nfuncs)))
+           ((string= k "import")
+            (let ((desc (fourth node)))
+              (when (and desc (tok-elem-p desc))
+                (let* ((dk (%tok-keyword (%first-tok desc)))
+                       (did (third desc)))
+                  (cond
+                   ((string= dk "func")
+                    (reg did (penv-funcs penv) nfuncs) (incf nfuncs))
+                   ((string= dk "table")
+                    (reg did (penv-tables penv) ntables) (incf ntables))
+                   ((string= dk "memory")
+                    (reg did (penv-mems penv) nmems) (incf nmems))
+                   ((string= dk "global")
+                    (reg did (penv-globals penv) nglobals)
+                    (incf nglobals)))))))
+           ((string= k "table")
+            (reg (node-id node) (penv-tables penv) ntables)
+            (incf ntables))
+           ((string= k "memory")
+            (reg (node-id node) (penv-mems penv) nmems)
+            (incf nmems))
+           ((string= k "global")
+            (reg (node-id node) (penv-globals penv) nglobals)
+            (incf nglobals))
+           ((string= k "elem")
+            (reg (node-id node) (penv-elems penv) nelems)
+            (incf nelems))
+           ((string= k "data")
+            (reg (node-id node) (penv-datas penv) ndatas)
+            (incf ndatas))))))))
 
 (defun %parse-module-fields (nodes penv)
   "Dispatch each top-level field :list node to its parser."
@@ -1965,8 +2057,9 @@ with :offset (token index) on malformed text."
     ;; NOTE: the module keyword may be omitted?  No: require it.
     ;; items of the module list
     (let ((items (cddr (first nodes))))
-      ;; register elem/data ids AFTER fields parse (their indices are
-      ;; positional); the elem/data parsers use hash-table-count.
+      ;; forward $id references: pre-register the six index spaces
+      ;; before any field body parses (WAT allows forward refs)
+      (%prescan-ids items penv)
       (%parse-module-fields items penv)
       (make-wasm-module
        :types (coerce (reverse (penv-types-list penv)) 'vector)

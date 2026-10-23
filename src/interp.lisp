@@ -366,15 +366,23 @@ tables, memories, globals).")
   ;; string formatting (the old hot-path cost) and no counter state.
   kind                                     ; :block or :loop
   params                                   ; count of stack values consumed on entry
-  results)                                 ; count of results on br/fallthrough
+  results                                  ; count of results on br/fallthrough
+  (height 0 :type fixnum))                 ; operand-stack depth below the frame's params
 
-;;; Branch protocol: THROW of (list tag nvals values) where values are
-;;; the branch operands in push order.
+;;; Branch protocol: THROW of (list tag vals rest) to the target
+;;; frame, where VALS are the branch operands in TOP-AT-HEAD order
+;;; (the natural order of the stack representation) and REST is the
+;;; truncated stack below them. Stack-rebuilding catches prepend VALS
+;;; directly; INTERP-INVOKE reverses once to the wasm-call push-order
+;;; results convention.
 
 (defun %br-depth-throw (depth stack block-stack)
   "Perform a branch at relative DEPTH from the innermost block. Pops the
- branch operands per the target frame's result arity, unwinds to the
- target, and returns (values target-frame remaining-stack) via THROW."
+branch operands per the target frame's arity (loop: params; block:
+results), TRUNCATES the stack to the target frame's entry height
+(discarding intermediate frames' leftovers — spec: br unwinds the
+operand stack to the branch target), and returns the operands plus the
+truncated remainder via THROW."
   (let ((frame (nth depth block-stack)))
     (unless frame
       (%trap :unreachable "branch depth ~d exceeds control stack" depth))
@@ -382,8 +390,12 @@ tables, memories, globals).")
                       (block-frame-params frame)
                       (block-frame-results frame)))
            (vals (subseq stack 0 nvals))
-           (rest (nthcdr nvals stack)))
-      (throw frame (values (reverse vals) rest)))))
+           (base (block-frame-height frame))
+           (rest (nthcdr nvals stack))
+           (rest (if (> (length rest) base)
+                     (subseq rest 0 base)
+                     rest)))
+      (throw frame (values vals rest)))))
 
 (defun %exec-seq (instrs locals block-stack stack)
   "Execute a straight-line instruction vector (a block body with the
@@ -448,42 +460,55 @@ tables, memories, globals).")
                      (nresults (%blocktype-arity bt))
                      (s-inner (nthcdr nparams s))
                      (frame (make-block-frame :kind :block
-                                              :params nparams :results nresults)))
+                                              :params nparams :results nresults
+                                              :height (length s-inner))))
                 (multiple-value-bind (vals leftover)
                     (catch frame
-                      ;; fallthrough: body's top NRESULTS values are
-                      ;; the block results, stacked on s-inner.
+                      ;; fallthrough: the body's top NRESULTS values are
+                      ;; the block results, stacked on s-inner. The
+                      ;; fallthrough path returns (:fallthrough
+                      ;; new-stack); a br THROW supplies (values
+                      ;; branch-operands rest). Wasm values are never
+                      ;; keywords, so the marker is unambiguous.
                       (let ((s2 (%exec-seq (wasm-instr-body instr) locals
                                            (cons frame block-stack) s-inner)))
-                        (return-from %exec-seq
-                          (append (subseq s2 0 nresults) s-inner)))
-                      ;; (unreachable: CATCH body either returns from
-                      ;; the function or THROWs past this point)
-                      nil)
-                  ;; br to this block: VALS are the branch operands
-                  ;; (push order), LEFTOVER is the stack below them.
-                  (setf s (append vals leftover)))))
+                        (values :fallthrough
+                                (append (subseq s2 0 nresults) s-inner))))
+                      ;; (unreachable: CATCH body either falls through
+                      ;; or THROWs past this point; the fallthrough
+                      ;; VALUES form above must stay last so CATCH
+                      ;; propagates both values.)
+                  (if (eq vals :fallthrough)
+                      (setf s leftover)
+                      ;; br to this block: VALS are the branch operands
+                      ;; (top-at-head), LEFTOVER the stack below them.
+                      (setf s (append vals leftover))))))
              (:loop
               (let* ((bt (getf imms :bt))
                      (nparams (%blocktype-param-arity bt))
                      (nresults (%blocktype-arity bt))
                      (frame (make-block-frame :kind :loop
-                                              :params nparams :results nresults)))
+                                              :params nparams :results nresults
+                                              :height (- (length s) nparams))))
                 (loop
                   (multiple-value-bind (vals leftover)
                       (catch frame
                         ;; one iteration; fallthrough finishes the
-                        ;; loop with its top NRESULTS values.
+                        ;; loop: its top NRESULTS values are the
+                        ;; results, stacked on the stack below the
+                        ;; loop's params. Fallthrough returns
+                        ;; (:fallthrough new-stack); a br to the loop
+                        ;; THROWs the new params to restart it.
                         (let ((s2 (%exec-seq (wasm-instr-body instr) locals
                                              (cons frame block-stack) s)))
-                          (return-from %exec-seq
-                            (append (subseq s2 0 nresults)
-                                    (nthcdr nparams s))))
-                        nil)
-                    ;; br to the loop: restart with the branch
-                    ;; operands as the new loop params.
-                    (declare (type list vals leftover))
-                    (setf s (append vals leftover))))))
+                          (values :fallthrough
+                                  (append (subseq s2 0 nresults)
+                                          (nthcdr nparams s)))))
+                    (if (eq vals :fallthrough)
+                        (return)                ; finished: exit restart loop
+                        ;; br to the loop: restart with the branch
+                        ;; operands as the new loop params.
+                        (setf s (append vals leftover)))))))
              (t
               (multiple-value-setq (s) (%exec-other op instr imms locals block-stack s))))
         finally (return s)))
@@ -566,7 +591,8 @@ tables, memories, globals).")
               (nresults (%blocktype-arity bt))
               (s-inner (nthcdr nparams s1))
               (frame (make-block-frame :kind :block
-                                       :params nparams :results nresults)))
+                                       :params nparams :results nresults
+                                       :height (length s-inner))))
          (multiple-value-bind (vals leftover)
              (catch frame
                (let ((body (if (zerop cond-v)
@@ -600,8 +626,8 @@ tables, memories, globals).")
     ((eq op :return)
      ;; return unwinds the whole function: throw to a sentinel frame
      ;; installed by interp-invoke
-     (throw *return-tag*
-       (values (reverse (subseq s 0 *frame-nresults*)) nil)))
+    (throw *return-tag*
+      (values (subseq s 0 *frame-nresults*) nil)))
     ;; ---- calls ----
     ((eq op :call)
      (%do-call (%func-at (getf imms :func)) s))
@@ -810,8 +836,10 @@ tables, memories, globals).")
                      (return-from interp-invoke
                        (reverse (subseq s 0 *frame-nresults*))))
                    nil)
+               ;; br/return targeting the function frame: VALS arrive
+               ;; top-at-head; wasm-call wants push order.
                (declare (ignore leftover))
-               vals)))
+               (reverse vals))))
       (%call-depth-exit saved-depth))))
 
 (defun interp-func (func &rest args)

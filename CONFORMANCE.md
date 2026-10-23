@@ -12,23 +12,23 @@ typed-funcrefs/memory64), never silently passed.
 
 | Outcome | Count |
 | --- | --- |
-| pass | 10108 |
-| fail | 10717 |
+| pass | 17630 |
+| fail | 3196 |
 | skip | 0 |
 | unsupported | 277 |
 | timeout | 0 |
-| harness-error | 85 |
+| harness-error | 84 |
 | **total** | **21187** |
 
-Executed: 21187 commands; pass rate 47.7% (denominator = all executed,
+Executed: 21187 commands; pass rate 83.2% (denominator = all executed,
 including unsupported — honest per PLAN.md §12.9).
 
 ## Per-file counts
 
 | File | pass | fail | unsupported | other |
 | --- | --- | --- | --- | --- |
-| address | 173 | 87 | 0 | 0 |
-| align | 115 | 49 | 1 | 0 |
+| address | 257 | 3 | 0 | 0 |
+| align | 158 | 6 | 1 | 0 |
 | annotations | 0 | 0 | 0 | 1 |
 | binary-leb128 | 83 | 4 | 0 | 4 |
 | binary | 128 | 1 | 0 | 0 |
@@ -43,35 +43,35 @@ including unsupported — honest per PLAN.md §12.9).
 | call_ref | 0 | 27 | 8 | 0 |
 | comments | 4 | 4 | 0 | 0 |
 | const | 645 | 62 | 69 | 2 |
-| conversions | 41 | 578 | 0 | 0 |
+| conversions | 609 | 10 | 0 | 0 |
 | custom | 10 | 0 | 0 | 1 |
-| data | 47 | 20 | 0 | 1 |
-| elem | 59 | 84 | 10 | 1 |
+| data | 50 | 18 | 0 | 0 |
+| elem | 62 | 82 | 10 | 0 |
 | endianness | 0 | 69 | 0 | 0 |
-| exports | 76 | 20 | 1 | 0 |
-| f32 | 1283 | 1231 | 0 | 0 |
-| f32_bitwise | 32 | 332 | 0 | 0 |
-| f32_cmp | 1495 | 912 | 0 | 0 |
-| f64 | 1283 | 1231 | 0 | 0 |
-| f64_bitwise | 32 | 332 | 0 | 0 |
-| f64_cmp | 1495 | 912 | 0 | 0 |
-| fac | 0 | 8 | 0 | 0 |
-| float_exprs | 464 | 450 | 3 | 10 |
+| exports | 82 | 14 | 1 | 0 |
+| f32 | 2371 | 143 | 0 | 0 |
+| f32_bitwise | 345 | 19 | 0 | 0 |
+| f32_cmp | 2407 | 0 | 0 | 0 |
+| f64 | 2371 | 143 | 0 | 0 |
+| f64_bitwise | 345 | 19 | 0 | 0 |
+| f64_cmp | 2407 | 0 | 0 | 0 |
+| fac | 8 | 0 | 0 | 0 |
+| float_exprs | 802 | 112 | 3 | 10 |
 | float_literals | 79 | 98 | 2 | 0 |
-| float_memory | 20 | 62 | 2 | 6 |
-| float_misc | 48 | 423 | 0 | 0 |
-| forward | 0 | 5 | 0 | 0 |
-| func | 72 | 101 | 0 | 2 |
+| float_memory | 38 | 44 | 2 | 6 |
+| float_misc | 455 | 16 | 0 | 0 |
+| forward | 5 | 0 | 0 | 0 |
+| func | 73 | 99 | 0 | 3 |
 | func_ptrs | 6 | 28 | 0 | 2 |
-| global | 45 | 77 | 0 | 2 |
-| i32 | 143 | 317 | 0 | 0 |
-| i64 | 89 | 327 | 0 | 0 |
+| global | 46 | 76 | 0 | 2 |
+| i32 | 450 | 10 | 0 | 0 |
+| i64 | 401 | 15 | 0 | 0 |
 | id | 6 | 1 | 0 | 0 |
 | if | 114 | 127 | 0 | 0 |
-| imports | 172 | 36 | 8 | 2 |
+| imports | 178 | 30 | 8 | 2 |
 | inline-module | 0 | 0 | 0 | 1 |
 | instance | 0 | 20 | 3 | 0 |
-| int_exprs | 87 | 21 | 0 | 0 |
+| int_exprs | 108 | 0 | 0 | 0 |
 | int_literals | 20 | 30 | 1 | 0 |
 | labels | 3 | 25 | 1 | 0 |
 | left-to-right | 0 | 96 | 0 | 0 |
@@ -82,17 +82,17 @@ including unsupported — honest per PLAN.md §12.9).
 | local_set | 32 | 21 | 0 | 0 |
 | local_tee | 41 | 56 | 1 | 0 |
 | loop | 42 | 78 | 1 | 0 |
-| memory | 43 | 44 | 0 | 3 |
-| memory_grow | 42 | 67 | 0 | 0 |
+| memory | 84 | 3 | 0 | 3 |
+| memory_grow | 63 | 46 | 0 | 0 |
 | memory_redundancy | 0 | 4 | 1 | 3 |
-| memory_size | 11 | 31 | 0 | 0 |
-| memory_trap | 7 | 175 | 0 | 0 |
-| names | 8 | 478 | 0 | 0 |
-| nop | 4 | 84 | 0 | 0 |
+| memory_size | 42 | 0 | 0 | 0 |
+| memory_trap | 14 | 168 | 0 | 0 |
+| names | 486 | 0 | 0 | 0 |
+| nop | 84 | 4 | 0 | 0 |
 | obsolete-keywords | 10 | 0 | 1 | 0 |
 | ref | 0 | 1 | 4 | 8 |
 | ref_as_non_null | 0 | 4 | 3 | 0 |
-| ref_func | 4 | 11 | 0 | 2 |
+| ref_func | 5 | 10 | 0 | 2 |
 | ref_is_null | 2 | 16 | 2 | 2 |
 | ref_null | 0 | 32 | 2 | 0 |
 | return | 20 | 64 | 0 | 0 |
@@ -101,17 +101,17 @@ including unsupported — honest per PLAN.md §12.9).
 | return_call_ref | 0 | 35 | 18 | 0 |
 | select | 30 | 126 | 1 | 0 |
 | skip-stack-guard-page | 0 | 10 | 1 | 0 |
-| stack | 0 | 7 | 0 | 0 |
+| stack | 6 | 1 | 0 | 0 |
 | start | 20 | 0 | 0 | 0 |
 | store | 68 | 0 | 0 | 0 |
-| switch | 7 | 21 | 0 | 0 |
-| table | 16 | 20 | 9 | 1 |
+| switch | 23 | 5 | 0 | 0 |
+| table | 18 | 18 | 9 | 1 |
 | table_get | 5 | 10 | 0 | 1 |
-| table_grow | 24 | 37 | 0 | 0 |
+| table_grow | 27 | 34 | 0 | 0 |
 | table_set | 7 | 19 | 0 | 0 |
-| table_size | 6 | 33 | 0 | 0 |
+| table_size | 39 | 0 | 0 | 0 |
 | token | 55 | 0 | 0 | 6 |
-| traps | 31 | 5 | 0 | 0 |
+| traps | 36 | 0 | 0 | 0 |
 | type-canon | 0 | 2 | 0 | 0 |
 | type-equivalence | 0 | 20 | 4 | 8 |
 | type-rec | 0 | 5 | 22 | 0 |
@@ -119,7 +119,7 @@ including unsupported — honest per PLAN.md §12.9).
 | unreachable | 0 | 64 | 0 | 0 |
 | unreached-invalid | 118 | 0 | 3 | 0 |
 | unreached-valid | 2 | 9 | 2 | 0 |
-| unwind | 9 | 41 | 0 | 0 |
+| unwind | 50 | 0 | 0 | 0 |
 | utf8-custom-section-id | 176 | 0 | 0 | 0 |
 | utf8-import-field | 176 | 0 | 0 | 0 |
 | utf8-import-module | 176 | 0 | 0 | 0 |

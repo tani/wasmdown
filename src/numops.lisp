@@ -361,10 +361,12 @@
     `(progn
        (declaim (ftype (function (,float-type) (integer 0 *)) ,name))
        (defun ,name (x)
-         (declare (type ,float-type x))
          (cond ((nan-p x)
                 (error 'wasmdown:wasm-trap :kind :invalid-conversion
                        :message ,(format nil "~(~a~): NaN" name)))
+               ((sb-ext:float-infinity-p x)
+                (error 'wasmdown:wasm-trap :kind :integer-overflow
+                       :message ,(format nil "~(~a~): out of range" name)))
                (t
                 (let ((n (round (ftruncate x))))  ; exact integral value
                   (declare (type integer n))

@@ -116,6 +116,75 @@
       (expect (call-export inst "sum" 10) '(55))
       (expect (call-export inst "sum" 0) '(0)))))
 
+(wasmdown.test:test interp/loop-params-backedge
+  ;; fac-ssa shape: (loop (param i64 i64) (result i64)) driven by
+  ;; br_if back to the loop. The br operands must become the loop's
+  ;; new params in PUSH order (first operand = first param, LAST
+  ;; operand on top); previously the restart re-bound them reversed,
+  ;; so every iteration computed on identical inputs and never
+  ;; terminated.
+  (let* ((types (vector (ft '(:i64) '(:i64 :i64))          ; 0: pick0
+                        (ft '(:i64 :i64) '(:i64 :i64 :i64)) ; 1: pick1
+                        (ft '(:i64 :i64) '(:i64))          ; 2: loop type
+                        (ft '(:i64) '(:i64))))             ; 3: fac-ssa
+         (pick0 (fn 0 (vector (i :local.get (list :local 0))
+                              (i :local.get (list :local 0))
+                              (endi))))
+         (pick1 (fn 1 (vector (i :local.get (list :local 0))
+                              (i :local.get (list :local 1))
+                              (i :local.get (list :local 0))
+                              (endi))))
+         (loop-body
+          (vector
+           ;; acc n acc' = acc*n: pick1(acc n) -> (acc n acc);
+           ;; pick1 again -> (acc n acc n); mul -> acc*n
+           (i :call (list :func 1)) (i :call (list :func 1)) (i :i64.mul)
+           ;; n' = n-1: pick1 -> (acc n acc n') after sub
+           (i :call (list :func 1)) (i :i64.const (list :value 1)) (i :i64.sub)
+           ;; br_if $l on (n' > 0): pick0(n') -> (n' n'); gt_u 0
+           (i :call (list :func 0)) (i :i64.const (list :value 0)) (i :i64.gt_u)
+           (i :br-if (list :label 0))
+           ;; fallthrough: result is acc' (top); drop n'
+           (i :drop) (i :return)))
+         (fac-ssa (fn 3 (vector
+                         (i :i64.const (list :value 1))
+                         (i :local.get (list :local 0))
+                         (i :loop (list :bt '(:typeidx . 2)) loop-body)
+                         (endi)))))
+    (let* ((mod (mmod :types types
+                      :funcs (vector pick0 pick1 fac-ssa)
+                      :exports (vector (make-wasm-export "fac-ssa" :func 2))))
+           (inst (make-module-instance mod '())))
+      ;; fac(2)=2, fac(3)=6, fac(6)=720; fac(25) wraps (i64 semantics)
+      ;; n>=1 only: fac-ssa(0) loops ~2^64 times by design (n-1
+      ;; wraps unsigned, gt_u keeps branching) — the spec file only
+      ;; tests n=25.
+      (expect (call-export inst "fac-ssa" 1) '(1))
+      (expect (call-export inst "fac-ssa" 2) '(2))
+      (expect (call-export inst "fac-ssa" 3) '(6))
+      (expect (call-export inst "fac-ssa" 6) '(720))
+      (expect (call-export inst "fac-ssa" 25) '(7034535277573963776)))))
+
+(wasmdown.test:test interp/br-block-result-order
+  ;; br to a block with 2 results must deliver them in push order:
+  ;; first operand pushed first, LAST operand ends on top. The
+  ;; non-commutative i32.sub discriminates: 11 22 br -> 11-22 =
+  ;; -11 (u32 4294967285), not 22-11 = 11.
+  (let ((mod (mmod
+              :types (vector (ft '() '(:i32 :i32)) ; 0: block type
+                              (ft '() '(:i32)))   ; 1: func type
+              :funcs (vector
+                      (fn 1 (vector
+                             (i :block (list :bt '(:typeidx . 0))
+                                 (vector (i :i32.const (list :value 11))
+                                         (i :i32.const (list :value 22))
+                                         (i :br (list :label 0))))
+                             (i :i32.sub)
+                             (endi))))
+              :exports (vector (make-wasm-export "f" :func 0)))))
+    (let ((inst (make-module-instance mod '())))
+      (expect (call-export inst "f") '(4294967285)))))
+
 (wasmdown.test:test interp/if-else
   (let ((mod (mmod
               :types (vector (ft '(:i32) '(:i32)))
