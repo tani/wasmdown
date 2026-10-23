@@ -10,7 +10,7 @@ baseline SBCL code generation, a public Lisp API and CLI for the **core
 Wasm subset** below, plus the stateful `.wast` spec-script runner and a
 measured baseline against the vendored official test suite. It is
 **not** a conformant Core 3.0 implementation and makes no conformance
-claim. No Component Model, WIT, WASI, SIMD, GC, exception-handling or
+claim. No Component Model, WIT, WASI, SIMD, GC or
 threads support yet — those are PLAN.md milestones M5, M7–M12.
 
 ## Conformance baseline (honest, per PLAN.md §12.8)
@@ -72,14 +72,17 @@ harness-errors.
 | API / CLI | `src/api.lisp`, `src/cli.lisp` | `read-module`, `validate-module`, `instantiate`, `invoke`, …; CLI `validate`/`inspect`/`compile`/`run`. |
 
 Not implemented (see `PLAN.md` for the full contract): SIMD (v128),
-Wasm GC, exception handling (`try_table`), `return_call_ref` (typed
-function references), memory64, multi-memory runtime (decode accepts
+Wasm GC, `return_call_ref` / `call_ref` (typed
+function references), memory64, multi-memory runtime (text accepts
 memidx forms), Component Model, Canonical ABI, WASI (all versions),
 threads/atomics, FASL cache. Tail calls `return_call` /
 `return_call_indirect` **are** implemented (constant-stack trampoline
-in `src/interp.lisp`). The `.wat` text format and `.wast` spec runner
-**are** implemented (`src/text.lisp`, `src/wast.lisp`), as is
-conformance reporting.
+in `src/interp.lisp`), as are exception handling (tag section, tags,
+`try_table`, `throw`, catch-all clauses, cross-call propagation with
+the uncaught boundary at the outermost guest frame) and the named
+module definition/instance script forms. The `.wat` text format and
+`.wast` spec runner **are** implemented (`src/text.lisp`,
+`src/wast.lisp`), as is conformance reporting.
 
 ## Error/phase taxonomy (PLAN.md §12.2)
 
