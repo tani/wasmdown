@@ -25,7 +25,9 @@ pass rate 83.2% (denominator = all executed, incl. unsupported)
 ```
 
 Regenerate with `make report-conformance` (writes `CONFORMANCE.md` +
-`tests/spec-core-results.jsonl`, one JSONL line per command). This is a
+`tests/spec-core-results.jsonl`, one JSONL line per command); the full
+97-file run completes in ~3 seconds and must stay fast — a slow or
+hanging run is a bug, not a workload. This is a
 baseline measurement, **not** a release gate; remaining failures are
 case-specific engine gaps plus out-of-scope features (SIMD/GC/EH/tail
 calls/typed funcrefs/memory64), which are classified `unsupported` —
