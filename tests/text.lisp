@@ -474,3 +474,46 @@ EQUALP (canonical-encode agreement oracle)."
     (wasmdown.test:is (every (lambda (r) (eq r :pass))
                              (map 'list #'wasmdown.wast:wast-result-outcome
                                   rs)))))
+
+(wasmdown.test:test text/loop-param-blocktype-not-nil
+  ;; Regression (loop 6, loop.wast 42->121 cascade): a blocktype
+  ;; (loop/block (param i32) ...) with params but NO results must
+  ;; resolve to (cons :typeidx n), NOT nil. The old cond branch
+  ;; ((null results) nil) silently dropped the params, so every
+  ;; multi-value param loop desynced the end-of-block stack check
+  ;; ('1 extra'/'underflow') — loop.wast module 0 failed wholesale.
+  (labels ((%find-loop (instrs)
+             (loop for i across instrs
+                   thereis (or (and (eq (wasm-instr-op i) :loop) i)
+                               (%find-loop (wasm-instr-body i))))))
+    (let* ((m (%wat "(module (func (export \"f\") (result i32) (block (result i32) (i32.const 0) (loop (param i32) (block (br 2 (i32.const 18))) (br 0 (i32.const 20))) (i32.const 19))))"))
+           (loop (%find-loop (wasm-func-body (aref (wasm-module-funcs m) 0))))
+           (bt (and loop (getf (wasm-instr-imms loop) :bt))))
+      (wasmdown.test:is (>= (length (wasm-module-types m)) 2))
+      (wasmdown.test:is (and (consp bt) (eq (car bt) :typeidx)))
+      (wasmdown.test:is
+       (equal '(:i32)
+              (wasm-func-type-params
+               (aref (wasm-module-types m) (cdr bt)))))
+      (wasmdown:validate-module m)
+      (let ((inst (wasmdown:instantiate m)))
+        (wasmdown.test:is (equal '(18) (wasmdown:invoke inst "f")))))))
+
+(wasmdown.test:test text/typeuse-ordering-malformed
+  ;; Regression (loop 6): WAT grammar pins typeuse order
+  ;; (type)? (param)* (result)*. block.wast/loop.wast/func.wast
+  ;; assert_malformed batches ("unexpected token") require rejecting
+  ;; (type) after (param)/(result) and (param) after (result).
+  (dolist (bad
+           '("(module (type $s (func (param i32) (result i32))) (func (i32.const 0) (loop (param i32) (type $s) (result i32))))"
+             "(module (type $s (func (param i32) (result i32))) (func (i32.const 0) (loop (type $s) (result i32) (param i32))))"
+             "(module (type $s (func (param i32) (result i32))) (func (i32.const 0) (loop (param i32) (result i32) (type $s))))"
+             "(module (func (i32.const 0) (loop (result i32) (param i32))))"))
+    (wasmdown.test:assert-raises wasmdown:decode-error
+      (wasmdown.text:parse-wat bad)))
+  ;; the LEGAL order (type) (param)* (result)* keeps working
+  ;; (loop.wast type-use func, stack.wast call_indirect typeuses)
+  (wasmdown:validate-module
+   (%wat "(module (type $s (func (param i32 f64 i32) (result i32 f64 i32))) (func (i32.const 0) (f64.const 0) (i32.const 0) (loop (type $s) (param i32) (param f64 i32) (result i32 f64) (result i32)) (drop) (drop) (drop)))"))
+  (wasmdown:validate-module
+   (%wat "(module (type $p (func)) (table 1 funcref) (func (block (call_indirect (type $p) (param) (result) (i32.const 0)))))")))

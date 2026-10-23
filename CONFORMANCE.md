@@ -13,15 +13,15 @@ now classify as :unsupported instead of crashing as harness-errors.
 
 | Outcome | Count |
 | --- | --- |
-| pass | 19870 |
-| fail | 522 |
+| pass | 19948 |
+| fail | 444 |
 | skip | 0 |
 | unsupported | 725 |
 | timeout | 0 |
 | harness-error | 70 |
 | **total** | **21187** |
 
-Executed: 21187 commands; pass rate 93.8% (denominator = all executed,
+Executed: 21187 commands; pass rate 94.2% (denominator = all executed,
 including unsupported — honest per PLAN.md §12.9).
 
 ## Per-file counts
@@ -82,7 +82,7 @@ including unsupported — honest per PLAN.md §12.9).
 | local_init | 0 | 0 | 10 | 0 |
 | local_set | 53 | 0 | 0 | 0 |
 | local_tee | 96 | 1 | 1 | 0 |
-| loop | 42 | 79 | 0 | 0 |
+| loop | 120 | 1 | 0 | 0 |
 | memory | 84 | 3 | 0 | 3 |
 | memory_grow | 104 | 4 | 0 | 1 |
 | memory_redundancy | 8 | 0 | 0 | 0 |

@@ -606,16 +606,27 @@ explicit (type x) is given the typeidx is resolved; otherwise the
 (param)(result) lists are returned for find-or-create at the call
 site. NOTE: params register their names in PENV-LOCALS, so a caller
 using %TYPEUSE speculatively (blocktype scanning) must tolerate that
-(blocktypes have no named params per the grammar)."
-  (let ((typeidx nil) (params '()) (results '()) (rest items))
+(blocktypes have no named params per the grammar).
+ORDERING (pinned by the suite: block.wast/loop.wast/func.wast
+assert_malformed batches): (type) strictly first, then (param)*,
+then (result)*. A (type) after a (param)/(result), or a (param)
+after a (result), is 'unexpected token' malformed text — the loop
+does not just stop at the first mismatching item, it REJECTS it."
+  (let ((typeidx nil) (params '()) (results '()) (rest items)
+        (stage 0))                    ; 0=type?, 1=params, 2=results
     (loop while rest
           for x = (car rest)
-          while (and (tok-elem-p x)
-                     (member (%tok-keyword (%first-tok x))
-                             '("type" "param" "result")
-                             :test #'string=))
+          for k = (and (tok-elem-p x)
+                       (member (%tok-keyword (%first-tok x))
+                               '("type" "param" "result")
+                               :test #'string=)
+                       (%tok-keyword (%first-tok x)))
+          while k
           do (cond
-              ((string= (%tok-keyword (%first-tok x)) "type")
+              ((string= k "type")
+               (unless (zerop stage)
+                 (%text-error (tok-pos (%first-tok x))
+                              "unexpected token: (type) must come first in a typeuse"))
                (when typeidx
                  (%text-error 0 "duplicate (type) in typeuse"))
                (let ((idtok (third x)))
@@ -624,10 +635,15 @@ using %TYPEUSE speculatively (blocktype scanning) must tolerate that
                  (setf typeidx
                        (%id-or-num idtok (penv-types penv) "type")))
                (pop rest))
-              ((string= (%tok-keyword (%first-tok x)) "param")
+              ((string= k "param")
+               (when (> stage 1)
+                 (%text-error (tok-pos (%first-tok x))
+                              "unexpected token: (param) after (result) in a typeuse"))
+               (setf stage 1)
                (setf params (append params (%params x penv)))
                (pop rest))
               (t
+               (setf stage 2)
                (setf results (append results
                                      (mapcar #'%valtype (cddr x))))
                (pop rest))))
@@ -932,7 +948,7 @@ Returns (values bt skipped)."
             do (incf skipped) (pop scan))
       (let ((bt (cond
                  (typeidx (cons :typeidx typeidx))
-                 ((null results) nil)
+                 ((and (null params) (null results)) nil)
                  ((and (null params) (= (length results) 1)) (car results))
                  (t (cons :typeidx
                           (%find-or-add-type params results penv))))))
@@ -1183,11 +1199,11 @@ list NODE: returns (values id bt body-items). Does NOT push the label
               do (incf skipped) (pop scan))
         (let ((body-items (nthcdr skipped items))
               (bt (cond
-                   (typeidx (cons :typeidx typeidx))
-                   ((null results) nil)
-                   ((and (null params) (= (length results) 1)) (car results))
-                   (t (cons :typeidx
-                            (%find-or-add-type params results penv))))))
+                 (typeidx (cons :typeidx typeidx))
+                 ((and (null params) (null results)) nil)
+                 ((and (null params) (= (length results) 1)) (car results))
+                 (t (cons :typeidx
+                          (%find-or-add-type params results penv))))))
           (values id bt body-items))))))
 
 (defun %fold-block (node penv op)
