@@ -15,6 +15,13 @@ conformance gates. This repository delivers an honest **partial** slice
    end (decode → validate → interpret → compile → invoke). SIMD/GC/EH/
    tail-calls/memory64/WAT/Component/WASI/threads/FASL cache are out of
    scope and rejected with clear errors, not silently.
+   *Superseded in part (loop 18, 2026-10-24): tail calls
+   (`return_call`/`return_call_indirect`, constant-stack trampoline)
+   and exception handling (tags, `try_table`, `throw`, named module
+   definition/instance forms) are now implemented end to end.
+   Still out of scope: SIMD, GC, typed function references,
+   memory64, multi-memory runtime, WAT-level Component/WASI,
+   threads, FASL cache. `declared_support` stays `partial`.*
 2. **Failure phases are distinct conditions** (PLAN.md §12.2):
    `decode-error` → `validation-error` → `link-error` →
    `instantiation-error` → `wasm-trap`. A decode error can never be
