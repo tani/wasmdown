@@ -5,11 +5,31 @@ A Common Lisp–native WebAssembly runtime, implemented per `PLAN.md`.
 **Status: `partial` (per PLAN.md §2 support-declaration policy).**
 
 This repository contains a working vertical slice of the plan: binary
-decoding, validation, a reference interpreter, baseline SBCL code
-generation, a public Lisp API and CLI for the **core Wasm subset** below.
-It is **not** a conformant Core 3.0 implementation and makes no conformance
+decoding, the `.wat` text format, validation, a reference interpreter,
+baseline SBCL code generation, a public Lisp API and CLI for the **core
+Wasm subset** below, plus the stateful `.wast` spec-script runner and a
+measured baseline against the vendored official test suite. It is
+**not** a conformant Core 3.0 implementation and makes no conformance
 claim. No Component Model, WIT, WASI, SIMD, GC, exception-handling or
 threads support yet — those are PLAN.md milestones M5, M7–M12.
+
+## Conformance baseline (honest, per PLAN.md §12.8)
+
+The official core suite (97 `.wast` files, pinned at
+`b0ec1f3f449525c217dbff3f1dfab435a756ea92` in `specs/lock.toml`)
+executed through the stateful runner with failure-phase classification:
+
+```
+pass 10089 | fail 10732 | unsupported 277 | harness-error 89 | total 21187
+pass rate 47.6% (denominator = all executed, incl. unsupported)
+```
+
+Regenerate with `make report-conformance` (writes `CONFORMANCE.md` +
+`tests/spec-core-results.jsonl`, one JSONL line per command). This is a
+baseline measurement, **not** a release gate; remaining failures are
+case-specific engine gaps plus out-of-scope features (SIMD/GC/EH/tail
+calls/typed funcrefs/memory64), which are classified `unsupported` —
+never silently passed.
 
 ## Implemented surface
 
@@ -26,9 +46,10 @@ threads support yet — those are PLAN.md milestones M5, M7–M12.
 
 Not implemented (see `PLAN.md` for the full contract): SIMD (v128),
 Wasm GC, exception handling (`try_table`), tail calls, memory64,
-multi-memory runtime (decode accepts memidx forms), text/WAT format,
-Component Model, Canonical ABI, WASI (all versions), threads/atomics,
-FASL cache, the `.wast` spec runner, conformance reporting.
+multi-memory runtime (decode accepts memidx forms), Component Model,
+Canonical ABI, WASI (all versions), threads/atomics, FASL cache.
+The `.wat` text format and `.wast` spec runner **are** implemented
+(`src/text.lisp`, `src/wast.lisp`), as is conformance reporting.
 
 ## Error/phase taxonomy (PLAN.md §12.2)
 
