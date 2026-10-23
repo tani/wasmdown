@@ -531,3 +531,24 @@
              :funcs (vector (f 0 '() (vector (i :unreachable)
                                              (i :br '(:label 0))
                                              (i :end))))))))
+
+;; (r) if WITHOUT else but with a non-empty result type: spec types
+;; the missing else as producing nothing, so a resultful if requires
+;; the else arm (if.wast type-no-else-vs-num/-nums assert_invalid).
+(bad validate/neg-if-no-else-with-results
+  (mmod :types (ti32)
+        :funcs (vector (f 0 '() (vector
+                                 (i :i32.const '(:value 1))
+                                 (i :if (list :bt :i32)
+                                   (vector (i :i32.const '(:value 1))))
+                                 (i :end))))))
+
+;; (r2) POSITIVE control: if without else and EMPTY results is fine.
+(wasmdown.test:test validate/pos-if-no-else-void
+  (ok (wasmdown.validate:validate-module
+       (mmod :types (t0)
+             :funcs (vector (f 0 '() (vector
+                                      (i :i32.const '(:value 1))
+                                      (i :if nil
+                                        (vector (i :nop)))
+                                      (i :end))))))))

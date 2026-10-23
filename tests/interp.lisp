@@ -509,3 +509,67 @@
      '())
     "g")
    '(7)))
+
+(wasmdown.test:test interp/block-params-seed-inner-stack
+  ;; Regression (loop 8): a block's params must be ON the inner stack
+  ;; when the body starts — the handler used to pass only the
+  ;; below-params stack (nthcdr), so (block (param i32) (result i32)
+  ;; (i32.const 2) (i32.add)) underflowed with [1] below. Pinned by
+  ;; block.wast's param/params/params-id (+-break) cases.
+  (let ((mod (mmod
+              :types (vector (ft '(:i32) '(:i32))       ; 0: block sig
+                             (ft '() '(:i32)))          ; 1: func sig
+              :funcs (vector
+                      (fn 1 (vector (i :i32.const (list :value 1))
+                                    (i :block (list :bt '(:typeidx . 0))
+                                      (vector (i :i32.const (list :value 2))
+                                              (i :i32.add)))
+                                    (i :end))))
+              :exports (vector (make-wasm-export "f" :func 0)))))
+    (let ((inst (make-module-instance mod '())))
+      (expect (call-export inst "f") '(3)))))
+
+(wasmdown.test:test interp/block-params-multivalue-id-fallthrough
+  ;; (block (param i32 i32) (result i32 i32)) feeding an i32.add after
+  ;; it — the block passes its params through untouched and the ADD
+  ;; afterwards consumes them (block.wast params-id).
+  (let ((mod (mmod
+              :types (vector (ft '(:i32 :i32) '(:i32 :i32))  ; 0
+                             (ft '() '(:i32)))                ; 1
+              :funcs (vector
+                      (fn 1 (vector (i :i32.const (list :value 1))
+                                    (i :i32.const (list :value 2))
+                                    (i :block (list :bt '(:typeidx . 0)) #())
+                                    (i :i32.add)
+                                    (i :end))))
+              :exports (vector (make-wasm-export "f" :func 0)))))
+    (let ((inst (make-module-instance mod '())))
+      (expect (call-export inst "f") '(3)))))
+
+(wasmdown.test:test interp/br-unwinds-frames-to-below-stack
+  ;; Regression (loop 8): %br-depth-throw truncated the below-operands
+  ;; stack from the WRONG END — it kept the TOP base values (junk from
+  ;; intermediate frames) instead of the BOTTOM base values (the target
+  ;; frame's below-stack), so br.wast nested-block-value computed
+  ;; 8+4=12 instead of 8+1=9. The below-stack is the list's tail, top
+  ;; is at its head.
+  (let ((mod (mmod
+              :types (vector (ft '() '())          ; 0: dummy (void)
+                             (ft '() '(:i32)))    ; 1: main
+              :funcs (vector
+                      (fn 0 (vector (i :end)))
+                      (fn 1 (vector
+                             (i :i32.const (list :value 1))
+                             ;; folded (i32.add (i32.const 4) (br 0 (i32.const 8)))
+                             ;; flattens to: call, const 4, const 8, br 0, add
+                             (i :block (list :bt :i32)
+                               (vector (i :call (list :func 0))
+                                       (i :i32.const (list :value 4))
+                                       (i :i32.const (list :value 8))
+                                       (i :br (list :label 0))
+                                       (i :i32.add)))
+                             (i :i32.add)
+                             (i :end))))
+              :exports (vector (make-wasm-export "f" :func 1)))))
+    (let ((inst (make-module-instance mod '())))
+      (expect (call-export inst "f") '(9)))))

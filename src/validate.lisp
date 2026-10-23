@@ -581,10 +581,18 @@ bodies of their :end terminator; bodies of :if carry no :else/:end)."
            (%push-ctrl fv :if in out)
            (validate-seq fv (wasm-instr-body instr))
            (%pop-ctrl fv)
-           (when (getf imms :else-body)
+           (cond
+            ((getf imms :else-body)
              (%push-ctrl fv :else in out)
              (validate-seq fv (getf imms :else-body))
              (%pop-ctrl fv))
+            ;; spec: a missing else behaves as an EMPTY else arm,
+            ;; which is valid iff params = results (the params left
+            ;; on the frame's stack ARE the results — the identity
+            ;; rule). Otherwise the empty else fails to produce out.
+            ((not (equal in out))
+             (verr "if without else requires params = results (got ~a -> ~a)"
+                   in out)))
            (%push-vals fv out)))
         ((eq op :br)
          (let* ((frame (%ctrl-label fv (imm :label) "br"))

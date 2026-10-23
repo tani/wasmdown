@@ -394,10 +394,12 @@ tables, memories, globals).")
 (defun %br-depth-throw (depth stack block-stack)
   "Perform a branch at relative DEPTH from the innermost block. Pops the
 branch operands per the target frame's arity (loop: params; block:
-results), TRUNCATES the stack to the target frame's entry height
-(discarding intermediate frames' leftovers — spec: br unwinds the
-operand stack to the branch target), and returns the operands plus the
-truncated remainder via THROW."
+results) and TRUNCATES the stack to the target frame's entry height:
+the bottom HEIGHT values of the below-operands stack are the frame's
+below-stack (values the target frame was entered above, in the flat
+body-stack model); anything above them belongs to intervening frames
+and is discarded — spec: br unwinds the operand stack to the branch
+target. Returns the operands plus the truncated remainder via THROW."
   (let ((frame (nth depth block-stack)))
     (unless frame
       (%trap :unreachable "branch depth ~d exceeds control stack" depth))
@@ -407,8 +409,10 @@ truncated remainder via THROW."
            (vals (subseq stack 0 nvals))
            (base (block-frame-height frame))
            (rest (nthcdr nvals stack))
+           ;; list tail-to-head, top-at-head: the frame's below-stack
+           ;; is the LAST BASE elements of REST, not the first.
            (rest (if (> (length rest) base)
-                     (subseq rest 0 base)
+                     (subseq rest (- (length rest) base))
                      rest)))
       (throw frame (values vals rest)))))
 
@@ -473,30 +477,32 @@ truncated remainder via THROW."
               (let* ((bt (getf imms :bt))
                      (nparams (%blocktype-param-arity bt))
                      (nresults (%blocktype-arity bt))
-                     (s-inner (nthcdr nparams s))
+                     (below (nthcdr nparams s))
                      (frame (make-block-frame :kind :block
                                               :params nparams :results nresults
-                                              :height (length s-inner))))
+                                              :height (length below))))
                 (multiple-value-bind (vals leftover)
                     (catch frame
-                      ;; fallthrough: the body's top NRESULTS values are
-                      ;; the block results, stacked on s-inner. The
+                      ;; Flat model (as :loop below): the body runs on
+                      ;; the FULL entry stack — params on top of the
+                      ;; below-params stack. Validated code never pops
+                      ;; below its params, and a br recovers each
+                      ;; frame's below-stack from the stack's bottom.
+                      ;; Fallthrough: the body's top NRESULTS values
+                      ;; are the block results, stacked on BELOW. The
                       ;; fallthrough path returns (:fallthrough
                       ;; new-stack); a br THROW supplies (values
-                      ;; branch-operands rest). Wasm values are never
-                      ;; keywords, so the marker is unambiguous.
+                      ;; branch-operands truncated-below). Wasm values
+                      ;; are never keywords, so the marker is
+                      ;; unambiguous.
                       (let ((s2 (%exec-seq (wasm-instr-body instr) locals
-                                           (cons frame block-stack) s-inner)))
+                                           (cons frame block-stack) s)))
                         (values :fallthrough
-                                (append (subseq s2 0 nresults) s-inner))))
-                      ;; (unreachable: CATCH body either falls through
-                      ;; or THROWs past this point; the fallthrough
-                      ;; VALUES form above must stay last so CATCH
-                      ;; propagates both values.)
+                                (append (subseq s2 0 nresults) below))))
                   (if (eq vals :fallthrough)
                       (setf s leftover)
                       ;; br to this block: VALS are the branch operands
-                      ;; (top-at-head), LEFTOVER the stack below them.
+                      ;; (top-at-head), LEFTOVER the below-stack.
                       (setf s (append vals leftover))))))
              (:loop
               (let* ((bt (getf imms :bt))
@@ -610,18 +616,21 @@ truncated remainder via THROW."
        (let* ((bt (getf imms :bt))
               (nparams (%blocktype-param-arity bt))
               (nresults (%blocktype-arity bt))
-              (s-inner (nthcdr nparams s1))
+              (below (nthcdr nparams s1))
               (frame (make-block-frame :kind :block
                                        :params nparams :results nresults
-                                       :height (length s-inner))))
+                                       :height (length below))))
          (multiple-value-bind (vals leftover)
              (catch frame
+               ;; Flat model (as :block/:loop): the chosen body runs on
+               ;; the FULL stack after the condition — params on top of
+               ;; the below-params stack.
                (let ((body (if (zerop cond-v)
                                (or (getf imms :else-body) #())
                                (wasm-instr-body instr))))
-                 (let ((s2 (%exec-seq body locals (cons frame block-stack) s-inner)))
+                 (let ((s2 (%exec-seq body locals (cons frame block-stack) s1)))
                    (return-from %exec-other
-                     (append (subseq s2 0 nresults) s-inner))))
+                     (append (subseq s2 0 nresults) below))))
                nil)
            (declare (type list vals leftover))
            (append vals leftover)))))
