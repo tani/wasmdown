@@ -20,8 +20,8 @@ The official core suite (97 `.wast` files, pinned at
 executed through the stateful runner with failure-phase classification:
 
 ```
-pass 20452 | fail 0 | unsupported 808 | harness-error 0 | total 21260
-pass rate 96.2% (denominator = all executed, incl. unsupported)
+pass 21110 | fail 17 | unsupported 133 | harness-error 0 | total 21260
+pass rate 99.3% of rows pass; 17 fail (see below); denominator = all executed, incl. unsupported
 ```
 
 Regenerate with `make report-conformance` (writes `CONFORMANCE.md` +
@@ -72,17 +72,20 @@ harness-errors.
 | API / CLI | `src/api.lisp`, `src/cli.lisp` | `read-module`, `validate-module`, `instantiate`, `invoke`, …; CLI `validate`/`inspect`/`compile`/`run`. |
 
 Not implemented (see `PLAN.md` for the full contract): SIMD (v128),
-Wasm GC, `return_call_ref` / `call_ref` (typed
-function references), memory64, multi-memory runtime (text accepts
-memidx forms), Component Model, Canonical ABI, WASI (all versions),
-threads/atomics, FASL cache. Tail calls `return_call` /
-`return_call_indirect` **are** implemented (constant-stack trampoline
-in `src/interp.lisp`), as are exception handling (tag section, tags,
-`try_table`, `throw`, catch-all clauses, cross-call propagation with
-the uncaught boundary at the outermost guest frame) and the named
-module definition/instance script forms. The `.wat` text format and
-`.wast` spec runner **are** implemented (`src/text.lisp`,
-`src/wast.lisp`), as is conformance reporting.
+Wasm GC values (struct/array/i31), `rec` type groups (iso-recursive
+type equivalence/canonicalization — the 10-row type-equivalence
+residual), memory64, multi-memory runtime (text accepts memidx
+forms), Component Model, Canonical ABI, WASI (all versions),
+threads/atomics, FASL cache, annotations. Tail calls
+`return_call`/`return_call_indirect`, exception handling (tags,
+`try_table`, `throw`, cross-call propagation, uncaught boundary at
+the outermost guest frame), typed function references (the
+`(ref $t)`/`(ref null $t)` lattice, `call_ref`, `return_call_ref`,
+`br_on_null`, `br_on_non_null`, `ref.as_non_null`, definite
+initialization for non-defaultable locals) and the named module
+definition/instance script forms **are** implemented. The `.wat`
+text format and `.wast` spec runner **are** implemented
+(`src/text.lisp`, `src/wast.lisp`), as is conformance reporting.
 
 ## Error/phase taxonomy (PLAN.md §12.2)
 
