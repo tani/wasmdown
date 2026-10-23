@@ -31,6 +31,21 @@ case-specific engine gaps plus out-of-scope features (SIMD/GC/EH/tail
 calls/typed funcrefs/memory64), which are classified `unsupported` —
 never silently passed.
 
+### Known gaps (tracked, not hidden)
+
+- **Script-syntax extensions**: `annotations.wast` (`@…` forms) and
+  `inline-module.wast` (bare-field scripts) are harness-errors — spec
+  test extensions outside the core grammar this runner implements.
+- **Implementation ceiling**: default linear-memory limit 1024 pages
+  (64 MiB, ADR-005); suite cases above it fail honestly. Raise
+  `wasmdown.runtime:*max-pages*` + `--dynamic-space-size` for more.
+- **Hostile-input bounds**: 64 MiB string literal / assembled-binary
+  ceiling and a 1M locals-per-function validator preflight
+  (`src/wast.lisp`) — both catchable `decode-error`s, never crashes.
+- **Runner cosmetic**: a failed module command leaves the script's
+  current-instance unset; subsequent `invoke`/`get` fail (classified
+  `fail`), matching the spec harness's observable behavior.
+
 ## Implemented surface
 
 | Subsystem | File | State |

@@ -1732,7 +1732,7 @@ const expressions)."
 
 (defun %parse-start-field (node penv)
   "Parse a (start $f) field."
-  (let ((idxtok (second node)))
+  (let ((idxtok (third node)))
     (when (penv-start penv)
       (%text-error 0 "multiple start sections"))
     (unless idxtok

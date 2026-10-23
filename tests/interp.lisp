@@ -351,3 +351,57 @@
         (let ((inst2 (make-module-instance mod2 '())))
           (wasmdown.test:assert-trap :null-reference
             (call-export inst2 "n3")))))))
+
+;;; ================================================================
+;;; regressions: interp select + store operand order (fixed from
+;;; official-suite triage; probes were lost, tests pin the fixes)
+
+(wasmdown.test:test interp/select-regression
+  ;; select pops c, b, a; returns a when c/=0 (official-suite fix)
+  (expect
+   (call-export
+    (make-module-instance
+     (mmod
+      :types (vector (ft '(:i32 :i32 :i32) '(:i32)))
+      :funcs (vector (fn 0 (vector (i :local.get (list :local 0))
+                                   (i :local.get (list :local 1))
+                                   (i :local.get (list :local 2))
+                                   (i :select)
+                                   (i :end))))
+      :exports (vector (make-wasm-export "sel" :func 0)))
+     '())
+    "sel" 11 22 1)
+   '(11))
+  (expect
+   (call-export
+    (make-module-instance
+     (mmod
+      :types (vector (ft '(:i32 :i32 :i32) '(:i32)))
+      :funcs (vector (fn 0 (vector (i :local.get (list :local 0))
+                                   (i :local.get (list :local 1))
+                                   (i :local.get (list :local 2))
+                                   (i :select)
+                                   (i :end))))
+      :exports (vector (make-wasm-export "sel" :func 0)))
+     '())
+    "sel" 11 22 0)
+   '(22)))
+
+(wasmdown.test:test interp/store-order-regression
+  ;; store pops value THEN address ([addr,val] with val on top)
+  (expect
+   (call-export
+    (make-module-instance
+     (mmod
+      :types (vector (ft '() '(:i32)))
+      :mems (vector (make-wasm-memory (lim 1)))
+      :funcs (vector (fn 0 (vector (i :i32.const (list :value 8))
+                                   (i :i32.const (list :value #xABCD))
+                                   (i :i32.store (list :align 2 :offset 0))
+                                   (i :i32.const (list :value 8))
+                                   (i :i32.load (list :align 2 :offset 0))
+                                   (i :end))))
+      :exports (vector (make-wasm-export "st" :func 0)))
+     '())
+    "st")
+   '(#xABCD)))

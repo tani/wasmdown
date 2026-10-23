@@ -5,8 +5,6 @@
 
 (in-package #:wasmdown.numops)
 
-(declaim (ftype (function (t) (unsigned-byte 32)) i32->)
-         (ftype (function (t) (unsigned-byte 64)) i64->))
 
 ;;; ---------------------------------------------------------------
 ;;; Normalizers and signed/unsigned views.

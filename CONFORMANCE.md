@@ -12,15 +12,15 @@ typed-funcrefs/memory64), never silently passed.
 
 | Outcome | Count |
 | --- | --- |
-| pass | 10089 |
-| fail | 10732 |
+| pass | 10108 |
+| fail | 10717 |
 | skip | 0 |
 | unsupported | 277 |
 | timeout | 0 |
-| harness-error | 89 |
+| harness-error | 85 |
 | **total** | **21187** |
 
-Executed: 21187 commands; pass rate 47.6% (denominator = all executed,
+Executed: 21187 commands; pass rate 47.7% (denominator = all executed,
 including unsupported — honest per PLAN.md §12.9).
 
 ## Per-file counts
@@ -102,7 +102,7 @@ including unsupported — honest per PLAN.md §12.9).
 | select | 30 | 126 | 1 | 0 |
 | skip-stack-guard-page | 0 | 10 | 1 | 0 |
 | stack | 0 | 7 | 0 | 0 |
-| start | 1 | 15 | 0 | 4 |
+| start | 20 | 0 | 0 | 0 |
 | store | 68 | 0 | 0 | 0 |
 | switch | 7 | 21 | 0 | 0 |
 | table | 16 | 20 | 9 | 1 |
