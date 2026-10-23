@@ -128,12 +128,87 @@ global.get)."
        (equal (wasm-func-type-results ft) results)))
 
 (defun valtype-width (t_)
+  (declare (ignore t_))
   (ecase t_
-    (:i32 32) (:i64 64) (:f32 32) (:f64 64)
-    ((:ref) (error "reference types are opaque"))))
+    (:i32 32) (:i64 64) (:f32 32) (:f64 64)))
+
+(defun typed-ref-p (t_)
+  "A typed reference value type: (:REF HEAP) non-null or
+(:REF NULL HEAP) nullable. HEAP is a keyword abstract heap type or
+(:TYPE N) for a typeuse index. Legacy reftypes (:FUNCREF :EXTERNREF
+:EXNREF) stay bare keywords."
+  (and (consp t_) (eq (first t_) :ref)
+       (or (= (length t_) 2) (and (= (length t_) 3)
+                                  (eq (second t_) 'null)))))
+
+(defun typed-ref-nullable-p (t_)
+  "Whether the typed reftype T_ is the nullable (:REF NULL HEAP) form."
+  (and (typed-ref-p t_) (= (length t_) 3)))
+
+(defun typed-ref-heap (t_)
+  "The typed reftype T_'s heap type."
+  (if (typed-ref-nullable-p t_) (third t_) (second t_)))
+
+(defun %heap-kind (heap types)
+  "The lattice bucket of HEAP in the type vector TYPES:
+:FUNC (function heap), :EXTERN, :EXN, :ANY, or :BOT (the null
+bottoms, which are below everything in their bucket only)."
+  (declare (type (or keyword (cons (eql :type) (cons t null))) heap)
+           (type (simple-vector) types))
+  (etypecase heap
+    (keyword (ecase heap
+               ((:func :nofunc) :func)
+               ((:extern :noextern) :extern)
+               ((:exn :noexn) :exn)
+               (:any :any)
+               (:none :bot)
+               (:eq :any)))
+    (cons
+     (let ((idx (second heap)))
+       (cond ((not (and (integerp idx) (<= 0 idx) (< idx (length types))))
+              (error "unknown type ~a" idx))
+             (t :func))))))
+
+(defun reftype-sub-p (sub super types)
+  "Whether reftype SUB is a subtype of SUPER in the type vector
+TYPES (Core 3.0 function-references lattice, rec-free slice):
+legacy keywords and typed refs mix; null <: nullable-everything-in-
+bucket; (:TYPE N) <: :FUNC (every typeuse is a function heap type in
+this slice). Equality is a subtype of itself."
+  (labels ((bucket (t_)
+             (etypecase t_
+               (keyword (ecase t_
+                          (:funcref :func) (:externref :extern) (:exnref :exn)))
+               (cons (%heap-kind (typed-ref-heap t_) types)))))
+    (let ((s sub) (u super))
+      (cond
+       ((equal s u) t)
+       ;; typed <: typed-nullable of the same bucket
+       ((and (consp s) (typed-ref-p s)
+             (consp u) (typed-ref-nullable-p u)
+             (eq (bucket s) (bucket u)))
+        t)
+       ;; legacy keyword <: typed-nullable of the same bucket:
+       ;; funcref <: (:ref null func)
+       ((and (keywordp s)
+             (consp u) (typed-ref-nullable-p u)
+             (eq (bucket s) (bucket u)))
+        t)
+       ;; typed non-null <: legacy keyword: (:ref func) <: funcref
+       ((and (consp s) (typed-ref-p s) (not (typed-ref-nullable-p s))
+             (keywordp u)
+             (eq (bucket s) (bucket u))
+             (eq (typed-ref-heap s)
+                 (ecase u (:funcref :func) (:externref :extern)
+                        (:exnref :exn))))
+        t)
+       (t nil)))))
 
 (defun defaultable-valtype-p (t_)
   "Whether the default value exists for the type in this slice.
-Numeric types and nullable refs default; non-nullable refs do not."
-  (declare (ignore t_))
-  t)
+Numeric types and NULLABLE refs default; NON-NULLABLE typed refs do
+not (spec: default values need a null; the definite-initialization
+validator tracks local.set coverage for those)."
+  (not (and (consp t_) (typed-ref-p t_)
+            (not (typed-ref-nullable-p t_)))))
+

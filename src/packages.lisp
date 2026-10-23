@@ -87,7 +87,9 @@
    ;; helpers
    #:func-type-arity-matches-p
    #:valtype-width
-   #:defaultable-valtype-p))
+   #:defaultable-valtype-p
+   #:typed-ref-p #:typed-ref-nullable-p #:typed-ref-heap
+   #:reftype-sub-p))
 
 (defpackage #:wasmdown.numops
   (:use #:cl)
