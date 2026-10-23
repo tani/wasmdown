@@ -629,7 +629,7 @@ using %TYPEUSE speculatively (blocktype scanning) must tolerate that
                (setf results (append results
                                      (mapcar #'%valtype (cddr x))))
                (pop rest))))
-    (values (nreverse params) (nreverse results) typeidx)))
+    (values params results typeidx)))
 
 (defun %find-or-add-type (params results penv)
   "Return the typeidx of the functype (params -> results), adding a new
@@ -1115,11 +1115,22 @@ rest of the plain sequence."
                    (member (tok-kind (car items)) '(:id :nat)))
           (setf table (%id-or-num (car items) (penv-tables penv) "table")
                 items (cdr items)))
-        (values (make-wasm-instr op-key
-                                 (list :type (%resolve-typeuse items penv)
-                                       :table table)
-                                 #() 0)
-                '())))
+        (let ((typeidx (%resolve-typeuse items penv))
+              (tail nil))
+          ;; the typeuse consumed only (type)/(param)/(result) items;
+          ;; everything after it is operands (folded) / rest of the
+          ;; plain sequence. %resolve-typeuse does not report how
+          ;; many items it consumed, so re-scan the typeuse prefix.
+          (setf tail items)
+          (loop while (and tail (tok-elem-p (car tail))
+                           (member (%tok-keyword (%first-tok (car tail)))
+                                   '("type" "param" "result")
+                                   :test #'string=))
+                do (pop tail))
+          (values (make-wasm-instr op-key
+                                   (list :type typeidx :table table)
+                                   #() 0)
+                  tail))))
      ;; select: (result t)* immediates
      ((string= k "select")
       (let ((types '()) (items rest))

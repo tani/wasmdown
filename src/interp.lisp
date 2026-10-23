@@ -505,7 +505,7 @@ truncated remainder via THROW."
                                   (append (subseq s2 0 nresults)
                                           (nthcdr nparams s)))))
                     (if (eq vals :fallthrough)
-                        (return)                ; finished: exit restart loop
+                        (return s)   ; finished: exit with the new stack
                         ;; br to the loop: restart with the branch
                         ;; operands as the new loop params.
                         (setf s (append vals leftover)))))))

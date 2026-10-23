@@ -343,3 +343,48 @@ EQUALP (canonical-encode agreement oracle)."
                (wasmdown.test:is (find :i32.const ops)))))
       (when (probe-file path)
         (delete-file path)))))
+
+(wasmdown.test:test text/multi-result-order
+  ;; Regression (loop 3): (result i32 i64) must keep DECLARATION
+  ;; order in the functype; the parser used to nreverse the collected
+  ;; list, inverting every multi-result/multi-param signature
+  ;; (br.wast::0 "expected I32, got I64" cluster).
+  (let* ((m (%round-trip
+             "(module (func (result i32 i64) (i32.const 1) (i64.const 7)))"))
+         (ft (aref (wasm-module-types m)
+                   (wasm-func-typeidx (aref (wasm-module-funcs m) 0)))))
+    (wasmdown.test:is (equal '(:i32 :i64) (wasm-func-type-results ft))))
+  ;; multi-param order (unnamed and named forms)
+  (let* ((m (%round-trip
+             "(module (func (param i32 i64) (result i64) (local.get 1)))"))
+         (ft (aref (wasm-module-types m)
+                   (wasm-func-typeidx (aref (wasm-module-funcs m) 0)))))
+    (wasmdown.test:is (equal '(:i32 :i64) (wasm-func-type-params ft))))
+  (let* ((m (%round-trip
+             "(module (func (param $a i32) (param $b i64) (result i64) (local.get $b)))"))
+         (ft (aref (wasm-module-types m)
+                   (wasm-func-typeidx (aref (wasm-module-funcs m) 0)))))
+    (wasmdown.test:is (equal '(:i32 :i64) (wasm-func-type-params ft))))
+  ;; the whole module must also validate
+  (let ((m (%wat "(module (func (result i32 i64) (block (result i32 i64) (return (br 0 (i32.const 1) (i64.const 7))))))")))
+    (wasmdown.test:is (wasmdown:validate-module m))))
+
+(wasmdown.test:test text/folded-call-indirect-operands
+  ;; Regression (loop 3): folded (call_indirect (type $t) op...) used
+  ;; to drop ALL operand expressions from the emitted instruction
+  ;; stream (validation "operand stack underflow" cluster).
+  (let* ((m (%round-trip
+             "(module (type $t (func (param i32))) (table 1 funcref) (func (call_indirect (type $t) (i32.const 5) (i32.const 0))))"))
+         (body (%instrs m 0)))
+    (wasmdown.test:is
+     (equal '(:i32.const :i32.const :call-indirect :end)
+            (mapcar #'wasm-instr-op body)))
+    (wasmdown.test:is (= 0 (getf (wasm-instr-imms (third body)) :table)))
+    (wasmdown.test:is (= 0 (getf (wasm-instr-imms (third body)) :type))))
+  ;; no-typeuse folded form still works and keeps the index operand
+  (let* ((m (%round-trip
+             "(module (table 1 funcref) (func (i32.const 0) (call_indirect)))"))
+         (body (%instrs m 0)))
+    (wasmdown.test:is
+     (equal '(:i32.const :call-indirect :end)
+            (mapcar #'wasm-instr-op body)))))
