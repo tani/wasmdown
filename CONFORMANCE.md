@@ -13,15 +13,15 @@ now classify as :unsupported instead of crashing as harness-errors.
 
 | Outcome | Count |
 | --- | --- |
-| pass | 19635 |
+| pass | 19742 |
 | fail | 661 |
 | skip | 0 |
 | unsupported | 746 |
 | timeout | 0 |
-| harness-error | 145 |
+| harness-error | 38 |
 | **total** | **21187** |
 
-Executed: 21187 commands; pass rate 92.7% (denominator = all executed,
+Executed: 21187 commands; pass rate 93.2% (denominator = all executed,
 including unsupported — honest per PLAN.md §12.9).
 
 ## Per-file counts
@@ -124,4 +124,4 @@ including unsupported — honest per PLAN.md §12.9).
 | utf8-custom-section-id | 176 | 0 | 0 | 0 |
 | utf8-import-field | 176 | 0 | 0 | 0 |
 | utf8-import-module | 176 | 0 | 0 | 0 |
-| utf8-invalid-encoding | 76 | 0 | 0 | 107 |
+| utf8-invalid-encoding | 183 | 0 | 0 | 0 |

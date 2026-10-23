@@ -219,7 +219,7 @@ U+10FFFF, bad lead/continuation bytes, truncated sequences).
 Returns the vector."
   (let ((n (length bytes))
         (i 0))
-    (flet ((bad () (%text-error pos "malformed UTF-8 encoding"))
+    (labels ((bad () (%text-error pos "malformed UTF-8 encoding"))
            (cont (k)
              (unless (and (< (+ i k) n)
                           (>= (aref bytes (+ i k)) #x80)
