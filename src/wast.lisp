@@ -996,11 +996,15 @@ the classification is honest, never a silent pass."
      ((has "(@") :annotations)
      ((or (tok "v128") (tok "i8x16") (tok "i16x8") (tok "i32x4")
           (tok "i64x2") (tok "f32x4") (tok "f64x2")) :simd)
-     ((has "return_call") :tail-calls)
+     ;; tail calls return_call/return_call_indirect are IN the engine
+     ;; slice (Core 3.0 §6.2, interp trampoline); only the typed
+     ;; function-reference return_call_ref remains out of scope
+     ;; (call_ref family, classified with GC below).
      ((or (has "try_table") (has "(throw") (tok "tag")
           (tok "exnref")) :exception-handling)
      ((or (has "(struct") (has "(array") (has "(i31")
-          (has "(rec") (tok "call_ref") (has "br_on_cast")
+          (has "(rec") (tok "call_ref") (tok "return_call_ref")
+          (has "br_on_cast")
           (has "ref.cast") (tok "anyref") (tok "eqref")
           ;; typed references: (ref null $t) and non-null (ref $t)
           (has "(ref null") (has "(ref func") (has "(ref extern")

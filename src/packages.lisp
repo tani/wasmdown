@@ -82,6 +82,7 @@
    #:wasm-module-tables #:wasm-module-mems #:wasm-module-globals
    #:wasm-module-exports #:wasm-module-start #:wasm-module-elems
    #:wasm-module-datas #:wasm-module-customs #:wasm-module-data-count
+   #:wasm-module-tags
    #:copy-wasm-module
    ;; helpers
    #:func-type-arity-matches-p
@@ -153,9 +154,12 @@
    #:make-instance-store
    #:make-module-instance
    #:module-instance
-   #:module-instance-memories #:module-instance-tables
-   #:module-instance-globals #:module-instance-funcs
-   #:module-instance-module #:module-instance-exports
+           #:module-instance-memories #:module-instance-tables
+           #:module-instance-globals #:module-instance-funcs
+           #:module-instance-tags
+           #:module-instance-module #:module-instance-exports
+           #:tag-instance #:tag-instance-p #:make-tag-instance
+           #:tag-instance-type #:tag-instance-module
    #:func-instance #:func-instance-p
    #:func-instance-type #:func-instance-module
    #:func-instance-kind #:func-instance-wasm-funcidx

@@ -44,14 +44,15 @@
   (%make-instance-store))
 
 (defstruct (module-instance (:constructor %make-module-instance))
-  "An instantiated module. MEMORIES/TABLES/GLOBALS/FUNCS are vectors in
-the index space (imported entities first, then defined ones); EXPORTS
+  "An instantiated module. MEMORIES/TABLES/GLOBALS/FUNCS/TAGS are vectors
+in the index space (imported entities first, then defined ones); EXPORTS
 is an alist (name . instance-object). ELEM-SEGS / DATA-SEGS hold the
 element/data segment drop state and retained contents."
   (memories #() :type vector)
   (tables #() :type vector)
   (globals #() :type vector)
   (funcs #() :type vector)
+  (tags #() :type vector)
   (module nil)
   (exports '() :type list)
   (elem-segs #() :type vector)
@@ -101,6 +102,15 @@ behave as empty for table.init)."
 memory.init."
   (dropped-p nil :type boolean)
   (bytes #() :type (vector (unsigned-byte 8))))
+
+(defstruct (tag-instance (:constructor %make-tag-instance))
+  "A tag (exception) instance: MODULE is the defining module-instance
+backpointer, TYPE the tag's functype (results must be empty; the
+validator enforces that). Tag instances compare by IDENTITY per the
+spec: throwing tag t is caught only by a catch clause naming the SAME
+instance (instance.wast's import/export generativity tests pin this)."
+  (module nil)
+  (type (make-wasm-func-type '() '()) :type wasm-func-type))
 
 (defun global-value (g) (global-instance-value g))
 (defun (setf global-value) (v g) (setf (global-instance-value g) v))
@@ -152,6 +162,10 @@ Elements initialize to the null reference (NIL)."
 
 (defun make-global-instance (value &key (type :i32) (mutable nil))
   (%make-global-instance :value value :mutable mutable :type type))
+
+(defun make-tag-instance (module type)
+  "MODULE is the owning module-instance; TYPE the tag's functype."
+  (%make-tag-instance :module module :type type))
 
 ;;; ---------------------------------------------------------------
 ;;; Hooks. wasmdown.interp installs the reference implementations at
@@ -446,12 +460,33 @@ Elements initialize to the null reference (NIL)."
       (%link-error "import ~a.~a: global type or mutability mismatch"
                    (wasm-import-module import) (wasm-import-field import)))))
 
+(defun %check-tag-import (import value module)
+  "Tag imports match by functype equality (spec external type of a
+tag: its type's params only, results being empty by construction).
+  A non-tag value (imports.wast's '(import \"test\" \"tag\" (func))'
+  incompatible-type case) is a link error here, never a kind mixup."
+  (declare (ignorable module))
+  (unless (tag-instance-p value)
+    (%link-error "import ~a.~a: expected a tag, got ~s"
+                 (wasm-import-module import) (wasm-import-field import)
+                 (type-of value)))
+  (let* ((expected-typeidx (wasm-import-type import))
+         (expected (svref (wasm-module-types module) expected-typeidx))
+         (actual (tag-instance-type value)))
+    (unless (and (equal (wasm-func-type-params expected)
+                        (wasm-func-type-params actual))
+                 (equal (wasm-func-type-results expected)
+                        (wasm-func-type-results actual)))
+      (%link-error "import ~a.~a: tag type mismatch"
+                   (wasm-import-module import) (wasm-import-field import)))))
+
 (defun %check-import (import value module)
   (case (wasm-import-kind import)
     (:func (%check-func-import import value module))
     (:table (%check-table-import import value))
     (:memory (%check-memory-import import value))
     (:global (%check-global-import import value))
+    (:tag (%check-tag-import import value module))
     (t (%link-error "unknown import kind ~a" (wasm-import-kind import)))))
 
 (defun %resolve-imports (module imports-alist)
@@ -523,7 +558,7 @@ Elements initialize to the null reference (NIL)."
 IMPORTS-ALIST maps ((\"mod\" \"field\") . value)."
   (let* ((resolved (%resolve-imports module imports-alist))
          (inst (%make-module-instance :module module :store store))
-         (ifuncs '()) (itables '()) (imems '()) (iglobals '()))
+         (ifuncs '()) (itables '()) (imems '()) (iglobals '()) (itags '()))
     ;; pass 1: partition imported entities by kind (import order)
     (dolist (pair resolved)
       (let ((value (cdr pair)))
@@ -531,9 +566,23 @@ IMPORTS-ALIST maps ((\"mod\" \"field\") . value)."
           (:func (push value ifuncs))
           (:table (push value itables))
           (:memory (push value imems))
-          (:global (push value iglobals)))))
+          (:global (push value iglobals))
+          (:tag (push value itags)))))
     (setf ifuncs (nreverse ifuncs) itables (nreverse itables)
-          imems (nreverse imems) iglobals (nreverse iglobals))
+          imems (nreverse imems) iglobals (nreverse iglobals)
+          itags (nreverse itags))
+    ;; tags: imported then defined. Defined tags allocate BEFORE funcs/
+    ;; globals: nothing in a constant expression references a tag, but
+    ;; the start function may throw one, so the vector must be complete
+    ;; before any guest code runs.
+    (setf (module-instance-tags inst)
+          (coerce
+           (append itags
+                   (loop for typeidx across (wasm-module-tags module)
+                         collect (make-tag-instance
+                                  inst
+                                  (svref (wasm-module-types module) typeidx))))
+           'vector))
     ;; funcs: imported then defined. Slot the func-instances into the
     ;; instance first so global init expressions and start bodies can
     ;; reference them via ref.func.
@@ -645,7 +694,8 @@ IMPORTS-ALIST maps ((\"mod\" \"field\") . value)."
                                       (:func (svref all-funcs idx))
                                       (:table (svref (module-instance-tables inst) idx))
                                       (:memory (svref (module-instance-memories inst) idx))
-                                      (:global (svref (module-instance-globals inst) idx)))
+                                      (:global (svref (module-instance-globals inst) idx))
+                                      (:tag (svref (module-instance-tags inst) idx)))
                         collect (cons (wasm-export-name ex) value)))
             ;; start function: run after exports exist so it may call
             ;; exported paths; traps propagate untouched.

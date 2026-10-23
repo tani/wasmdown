@@ -41,6 +41,11 @@ tables, memories, globals).")
 (defvar *frame-nresults* 0
   "Number of results of the currently executing function; a :return
  carries exactly that many values.")
+(defparameter *tail-call-tag* (list 'tail-call)
+  "Throw tag unwinding a return_call/return_call_indirect to the
+INTERP-INVOKE trampoline. The thrown value is (FUNC ARGS): the callee
+replaces the current guest frame, so the trampoline re-enters with
+the SAME depth accounting (host frames are discarded by the throw).")
 
 (declaim (inline push-val pop-val))
 
@@ -601,9 +606,29 @@ target. Returns the operands plus the truncated remainder via THROW."
   (let* ((type (wasmdown.runtime:func-instance-type func))
          (nparams (length (wasm-func-type-params type)))
          (args (reverse (subseq s 0 nparams)))
-         (s1 (nthcdr nparams s))
-         (results (apply #'wasmdown.runtime:wasm-call func args)))
-    (append (reverse results) s1)))
+         (s1 (nthcdr nparams s)))
+    (append (reverse (apply #'wasmdown.runtime:wasm-call func args)) s1)))
+
+(defun %do-tail-call (func s)
+  "Pop the callee's args (reverse push order) and UNWIND the current
+guest frame to INTERP-INVOKE's trampoline: the callee executes in
+place of the caller, on the caller's depth accounting (Core 3.0
+tail-call semantics). Never returns."
+  (let* ((type (wasmdown.runtime:func-instance-type func))
+         (nparams (length (wasm-func-type-params type)))
+         (args (reverse (subseq s 0 nparams))))
+    (throw *tail-call-tag* (cons func args))))
+
+(defun %do-tail-host (func s)
+  "Tail call to a HOST function: the host body cannot grow the guest
+stack, so its results ARE the caller's function results. Pop the
+args, apply, and throw to the function frame exactly like :return."
+  (let* ((type (wasmdown.runtime:func-instance-type func))
+         (nparams (length (wasm-func-type-params type)))
+         (args (reverse (subseq s 0 nparams)))
+         (results (reverse (apply #'wasmdown.runtime:wasm-call func args))))
+    (throw *return-tag*
+      (values (subseq results 0 *frame-nresults*) nil))))
 
 (defun %exec-other (op instr imms locals block-stack s)
   "Dispatch every opcode family not handled inline in %EXEC-SEQ.
@@ -685,6 +710,46 @@ target. Returns the operands plus the truncated remainder via THROW."
                (%trap :indirect-call-type-mismatch
                       "call_indirect type mismatch at index ~d" elemidx)))
            (%do-call ref s1)))))
+    ;; ---- tail calls ----
+    ;; Validation proved the callee's results equal the caller's, so
+    ;; the callee's return IS this frame's return. A :wasm callee
+    ;; unwinds to interp-invoke's trampoline (%DO-TAIL-CALL, never
+    ;; returns); a :host callee cannot recurse into the guest (its
+    ;; Lisp body is opaque to wasm), so its results are simply THIS
+    ;; function's results: throw them to the function frame like
+    ;; :return does.
+    ((eq op :return-call)
+     (let ((func (%func-at (getf imms :func))))
+       (if (eq (wasmdown.runtime:func-instance-kind func) :host)
+           (%do-tail-host func s)
+           (%do-tail-call func s))))
+    ((eq op :return-call-indirect)
+     (let* ((tableidx (getf imms :table))
+            (typeidx (getf imms :type))
+            (table (%table-at tableidx)))
+       (unless (eq (wasmdown.runtime:table-instance-type table) :funcref)
+         (%trap :indirect-call-type-mismatch
+                "return_call_indirect on non-funcref table"))
+       (multiple-value-bind (elemidx s1) (pop-val s)
+         (let ((ref (wasmdown.runtime:table-get table elemidx)))
+           (unless (wasmdown.runtime:func-instance-p ref)
+             (%trap :null-reference
+                    "return_call_indirect on null reference ~d" elemidx))
+           (let* ((expected (svref (wasm-module-types
+                                     (wasmdown.runtime:module-instance-module
+                                      *frame-module*))
+                                    typeidx))
+                  (actual (wasmdown.runtime:func-instance-type ref)))
+             (unless (and (equal (wasm-func-type-params expected)
+                                 (wasm-func-type-params actual))
+                          (equal (wasm-func-type-results expected)
+                                 (wasm-func-type-results actual)))
+               (%trap :indirect-call-type-mismatch
+                      "return_call_indirect type mismatch at index ~d"
+                      elemidx)))
+           (if (eq (wasmdown.runtime:func-instance-kind ref) :host)
+               (%do-tail-host ref s1)
+               (%do-tail-call ref s1))))))
     ;; ---- references ----
     ((eq op :ref.null) (push nil s))
     ((eq op :ref.is-null)
@@ -828,17 +893,20 @@ target. Returns the operands plus the truncated remainder via THROW."
 
 (defun interp-invoke (func args)
   "Execute a :wasm func-instance with ARGS (a list in push order).
- Returns the results list. This is the reference implementation the
- runtime's *INVOKE-WASM-FUNC* hook points at."
-  (let* ((module (wasmdown.runtime:func-instance-module func))
-         (funcidx (wasmdown.runtime:func-instance-wasm-funcidx func))
-         (wasm-fn (svref (wasm-module-funcs
-                          (wasmdown.runtime:module-instance-module module))
-                         funcidx))
-         (type (svref (wasm-module-types
-                       (wasmdown.runtime:module-instance-module module))
-                      (wasm-func-typeidx wasm-fn)))
-         (saved-depth *call-depth*)
+Returns the results list. This is the reference implementation the
+runtime's *INVOKE-WASM-FUNC* hook points at.
+
+TAIL-CALL TRAMPOLINE: a return_call/return_call_indirect throws
+*TAIL-CALL-TAG* with (FUNC . ARGS), unwinding every guest frame of
+this invocation back to here; the loop then executes the callee in
+the SAME guest frame — *CALL-DEPTH* is restored to this invoke's
+entry depth (saved by the UNWIND-PROTECT binding before the
+re-entry) and NOT incremented again, so an unbounded self/mutual
+tail-recursion chain runs in constant host stack and constant guest
+depth (Core 3.0 §6.2; return_call.wast counts to 1_000_000). A chain
+that grows via NON-tail :call frames still increments per frame and
+traps :call-stack-exhausted at *CALL-DEPTH-LIMIT*."
+  (let* ((saved-depth *call-depth*)
          (frame-depth (%call-depth-enter)))
     ;; Decrement on any exit (normal, trap, or host throw): the
     ;; dynamic *CALL-DEPTH* binding restores the caller's value by
@@ -846,32 +914,60 @@ target. Returns the operands plus the truncated remainder via THROW."
     ;; explicit so the global can never stay inflated across
     ;; top-level invokes.
     (unwind-protect
-         (let ((*frame-module* module)
-               (*frame-funcidx* funcidx)
-               (*call-depth* frame-depth))
-           (let* ((locals (%locals-vector wasm-fn args))
-                  ;; function-level frame: a br past every block targets
-                  ;; it and exits the function with its results. The
-                  ;; frame doubles as the catch tag (no GENSYM string
-                  ;; formatting in this hot path); *RETURN-TAG* holds it
-                  ;; for the :return handler.
-                  (fn-frame (make-block-frame :kind :block
-                                              :params (length (wasm-func-type-params type))
-                                              :results (length (wasm-func-type-results type))))
-                  (*return-tag* fn-frame)
-                  (*frame-nresults* (block-frame-results fn-frame)))
-             (multiple-value-bind (vals leftover)
-                 (catch fn-frame
-                   ;; fallthrough: top NRESULTS values are the results
-                   (let ((s (%exec-seq (wasm-func-body wasm-fn) locals
-                                       (list fn-frame) '())))
-                     (return-from interp-invoke
-                       (reverse (subseq s 0 *frame-nresults*))))
-                   nil)
-               ;; br/return targeting the function frame: VALS arrive
-               ;; top-at-head; wasm-call wants push order.
-               (declare (ignore leftover))
-               (reverse vals))))
+         (loop
+           named trampoline
+           with cur-func = func
+           with cur-args = args
+           do (let* ((module (wasmdown.runtime:func-instance-module cur-func))
+                     (funcidx (wasmdown.runtime:func-instance-wasm-funcidx cur-func))
+                     (wasm-fn (svref (wasm-module-funcs
+                                     (wasmdown.runtime:module-instance-module module))
+                                    funcidx))
+                     (type (svref (wasm-module-types
+                                   (wasmdown.runtime:module-instance-module module))
+                                  (wasm-func-typeidx wasm-fn))))
+                (declare (ignorable type))
+                (let ((*frame-module* module)
+                      (*frame-funcidx* funcidx)
+                      ;; tail-call re-entry: SAME depth, never re-grow
+                      (*call-depth* frame-depth))
+                  (let* ((locals (%locals-vector wasm-fn cur-args))
+                         ;; function-level frame: a br past every block
+                         ;; targets it and exits the function with its
+                         ;; results. The frame doubles as the catch tag
+                         ;; (no GENSYM string formatting in this hot
+                         ;; path); *RETURN-TAG* holds it for the
+                         ;; :return handler.
+                         (fn-frame (make-block-frame
+                                    :kind :block
+                                    :params (length (wasm-func-type-params type))
+                                    :results (length (wasm-func-type-results type))))
+                         (*return-tag* fn-frame)
+                         (*frame-nresults* (block-frame-results fn-frame)))
+                    (let ((outcome
+                           (catch *tail-call-tag*
+                             (multiple-value-bind (vals leftover)
+                                 (catch fn-frame
+                                   ;; fallthrough: top NRESULTS values
+                                   ;; are the results
+                                   (let ((s (%exec-seq
+                                             (wasm-func-body wasm-fn)
+                                             locals (list fn-frame) '())))
+                                     (return-from trampoline
+                                       (reverse
+                                        (subseq s 0 *frame-nresults*)))))
+                               ;; br/return targeting the function
+                               ;; frame: VALS arrive top-at-head;
+                               ;; wasm-call wants push order.
+                               (declare (ignore leftover))
+                               (return-from trampoline (reverse vals))))))
+                      ;; tail call: the throw unwound every host
+                      ;; frame of the previous iteration (including
+                      ;; all nested non-tail invokes' cleanups), and
+                      ;; *CALL-DEPTH* is back at this trampoline's
+                      ;; entry binding; replace the frame and loop.
+                      (setf cur-func (car outcome)
+                            cur-args (cdr outcome)))))))
       (%call-depth-exit saved-depth))))
 
 (defun interp-func (func &rest args)

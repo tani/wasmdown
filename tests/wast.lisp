@@ -568,3 +568,221 @@
               (assert_return (invoke \"f\") (i32.const 42))
               (func) (table 1 funcref)")))
     (wasmdown.test:is (equal '(:pass :pass :pass :pass) os))))
+
+(wasmdown.test:test wast/return-call-deep-self-recursion
+  ;; Tail calls (loop 18, PLAN.md §3.1/§6.2): return_call replaces the
+  ;; current guest frame via the interp-invoke trampoline (THROW
+  ;; *TAIL-CALL-TAG* unwinds to the loop; re-entry keeps the SAME
+  ;; *CALL-DEPTH*), so counting to 1_000_000 runs in constant stack
+  ;; (return_call.wast ::61-66/::126) instead of trapping exhausted.
+  (let ((os (%outcomes
+             "(module
+                (func $count (export \"count\") (param i64) (result i64)
+                  (if (result i64) (i64.eqz (local.get 0))
+                    (then (local.get 0))
+                    (else (return_call $count
+                            (i64.sub (local.get 0) (i64.const 1)))))))
+              (assert_return (invoke \"count\" (i64.const 1000000))
+                             (i64.const 0))")))
+    (wasmdown.test:is (equal '(:pass :pass) os))))
+
+(wasmdown.test:test wast/return-call-mutual-indirect-recursion
+  ;; return_call_indirect through a table: mutual even/odd to 1M
+  ;; iterations must stay constant-stack (return_call_indirect.wast
+  ;; ::204-225/::294-301), and the runtime type check still traps
+  ;; 'indirect call type mismatch' on a wrong-typed table slot
+  ;; (::268-269 assert_trap batch) and 'undefined element' OOB
+  ;; (::270-272).
+  (let ((os (%outcomes
+             "(module
+                (type $over-i64 (func (param i64) (result i64)))
+                (type $out-i32 (func (result i32)))
+                (table funcref (elem $even $odd $out))
+                (func $even (export \"even\") (param i64) (result i64)
+                  (if (result i64) (i64.eqz (local.get 0))
+                    (then (i64.const 44))
+                    (else (return_call_indirect (type $over-i64)
+                           (i64.sub (local.get 0) (i64.const 1))
+                           (i32.const 1)))))
+                (func $odd (export \"odd\") (param i64) (result i64)
+                  (if (result i64) (i64.eqz (local.get 0))
+                    (then (i64.const 99))
+                    (else (return_call_indirect (type $over-i64)
+                           (i64.sub (local.get 0) (i64.const 1))
+                           (i32.const 0)))))
+                (func $out (result i32) (i32.const 1))
+                (func (export \"d\") (param i32 i64) (result i64)
+                  (return_call_indirect (type $over-i64)
+                                        (local.get 1) (local.get 0))))
+              (assert_return (invoke \"even\" (i64.const 1000001))
+                             (i64.const 99))
+              (assert_return (invoke \"odd\" (i64.const 1000000))
+                             (i64.const 99))
+              (assert_trap (invoke \"d\" (i32.const 2) (i64.const 2))
+                           \"indirect call type mismatch\")
+              (assert_trap (invoke \"d\" (i32.const 9) (i64.const 2))
+                           \"undefined element\")")))
+    (wasmdown.test:is
+     (equal '(:pass :pass :pass :pass :pass) os))))
+
+(wasmdown.test:test wast/return-call-non-tail-growth-still-exhausts
+  ;; Depth accounting edge: the trampoline restores *CALL-DEPTH* to
+  ;; the invoke's entry value on every tail-call re-entry, so a tail
+  ;; chain never falsely exhausts — but NON-tail :call recursion still
+  ;; increments per frame and must trap :call-stack-exhausted
+  ;; (return_call.wast's assert_exhaustion contract; call.wast ::425+).
+  (let ((os (%outcomes
+             "(module
+                (func $f (export \"f\") (param i64) (result i64)
+                  (i64.add (i64.const 1)
+                    (call $f (local.get 0))))
+                (func $tail (export \"tail\") (param i64) (result i64)
+                  (if (result i64) (i64.eqz (local.get 0))
+                    (then (local.get 0))
+                    (else (return_call $tail
+                            (i64.sub (local.get 0) (i64.const 1)))))))
+              (assert_return (invoke \"tail\" (i64.const 2000))
+                             (i64.const 0))
+              (assert_exhaustion (invoke \"f\" (i64.const 0))
+                                 \"call stack exhausted\")")))
+    (wasmdown.test:is (equal '(:pass :pass :pass) os))))
+
+(wasmdown.test:test wast/return-call-validation-result-match
+  ;; Validation (loop 18): like call/call_indirect, PLUS the callee's
+  ;; results must EQUAL the caller's declared results (return_call.wast
+  ;; ::146-258 assert_invalid batch: result-more/fewer/i64-vs-i32 and
+  ;; the void-vs-num shapes). Arity-only differences in PARAMS stay
+  ;; valid (::184-192 module batch); the callee-index bounds check is
+  ;; 'unknown function' (::252-258).
+  (let ((os (%outcomes
+             "(assert_invalid
+                (module
+                  (func $more (result i32 i32) unreachable)
+                  (func (result i32) (return_call $more)))
+                \"type mismatch\")
+              (assert_invalid
+                (module
+                  (func $fewer (result i32) unreachable)
+                  (func (result i32 i32) (return_call $fewer)))
+                \"type mismatch\")
+              (assert_invalid
+                (module
+                  (func $i64 (result i64) unreachable)
+                  (func (result i32) (return_call $i64)))
+                \"type mismatch\")
+              (module
+                (func $arity-1-vs-0 (i32.const 1) (return_call 1))
+                (func $void))
+              (assert_invalid
+                (module (func $unbound (return_call 1)))
+                \"unknown function\")
+              (assert_invalid
+                (module (func $big (return_call 1012321300)))
+                \"unknown function\")")))
+    (wasmdown.test:is
+     (equal '(:pass :pass :pass :pass :pass :pass) os))))
+
+(wasmdown.test:test wast/return-call-indirect-validation-and-malformed
+  ;; return_call_indirect typing: table must be funcref ('unknown
+  ;; table' when absent, return_call_indirect.wast ::435-441; the
+  ;; externref table is 'type mismatch' ::593-600), the typeuse
+  ;; grammar keeps the call_indirect malformed shapes ('unexpected
+  ;; token' ordering batch ::309-343, 'inline function type' when
+  ;; (type)+inline are unequal ::388-431), and a bare result-only
+  ;; typeuse binds fine (::71-95 syntax batch).
+  (let ((os (%outcomes
+             "(assert_invalid
+                (module (type (func))
+                        (func $no-table (return_call_indirect (type 0)
+                                                           (i32.const 0))))
+                \"unknown table\")
+              (assert_invalid
+                (module (type (func))
+                        (table 10 externref)
+                        (func $x (return_call_indirect (type 0)
+                                                       (i32.const 0))))
+                \"type mismatch\")
+              (assert_malformed
+                (module quote
+                  \"(type $sig (func))\"
+                  \"(table 0 funcref)\"
+                  \"(func (result i32)\"
+                  \"  (return_call_indirect (type $sig) (result i32)\"
+                  \"    (i32.const 0))\"
+                  \")\")
+                \"inline function type\")
+              (assert_malformed
+                (module quote
+                  \"(table 0 funcref)\"
+                  \"(func (return_call_indirect (param $x i32)\"
+                  \"  (i32.const 0) (i32.const 0)))\")
+                \"unexpected token\")
+              (module
+                (type $proc (func))
+                (table funcref (elem))
+                (func (return_call_indirect (result) (i32.const 0)))
+                (func (result i32)
+                  (return_call_indirect (param) (param i64) (param)
+                    (result) (result i32) (result)
+                    (i64.const 0) (i32.const 0))))")))
+    (wasmdown.test:is
+     (equal '(:pass :pass :pass :pass :pass) os))))
+
+(wasmdown.test:test wast/return-call-host-tail-target
+  ;; A tail call to a HOST function (spectest print) must return its
+  ;; results as the caller's results — the host body cannot grow the
+  ;; guest stack, so %DO-TAIL-HOST throws to the function frame like
+  ;; :return (return_call.wast ::82-84 tailprint_i32_f32 ::140).
+  (let ((os (%outcomes
+             "(module
+                (import \"spectest\" \"print_i32_f32\"
+                  (func $print (param i32 f32)))
+                (func (export \"go\") (param i32 f32)
+                  (return_call $print (local.get 0) (local.get 1))))
+              (assert_return (invoke \"go\" (i32.const 5)
+                                     (f32.const 91.0)))")))
+    (wasmdown.test:is (equal '(:pass :pass) os))))
+
+(wasmdown.test:test wast/return-call-multi-result-and-binary-roundtrip
+  ;; Multi-value tail calls (return_call.wast ::86-93/::141) and the
+  ;; binary path: 0x12 funcidx / 0x13 typeidx tableidx decode and the
+  ;; encoder mirrors them (encode == re-encode after decode).
+  (let ((os (%outcomes
+             "(module
+                (func $swizzle (param f64 i64) (result i32 f32)
+                  (i32.wrap_i64 (local.get 1))
+                  (f32.demote_f64 (local.get 0)))
+                (func (export \"s\") (param f64 i64) (result i32 f32)
+                  (return_call $swizzle (local.get 0) (local.get 1))))
+              (assert_return (invoke \"s\" (f64.const 4.2) (i64.const 99))
+                             (i32.const 99) (f32.const 4.2))")))
+    (wasmdown.test:is (equal '(:pass :pass) os)))
+  (let* ((m (wasmdown.text:parse-wat
+             "(module (func $f (result i32) (return_call $g))
+                     (func $g (result i32) (i32.const 7)))"))
+         (bytes (wasmdown.binary:encode-module m))
+         (m2 (wasmdown.binary:decode-module bytes))
+         (bytes2 (wasmdown.binary:encode-module m2)))
+    (wasmdown.test:is (equalp bytes bytes2))
+    (let ((instr (aref (wasmdown.types:wasm-func-body
+                        (aref (wasmdown.types:wasm-module-funcs m2) 0))
+                       0)))
+      (wasmdown.test:is (eq (wasmdown.types:wasm-instr-op instr)
+                            :return-call))
+      (wasmdown.test:is (equal (wasmdown.types:wasm-instr-imms instr)
+                               '(:func 1))))))
+
+(wasmdown.test:test wast/return-call-ref-still-gc-unsupported
+  ;; return_call_ref (typed function references) is OUT of the engine
+  ;; slice: with the TAIL-CALLS arm gone (return_call/return_call_
+  ;; indirect are implemented), the call_ref-family token keeps
+  ;; return_call_ref.wast's modules honestly classified :unsupported
+  ;; via the GC arm — never a decode-phase fail.
+  (let ((os (%outcomes
+             "(module (type $t (func))
+                      (elem declare func $f)
+                      (func $f (result (ref $t)) (ref.func $f))
+                      (func (export \"g\") (result i32)
+                        (return_call_ref $t (ref.func $f))))
+              (invoke \"g\")")))
+    (wasmdown.test:is (equal '(:unsupported :unsupported) os))))

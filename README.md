@@ -20,8 +20,8 @@ The official core suite (97 `.wast` files, pinned at
 executed through the stateful runner with failure-phase classification:
 
 ```
-pass 20322 | fail 0 | unsupported 938 | harness-error 0 | total 21260
-pass rate 95.6% (denominator = all executed, incl. unsupported)
+pass 20367 | fail 0 | unsupported 893 | harness-error 0 | total 21260
+pass rate 95.8% (denominator = all executed, incl. unsupported)
 ```
 
 Regenerate with `make report-conformance` (writes `CONFORMANCE.md` +
@@ -34,9 +34,11 @@ that previously "passed" without ever being parsed. That dip is now
 FULLY RECOVERED AND EXCEEDED (95.6% > the pre-dip 95.2%) by fixing
 the exposed gaps — not by reverting the wrap. This is a
 baseline measurement, **not** a release gate; remaining failures are
-case-specific engine gaps plus out-of-scope features (SIMD/GC/EH/tail
-calls/typed funcrefs/memory64), classified `unsupported` and never
-silently passed. The `unsupported` rise from earlier baselines
+case-specific engine gaps plus out-of-scope features (SIMD/GC/EH/
+`return_call_ref`/typed funcrefs/memory64), classified `unsupported`
+and never silently passed. Tail calls `return_call`/
+`return_call_indirect` are implemented (loop 18: +45 rows, 893
+unsupported). The `unsupported` rise from earlier baselines
 (277→725) is honest reclassification: actions against genuinely
 out-of-scope modules now classify cleanly instead of crashing as
 harness-errors.
@@ -70,11 +72,14 @@ harness-errors.
 | API / CLI | `src/api.lisp`, `src/cli.lisp` | `read-module`, `validate-module`, `instantiate`, `invoke`, …; CLI `validate`/`inspect`/`compile`/`run`. |
 
 Not implemented (see `PLAN.md` for the full contract): SIMD (v128),
-Wasm GC, exception handling (`try_table`), tail calls, memory64,
-multi-memory runtime (decode accepts memidx forms), Component Model,
-Canonical ABI, WASI (all versions), threads/atomics, FASL cache.
-The `.wat` text format and `.wast` spec runner **are** implemented
-(`src/text.lisp`, `src/wast.lisp`), as is conformance reporting.
+Wasm GC, exception handling (`try_table`), `return_call_ref` (typed
+function references), memory64, multi-memory runtime (decode accepts
+memidx forms), Component Model, Canonical ABI, WASI (all versions),
+threads/atomics, FASL cache. Tail calls `return_call` /
+`return_call_indirect` **are** implemented (constant-stack trampoline
+in `src/interp.lisp`). The `.wat` text format and `.wast` spec runner
+**are** implemented (`src/text.lisp`, `src/wast.lisp`), as is
+conformance reporting.
 
 ## Error/phase taxonomy (PLAN.md §12.2)
 

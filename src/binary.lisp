@@ -375,6 +375,15 @@ markers (keywords) for the block terminators."
          (let ((type (read-u32 r))
                (table (read-u32 r)))
            (mk :call-indirect (list :type type :table table))))
+        ;; tail calls (Core 3.0 §6.2): same immediates as their
+        ;; non-tail counterparts; NOT in *simple-ops* (they carry
+        ;; immediates), so dedicated clauses like :call/:call-indirect.
+        (#x12 (mk :return-call (list :func (read-u32 r))))
+        (#x13
+         (let ((type (read-u32 r))
+               (table (read-u32 r)))
+           (mk :return-call-indirect
+               (list :type type :table table))))
         (#x1B (mk :select (list :types nil)))   ; untyped select: no imms
         (#x1C
           (let ((types (read-vec r #'%read-valtype "select type")))

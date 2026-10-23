@@ -661,6 +661,36 @@ bodies of their :end terminator; bodies of :if carry no :else/:end)."
            (%pop-val-expect fv :i32)
            (%pop-vals fv (wasm-func-type-params ft))
            (%push-vals fv (wasm-func-type-results ft))))
+        ;; --- tail calls (Core 3.0 §6.2) ---
+        ;; Like call/call-indirect, plus the callee's RESULT types
+        ;; must match the enclosing function's declared results
+        ;; (return_call semantics: the callee's return IS this
+        ;; function's return). No subtyping in this slice: EQUAL.
+        ((eq op :return-call)
+         (let* ((ft (vctx-func-type (fv-ctx fv) (imm :func) "return_call"))
+                (results (ctrl-frame-end-types
+                          (car (last (fv-ctrls fv))))))
+           (unless (equal (wasm-func-type-results ft) results)
+             (verr "type mismatch: return_call result types ~a do not match function results ~a"
+                   (wasm-func-type-results ft) results))
+           (%pop-vals fv (wasm-func-type-params ft))
+           (%unreachable fv)))
+        ((eq op :return-call-indirect)
+         (let* ((table (vctx-table-at (fv-ctx fv) (imm :table)
+                                      "return_call_indirect"))
+                (ft (func-type-at module (imm :type)
+                                  "return_call_indirect type"))
+                (results (ctrl-frame-end-types
+                          (car (last (fv-ctrls fv))))))
+           (unless (eq (wasm-table-type table) :funcref)
+             (verr "return_call_indirect: table ~a must have type funcref, got ~a"
+                   (imm :table) (wasm-table-type table)))
+           (unless (equal (wasm-func-type-results ft) results)
+             (verr "type mismatch: return_call_indirect result types ~a do not match function results ~a"
+                   (wasm-func-type-results ft) results))
+           (%pop-val-expect fv :i32)
+           (%pop-vals fv (wasm-func-type-params ft))
+           (%unreachable fv)))
         ;; --- parametric ---
         ((eq op :drop) (%pop-val fv))
         ((eq op :select)

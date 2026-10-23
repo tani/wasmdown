@@ -773,6 +773,7 @@ rational value. Hex floats (0xh.hhhp±d) and decimal floats
   (tables (make-hash-table :test #'equal))
   (mems (make-hash-table :test #'equal))
   (globals (make-hash-table :test #'equal))
+  (tags (make-hash-table :test #'equal))
   (elems (make-hash-table :test #'equal))
   (datas (make-hash-table :test #'equal))
   (locals (make-hash-table :test #'equal))     ; per-func $id -> localidx
@@ -783,6 +784,7 @@ rational value. Hex floats (0xh.hhhp±d) and decimal floats
   (tables-list ())
   (mems-list ())
   (globals-list ())
+  (tags-list ())        ; reversed typeidx
   (exports-list ())     ; reversed
   (elems-list ())
   (datas-list ())
@@ -790,7 +792,8 @@ rational value. Hex floats (0xh.hhhp±d) and decimal floats
   (n-imported-funcs 0)
   (n-imported-tables 0)
   (n-imported-mems 0)
-  (n-imported-globals 0))
+  (n-imported-globals 0)
+  (n-imported-tags 0))
 
 (defun %id-or-num (tok table what)
   "Resolve an index token: $id via TABLE (an equal-hash), or a plain
@@ -851,6 +854,11 @@ or adjacent to the 0x prefix) — int_literals.wast pins 1__000,
      ((string= k "f64") :f64)
      ((string= k "funcref") :funcref)
      ((string= k "externref") :externref)
+     ;; EH-scope admission (ref_null.wast): exnref is the nullable
+     ;; exception-reference type of Core 3.0 EH. Only the ABSOLUTE
+     ;; shorthand is admitted here — typed-ref spellings ((ref $t)
+     ;; etc.) remain GC scope.
+     ((string= k "exnref") :exnref)
      (t (%text-error (tok-pos x) "unknown value type ~a"
                      (if (tok-p x) (tok-text x) k))))))
 
@@ -1099,7 +1107,14 @@ underscore)."
             ((string= text "br_if") "br-if")
             ((string= text "br_table") "br-table")
             ((string= text "call_indirect") "call-indirect")
+            ((string= text "return_call") "return-call")
+            ((string= text "return_call_indirect")
+             "return-call-indirect")
             ((string= text "ref.is_null") "ref.is-null")
+            ;; EH (Core 3.0): try_table's underscore hyphenates like
+            ;; the other multi-word control ops; throw_ref likewise.
+            ((string= text "try_table") "try-table")
+            ((string= text "throw_ref") "throw-ref")
             (t text)))
           :keyword))
 
@@ -1160,8 +1175,10 @@ underscore)."
            (member (%tok-keyword x)
                    '("i32.const" "i64.const" "f32.const" "f64.const"
                      "local.get" "local.set" "local.tee" "global.get"
-                     "global.set" "call" "ref.func" "ref.null" "br"
-                     "br_if" "br_table" "call_indirect" "select"
+                    "global.set" "call" "ref.func" "ref.null" "br"
+                    "br_if" "br_table" "call_indirect" "select"
+                    "return_call" "return_call_indirect"
+                    "throw" "throw_ref"
                      "table.get" "table.set" "table.grow" "table.size"
                      "table.fill" "table.init" "table.copy" "elem.drop"
                      "memory.size" "memory.grow" "memory.init" "data.drop"
@@ -1199,9 +1216,10 @@ loop/if parse them); elsewhere it is a decode-error."
               ((tok-elem-p x)
                (dolist (i (%folded x penv)) (push i out))
                (pop cursor))
-              ;; plain-form structured ops: block/loop/if
+              ;; plain-form structured ops: block/loop/if/try_table
               ((and (tok-p x)
-                    (member (%tok-keyword x) '("block" "loop" "if")
+                    (member (%tok-keyword x)
+                            '("block" "loop" "if" "try_table")
                             :test #'string=))
                (multiple-value-bind (instr rest)
                    (%plain-structured x (cdr cursor) penv)
@@ -1236,6 +1254,7 @@ operator — spec folded-form semantics)."
      ((string= k "block") (list (%fold-block node penv :block)))
      ((string= k "loop") (list (%fold-block node penv :loop)))
      ((string= k "if") (%fold-if node penv))
+     ((string= k "try_table") (list (%fold-try-table node penv)))
      (t
       ;; immediates first, then the operand expressions (folded lists)
       (multiple-value-bind (instr operands)
@@ -1252,6 +1271,81 @@ allowed there — folded operands must themselves be folded lists)."
   (%text-error (tok-pos tok)
                "expected folded operand, found bare token ~a"
                (tok-text tok)))
+
+;;; ---------------------------------------------------------------
+;;; Exception handling (Core 3.0): catch clauses of try_table.
+
+(defun %parse-catch-clauses (items penv)
+  "Parse the leading (catch x l)/(catch_ref x l)/(catch_all l)/
+(catch_all_ref l) clause items of a try_table. Returns (values
+catches-vector rest). Each clause record:
+  (:catch tagidx label) / (:catch-ref tagidx label)
+  (:catch-all label)    / (:catch-all-ref label)
+LABEL is an already-resolved RELATIVE depth."
+  (let ((clauses '())
+        (cursor items))
+    (loop
+      (unless (and cursor (tok-elem-p (car cursor))) (return))
+      (let* ((node (car cursor))
+             (k (%tok-keyword (%first-tok node))))
+        (cond
+         ((string= k "catch")
+          (multiple-value-bind (tag rest)
+              (%take-index (cddr node) (penv-tags penv) "tag")
+            (multiple-value-bind (label rest2)
+                (%take-label rest penv "catch")
+              (unless (null rest2)
+                (%text-error 0 "junk after catch clause"))
+              (push (list :catch tag label) clauses)
+              (pop cursor))))
+         ((string= k "catch_ref")
+          (multiple-value-bind (tag rest)
+              (%take-index (cddr node) (penv-tags penv) "tag")
+            (multiple-value-bind (label rest2)
+                (%take-label rest penv "catch_ref")
+              (unless (null rest2)
+                (%text-error 0 "junk after catch_ref clause"))
+              (push (list :catch-ref tag label) clauses)
+              (pop cursor))))
+         ((string= k "catch_all")
+          (multiple-value-bind (label rest)
+              (%take-label (cddr node) penv "catch_all")
+            (unless (null rest)
+              (%text-error 0 "junk after catch_all clause"))
+            (push (list :catch-all label) clauses)
+            (pop cursor)))
+         ((string= k "catch_all_ref")
+          (multiple-value-bind (label rest)
+              (%take-label (cddr node) penv "catch_all_ref")
+            (unless (null rest)
+              (%text-error 0 "junk after catch_all_ref clause"))
+            (push (list :catch-all-ref label) clauses)
+            (pop cursor)))
+         (t (return)))))
+    (values (coerce (nreverse clauses) 'vector)
+            (nthcdr (length clauses) items))))
+
+(defun %fold-try-table (node penv)
+  "Parse a folded (try_table $l? typeuse clause* instr*): the label is
+in scope for the body AND for the catch clause label resolution (same
+depth accounting as %PLAIN-STRUCTURED's plain form); folded try_table
+blocks contain no plain end."
+  (multiple-value-bind (id bt items)
+      (%block-label-and-type node penv)
+    (push (or id :unnamed) (penv-labels penv))
+    (multiple-value-bind (catches rest)
+        (%parse-catch-clauses items penv)
+      (multiple-value-bind (body term leftover)
+          (%instr-list rest penv)
+        (declare (ignore leftover))
+        (when term
+          (%text-error 0 "unexpected ~a inside folded try_table"
+                       (car term)))
+        (when (penv-labels penv) (pop (penv-labels penv)))
+        (make-wasm-instr :try-table
+                         (list :bt bt :catches catches)
+                         (coerce body 'vector)
+                         0)))))
 
 (defun %plain-structured (tok items penv)
   "Parse a PLAIN-form block/loop/if starting at opcode TOK; ITEMS are
@@ -1291,6 +1385,25 @@ the trailing-id matching rule. Returns (values instr rest-items)."
                       (list :bt bt)
                       (coerce body 'vector) 0)
                     rest)))
+         ((string= k "try_table")
+          ;; try_table $l? blocktype (catch ...)* (catch_all ...)*
+          ;; body end. Catch clause labels resolve AFTER the try's own
+          ;; label is pushed (spec: the handler labels are branch
+          ;; targets OUTSIDE the try block, in the enclosing scope,
+          ;; but label depths count the try itself — the clauses are
+          ;; parsed before the body while the label is on the stack).
+          (multiple-value-bind (catches rest)
+              (%parse-catch-clauses cursor penv)
+            (multiple-value-bind (body term rest2)
+                (%instr-list rest penv)
+              (unless (eq (car term) :end)
+                (%text-error pos "plain try_table must end with end"))
+              (%check-trailing-label id (cdr term) "end" pos)
+              (pop-label)
+              (values (make-wasm-instr :try-table
+                                       (list :bt bt :catches catches)
+                                       (coerce body 'vector) 0)
+                      rest2))))
          (t                                  ; if
           (multiple-value-bind (then term rest)
               (%instr-list cursor penv)
@@ -1466,11 +1579,16 @@ rest of the plain sequence."
                          :default (%label-idx (car (last toks)) penv))
                    #() 0)
                   items))))
-     ;; call / ref.func: one funcidx
-     ((member k '("call" "ref.func") :test #'string=)
+     ;; call / return_call / ref.func: one funcidx
+     ((member k '("call" "return_call" "ref.func") :test #'string=)
       (multiple-value-bind (f items)
           (%take-index rest (penv-funcs penv) "func")
         (values (make-wasm-instr op-key (list :func f) #() 0) items)))
+     ;; throw: one tagidx (EH, Core 3.0)
+     ((string= k "throw")
+      (multiple-value-bind (x items)
+          (%take-index rest (penv-tags penv) "tag")
+        (values (make-wasm-instr op-key (list :tag x) #() 0) items)))
      ;; local/global index ops
      ((member k '("local.get" "local.set" "local.tee") :test #'string=)
       (multiple-value-bind (x items)
@@ -1537,19 +1655,22 @@ rest of the plain sequence."
                                  (list :type (cond
                                               ((string= ht "func") :funcref)
                                               ((string= ht "extern") :externref)
+                                              ;; EH (ref_null.wast): (ref.null exn)
+                                              ((string= ht "exn") :exnref)
                                               (t (%text-error
                                                   (tok-pos (car rest))
                                                   "bad ref.null type ~a"
                                                   (tok-text (car rest))))))
                                  #() 0)
                 (cdr rest))))
-     ;; call_indirect: optional table index then typeuse. The typeuse
-     ;; follows BLOCKTYPE semantics (func.wast ::108-111, call_indirect
-     ;; ::143-146): an explicit (type x) plus inline (param)/(result)
-     ;; items must be syntactically EQUAL to the referenced functype
-     ;; ('inline function type' malformed at DECODE); named params in
-     ;; the inline items are 'unexpected token' (blocktype grammar).
-     ((string= k "call_indirect")
+     ;; call_indirect / return_call_indirect: optional table index then
+     ;; typeuse. The typeuse follows BLOCKTYPE semantics (func.wast
+     ;; ::108-111, call_indirect ::143-146): an explicit (type x) plus
+     ;; inline (param)/(result) items must be syntactically EQUAL to
+     ;; the referenced functype ('inline function type' malformed at
+     ;; DECODE); named params in the inline items are 'unexpected
+     ;; token' (blocktype grammar).
+     ((member k '("call_indirect" "return_call_indirect") :test #'string=)
       (let ((table 0) (items rest))
         (when (and items (tok-p (car items))
                    (member (tok-kind (car items)) '(:id :nat)))
@@ -1835,10 +1956,10 @@ missing-(func) diagnostics at the same source positions)."
   (%type-field-signature node))
 
 (defun %import-desc (desc penv kind)
-  "Parse an import descriptor list ((func|table|memory|global) $id?
-type...) for KIND, returning the type payload: typeidx for funcs,
-wasm-table/wasm-memory/(type . mut) otherwise. Registers the id at
-the kind's running import count (its true index-space position)."
+  "Parse an import descriptor list ((func|table|memory|global|tag) $id?
+type...) for KIND, returning the type payload: typeidx for funcs and
+tags, wasm-table/wasm-memory/(type . mut) otherwise. Registers the id
+at the kind's running import count (its true index-space position)."
   (let* ((head (%first-tok desc))
          (k (and head (%tok-keyword head)))
          (items (cddr desc)))
@@ -1847,13 +1968,15 @@ the kind's running import count (its true index-space position)."
                    (:func (penv-n-imported-funcs penv))
                    (:table (penv-n-imported-tables penv))
                    (:memory (penv-n-imported-mems penv))
-                   (:global (penv-n-imported-globals penv)))))
+                   (:global (penv-n-imported-globals penv))
+                   (:tag (penv-n-imported-tags penv)))))
         (when id
           (%register-id id (case kind
                              (:func (penv-funcs penv))
                              (:table (penv-tables penv))
                              (:memory (penv-mems penv))
-                             (:global (penv-globals penv)))
+                             (:global (penv-globals penv))
+                             (:tag (penv-tags penv)))
                            (string-downcase kind) (tok-pos id) idx))
         (ecase kind
           (:func
@@ -1867,7 +1990,15 @@ the kind's running import count (its true index-space position)."
            (make-wasm-memory (%import-memory-type rest (and id (tok-pos id)))))
           (:global
            (setf (penv-n-imported-globals penv) (1+ idx))
-           (%import-global-type rest (and id (tok-pos id)))))))))
+           (%import-global-type rest (and id (tok-pos id))))
+          ;; A tag's typeuse is (param)* with EMPTY results — the
+          ;; grammar has no (result) in a tagtype; a stray (result)
+          ;; item is junk the typeuse scanner leaves behind, and the
+          ;; tag field parser rejects it (parse-time 'unexpected
+          ;; token', matching the reference's malformed diagnostics).
+          (:tag
+           (setf (penv-n-imported-tags penv) (1+ idx))
+           (%resolve-typeuse rest penv)))))))
 
 (defun %import-table-type (k rest pos)
   "Table import type: limits (n n?) then reftype, per the text grammar
@@ -1917,11 +2048,87 @@ the kind's running import count (its true index-space position)."
                    ((string= k "table") :table)
                    ((string= k "memory") :memory)
                    ((string= k "global") :global)
+                   ((string= k "tag") :tag)
                    (t (%text-error (and head (tok-pos head))
                                    "bad import kind ~a" k)))))
         (push (make-wasm-import module field kind
                                 (%import-desc desc penv kind))
               (penv-imports-list penv))))))
+
+(defun %tag-typeuse (items penv)
+  "The typeuse of a tag field: (type x)? (param)* — results are
+  grammatically impossible in a tagtype. Returns (values typeidx
+  leftovers); LEFTOVERS is non-empty when an unrecognized item (e.g. a
+  stray (result ...) or junk) follows, which the caller reports as a
+  parse error (the reference parser rejects it as 'unexpected token')."
+  (multiple-value-bind (params results typeidx)
+      (%typeuse items penv)
+    (declare (ignorable results))
+    ;; %TYPEUSE consumes (result) items silently; a tagtype must not
+    ;; carry any. Re-scan to detect them explicitly.
+    (let ((stray-result nil)
+          (consumed 0)
+          (scan items))
+      (loop while (and scan (tok-elem-p (car scan))
+                       (member (%tok-keyword (%first-tok (car scan)))
+                               '("type" "param" "result")
+                               :test #'string=))
+            do (when (string= (%tok-keyword (%first-tok (car scan)))
+                              "result")
+                 (setf stray-result t))
+               (incf consumed)
+               (pop scan))
+      (let ((leftovers (nthcdr consumed items)))
+        (cond (stray-result
+               (%text-error 0 "unexpected token: (result) in a tag type"))
+              (leftovers
+               ;; junk after the typeuse (the loop stopped at a
+               ;; non-type/param/result item): the caller decides
+               (values (or typeidx
+                          (%find-or-add-type params '() penv))
+                       leftovers))
+              (t
+               (values (or typeidx
+                          (%find-or-add-type params '() penv))
+                       leftovers)))))))
+
+(defun %parse-tag-field (node penv)
+  "Parse a (tag ...) field (Core 3.0 exception handling):
+  (tag $id? (export \"n\")* (import \"m\" \"f\")? typeuse).
+  An inline (import) turns the tag into an import entry; the typeuse
+  is (type x)? (param)* with EMPTY results. A defined tag appends its
+  typeidx to the tag list; imports register $id at the running import
+  count (via %IMPORT-DESC's :TAG arm)."
+  (let* ((items (cddr node))
+         (pos (or (and items (tok-p (car items)) (tok-pos (car items)))
+                  0)))
+    (multiple-value-bind (id rest) (%opt-id items)
+      (setf rest (%inline-exports rest penv :tag (penv-tags penv)))
+      (if (and rest (tok-elem-p (car rest))
+               (string= (%tok-keyword (%first-tok (car rest))) "import"))
+          (let* ((im (car rest))
+                 (module (%name-string (%name-tok (third im))))
+                 (field (%name-string (%name-tok (fourth im))))
+                 (tail (cdr rest)))
+            (when id
+              (%register-id id (penv-tags penv) "tag" (tok-pos id)
+                             (penv-n-imported-tags penv)))
+            (multiple-value-bind (typeidx leftovers)
+                (%tag-typeuse tail penv)
+              (declare (ignore leftovers))
+              (push (make-wasm-import module field :tag typeidx)
+                    (penv-imports-list penv))))
+          (progn
+            (when id
+              (%register-id id (penv-tags penv) "tag" (tok-pos id)
+                             (+ (penv-n-imported-tags penv)
+                                (length (penv-tags-list penv)))))
+            (multiple-value-bind (typeidx leftovers)
+                (%tag-typeuse rest penv)
+              (unless (null leftovers)
+                (%text-error pos "junk after tag type"))
+              (push typeidx (penv-tags-list penv))))))))
+
 
 (defun %parse-func-field (node penv)
   "Parse a (func ...) field with inline import/export abbreviations:
@@ -2102,12 +2309,14 @@ Returns the remaining items."
                             (:func (penv-n-imported-funcs penv))
                             (:table (penv-n-imported-tables penv))
                             (:memory (penv-n-imported-mems penv))
-                            (:global (penv-n-imported-globals penv)))
+                            (:global (penv-n-imported-globals penv))
+                            (:tag (penv-n-imported-tags penv)))
                           (ecase kind
                             (:func (length (penv-funcs-list penv)))
                             (:table (length (penv-tables-list penv)))
                             (:memory (length (penv-mems-list penv)))
-                            (:global (length (penv-globals-list penv)))))))
+                            (:global (length (penv-globals-list penv)))
+                            (:tag (length (penv-tags-list penv)))))))
              (declare (ignore table))
              (push (make-wasm-export name kind idx)
                    (penv-exports-list penv))
@@ -2367,6 +2576,7 @@ error."
                    ((string= k "table") :table)
                    ((string= k "memory") :memory)
                    ((string= k "global") :global)
+                   ((string= k "tag") :tag)
                    (t (%text-error (and head (tok-pos head))
                                    "bad export kind ~a" k)))))
         (let ((idx (case kind
@@ -2374,7 +2584,8 @@ error."
                      (:table (%id-or-num idxtok (penv-tables penv) "table"))
                      (:memory (%id-or-num idxtok (penv-mems penv) "memory"))
                      (:global (%id-or-num idxtok (penv-globals penv)
-                                           "global")))))
+                                           "global"))
+                     (:tag (%id-or-num idxtok (penv-tags penv) "tag")))))
           (push (make-wasm-export name kind idx)
                 (penv-exports-list penv)))))))
 
@@ -2598,7 +2809,7 @@ spaces BEFORE parsing field bodies, so forward references (legal WAT)
 resolve. Imports count toward their kind's index space in field
 order, interleaved with defined entities. Type ids stay deferred
 (implicit typeuses shift the list during body parsing)."
-  (let ((nfuncs 0) (ntables 0) (nmems 0) (nglobals 0)
+  (let ((nfuncs 0) (ntables 0) (nmems 0) (nglobals 0) (ntags 0)
         (nelems 0) (ndatas 0))
     (flet ((reg (id table idx)
              (when (and id (tok-p id) (eq (tok-kind id) :id))
@@ -2642,7 +2853,10 @@ order, interleaved with defined entities. Type ids stay deferred
                     (reg did (penv-mems penv) nmems) (incf nmems))
                    ((string= dk "global")
                     (reg did (penv-globals penv) nglobals)
-                    (incf nglobals)))))))
+                    (incf nglobals))
+                   ((string= dk "tag")
+                    (reg did (penv-tags penv) ntags)
+                    (incf ntags)))))))
            ((string= k "table")
             (reg (node-id node) (penv-tables penv) ntables)
             (incf ntables))
@@ -2652,6 +2866,11 @@ order, interleaved with defined entities. Type ids stay deferred
            ((string= k "global")
             (reg (node-id node) (penv-globals penv) nglobals)
             (incf nglobals))
+           ((string= k "tag")
+            ;; inline-import tags occupy the index space like the
+            ;; other kinds (field order)
+            (reg (node-id node) (penv-tags penv) ntags)
+            (incf ntags))
            ((string= k "elem")
             (reg (node-id node) (penv-elems penv) nelems)
             (incf nelems))
@@ -2695,7 +2914,7 @@ assert_malformed cases."
             (%text-error (and head (tok-pos head))
                          "import after function/table/memory/global definition"))
           (%parse-import-field node penv))
-         ((member k '("func" "table" "memory" "global") :test #'string=)
+         ((member k '("func" "table" "memory" "global" "tag") :test #'string=)
           ;; inline-import abbreviations ((func (import ...)) etc.)
           ;; expand to import fields at this position: after any
           ;; definition they are malformed exactly like a bare
@@ -2712,7 +2931,8 @@ assert_malformed cases."
             (:func (%parse-func-field node penv))
             (:table (%parse-table-field node penv))
             (:memory (%parse-memory-field node penv))
-            (:global (%parse-global-field node penv))))
+            (:global (%parse-global-field node penv))
+            (:tag (%parse-tag-field node penv))))
          ((string= k "export") (%parse-export-field node penv))
          ((string= k "start") (%parse-start-field node penv))
          ((string= k "elem") (%parse-elem-field node penv))
@@ -2758,6 +2978,7 @@ with :offset (token index) on malformed text."
        :funcs (coerce (reverse (penv-funcs-list penv)) 'vector)
        :tables (coerce (reverse (penv-tables-list penv)) 'vector)
        :mems (coerce (reverse (penv-mems-list penv)) 'vector)
+       :tags (coerce (reverse (penv-tags-list penv)) 'vector)
        :globals (coerce (reverse (penv-globals-list penv)) 'vector)
        :exports (coerce (reverse (penv-exports-list penv)) 'vector)
        :start (penv-start penv)

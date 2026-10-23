@@ -100,6 +100,10 @@ global.get)."
   (funcs #() :type (vector wasm-func))
   (tables #() :type (vector wasm-table))
   (mems #() :type (vector wasm-memory))
+  ;; tag section (id 13): vector of typeidx; tag i's type is
+  ;; (aref types (svref tags i)) and MUST be a functype with empty
+  ;; results (validated in wasmdown.validate:check-tags).
+  (tags #() :type (vector (integer 0)))
   (globals #() :type (vector wasm-global))
   (exports #() :type (vector wasm-export))
   (start nil :type (or null (integer 0)))
@@ -109,11 +113,14 @@ global.get)."
   (data-count nil :type (or null (integer 0))))
 
 (defun make-wasm-module (&key (types #()) (imports #()) (funcs #()) (tables #())
-                             (mems #()) (globals #()) (exports #()) (start nil)
-                             (elems #()) (datas #()) (customs #()) (data-count nil))
+                             (mems #()) (tags #()) (globals #()) (exports #())
+                             (start nil) (elems #()) (datas #()) (customs #())
+                             (data-count nil))
   (%make-wasm-module :types types :imports imports :funcs funcs :tables tables
-                     :mems mems :globals globals :exports exports :start start
-                     :elems elems :datas datas :customs customs :data-count data-count))
+                     :mems mems :tags tags :globals globals :exports exports
+                     :start start :elems elems :datas datas :customs customs
+                     :data-count data-count))
+
 
 (defun func-type-arity-matches-p (ft params results)
   "Function-type equality on lists of value types."

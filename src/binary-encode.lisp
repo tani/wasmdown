@@ -171,6 +171,7 @@
    (cons :block #x02) (cons :loop #x03) (cons :if #x04)
    (cons :br #x0C) (cons :br-if #x0D) (cons :br-table #x0E)
    (cons :return #x0F) (cons :call #x10) (cons :call-indirect #x11)
+   (cons :return-call #x12) (cons :return-call-indirect #x13)
    (cons :select #x1B)
    (cons :local.get #x20) (cons :local.set #x21) (cons :local.tee #x22)
    (cons :global.get #x23) (cons :global.set #x24)
@@ -283,6 +284,11 @@ low word first, then high word."
       (:call (enc-byte e #x10) (enc-u32 e (getf imms :func)))
       (:call-indirect
        (enc-byte e #x11)
+       (enc-u32 e (getf imms :type))
+       (enc-u32 e (getf imms :table)))
+      (:return-call (enc-byte e #x12) (enc-u32 e (getf imms :func)))
+      (:return-call-indirect
+       (enc-byte e #x13)
        (enc-u32 e (getf imms :type))
        (enc-u32 e (getf imms :table)))
       (:select

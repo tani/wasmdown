@@ -13,15 +13,15 @@ now classify as :unsupported instead of crashing as harness-errors.
 
 | Outcome | Count |
 | --- | --- |
-| pass | 20322 |
+| pass | 20367 |
 | fail | 0 |
 | skip | 0 |
-| unsupported | 938 |
+| unsupported | 893 |
 | timeout | 0 |
 | harness-error | 0 |
 | **total** | **21260** |
 
-Executed: 21260 commands; pass rate 95.6% (denominator = all executed,
+Executed: 21260 commands; pass rate 95.8% (denominator = all executed,
 including unsupported — honest per PLAN.md §12.9).
 
 ## Per-file counts
@@ -97,8 +97,8 @@ including unsupported — honest per PLAN.md §12.9).
 | ref_is_null | 2 | 0 | 20 | 0 |
 | ref_null | 0 | 0 | 34 | 0 |
 | return | 84 | 0 | 0 | 0 |
-| return_call | 0 | 0 | 51 | 0 |
-| return_call_indirect | 1 | 0 | 82 | 0 |
+| return_call | 15 | 0 | 36 | 0 |
+| return_call_indirect | 31 | 0 | 52 | 0 |
 | return_call_ref | 0 | 0 | 53 | 0 |
 | select | 31 | 0 | 126 | 0 |
 | skip-stack-guard-page | 11 | 0 | 0 | 0 |
