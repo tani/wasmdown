@@ -13,41 +13,41 @@ now classify as :unsupported instead of crashing as harness-errors.
 
 | Outcome | Count |
 | --- | --- |
-| pass | 20163 |
-| fail | 223 |
+| pass | 19635 |
+| fail | 661 |
 | skip | 0 |
 | unsupported | 746 |
 | timeout | 0 |
-| harness-error | 55 |
+| harness-error | 145 |
 | **total** | **21187** |
 
-Executed: 21187 commands; pass rate 95.2% (denominator = all executed,
+Executed: 21187 commands; pass rate 92.7% (denominator = all executed,
 including unsupported — honest per PLAN.md §12.9).
 
 ## Per-file counts
 
 | File | pass | fail | unsupported | other |
 | --- | --- | --- | --- | --- |
-| address | 257 | 3 | 0 | 0 |
+| address | 259 | 1 | 0 | 0 |
 | align | 162 | 3 | 0 | 0 |
 | annotations | 0 | 0 | 0 | 1 |
 | binary-leb128 | 87 | 4 | 0 | 0 |
 | binary | 126 | 1 | 2 | 0 |
-| block | 223 | 0 | 0 | 0 |
+| block | 216 | 7 | 0 | 0 |
 | br | 97 | 0 | 0 | 0 |
 | br_if | 118 | 0 | 1 | 0 |
 | br_on_non_null | 0 | 0 | 12 | 0 |
 | br_on_null | 0 | 0 | 10 | 0 |
 | br_table | 24 | 0 | 162 | 0 |
 | call | 91 | 0 | 0 | 0 |
-| call_indirect | 172 | 0 | 0 | 0 |
+| call_indirect | 167 | 5 | 0 | 0 |
 | call_ref | 0 | 0 | 35 | 0 |
-| comments | 4 | 4 | 0 | 0 |
-| const | 776 | 0 | 0 | 2 |
+| comments | 8 | 0 | 0 | 0 |
+| const | 754 | 24 | 0 | 0 |
 | conversions | 619 | 0 | 0 | 0 |
 | custom | 9 | 0 | 1 | 1 |
-| data | 65 | 3 | 0 | 0 |
-| elem | 118 | 18 | 18 | 0 |
+| data | 66 | 2 | 0 | 0 |
+| elem | 123 | 13 | 18 | 0 |
 | endianness | 69 | 0 | 0 | 0 |
 | exports | 96 | 0 | 1 | 0 |
 | f32 | 2512 | 2 | 0 | 0 |
@@ -57,43 +57,43 @@ including unsupported — honest per PLAN.md §12.9).
 | f64_bitwise | 364 | 0 | 0 | 0 |
 | f64_cmp | 2407 | 0 | 0 | 0 |
 | fac | 8 | 0 | 0 | 0 |
-| float_exprs | 915 | 12 | 0 | 0 |
+| float_exprs | 927 | 0 | 0 | 0 |
 | float_literals | 179 | 0 | 0 | 0 |
-| float_memory | 78 | 12 | 0 | 0 |
+| float_memory | 90 | 0 | 0 | 0 |
 | float_misc | 471 | 0 | 0 | 0 |
 | forward | 5 | 0 | 0 | 0 |
-| func | 169 | 2 | 0 | 4 |
+| func | 161 | 9 | 0 | 5 |
 | func_ptrs | 35 | 0 | 0 | 1 |
 | global | 117 | 7 | 0 | 0 |
 | i32 | 450 | 10 | 0 | 0 |
 | i64 | 401 | 15 | 0 | 0 |
-| id | 6 | 1 | 0 | 0 |
-| if | 241 | 0 | 0 | 0 |
-| imports | 191 | 16 | 9 | 2 |
+| id | 0 | 2 | 0 | 5 |
+| if | 234 | 7 | 0 | 0 |
+| imports | 197 | 12 | 9 | 0 |
 | inline-module | 0 | 0 | 0 | 1 |
 | instance | 0 | 8 | 15 | 0 |
 | int_exprs | 108 | 0 | 0 | 0 |
 | int_literals | 51 | 0 | 0 | 0 |
 | labels | 29 | 0 | 0 | 0 |
 | left-to-right | 96 | 0 | 0 | 0 |
-| linking | 82 | 33 | 29 | 19 |
+| linking | 126 | 4 | 29 | 4 |
 | load | 97 | 0 | 0 | 0 |
 | local_get | 36 | 0 | 0 | 0 |
 | local_init | 0 | 0 | 10 | 0 |
 | local_set | 53 | 0 | 0 | 0 |
 | local_tee | 97 | 0 | 1 | 0 |
-| loop | 121 | 0 | 0 | 0 |
-| memory | 83 | 4 | 0 | 3 |
-| memory_grow | 104 | 4 | 0 | 1 |
+| loop | 114 | 7 | 0 | 0 |
+| memory | 87 | 3 | 0 | 0 |
+| memory_grow | 109 | 0 | 0 | 0 |
 | memory_redundancy | 8 | 0 | 0 | 0 |
 | memory_size | 42 | 0 | 0 | 0 |
 | memory_trap | 182 | 0 | 0 | 0 |
-| names | 486 | 0 | 0 | 0 |
+| names | 6 | 480 | 0 | 0 |
 | nop | 88 | 0 | 0 | 0 |
 | obsolete-keywords | 10 | 0 | 1 | 0 |
 | ref | 0 | 1 | 4 | 8 |
 | ref_as_non_null | 0 | 0 | 7 | 0 |
-| ref_func | 11 | 6 | 0 | 0 |
+| ref_func | 16 | 1 | 0 | 0 |
 | ref_is_null | 2 | 0 | 20 | 0 |
 | ref_null | 0 | 0 | 34 | 0 |
 | return | 84 | 0 | 0 | 0 |
@@ -106,12 +106,12 @@ including unsupported — honest per PLAN.md §12.9).
 | start | 20 | 0 | 0 | 0 |
 | store | 68 | 0 | 0 | 0 |
 | switch | 28 | 0 | 0 | 0 |
-| table | 18 | 18 | 9 | 1 |
-| table_get | 13 | 2 | 0 | 1 |
-| table_grow | 47 | 13 | 0 | 1 |
-| table_set | 12 | 14 | 0 | 0 |
+| table | 22 | 15 | 9 | 0 |
+| table_get | 16 | 0 | 0 | 0 |
+| table_grow | 61 | 0 | 0 | 0 |
+| table_set | 26 | 0 | 0 | 0 |
 | table_size | 39 | 0 | 0 | 0 |
-| token | 61 | 0 | 0 | 0 |
+| token | 44 | 14 | 0 | 3 |
 | traps | 36 | 0 | 0 | 0 |
 | type-canon | 0 | 0 | 2 | 0 |
 | type-equivalence | 11 | 1 | 12 | 8 |
@@ -124,4 +124,4 @@ including unsupported — honest per PLAN.md §12.9).
 | utf8-custom-section-id | 176 | 0 | 0 | 0 |
 | utf8-import-field | 176 | 0 | 0 | 0 |
 | utf8-import-module | 176 | 0 | 0 | 0 |
-| utf8-invalid-encoding | 180 | 3 | 0 | 0 |
+| utf8-invalid-encoding | 76 | 0 | 0 | 107 |

@@ -106,7 +106,11 @@ whitespace, parens, quote, semicolon, comma and NUL)."
 (defun %read-string (s i)
   "Decode a \"...\" literal starting at S[I]; returns the decoded text
 and the index past the closing quote. Escapes: \t \n \r \" \' \\
-\\xx (hex byte) \\u{...} (code point)."
+\\xx (hex byte) \\u{...} (code point, UTF-8 encoded). The result is
+BYTE-ACCURATE: every character of the returned string is a byte
+value (raw source characters above U+007F are re-encoded as their
+UTF-8 bytes) so quote payloads carry exactly the bytes the binary
+form would, and the text decoder can enforce UTF-8 validity on names."
   (let ((n (length s))
         (out (make-array 16 :element-type 'character
                          :fill-pointer 0 :adjustable t)))
@@ -118,7 +122,10 @@ and the index past the closing quote. Escapes: \t \n \r \" \' \\
          ((char= c #\")
           (return (values (coerce out 'string) (1+ i))))
          ((char/= c #\\)
-          (vector-push-extend c out) (incf i))
+          (if (< (char-code c) #x80)
+              (vector-push-extend c out)
+              (%push-utf8 (char-code c) out))
+          (incf i))
          (t (incf i)
             (when (>= i n) (%werr i "unclosed string escape"))
             (let ((e (char s i)))
@@ -130,6 +137,13 @@ and the index past the closing quote. Escapes: \t \n \r \" \' \\
                ((char= e #\') (vector-push-extend #\' out) (incf i))
                ((char= e #\\) (vector-push-extend #\\ out) (incf i))
                ((char= e #\u)
+                ;; \u{hex} per the script grammar: the code point's
+                ;; UTF-8 ENCODING is appended (multi-byte for
+                ;; U+0080..U+10FFFF), so the reassembled quote text
+                ;; carries the same bytes the binary form would.
+                ;; Surrogates (D800-DFFF) and > U+10FFFF are rejected
+                ;; here; raw \xx escapes deliberately pass through so
+                ;; the text decoder can flag malformed UTF-8.
                 (let ((j (+ i 2)))
                   (unless (and (< j n) (char= (char s (1+ i)) #\{))
                     (%werr i "bad \\u escape"))
@@ -143,8 +157,12 @@ and the index past the closing quote. Escapes: \t \n \r \" \' \\
                     (when (zerop (length hex))
                       (%werr i "empty \\u escape"))
                     (let ((cp (parse-integer hex :radix 16)))
-                      (when (> cp #x10FFFF) (%werr i "code point too large"))
-                      (vector-push-extend (code-char cp) out)))
+                      (cond
+                       ((and (>= cp #xD800) (<= cp #xDFFF))
+                        (%werr i "malformed UTF-8 codepoint"))
+                       ((> cp #x10FFFF)
+                        (%werr i "malformed UTF-8 codepoint"))
+                       (t (%push-utf8 cp out)))))
                   (setf i j)))
                ((%hexdigit-p e)
                 (unless (and (< (1+ i) n) (%hexdigit-p (char s (1+ i))))
@@ -154,6 +172,23 @@ and the index past the closing quote. Escapes: \t \n \r \" \' \\
                  out)
                 (incf i 2))
                (t (%werr i "unknown string escape \\~c" e))))))))))
+
+(defun %push-utf8 (cp out)
+  "Append the UTF-8 encoding of code point CP to the adjustable
+character string OUT (one character per byte, byte-valued)."
+  (flet ((b (x) (vector-push-extend (code-char x) out)))
+    (cond
+     ((< cp #x80) (b cp))
+     ((< cp #x800) (b (logior #xC0 (ash cp -6))) (b (logior #x80 (logand cp #x3F))))
+     ((< cp #x10000)
+      (b (logior #xE0 (ash cp -12)))
+      (b (logior #x80 (logand (ash cp -6) #x3F)))
+      (b (logior #x80 (logand cp #x3F))))
+     (t
+      (b (logior #xF0 (ash cp -18)))
+      (b (logior #x80 (logand (ash cp -12) #x3F)))
+      (b (logior #x80 (logand (ash cp -6) #x3F)))
+      (b (logior #x80 (logand cp #x3F)))))))
 
 (defun %atom-kind (text)
   "Classify an atom: $id, :nat (unsigned int), :int (signed int),
@@ -461,7 +496,16 @@ unsupported named-form cases), or signals decode-error on bad shape."
            ((string= k "binary")
             (values :binary id (%concat-bytes strs)))
            (t
-            (values :quote id (%concat-strings strs))))))
+            ;; The quote payload is module FIELDS per the script
+            ;; grammar; parse-wat expects a whole (module ...) form,
+            ;; so wrap the concatenation (PLAN.md 12: quote payloads
+            ;; were previously handed verbatim to parse-wat, which
+            ;; rejected them with "expected exactly one (module
+            ;; ...)" — recording assert_malformed cases as
+            ;; misattributed passes).
+            (values :quote id
+                    (format nil "(module ~a)"
+                            (%concat-strings strs)))))))
        (t
         ;; plain text: parse-wat expects the whole (module ...) form;
         ;; slice the node's full source span (parens included).

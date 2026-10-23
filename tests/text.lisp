@@ -553,13 +553,22 @@ EQUALP (canonical-encode agreement oracle)."
    (%wat "(module (memory 1) (data (i32.const 0) \"a\"))")))
 
 (wasmdown.test:test text/utf8-data-literals
-  ;; Regression (loop 9): data-string literals UTF-8 encode chars
-  ;; (was (char-code ch) per char — astral/BMP fixtures crashed as
-  ;; not (UNSIGNED-BYTE 8); token.wast::39 fixtures pass).
-  ;; e-acute (U+00E9) written via hex-escape chars must encode as
-  ;; the 2-byte UTF-8 sequence C3 A9.
+  ;; Loop-10 byte-accurate strings: \\xx escapes are RAW BYTES in
+  ;; data segments (spec); \\u{...} escapes carry the code point's
+  ;; UTF-8 encoding. The old pin asserted the loop-9 interim
+  ;; behavior (UTF-8 re-encoding of every char) — superseded.
+  ;; \\e9 = one raw byte 0xE9:
   (let ((m (%wat "(module (memory 1) (data (i32.const 0) \"\\e9\"))")))
     (wasmdown:validate-module m)
     (let ((d (aref (wasmdown.types:wasm-module-datas m) 0)))
+      (wasmdown.test:is (equalp #(233)
+                                (wasmdown.types:wasm-data-bytes d)))))
+  ;; \\u{e9} = e-acute's UTF-8 encoding (C3 A9):
+  (let ((m (%wat "(module (memory 1) (data (i32.const 0) \"\\u{e9}\"))")))
+    (wasmdown:validate-module m)
+    (let ((d (aref (wasmdown.types:wasm-module-datas m) 0)))
       (wasmdown.test:is (equalp #(195 169)
-                                (wasmdown.types:wasm-data-bytes d))))))
+                                (wasmdown.types:wasm-data-bytes d)))))
+  ;; surrogate escapes REJECT at decode (utf8-invalid-encoding):
+  (wasmdown.test:assert-raises wasmdown:decode-error
+    (%wat "(module (memory 1) (data (i32.const 0) \"\\u{d800}\"))")))

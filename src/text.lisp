@@ -121,54 +121,138 @@ with :lparen/:rparen balanced; strings are decoded (with escapes)."
       (coerce (nreverse tokens) 'vector))))
 
 (defun %read-string (s i)
-  "Read a \"...\" string starting at S[I] = #\". Returns the decoded
-string and the index past the closing quote. Escapes: \\t \\n \\r \\\" \\\'
-\\\\ \\\\xx (hex byte) and \\\\uuXXXX (Unicode code point)."
+  "Read a \"...\" string literal starting at S[I] = #\". Returns the
+decoded BYTE VECTOR and the index past the closing quote. Per the
+WAT grammar a string literal is a sequence of BYTES: \\xx escapes are
+raw bytes, \\t \\n \\r \\\" \\' \\\\ map to their byte values, and \\u{hex}
+appends the UTF-8 encoding of the code point (surrogates and code
+points above U+10FFFF are malformed). Raw source characters above
+U+007F arrive pre-encoded as their UTF-8 byte sequence by the script
+reader (byte-valued characters); non-byte characters in a direct
+parse-wat input are UTF-8 encoded here so both entry paths agree."
   (let ((n (length s))
-        (out (make-array 16 :element-type 'character
+        (out (make-array 16 :element-type '(unsigned-byte 8)
                          :fill-pointer 0 :adjustable t)))
-    (incf i)
-    (loop
-      (when (>= i n)
-        (%text-error i "unclosed string literal"))
-      (let ((c (char s i)))
-        (cond
-         ((char= c #\")
-          (return (values (coerce out 'string) (1+ i))))
-         ((char/= c #\\)
-          (vector-push-extend c out)
-          (incf i))
-         (t
-          (incf i)
-          (when (>= i n)
-            (%text-error i "unclosed string escape"))
-          (let ((e (char s i)))
-            (cond
-             ((char= e #\t) (vector-push-extend #\Tab out) (incf i))
-             ((char= e #\n) (vector-push-extend #\Newline out) (incf i))
-             ((char= e #\r) (vector-push-extend #\Return out) (incf i))
-             ((char= e #\") (vector-push-extend #\" out) (incf i))
-             ((char= e #\') (vector-push-extend #\' out) (incf i))
-             ((char= e #\\) (vector-push-extend #\\ out) (incf i))
-             ((char= e #\u)
-              (when (or (< (+ i 5) n)
-                        (notevery #'%hexdigit-p (subseq s (1+ i) (+ i 5))))
-                (%text-error i "bad \\u escape"))
-              (vector-push-extend
-               (code-char (parse-integer s :start (1+ i) :end (+ i 5)
-                                          :radix 16))
-               out)
-              (incf i 5))
-             ((%hexdigit-p e)
-              (when (or (>= (1+ i) n) (not (%hexdigit-p (char s (1+ i)))))
-                (%text-error i "bad hex escape ~a~a" e
-                             (if (< (1+ i) n) (char s (1+ i)) #\?)))
-              (vector-push-extend (code-char
-                                   (parse-integer s :start i :end (+ i 2)
-                                                  :radix 16))
-                                  out)
-              (incf i 2))
-             (t (%text-error i "unknown string escape \\~c" e))))))))))
+    (labels ((put (b) (vector-push-extend b out))
+             (put-utf8 (cp)
+               (cond
+                ((< cp #x80) (put cp))
+                ((< cp #x800)
+                 (put (logior #xC0 (ash cp -6)))
+                 (put (logior #x80 (logand cp #x3F))))
+                ((< cp #x10000)
+                 (put (logior #xE0 (ash cp -12)))
+                 (put (logior #x80 (logand (ash cp -6) #x3F)))
+                 (put (logior #x80 (logand cp #x3F))))
+                (t
+                 (put (logior #xF0 (ash cp -18)))
+                 (put (logior #x80 (logand (ash cp -12) #x3F)))
+                 (put (logior #x80 (logand (ash cp -6) #x3F)))
+                 (put (logior #x80 (logand cp #x3F)))))))
+      (incf i)
+      (loop
+        (when (>= i n)
+          (%text-error i "unclosed string literal"))
+        (let ((c (char s i)))
+          (cond
+           ((char= c #\")
+            (return (values (coerce out 'vector) (1+ i))))
+           ((char/= c #\\)
+            (if (< (char-code c) #x100)
+                (put (char-code c))
+                (put-utf8 (char-code c)))
+            (incf i))
+           (t
+            (incf i)
+            (when (>= i n)
+              (%text-error i "unclosed string escape"))
+            (let ((e (char s i)))
+              (cond
+               ((char= e #\t) (put 9) (incf i))
+               ((char= e #\n) (put 10) (incf i))
+               ((char= e #\r) (put 13) (incf i))
+               ((char= e #\") (put 34) (incf i))
+               ((char= e #\') (put 39) (incf i))
+               ((char= e #\\) (put 92) (incf i))
+               ((char= e #\u)
+                ;; \u{hex...}: 1..6 hex digits, then the UTF-8 bytes
+                (let ((j (+ i 2)))
+                  (unless (and (< j n) (char= (char s (1+ i)) #\{))
+                    (%text-error i "bad \\u escape"))
+                  (loop
+                    (unless (< j n) (%text-error j "unclosed \\u escape"))
+                    (let ((u (char s j)))
+                      (cond ((char= u #\}) (incf j) (return))
+                            ((%hexdigit-p u) (incf j))
+                            (t (%text-error j "bad \\u escape")))))
+                  (let ((hex (subseq s (+ i 2) (1- j))))
+                    (when (zerop (length hex))
+                      (%text-error i "empty \\u escape"))
+                    (let ((cp (parse-integer hex :radix 16)))
+                      (cond
+                       ((and (>= cp #xD800) (<= cp #xDFFF))
+                        (%text-error i "malformed UTF-8 codepoint"))
+                       ((> cp #x10FFFF)
+                        (%text-error i "malformed UTF-8 codepoint"))
+                       (t (put-utf8 cp)))))
+                  (setf i j)))
+               ((%hexdigit-p e)
+                (unless (and (< (1+ i) n) (%hexdigit-p (char s (1+ i))))
+                  (%text-error i "bad hex escape"))
+                (put (parse-integer s :start i :end (+ i 2) :radix 16))
+                (incf i 2))
+               (t (%text-error i "unknown string escape \\~c" e)))))))))))
+
+;;; ---------------------------------------------------------------
+;;; Names: a name is a UTF-8-encoded byte vector. Strict validation
+;;; (the same rules as the binary decoder's read-name): overlong
+;;; forms, surrogates, code points above U+10FFFF, bad lead and
+;;; continuation bytes are decode errors. assert_malformed
+;;; "malformed UTF-8 encoding" cases exercise all of them through
+;;; \\xx escapes in quoted modules.
+
+(defun %utf8-validate (bytes pos)
+  "Validate BYTE VECTOR as UTF-8; signals decode-error at POS on any
+malformed sequence (the same rules as the binary decoder's
+read-name: overlong forms, surrogate code points, code points above
+U+10FFFF, bad lead/continuation bytes, truncated sequences).
+Returns the vector."
+  (let ((n (length bytes))
+        (i 0))
+    (flet ((bad () (%text-error pos "malformed UTF-8 encoding"))
+           (cont (k)
+             (unless (and (< (+ i k) n)
+                          (>= (aref bytes (+ i k)) #x80)
+                          (<= (aref bytes (+ i k)) #xBF))
+               (bad))
+             (- (aref bytes (+ i k)) #x80)))
+      (declare (ignorable #'bad #'cont))
+      (loop while (< i n)
+            for b = (aref bytes i)
+            do (cond
+                ((< b #x80) (incf i))
+                ((and (>= b #xC2) (<= b #xDF))
+                 (unless (< (+ i 1) n) (bad))
+                 (cont 1) (incf i 2))
+                ((and (>= b #xE0) (<= b #xEF))
+                 (unless (< (+ i 2) n) (bad))
+                 (let ((cp (logior (ash (- b #xE0) 12)
+                                   (ash (cont 1) 6)
+                                   (cont 2))))
+                   (when (< cp #x800) (bad))
+                   (when (and (>= cp #xD800) (<= cp #xDFFF)) (bad))
+                   (incf i 3)))
+                ((and (>= b #xF0) (<= b #xF4))
+                 (unless (< (+ i 3) n) (bad))
+                 (let ((cp (logior (ash (- b #xF0) 18)
+                                   (ash (cont 1) 12)
+                                   (ash (cont 2) 6)
+                                   (cont 3))))
+                   (when (< cp #x10000) (bad))
+                   (when (> cp #x10FFFF) (bad))
+                   (incf i 4)))
+                (t (bad)))))
+    bytes))
 
 (defun %read-atom (s i)
   "Read an atom (id / keyword / number) starting at S[I]. Returns the
@@ -195,40 +279,110 @@ fields can require numeric forms; keyword classification happens later."
 
 (defun %atom-kind (text)
   "Classify a bare atom: nat, int, float, keyword (op/field name) or
-plain symbol (type names like i32 are keywords here)."
-  (let ((p 0) (len (length text)))
-    (when (and (< p len) (member (char text p) '(#\+ #\-)))
-      (incf p))
-    (cond
-     ;; 0x... integer (hex, possibly with _)
-     ((and (<= (+ p 2) len) (char= (char text p) #\0)
-           (char= (char text (1+ p)) #\x)
-           (plusp (- len (+ p 2))))
-      :nat)
-     ;; decimal integer: digits only (with _ separators)
-     ((and (< p len)
-           (every (lambda (c) (or (%digit-p c) (char= c #\_)))
-                  (subseq text p))
-           (notevery (lambda (c) (char= c #\_)) (subseq text p)))
-      :nat)
-     ;; float: inf/nan/hex-float/decimal-float
-     ((%float-literal-p text) :float)
-     (t :keyword))))
+plain symbol (type names like i32 are keywords here). All numeric
+shapes go through the STRICT %num-shape grammar (underscores between
+digits only, digits around '.'/exponents), so malformed spellings
+(1__000, 0x_1p1, 99_) classify as :keyword — const parsers then
+report them as bad immediates ('unknown operator' per the suite)."
+  (let ((low (string-downcase text)))
+    (case (%num-shape low)
+      (:decint (if (and (plusp (length low))
+                        (member (char low 0) '(#\+ #\-)))
+                  :int :nat))
+      (:hexint (if (and (plusp (length low))
+                        (member (char low 0) '(#\+ #\-)))
+                  :int :nat))
+      (:hexfloat :float)
+      (:decfloat :float)
+      (t
+       ;; inf / nan / nan:0xpayload (strict payload grammar)
+       (cond
+        ;; signed inf/nan (+inf, -inf, +nan, -nan and signed
+        ;; nan:0x payloads via %float-literal-p)
+        ((or (string= low "inf") (string= low "nan")
+             (and (>= (length low) 4)
+                  (member (char low 0) '(#\+ #\-))
+                  (or (string= (subseq low 1) "inf")
+                      (string= (subseq low 1) "nan")))
+             (%float-literal-p text))
+         :float)
+        (t :keyword))))))
+
+(defun %nat-hex-ok (s)
+  "Whether S is a nonempty hex-digit run with legal single
+underscores between digits (the nan:0x payload grammar)."
+  (and (plusp (length s))
+       (loop with prev-digit = nil
+             for c across s
+             always (cond
+                     ((%hexdigit-p c) (setf prev-digit t) t)
+                     ((char= c #\_)
+                      (prog1 prev-digit (setf prev-digit nil)))
+                     (t nil)))
+       (char/= (char s (1- (length s))) #\_)))
 
 (defun %float-literal-p (text)
   "Whether TEXT is a float literal per the WAT grammar: inf, nan,
-nan:0x..., or a decimal/hex number with . or p/e exponent parts."
-  (let ((low (string-downcase text)))
+nan:0x<digits>, or a strict decimal/hex float shape. nan:canonical /
+nan:arithmetic are SCRIPT-ONLY directives (assert_return results);
+inside modules they are malformed (i32.wast/i64.wast/f32.wast/
+f64.wast assert_malformed 'unexpected token' cases)."
+  (let* ((low0 (string-downcase text))
+         (low (if (and (plusp (length low0))
+                       (member (char low0 0) '(#\+ #\-)))
+                  (subseq low0 1)
+                  low0)))
+    (declare (ignorable low0))
     (cond ((or (string= low "inf") (string= low "nan")) t)
-          ((and (> (length low) 4) (string= low "nan:" :end1 4)) t)
+          ;; nan:0x payload: hex digits only, no underscores per the
+          ;; grammar? The suite pins nan:0x7f_ffff as VALID, so
+          ;; underscores are allowed like digits here.
+          ((and (> (length low) 6) (string= low "nan:0x" :end1 6)
+                (%nat-hex-ok (subseq low 6)))
+           t)
           (t (multiple-value-bind (kind) (%num-shape low)
                (member kind '(:hexfloat :decfloat)))))))
 
 (defun %num-shape (low)
   "Return the shape of a number token LOWERCASED: :hexint, :decint,
-:hexfloat, :decfloat or :other. Underscores are permitted like digits."
-  (labels ((digp (c) (or (%digit-p c) (char= c #\_)))
-            (hexp (c) (or (%hexdigit-p c) (char= c #\_))))
+:hexfloat, :decfloat or :other. STRICT per the WAT grammar:
+
+  - underscores separate DIGITS only: never leading, trailing,
+    doubled, or adjacent to '.', 'e'/'p', or a sign;
+  - at least one digit before '.' ('.0' is malformed), at least one
+    digit after '.' when a fraction is present;
+  - hex floats (0x...) may omit the fraction entirely and the p
+    exponent entirely, but any '.' or 'p' present must carry digits
+    around it ('0x.', '0x0p', '0x0p+' malformed);
+  - decimal floats require digits around '.', and e-exponents
+    require digits after the optional sign;
+  - '0x' with no digits is malformed (not a number).
+
+This strictness is pinned by float_literals.wast, int_literals.wast
+and const.wast assert_malformed batches ('unknown operator')."
+  (labels ((digp (c) (%digit-p c))
+           (hexp (c) (%hexdigit-p c))
+           ;; run of digits with single underscores between them;
+           ;; returns (values okp nextpos digit-count)
+           (digits (from pred)
+             ;; a run of digits separated by single underscores.
+             ;; OK is NIL when an underscore is leading, trailing,
+             ;; doubled, or adjacent to a non-digit on either side.
+             (let ((p from) (count 0) (ok t) (last-digit-p nil))
+               (loop while (< p (length low))
+                     for c = (char low p)
+                     while (or (funcall pred c) (char= c #\_))
+                     do (cond
+                         ((char= c #\_)
+                          (unless (and last-digit-p
+                                       (< (1+ p) (length low))
+                                       (funcall pred (char low (1+ p))))
+                            (setf ok nil)
+                            (return))
+                          (setf last-digit-p nil))
+                         (t (incf count) (setf last-digit-p t)))
+                        do (incf p))
+               (values ok p count))))
     (let* ((len (length low))
            (p (if (and (plusp len) (member (char low 0) '(#\+ #\-))) 1 0))
            (start p)
@@ -236,38 +390,59 @@ nan:0x..., or a decimal/hex number with . or p/e exponent parts."
                      (char= (char low (1+ p)) #\x)))
            (pred (if hex #'hexp #'digp)))
       (when hex (incf p 2))
-      ;; integer digits
-      (loop while (and (< p len) (funcall pred (char low p))) do (incf p))
-      (cond
-       ((and (= p len) (> p start) (not (char= (char low (1- p)) #\_)))
-        (if hex :hexint :decint))
-       ;; fractional part
-       ((and (< p len) (char= (char low p) #\.))
-        (incf p)
-        (loop while (and (< p len) (funcall pred (char low p))) do (incf p))
-        (when (and (< p len)
-                   (or (and hex (char= (char low p) #\p))
-                       (and (not hex) (char= (char low p) #\e))))
-          ;; exponent present: float
-          (incf p)
-          (when (and (< p len) (member (char low p) '(#\+ #\-))) (incf p))
-          (loop while (and (< p len) (%digit-p (char low p))) do (incf p))
-          (when (= p len) (return-from %num-shape
-                            (if hex :hexfloat :decfloat))))
-        ;; fraction with no exponent is still a decimal float
-        (when (and (not hex) (= p len))
-          :decfloat)
-        )
-       ;; integer with exponent, no fraction
-       ((and (< p len)
-             (or (and hex (char= (char low p) #\p))
-                 (and (not hex) (char= (char low p) #\e))))
-        (incf p)
-        (when (and (< p len) (member (char low p) '(#\+ #\-))) (incf p))
-        (loop while (and (< p len) (%digit-p (char low p))) do (incf p))
-        (when (= p len)
-          (if hex :hexfloat :decfloat)))
-       (t :other)))))
+      (multiple-value-bind (int-ok p1 int-count)
+          (digits p pred)
+        (unless int-ok (return-from %num-shape :other))
+        (setf p p1)
+        (cond
+         ;; integer only
+         ((and (= p len) (> int-count 0))
+          (if hex :hexint :decint))
+         ;; fraction and/or exponent
+         ((< p len)
+          (let ((frac-count 0)
+                (dot-p nil))
+            (when (char= (char low p) #\.)
+              ;; '.' must follow at least one digit and lead >=1 digit
+              (when (zerop int-count) (return-from %num-shape :other))
+              (setf dot-p t)
+              (incf p)
+              (multiple-value-bind (f-ok p2 fc)
+                  (digits p pred)
+                (unless f-ok (return-from %num-shape :other))
+                (setf p p2 frac-count fc)))
+            (cond
+             ((and (< p len)
+                   (char= (char low p) (if hex #\p #\e)))
+              ;; exponent: hex floats REQUIRE either digits or a dot
+              ;; before p; decimals likewise; digits must follow the
+              ;; optional sign.
+              (when (and hex (zerop int-count) (zerop frac-count))
+                (return-from %num-shape :other))
+              (when (and (not hex) (zerop int-count) (zerop frac-count))
+                (return-from %num-shape :other))
+              (incf p)
+              (when (and (< p len) (member (char low p) '(#\+ #\-)))
+                (incf p))
+              (multiple-value-bind (e-ok p3 ec)
+                  (digits p #'digp)
+                (declare (ignore e-ok))
+                (when (zerop ec) (return-from %num-shape :other))
+                (setf p p3)
+                (if (= p len)
+                    (if hex :hexfloat :decfloat)
+                    :other)))
+             ;; no exponent: decimal fraction only; hex needs >=1
+             ;; digit on one side of the dot (both-empty rejected
+             ;; above via int-count check)
+             ((= p len)
+              (if (and (or dot-p (> int-count 0)) (not hex))
+                  :decfloat
+                  (if (and hex dot-p (> (+ int-count frac-count) 0))
+                      :hexfloat
+                      :other)))
+             (t :other))))
+         (t :other))))))
 
 ;;; ---------------------------------------------------------------
 ;;; Token trees. A node is (:list . children) or a leaf token
@@ -343,8 +518,13 @@ unsigned bit pattern (sign + exponent field + mantissa field)."
         (logior (ash (sign-bit) sign-pos)
                 (ash exp-all-ones mant-w)
                 (ash 1 (- mant-w 1))))       ; canonical NaN payload
-       ((and (> (length body) 4) (string= body "nan:" :end1 4))
-        (let ((payload (parse-integer body :start 6 :radix 16)))
+       ((and (> (length body) 5) (string= body "nan:0x" :end1 6)
+             ;; strict payload grammar: hex digits with legal single
+             ;; underscores (const.wast: nan:0x7f_ffff VALID, nan:1
+             ;; and nan:0x0/overwide REJECTED)
+             (%nat-hex-ok (subseq body 6)))
+        (let ((payload (parse-integer (remove #\_ body)
+                                      :start 6 :radix 16)))
           ;; WAT grammar: 0 < payload < 2^significand (the FULL
           ;; significand, not the canonical-quiet sub-range).
           (when (or (zerop payload) (>= payload (ash 1 (- p 1))))
@@ -526,7 +706,13 @@ number. Signals decode-error for unknown ids or malformed tokens."
      (t (%text-error (tok-pos tok) "bad ~a index token ~a" what text)))))
 
 (defun %parse-nat (text pos)
-  "Parse an unsigned integer token (dec or 0x hex, _ separators)."
+  "Parse an unsigned integer token (dec or 0x hex). STRICT grammar:
+underscores separate digits only (never leading, trailing, doubled
+or adjacent to the 0x prefix) — int_literals.wast pins 1__000,
+0x_100, 0x00_, _0x100, 0xff__ffff as malformed."
+  (let ((shape (%num-shape (string-downcase text))))
+    (unless (or (eq shape :decint) (eq shape :hexint))
+      (%text-error pos "malformed integer ~a" text)))
   (let ((clean (remove #\_ text)))
     (multiple-value-bind (v end)
         (parse-integer clean :radix (if (and (> (length clean) 1)
@@ -991,25 +1177,41 @@ rest of the plain sequence."
      ((gethash k *plain-op-keywords*)
       (values (make-wasm-instr op-key nil #() 0) rest))
      ;; integer consts: :value keeps the SIGNED literal (the binary
-     ;; decoder reads s32/s64; tests/binary expects e.g. -1 for -1)
+     ;; decoder reads s32/s64; tests/binary expects e.g. -1 for -1).
+     ;; STRICT: the immediate must be a well-formed integer token;
+     ;; i32.const nan:* / 1x / 0x etc are 'unknown operator'
+     ;; malformed text (i32.wast/i64.wast/const.wast assert_malformed).
      ((member k '("i32.const" "i64.const") :test #'string=)
       (unless (and rest (tok-p (car rest)))
         (funcall bad))
-      (let ((v (%parse-int (tok-text (car rest)) (tok-pos (car rest)))))
-        (values (make-wasm-instr op-key (list :value v) #() 0)
-                (cdr rest))))
-     ;; float consts (exact bit patterns)
+      (let ((tok (car rest)))
+        (unless (member (tok-kind tok) '(:nat :int))
+          (funcall bad))
+        (let ((v (%parse-int (tok-text tok) (tok-pos tok))))
+          (values (make-wasm-instr op-key (list :value v) #() 0)
+                  (cdr rest)))))
+     ;; float consts (exact bit patterns). STRICT: the immediate must
+     ;; be a :float-classified token; f32.const nan:canonical /
+     ;; nan:arithmetic / 0x / 1x are 'unknown operator' malformed text
+     ;; (f32.wast/f64.wast/const.wast assert_malformed cases).
      ((member k '("f32.const" "f64.const") :test #'string=)
       (unless (and rest (tok-p (car rest)))
         (funcall bad))
-      (let* ((text (tok-text (car rest)))
-             (f32-p (string= k "f32.const")))
-        (values (make-wasm-instr op-key
-                                 (list :bits (%float-bits text
-                                                          (if f32-p 24 53)
-                                                          (if f32-p 127 1023)))
-                                 #() 0)
-                (cdr rest))))
+      (let ((tok (car rest)))
+        ;; WAT float grammar accepts integer spellings (f64.const 0
+        ;; = 0.0); :nat/:int tokens are valid float immediates.
+        ;; :keyword rejects nan:canonical/nan:arithmetic (script-only
+        ;; directives) and other malformed spellings.
+        (unless (member (tok-kind tok) '(:float :nat :int))
+          (funcall bad))
+        (let* ((text (tok-text tok))
+               (f32-p (string= k "f32.const")))
+          (values (make-wasm-instr op-key
+                                   (list :bits (%float-bits text
+                                                            (if f32-p 24 53)
+                                                            (if f32-p 127 1023)))
+                                   #() 0)
+                  (cdr rest)))))
      ;; memarg ops: offset=/align= (both optional; align is a power of 2)
      ((gethash k *memarg-op-keywords*)
       (let ((offset 0) (align-hint nil) (items rest))
@@ -1295,12 +1497,54 @@ could not know."
         (setf (gethash (tok-text id) table) idx)))))
 
 (defun %string-tok (x)
-  "The decoded string of a :string token X, or decode-error."
+  "The decoded byte vector of a :string token X, or decode-error."
   (unless (and (tok-p x) (eq (tok-kind x) :string))
     (%text-error (if (tok-p x) (tok-pos x) 0)
                  "expected a string, found ~a"
                  (if (tok-p x) (tok-text x) x)))
   (tok-text x))
+
+(defun %name-tok (x)
+  "A NAME string token as a UTF-8-validated byte vector: names must
+be well-formed UTF-8 per the spec, and \\xx escapes can spell invalid
+sequences which assert_malformed cases require rejected at decode."
+  (%utf8-validate (%string-tok x) (if (tok-p x) (tok-pos x) 0)))
+
+(defun %name-string (bytes)
+  "The Lisp string for a validated UTF-8 name byte vector (the IR
+stores strings)."
+  (let ((out (make-array (max 4 (length bytes))
+                         :element-type 'character
+                         :fill-pointer 0 :adjustable t))
+        (i 0)
+        (n (length bytes)))
+    (declare (type (integer 0) i))
+    (loop while (< i n)
+          for b = (aref bytes i)
+          do (cond
+              ((< b #x80) (vector-push-extend (code-char b) out) (incf i))
+              ((and (>= b #xC2) (<= b #xDF))
+               (vector-push-extend
+                (code-char (logior (ash (- b #xC0) 6)
+                                   (- (aref bytes (+ i 1)) #x80)))
+                out)
+               (incf i 2))
+              ((and (>= b #xE0) (<= b #xEF))
+               (vector-push-extend
+                (code-char (logior (ash (- b #xE0) 12)
+                                   (ash (- (aref bytes (+ i 1)) #x80) 6)
+                                   (- (aref bytes (+ i 2)) #x80)))
+                out)
+               (incf i 3))
+              (t
+               (vector-push-extend
+                (code-char (logior (ash (- b #xF0) 18)
+                                   (ash (- (aref bytes (+ i 1)) #x80) 12)
+                                   (ash (- (aref bytes (+ i 2)) #x80) 6)
+                                   (- (aref bytes (+ i 3)) #x80)))
+                out)
+               (incf i 4))))
+    (coerce out 'string)))
 
 (defun %opt-id (items)
   "Split ITEMS into (values id-tok-or-nil rest-items) when the head is
@@ -1444,8 +1688,8 @@ the kind's running import count (its true index-space position)."
 
 (defun %parse-import-field (node penv)
   "Parse an (import \"m\" \"f\" desc) field."
-  (let ((module (%string-tok (third node)))
-        (field (%string-tok (fourth node)))
+  (let ((module (%name-string (%name-tok (third node))))
+        (field (%name-string (%name-tok (fourth node))))
         (desc (fifth node)))
     (unless (and desc (tok-elem-p desc))
       (%text-error 0 "import needs a descriptor"))
@@ -1478,7 +1722,7 @@ An inline (import) turns the func into an import entry instead."
                        (string= (%tok-keyword (%first-tok (car rest)))
                                 "export"))
             do (let* ((ex (car rest))
-                      (name (%string-tok (third ex)))
+                      (name (%name-string (%name-tok (third ex))))
                       (idx (+ (penv-n-imported-funcs penv)
                               (length (penv-funcs-list penv)))))
                  (declare (ignore id))
@@ -1489,8 +1733,8 @@ An inline (import) turns the func into an import entry instead."
       (if (and rest (tok-elem-p (car rest))
                (string= (%tok-keyword (%first-tok (car rest))) "import"))
           (let* ((im (car rest))
-                 (module (%string-tok (third im)))
-                 (field (%string-tok (fourth im)))
+                 (module (%name-string (%name-tok (third im))))
+                 (field (%name-string (%name-tok (fourth im))))
                  (body-items (cdr rest)))
             (when id
               (%register-id id (penv-funcs penv) "func" (tok-pos id)
@@ -1579,7 +1823,7 @@ Returns the remaining items."
                    (string= (%tok-keyword (%first-tok (car rest)))
                             "export"))
         do (let* ((ex (car rest))
-                  (name (%string-tok (third ex)))
+                  (name (%name-string (%name-tok (third ex))))
                   (idx (+ (ecase kind
                             (:func (penv-n-imported-funcs penv))
                             (:table (penv-n-imported-tables penv))
@@ -1640,14 +1884,14 @@ abbreviation (which also emits the elem segment)."
                (string= (%tok-keyword (%first-tok (car rest))) "import"))
           ;; inline import abbreviation
           (let* ((im (car rest))
-                 (module (%string-tok (third im)))
-                 (field (%string-tok (fourth im)))
+                 (module (%name-string (%name-tok (third im))))
+                 (field (%name-string (%name-tok (fourth im))))
                  (tail (cdr rest)))
             (when id
               (%register-id id (penv-tables penv) "table" (tok-pos id)
                              (penv-n-imported-tables penv)))
             (incf (penv-n-imported-tables penv))
-            (let ((ty (%import-table-type "table" tail (tok-pos id))))
+            (let ((ty (%import-table-type "table" tail (and id (tok-pos id)))))
               (push (make-wasm-import module field :table ty)
                     (penv-imports-list penv))))
           ;; defined table
@@ -1683,14 +1927,14 @@ import, then limits (n [n]) or the (data ...) abbreviation."
       (if (and rest (tok-elem-p (car rest))
                (string= (%tok-keyword (%first-tok (car rest))) "import"))
           (let* ((im (car rest))
-                 (module (%string-tok (third im)))
-                 (field (%string-tok (fourth im)))
+                 (module (%name-string (%name-tok (third im))))
+                 (field (%name-string (%name-tok (fourth im))))
                  (tail (cdr rest)))
             (when id
               (%register-id id (penv-mems penv) "memory" (tok-pos id)
                              (penv-n-imported-mems penv)))
             (incf (penv-n-imported-mems penv))
-            (let ((ty (%import-memory-type tail (tok-pos id))))
+            (let ((ty (%import-memory-type tail (and id (tok-pos id)))))
               (push (make-wasm-import module field :memory
                                       (make-wasm-memory ty))
                     (penv-imports-list penv))))
@@ -1749,8 +1993,8 @@ single folded list or a plain instruction sequence ending with end)."
       (if (and rest (tok-elem-p (car rest))
                (string= (%tok-keyword (%first-tok (car rest))) "import"))
           (let* ((im (car rest))
-                 (module (%string-tok (third im)))
-                 (field (%string-tok (fourth im)))
+                 (module (%name-string (%name-tok (third im))))
+                 (field (%name-string (%name-tok (fourth im))))
                  (tail (cdr rest)))
             (when id
               (%register-id id (penv-globals penv) "global" (tok-pos id)
@@ -1807,7 +2051,7 @@ error."
 
 (defun %parse-export-field (node penv)
   "Parse an (export \"n\" (kind idx)) field."
-  (let ((name (%string-tok (third node)))
+  (let ((name (%name-string (%name-tok (third node))))
         (desc (fourth node)))
     (unless (and desc (tok-elem-p desc))
       (%text-error 0 "export needs a descriptor"))
@@ -1843,36 +2087,20 @@ error."
 ;;; ---------------------------------------------------------------
 ;;; Element and data segments.
 
-(defun %utf8-encode-char (ch out)
-  "Append the UTF-8 encoding of character CH to the adjustable octet
-vector OUT (the WAT spec encodes data segment string literals as
-UTF-8, so code points above #xFF occupy 2-4 bytes)."
-  (let ((cp (char-code ch)))
-    (flet ((push1 (b) (vector-push-extend b out)))
-      (cond ((< cp #x80) (push1 cp))
-            ((< cp #x800)
-             (push1 (logior #xC0 (ash cp -6)))
-             (push1 (logior #x80 (logand cp #x3F))))
-            ((< cp #x10000)
-             (push1 (logior #xE0 (ash cp -12)))
-             (push1 (logior #x80 (logand (ash cp -6) #x3F)))
-             (push1 (logior #x80 (logand cp #x3F))))
-            (t
-             (push1 (logior #xF0 (ash cp -18)))
-             (push1 (logior #x80 (logand (ash cp -12) #x3F)))
-             (push1 (logior #x80 (logand (ash cp -6) #x3F)))
-             (push1 (logior #x80 (logand cp #x3F))))))))
-
 (defun %data-bytes (items)
   "Concatenate the :string tokens of a data segment into a byte
-vector, UTF-8 encoded (token.wast pins astral-plane code points in
-data strings: the bytes are the UTF-8 form, not char-code)."
-  (let ((out (make-array 16 :element-type '(unsigned-byte 8)
-                         :fill-pointer 0 :adjustable t)))
-    (dolist (x items)
-      (let ((s (%string-tok x)))
-        (loop for ch across s
-              do (%utf8-encode-char ch out))))
+vector. String literals ARE byte sequences (the tokenizer's byte
+vector is taken verbatim): \\xx escapes are raw bytes and \\u{...}
+escapes are already UTF-8 encoded (token.wast pins astral-plane code
+points in data strings; their byte form is what lands in memory)."
+  (let* ((chunks (mapcar (lambda (x) (%string-tok x)) items))
+         (total (reduce #'+ (mapcar #'length chunks) :initial-value 0))
+         (out (make-array (max 16 total)
+                          :element-type '(unsigned-byte 8)
+                          :fill-pointer 0 :adjustable t)))
+    (declare (ignore total))
+    (dolist (v chunks)
+      (loop for b across v do (vector-push-extend b out)))
     (coerce out 'vector)))
 
 (defun %elem-items (items rt penv)
@@ -2096,7 +2324,8 @@ order, interleaved with defined entities. Type ids stay deferred
               (reg (node-id node) (penv-funcs penv) nfuncs)
               (incf nfuncs)))
            ((string= k "import")
-            (let ((desc (fourth node)))
+            ;; the descriptor is the FIFTH child: (import "m" "f" (desc ...))
+            (let ((desc (fifth node)))
               (when (and desc (tok-elem-p desc))
                 (let* ((dk (%tok-keyword (%first-tok desc)))
                        (did (third desc)))
@@ -2126,24 +2355,66 @@ order, interleaved with defined entities. Type ids stay deferred
             (reg (node-id node) (penv-datas penv) ndatas)
             (incf ndatas))))))))
 
+(defun %inline-import-p (node k)
+  "Whether a func/table/memory/global field node carries the inline
+(import \"m\" \"f\") abbreviation: skip the optional $id and any
+leading (export ...) items, then look for an (import ...) item."
+  (declare (ignore k))
+  (let ((rest (cddr node)))
+    (multiple-value-bind (id rest2) (%opt-id rest)
+      (declare (ignore id))
+      (loop while (and rest2 (tok-elem-p (car rest2))
+                       (string= (%tok-keyword (%first-tok (car rest2)))
+                                "export"))
+            do (pop rest2))
+      (and rest2 (tok-elem-p (car rest2))
+           (string= (%tok-keyword (%first-tok (car rest2))) "import")))))
+
+(defun %intern-key (k)
+  (intern (string-upcase k) :keyword))
+
 (defun %parse-module-fields (nodes penv)
-  "Dispatch each top-level field :list node to its parser."
-  (dolist (node nodes)
-   (let* ((head (%first-tok node))
-          (k (and head (%tok-keyword head))))
-     (cond
-      ((string= k "type") (%parse-type-field node penv))
-      ((string= k "import") (%parse-import-field node penv))
-      ((string= k "func") (%parse-func-field node penv))
-      ((string= k "table") (%parse-table-field node penv))
-      ((string= k "memory") (%parse-memory-field node penv))
-      ((string= k "global") (%parse-global-field node penv))
-      ((string= k "export") (%parse-export-field node penv))
-      ((string= k "start") (%parse-start-field node penv))
-      ((string= k "elem") (%parse-elem-field node penv))
-      ((string= k "data") (%parse-data-field node penv))
-      (t (%text-error (and head (tok-pos head))
-                     "unknown module field ~a" k))))))
+  "Dispatch each top-level field :list node to its parser. IMPORTS
+FIRST: the WAT grammar requires every (import ...) field to precede
+all func/table/memory/global definitions (their inline (import ...)
+abbreviations expand to import fields at the same position).
+imports.wast pins the 16 'import after function/global/table/memory'
+assert_malformed cases."
+  (let ((seen-def nil))
+    (dolist (node nodes)
+      (let* ((head (%first-tok node))
+             (k (and head (%tok-keyword head))))
+        (cond
+         ((string= k "type") (%parse-type-field node penv))
+         ((string= k "import")
+          (when seen-def
+            (%text-error (and head (tok-pos head))
+                         "import after function/table/memory/global definition"))
+          (%parse-import-field node penv))
+         ((member k '("func" "table" "memory" "global") :test #'string=)
+          ;; inline-import abbreviations ((func (import ...)) etc.)
+          ;; expand to import fields at this position: after any
+          ;; definition they are malformed exactly like a bare
+          ;; (import ...) there. Otherwise this field IS a
+          ;; definition and closes the import prefix.
+          (let ((inline-import-p (%inline-import-p node k)))
+            (cond
+             ((and inline-import-p seen-def)
+              (%text-error (and head (tok-pos head))
+                           "import after function/table/memory/global definition"))
+             ((null inline-import-p)
+              (setf seen-def t))))
+          (case (%intern-key k)
+            (:func (%parse-func-field node penv))
+            (:table (%parse-table-field node penv))
+            (:memory (%parse-memory-field node penv))
+            (:global (%parse-global-field node penv))))
+         ((string= k "export") (%parse-export-field node penv))
+         ((string= k "start") (%parse-start-field node penv))
+         ((string= k "elem") (%parse-elem-field node penv))
+         ((string= k "data") (%parse-data-field node penv))
+         (t (%text-error (and head (tok-pos head))
+                         "unknown module field ~a" k)))))))
 
 (defun parse-wat (s)
   "Parse WAT text (a string) into a wasm-module IR identical to the

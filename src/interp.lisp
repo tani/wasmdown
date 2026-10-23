@@ -697,8 +697,10 @@ target. Returns the operands plus the truncated remainder via THROW."
      (multiple-value-bind (idx s1) (pop-val s)
        (push (wasmdown.runtime:table-get (%table-at (getf imms :table)) idx) s1)))
     ((eq op :table.set)
-     (multiple-value-bind (idx s1) (pop-val s)
-       (multiple-value-bind (ref s2) (pop-val s1)
+     ;; Stack order [idx, ref] with ref on top: pop ref FIRST, then
+     ;; idx (the old code popped idx first — the scout-verified bug).
+     (multiple-value-bind (ref s1) (pop-val s)
+       (multiple-value-bind (idx s2) (pop-val s1)
          (wasmdown.runtime:table-set (%table-at (getf imms :table)) idx ref)
          s2)))
     ;; ---- memory ----
