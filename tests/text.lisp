@@ -404,3 +404,27 @@ EQUALP (canonical-encode agreement oracle)."
     (wasmdown.test:is
      (equal '(:i32.const :call-indirect :end)
             (mapcar #'wasm-instr-op body)))))
+
+(wasmdown.test:test text/named-module-id-parse
+  ;; Regression (loop 4): (module $M ...) — the optional $id after
+  ;; the module keyword must be skipped, not parsed as a field.
+  ;; Previously EVERY named module failed with "unknown module
+  ;; field NIL" (linking.wast/elem.wast cascade).
+  (let* ((m (%round-trip
+             "(module $M (func (export \"f\") (result i32) (i32.const 1)))"))
+         (inst (wasmdown:instantiate m)))
+    (wasmdown.test:is (= 1 (length (wasm-module-funcs m))))
+    (wasmdown.test:is (equal '(1) (wasmdown:invoke inst "f")))))
+
+(wasmdown.test:test text/simd-substring-false-positive
+  ;; Regression (loop 4): hex literals like 0x80000000 and $x2-style
+  ;; ids must NOT trip the SIMD unsupported-feature scan (bare
+  ;; substring 'x8'/'x2' matching). The module is plain integer
+  ;; code; classification must see NO SIMD.
+  (let ((rs (wasmdown.wast:run-script
+             "(module (func (export \"f\") (param $x2 i32) (result i32)
+                            (i32.add (local.get $x2) (i32.const -0x80000000))))
+              (assert_return (invoke \"f\" (i32.const 1)) (i32.const -2147483647))")))
+    (wasmdown.test:is (every (lambda (r) (eq r :pass))
+                             (map 'list #'wasmdown.wast:wast-result-outcome
+                                  rs)))))

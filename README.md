@@ -30,8 +30,11 @@ Regenerate with `make report-conformance` (writes `CONFORMANCE.md` +
 hanging run is a bug, not a workload. This is a
 baseline measurement, **not** a release gate; remaining failures are
 case-specific engine gaps plus out-of-scope features (SIMD/GC/EH/tail
-calls/typed funcrefs/memory64), which are classified `unsupported` —
-never silently passed.
+calls/typed funcrefs/memory64), classified `unsupported` and never
+silently passed. The `unsupported` rise from earlier baselines
+(277→725) is honest reclassification: actions against genuinely
+out-of-scope modules now classify cleanly instead of crashing as
+harness-errors.
 
 ### Known gaps (tracked, not hidden)
 

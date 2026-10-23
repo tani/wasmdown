@@ -54,6 +54,20 @@
               (assert_return (invoke \"call\") (i32.const 7))")))
     (wasmdown.test:is (every (lambda (o) (eq o :pass)) os))))
 
+(wasmdown.test:test wast/register-named-module
+  ;; (module $Mf ...)(register "Mf" $Mf): the alias must reach the
+  ;; import registry (second module links against "Mf"."f") AND the
+  ;; named instance must remain invocable as $Mf (linking.wast
+  ;; convention).
+  (let ((os (%outcomes
+             "(module $Mf (func (export \"f\") (result i32) (i32.const 7)))
+              (register \"Mf\" $Mf)
+              (module (import \"Mf\" \"f\" (func (result i32)))
+                      (func (export \"call\") (result i32) (call 0)))
+              (assert_return (invoke \"call\") (i32.const 7))
+              (assert_return (invoke $Mf \"f\") (i32.const 7))")))
+    (wasmdown.test:is (every (lambda (o) (eq o :pass)) os))))
+
 (wasmdown.test:test wast/spectest-import-capture
   ;; spectest print_i32 is a host function; a module importing and
   ;; invoking it must link, instantiate and execute without error.
