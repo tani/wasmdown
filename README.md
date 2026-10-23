@@ -20,14 +20,21 @@ The official core suite (97 `.wast` files, pinned at
 executed through the stateful runner with failure-phase classification:
 
 ```
-pass 20163 | fail 223 | unsupported 746 | harness-error 55 | total 21187
-pass rate 95.2% (denominator = all executed, incl. unsupported)
+pass 19635 | fail 661 | unsupported 746 | harness-error 145 | total 21187
+pass rate 92.7% (denominator = all executed, incl. unsupported)
 ```
 
 Regenerate with `make report-conformance` (writes `CONFORMANCE.md` +
 `tests/spec-core-results.jsonl`, one JSONL line per command); the full
 97-file run completes in ~3 seconds and must stay fast — a slow or
-hanging run is a bug, not a workload. This is a
+hanging run is a bug, not a workload.
+The pass-rate DROP from the prior 95.2% baseline is deliberate
+and honest (PLAN.md §12.8): the `(module quote …)` wrap now parses
+~543 payloads that previously "passed" without ever being parsed —
+misattributed passes may not be recorded as pass. The strictness
+fixes already clear whole families (float_literals 179/179,
+int_literals 51/51); the remaining converted cases are honest
+fails/harness-errors under active triage. This is a
 baseline measurement, **not** a release gate; remaining failures are
 case-specific engine gaps plus out-of-scope features (SIMD/GC/EH/tail
 calls/typed funcrefs/memory64), classified `unsupported` and never
