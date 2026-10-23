@@ -13,15 +13,15 @@ now classify as :unsupported instead of crashing as harness-errors.
 
 | Outcome | Count |
 | --- | --- |
-| pass | 20367 |
+| pass | 20452 |
 | fail | 0 |
 | skip | 0 |
-| unsupported | 893 |
+| unsupported | 808 |
 | timeout | 0 |
 | harness-error | 0 |
 | **total** | **21260** |
 
-Executed: 21260 commands; pass rate 95.8% (denominator = all executed,
+Executed: 21260 commands; pass rate 96.2% (denominator = all executed,
 including unsupported — honest per PLAN.md §12.9).
 
 ## Per-file counts
@@ -49,7 +49,7 @@ including unsupported — honest per PLAN.md §12.9).
 | data | 68 | 0 | 0 | 0 |
 | elem | 136 | 0 | 18 | 0 |
 | endianness | 69 | 0 | 0 | 0 |
-| exports | 96 | 0 | 1 | 0 |
+| exports | 97 | 0 | 0 | 0 |
 | f32 | 2514 | 0 | 0 | 0 |
 | f32_bitwise | 364 | 0 | 0 | 0 |
 | f32_cmp | 2407 | 0 | 0 | 0 |
@@ -69,9 +69,9 @@ including unsupported — honest per PLAN.md §12.9).
 | i64 | 416 | 0 | 0 | 0 |
 | id | 7 | 0 | 0 | 0 |
 | if | 241 | 0 | 0 | 0 |
-| imports | 159 | 0 | 59 | 0 |
+| imports | 218 | 0 | 0 | 0 |
 | inline-module | 1 | 0 | 0 | 0 |
-| instance | 0 | 0 | 23 | 0 |
+| instance | 23 | 0 | 0 | 0 |
 | int_exprs | 108 | 0 | 0 | 0 |
 | int_literals | 51 | 0 | 0 | 0 |
 | labels | 29 | 0 | 0 | 0 |
@@ -83,7 +83,7 @@ including unsupported — honest per PLAN.md §12.9).
 | local_set | 53 | 0 | 0 | 0 |
 | local_tee | 97 | 0 | 1 | 0 |
 | loop | 121 | 0 | 0 | 0 |
-| memory | 89 | 0 | 1 | 0 |
+| memory | 90 | 0 | 0 | 0 |
 | memory_grow | 109 | 0 | 0 | 0 |
 | memory_redundancy | 8 | 0 | 0 | 0 |
 | memory_size | 42 | 0 | 0 | 0 |
@@ -106,7 +106,7 @@ including unsupported — honest per PLAN.md §12.9).
 | start | 20 | 0 | 0 | 0 |
 | store | 68 | 0 | 0 | 0 |
 | switch | 28 | 0 | 0 | 0 |
-| table | 23 | 0 | 23 | 0 |
+| table | 24 | 0 | 22 | 0 |
 | table_get | 16 | 0 | 0 | 0 |
 | table_grow | 61 | 0 | 0 | 0 |
 | table_set | 26 | 0 | 0 | 0 |

@@ -258,9 +258,10 @@ Returns the canonical encoding."
    11))
 
 (wasmdown.test:test binary/golden-unknown-section-id
-  ;; (j) unknown section id 13 rejected.
+  ;; (j) unknown section id 14 rejected — id 13 is the EH tag section
+  ;; (Core 3.0); binary.wast ::32 pins 14 as the first unknown id.
   (assert-decode-error
-   (cat *header* (section 13 (u32 0)))
+   (cat *header* (section 14 (u32 0)))
    8))
 
 (wasmdown.test:test binary/golden-custom-section

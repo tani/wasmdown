@@ -1523,9 +1523,19 @@ rest of the plain sequence."
                                                             (if f32-p 127 1023)))
                                    #() 0)
                   (cdr rest)))))
-     ;; memarg ops: offset=/align= (both optional; align is a power of 2)
+     ;; memarg ops: optional leading memory index ($id or number —
+     ;; multi-memory, Core 3.0), then offset=/align= (both optional;
+     ;; align a power of 2)
      ((gethash k *memarg-op-keywords*)
-      (let ((offset 0) (align-hint nil) (items rest))
+      (let ((offset 0) (align-hint nil) (items rest) (memidx 0))
+        ;; optional memory index: a bare $id/nat BEFORE any memarg
+        ;; keyword (instance.wast's (i32.store $mem1 ...) form).
+        ;; offset=/align= are :keyword tokens, so an :id/:nat here is
+        ;; unambiguous.
+        (when (and items (tok-p (car items))
+                   (member (tok-kind (car items)) '(:id :nat)))
+          (setf memidx (%id-or-num (car items) (penv-mems penv) "memory")
+                items (cdr items)))
         (loop while (and items (tok-p (car items))
                          (eq (tok-kind (car items)) :keyword))
               for tok = (car items)
@@ -1542,14 +1552,12 @@ rest of the plain sequence."
                            items (cdr items)))
               else
                 do (return))
-        ;; NOTE: multi-memory (memidx before the memarg) is not in
-        ;; this slice; memidx stays 0. A bare number after the memarg
-        ;; keywords is a folded operand (e.g. the address of a load).
         (let* ((width (second (assoc k *memarg-ops* :test #'string=)))
                (align (or align-hint width)))
           (values (make-wasm-instr
                    op-key
-                   (list :align (1- (integer-length align)) :offset offset)
+                   (list :align (1- (integer-length align))
+                         :offset offset :memidx memidx)
                    #() 0)
                   items))))
      ;; br / br-if: one label

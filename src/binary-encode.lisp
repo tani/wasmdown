@@ -124,7 +124,9 @@
 (defun %valtype-byte (t_)
   (ecase t_
     (:i32 #x7F) (:i64 #x7E) (:f32 #x7D) (:f64 #x7C)
-    (:funcref #x70) (:externref #x6F)))
+    (:funcref #x70) (:externref #x6F)
+    ;; EH (Core 3.0): exnref 0x69.
+    (:exnref #x69)))
 
 (defun enc-valtype (e t_)
   (enc-byte e (%valtype-byte t_)))
@@ -172,6 +174,8 @@
    (cons :br #x0C) (cons :br-if #x0D) (cons :br-table #x0E)
    (cons :return #x0F) (cons :call #x10) (cons :call-indirect #x11)
    (cons :return-call #x12) (cons :return-call-indirect #x13)
+   ;; EH (Core 3.0): throw 0x08, try_table 0x1F.
+   (cons :throw #x08) (cons :try-table #x1F)
    (cons :select #x1B)
    (cons :local.get #x20) (cons :local.set #x21) (cons :local.tee #x22)
    (cons :global.get #x23) (cons :global.set #x24)
@@ -291,6 +295,28 @@ low word first, then high word."
        (enc-byte e #x13)
        (enc-u32 e (getf imms :type))
        (enc-u32 e (getf imms :table)))
+      ;; EH (Core 3.0): throw 0x08 (tagidx), try_table 0x1F
+      ;; (blocktype, catch clause vector, body, end). throw_ref 0x0A
+      ;; is a table-driven simple op (the decoder's *SIMPLE-OPS*).
+      (:throw (enc-byte e #x08) (enc-u32 e (getf imms :tag)))
+      (:try-table
+       (enc-byte e #x1F)
+       (enc-blocktype e (getf imms :bt))
+       (let ((catches (getf imms :catches)))
+         (enc-u32 e (length catches))
+         (loop for c across catches
+               do (case (first c)
+                    (:catch (enc-byte e #x00)
+                            (enc-u32 e (second c))
+                            (enc-u32 e (third c)))
+                    (:catch-ref (enc-byte e #x01)
+                                (enc-u32 e (second c))
+                                (enc-u32 e (third c)))
+                    (:catch-all (enc-byte e #x02) (enc-u32 e (second c)))
+                    (:catch-all-ref (enc-byte e #x03)
+                                    (enc-u32 e (second c))))))
+       (enc-instrs e body)
+       (enc-byte e #x0B))
       (:select
        (if (getf imms :types)
            (progn (enc-byte e #x1C)
@@ -393,7 +419,9 @@ low word first, then high word."
             do (enc-name e (wasm-import-module imp))
                (enc-name e (wasm-import-field imp))
                (enc-byte e (ecase (wasm-import-kind imp)
-                             (:func 0) (:table 1) (:memory 2) (:global 3)))
+                             (:func 0) (:table 1) (:memory 2) (:global 3)
+                             ;; EH (Core 3.0): tag import kind.
+                             (:tag 4)))
                (let ((ty (wasm-import-type imp)))
                  (ecase (wasm-import-kind imp)
                    (:func (enc-u32 e ty))
@@ -401,7 +429,10 @@ low word first, then high word."
                            (enc-limits e (wasm-table-limits ty)))
                    (:memory (enc-limits e (wasm-memory-limits ty)))
                    (:global (enc-valtype e (car ty))
-                            (enc-byte e (if (cdr ty) 1 0)))))))))
+                            (enc-byte e (if (cdr ty) 1 0)))
+                   ;; tag payload: typeidx (the functype; empty results
+                   ;; enforced at validation).
+                   (:tag (enc-u32 e ty))))))))
 
 (defun enc-func-section (e funcs)
   (enc-section e 3
@@ -439,7 +470,9 @@ low word first, then high word."
       (loop for ex across exports
             do (enc-name e (wasm-export-name ex))
                (enc-byte e (ecase (wasm-export-kind ex)
-                             (:func 0) (:table 1) (:memory 2) (:global 3)))
+                             (:func 0) (:table 1) (:memory 2) (:global 3)
+                             ;; EH (Core 3.0): tag export kind.
+                             (:tag 4)))
                (enc-u32 e (wasm-export-index ex))))))
 
 (defun enc-start-section (e start)
@@ -553,6 +586,13 @@ legacy funcidx item form; returns the funcidx or nil."
 (defun enc-datacount-section (e n)
   (enc-section e 12 (lambda (e) (enc-u32 e n))))
 
+(defun enc-tag-section (e tags)
+  "The tag section (id 13, EH Core 3.0): a vector of typeidx."
+  (enc-section e 13
+    (lambda (e)
+      (enc-u32 e (length tags))
+      (loop for ty across tags do (enc-u32 e ty)))))
+
 (defun enc-code-section (e funcs)
   (enc-section e 10
     (lambda (e)
@@ -596,6 +636,7 @@ payload bytes."
           (start (wasm-module-start m))
           (elems (wasm-module-elems m))
           (datas (wasm-module-datas m))
+          (tags (wasm-module-tags m))
           (customs (wasm-module-customs m))
           (data-count (wasm-module-data-count m)))
       (unless (zerop (length types)) (enc-type-section e types))
@@ -615,5 +656,8 @@ payload bytes."
         (enc-datacount-section e (or data-count (length datas))))
       (unless (zerop (length funcs)) (enc-code-section e funcs))
       (unless (zerop (length datas)) (enc-data-section e datas))
+      ;; Tag (id 13) comes after Data (id 11) in the canonical section
+      ;; order (the decoder's rank table enforces the same).
+      (unless (zerop (length tags)) (enc-tag-section e tags))
       (loop for c across customs do (enc-custom-section e c)))
     (encoder->vector e)))

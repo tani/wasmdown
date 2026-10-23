@@ -401,7 +401,9 @@ end the closing ) char, so (source start end) slices the whole form."
   bytes                                  ; octet vector (binary)
   args                                   ; parsed literal args (invoke)
   results                                ; parsed result values
-  message)                                ; expected-failure message
+  message                               ; expected-failure message
+  named-form)                           ; :definition / :instance for the
+                                        ; Core 3.0 named module forms
 
 (defun %parse-int-token (tk)
   "An integer token's value (sign-aware, dec or hex, _ separators)."
@@ -538,30 +540,45 @@ typed value record, or NIL when NODE is not a value form."
 (defun %parse-module-form (node source)
   "Parse a (module ...) node. Returns (values kind id payload):
 KIND :text (payload = string), :binary (payload = octet vector),
-:quote (payload = string), :definition / :instance (payload nil — the
-unsupported named-form cases), or signals decode-error on bad shape."
+:quote (payload = string), :definition (payload = the module source
+span — stored, not instantiated), :instance (payload = the referenced
+definition's $id), or signals decode-error on bad shape."
   (let ((items (rest (%node-children node))))   ; skip 'module'
     (multiple-value-bind (id rest) (%opt-id items)
       (cond
-       ;; (module definition ...) / (module instance ...): unsupported
-       ;; named forms (spec Core 3.0; engine slice excludes them).
+       ;; (module definition ...)/(module instance ...): Core 3.0
+       ;; named forms. A DEFINITION parses and validates its fields
+       ;; but is NOT instantiated — the source span is kept for the
+       ;; later (module instance $I $M). An INSTANCE names a stored
+       ;; definition: (module instance $I $M) — the id after the
+       ;; keyword is the NEW instance's name and the following id the
+       ;; definition's $id.
        ((and rest (stoken-p (first rest))
              (eq (stoken-kind (first rest)) :keyword)
              (member (string-downcase (stoken-text (first rest)))
                      '("definition" "instance") :test #'string=))
-        ;; (module definition $M ...)/(module instance $I $M): the
-        ;; form's $id is the first id AFTER the keyword; capture it so
-        ;; later (register "n" $I) commands classify :unsupported
-        ;; (instance.wast ::3-4, ::17) instead of 'no module to
-        ;; register' fails.
-        (let ((nid (or id
-                       (let ((after (rest rest)))
-                         (and after (stoken-p (first after))
-                              (eq (stoken-kind (first after)) :id)
-                              (stoken-text (first after)))))))
-          (values (intern (string-upcase
-                           (stoken-text (first rest))) :keyword)
-                  nid nil)))
+        (let* ((k (string-downcase (stoken-text (first rest))))
+               (after (rest rest))
+               (nid (or id
+                        (and after (stoken-p (first after))
+                             (eq (stoken-kind (first after)) :id)
+                             (stoken-text (first after))))))
+          (cond
+           ((string= k "definition")
+            ;; payload: the FIELDS' source span, wrapped as a module
+            ;; so parse-wat accepts it at instance time.
+            (multiple-value-bind (start end) (%node-span node)
+              (let ((full (subseq source start (1+ end))))
+                (values :definition nid full))))
+           (t
+            ;; (module instance $I $M): payload = the definition's $id
+            (let ((def-id (or (and id
+                                    (not nid)
+                                    id)
+                               (and after (stoken-p (second after))
+                                    (eq (stoken-kind (second after)) :id)
+                                    (stoken-text (second after))))))
+              (values :instance nid def-id))))))
        ;; binary/quote keywords
        ((and rest (stoken-p (first rest))
              (eq (stoken-kind (first rest)) :keyword)
@@ -775,8 +792,12 @@ command shape."
               (:text (mk :id id :text payload))
               (:binary (mk :id id :bytes payload))
               (:quote (mk :id id :text payload))
-              (:definition (mk :id id :message "unsupported: module definition"))
-              (:instance (mk :id id :message "unsupported: module instance")))))
+              ;; named forms (Core 3.0): definition carries the source
+              ;; span in TEXT (stored un-instantiated); instance
+              ;; carries the definition's $id in MODULE-ARG.
+              (:definition (mk :id id :text payload :named-form :definition))
+              (:instance (mk :id id :module-arg payload
+                             :named-form :instance)))))
          ((string= head "register")
           (let* ((items (rest (%node-children node)))
                  (name (first items)))
@@ -904,7 +925,11 @@ behavior."
   (current-unsupported nil :type boolean)
   ;; registered names whose instance is out-of-scope-unsupported;
   ;; imports from them classify :unsupported, never 'unknown import'
-  (unsupported-registry (make-hash-table :test #'equal) :type hash-table))
+  (unsupported-registry (make-hash-table :test #'equal) :type hash-table)
+  ;; EH/named-forms (Core 3.0): (module definition $M ...) stores the
+  ;; parsed module here keyed by $id — instantiation is deferred to
+  ;; (module instance $I $M).
+  (module-definitions (make-hash-table :test #'equal) :type hash-table))
 
 (defun %register-unsupported (state name)
   "Record that registered name NAME holds an out-of-scope-unsupported
@@ -1000,8 +1025,10 @@ the classification is honest, never a silent pass."
      ;; slice (Core 3.0 §6.2, interp trampoline); only the typed
      ;; function-reference return_call_ref remains out of scope
      ;; (call_ref family, classified with GC below).
-     ((or (has "try_table") (has "(throw") (tok "tag")
-          (tok "exnref")) :exception-handling)
+     ;; EH (Core 3.0) is IMPLEMENTED (tag section, try_table/throw/
+     ;; throw_ref validation + interp, exnref valtype, tag imports/
+     ;; exports): no classification arm — EH shapes run the honest
+     ;; pipeline. The GC arm below still catches typed-ref spellings.
      ((or (has "(struct") (has "(array") (has "(i31")
           (has "(rec") (tok "call_ref") (tok "return_call_ref")
           (has "br_on_cast")
@@ -1218,28 +1245,78 @@ standard pipeline runs."
                               state (wasmdown.types:wasm-import-module imp))))
            (error () nil)))))
 
+
+(defun %strip-definition-keyword (src)
+  "The module-definition source span SRC (\"(module definition $M
+  fields...)\") rewritten for parse-wat: drop the leading `definition`
+  keyword, keeping the module form and any $id. The keyword is always
+  directly after `(module` in this form's grammar."
+  (let ((prefix "(module ")
+        (kw "definition"))
+    (if (and (>= (length src) (+ (length prefix) (length kw)))
+             (string-equal src prefix :end1 (length prefix))
+             (string-equal src kw :start1 (length prefix)
+                           :end1 (+ (length prefix) (length kw))))
+        (concatenate 'string "(module"
+                     (subseq src (+ (length prefix) (length kw))))
+        src)))
+
+
 (defun %module-outcome (cmd state)
   "Run a (module ...) command through decode/validate/link/
 instantiate/execute. Returns (values outcome phase detail instance)."
   (handler-case
       (progn
         ;; (module definition ...)/(module instance ...): Core 3.0
-        ;; named forms, out of the engine slice (PLAN.md §2, ADR-005).
-        ;; The command carries neither text nor bytes (payload nil);
-        ;; classify :unsupported BEFORE the decode pipeline would
-        ;; parse-wat(NIL) and misreport 'expected exactly one
-        ;; (module ...)'. Also record the $id so later register
-        ;; commands classify :unsupported (instance.wast ::0-4).
-        (when (and (null (wast-cmd-text cmd))
-                   (null (wast-cmd-bytes cmd))
-                   (wast-cmd-message cmd))
-          (let ((mid (wast-cmd-id cmd)))
-            (when mid
-              (setf (gethash mid (wast-state-unsupported-named state))
-                    t))
-            (return-from %module-outcome
-              (values :unsupported nil
-                      (wast-cmd-message cmd)))))
+        ;; named forms. A DEFINITION parses + validates its fields
+        ;; but never instantiates: the parsed module is stored under
+        ;; its $id for the later (module instance $I $M). An INSTANCE
+        ;; re-decodes the stored definition's source and instantiates
+        ;; a FRESH instance (instance.wast: two instances of one
+        ;; definition have distinct state — instantiation is
+        ;; generative; import/export aliasing is NOT).
+        (when (wast-cmd-named-form cmd)
+          (case (wast-cmd-named-form cmd)
+            (:definition
+             (let* ((src (%strip-definition-keyword (wast-cmd-text cmd)))
+                    (module (%decode-module-form
+                             (make-wast-cmd :name :module :index 0
+                                            :start 0 :text src)))
+                    (mid (wast-cmd-id cmd)))
+               (when (and mid (not (eq module :unsupported)))
+                 (setf (gethash mid (wast-state-module-definitions state))
+                       src))
+               (if (eq module :unsupported)
+                   (let ((feature (%unsupported-feature-p
+                                   (or (wast-cmd-text cmd) ""))))
+                     (return-from %module-outcome
+                       (values :unsupported nil
+                               (format nil "uses unsupported feature ~a"
+                                       feature))))
+                   (progn
+                     (%preflight-locals module)
+                     (%preflight-datacount module)
+                     (wasmdown:validate-module module)
+                     (return-from %module-outcome
+                       (values :pass nil "ok (definition stored)" nil))))))
+            (:instance
+             (let* ((def-id (wast-cmd-module-arg cmd))
+                    (src (gethash def-id
+                                  (wast-state-module-definitions state))))
+               (return-from %module-outcome
+                 (if src
+                     (let ((module (wasmdown.text:parse-wat src)))
+                       (%preflight-locals module)
+                       (%preflight-datacount module)
+                       (wasmdown:validate-module module)
+                       (let ((inst (wasmdown:instantiate
+                                    module
+                                    :imports (%state-imports-for module))))
+                         (values :pass nil "ok" inst)))
+                     ;; the definition was out-of-scope (never stored):
+                     ;; the instance command inherits that honestly
+                     (values :unsupported nil
+                             "instance of an out-of-scope definition")))))))
         (when (and (wast-cmd-bytes cmd)
                    (or (%binary-gc-table-p (wast-cmd-bytes cmd))
                        (%binary-gc-valtype-p (wast-cmd-bytes cmd))))
@@ -1607,15 +1684,21 @@ given, receives a JSONL line per result (PLAN.md 12.8)."
           (%module-outcome cmd state)
         (cond
          ((eq outcome :pass)
-          (setf (wast-state-current state) inst
-                (wast-state-current-unsupported state) nil)
-          (when (wast-cmd-id cmd)
-            (remhash (wast-cmd-id cmd)
-                     (wast-state-unsupported-named state))
-            (setf (gethash (wast-cmd-id cmd)
-                           (wast-state-named-instances state))
-                  inst))
-          (funcall record cmd :pass nil "ok" nil))
+          (cond
+           ;; (module definition ...): stores the module, no instance
+           ;; produced — the current position is untouched.
+           ((eq (wast-cmd-named-form cmd) :definition)
+            (funcall record cmd :pass nil "ok (definition stored)" nil))
+           (t
+            (setf (wast-state-current state) inst
+                  (wast-state-current-unsupported state) nil)
+            (when (wast-cmd-id cmd)
+              (remhash (wast-cmd-id cmd)
+                       (wast-state-unsupported-named state))
+              (setf (gethash (wast-cmd-id cmd)
+                             (wast-state-named-instances state))
+                    inst))
+            (funcall record cmd :pass nil "ok" nil))))
          ((eq outcome :unsupported)
           ;; unsupported module: remember its $id (and that the current
           ;; position holds an unsupported module) so later actions

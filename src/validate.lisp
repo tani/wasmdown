@@ -48,7 +48,7 @@ the types contract exports wasm-limits-has-max-p)."
   (member t_ '(:i32 :i64 :f32 :f64)))
 
 (defun reftype-p (t_)
-  (member t_ '(:funcref :externref)))
+  (member t_ '(:funcref :externref :exnref)))
 
 (defun valtype-p (t_)
   (or (numtype-p t_) (reftype-p t_)))
@@ -96,7 +96,10 @@ the types contract exports wasm-limits-has-max-p)."
   (imported-global-count 0)
   (elems #())                  ; vector of elem reftypes
   (data-count 0)
-  (declared-refs nil))         ; list of funcidx declared via elem/export
+  (declared-refs nil)          ; list of funcidx declared via elem/export
+  ;; EH (Core 3.0): tag index space — vector of tag functypes
+  ;; (imports first, then the tag section's typeidx-resolved types).
+  (tags #()))
 
 (defun imported-kind-count (module kind)
   (count kind (wasm-module-imports module) :key #'wasm-import-kind))
@@ -136,7 +139,23 @@ afterwards)."
                                         (list (wasm-global-type g)
                                               (wasm-global-mutable g)))
                                 (wasm-module-globals module)))
-                          'vector)))
+                          'vector))
+         ;; EH (Core 3.0): the tag index space — imported tag typeidxs
+         ;; (their functype resolved against the module's types),
+         ;; then the tag section's typeidxs. Tag typeidxs out of
+         ;; range resolve to NIL here; CHECK-TAGS reports the honest
+         ;; 'unknown type' at validation.
+         (tags (coerce (append
+                        (mapcar (lambda (ty)
+                                  (func-type-at-soft module ty))
+                                (mapcar #'wasm-import-type
+                                        (remove :tag imports :key
+                                                #'wasm-import-kind
+                                                :test-not #'eql)))
+                        (map 'list (lambda (ty)
+                                     (func-type-at-soft module ty))
+                             (wasm-module-tags module)))
+                       'vector)))
     (make-vctx :module module
                :num-imported-funcs imp-funcs
                :func-typeidxs func-typeidxs
@@ -147,7 +166,8 @@ afterwards)."
                (count :global imports :key #'wasm-import-kind)
                :elems (wasm-module-elems module)
                :data-count (length (wasm-module-datas module))
-               :declared-refs (%declared-func-refs module))))
+               :declared-refs (%declared-func-refs module)
+               :tags tags)))
 
 (defun %declared-func-refs (module)
   "The funcidx set legal for ref.func (spec: funcidx(globals mems tables
@@ -181,6 +201,20 @@ afterwards)."
             what funcidx (length v)))
     (func-type-at (vctx-module ctx) (svref v funcidx)
                   (format nil "~a (function ~a)" what funcidx))))
+
+
+(defun vctx-tag-type (ctx tagidx what)
+  "Tag functype for absolute TAGIDX (imports first), or error. A tag
+whose typeidx resolved to NIL (out of range) at build-vctx time
+reports the honest 'unknown type' here."
+  (let ((v (vctx-tags ctx)))
+    (unless (and (integerp tagidx) (>= tagidx 0) (< tagidx (length v)))
+      (verr "~a: tag index ~a out of range (module has ~a tag~:p)"
+            what tagidx (length v)))
+    (let ((ft (svref v tagidx)))
+      (unless ft
+        (verr "~a: unknown type" what))
+      ft)))
 
 (defun vctx-table-at (ctx tableidx what)
   (let ((v (vctx-tables ctx)))
@@ -381,6 +415,16 @@ exclusive upper bound of global indices referenceable via global.get
       (verr "~a: label index ~a out of range (depth ~a)"
             what labelidx (length ctrls)))
     (nth labelidx ctrls)))
+
+(defun %check-label-types (fv labelidx want)
+  "A try_table catch clause's label must exist and carry EXACTLY the
+types WANT at branch time (spec: the catch handler receives the tag's
+payload values, plus an exnref for the _ref clauses)."
+  (let ((frame (%ctrl-label fv labelidx "try_table catch clause")))
+    (let ((have (%label-types frame)))
+      (unless (equal have want)
+        (verr "type mismatch: catch clause label ~a carries ~a, expected ~a"
+              labelidx have want)))))
 
 (defun %unreachable (fv)
   ;; (fv-vals fv) is a push-down list (element 0 = stack top); the
@@ -691,6 +735,62 @@ bodies of their :end terminator; bodies of :if carry no :else/:end)."
            (%pop-val-expect fv :i32)
            (%pop-vals fv (wasm-func-type-params ft))
            (%unreachable fv)))
+        ;; --- EH (Core 3.0): throw / throw_ref / try_table ---
+        ((eq op :throw)
+         (let ((ft (vctx-tag-type (fv-ctx fv) (imm :tag) "throw")))
+           (%pop-vals fv (wasm-func-type-params ft)))
+         (%unreachable fv))
+        ((eq op :throw-ref)
+         (%pop-val-expect fv :exnref)
+         (%unreachable fv))
+        ((eq op :try-table)
+         ;; try_table blocktype l^* (catch x l)^* (catch_ref x l)^*
+         ;; (catch_all l)? (catch_all_ref l)? instr* end. The block
+         ;; itself validates like block (params popped, body checked
+         ;; in a new frame, results pushed). Each catch clause's
+         ;; label must exist and carry the tag's params at branch
+         ;; time (catch: tag params; catch_ref: tag params + exnref;
+         ;; catch_all: nothing; catch_all_ref: exnref) — the clause
+         ;; labels resolve in the ENCLOSING scope (they branch OUT of
+         ;; the try block), so the label check runs against the ctrl
+         ;; stack AFTER the try's own frame is pushed (the try label
+         ;; counts as one depth level, matching the text parser's
+         ;; label accounting).
+         (multiple-value-bind (in out)
+             (valid-blocktype-params-results module (imm :bt))
+           (%pop-vals fv in)
+           (%push-ctrl fv :try-table in out)
+          ;; Clause labels resolve with the try frame on the stack
+          ;; (the branch targets are OUTSIDE the try block; the try's
+          ;; own label counts one depth level, matching the text
+          ;; parser). Each label must carry exactly the payload types
+          ;; the clause pushes at dispatch time.
+          (loop for c across (imm :catches)
+                do (let* ((label-depth (ecase (first c)
+                                         ((:catch :catch-ref) (third c))
+                                         ((:catch-all :catch-all-ref)
+                                          (second c))))
+                          (frame (%ctrl-label fv label-depth
+                                             "try_table catch clause")))
+                     (declare (ignore frame))
+                     (let ((want
+                             (ecase (first c)
+                               (:catch
+                                (wasm-func-type-params
+                                 (vctx-tag-type (fv-ctx fv) (second c)
+                                                "try_table catch")))
+                               (:catch-ref
+                                (append
+                                 (wasm-func-type-params
+                                  (vctx-tag-type (fv-ctx fv) (second c)
+                                                 "try_table catch_ref"))
+                                 (list :exnref)))
+                               (:catch-all '())
+                               (:catch-all-ref (list :exnref)))))
+                       (%check-label-types fv label-depth want))))
+           (validate-seq fv (wasm-instr-body instr))
+           (%pop-ctrl fv)
+           (%push-vals fv out)))
         ;; --- parametric ---
         ((eq op :drop) (%pop-val fv))
         ((eq op :select)
@@ -904,6 +1004,7 @@ wasmdown:validation-error."
   (check-types-section module)
   (let ((ctx (build-vctx module)))
     (check-imports module)
+    (check-tags ctx)
     (check-tables-and-mems ctx)
     (check-globals ctx)
     (check-elems ctx)
@@ -944,7 +1045,30 @@ wasmdown:validation-error."
                (:global
                 (unless (valtype-p (car ty))
                   (verr "import ~a: invalid global type ~a" i (car ty))))
+               ;; EH (Core 3.0): a tag import's payload is a typeidx
+               ;; whose functype must have EMPTY results.
+               (:tag
+                (let ((ft (func-type-at-soft module ty)))
+                  (unless ft
+                    (verr "import ~a: tag type index ~a out of range"
+                          i ty))
+                  (when (wasm-func-type-results ft)
+                    (verr "import ~a: tag type ~a must have empty results"
+                          i ty))))
                (t (verr "import ~a: unknown import kind ~a" i kind))))))
+
+(defun check-tags (ctx)
+  "EH (Core 3.0): every tag's type must be a functype with EMPTY
+results (spec: the tag type is [t*] -> []). Covers both imported and
+section tags via the vctx's tag index space; out-of-range typeidxs
+surface here as 'unknown type' (the vctx slot holds NIL for them)."
+  (loop for ft across (vctx-tags ctx)
+        for i from 0
+        do (cond
+            ((null ft)
+             (verr "tag ~a: unknown type" i))
+            ((wasm-func-type-results ft)
+             (verr "tag ~a: tag type must be empty" i)))))
 
 (defun check-tables-and-mems (ctx)
   (let ((module (vctx-module ctx)))
@@ -1061,7 +1185,7 @@ imported or previously-defined globals (spec note on const exprs)."
           do (let ((name (wasm-export-name exp))
                    (kind (wasm-export-kind exp))
                    (index (wasm-export-index exp)))
-               (unless (member kind '(:func :table :memory :global))
+               (unless (member kind '(:func :table :memory :global :tag))
                  (verr "export ~a: unknown export kind ~a" i kind))
                (unless (export-index-ok-p ctx kind index)
                  (verr "export ~a: index ~a out of range for kind ~a"
@@ -1077,6 +1201,8 @@ imported or previously-defined globals (spec note on const exprs)."
     (:table (< -1 index (length (vctx-tables ctx))))
     (:memory (< -1 index (length (vctx-mems ctx))))
     (:global (< -1 index (length (vctx-globals ctx))))
+    ;; EH (Core 3.0): tags share the imports-first index space.
+    (:tag (< -1 index (length (vctx-tags ctx))))
     (t nil)))
 
 (defun check-start (module ctx)

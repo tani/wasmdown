@@ -188,19 +188,21 @@
               (assert_return (invoke \"g\") (f64.const nan:0x4000000000000))")))
     (wasmdown.test:is (equal '(:pass :pass) os))))
 
-(wasmdown.test:test wast/definition-instance-unsupported
-  ;; Regression (loop 15): (module definition $M ...) / (module
-  ;; instance $I $M) are Core 3.0 named-form script commands outside
-  ;; this engine slice; they must classify :unsupported BEFORE decode
-  ;; (not crash parse-wat on a NIL payload), the $id is recorded, and
-  ;; a register naming the recorded id classifies :unsupported too.
+(wasmdown.test:test wast/definition-instance-implemented
+  ;; Loop 18: (module definition $M ...) / (module instance $I $M)
+  ;; are implemented Core 3.0 named-form script commands (instance.
+  ;; wast). A definition parses, validates and stores WITHOUT
+  ;; instantiating; an instance re-instantiates the stored definition
+  ;; (generativity: fresh state per instance); register publishes it
+  ;; and a get on the instance reads its own copy of the state.
   (let ((os (%outcomes
              "(module definition $M
                 (global (export \"glob\") (mut i32) (i32.const 0)))
               (module instance $I1 $M)
-              (register \"I1\" $I1)")))
-    (wasmdown.test:is (equal '(:unsupported :unsupported :unsupported)
-                             os))))
+              (module instance $I2 $M)
+              (register \"I1\" $I1)
+              (register \"I2\" $I2)")))
+    (wasmdown.test:is (equal '(:pass :pass :pass :pass :pass) os))))
 
 (wasmdown.test:test wast/typed-ref-typeuse-unsupported-no-crash
   ;; Regression (loop 16, the biggest single-fix family): (ref $t),

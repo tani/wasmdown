@@ -87,13 +87,14 @@ the SAME depth accounting (host frames are discarded by the throw).")
  clean state even after a trapped (or host-thrown) unwind.")
 (declaim (type fixnum *call-depth*))
 
-(defvar *call-depth-limit* 1500
+(defvar *call-depth-limit* 1000
   "Maximum guest call nesting. Reaching it traps :call-stack-exhausted
- (CONTRACTS.md) instead of exhausting the host control stack, whose
- SBCL error is fatal and uncatchable. 1500 sits far below the ~150k
- host frames a default SBCL control stack tolerates, leaving ample
- margin for deeply nested non-recursive programs (block frames add
- host frames too).")
+(CONTRACTS.md) instead of exhausting the host control stack, whose
+SBCL error is fatal and uncatchable. MEASURED ceiling (loop 18, after
+the tail-call trampoline + EH handler-bind added per-invoke host
+frames): ~1400 frames faults the default SBCL control stack; 1000
+keeps a ~30% margin. Block frames and handler-bind closures add host
+frames too — re-measure whenever interp-invoke's frame shape changes.")
 (declaim (type (and fixnum unsigned-byte) *call-depth-limit*))
 
 (declaim (inline %call-depth-enter))
@@ -421,6 +422,67 @@ target. Returns the operands plus the truncated remainder via THROW."
                      rest)))
       (throw frame (values vals rest)))))
 
+;;; ---------------------------------------------------------------
+;;; Exception handling (Core 3.0). A wasm `throw` pops the tag's
+;;; payload and signals wasmdown:wasm-exception (a Lisp CONDITION,
+;;; distinct from traps — it must never leak past interp-invoke).
+;;; Each try_table frame installs a handler that, on a MATCHING tag
+;;; identity, branches to the clause's label with the payload values
+;;; via the standard branch THROW; a non-matching exception
+;;; re-signals outward (inner frames first, spec handler order).
+;;; An exception no frame catches becomes the trap category
+;;; :uncaught-exception at the outermost invoke boundary.
+
+(defun %tag-at (tagidx)
+  "The tag-instance at absolute TAGIDX of the current module."
+  (let ((tags (wasmdown.runtime:module-instance-tags *frame-module*)))
+    (if (< tagidx (length tags))
+        (svref tags tagidx)
+        (%trap :unreachable "unknown tag ~d" tagidx))))
+
+(defun %match-catch-clause (catches ex)
+  "The first clause of CATCHES matching the thrown exception EX:
+tag-identity for catch/catch_ref, anything for catch_all (first clause
+wins, spec order). Returns (values clause exnref-p) or NIL."
+  (let ((thrown-tag (wasmdown:wasm-exception-tag ex)))
+    (loop for c across catches
+          when (case (first c)
+                 (:catch (eq (%tag-at (second c)) thrown-tag))
+                 (:catch-ref (eq (%tag-at (second c)) thrown-tag))
+                 (:catch-all t)
+                 (:catch-all-ref t)
+                 (t nil))
+            return (values c (member (first c) '(:catch-ref :catch-all-ref)
+                                     :test #'eq))
+          finally (return nil))))
+
+(defun %branch-to-clause (ex clause exnref-p block-stack entry-stack)
+  "Branch to the matched catch clause's label with the exception's
+payload (plus the exnref — the condition object itself — for the _ref
+clauses) via the branch THROW protocol. ENTRY-STACK is the operand
+stack at the try_table's entry: every clause target's below-stack is a
+suffix of it (clause labels are relative to the try frame, which
+counts one depth on the block stack). Never returns."
+  (let* ((label-depth (ecase (first clause)
+                        ((:catch :catch-ref) (third clause))
+                        ((:catch-all :catch-all-ref) (second clause))))
+         (target (nth label-depth block-stack)))
+    (unless target
+      (%trap :unreachable "catch clause label ~d out of range"
+             label-depth))
+    (let* ((payload (wasmdown:wasm-exception-payload ex))
+           (vals (if exnref-p
+                     (cons ex payload)   ; exnref on top, then payload
+                     payload))
+           (base (block-frame-height target))
+           ;; the target's below-stack: the LAST base values of the
+           ;; try's entry stack (the branch unwinds everything the
+           ;; frames above the target pushed)
+           (rest (if (> (length entry-stack) base)
+                     (subseq entry-stack (- (length entry-stack) base))
+                     entry-stack)))
+      (throw target (values vals rest)))))
+
 (defun %exec-seq (instrs locals block-stack stack)
   "Execute a straight-line instruction vector (a block body with the
  trailing :end removed). Returns the resulting operand stack (Lisp list,
@@ -541,6 +603,43 @@ target. Returns the operands plus the truncated remainder via THROW."
                         ;; br to the loop: restart with the branch
                         ;; operands as the new loop params.
                         (setf s (append vals leftover))))))))
+             (:try-table
+              ;; EH (Core 3.0): the guarded body runs on a block frame
+              ;; like :block (params consumed at entry, results pushed
+              ;; on fallthrough), with a HANDLER-BIND that intercepts
+              ;; wasmdown:wasm-exception conditions: a matching catch
+              ;; clause branches to its label with the payload via
+              ;; %BRANCH-TO-CLAUSE (a THROW to the target frame — the
+              ;; rethrow happens with the try frame on the block
+              ;; stack, matching the clause labels' relative depth);
+              ;; a non-matching exception re-signals outward.
+              (let* ((bt (getf imms :bt))
+                     (nparams (%blocktype-param-arity bt))
+                     (nresults (%blocktype-arity bt))
+                     (below (nthcdr nparams s))
+                     (frame (make-block-frame :kind :block
+                                              :params nparams :results nresults
+                                              :height (length below)))
+                     (catches (getf imms :catches))
+                     (try-block-stack (cons frame block-stack)))
+                (multiple-value-bind (vals leftover)
+                    (catch frame
+                      (handler-bind
+                          ((wasmdown:wasm-exception
+                             (lambda (ex)
+                               (multiple-value-bind (clause exnref-p)
+                                   (%match-catch-clause catches ex)
+                                 (when clause
+                                   (%branch-to-clause ex clause exnref-p
+                                                      try-block-stack s))))))
+                        (let ((s2 (%exec-seq (wasm-instr-body instr) locals
+                                             try-block-stack s)))
+                          (values :fallthrough
+                                  (append (subseq s2 0 nresults) below))))
+                      )
+                  (if (eq vals :fallthrough)
+                      (setf s leftover)
+                      (setf s (append vals leftover))))))
              (t
               (multiple-value-setq (s) (%exec-other op instr imms locals block-stack s))))
         finally (return s)))
@@ -750,6 +849,25 @@ args, apply, and throw to the function frame exactly like :return."
            (if (eq (wasmdown.runtime:func-instance-kind ref) :host)
                (%do-tail-host ref s1)
                (%do-tail-call ref s1))))))
+    ;; ---- exception handling (Core 3.0) ----
+    ((eq op :throw)
+     (let* ((tag (%tag-at (getf imms :tag)))
+            (nparams (length (wasm-func-type-params
+                              (wasmdown.runtime:tag-instance-type tag)))))
+       (multiple-value-bind (payload s1) (%pop-n s nparams)
+         ;; %POP-N returns the payload bottom-first; the branch
+         ;; protocol wants TOP-AT-HEAD, so reverse before carrying it.
+         (signal 'wasmdown:wasm-exception
+                 :tag tag
+                 :payload (reverse payload))
+         s1)))
+    ((eq op :throw-ref)
+     (multiple-value-bind (ex s1) (pop-val s)
+       (unless (typep ex 'wasmdown:wasm-exception)
+         (%trap :null-reference
+                "throw_ref on a null exception reference"))
+       (signal ex)
+       s1))
     ;; ---- references ----
     ((eq op :ref.null) (push nil s))
     ((eq op :ref.is-null)
@@ -869,6 +987,8 @@ args, apply, and throw to the function frame exactly like :return."
     (:i32 0) (:i64 0)
     (:f32 (f32-from-bits 0)) (:f64 (f64-from-bits 0))
     (:funcref nil) (:externref nil)
+    ;; EH (Core 3.0): exnref is nullable; its default is null.
+    (:exnref nil)
     (t (if (and (consp valtype) (eq (first valtype) :ref))
             nil
             (%trap :unreachable "no default for type ~a" valtype)))))
@@ -905,7 +1025,11 @@ re-entry) and NOT incremented again, so an unbounded self/mutual
 tail-recursion chain runs in constant host stack and constant guest
 depth (Core 3.0 §6.2; return_call.wast counts to 1_000_000). A chain
 that grows via NON-tail :call frames still increments per frame and
-traps :call-stack-exhausted at *CALL-DEPTH-LIMIT*."
+traps :call-stack-exhausted at *CALL-DEPTH-LIMIT*.
+
+EH BOUNDARY: a wasmdown:wasm-exception that no try_table caught is
+UNCAUGHT — it traps :uncaught-exception here (spec: uncaught wasm
+exceptions trap), never leaking a Lisp condition past the invoke."
   (let* ((saved-depth *call-depth*)
          (frame-depth (%call-depth-enter)))
     ;; Decrement on any exit (normal, trap, or host throw): the
@@ -946,21 +1070,35 @@ traps :call-stack-exhausted at *CALL-DEPTH-LIMIT*."
                          (*frame-nresults* (block-frame-results fn-frame)))
                     (let ((outcome
                            (catch *tail-call-tag*
-                             (multiple-value-bind (vals leftover)
-                                 (catch fn-frame
-                                   ;; fallthrough: top NRESULTS values
-                                   ;; are the results
-                                   (let ((s (%exec-seq
-                                             (wasm-func-body wasm-fn)
-                                             locals (list fn-frame) '())))
-                                     (return-from trampoline
-                                       (reverse
-                                        (subseq s 0 *frame-nresults*)))))
-                               ;; br/return targeting the function
-                               ;; frame: VALS arrive top-at-head;
-                               ;; wasm-call wants push order.
-                               (declare (ignore leftover))
-                               (return-from trampoline (reverse vals))))))
+                             (handler-bind
+                                 ((wasmdown:wasm-exception
+                                    (lambda (ex)
+                                      (declare (ignore ex))
+                                      ;; uncaught at the function
+                                      ;; boundary: a wasm exception
+                                      ;; escapes the invocation as a
+                                      ;; trap category, never a Lisp
+                                      ;; error leak (spec: uncaught
+                                      ;; exceptions trap).
+                                      (error 'wasmdown:wasm-trap
+                                             :kind :uncaught-exception
+                                             :message
+                                             "uncaught exception"))))
+                               (multiple-value-bind (vals leftover)
+                                   (catch fn-frame
+                                     ;; fallthrough: top NRESULTS values
+                                     ;; are the results
+                                     (let ((s (%exec-seq
+                                               (wasm-func-body wasm-fn)
+                                               locals (list fn-frame) '())))
+                                       (return-from trampoline
+                                         (reverse
+                                          (subseq s 0 *frame-nresults*)))))
+                                 ;; br/return targeting the function
+                                 ;; frame: VALS arrive top-at-head;
+                                 ;; wasm-call wants push order.
+                                 (declare (ignore leftover))
+                                 (return-from trampoline (reverse vals)))))))
                       ;; tail call: the throw unwound every host
                       ;; frame of the previous iteration (including
                       ;; all nested non-tail invokes' cleanups), and

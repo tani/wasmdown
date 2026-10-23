@@ -203,26 +203,33 @@ degrade to a simple-vector (data-seg-state's slot type)."
     (case b
       (#x7f :i32) (#x7e :i64) (#x7d :f32) (#x7c :f64)
       (#x70 :funcref) (#x6f :externref)
+      ;; EH (Core 3.0): exnref 0x69 in valtype position
+      ;; (ref_null.wast's binary mirror of (ref.null exn)).
+      (#x69 :exnref)
       (t (%decode-error r "unknown type form 0x~x" b)))))
 
 (defun %read-reftype (r)
   (let ((b (read-byte-at r)))
     (case b
       (#x70 :funcref) (#x6f :externref)
+      ;; EH (Core 3.0): table/global element type exnref (0x69).
+      (#x69 :exnref)
       (t (%decode-error r "unknown type form 0x~x" b)))))
 
 (defun %read-heaptype (r)
-  "For ref.null: only the two shorthand heap types of this slice."
+  "For ref.null: the shorthand heap types of this slice, plus EH's
+exn (0x69) — ref_null.wast's (ref.null exn) binary form."
   (let ((b (read-byte-at r)))
     (case b
       (#x70 :funcref) (#x6f :externref)
+      (#x69 :exnref)
       (t (%decode-error r "unknown type form 0x~x" b)))))
 
 (defun %read-blocktype (r)
   "NIL (empty), a valtype, or (:typeidx . n)."
   (let ((b (peek-byte-at r)))
     (cond ((= b #x40) (read-byte-at r) nil)
-          ((member b '(#x7f #x7e #x7d #x7c #x70 #x6f))
+          ((member b '(#x7f #x7e #x7d #x7c #x70 #x6f #x69))
            (%read-valtype r))
           (t
            (let ((start (reader-offset r))
@@ -230,6 +237,7 @@ degrade to a simple-vector (data-seg-state's slot type)."
              (if (>= n 0)
                  (cons :typeidx n)
                  (decode-error-at start "unknown type form 0x~x" b)))))))
+
 
 (defun %read-limits (r)
   "Flags 0x00 (min) and 0x01 (min+max) only: shared and 64-bit flag
@@ -254,9 +262,12 @@ forms are rejected as decode-error."
   ;; local.../select-typed/ref.*) also sit at their real bytes here so
   ;; the encoder's reverse lookup stays in lockstep; the decoder never
   ;; consults those entries (its case clauses match first).
+  ;; EH (Core 3.0): throw_ref (0x0A) is immediate-free and lives in
+  ;; this table; throw (0x08) and try_table (0x1F) carry immediates
+  ;; and keep dedicated %READ-INSTR clauses below.
   #(
     :unreachable :nop nil nil nil :else nil nil   ; 0x00-0x07
-    nil nil nil :end :br :br-if :br-table :return   ; 0x08-0x0F
+    nil nil :throw-ref nil :br :br-if :br-table :return   ; 0x08-0x0F (0x0A throw_ref, EH)
     :call :call-indirect nil nil nil nil nil nil   ; 0x10-0x17
     nil nil :drop :select nil nil nil nil   ; 0x18-0x1F
     :local.get :local.set :local.tee :global.get :global.set :table.get :table.set nil   ; 0x20-0x27
@@ -375,6 +386,8 @@ markers (keywords) for the block terminators."
          (let ((type (read-u32 r))
                (table (read-u32 r)))
            (mk :call-indirect (list :type type :table table))))
+        ;; EH (Core 3.0): throw 0x08 — tagidx immediate.
+        (#x08 (mk :throw (list :tag (read-u32 r))))
         ;; tail calls (Core 3.0 §6.2): same immediates as their
         ;; non-tail counterparts; NOT in *simple-ops* (they carry
         ;; immediates), so dedicated clauses like :call/:call-indirect.
@@ -384,6 +397,29 @@ markers (keywords) for the block terminators."
                (table (read-u32 r)))
            (mk :return-call-indirect
                (list :type type :table table))))
+        ;; EH (Core 3.0): try_table 0x1F — blocktype, catch clause
+        ;; vector, then the guarded body up to the matching end
+        ;; (catch clause tags: 0x00 catch, 0x01 catch_ref, 0x02
+        ;; catch_all, 0x03 catch_all_ref; Core 3.0 binary format).
+        (#x1F
+         (let* ((bt (%read-blocktype r))
+                (catches
+                  (read-vec r
+                            (lambda (r)
+                              (let ((cc (read-byte-at r)))
+                                (case cc
+                                  (#x00 (list :catch (read-u32 r)
+                                              (read-u32 r)))
+                                  (#x01 (list :catch-ref (read-u32 r)
+                                              (read-u32 r)))
+                                  (#x02 (list :catch-all (read-u32 r)))
+                                  (#x03 (list :catch-all-ref (read-u32 r)))
+                                  (t (%decode-error r
+                                                    "malformed catch clause 0x~x"
+                                                    cc)))))
+                            "catch clause"))
+                (body (coerce (%read-block-body r (1+ depth)) 'vector)))
+           (mk :try-table (list :bt bt :catches catches) body)))
         (#x1B (mk :select (list :types nil)))   ; untyped select: no imms
         (#x1C
           (let ((types (read-vec r #'%read-valtype "select type")))
@@ -531,6 +567,10 @@ terminating :end, which IS included in the result. R is a reader."
                             (%decode-error r "malformed global mutability 0x~x" mut))
                           (make-wasm-import module field :global
                                             (cons type (= mut 1)))))
+                  ;; EH (Core 3.0): tag import — kind 0x04, payload a
+                  ;; typeidx (the tag's functype; results must be
+                  ;; empty, checked at validation).
+                  (#x04 (make-wasm-import module field :tag (read-u32 r)))
                   (t (%decode-error r "unknown import kind 0x~x" kind)))))
             "import"))
 
@@ -570,6 +610,8 @@ terminating :end, which IS included in the result. R is a reader."
                                    (case kind
                                      (#x00 :func) (#x01 :table)
                                      (#x02 :memory) (#x03 :global)
+                                     ;; EH (Core 3.0): tag export kind.
+                                     (#x04 :tag)
                                      (t (%decode-error r "unknown export kind 0x~x" kind)))
                                    index)))
             "export"))
@@ -695,6 +737,13 @@ enforced exactly."
 (defun %read-datacount-section (r)
   (read-u32 r))
 
+(defun %read-tag-section (r)
+  "The tag section (id 13, EH Core 3.0): a vector of typeidx, one per
+defined tag. The referenced type must be a functype with EMPTY
+results; that check is validation's (check-tags), keeping decode
+purely structural."
+  (read-vec r #'read-u32 "tag"))
+
 (defun decode-module (bytes)
   "Decode a module byte vector into a wasm-module. Signals
 wasmdown:decode-error (with :offset) on any malformation."
@@ -713,7 +762,7 @@ wasmdown:decode-error (with :offset) on any malformation."
           (last-rank 0)
           (types #()) (imports #()) (funcs #()) (tables #()) (mems #())
           (globals #()) (exports #()) (start nil) (elems #()) (datas #())
-          (customs '()) (data-count nil) (func-typeidxs nil))
+          (customs '()) (data-count nil) (func-typeidxs nil) (tags #()))
       (loop
         (when (>= (reader-offset r) (reader-limit r))
           (return))
@@ -746,15 +795,16 @@ wasmdown:decode-error (with :offset) on any malformation."
                                        :offset sec-start)
                      customs)))
             (t
-             (when (> id 12)
+             (when (> id 13)
                (decode-error-at sec-start "unknown section id ~d" id))
              (when (gethash id seen)
                (decode-error-at sec-start "duplicate section id ~d" id))
              ;; Spec order: 1..9, then DataCount(12), then Code(10),
-             ;; then Data(11). Enforce that exact order.
+             ;; then Data(11), then Tag(13) (EH Core 3.0; the section
+             ;; list's canonical rank — Tag comes after Data).
              (let ((rank (ecase id
                            ((1 2 3 4 5 6 7 8 9) id)
-                           (12 10) (10 11) (11 12))))
+                           (12 10) (10 11) (11 12) (13 13))))
                (when (<= rank last-rank)
                  (decode-error-at sec-start
                                   "out of order section id ~d"
@@ -773,13 +823,14 @@ wasmdown:decode-error (with :offset) on any malformation."
                (9 (setf elems (%read-elem-section r)))
                (10 (setf funcs (%read-code-section r (or func-typeidxs #()))))
                (11 (setf datas (%read-data-section r)))
-               (12 (setf data-count (%read-datacount-section r))))))
+               (12 (setf data-count (%read-datacount-section r)))
+               (13 (setf tags (%read-tag-section r))))))
           (unless (= (reader-offset r) content-end)
             (decode-error-at sec-start
                              "section size mismatch: section ~d content does not fill declared size ~d"
                              id size))))
       (make-wasm-module
        :types types :imports imports :funcs funcs :tables tables
-       :mems mems :globals globals :exports exports :start start
+       :mems mems :tags tags :globals globals :exports exports :start start
        :elems elems :datas datas :customs (coerce (nreverse customs) 'vector)
        :data-count data-count))))
