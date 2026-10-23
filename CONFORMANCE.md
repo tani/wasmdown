@@ -13,15 +13,15 @@ now classify as :unsupported instead of crashing as harness-errors.
 
 | Outcome | Count |
 | --- | --- |
-| pass | 21117 |
-| fail | 10 |
+| pass | 21122 |
+| fail | 7 |
 | skip | 0 |
-| unsupported | 133 |
+| unsupported | 131 |
 | timeout | 0 |
 | harness-error | 0 |
 | **total** | **21260** |
 
-Executed: 21260 commands; pass rate 99.3% (denominator = all executed,
+Executed: 21260 commands; pass rate 99.4% (denominator = all executed,
 including unsupported — honest per PLAN.md §12.9).
 
 ## Per-file counts
@@ -114,9 +114,9 @@ including unsupported — honest per PLAN.md §12.9).
 | token | 61 | 0 | 0 | 0 |
 | traps | 36 | 0 | 0 | 0 |
 | type-canon | 0 | 0 | 2 | 0 |
-| type-equivalence | 4 | 8 | 20 | 0 |
+| type-equivalence | 8 | 6 | 18 | 0 |
 | type-rec | 0 | 1 | 26 | 0 |
-| type | 2 | 1 | 0 | 0 |
+| type | 3 | 0 | 0 | 0 |
 | unreachable | 64 | 0 | 0 | 0 |
 | unreached-invalid | 121 | 0 | 0 | 0 |
 | unreached-valid | 13 | 0 | 0 | 0 |

@@ -20,15 +20,17 @@ The official core suite (97 `.wast` files, pinned at
 executed through the stateful runner with failure-phase classification:
 
 ```
-pass 21110 | fail 16 | unsupported 133 | harness-error 0 | total 21260
-pass rate 99.2% (denominator = all executed, incl. unsupported)
+pass 21122 | fail 7 | unsupported 131 | harness-error 0 | total 21260
+pass rate 99.3% (denominator = all executed, incl. unsupported)
 ```
 
-The 16 fails: 10 type-canonicalization (type-equivalence.wast 8,
-type-rec.wast 1, type.wast 1 — structurally-equal functypes get
-distinct indices; needs the `rec`-group canonical-representative
-pass, next loop) and 6 table.wast assert_invalid over-permission
-(::29-31, ::40-42 — one relaxed channel, its own follow-up).
+The 7 fails are ALL one family — type-canonicalization
+(type-equivalence.wast 6, type-rec.wast 1): structurally-equal
+functypes get distinct indices, so the lattice's nominal typeuse
+comparison rejects where the spec wants equivalence. Fix: the
+`rec`-group canonical-representative pass (next loop). The earlier
+table.wast over-permission (6) and elem.wast rows flipped green
+as the loop-19 lattice settled across final measurements.
 
 Regenerate with `make report-conformance` (writes `CONFORMANCE.md` +
 `tests/spec-core-results.jsonl`, one JSONL line per command); the full
@@ -134,22 +136,23 @@ SBCL-specific numeric internals where documented.
 
 ## Roadmap (residual families, in loop order)
 
-1. **table.wast over-permission (6 rows)** — one relaxed
-   assert_invalid channel, `::29-31`/`::40-42`; a small follow-up
-   slice, not part of a larger feature loop.
-2. **`rec` type groups + canonicalization (10 rows)** —
-   iso-recursive type equivalence: structurally-equal functypes
-   share one canonical representative; the lattice's nominal
-   typeuse comparison then matches across differently-declared
-   equal types (type-equivalence.wast 8, type-rec.wast 1,
-   type.wast 1).
-3. **GC values (struct/array/i31)** — the largest remaining
+1. **`rec` type groups + canonicalization (7 fail rows + ~54
+   unsupported carriers)** — iso-recursive type equivalence:
+   structurally-equal functypes share one canonical representative
+   (a `build-vctx` pass mapping each typeidx → the min index of
+   its equal functype; `%heap-sub-p`/`reftype-sub-p` and the
+   link-time functype compare route through canonical reps), so
+   the nominal typeuse comparison matches across
+   differently-declared equal types. This is the ENTIRE remaining
+   fail set (type-equivalence.wast 6, type-rec.wast 1).
+2. **GC values (struct/array/i31)** — the largest remaining
    `unsupported` family; struct/array/i31 heap types, `struct.new`
    and friends, `ref.cast`/`br_on_cast`.
-4. **memory64 / multi-memory runtime / SIMD** — the remaining
+3. **memory64 / multi-memory runtime / SIMD** — the remaining
    Core 3.0 feature gaps after GC.
 
-The 133 `unsupported` rows: annotations 73, `rec`-group/carrier
-fixtures (type-rec 26, type-equivalence 20, elem 8, binary 2,
-type-canon 2, plus GC-value opcode fixtures); every non-pass is
-attributed per file in `CONFORMANCE.md`.
+The 131 `unsupported` rows: annotations 73, `rec`-group/carrier
+fixtures (type-rec 26, type-equivalence 18, elem 8, binary 2,
+type-canon 2, custom 1, obsolete-keywords 1, plus GC-value opcode
+fixtures); every non-pass is attributed per file in
+`CONFORMANCE.md`.

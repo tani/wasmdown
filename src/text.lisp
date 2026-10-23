@@ -2047,20 +2047,25 @@ nat token is the max (a reftype/id after the min is NOT a max)."
 ...)) field node, or a decode-error when the shape is wrong. Split
 out of %PARSE-TYPE-FIELD so the two-pass scheme (pass 1 registers
 every explicit type before any body parses; pass 2 parses the rest)
-can compute signatures without growing the penv. PENV is the SHARED
-parse environment — heap-type forward refs ((ref $t2) in $t1's
+can compute signatures without growing the penv. PENV supplies the
+SHARED type id hash — heap-type forward refs ((ref $t2) in $t1's
 signature, type_equivalence.wast) resolve against the pre-registered
-type id hash."
-  (multiple-value-bind (id rest) (%opt-id (cddr node))
-    (let ((funclist (first rest)))
-      (unless (and funclist (tok-elem-p funclist)
-                   (string= (%tok-keyword (%first-tok funclist)) "func"))
-        (%text-error (or (and id (tok-p id) (tok-pos id)) 0)
-                     "(type) needs a (func ...) list"))
-      (multiple-value-bind (params results typeidx)
-          (%typeuse (cddr funclist) penv)
-        (declare (ignore typeidx))
-        (values id params results)))))
+ids — but the parse uses a SHADOW penv with a FRESH locals hash:
+type-field params are NOT function locals, and registering their
+names would collide when an equal signature repeats (type.wast ::6-7
+and type-equivalence.wast's (param $x ...) twins — 'duplicate local'
+harness noise) or bleed into the first func's namespace."
+  (let ((shadow (make-penv :types (penv-types penv))))
+    (multiple-value-bind (id rest) (%opt-id (cddr node))
+      (let ((funclist (first rest)))
+        (unless (and funclist (tok-elem-p funclist)
+                     (string= (%tok-keyword (%first-tok funclist)) "func"))
+          (%text-error (or (and id (tok-p id) (tok-pos id)) 0)
+                       "(type) needs a (func ...) list"))
+        (multiple-value-bind (params results typeidx)
+            (%typeuse (cddr funclist) shadow)
+          (declare (ignore typeidx))
+          (values id params results))))))
 
 (defun %prescan-types (nodes penv)
   "Pass 1 of the two-pass type scheme: parse every explicit (type ...)
