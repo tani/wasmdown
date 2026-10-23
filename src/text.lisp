@@ -1774,22 +1774,33 @@ single folded list or a plain instruction sequence ending with end)."
                       (penv-globals-list penv)))))))))
 
 (defun %parse-expr (items penv)
-  "Parse a constant expression from ITEMS: either ONE folded list
-(e.g. (i32.const 0)) or a plain instruction sequence ending with end.
-Returns the instr vector INCLUDING the trailing :end (contract for
-const expressions)."
+  "Parse a constant expression from ITEMS. Shapes (WAT spec):
+  - zero or more instruction forms — folded lists ((i32.const 0) ...),
+    plain tokens (ref.func $f; an (item ...) abbreviation wraps these),
+  - a plain instruction sequence terminated by end.
+Either way the returned instr vector INCLUDES the trailing :end
+(contract for const expressions). Multi-instruction and non-const
+shapes PARSE here and fail at VALIDATION (const-expr-type reports
+arity/constness); junk the instruction parser rejects is a decode
+error."
   (cond
    ((and (= (length items) 1) (tok-elem-p (car items)))
     ;; single folded expression
     (let ((instrs (%folded (car items) penv)))
       (coerce (append instrs (list (make-wasm-instr :end nil #() 0)))
               'vector)))
+   ((and items (every #'tok-elem-p items))
+    ;; folded sequence: parse each list; no end keyword involved
+    (let ((instrs (mapcar (lambda (x) (%folded x penv)) items)))
+      (coerce (append (reduce #'append instrs :from-end t)
+                      (list (make-wasm-instr :end nil #() 0)))
+              'vector)))
    (t
-    ;; plain sequence: instructions then end
+    ;; plain sequence: instructions then optional end
     (multiple-value-bind (body term rest)
         (%instr-list items penv)
       (declare (ignore rest))
-      (unless (eq (car term) :end)
+      (unless (or (eq (car term) :end) (null term))
         (%text-error 0 "constant expression must end with end"))
       (coerce (append body (list (make-wasm-instr :end nil #() 0)))
               'vector)))))
@@ -1832,14 +1843,36 @@ const expressions)."
 ;;; ---------------------------------------------------------------
 ;;; Element and data segments.
 
+(defun %utf8-encode-char (ch out)
+  "Append the UTF-8 encoding of character CH to the adjustable octet
+vector OUT (the WAT spec encodes data segment string literals as
+UTF-8, so code points above #xFF occupy 2-4 bytes)."
+  (let ((cp (char-code ch)))
+    (flet ((push1 (b) (vector-push-extend b out)))
+      (cond ((< cp #x80) (push1 cp))
+            ((< cp #x800)
+             (push1 (logior #xC0 (ash cp -6)))
+             (push1 (logior #x80 (logand cp #x3F))))
+            ((< cp #x10000)
+             (push1 (logior #xE0 (ash cp -12)))
+             (push1 (logior #x80 (logand (ash cp -6) #x3F)))
+             (push1 (logior #x80 (logand cp #x3F))))
+            (t
+             (push1 (logior #xF0 (ash cp -18)))
+             (push1 (logior #x80 (logand (ash cp -12) #x3F)))
+             (push1 (logior #x80 (logand (ash cp -6) #x3F)))
+             (push1 (logior #x80 (logand cp #x3F))))))))
+
 (defun %data-bytes (items)
-  "Concatenate the :string tokens of a data segment into a byte vector."
+  "Concatenate the :string tokens of a data segment into a byte
+vector, UTF-8 encoded (token.wast pins astral-plane code points in
+data strings: the bytes are the UTF-8 form, not char-code)."
   (let ((out (make-array 16 :element-type '(unsigned-byte 8)
                          :fill-pointer 0 :adjustable t)))
     (dolist (x items)
       (let ((s (%string-tok x)))
         (loop for ch across s
-              do (vector-push-extend (char-code ch) out))))
+              do (%utf8-encode-char ch out))))
     (coerce out 'vector)))
 
 (defun %elem-items (items rt penv)
@@ -1866,19 +1899,28 @@ expression vectors (each INCLUDING its :end)."
             (unless (tok-elem-p x)
               (%text-error (if (tok-p x) (tok-pos x) 0)
                            "elem item must be an expression"))
-            (%parse-expr (list x) penv))
+            ;; (item e*): the spec's item wrapper around one
+            ;; instruction sequence; unwrap to a folded const expr
+            ;; whose arity/constness fails at VALIDATION (elem.wast
+            ;; pins (item (ref.null func) (ref.null func)) etc).
+            (if (and (tok-p (%first-tok x))
+                     (string= (%tok-keyword (%first-tok x)) "item"))
+                (%parse-expr (cddr x) penv)
+                (%parse-expr (list x) penv)))
           items))
 
 (defun %elem-offset-expr (items penv)
-  "The offset of an active elem: a bare (i32.const n) style expression
-list, or an (offset expr) wrapper. Returns (values expr rest)."
+  "The offset of an active elem/data: an (offset expr*) wrapper, or
+the single-instruction abbreviation — ANY leading folded list (strings
+are :string tokens, reftypes keywords, so a leading list is always the
+offset per the WAT grammar's offset abbreviation). Returns (values
+expr rest). The expression's arity/constness is checked at
+VALIDATION, not here."
  (cond
   ((and items (tok-elem-p (car items))
         (string= (%tok-keyword (%first-tok (car items))) "offset"))
    (values (%parse-expr (cddr (car items)) penv) (cdr items)))
-  ((and items (tok-elem-p (car items))
-        (member (%tok-keyword (%first-tok (car items)))
-                '("i32.const" "global.get") :test #'string=))
+  ((and items (tok-elem-p (car items)))
    (values (%parse-expr (list (car items)) penv) (cdr items)))
   (t (values nil items))))
 

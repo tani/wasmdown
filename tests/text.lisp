@@ -539,3 +539,27 @@ EQUALP (canonical-encode agreement oracle)."
                         (func (export \"g\") (param $i i32) (result i32)
                           (ref.is_null (table.get $t (local.get $i)))))"))))
     (wasmdown.test:is (equal '(1) (wasmdown:invoke inst "g" 0)))))
+
+(wasmdown.test:test text/multi-instr-offset-exprs
+  ;; Regression (loop 9): const-expr contexts (offset/item) accept
+  ;; multi-instruction folded sequences and empty exprs — they parse
+  ;; and fail VALIDATION (arity/constness), not DECODE. data.wast
+  ;; ::53-60 wanted phase VALIDATE.
+  (wasmdown.test:assert-raises wasmdown:validation-error
+    (wasmdown:validate-module
+     (%wat "(module (memory 1) (data (offset (i32.const 0) (nop)) \"a\"))")))
+  ;; legal abbreviation: any leading folded list is the offset
+  (wasmdown:validate-module
+   (%wat "(module (memory 1) (data (i32.const 0) \"a\"))")))
+
+(wasmdown.test:test text/utf8-data-literals
+  ;; Regression (loop 9): data-string literals UTF-8 encode chars
+  ;; (was (char-code ch) per char — astral/BMP fixtures crashed as
+  ;; not (UNSIGNED-BYTE 8); token.wast::39 fixtures pass).
+  ;; e-acute (U+00E9) written via hex-escape chars must encode as
+  ;; the 2-byte UTF-8 sequence C3 A9.
+  (let ((m (%wat "(module (memory 1) (data (i32.const 0) \"\\e9\"))")))
+    (wasmdown:validate-module m)
+    (let ((d (aref (wasmdown.types:wasm-module-datas m) 0)))
+      (wasmdown.test:is (equalp #(195 169)
+                                (wasmdown.types:wasm-data-bytes d))))))

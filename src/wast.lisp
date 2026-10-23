@@ -780,7 +780,7 @@ the classification is honest, never a silent pass."
      ((or (has "try_table") (has "(throw") (tok "tag")
           (tok "exnref")) :exception-handling)
      ((or (has "(struct") (has "(array") (has "(i31")
-          (has "(rec ") (tok "call_ref") (has "br_on_cast")
+          (has "(rec") (tok "call_ref") (has "br_on_cast")
           (has "ref.cast") (tok "anyref") (tok "eqref")
           ;; typed references: (ref null $t) and non-null (ref $t)
           (has "(ref null") (has "(ref func") (has "(ref extern")
@@ -889,6 +889,35 @@ module object is needed; signals a catchable wasmdown:decode-error."
                (/= func-count code-count))
       (%werr 0 "function and code section have inconsistent lengths: ~d vs ~d"
              func-count code-count))))
+(defun %binary-gc-table-p (bytes)
+  "Whether a binary payload's Table section uses a GC typed-reference
+element type (a reftype byte other than funcref/externref in
+table-type position — elem.wast's (table 1 (ref func) ...) fixtures).
+Only the FIRST table entry is inspected (entries are delimited by
+their limits, which the detector does not parse; every suite fixture
+declaring a GC table declares it first). Such modules are GC scope,
+classified :unsupported rather than decode-failed."
+  (when (< (length bytes) 8) (return-from %binary-gc-table-p nil))
+  (handler-case
+      (let ((r (wasmdown.binary:make-reader bytes))
+            (gc-p nil))
+        ;; magic + version
+        (dotimes (_ 8) (wasmdown.binary:read-byte-at r))
+        (loop
+          (when (>= (wasmdown.binary:reader-offset r) (length bytes)) (return))
+          (let* ((id (wasmdown.binary:read-byte-at r))
+                 (size (wasmdown.binary:read-u32 r))
+                 (end (+ (wasmdown.binary:reader-offset r) size)))
+            (when (= id 4)
+              (wasmdown.binary:read-u32 r)        ; entry count
+              (unless (member (wasmdown.binary:read-byte-at r)
+                              '(#x70 #x6f))
+                (setf gc-p t)))
+            (setf (wasmdown.binary:reader-offset r) end)
+            (when gc-p (return))))
+        gc-p)
+    (error () nil)))
+
 
 (defun %module-outcome (cmd state)
   "Run a (module ...) command through decode/validate/link/
@@ -896,6 +925,11 @@ instantiate/execute. Returns (values outcome phase detail instance)."
   (declare (ignore state))
   (handler-case
       (progn
+        (when (and (wast-cmd-bytes cmd)
+                   (%binary-gc-table-p (wast-cmd-bytes cmd)))
+          (return-from %module-outcome
+            (values :unsupported nil
+                    "uses unsupported feature gc (typed-ref table in binary)")))
         (when (wast-cmd-bytes cmd)
           (%preflight-binary-sections (wast-cmd-bytes cmd)))
         (let ((module (%decode-module-form cmd)))
@@ -994,7 +1028,7 @@ comparison directive list."
                    (list :ref-func-id (second spec))
                    (list :ref-non-null)))
     (:ref-null (list :ref-null))
-    (:ref-extern (list :ref-extern (third spec)))))
+    (:ref-extern (list :ref-extern (second spec)))))
 
 (defun %arg-to-lisp (spec)
   "Convert a parsed argument spec to the Lisp-domain argument value
@@ -1011,7 +1045,7 @@ per docs/CONTRACTS.md (i32/i64 unsigned, f32/f64 floats, refs)."
       )
     (:ref-func (error "ref.func as invoke argument unsupported"))
     (:ref-null nil)
-    (:ref-extern (list 'externref (third spec)))))
+    (:ref-extern (list 'externref (second spec)))))
 
 (defun %value-matches (actual expected)
   "Compare one result value against its expectation directive."

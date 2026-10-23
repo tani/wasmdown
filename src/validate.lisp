@@ -247,19 +247,23 @@ exclusive upper bound of global indices referenceable via global.get
                       (verr "~a: ref.func ~a is not declared by an element segment or export"
                             what x))
                     (push1 :funcref)))
-                 ((eq op :global.get)
-                  (let* ((x (getf imms :global))
-                         (g (and (integerp x) (>= x 0)
-                                 (< x (length (vctx-globals ctx)))
-                                 (svref (vctx-globals ctx) x))))
-                    (unless g
-                      (verr "~a: global.get index ~a out of range (module has ~a global~:p)"
-                            what x (length (vctx-globals ctx))))
-                    (when global-limit
-                      (unless (< x global-limit)
-                        (verr "~a: global.get ~a must reference an imported or previously defined global"
-                              what x)))
-                    (push1 (first g))))
+                ((eq op :global.get)
+                 (let* ((x (getf imms :global))
+                        (g (and (integerp x) (>= x 0)
+                                (< x (length (vctx-globals ctx)))
+                                (svref (vctx-globals ctx) x))))
+                   (unless g
+                     (verr "~a: global.get index ~a out of range (module has ~a global~:p)"
+                           what x (length (vctx-globals ctx))))
+                   (when global-limit
+                     (unless (< x global-limit)
+                       (verr "~a: global.get ~a must reference an imported or previously defined global"
+                             what x)))
+                   ;; spec const-expr rule: only immutable globals
+                   (when (second g)
+                     (verr "~a: global.get ~a of a mutable global is not constant"
+                           what x))
+                   (push1 (first g))))
                 ;; Extended-const expressions (Core 3.0): i32/i64
                 ;; add/sub/mul over constant operands are constant.
                 ;; Both operands must carry the op's type.

@@ -64,6 +64,20 @@ byte of encoding)."
                        what count))
     (coerce (loop repeat count collect (funcall elem-fn r)) 'vector)))
 
+(defun read-byte-vec (r what)
+  "A u32-counted vector of raw bytes, specialized to
+(vector (unsigned-byte 8)) — including the EMPTY case, which must not
+degrade to a simple-vector (data-seg-state's slot type)."
+  (let ((start (reader-offset r))
+        (count (read-u32 r)))
+    (when (> count (- (reader-limit r) (reader-offset r)))
+      (decode-error-at start "length out of bounds: ~a vector declares ~d element~:p"
+                       what count))
+    (let ((v (make-array count :element-type '(unsigned-byte 8))))
+      (loop for i below count
+            do (setf (aref v i) (read-byte-at r)))
+      v)))
+
 ;;; ---------------------------------------------------------------
 ;;; LEB128. Spec-permitted padded (non-minimal) encodings are accepted
 ;;; within the width's maximum byte length (5 bytes for u32/s32/s33,
@@ -636,13 +650,13 @@ enforced exactly."
               (let ((flags (read-u32 r)))
                 (case flags
                   (#x00 (make-wasm-data (list :active 0 (decode-instr-seq r))
-                                        (read-vec r #'read-byte-at "data byte")))
+                                        (read-byte-vec r "data byte")))
                   (#x01 (make-wasm-data (list :passive)
-                                        (read-vec r #'read-byte-at "data byte")))
+                                        (read-byte-vec r "data byte")))
                   (#x02 (let ((mem (read-u32 r))
                               (expr (decode-instr-seq r)))
                           (make-wasm-data (list :active mem expr)
-                                          (read-vec r #'read-byte-at "data byte"))))
+                                          (read-byte-vec r "data byte"))))
                   (t (%decode-error r "malformed data segment flags ~d" flags)))))
             "data"))
 
