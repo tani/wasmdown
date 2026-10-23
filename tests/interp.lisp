@@ -474,3 +474,20 @@
      '())
     "st")
    '(#xABCD)))
+(wasmdown.test:test interp/loop-fallthrough-return
+  ;; :loop fallthrough must return the operand stack (was NIL —
+  ;; a plain (return) inside the CL restart loop abandoned it).
+  (expect
+   (call-export
+    (make-module-instance
+     (mmod
+      :types (vector (ft '() '(:i32)))
+      :funcs (vector (fn 0 (vector (i :i32.const (list :value 42))
+                                   (i :loop nil
+                                     (vector (i :i32.const (list :value 1))
+                                             (i :drop)))
+                                   (i :end))))
+      :exports (vector (make-wasm-export "f" :func 0)))
+     '())
+    "f")
+   '(42)))
