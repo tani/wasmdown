@@ -112,6 +112,8 @@
            #:f64-div #:f64-min #:f64-max #:f64-copysign
            #:f64-eq #:f64-ne #:f64-lt #:f64-gt #:f64-le #:f64-ge
            #:i32-wrap-i64 #:i64-extend-i32-s #:i64-extend-i32-u
+           #:i32-extend8-s #:i32-extend16-s
+           #:i64-extend8-s #:i64-extend16-s #:i64-extend32-s
            #:i32-trunc-f32-s #:i32-trunc-f32-u
            #:i32-trunc-f64-s #:i32-trunc-f64-u
            #:i64-trunc-f32-s #:i64-trunc-f32-u

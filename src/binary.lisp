@@ -323,15 +323,20 @@ word, but little-endian accumulation is unsigned."
 ;;; rest of the decoder is portable CL.
 
 (defun %read-memarg (r)
-  "align u32; bit 6 set -> memidx follows, stored as (:memidx . n) in
-the returned plist; offset u32 (this slice is 32-bit-only, so a u32
-even though the grammar writes u64)."
-  (let ((align (read-u32 r)))
-    (if (logtest align #x40)
+  "memarg per the reference decoder (decode.ml memop): flags is a u32
+that must be < 0x80 (else 'malformed memop flags' at DECODE — align
+exponents beyond 2^63 and multi-byte flag encodings are malformed);
+bit 6 -> memidx follows (stored as :memidx); align = flags & 0x3F;
+offset is u32 in this 32-bit-only slice (the grammar writes u64)."
+  (let ((start (reader-offset r))
+        (flags (read-u32 r)))
+    (unless (< flags #x80)
+      (decode-error-at start "malformed memop flags: ~a" flags))
+    (if (logtest flags #x40)
         (let ((memidx (read-u32 r))
               (offset (read-u32 r)))
-          (list :align (- align #x40) :offset offset :memidx memidx))
-        (list :align align :offset (read-u32 r)))))
+          (list :align (logand flags #x3F) :offset offset :memidx memidx))
+        (list :align flags :offset (read-u32 r)))))
 
 (defun %read-instr (r depth)
   "Decode one instruction at R. Returns the wasm-instr, or :end / :else

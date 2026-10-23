@@ -251,6 +251,26 @@
   (is= #x12345678 (i32-wrap-i64 #xffffffff12345678))
   (is= #x00000000 (i32-wrap-i64 #x100000000)))
 
+(wasmdown.test:test numops/extend8-16-sign-extension
+  ;; Regression (loop 12, i32.wast/i64.wast extend8_s/extend16_s
+  ;; 'result 0: got -1' batches): iNN.extendM_s sign-extends the low
+  ;; M bits, NOT the full-width i32-s/i64-s signed view.
+  (is= 0 (i32-extend8-s 0))
+  (is= 127 (i32-extend8-s #x7f))
+  (is= #xffffff80 (i32-extend8-s #x80))
+  (is= #xffffffff (i32-extend8-s #xff))
+  (is= 0 (i32-extend8-s #x01234500))
+  (is= #xffffff80 (i32-extend8-s #xfedcba80))
+  (is= #xffffffff (i32-extend8-s #xffffffff))
+  (is= 32767 (i32-extend16-s #x7fff))
+  (is= #xffff8000 (i32-extend16-s #x8000))
+  (is= #xffffffff (i32-extend16-s #xffff))
+  (is= 0 (i32-extend16-s #x01230000))
+  (is= #xffffffffffffff80 (i64-extend8-s #x8000000000000080))
+  (is= #xffffffff80000000 (i64-extend32-s #x80000000))
+  (is= #x7fffffff (i64-extend32-s #x800000007fffffff))
+  (is= 42 (i64-extend32-s 42)))
+
 (wasmdown.test:test numops/trunc-trap-boundaries
   ;; f32 -> i32_s: true representable bounds
   (is= #x80000000 (i32-trunc-f32-s -2147483648.0f0))

@@ -368,6 +368,34 @@ Returns the canonical encoding."
       (wasmdown.test:is (= 3 (getf imm :offset)))
       (wasmdown.test:is (= 1 (getf imm :memidx))))))
 
+(wasmdown.test:test binary/spec-memop-flags-malformed
+  ;; align.wast: memarg flags is a u32 that must be < 0x80 —
+  ;; 0x80 0x01 (align exponent 2^128) and 0x80 0x02 (2^256) are
+  ;; "malformed memop flags" DECODE errors (reference decode.ml memop
+  ;; requires I32.lt_u flags 0x80l).
+  (dolist (flags-bytes '(#(#x80 #x01) #(#x80 #x02)))
+    (let ((bad (cat *header*
+                    (section 1 (u32 1) (bv #x60) (u32 0) (u32 0))
+                    (section 3 (u32 1) (u32 0))
+                    (section 5 (u32 1) (bv #x00) (u32 1))
+                    (section 10 (u32 1) (u32 8) (u32 0)
+                             (bv #x41) (u32 0)
+                             (bv #x28)
+                             (apply #'bv (coerce flags-bytes 'list))
+                             (u32 0)
+                             (bv #x1A) (bv #x0B)))))
+      (wasmdown.test:is (decode-error-p bad))))
+  ;; control: flags 0x02 (align 2) with offset 0 decodes fine.
+  (let ((good (dec (cat *header*
+                        (section 1 (u32 1) (bv #x60) (u32 0) (u32 0))
+                        (section 3 (u32 1) (u32 0))
+                        (section 5 (u32 1) (bv #x00) (u32 1))
+                        (section 10 (u32 1) (u32 8) (u32 0)
+                                 (bv #x41) (u32 0)
+                                 (bv #x28) (bv #x02) (u32 0)
+                                 (bv #x1A) (bv #x0B))))))
+    (wasmdown.test:is (wasmdown.types:wasm-module-p good))))
+
 (wasmdown.test:test binary/golden-datacount-position
   ;; (q) DataCount (12) between Elem (9) and Code (10): accepted.
   ;; Also Data (11) after Code (10): accepted.

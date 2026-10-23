@@ -353,6 +353,27 @@ canonical NaN (e.g. hardware propagation from -nan operands) matches."
     (i64-> (if (>= x #x80000000) (- x #x100000000) x))))
 (defun i64-extend-i32-u (x) (i64-> (i32-> x)))
 
+;;; iNN.extendM_s (sign-extension proposal): sign-extend the low M bits
+;;; of an iNN value (stored in the unsigned iNN domain) to full width.
+(declaim (inline i32-extend8-s) (inline i32-extend16-s))
+(defun i32-extend8-s (x)
+  (let ((b (logand (i32-> x) #xFF)))
+    (i32-> (if (>= b #x80) (- b #x100) b))))
+(defun i32-extend16-s (x)
+  (let ((h (logand (i32-> x) #xFFFF)))
+    (i32-> (if (>= h #x8000) (- h #x10000) h))))
+(declaim (inline i64-extend8-s) (inline i64-extend16-s)
+         (inline i64-extend32-s))
+(defun i64-extend8-s (x)
+  (let ((b (logand (i64-> x) #xFF)))
+    (i64-> (if (>= b #x80) (- b #x100) b))))
+(defun i64-extend16-s (x)
+  (let ((h (logand (i64-> x) #xFFFF)))
+    (i64-> (if (>= h #x8000) (- h #x10000) h))))
+(defun i64-extend32-s (x)
+  (let ((w (logand (i64-> x) #xFFFFFFFF)))
+    (i64-> (if (>= w #x80000000) (- w #x100000000) w))))
+
 ;;; Trapping float->int truncation.  Bounds: trunc(z) must land in
 ;;; [-2^(N-1), 2^(N-1)) (signed) or [0, 2^N) (unsigned).  NaN traps
 ;;; :invalid-conversion; out-of-range traps :integer-overflow.

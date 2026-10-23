@@ -509,17 +509,23 @@ exclusive upper bound of global indices referenceable via global.get
 
 (defun %check-memarg (fv imms width-bits)
   "Validate a memarg: memidx must exist, alignment must not exceed the
-natural width (spec: 2^align <= N/8). Offsets are unconstrained u32."
+natural width (spec: 2^align <= N/8), and the offset must fit the u32
+range the spec's memarg grammar allows (suite: address.wast/
+align.wast 'offset out of range' with offset=2^32 and above)."
   (let* ((memidx (or (getf imms :memidx) 0))
          (align (getf imms :align))
+         (offset (getf imms :offset))
          (what (format nil "memory access (width ~a bits)" width-bits)))
     (vctx-mem-at (fv-ctx fv) memidx what)
     (unless (and (integerp align) (>= align 0)
                  (<= (ash 1 align) (/ width-bits 8)))
       (verr "alignment must not be larger than natural (offset ~a: align ~a > ~a)"
             (fv-offset fv) align (/ width-bits 8)))
-    (unless (integerp (getf imms :offset))
-      (verr "memory offset immediate must be an integer"))))
+    (unless (integerp offset)
+      (verr "memory offset immediate must be an integer"))
+    (unless (and (>= offset 0) (<= offset #xffffffff))
+      (verr "offset out of range (offset ~a): ~a is not within u32"
+            (fv-offset fv) offset))))
 
 (defun %local-type (fv localidx)
   (let ((locals (fv-locals fv)))

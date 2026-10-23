@@ -361,6 +361,27 @@
         :funcs (vector (f 0 '() (vector (i :i32.const '(:value 0))
                                         (i :i32.load8_u '(:align 1 :offset 0))
                                         (i :drop) (i :end))))))
+;; (e3) memarg offset out of u32 range: address.wast/align.wast
+;; "offset out of range" — the text grammar admits the integer but
+;; validation must reject offsets above 2^32-1.
+(bad validate/neg-memarg-offset-out-of-range
+  (mmod :types (t0)
+        :mems (vector (make-wasm-memory (make-wasm-limits 1)))
+        :funcs (vector (f 0 '() (vector (i :i32.const '(:value 0))
+                                        (i :i32.load
+                                           (list :align 2
+                                                 :offset 4294967296))
+                                        (i :drop) (i :end))))))
+;; (e3b) POSITIVE control: offset = 2^32-1 is the last valid u32.
+(wasmdown.test:test validate/pos-memarg-offset-umax
+  (ok (wasmdown.validate:validate-module
+       (mmod :types (t0)
+             :mems (vector (make-wasm-memory (make-wasm-limits 1)))
+             :funcs (vector (f 0 '() (vector
+                                      (i :i32.const '(:value 0))
+                                      (i :i32.load
+                                         (list :align 2 :offset 4294967295))
+                                      (i :drop) (i :end))))))))
 
 ;; (f) data-count mismatch: section declares 2, data section has 1.
 (bad validate/neg-datacount-mismatch

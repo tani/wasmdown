@@ -13,27 +13,27 @@ now classify as :unsupported instead of crashing as harness-errors.
 
 | Outcome | Count |
 | --- | --- |
-| pass | 19742 |
-| fail | 661 |
+| pass | 19792 |
+| fail | 611 |
 | skip | 0 |
 | unsupported | 746 |
 | timeout | 0 |
 | harness-error | 38 |
 | **total** | **21187** |
 
-Executed: 21187 commands; pass rate 93.2% (denominator = all executed,
+Executed: 21187 commands; pass rate 93.4% (denominator = all executed,
 including unsupported — honest per PLAN.md §12.9).
 
 ## Per-file counts
 
 | File | pass | fail | unsupported | other |
 | --- | --- | --- | --- | --- |
-| address | 259 | 1 | 0 | 0 |
-| align | 162 | 3 | 0 | 0 |
+| address | 260 | 0 | 0 | 0 |
+| align | 165 | 0 | 0 | 0 |
 | annotations | 0 | 0 | 0 | 1 |
 | binary-leb128 | 87 | 4 | 0 | 0 |
 | binary | 126 | 1 | 2 | 0 |
-| block | 216 | 7 | 0 | 0 |
+| block | 223 | 0 | 0 | 0 |
 | br | 97 | 0 | 0 | 0 |
 | br_if | 118 | 0 | 1 | 0 |
 | br_on_non_null | 0 | 0 | 12 | 0 |
@@ -65,10 +65,10 @@ including unsupported — honest per PLAN.md §12.9).
 | func | 161 | 9 | 0 | 5 |
 | func_ptrs | 35 | 0 | 0 | 1 |
 | global | 117 | 7 | 0 | 0 |
-| i32 | 450 | 10 | 0 | 0 |
-| i64 | 401 | 15 | 0 | 0 |
+| i32 | 460 | 0 | 0 | 0 |
+| i64 | 416 | 0 | 0 | 0 |
 | id | 0 | 2 | 0 | 5 |
-| if | 234 | 7 | 0 | 0 |
+| if | 241 | 0 | 0 | 0 |
 | imports | 197 | 12 | 9 | 0 |
 | inline-module | 0 | 0 | 0 | 1 |
 | instance | 0 | 8 | 15 | 0 |
@@ -82,7 +82,7 @@ including unsupported — honest per PLAN.md §12.9).
 | local_init | 0 | 0 | 10 | 0 |
 | local_set | 53 | 0 | 0 | 0 |
 | local_tee | 97 | 0 | 1 | 0 |
-| loop | 114 | 7 | 0 | 0 |
+| loop | 121 | 0 | 0 | 0 |
 | memory | 87 | 3 | 0 | 0 |
 | memory_grow | 109 | 0 | 0 | 0 |
 | memory_redundancy | 8 | 0 | 0 | 0 |

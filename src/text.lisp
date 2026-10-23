@@ -854,6 +854,72 @@ entry when no equal one exists."
     (cond (typeidx typeidx)
           (t (%find-or-add-type params results penv)))))
 
+(defun %block-typeuse (items penv)
+  "Parse a BLOCKTYPE typeuse from ITEMS (the head items after the
+optional label of a block/loop/if). Per the spec text grammar
+(parser.mly block/block_param_body) this differs from a func typeuse:
+  1. (param) items are anonymous valtype lists only — a (param $id t)
+     binder is grammatically impossible ('unexpected token' malformed
+     text; block.wast/func.wast assert_malformed batches).
+  2. When an explicit (type x) is present AND inline (param)/(result)
+     items follow, the inline functype must be syntactically EQUAL to
+     the referenced functype — otherwise 'inline function type' is
+     malformed (block.wast's (block (type $sig) (result i32) ...) batch;
+     func-style find-or-create does NOT apply).
+Returns (values params results typeidx-or-nil)."
+  (let ((typeidx nil) (params '()) (results '()) (rest items)
+        (stage 0))
+    (loop while rest
+          for x = (car rest)
+          for k = (and (tok-elem-p x)
+                       (member (%tok-keyword (%first-tok x))
+                               '("type" "param" "result")
+                               :test #'string=)
+                       (%tok-keyword (%first-tok x)))
+          while k
+          do (cond
+              ((string= k "type")
+               (unless (zerop stage)
+                 (%text-error (tok-pos (%first-tok x))
+                              "unexpected token: (type) must come first in a typeuse"))
+               (when typeidx
+                 (%text-error 0 "duplicate (type) in a typeuse"))
+               (let ((idtok (third x)))
+                 (unless idtok
+                   (%text-error 0 "(type) needs an index"))
+                 (setf typeidx
+                       (%id-or-num idtok (penv-types penv) "type")))
+               (pop rest))
+              ((string= k "param")
+               (when (> stage 1)
+                 (%text-error (tok-pos (%first-tok x))
+                              "unexpected token: (param) after (result) in a typeuse"))
+               (setf stage 1)
+               ;; blocktype params are anonymous: (param $x t) is not
+               ;; in the grammar — the token cannot be parsed.
+               (let ((ptoks (cddr x)))
+                 (when (and ptoks (tok-p (car ptoks))
+                            (eq (tok-kind (car ptoks)) :id))
+                   (%text-error (tok-pos (car ptoks))
+                                "unexpected token: block params cannot be named"))
+                 (setf params (append params
+                                     (mapcar #'%valtype ptoks))))
+               (pop rest))
+              (t
+               (setf stage 2)
+               (setf results (append results
+                                     (mapcar #'%valtype (cddr x))))
+               (pop rest))))
+    ;; (type x) + inline declarations: syntactic equality required.
+    (when (and typeidx (or params results))
+      (let ((ft (nth typeidx (reverse (penv-types-list penv)))))
+        (unless (and ft
+                     (equal (wasm-func-type-params ft) params)
+                     (equal (wasm-func-type-results ft) results))
+          (%text-error 0
+                       "inline function type does not match explicit type"))))
+    (values params results typeidx)))
+
 ;;; ---------------------------------------------------------------
 ;;; Instructions.
 
@@ -1129,9 +1195,10 @@ the trailing-id matching rule. Returns (values instr rest-items)."
 
 (defun %parse-block-typeuse-items (items penv)
   "Consume (type)/(param)/(result) items from the head of ITEMS.
-Returns (values bt skipped)."
+Returns (values bt skipped). Blocktype grammar rules (named-param
+rejection, (type x)+inline equality) are enforced by %BLOCK-TYPEUSE."
   (multiple-value-bind (params results typeidx)
-      (%typeuse items penv)
+      (%block-typeuse items penv)
     (let ((skipped 0)
           (scan items))
       (loop while (and scan (tok-elem-p (car scan))
@@ -1398,7 +1465,7 @@ list NODE: returns (values id bt body-items). Does NOT push the label
       (setf id (tok-text (car items)))
       (pop items))
     (multiple-value-bind (params results typeidx)
-        (%typeuse items penv)
+        (%block-typeuse items penv)
       (let ((skipped 0)
             (scan items))
         (loop while (and scan (tok-elem-p (car scan))

@@ -572,3 +572,36 @@ EQUALP (canonical-encode agreement oracle)."
   ;; surrogate escapes REJECT at decode (utf8-invalid-encoding):
   (wasmdown.test:assert-raises wasmdown:decode-error
     (%wat "(module (memory 1) (data (i32.const 0) \"\\u{d800}\"))")))
+
+(wasmdown.test:test text/blocktype-named-param-malformed
+  ;; Regression (loop 12, block.wast ::59/::219/::220): blocktype
+  ;; (param) items are anonymous valtype lists per the grammar
+  ;; (parser.mly block_param_body: LPAR PARAM valtype_list RPAR);
+  ;; (param $x i32) in a block/loop/if typeuse is 'unexpected token'
+  ;; malformed text (folded and plain forms).
+  (dolist (bad
+           '("(module (func (i32.const 0) (block (param $x i32) (drop))))"
+             "(module (func (param i32) (result i32) block (param $x i32) end))"
+             "(module (func (param i32) (result i32) (block (param $x i32))))"))
+    (wasmdown.test:assert-raises wasmdown:decode-error
+      (%wat bad)))
+  ;; anonymous block params stay legal (multi-value).
+  (wasmdown:validate-module
+   (%wat "(module (func (i32.const 0) (block (param i32) (drop))))")))
+
+(wasmdown.test:test text/blocktype-inline-type-mismatch-malformed
+  ;; Regression (loop 12, block.wast ::60-63): when a blocktype gives
+  ;; an explicit (type x) AND inline (param)/(result) items, the inline
+  ;; functype must be syntactically EQUAL to the referenced type
+  ;; (parser.mly inline_functype_explicit); a mismatch is the
+  ;; 'inline function type' malformed case at DECODE.
+  (dolist (bad
+           '("(module (type $sig (func)) (func (block (type $sig) (result i32) (i32.const 0)) (unreachable)))"
+             "(module (type $sig (func (param i32) (result i32))) (func (block (type $sig) (result i32) (i32.const 0)) (unreachable)))"
+             "(module (type $sig (func (param i32) (result i32))) (func (i32.const 0) (block (type $sig) (param i32) (drop)) (unreachable)))"
+             "(module (type $sig (func (param i32 i32) (result i32))) (func (i32.const 0) (block (type $sig) (param i32) (result i32)) (unreachable)))"))
+    (wasmdown.test:assert-raises wasmdown:decode-error
+      (%wat bad)))
+  ;; MATCHING inline declarations next to (type x) are legal.
+  (wasmdown:validate-module
+   (%wat "(module (type $sig (func (result i32))) (func (block (type $sig) (result i32) (i32.const 0)) (drop)))")))
