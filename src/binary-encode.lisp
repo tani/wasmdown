@@ -467,51 +467,51 @@ legacy funcidx item form; returns the funcidx or nil."
                          (enc-u32 e 0)      ; flag 0: legacy active
                          (enc-instrs e expr)
                          (enc-u32 e (length inits))
-                         (loop for init across inits
+                         (loop for init in inits
                                do (enc-u32 e (elem-init-ref-func-index init))))
                         ((and (eql tableidx 0) (eq type :funcref))
                          (enc-u32 e 4)      ; flag 4: active, elemexpr, funcref
                          (enc-instrs e expr)
                          (enc-u32 e (length inits))
-                         (loop for init across inits do (enc-instrs e init)))
+                         (loop for init in inits do (enc-instrs e init)))
                         (t
                          (enc-u32 e 6)      ; flag 6: active, elemexpr, type
                          (enc-u32 e tableidx)
                          (enc-instrs e expr)
                          (enc-valtype e type)
                          (enc-u32 e (length inits))
-                         (loop for init across inits do (enc-instrs e init))))))
+                         (loop for init in inits do (enc-instrs e init))))))
                    ((equal mode '(:passive))
                     (cond
                       ((and (eq type :funcref)
                             (every #'elem-init-legacy-funcidx-p inits))
                        (enc-u32 e 1)
                        (enc-u32 e (length inits))
-                       (loop for init across inits
+                       (loop for init in inits
                              do (enc-u32 e (elem-init-ref-func-index init))))
                       ((eq type :funcref)
                        (enc-u32 e 5)
                        (enc-valtype e type)
                        (enc-u32 e (length inits))
-                       (loop for init across inits do (enc-instrs e init)))
+                       (loop for init in inits do (enc-instrs e init)))
                       (t
                        (enc-u32 e 5)
                        (enc-valtype e type)
                        (enc-u32 e (length inits))
-                       (loop for init across inits do (enc-instrs e init)))))
+                       (loop for init in inits do (enc-instrs e init)))))
                    ((equal mode '(:declarative))
                     (cond
                       ((and (eq type :funcref)
                             (every #'elem-init-legacy-funcidx-p inits))
                        (enc-u32 e 3)
                        (enc-u32 e (length inits))
-                       (loop for init across inits
+                       (loop for init in inits
                              do (enc-u32 e (elem-init-ref-func-index init))))
                       (t
                        (enc-u32 e 7)
                        (enc-valtype e type)
                        (enc-u32 e (length inits))
-                       (loop for init across inits do (enc-instrs e init)))))
+                       (loop for init in inits do (enc-instrs e init)))))
                    (t (error "encode: bad elem mode ~s" mode))))))))
 
 (defun enc-data-section (e datas)

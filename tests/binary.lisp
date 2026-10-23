@@ -420,7 +420,7 @@ Returns the canonical encoding."
       (wasmdown.test:is (zerop (second mode)))
       (wasmdown.test:is (eq :funcref (wasmdown.types:wasm-elem-type el)))
       (wasmdown.test:is (= 1 (length (wasmdown.types:wasm-elem-inits el))))
-      (let ((init (svref (wasmdown.types:wasm-elem-inits el) 0)))
+      (let ((init (first (wasmdown.types:wasm-elem-inits el))))
         (wasmdown.test:is (= 2 (length init)))
         (wasmdown.test:is (eq :ref.func
                               (wasmdown.types:wasm-instr-op (svref init 0))))
@@ -494,16 +494,16 @@ Returns the canonical encoding."
   (assert-roundtrip (mmod :types (vector (ft '(:i32) nil)) :funcs (vector (fn 0 nil (vector (i :local.get (list :local 0)) (i :local.set (list :local 1)) (i :local.get (list :local 1)) (i :local.tee (list :local 2)) (i :drop) (i :end)))))))
 
 (wasmdown.test:test binary/roundtrip-table-ops
-  (assert-roundtrip (mmod :types (vector (ft nil nil)) :tables (vector (tab :funcref) (tab :funcref)) :elems (vector (wasmdown.types:make-wasm-elem '(:passive) :funcref (vector (ref-func-expr 0)))) :funcs (vector (fn 0 nil (vector (i :i32.const (list :value 0)) (i :ref.null (list :type :funcref)) (i :table.set (list :table 0)) (i :i32.const (list :value 0)) (i :table.get (list :table 0)) (i :drop) (i :table.size (list :table 0)) (i :drop) (i :ref.null (list :type :funcref)) (i :i32.const (list :value 1)) (i :table.grow (list :table 0)) (i :drop) (i :i32.const (list :value 0)) (i :ref.null (list :type :funcref)) (i :i32.const (list :value 1)) (i :table.fill (list :table 0)) (i :drop) (i :i32.const (list :value 0)) (i :i32.const (list :value 0)) (i :i32.const (list :value 1)) (i :table.copy (list :dst 0 :src 1)) (i :drop) (i :i32.const (list :value 0)) (i :i32.const (list :value 0)) (i :i32.const (list :value 1)) (i :table.init (list :elem 0 :table 0)) (i :drop) (i :elem.drop (list :elem 0)) (i :ref.func (list :func 0)) (i :ref.is-null) (i :drop) (i :end)))))))
+  (assert-roundtrip (mmod :types (vector (ft nil nil)) :tables (vector (tab :funcref) (tab :funcref)) :elems (vector (wasmdown.types:make-wasm-elem '(:passive) :funcref (list (ref-func-expr 0)))) :funcs (vector (fn 0 nil (vector (i :i32.const (list :value 0)) (i :ref.null (list :type :funcref)) (i :table.set (list :table 0)) (i :i32.const (list :value 0)) (i :table.get (list :table 0)) (i :drop) (i :table.size (list :table 0)) (i :drop) (i :ref.null (list :type :funcref)) (i :i32.const (list :value 1)) (i :table.grow (list :table 0)) (i :drop) (i :i32.const (list :value 0)) (i :ref.null (list :type :funcref)) (i :i32.const (list :value 1)) (i :table.fill (list :table 0)) (i :drop) (i :i32.const (list :value 0)) (i :i32.const (list :value 0)) (i :i32.const (list :value 1)) (i :table.copy (list :dst 0 :src 1)) (i :drop) (i :i32.const (list :value 0)) (i :i32.const (list :value 0)) (i :i32.const (list :value 1)) (i :table.init (list :elem 0 :table 0)) (i :drop) (i :elem.drop (list :elem 0)) (i :ref.func (list :func 0)) (i :ref.is-null) (i :drop) (i :end)))))))
 
 (wasmdown.test:test binary/roundtrip-bulk-memory
   (assert-roundtrip (mmod :types (vector (ft nil nil)) :mems (vector (mem 1)) :datas (vector (wasmdown.types:make-wasm-data '(:passive) (make-array 2 :element-type '(unsigned-byte 8) :initial-contents #(1 2)))) :funcs (vector (fn 0 nil (vector (i :i32.const (list :value 0)) (i :i32.const (list :value 0)) (i :i32.const (list :value 2)) (i :memory.init (list :data 0 :memidx 0)) (i :data.drop (list :data 0)) (i :i32.const (list :value 0)) (i :i32.const (list :value 0)) (i :i32.const (list :value 2)) (i :memory.copy (list :dst 0 :src 0)) (i :i32.const (list :value 0)) (i :i32.const (list :value 0)) (i :i32.const (list :value 2)) (i :memory.fill (list :memidx 0)) (i :end)))))))
 
 (wasmdown.test:test binary/roundtrip-elem-segments
-  (assert-roundtrip (mmod :types (vector (ft nil nil)) :tables (vector (tab :funcref)) :funcs (vector (fn 0 nil (vector (i :end)))) :elems (vector (wasmdown.types:make-wasm-elem '(:passive) :funcref (vector (ref-func-expr 0) (ref-null-expr :funcref))) (wasmdown.types:make-wasm-elem '(:declarative) :funcref (vector (ref-func-expr 0))) (wasmdown.types:make-wasm-elem (list :active 0 (i32-const-expr 0)) :funcref (vector (ref-func-expr 0)))))))
+  (assert-roundtrip (mmod :types (vector (ft nil nil)) :tables (vector (tab :funcref)) :funcs (vector (fn 0 nil (vector (i :end)))) :elems (vector (wasmdown.types:make-wasm-elem '(:passive) :funcref (list (ref-func-expr 0) (ref-null-expr :funcref))) (wasmdown.types:make-wasm-elem '(:declarative) :funcref (list (ref-func-expr 0))) (wasmdown.types:make-wasm-elem (list :active 0 (i32-const-expr 0)) :funcref (list (ref-func-expr 0)))))))
 
 (wasmdown.test:test binary/roundtrip-elem-externref
-  (assert-roundtrip (mmod :types (vector (ft nil nil)) :funcs (vector (fn 0 nil (vector (i :end)))) :elems (vector (wasmdown.types:make-wasm-elem '(:passive) :externref (vector (ref-null-expr :externref)))))))
+  (assert-roundtrip (mmod :types (vector (ft nil nil)) :funcs (vector (fn 0 nil (vector (i :end)))) :elems (vector (wasmdown.types:make-wasm-elem '(:passive) :externref (list (ref-null-expr :externref)))))))
 
 (wasmdown.test:test binary/roundtrip-data-segments
   (assert-roundtrip (mmod :types (vector (ft nil nil)) :mems (vector (mem 1)) :funcs (vector (fn 0 nil (vector (i :end)))) :datas (vector (wasmdown.types:make-wasm-data '(:passive) (make-array 3 :element-type '(unsigned-byte 8) :initial-contents #(1 2 3))) (wasmdown.types:make-wasm-data (list :active 0 (i32-const-expr 0)) (make-array 2 :element-type '(unsigned-byte 8) :initial-contents #(9 8)))))))

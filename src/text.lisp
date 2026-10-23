@@ -1,0 +1,1996 @@
+;;;; WASMDOWN — .wat text format parser (PLAN.md §3.3: the core spec
+;;;; defines a text format; this is the M0 development/conformance
+;;;; frontend). Package WASMDOWN.TEXT.
+;;;;
+;;;; parse-wat (string) -> wasmdown.types:wasm-module, producing exactly
+;;;; the IR of src/binary.lisp's decoder (CONTRACTS.md is binding):
+;;;; - ops are the hyphenated/dotted keywords of the binary slice,
+;;;;   case-insensitive in the source text,
+;;;; - block/loop/if bodies exclude the trailing :end, const expressions
+;;;;   (global init, elem/data offsets and items) include it,
+;;;; - immediates are the plists of the contract (:label :targets
+;;;;   :default :func :local :global :table :type :value :bits :types
+;;;;   :data :elem :memidx :dst :src :align :offset), blocktype in :bt.
+;;;;
+;;;; Phase taxonomy: malformed text signals wasmdown:decode-error (the
+;;;; text grammar is decode-phase; :offset carries the character index).
+;;;; Semantic-index errors (label out of scope, unknown $id) are
+;;;; reported the same way — the text format is the same phase.
+;;;;
+;;;; APPROACH (overall): tokenize the whole input into parenthesized
+;;;; s-expressions of tokens (never CL READ — PLAN.md §5.1), then fold
+;;;; each module field with a name/index environment. Instruction
+;;;; immediates resolve identifiers to numeric indices at parse time so
+;;;; encode-module can consume the module unchanged.
+;;;;
+;;;; FLOAT LITERALS (documented approach, per assignment): the mapping
+;;;; literal -> IEEE-754 bit pattern is computed EXACTLY, in integer
+;;;; domain only — never through host SINGLE/DOUBLE-FLOAT parsing:
+;;;; - decimal float: mantissa/exponent are exact bignums; the value is
+;;;;   scaled into the target precision with round-to-nearest-even on
+;;;;   the exact value (sticky bits recorded), then normalized like a
+;;;;   hardware float unit. This matches the spec's round-to-nearest of
+;;;;   the mathematically exact literal.
+;;;; - hexadecimal float: value = hexdigits * 2^exp is already binary;
+;;;;   shift to the target range, rounding to nearest even.
+;;;; - nan / nan:0xpayload: exponent all ones, payload in the low bits.
+;;;;   -nan sets the sign bit. nan:payload with an MSB-clear payload is
+;;;;   an arithmetic NaN (the parser preserves it bit-exactly).
+
+(defpackage #:wasmdown.text
+  (:use #:cl #:wasmdown.types)
+  (:export #:parse-wat #:parse-wat-file))
+
+(in-package #:wasmdown.text)
+
+;;; ---------------------------------------------------------------
+;;; Tokenizer. A token is (kind . string) with kind in
+;;; (:lparen :rparen :string :nat :int :float :id :keyword :atom).
+;;; :string tokens carry the DECODED bytes as a Lisp string; numeric
+;;; and id tokens carry the raw source text (undecoded).
+
+(defun %text-error (pos format-control &rest args)
+  (error 'wasmdown:decode-error
+         :offset pos
+         :message (apply #'format nil format-control args)))
+
+(declaim (inline %digit-p %hexdigit-p))
+(defun %digit-p (c) (and (char>= c #\0) (char<= c #\9)))
+(defun %hexdigit-p (c)
+  (or (%digit-p c)
+      (and (char>= c #\a) (char<= c #\f))
+      (and (char>= c #\A) (char<= c #\F))))
+
+(defun %tokenize (s)
+  "Tokenize WAT text S. Returns a flat vector of (kind . text) tokens
+with :lparen/:rparen balanced; strings are decoded (with escapes)."
+  (let ((n (length s))
+        (tokens '())
+        (i 0))
+    (flet ((advance (k) (incf i k))
+           (emit (kind text) (push (cons kind text) tokens)))
+      (loop
+        (when (>= i n) (return))
+        (let ((c (char s i)))
+          (cond
+           ;; whitespace
+           ((member c '(#\space #\tab #\newline #\return #\page))
+            (advance 1))
+           ;; line comment ;; ... (to end of line)
+           ((and (< (1+ i) n) (char= c #\;) (char= (char s (1+ i)) #\;))
+            (loop while (and (< i n) (char/= (char s i) #\newline))
+                  do (advance 1)))
+           ;; block comment (; ... ;) with nesting
+           ((and (< (1+ i) n) (char= c (code-char 40))
+                 (char= (char s (1+ i)) #\;))
+            (let ((start i))
+              (advance 2)
+              (let ((depth 1))
+                (loop
+                  (when (>= i n)
+                    (%text-error start "unclosed block comment"))
+                  (cond
+                   ((and (< (1+ i) n) (char= (char s i) (code-char 40))
+                         (char= (char s (1+ i)) #\;))
+                    (advance 2) (incf depth))
+                   ((and (< (1+ i) n) (char= (char s i) #\;)
+                         (char= (char s (1+ i)) (code-char 41)))
+                    (advance 2) (decf depth)
+                    (when (zerop depth) (return)))
+                   (t (advance 1)))))))
+           ;; parens
+           ((char= c (code-char 40)) (emit :lparen "(") (advance 1))
+           ((char= c (code-char 41)) (emit :rparen ")") (advance 1))
+           ;; string with escapes
+           ((char= c #\")
+            (multiple-value-bind (decoded next)
+                (%read-string s i)
+              (emit :string decoded)
+              (setf i next)))
+           ;; reserved chars are errors in atom position
+           ;; '#' is reserved (never valid); '=' only starts atoms in
+           ;; the memarg immediates offset=/align=
+           ((char= c #\#)
+            (%text-error i "unexpected character ~c" c))
+           ;; id $... / keyword op / number
+           (t
+            (multiple-value-bind (kind text next)
+                (%read-atom s i)
+              (emit kind text)
+              (setf i next))))))
+      (coerce (nreverse tokens) 'vector))))
+
+(defun %read-string (s i)
+  "Read a \"...\" string starting at S[I] = #\". Returns the decoded
+string and the index past the closing quote. Escapes: \\t \\n \\r \\\" \\\'
+\\\\ \\\\xx (hex byte) and \\\\uuXXXX (Unicode code point)."
+  (let ((n (length s))
+        (out (make-array 16 :element-type 'character
+                         :fill-pointer 0 :adjustable t)))
+    (incf i)
+    (loop
+      (when (>= i n)
+        (%text-error i "unclosed string literal"))
+      (let ((c (char s i)))
+        (cond
+         ((char= c #\")
+          (return (values (coerce out 'string) (1+ i))))
+         ((char/= c #\\)
+          (vector-push-extend c out)
+          (incf i))
+         (t
+          (incf i)
+          (when (>= i n)
+            (%text-error i "unclosed string escape"))
+          (let ((e (char s i)))
+            (cond
+             ((char= e #\t) (vector-push-extend #\Tab out) (incf i))
+             ((char= e #\n) (vector-push-extend #\Newline out) (incf i))
+             ((char= e #\r) (vector-push-extend #\Return out) (incf i))
+             ((char= e #\") (vector-push-extend #\" out) (incf i))
+             ((char= e #\') (vector-push-extend #\' out) (incf i))
+             ((char= e #\\) (vector-push-extend #\\ out) (incf i))
+             ((char= e #\u)
+              (when (or (< (+ i 5) n)
+                        (notevery #'%hexdigit-p (subseq s (1+ i) (+ i 5))))
+                (%text-error i "bad \\u escape"))
+              (vector-push-extend
+               (code-char (parse-integer s :start (1+ i) :end (+ i 5)
+                                          :radix 16))
+               out)
+              (incf i 5))
+             ((%hexdigit-p e)
+              (when (or (>= (1+ i) n) (not (%hexdigit-p (char s (1+ i)))))
+                (%text-error i "bad hex escape ~a~a" e
+                             (if (< (1+ i) n) (char s (1+ i)) #\?)))
+              (vector-push-extend (code-char
+                                   (parse-integer s :start i :end (+ i 2)
+                                                  :radix 16))
+                                  out)
+              (incf i 2))
+             (t (%text-error i "unknown string escape \\~c" e))))))))))
+
+(defun %read-atom (s i)
+  "Read an atom (id / keyword / number) starting at S[I]. Returns the
+token kind, raw text and next index. Numbers are recognized so module
+fields can require numeric forms; keyword classification happens later."
+  (let ((n (length s))
+        (start i))
+    (loop while (< i n)
+          for c = (char s i)
+          when (or (char= c (code-char 40)) (char= c (code-char 41))
+                   (char= c #\")
+                   (char= c #\space) (char= c #\tab) (char= c #\newline)
+                   (char= c #\return) (char= c #\;))
+            do (return)
+          do (incf i))
+    (when (= i start)
+      (%text-error start "unexpected character ~c" (char s start)))
+    (let* ((text (subseq s start i))
+           (c0 (char text 0)))
+      (values
+       (cond ((char= c0 #\$) :id)
+             (t (%atom-kind text)))
+       text i))))
+
+(defun %atom-kind (text)
+  "Classify a bare atom: nat, int, float, keyword (op/field name) or
+plain symbol (type names like i32 are keywords here)."
+  (let ((p 0) (len (length text)))
+    (when (and (< p len) (member (char text p) '(#\+ #\-)))
+      (incf p))
+    (cond
+     ;; 0x... integer (hex, possibly with _)
+     ((and (<= (+ p 2) len) (char= (char text p) #\0)
+           (char= (char text (1+ p)) #\x)
+           (plusp (- len (+ p 2))))
+      :nat)
+     ;; decimal integer: digits only (with _ separators)
+     ((and (< p len)
+           (every (lambda (c) (or (%digit-p c) (char= c #\_)))
+                  (subseq text p))
+           (notevery (lambda (c) (char= c #\_)) (subseq text p)))
+      :nat)
+     ;; float: inf/nan/hex-float/decimal-float
+     ((%float-literal-p text) :float)
+     (t :keyword))))
+
+(defun %float-literal-p (text)
+  "Whether TEXT is a float literal per the WAT grammar: inf, nan,
+nan:0x..., or a decimal/hex number with . or p/e exponent parts."
+  (let ((low (string-downcase text)))
+    (cond ((or (string= low "inf") (string= low "nan")) t)
+          ((and (> (length low) 4) (string= low "nan:" :end1 4)) t)
+          (t (multiple-value-bind (kind) (%num-shape low)
+               (member kind '(:hexfloat :decfloat)))))))
+
+(defun %num-shape (low)
+  "Return the shape of a number token LOWERCASED: :hexint, :decint,
+:hexfloat, :decfloat or :other. Underscores are permitted like digits."
+  (labels ((digp (c) (or (%digit-p c) (char= c #\_)))
+            (hexp (c) (or (%hexdigit-p c) (char= c #\_))))
+    (let* ((len (length low))
+           (p (if (and (plusp len) (member (char low 0) '(#\+ #\-))) 1 0))
+           (start p)
+           (hex (and (<= (+ p 2) len) (char= (char low p) #\0)
+                     (char= (char low (1+ p)) #\x)))
+           (pred (if hex #'hexp #'digp)))
+      (when hex (incf p 2))
+      ;; integer digits
+      (loop while (and (< p len) (funcall pred (char low p))) do (incf p))
+      (cond
+       ((and (= p len) (> p start) (not (char= (char low (1- p)) #\_)))
+        (if hex :hexint :decint))
+       ;; fractional part
+       ((and (< p len) (char= (char low p) #\.))
+        (incf p)
+        (loop while (and (< p len) (funcall pred (char low p))) do (incf p))
+        (when (and (< p len)
+                   (or (and hex (char= (char low p) #\p))
+                       (and (not hex) (char= (char low p) #\e))))
+          ;; exponent present: float
+          (incf p)
+          (when (and (< p len) (member (char low p) '(#\+ #\-))) (incf p))
+          (loop while (and (< p len) (%digit-p (char low p))) do (incf p))
+          (when (= p len) (return-from %num-shape
+                            (if hex :hexfloat :decfloat))))
+        ;; fraction with no exponent is still a decimal float
+        (when (and (not hex) (= p len))
+          :decfloat)
+        )
+       ;; integer with exponent, no fraction
+       ((and (< p len)
+             (or (and hex (char= (char low p) #\p))
+                 (and (not hex) (char= (char low p) #\e))))
+        (incf p)
+        (when (and (< p len) (member (char low p) '(#\+ #\-))) (incf p))
+        (loop while (and (< p len) (%digit-p (char low p))) do (incf p))
+        (when (= p len)
+          (if hex :hexfloat :decfloat)))
+       (t :other)))))
+
+;;; ---------------------------------------------------------------
+;;; Token trees. A node is (:list . children) or a leaf token
+;;; ((kind . text) . position). Positions are character offsets used
+;;; for error reporting.
+
+(defstruct tok kind text pos)
+
+(defun %parse-tokens (tokens)
+  "Build a tree of lists from the flat token vector. Each list element
+is a TOK struct; lists are plain Lisp lists (the :lparen tok is
+replaced by its children list)."
+  (let ((stack (list nil)))
+    (loop for (kind . text) across tokens
+          for idx from 0
+          do (case kind
+               (:lparen (push nil stack))
+               (:rparen
+                (let ((children (pop stack)))
+                  (when (null stack)
+                    (%text-error idx "unbalanced right parenthesis"))
+                  (push (cons :list (nreverse children))
+                        (car stack))))
+               (t (push (make-tok :kind kind :text text :pos idx)
+                        (car stack)))))
+    (unless (null (cdr stack))
+      (%text-error 0 "unclosed parenthesis"))
+    (nreverse (car stack))))
+
+(defun tok-elem-p (x) (and (consp x) (eq (car x) :list)))
+
+(defun %first-tok (node)
+  (when (and (listp node) (consp (cdr node)) (tok-p (cadr node)))
+    (cadr node)))
+
+;;; ---------------------------------------------------------------
+;;; Exact float literal -> IEEE-754 bits (never host float parsing).
+;;
+;;; The value of a decimal/hex literal is an exact rational. Round it
+;;; to the target precision with round-to-nearest-even (the IEEE
+;;; default the spec requires), then encode sign/exponent/mantissa:
+;;;   normal:   1.f * 2^e with bias offset
+;;;   subnormal: 0.f * 2^(1-bias) when e < 1-bias
+;;;   overflow:  rounds to infinity or the max finite (RNE)
+;;;   zero:      sign bit only
+;;; NaN: exponent all ones; payload into the low (p-1) bits, MSB of
+;;; payload forced to 1 (spec: nan:0x... is the raw payload and any
+;;; payload is arithmetic when it fits; the text syntax already
+;;; requires 0 < payload < 2^(p-1) for nan:0x and forces nothing, but
+;;; our encoder stores what was given bit-exactly).
+
+(defun %float-bits (text p bias)
+  "TEXT is a float literal; P the total precision INCLUDING the hidden
+bit (24 or 53), BIAS the exponent bias (127 or 1023). Returns the full
+unsigned bit pattern (sign + exponent field + mantissa field)."
+  (let* ((low (string-downcase text))
+         (neg (and (plusp (length low))
+                   (char= (char low 0) #\-)))
+         (body (if (and (plusp (length low))
+                        (member (char low 0) '(#\+ #\-)))
+                   (subseq low 1) low))
+         ;; field widths derived from P and BIAS
+         (mant-w (- p 1))                  ; mantissa field bits
+         (exp-w (integer-length (* 2 bias))) ; 8 for 127, 11 for 1023
+         (sign-pos (+ mant-w exp-w))
+         (exp-all-ones (- (ash 1 exp-w) 1)))
+    (flet ((sign-bit () (if neg 1 0)))
+      (cond
+       ((string= body "inf")
+        (logior (ash (sign-bit) sign-pos)
+                (ash exp-all-ones mant-w)))
+       ((string= body "nan")
+        (logior (ash (sign-bit) sign-pos)
+                (ash exp-all-ones mant-w)
+                (ash 1 (- mant-w 1))))       ; canonical NaN payload
+       ((and (> (length body) 4) (string= body "nan:" :end1 4))
+        (let ((payload (parse-integer body :start 6 :radix 16)))
+          (when (or (zerop payload) (>= payload (ash 1 (- mant-w 1))))
+            (%text-error 0 "NaN payload 0x~x out of range" payload))
+          (logior (ash (sign-bit) sign-pos)
+                  (ash exp-all-ones mant-w)
+                  payload)))
+       (t
+        (let* ((v (%literal-value body))
+               (bits (%round-and-encode v p bias)))
+          (logior (ash (sign-bit) sign-pos) bits)))))))
+
+(defun %round-and-encode (v p bias)
+  "Encode the exact positive rational V as the low (p+bias) bits of an
+IEEE-754 number (the sign bit is the caller's business). Exact
+integer/rational arithmetic, round-to-nearest-even.
+
+Model: write v = m * 2^(e-p) where m is a p-bit (or fewer) integer and
+e the exponent position (2^(e-1) <= v < 2^e). If e >= emin the
+mantissa m is v * 2^(p-e) rounded; if e < emin the number is
+subnormal with mantissa v * 2^(p-emin) rounded (and rounding up to 2^p
+is the smallest normal)."
+  (if (zerop v)
+      0
+      (multiple-value-bind (m re)
+          (%scaled-mantissa v p bias)
+        (let* ((emin (- 1 bias))
+               (mant-w (- p 1))             ; mantissa field width
+               (exp-w (integer-length (* 2 bias)))
+               (mant-max (1- (ash 1 mant-w)))
+               (exp-all-ones (- (ash 1 exp-w) 1))
+               ;; finite exponent range: re in [emin, emax] where the
+               ;; biased field (re + bias - 1) must stay <= exp-all-ones-1
+               (emax (- exp-all-ones bias)))
+          (cond
+           ;; overflow: rounds to infinity
+           ((> re emax)
+            (logior (ash exp-all-ones mant-w) mant-max))
+           ;; subnormal result: exponent field 0, mantissa m
+           ((< re emin) m)
+           ;; normal: exponent field (re-1)+bias over the low mant-w bits
+           (t (logior (ash (+ re bias -1) mant-w)
+                      (logand m mant-max))))))))
+
+(defun %scaled-mantissa (v p bias)
+  "Two values: the RNE-rounded mantissa M of V and its effective
+exponent RE (units of 2^(RE-P)). For normals M has p bits with the
+hidden bit at 2^(P-1) and RE = e; for subnormals M has at most P-1
+bits (no hidden bit) and RE = emin. A rounding carry into the next
+binade is folded here (M loses its top bit, RE is bumped)."
+  (let* ((emin (- 1 bias))
+         (mant-w (- p 1))
+         ;; subnormal iff v is strictly below the smallest normal 2^emin
+         (subnormal-p (< v (expt 2 emin)))
+         (e (%log2-ceil v))               ; 2^(e-1) <= v < 2^e
+         ;; scale so that m = v * 2^scale is the integer mantissa
+         (scale (if subnormal-p (- mant-w emin) (- p e)))
+         (num (numerator v))
+         (den (denominator v))
+         ;; v * 2^scale = snum/sden, exactly
+         (sden (if (minusp scale)
+                   (* den (expt 2 (- scale)))
+                   den))
+         (snum (if (minusp scale)
+                   num
+                   (* num (expt 2 scale)))))
+    (multiple-value-bind (m0 rem)
+        (floor snum sden)
+      (let ((m (cond
+                ((> (* 2 rem) sden) (1+ m0)) ; fraction > 1/2
+                ((< (* 2 rem) sden) m0)      ; fraction < 1/2
+                ((oddp m0) (1+ m0))          ; tie -> even
+                (t m0)))
+            (limit (if subnormal-p (ash 1 mant-w) (ash 1 p))))
+        (if (>= m limit)
+            ;; carry into the next binade: hidden bit drops out
+            (values (- m limit) (1+ (if subnormal-p emin e)))
+            (values m (if subnormal-p emin e)))))))
+
+(defun %log2-ceil (v)
+  "Smallest E with V < 2^E, for positive rational V. Exact (works for
+negative exponents too, via expt rather than ash)."
+  (if (integerp v)
+      (integer-length v)
+      (let ((num (numerator v)) (den (denominator v)))
+        (let ((e (integer-length num)))
+          (loop while (<= (* den (expt 2 e)) num) do (incf e))
+          (loop while (<= num (* den (expt 2 (- e 1)))) do (decf e))
+          e))))
+
+;;; ---------------------------------------------------------------
+;;; Literal text -> exact rational value.
+
+(defun %literal-value (body)
+  "BODY is a float literal without sign/inf/nan: parse into the exact
+rational value. Hex floats (0xh.hhhp±d) and decimal floats
+(d.ddd[e±d], with underscores removed) are both exact."
+  (let* ((clean (remove #\_ body))
+         (hex-p (and (>= (length clean) 2)
+                     (char= (char clean 0) #\0)
+                     (or (char= (char clean 1) #\x) (char= (char clean 1) #\X)))))
+    (if hex-p
+        (%hex-float-value (subseq clean 2))
+        (%dec-float-value clean))))
+
+(defun %hex-float-value (s)
+  "0x-prefixed body: [hex].[hex]p[±]dec -> exact rational."
+  (let* ((p (position #\p s))
+         (mant (if p (subseq s 0 p) s))
+         (expo (if p (parse-integer s :start (1+ p)) 0))
+         (dot (position #\. mant))
+         (int-part (if dot (subseq mant 0 dot) mant))
+         (frac-part (if dot (subseq mant (1+ dot)) ""))
+         (int-v (if (zerop (length int-part))
+                    0
+                    (parse-integer int-part :radix 16)))
+         (frac-v (if (zerop (length frac-part))
+                     0
+                     (parse-integer frac-part :radix 16)))
+         (frac-bits (* 4 (length frac-part))))
+    ;; value = (int-v * 2^frac-bits + frac-v) / 2^frac-bits * 2^expo
+    (* (+ (* int-v (ash 1 frac-bits)) frac-v)
+       (expt 2 (- expo frac-bits)))))
+
+(defun %dec-float-value (s)
+  "Decimal float body: d.[d][e±d] -> exact rational."
+  (let* ((e (position #\e s))
+         (mant (if e (subseq s 0 e) s))
+         (expo (if e (parse-integer s :start (1+ e)) 0))
+         (dot (position #\. mant))
+         (int-part (if dot (subseq mant 0 dot) mant))
+         (frac-part (if dot (subseq mant (1+ dot)) ""))
+         (digits (concatenate 'string int-part frac-part))
+         (int-v (if (zerop (length digits)) 0 (parse-integer digits)))
+         (den (expt 10 (length frac-part))))
+    ;; value = digits / 10^len(frac) * 10^expo, kept as one fraction
+    (/ (* int-v (expt 10 (max 0 expo)))
+       (* den (expt 10 (max 0 (- expo)))))))
+
+;;; ---------------------------------------------------------------
+;;; Parsing environment: named indices (two namespaces per the spec —
+;;; one index space per entity kind) and the accumulating module.
+
+(defstruct penv
+  (types (make-hash-table :test #'equal))      ; $id -> typeidx
+  (funcs (make-hash-table :test #'equal))     ; $id -> funcidx (imports first)
+  (tables (make-hash-table :test #'equal))
+  (mems (make-hash-table :test #'equal))
+  (globals (make-hash-table :test #'equal))
+  (elems (make-hash-table :test #'equal))
+  (datas (make-hash-table :test #'equal))
+  (locals (make-hash-table :test #'equal))     ; per-func $id -> localidx
+  (labels ())                                  ; innermost-first $id list
+  (types-list ())       ; reversed accumulation of wasm-func-type
+  (imports-list ())     ; reversed
+  (funcs-list ())       ; reversed (wasm-func)
+  (tables-list ())
+  (mems-list ())
+  (globals-list ())
+  (exports-list ())     ; reversed
+  (elems-list ())
+  (datas-list ())
+  (start nil)
+  (n-imported-funcs 0)
+  (n-imported-tables 0)
+  (n-imported-mems 0)
+  (n-imported-globals 0))
+
+(defun %id-or-num (tok table what)
+  "Resolve an index token: $id via TABLE (an equal-hash), or a plain
+number. Signals decode-error for unknown ids or malformed tokens."
+  (let ((text (tok-text tok)))
+    (cond
+     ((eq (tok-kind tok) :id)
+      (or (gethash text table)
+          (%text-error (tok-pos tok) "unknown ~a identifier ~a" what text)))
+     ((eq (tok-kind tok) :nat)
+      (%parse-nat (tok-text tok) (tok-pos tok)))
+     (t (%text-error (tok-pos tok) "bad ~a index token ~a" what text)))))
+
+(defun %parse-nat (text pos)
+  "Parse an unsigned integer token (dec or 0x hex, _ separators)."
+  (let ((clean (remove #\_ text)))
+    (multiple-value-bind (v end)
+        (parse-integer clean :radix (if (and (> (length clean) 1)
+                                              (char= (char clean 1) #\x))
+                                         16 10)
+                         :start (if (and (> (length clean) 1)
+                                         (char= (char clean 1) #\x))
+                                    2 0)
+                         :junk-allowed t)
+      (unless (and v (= end (length clean)))
+        (%text-error pos "malformed integer ~a" text))
+      v)))
+
+(defun %parse-int (text pos)
+  "Signed integer token: optional +/-, dec or 0x hex, _ separators."
+  (let ((neg (and (plusp (length text)) (char= (char text 0) #\-)))
+        (body (if (and (plusp (length text))
+                       (member (char text 0) '(#\+ #\-)))
+                  (subseq text 1) text)))
+    (let ((v (%parse-nat body pos)))
+      (if neg (- v) v))))
+
+(defun %tok-keyword (x)
+  "The lowercased keyword text of a leaf token X, or nil."
+  (and (tok-p x) (string-downcase (tok-text x))))
+
+;;; ---------------------------------------------------------------
+;;; Value types and typeuses.
+
+(defun %valtype (x)
+  "The valtype keyword for token X, or decode-error."
+  (let ((k (%tok-keyword x)))
+    (cond
+     ((string= k "i32") :i32)
+     ((string= k "i64") :i64)
+     ((string= k "f32") :f32)
+     ((string= k "f64") :f64)
+     ((string= k "funcref") :funcref)
+     ((string= k "externref") :externref)
+     (t (%text-error (tok-pos x) "unknown value type ~a"
+                     (if (tok-p x) (tok-text x) k))))))
+
+(defun %params (node penv)
+  "Parse a (param ...) list NODE: named params register in PENV-LOCALS
+(with their local index: params come first, in declaration order);
+returns the param valtype list. The func parser seeds PENV-LOCALS with
+the running param count and clears it between functions."
+  (let ((rest (cddr node)))
+    ;; (param $x i32) or (param i32 i64)
+    (if (and rest (tok-p (car rest)) (eq (tok-kind (car rest)) :id))
+        (if (and (= (length rest) 2) (tok-p (second rest)))
+            (let ((ty (%valtype (second rest))))
+              (setf (gethash (tok-text (car rest)) (penv-locals penv))
+                    (%next-local-index penv))
+              (list ty))
+            (%text-error (tok-pos (car rest))
+                         "named param must be (param $id type)"))
+        (mapcar #'%valtype rest))))
+
+(defun %next-local-index (penv)
+  "The next free local index (params first, then locals): the parser
+tracks the running count in PENV-LOCALS under the key NIL."
+  (let ((h (penv-locals penv)))
+    (let ((n (or (gethash nil h) 0)))
+      (setf (gethash nil h) (1+ n))
+      n)))
+
+(defun %reset-locals (penv)
+  "Clear the per-function local namespace before parsing a func body."
+  (clrhash (penv-locals penv)))
+
+(defun %typeuse (items penv)
+  "Parse a typeuse from ITEMS (a list of toks/lists): (type $t)?
+(param)* (result)*, stopping at the first item that is not one of
+those. Returns (values params results typeidx-or-nil). When an
+explicit (type x) is given the typeidx is resolved; otherwise the
+(param)(result) lists are returned for find-or-create at the call
+site. NOTE: params register their names in PENV-LOCALS, so a caller
+using %TYPEUSE speculatively (blocktype scanning) must tolerate that
+(blocktypes have no named params per the grammar)."
+  (let ((typeidx nil) (params '()) (results '()) (rest items))
+    (loop while rest
+          for x = (car rest)
+          while (and (tok-elem-p x)
+                     (member (%tok-keyword (%first-tok x))
+                             '("type" "param" "result")
+                             :test #'string=))
+          do (cond
+              ((string= (%tok-keyword (%first-tok x)) "type")
+               (when typeidx
+                 (%text-error 0 "duplicate (type) in typeuse"))
+               (let ((idtok (third x)))
+                 (unless idtok
+                   (%text-error 0 "(type) needs an index"))
+                 (setf typeidx
+                       (%id-or-num idtok (penv-types penv) "type")))
+               (pop rest))
+              ((string= (%tok-keyword (%first-tok x)) "param")
+               (setf params (append params (%params x penv)))
+               (pop rest))
+              (t
+               (setf results (append results
+                                     (mapcar #'%valtype (cddr x))))
+               (pop rest))))
+    (values (nreverse params) (nreverse results) typeidx)))
+
+(defun %find-or-add-type (params results penv)
+  "Return the typeidx of the functype (params -> results), adding a new
+entry when no equal one exists."
+  (let ((types (penv-types-list penv)))
+    (loop for i from 0
+          for ft in (reverse types)
+          when (and (equal (wasm-func-type-params ft) params)
+                    (equal (wasm-func-type-results ft) results))
+            do (return-from %find-or-add-type i)))
+  (push (make-wasm-func-type params results) (penv-types-list penv))
+  (1- (length (penv-types-list penv))))
+
+(defun %resolve-typeuse (items penv)
+  "Resolve a typeuse to a typeidx (explicit (type x) wins; bare
+(param)/(result) are find-or-create)."
+  (multiple-value-bind (params results typeidx) (%typeuse items penv)
+    (cond (typeidx typeidx)
+          (t (%find-or-add-type params results penv)))))
+
+;;; ---------------------------------------------------------------
+;;; Instructions.
+
+;;; The full engine opcode set (binary slice). Plain = no immediates.
+(defparameter *plain-ops*
+  '("unreachable" "nop" "return" "drop"
+    "i32.eqz" "i32.eq" "i32.ne" "i32.lt_s" "i32.lt_u" "i32.gt_s"
+    "i32.gt_u" "i32.le_s" "i32.le_u" "i32.ge_s" "i32.ge_u"
+    "i64.eqz" "i64.eq" "i64.ne" "i64.lt_s" "i64.lt_u" "i64.gt_s"
+    "i64.gt_u" "i64.le_s" "i64.le_u" "i64.ge_s" "i64.ge_u"
+    "f32.eq" "f32.ne" "f32.lt" "f32.gt" "f32.le" "f32.ge"
+    "f64.eq" "f64.ne" "f64.lt" "f64.gt" "f64.le" "f64.ge"
+    "i32.clz" "i32.ctz" "i32.popcnt" "i32.add" "i32.sub" "i32.mul"
+    "i32.div_s" "i32.div_u" "i32.rem_s" "i32.rem_u" "i32.and"
+    "i32.or" "i32.xor" "i32.shl" "i32.shr_s" "i32.shr_u" "i32.rotl"
+    "i32.rotr"
+    "i64.clz" "i64.ctz" "i64.popcnt" "i64.add" "i64.sub" "i64.mul"
+    "i64.div_s" "i64.div_u" "i64.rem_s" "i64.rem_u" "i64.and"
+    "i64.or" "i64.xor" "i64.shl" "i64.shr_s" "i64.shr_u" "i64.rotl"
+    "i64.rotr"
+    "f32.abs" "f32.neg" "f32.ceil" "f32.floor" "f32.trunc"
+    "f32.nearest" "f32.sqrt" "f32.add" "f32.sub" "f32.mul" "f32.div"
+    "f32.min" "f32.max" "f32.copysign"
+    "f64.abs" "f64.neg" "f64.ceil" "f64.floor" "f64.trunc"
+    "f64.nearest" "f64.sqrt" "f64.add" "f64.sub" "f64.mul" "f64.div"
+    "f64.min" "f64.max" "f64.copysign"
+    "i32.wrap_i64" "i32.trunc_f32_s" "i32.trunc_f32_u"
+    "i32.trunc_f64_s" "i32.trunc_f64_u"
+    "i64.extend_i32_s" "i64.extend_i32_u"
+    "i64.trunc_f32_s" "i64.trunc_f32_u" "i64.trunc_f64_s"
+    "i64.trunc_f64_u"
+    "f32.convert_i32_s" "f32.convert_i32_u" "f32.convert_i64_s"
+    "f32.convert_i64_u" "f32.demote_f64"
+    "f64.convert_i32_s" "f64.convert_i32_u" "f64.convert_i64_s"
+    "f64.convert_i64_u" "f64.promote_f32"
+    "i32.reinterpret_f32" "i64.reinterpret_f64"
+    "f32.reinterpret_i32" "f64.reinterpret_i64"
+    "i32.extend8_s" "i32.extend16_s"
+    "i64.extend8_s" "i64.extend16_s" "i64.extend32_s"
+    "i32.trunc_sat_f32_s" "i32.trunc_sat_f32_u" "i32.trunc_sat_f64_s"
+    "i32.trunc_sat_f64_u" "i64.trunc_sat_f32_s" "i64.trunc_sat_f32_u"
+    "i64.trunc_sat_f64_s" "i64.trunc_sat_f64_u"
+    "ref.is_null"))
+
+(defparameter *plain-op-keywords*
+  (let ((h (make-hash-table :test #'equal)))
+    (dolist (s *plain-ops* h)
+      (setf (gethash s h) (intern (string-upcase s) :keyword)))))
+
+(defparameter *memarg-ops*
+  '(("i32.load" 4) ("i64.load" 8) ("f32.load" 4) ("f64.load" 8)
+    ("i32.load8_s" 1) ("i32.load8_u" 1) ("i32.load16_s" 2)
+    ("i32.load16_u" 2) ("i64.load8_s" 1) ("i64.load8_u" 1)
+    ("i64.load16_s" 2) ("i64.load16_u" 2) ("i64.load32_s" 4)
+    ("i64.load32_u" 4)
+    ("i32.store" 4) ("i64.store" 8) ("f32.store" 4) ("f64.store" 8)
+    ("i32.store8" 1) ("i32.store16" 2) ("i64.store8" 1)
+    ("i64.store16" 2) ("i64.store32" 4)))
+
+(defparameter *memarg-op-keywords*
+  (let ((h (make-hash-table :test #'equal)))
+    (dolist (p *memarg-ops* h)
+      (setf (gethash (car p) h) (intern (string-upcase (car p)) :keyword)))))
+
+(defun %kw (text)
+  "Intern lowercase op text as the IR keyword. Multi-word control ops use hyphens (:br-if :br-table :call-indirect); every other op keeps
+the text name verbatim (:i32.load8_s keeps its underscore)."
+  (intern (string-upcase
+           (cond
+            ((string= text "br_if") "br-if")
+            ((string= text "br_table") "br-table")
+            ((string= text "call_indirect") "call-indirect")
+            (t text)))
+          :keyword))
+
+(defun %wrap32 (v)
+  "Wrap a signed integer into the unsigned 32-bit domain (i32.const)."
+  (mod v #x100000000))
+
+(defun %wrap64 (v)
+  (mod v #x10000000000000000))
+
+(defun %label-idx (tok penv)
+  "Resolve a label token to a relative depth (innermost = 0)."
+  (cond
+   ((eq (tok-kind tok) :nat) (%parse-nat (tok-text tok) (tok-pos tok)))
+   ((eq (tok-kind tok) :id)
+    (let ((pos (position (tok-text tok) (penv-labels penv) :test #'equal)))
+      (or pos
+          (%text-error (tok-pos tok) "label ~a out of scope"
+                       (tok-text tok)))))
+   (t (%text-error (tok-pos tok) "bad label token")))) 
+
+
+;;; ---------------------------------------------------------------
+;;; Instruction sequences. Items are TOKs (opcode/immediate tokens in
+;;; plain form) or :list nodes (folded form). In a plain sequence the
+;;; opcode's immediate tokens follow it in the same stream, so
+;;; %INSTR-LIST keeps a cursor and lets %SPLIT-IMMS consume tokens.
+
+(defun %plain-head-p (x)
+  "Whether TOK item X starts a plain (immediate-bearing) instruction."
+  (and (tok-p x)
+       (or (gethash (%tok-keyword x) *plain-op-keywords*)
+           (gethash (%tok-keyword x) *memarg-op-keywords*)
+           (member (%tok-keyword x)
+                   '("i32.const" "i64.const" "f32.const" "f64.const"
+                     "local.get" "local.set" "local.tee" "global.get"
+                     "global.set" "call" "ref.func" "ref.null" "br"
+                     "br_if" "br_table" "call_indirect" "select"
+                     "table.get" "table.set" "table.grow" "table.size"
+                     "table.fill" "table.init" "table.copy" "elem.drop"
+                     "memory.size" "memory.grow" "memory.init" "data.drop"
+                     "memory.copy" "memory.fill")
+                   :test #'string=))))
+
+(defun %instr-list (items penv)
+  "Parse a sequence of instruction items (toks and folded lists) into a
+list of wasm-instr. Structured bodies EXCLUDE their :end (contract).
+Returns (VALUES INSTRS TERMINATOR REST) where TERMINATOR is NIL (all
+items consumed) or (:end . id-tok) / (:else . id-tok) when the sequence
+stopped at a plain-form end/else keyword (id-tok the optional trailing
+identifier, for the caller's label matching) and REST the items after
+it. A stray end/else is only legal inside plain block bodies (block/
+loop/if parse them); elsewhere it is a decode-error."
+  (let ((out '())
+        (cursor items))
+    (loop while cursor
+          for x = (car cursor)
+          do (cond
+              ;; plain-form end/else: stop and hand it to the caller
+              ((and (tok-p x)
+                    (member (%tok-keyword x) '("end" "else") :test #'string=))
+               (let* ((kind (if (string= (%tok-keyword x) "end")
+                                 :end :else))
+                      (rest (cdr cursor))
+                      (idtok nil))
+                 (when (and rest (tok-p (car rest))
+                            (eq (tok-kind (car rest)) :id))
+                   (setf idtok (car rest)
+                         rest (cdr rest)))
+                 (return-from %instr-list
+                   (values (nreverse out) (cons kind idtok) rest))))
+              ;; folded instruction
+              ((tok-elem-p x)
+               (dolist (i (%folded x penv)) (push i out))
+               (pop cursor))
+              ;; plain-form structured ops: block/loop/if
+              ((and (tok-p x)
+                    (member (%tok-keyword x) '("block" "loop" "if")
+                            :test #'string=))
+               (multiple-value-bind (instr rest)
+                   (%plain-structured x (cdr cursor) penv)
+                 (push instr out)
+                 (setf cursor rest)))
+              ;; plain opcode token (immediates follow in the stream)
+              (t
+               (multiple-value-bind (instr rest)
+                   (%split-imms (%tok-keyword x) (cdr cursor)
+                                (tok-pos x) penv)
+                 (push instr out)
+                 (setf cursor rest)))))
+    (values (nreverse out) nil nil)))
+
+(defun %check-trailing-label (id labeltok what pos)
+  "Spec: the optional trailing id after end/else must match the
+block's label. ID is the block's label (string or nil); LABELTOK the
+trailing id token (or nil)."
+  (when labeltok
+    (unless (and id (string= id (tok-text labeltok)))
+      (%text-error (or pos (tok-pos labeltok))
+                   "mismatching trailing label ~a after ~a"
+                   (tok-text labeltok) what))))
+
+(defun %folded (node penv)
+  "Parse one folded instruction list NODE into a LIST of wasm-instr
+(ordinary folded ops emit operand instructions first, then the
+operator — spec folded-form semantics)."
+  (let* ((head (second node))
+         (k (and head (%tok-keyword head))))
+    (cond
+     ((string= k "block") (list (%fold-block node penv :block)))
+     ((string= k "loop") (list (%fold-block node penv :loop)))
+     ((string= k "if") (%fold-if node penv))
+     (t
+      ;; immediates first, then the operand expressions (folded lists)
+      (multiple-value-bind (instr operands)
+          (%split-imms k (cddr node) (and head (tok-pos head)) penv)
+        (append
+         (loop for o in operands
+               if (tok-elem-p o) nconc (%folded o penv)
+               else collect (%plain-single o penv))
+         (list instr)))))))
+
+(defun %plain-single (tok penv)
+  "A bare opcode TOKEN inside a folded operand position (no operands
+allowed there — folded operands must themselves be folded lists)."
+  (%text-error (tok-pos tok)
+               "expected folded operand, found bare token ~a"
+               (tok-text tok)))
+
+(defun %plain-structured (tok items penv)
+  "Parse a PLAIN-form block/loop/if starting at opcode TOK; ITEMS are
+the following items of the enclosing sequence. Handles the optional
+label id, typeuse, the body up to the matching end (else for if), and
+the trailing-id matching rule. Returns (values instr rest-items)."
+  (let* ((k (%tok-keyword tok))
+         (pos (tok-pos tok))
+         (id nil)
+         (cursor items))
+    ;; optional label
+    (when (and cursor (tok-p (car cursor))
+               (eq (tok-kind (car cursor)) :id))
+      (setf id (tok-text (car cursor)))
+      (pop cursor))
+    ;; typeuse: (type)/(param)/(result) lists off the head
+    (multiple-value-bind (bt skipped)
+        (%parse-block-typeuse-items cursor penv)
+      (setf cursor (nthcdr skipped cursor))
+      (when id (push id (penv-labels penv)))
+      (flet ((pop-label () (when (and (penv-labels penv) id)
+                             (pop (penv-labels penv)))))
+        (cond
+         ((or (string= k "block") (string= k "loop"))
+          (multiple-value-bind (body term rest)
+              (%instr-list cursor penv)
+            (unless (eq (car term) :end)
+              (%text-error pos "plain ~a must end with end" k))
+            (%check-trailing-label id (cdr term) "end" pos)
+            (pop-label)
+            (values (make-wasm-instr
+                      (if (string= k "block") :block :loop)
+                      (list :bt bt)
+                      (coerce body 'vector) 0)
+                    rest)))
+         (t                                  ; if
+          (multiple-value-bind (then term rest)
+              (%instr-list cursor penv)
+            (cond
+             ((eq (car term) :end)
+              ;; no else branch
+              (%check-trailing-label id (cdr term) "end" pos)
+              (pop-label)
+              (values (make-wasm-instr :if (list :bt bt)
+                                       (coerce then 'vector) 0)
+                      rest))
+             ((eq (car term) :else)
+              (%check-trailing-label id (cdr term) "else" pos)
+              (multiple-value-bind (else term2 rest2)
+                  (%instr-list rest penv)
+                (unless (eq (car term2) :end)
+                  (%text-error pos "plain if must end with end"))
+                (%check-trailing-label id (cdr term2) "end" pos)
+                (pop-label)
+                (values (make-wasm-instr
+                         :if
+                         (list :bt bt
+                               :else-body (coerce else 'vector))
+                         (coerce then 'vector) 0)
+                        rest2)))
+             (t (%text-error pos "plain if must end with end"))))))))))
+
+(defun %parse-block-typeuse-items (items penv)
+  "Consume (type)/(param)/(result) items from the head of ITEMS.
+Returns (values bt skipped)."
+  (multiple-value-bind (params results typeidx)
+      (%typeuse items penv)
+    (declare (ignore params))
+    (let ((skipped 0)
+          (scan items))
+      (loop while (and scan (tok-elem-p (car scan))
+                       (member (%tok-keyword (%first-tok (car scan)))
+                               '("type" "param" "result")
+                               :test #'string=))
+            do (incf skipped) (pop scan))
+      (let ((bt (cond
+                 (typeidx (cons :typeidx typeidx))
+                 ((null results) nil)
+                 ((= (length results) 1) (car results))
+                 (t (cons :typeidx (%find-or-add-type '() results penv))))))
+        (values bt skipped)))))
+
+(defun %imm-tok-p (x)
+  "Whether item X is a plain token usable as an immediate index/label."
+  (and (tok-p x) (member (tok-kind x) '(:id :nat :int :float :keyword))))
+
+(defun %take-label (items penv what)
+  "Consume one label token from ITEMS; returns (values label rest)."
+  (unless (and items (tok-p (car items)))
+    (%text-error 0 "missing ~a label" what))
+  (values (%label-idx (car items) penv) (cdr items)))
+
+(defun %take-index (items table what)
+  "Consume one index token ($id or number) from ITEMS."
+  (unless (and items (tok-p (car items)))
+    (%text-error 0 "missing ~a index" what))
+  (values (%id-or-num (car items) table what) (cdr items)))
+
+(defun %split-imms (k rest pos penv)
+  "Parse the immediates of op text K starting at items REST (which are
+the items AFTER the op token: following tokens in plain form, inner
+items in folded form). Returns (VALUES INSTR REMAINING) where
+REMAINING are the operand items (folded lists) of a folded op, or the
+rest of the plain sequence."
+  (let ((op-key (%kw k))
+        (bad (lambda ()
+               (%text-error pos "bad or missing immediates for ~a" k))))
+    (cond
+     ;; plain ops: no immediates
+     ((gethash k *plain-op-keywords*)
+      (values (make-wasm-instr op-key nil #() 0) rest))
+     ;; integer consts: :value keeps the SIGNED literal (the binary
+     ;; decoder reads s32/s64; tests/binary expects e.g. -1 for -1)
+     ((member k '("i32.const" "i64.const") :test #'string=)
+      (unless (and rest (tok-p (car rest)))
+        (funcall bad))
+      (let ((v (%parse-int (tok-text (car rest)) (tok-pos (car rest)))))
+        (values (make-wasm-instr op-key (list :value v) #() 0)
+                (cdr rest))))
+     ;; float consts (exact bit patterns)
+     ((member k '("f32.const" "f64.const") :test #'string=)
+      (unless (and rest (tok-p (car rest)))
+        (funcall bad))
+      (let* ((text (tok-text (car rest)))
+             (f32-p (string= k "f32.const")))
+        (values (make-wasm-instr op-key
+                                 (list :bits (%float-bits text
+                                                          (if f32-p 24 53)
+                                                          (if f32-p 127 1023)))
+                                 #() 0)
+                (cdr rest))))
+     ;; memarg ops: offset=/align= (both optional; align is a power of 2)
+     ((gethash k *memarg-op-keywords*)
+      (let ((offset 0) (align-hint nil) (items rest))
+        (loop while (and items (tok-p (car items))
+                         (eq (tok-kind (car items)) :keyword))
+              for tok = (car items)
+              for txt = (tok-text tok)
+              when (and (> (length txt) 7) (string= txt "offset=" :end1 7))
+                do (setf offset (%parse-nat (subseq txt 7) (tok-pos tok))
+                         items (cdr items))
+              else when (and (> (length txt) 6) (string= txt "align=" :end1 6))
+                do (let ((a (%parse-nat (subseq txt 6) (tok-pos tok))))
+                     (unless (and (plusp a) (= 1 (logcount a)))
+                       (%text-error (tok-pos tok)
+                                    "alignment ~a is not a power of 2" a))
+                     (setf align-hint a
+                           items (cdr items)))
+              else
+                do (return))
+        ;; NOTE: multi-memory (memidx before the memarg) is not in
+        ;; this slice; memidx stays 0. A bare number after the memarg
+        ;; keywords is a folded operand (e.g. the address of a load).
+        (let* ((width (gethash k *memarg-op-keywords*))
+               (align (or align-hint width)))
+          (values (make-wasm-instr
+                   op-key
+                   (list :align (1- (integer-length align)) :offset offset)
+                   #() 0)
+                  items))))
+     ;; br / br-if: one label
+     ((member k '("br" "br_if") :test #'string=)
+      (multiple-value-bind (label items) (%take-label rest penv k)
+        (values (make-wasm-instr op-key (list :label label) #() 0) items)))
+     ;; br_table: label* default — in FOLDED form the trailing items
+     ;; are operand lists and the labels are the leading tokens; the
+     ;; LAST immediate label is the default, the trailing folded
+     ;; list is the index operand.
+     ((string= k "br_table")
+      (let ((labels '()) (items rest))
+        ;; consume leading immediate label tokens
+        (loop while (and items (tok-p (car items))
+                         (member (tok-kind (car items)) '(:id :nat)))
+              do (push (car items) labels)
+                 (pop items))
+        (when (null labels)
+          (%text-error pos "br_table needs at least a default label"))
+        (let ((toks (nreverse labels)))
+          (values (make-wasm-instr
+                   op-key
+                   (list :targets
+                         (coerce (mapcar (lambda (l) (%label-idx l penv))
+                                         (butlast toks))
+                                 'vector)
+                         :default (%label-idx (car (last toks)) penv))
+                   #() 0)
+                  items))))
+     ;; call / ref.func: one funcidx
+     ((member k '("call" "ref.func") :test #'string=)
+      (multiple-value-bind (f items)
+          (%take-index rest (penv-funcs penv) "func")
+        (values (make-wasm-instr op-key (list :func f) #() 0) items)))
+     ;; local/global index ops
+     ((member k '("local.get" "local.set" "local.tee") :test #'string=)
+      (multiple-value-bind (x items)
+          (%take-index rest (penv-locals penv) "local")
+        (values (make-wasm-instr op-key (list :local x) #() 0) items)))
+     ((member k '("global.get" "global.set") :test #'string=)
+      (multiple-value-bind (x items)
+          (%take-index rest (penv-globals penv) "global")
+        (values (make-wasm-instr op-key (list :global x) #() 0) items)))
+     ;; table ops with optional table index (default 0)
+     ((member k '("table.get" "table.set" "table.grow" "table.size"
+                  "table.fill") :test #'string=)
+      (let ((table 0) (items rest))
+        (when (and items (tok-p (car items))
+                   (member (tok-kind (car items)) '(:id :nat)))
+          (setf table (%id-or-num (car items) (penv-tables penv) "table")
+                items (cdr items)))
+        (values (make-wasm-instr op-key (list :table table) #() 0) items)))
+     ;; table.init: elemidx then optional tableidx
+     ((string= k "table.init")
+      (multiple-value-bind (elem items)
+          (%take-index rest (penv-elems penv) "elem")
+        (let ((table 0))
+          (when (and items (tok-p (car items))
+                     (member (tok-kind (car items)) '(:id :nat)))
+            (setf table (%id-or-num (car items) (penv-tables penv) "table")
+                  items (cdr items)))
+          (values (make-wasm-instr op-key
+                                   (list :elem elem :table table) #() 0)
+                  items))))
+     ;; table.copy: two optional table indices (dst src)
+     ((string= k "table.copy")
+      (let ((dst 0) (src 0) (items rest))
+        (when (and items (tok-p (car items))
+                   (member (tok-kind (car items)) '(:id :nat)))
+          (setf dst (%id-or-num (car items) (penv-tables penv) "table")
+                items (cdr items))
+          (when (and items (tok-p (car items))
+                     (member (tok-kind (car items)) '(:id :nat)))
+            (setf src (%id-or-num (car items) (penv-tables penv) "table")
+                  items (cdr items))))
+        (values (make-wasm-instr op-key (list :dst dst :src src) #() 0)
+                items)))
+     ((string= k "elem.drop")
+      (multiple-value-bind (x items)
+          (%take-index rest (penv-elems penv) "elem")
+        (values (make-wasm-instr op-key (list :elem x) #() 0) items)))
+     ;; ref.null func|extern
+     ((string= k "ref.null")
+      (unless (and rest (tok-p (car rest)))
+        (funcall bad))
+      (let ((ht (%tok-keyword (car rest))))
+        (values (make-wasm-instr op-key
+                                 (list :type (cond
+                                              ((string= ht "func") :funcref)
+                                              ((string= ht "extern") :externref)
+                                              (t (%text-error
+                                                  (tok-pos (car rest))
+                                                  "bad ref.null type ~a"
+                                                  (tok-text (car rest))))))
+                                 #() 0)
+                (cdr rest))))
+     ;; call_indirect: optional table index then typeuse
+     ((string= k "call_indirect")
+      (let ((table 0) (items rest))
+        (when (and items (tok-p (car items))
+                   (member (tok-kind (car items)) '(:id :nat)))
+          (setf table (%id-or-num (car items) (penv-tables penv) "table")
+                items (cdr items)))
+        (values (make-wasm-instr op-key
+                                 (list :type (%resolve-typeuse items penv)
+                                       :table table)
+                                 #() 0)
+                '())))
+     ;; select: (result t)* immediates
+     ((string= k "select")
+      (let ((types '()) (items rest))
+        (loop while (and items (tok-elem-p (car items))
+                         (string= (%tok-keyword (%first-tok (car items)))
+                                  "result"))
+              do (setf types (append types
+                                    (mapcar #'%valtype (cddr (car items))))
+                     items (cdr items)))
+        (values (make-wasm-instr op-key
+                                 (list :types (and types (coerce types 'vector)))
+                                 #() 0)
+                items)))
+     ;; memory ops (single-memory slice: memidx 0)
+     ((member k '("memory.size" "memory.grow" "memory.fill") :test #'string=)
+      (values (make-wasm-instr op-key (list :memidx 0) #() 0) rest))
+     ((string= k "memory.copy")
+      (values (make-wasm-instr op-key (list :dst 0 :src 0) #() 0) rest))
+     ((string= k "memory.init")
+      (multiple-value-bind (x items)
+          (%take-index rest (penv-datas penv) "data")
+        (values (make-wasm-instr op-key (list :data x :memidx 0) #() 0)
+                items)))
+     ((string= k "data.drop")
+      (multiple-value-bind (x items)
+          (%take-index rest (penv-datas penv) "data")
+        (values (make-wasm-instr op-key (list :data x) #() 0) items)))
+     (t (funcall bad)))))
+
+(defun %block-label-and-type (node penv)
+  "Common prefix parsing for a folded (block|loop|if [$id]? typeuse ...)
+list NODE: returns (values id bt body-items). Does NOT push the label
+(the caller does, so it can pop it on error paths)."
+  (let* ((rest (cddr node))
+         (id nil)
+         (items rest))
+    (when (and items (tok-p (car items)) (eq (tok-kind (car items)) :id))
+      (setf id (tok-text (car items)))
+      (pop items))
+    (multiple-value-bind (params results typeidx)
+        (%typeuse items penv)
+      (declare (ignore params))
+      (let ((skipped 0)
+            (scan items))
+        (loop while (and scan (tok-elem-p (car scan))
+                         (member (%tok-keyword (%first-tok (car scan)))
+                                 '("type" "param" "result")
+                                 :test #'string=))
+              do (incf skipped) (pop scan))
+        (let ((body-items (nthcdr skipped items))
+              (bt (cond
+                   (typeidx (cons :typeidx typeidx))
+                   ((null results) nil)
+                   ((= (length results) 1) (car results))
+                   (t (cons :typeidx
+                            (%find-or-add-type '() results penv))))))
+          (values id bt body-items))))))
+
+(defun %fold-block (node penv op)
+  "Parse a folded (block ...)/(loop ...) list: the label is in scope
+for the body; folded blocks contain no plain end (their own closing
+parenthesis closes them)."
+  (multiple-value-bind (id bt items)
+      (%block-label-and-type node penv)
+    (when id (push id (penv-labels penv)))
+    (multiple-value-bind (body term rest)
+        (%instr-list items penv)
+      (declare (ignore rest))
+      (when term
+        (%text-error 0 "unexpected ~a inside folded block" (car term)))
+      (when id (pop (penv-labels penv)))
+      (make-wasm-instr op (list :bt bt) (coerce body 'vector) 0))))
+
+(defun %fold-if (node penv)
+  "Parse a folded (if ...): optional label + typeuse, then zero or
+more CONDITION operand expressions (folded lists), then (then ...) and
+an optional (else ...). Condition instructions are emitted BEFORE the
+:if (folded-if semantics: the if consumes its condition from the
+operand stack)."
+  (multiple-value-bind (id bt items)
+      (%block-label-and-type node penv)
+    (when id (push id (penv-labels penv)))
+    ;; condition operands: folded lists before (then ...)
+    (let ((conds '()))
+      (loop while (and items (tok-elem-p (car items))
+                       (not (member (%tok-keyword (%first-tok (car items)))
+                                    '("then" "else") :test #'string=)))
+            do (setf conds (nconc conds (%folded (car items) penv))
+                   items (cdr items)))
+      (let ((then '()) (else '()) (else-p nil))
+        (dolist (x items)
+          (cond
+           ((and (tok-elem-p x)
+                 (string= (%tok-keyword (%first-tok x)) "then"))
+            (multiple-value-bind (b term rest)
+                (%instr-list (cddr x) penv)
+              (declare (ignore rest))
+              (when term
+                (%text-error 0 "unexpected ~a in folded then" (car term)))
+              (setf then b)))
+           ((and (tok-elem-p x)
+                 (string= (%tok-keyword (%first-tok x)) "else"))
+            (setf else-p t)
+            (multiple-value-bind (b term rest)
+                (%instr-list (cddr x) penv)
+              (declare (ignore rest))
+              (when term
+                (%text-error 0 "unexpected ~a in folded else" (car term)))
+              (setf else b)))
+           (t (%text-error (if (tok-p x) (tok-pos x) 0)
+                           "bad if item"))))
+        (when (penv-labels penv) (pop (penv-labels penv)))
+        (append conds
+                (list (make-wasm-instr
+                       :if
+                       (if else-p
+                           (list :bt bt :else-body (coerce else 'vector))
+                           (list :bt bt))
+                       (coerce then 'vector)
+                       0)))))))
+
+;;; ---------------------------------------------------------------
+;;; Module fields. Every field parser takes its :list node (including
+;;; the leading keyword token) plus the shared PENV, registers ids,
+;;; and appends to the PENV's accumulation lists.
+
+(defun %register-id (id table what pos)
+  "Register $ID -> next index in TABLE, signaling on duplicates."
+  (when id
+    (when (gethash (tok-text id) table)
+      (%text-error pos "duplicate identifier ~a" (tok-text id)))
+    (setf (gethash (tok-text id) table)
+          (hash-table-count table))))
+
+(defun %string-tok (x)
+  "The decoded string of a :string token X, or decode-error."
+  (unless (and (tok-p x) (eq (tok-kind x) :string))
+    (%text-error (if (tok-p x) (tok-pos x) 0)
+                 "expected a string, found ~a"
+                 (if (tok-p x) (tok-text x) x)))
+  (tok-text x))
+
+(defun %opt-id (items)
+  "Split ITEMS into (values id-tok-or-nil rest-items) when the head is
+an $id token."
+  (if (and items (tok-p (car items)) (eq (tok-kind (car items)) :id))
+      (values (car items) (cdr items))
+      (values nil items)))
+
+(defun %limits-tail (items pos what)
+  "Parse n | n n limits from ITEMS: the min is a nat token; a SECOND
+nat token is the max (a reftype/id after the min is NOT a max)."
+  (unless (and (>= (length items) 1) (tok-p (car items)))
+    (%text-error pos "~a needs limits" what))
+  (let ((min (%parse-nat (tok-text (car items)) (tok-pos (car items)))))
+    (if (and (cdr items) (tok-p (second items))
+             (eq (tok-kind (second items)) :nat))
+        (let ((max (%parse-nat (tok-text (second items))
+                               (tok-pos (second items)))))
+          (values (make-wasm-limits min max) (cddr items)))
+        (values (make-wasm-limits min) (cdr items)))))
+
+(defun %parse-type-field (node penv)
+  "Parse a (type $id? (func ...)) field."
+  (let* ((id (third node))
+         (funclist (fourth node)))
+    (unless (and funclist (tok-elem-p funclist)
+                 (string= (%tok-keyword (%first-tok funclist)) "func"))
+      (%text-error (or (and id (tok-p id) (tok-pos id)) 0)
+                   "(type) needs a (func ...) list"))
+    ;; register BEFORE resolving inner typeuses (recursion allowed:
+    ;; the spec forbids it, but textually a typeuse inside a type
+    ;; field's functype is impossible anyway)
+    (when (and id (tok-p id) (eq (tok-kind id) :id))
+      (%register-id id (penv-types penv) "type" (tok-pos id)))
+    (multiple-value-bind (params results typeidx)
+        (%typeuse (cddr funclist) penv)
+      (when typeidx
+        (%text-error 0 "(type) functype cannot reference another type"))
+      (push (make-wasm-func-type params results)
+            (penv-types-list penv)))))
+
+(defun %import-desc (desc penv kind)
+  "Parse an import descriptor list ((func|table|memory|global) $id?
+type...) for KIND, returning the type payload: typeidx for funcs,
+wasm-table/wasm-memory/(type . mut) otherwise. Registers the id."
+  (let* ((head (%first-tok desc))
+         (k (and head (%tok-keyword head)))
+         (items (cddr desc)))
+    (multiple-value-bind (id rest) (%opt-id items)
+      (let ((idx (ecase kind
+                   (:func (penv-n-imported-funcs penv))
+                   (:table (penv-n-imported-tables penv))
+                   (:memory (penv-n-imported-mems penv))
+                   (:global (penv-n-imported-globals penv)))))
+        (when id (%register-id id (case kind
+                                    (:func (penv-funcs penv))
+                                    (:table (penv-tables penv))
+                                    (:memory (penv-mems penv))
+                                    (:global (penv-globals penv)))
+                                  (string-downcase kind) (tok-pos id)))
+        (ecase kind
+          (:func
+           (setf (penv-n-imported-funcs penv) (1+ idx))
+           (%resolve-typeuse rest penv))
+          (:table
+           (setf (penv-n-imported-tables penv) (1+ idx))
+           (%import-table-type k rest (and id (tok-pos id))))
+          (:memory
+           (setf (penv-n-imported-mems penv) (1+ idx))
+           (make-wasm-memory (%import-memory-type rest (and id (tok-pos id)))))
+          (:global
+           (setf (penv-n-imported-globals penv) (1+ idx))
+           (%import-global-type rest (and id (tok-pos id)))))))))
+
+(defun %import-table-type (k rest pos)
+  "Table import type: limits (n n?) then reftype, per the text grammar
+((table n n? funcref) in the official suite)."
+  (declare (ignore k))
+  (unless (and rest (tok-p (car rest)))
+    (%text-error pos "imported table needs limits and a type"))
+  (multiple-value-bind (limits tail)
+      (%limits-tail rest pos "imported table")
+    (let ((rt (and tail (car tail))))
+      (unless (and rt (tok-p rt))
+        (%text-error pos "imported table needs a reference type"))
+      (let ((rty (%valtype rt)))
+        (unless (member rty '(:funcref :externref))
+          (%text-error pos "table type must be a reference type"))
+        (make-wasm-table rty limits)))))
+
+(defun %import-memory-type (rest pos)
+  (unless (and rest (tok-p (car rest)))
+    (%text-error pos "imported memory needs limits"))
+  (multiple-value-bind (limits tail)
+      (%limits-tail rest pos "imported memory")
+    (declare (ignore tail))
+    limits))
+
+(defun %import-global-type (rest pos)
+  "Global import type: valtype or (mut valtype); returns (type . mut)."
+  (cond
+   ((and rest (tok-p (car rest)))
+    (cons (%valtype (car rest)) nil))
+   ((and rest (tok-elem-p (car rest))
+         (string= (%tok-keyword (%first-tok (car rest))) "mut"))
+    (cons (%valtype (third (car rest))) t))
+   (t (%text-error pos "imported global needs a type"))))
+
+(defun %parse-import-field (node penv)
+  "Parse an (import \"m\" \"f\" desc) field."
+  (let ((module (%string-tok (third node)))
+        (field (%string-tok (fourth node)))
+        (desc (fifth node)))
+    (unless (and desc (tok-elem-p desc))
+      (%text-error 0 "import needs a descriptor"))
+    (let* ((head (%first-tok desc))
+           (k (and head (%tok-keyword head))))
+      (let ((kind (cond
+                   ((string= k "func") :func)
+                   ((string= k "table") :table)
+                   ((string= k "memory") :memory)
+                   ((string= k "global") :global)
+                   (t (%text-error (and head (tok-pos head))
+                                   "bad import kind ~a" k)))))
+        (push (make-wasm-import module field kind
+                                (%import-desc desc penv kind))
+              (penv-imports-list penv))))))
+
+(defun %parse-func-field (node penv)
+  "Parse a (func ...) field with inline import/export abbreviations:
+(func $id? (export \"n\")* (import \"m\" \"f\")? typeuse locals* body).
+An inline (import) turns the func into an import entry instead."
+  (let* ((items (cddr node))
+         (pos (and (first items) (tok-p (first items))
+                   (tok-pos (first items))))
+         (id nil))
+    (multiple-value-bind (i rest) (%opt-id items)
+      (setf id i)
+      ;; inline exports: (func (export \"n\") ...). Multiple names
+      ;; export the SAME func index.
+      (loop while (and rest (tok-elem-p (car rest))
+                       (string= (%tok-keyword (%first-tok (car rest)))
+                                "export"))
+            do (let* ((ex (car rest))
+                      (name (%string-tok (third ex)))
+                      (idx (+ (penv-n-imported-funcs penv)
+                              (hash-table-count (penv-funcs penv)))))
+                 (declare (ignore id))
+                 (push (make-wasm-export name :func idx)
+                       (penv-exports-list penv))
+                 (pop rest)))
+      ;; inline import: becomes an import entry, no body
+      (if (and rest (tok-elem-p (car rest))
+               (string= (%tok-keyword (%first-tok (car rest))) "import"))
+          (let* ((im (car rest))
+                 (module (%string-tok (third im)))
+                 (field (%string-tok (fourth im)))
+                 (body-items (cdr rest)))
+            (when id
+              (%register-id id (penv-funcs penv) "func" (tok-pos id)))
+            ;; the typeuse (and locals?) of an inline-imported func:
+            ;; per the abbreviation, (type/param/result) only, no body
+            (let ((typeidx (%resolve-typeuse body-items penv)))
+              (incf (penv-n-imported-funcs penv))
+              (push (make-wasm-import module field :func typeidx)
+                    (penv-imports-list penv))))
+          ;; ordinary defined func
+          (let* ((idx (hash-table-count (penv-funcs penv)))
+                 (abs-idx (+ (penv-n-imported-funcs penv) idx)))
+            (when id
+              (%register-id id (penv-funcs penv) "func" (tok-pos id)))
+            (%reset-locals penv)
+            (multiple-value-bind (params results typeidx)
+                (%typeuse rest penv)
+              ;; count typeuse items consumed
+              (let ((skipped 0)
+                    (scan rest))
+                (loop while (and scan (tok-elem-p (car scan))
+                                 (member (%tok-keyword (%first-tok (car scan)))
+                                         '("type" "param" "result")
+                                         :test #'string=))
+                      do (incf skipped) (pop scan))
+                (let ((body-items (nthcdr skipped rest)))
+                  ;; locals: (local $id? t)* / (local t*)
+                  (let ((locals '())
+                        (cursor body-items))
+                    (loop while (and cursor (tok-elem-p (car cursor))
+                                     (string= (%tok-keyword
+                                               (%first-tok (car cursor)))
+                                              "local"))
+                          do (let ((l (car cursor)))
+                               ;; named local: (local $x i32) single type;
+                               ;; unnamed: (local i32 i64 ...)
+                               (let ((lrest (cddr l)))
+                                 (if (and lrest (tok-p (car lrest))
+                                          (eq (tok-kind (car lrest)) :id))
+                                     (progn
+                                       (setf (gethash (tok-text (car lrest))
+                                                     (penv-locals penv))
+                                             (%next-local-index penv))
+                                       (push (cons (%valtype (second lrest)) 1)
+                                             locals))
+                                     (dolist (t_ lrest)
+                                       (push (cons (%valtype t_) 1)
+                                             locals))))
+                               (pop cursor)))
+                    ;; remaining items are the body (folded and/or plain)
+                    ;; A plain body ends with the final `end` of the func.
+                    (multiple-value-bind (body term terminator-rest)
+                        (%instr-list cursor penv)
+                      (declare (ignore terminator-rest))
+                      (when term
+                        ;; a func body has no block end of its own in
+                        ;; the folded style; a plain-style func body IS
+                        ;; terminated by end
+                        (unless (eq (car term) :end)
+                          (%text-error pos "func body cannot end with ~a"
+                                       (car term)))
+                        ;; tolerate both: the binary body excludes end
+                        (setf body body))
+                      (let ((type-idx (or typeidx
+                                          (%find-or-add-type params results
+                                                             penv))))
+                        ;; contract: func bodies INCLUDE the trailing
+                        ;; :end (like the binary decoder's exprs)
+                        (push (make-wasm-func
+                               type-idx
+                               (nreverse locals)
+                               (coerce (append body
+                                               (list (make-wasm-instr :end
+                                                                      nil #() 0)))
+                                       'vector)
+                               0)
+                              (penv-funcs-list penv)))))))))))))
+
+(defun %inline-exports (rest penv kind table)
+  "Consume leading (export \"n\") items from REST, pushing export
+entries for the NEXT index of KIND (imports counted via TABLE's
+hash-count + the defined list length). Returns the remaining items."
+  (loop while (and rest (tok-elem-p (car rest))
+                   (string= (%tok-keyword (%first-tok (car rest)))
+                            "export"))
+        do (let* ((ex (car rest))
+                  (name (%string-tok (third ex)))
+                  (idx (+ (ecase kind
+                            (:func (penv-n-imported-funcs penv))
+                            (:table (penv-n-imported-tables penv))
+                            (:memory (penv-n-imported-mems penv))
+                            (:global (penv-n-imported-globals penv)))
+                          (ecase kind
+                            (:func (hash-table-count (penv-funcs penv)))
+                            (:table (length (penv-tables-list penv)))
+                            (:memory (length (penv-mems-list penv)))
+                            (:global (length (penv-globals-list penv)))))))
+             (declare (ignore table))
+             (push (make-wasm-export name kind idx)
+                   (penv-exports-list penv))
+             (pop rest))
+        finally (return rest)))
+
+(defun %table-type-items (items pos)
+  "Parse a defined table's type from ITEMS: reftype then limits
+(n [n]), OR the inline (elem ...) abbreviation. Returns (values
+wasm-table inits) where INITS is the elem segment's init list for the
+inline form, or NIL."
+  (cond
+   ;; inline elem: (table reftype (elem item*)) — the elem list itself
+   ;; is the LAST item
+   ((and (>= (length items) 1)
+         (tok-elem-p (car (last items)))
+         (string= (%tok-keyword (%first-tok (car (last items)))) "elem"))
+    (let* ((elemlist (car (last items)))
+           (eitems (cddr elemlist))
+           (n (length eitems)))
+      (values (make-wasm-table :funcref (make-wasm-limits n))
+              eitems)))
+   (t
+    ;; (table n n? reftype): limits first, reftype last
+    (unless (and (>= (length items) 2) (tok-p (car items)))
+      (%text-error pos "table needs limits and a reference type"))
+    (multiple-value-bind (limits tail)
+        (%limits-tail items pos "table")
+      (let ((rt (and tail (car tail))))
+        (unless (and rt (tok-p rt))
+          (%text-error pos "table needs a reference type"))
+        (let ((rty (%valtype rt)))
+          (unless (member rty '(:funcref :externref))
+            (%text-error pos "table type must be a reference type"))
+          (unless (null (cdr tail))
+            (%text-error pos "junk after table type"))
+          (values (make-wasm-table rty limits) nil)))))))
+
+(defun %parse-table-field (node penv)
+  "Parse a (table ...) field: $id?, inline exports, optional inline
+import, then the type (reftype limits) or the inline (elem)
+abbreviation (which also emits the elem segment)."
+  (let* ((items (cddr node))
+         (pos (or (and items (tok-p (car items)) (tok-pos (car items))) 0)))
+    (multiple-value-bind (id rest) (%opt-id items)
+      (setf rest (%inline-exports rest penv :table (penv-tables penv)))
+      (if (and rest (tok-elem-p (car rest))
+               (string= (%tok-keyword (%first-tok (car rest))) "import"))
+          ;; inline import abbreviation
+          (let* ((im (car rest))
+                 (module (%string-tok (third im)))
+                 (field (%string-tok (fourth im)))
+                 (tail (cdr rest)))
+            (when id
+              (%register-id id (penv-tables penv) "table" (tok-pos id)))
+            (incf (penv-n-imported-tables penv))
+            (let ((ty (%import-table-type "table" tail (tok-pos id))))
+              (push (make-wasm-import module field :table ty)
+                    (penv-imports-list penv))))
+          ;; defined table
+          (progn
+            (when id
+              (%register-id id (penv-tables penv) "table" (tok-pos id)))
+            (multiple-value-bind (tab inits)
+                (%table-type-items rest pos)
+              (push tab (penv-tables-list penv))
+              ;; the inline (elem) also defines an ACTIVE elem segment
+              ;; targeting this table at offset 0
+              (when inits
+                (let ((tableidx (+ (penv-n-imported-tables penv)
+                                   (1- (length (penv-tables-list penv))))))
+                  (push (make-wasm-elem
+                         (list :active tableidx
+                               (vector (make-wasm-instr :i32.const
+                                                        (list :value 0) #() 0)
+                                       (make-wasm-instr :end nil #() 0)))
+                         :funcref
+                         (%elem-items inits :funcref penv))
+                        (penv-elems-list penv))))))))))
+
+(defun %parse-memory-field (node penv)
+  "Parse a (memory ...) field: $id?, inline exports, optional inline
+import, then limits (n [n]) or the (data ...) abbreviation."
+  (let* ((items (cddr node))
+         (pos (or (and items (tok-p (car items)) (tok-pos (car items))) 0)))
+    (multiple-value-bind (id rest) (%opt-id items)
+      (setf rest (%inline-exports rest penv :memory (penv-mems penv)))
+      (if (and rest (tok-elem-p (car rest))
+               (string= (%tok-keyword (%first-tok (car rest))) "import"))
+          (let* ((im (car rest))
+                 (module (%string-tok (third im)))
+                 (field (%string-tok (fourth im)))
+                 (tail (cdr rest)))
+            (when id
+              (%register-id id (penv-mems penv) "memory" (tok-pos id)))
+            (incf (penv-n-imported-mems penv))
+            (let ((ty (%import-memory-type tail (tok-pos id))))
+              (push (make-wasm-import module field :memory
+                                      (make-wasm-memory ty))
+                    (penv-imports-list penv))))
+          (progn
+            (when id
+              (%register-id id (penv-mems penv) "memory" (tok-pos id)))
+            ;; (data "...") abbreviation: memory sized to the data
+            (if (and rest (tok-elem-p (car rest))
+                     (string= (%tok-keyword (%first-tok (car rest)))
+                              "data"))
+                (let* ((datalist (car rest))
+                       (bytes (%data-bytes (cddr datalist))))
+                  (let ((pages (ash (+ (length bytes) #xFFFF) -16)))
+                    (push (make-wasm-memory
+                           (make-wasm-limits (max 1 pages)))
+                          (penv-mems-list penv))
+                    ;; active data segment at offset 0
+                    (let ((memidx (+ (penv-n-imported-mems penv)
+                                     (1- (length (penv-mems-list penv))))))
+                      (push (make-wasm-data
+                             (list :active memidx
+                                   (vector (make-wasm-instr :i32.const
+                                                            (list :value 0) #() 0)
+                                           (make-wasm-instr :end nil #() 0)))
+                             bytes)
+                            (penv-datas-list penv)))))
+                (progn
+                  (multiple-value-bind (limits tail)
+                      (%limits-tail rest pos "memory")
+                    (unless (null tail)
+                      (%text-error pos "junk after memory limits"))
+                    (push (make-wasm-memory limits)
+                          (penv-mems-list penv))))))))))
+
+(defun %global-type (item pos)
+  "A global type is a valtype or a (mut valtype) list. Returns
+(values type mutable-p)."
+  (cond
+   ((tok-p item) (values (%valtype item) nil))
+   ((and (tok-elem-p item)
+         (string= (%tok-keyword (%first-tok item)) "mut"))
+    (unless (third item)
+      (%text-error pos "(mut) needs a type"))
+    (values (%valtype (third item)) t))
+   (t (%text-error pos "bad global type"))))
+
+(defun %parse-global-field (node penv)
+  "Parse a (global $id? type init) field. Init is an expression (a
+single folded list or a plain instruction sequence ending with end)."
+  (let* ((items (cddr node))
+         (pos (or (and items (tok-p (car items)) (tok-pos (car items))) 0)))
+    (multiple-value-bind (id rest) (%opt-id items)
+      (setf rest (%inline-exports rest penv :global (penv-globals penv)))
+      (if (and rest (tok-elem-p (car rest))
+               (string= (%tok-keyword (%first-tok (car rest))) "import"))
+          (let* ((im (car rest))
+                 (module (%string-tok (third im)))
+                 (field (%string-tok (fourth im)))
+                 (tail (cdr rest)))
+            (when id
+              (%register-id id (penv-globals penv) "global" (tok-pos id)))
+            (incf (penv-n-imported-globals penv))
+            (multiple-value-bind (type mut) (%global-type (car tail) pos)
+              (push (make-wasm-import module field :global (cons type mut))
+                    (penv-imports-list penv))))
+          ;; defined global: type then init expr
+          (progn
+            (when id
+              (%register-id id (penv-globals penv) "global" (tok-pos id)))
+            (unless (and rest (or (tok-p (car rest)) (tok-elem-p (car rest))))
+              (%text-error pos "global needs a type and init"))
+            (multiple-value-bind (type mut) (%global-type (car rest) pos)
+              (let ((expr (%parse-expr (cdr rest) penv)))
+                (push (make-wasm-global :type type :mutable mut
+                                         :init expr)
+                      (penv-globals-list penv)))))))))
+
+(defun %parse-expr (items penv)
+  "Parse a constant expression from ITEMS: either ONE folded list
+(e.g. (i32.const 0)) or a plain instruction sequence ending with end.
+Returns the instr vector INCLUDING the trailing :end (contract for
+const expressions)."
+  (cond
+   ((and (= (length items) 1) (tok-elem-p (car items)))
+    ;; single folded expression
+    (let ((instrs (%folded (car items) penv)))
+      (coerce (append instrs (list (make-wasm-instr :end nil #() 0)))
+              'vector)))
+   (t
+    ;; plain sequence: instructions then end
+    (multiple-value-bind (body term rest)
+        (%instr-list items penv)
+      (declare (ignore rest))
+      (unless (eq (car term) :end)
+        (%text-error 0 "constant expression must end with end"))
+      (coerce (append body (list (make-wasm-instr :end nil #() 0)))
+              'vector)))))
+
+(defun %parse-export-field (node penv)
+  "Parse an (export \"n\" (kind idx)) field."
+  (let ((name (%string-tok (third node)))
+        (desc (fourth node)))
+    (unless (and desc (tok-elem-p desc))
+      (%text-error 0 "export needs a descriptor"))
+    (let* ((head (%first-tok desc))
+           (k (and head (%tok-keyword head)))
+           (idxtok (third desc)))
+      (let ((kind (cond
+                   ((string= k "func") :func)
+                   ((string= k "table") :table)
+                   ((string= k "memory") :memory)
+                   ((string= k "global") :global)
+                   (t (%text-error (and head (tok-pos head))
+                                   "bad export kind ~a" k)))))
+        (let ((idx (case kind
+                     (:func (%id-or-num idxtok (penv-funcs penv) "func"))
+                     (:table (%id-or-num idxtok (penv-tables penv) "table"))
+                     (:memory (%id-or-num idxtok (penv-mems penv) "memory"))
+                     (:global (%id-or-num idxtok (penv-globals penv)
+                                           "global")))))
+          (push (make-wasm-export name kind idx)
+                (penv-exports-list penv)))))))
+
+(defun %parse-start-field (node penv)
+  "Parse a (start $f) field."
+  (let ((idxtok (second node)))
+    (when (penv-start penv)
+      (%text-error 0 "multiple start sections"))
+    (unless idxtok
+      (%text-error 0 "start needs a func index"))
+    (setf (penv-start penv)
+          (%id-or-num idxtok (penv-funcs penv) "func"))))
+
+;;; ---------------------------------------------------------------
+;;; Element and data segments.
+
+(defun %data-bytes (items)
+  "Concatenate the :string tokens of a data segment into a byte vector."
+  (let ((out (make-array 16 :element-type '(unsigned-byte 8)
+                         :fill-pointer 0 :adjustable t)))
+    (dolist (x items)
+      (let ((s (%string-tok x)))
+        (loop for ch across s
+              do (vector-push-extend (char-code ch) out))))
+    (coerce out 'vector)))
+
+(defun %elem-items (items rt penv)
+  "Elem init items: funcidx tokens ($f/0) abbreviate (ref.func x);
+folded lists are full expressions. Returns the list of init
+expression vectors (each INCLUDING its :end)."
+  (when (and items (tok-p (car items))
+             (member (tok-kind (car items)) '(:id :nat)))
+    ;; legacy funcidx list form (spec: only valid for funcref, but the
+    ;; runtime treats ref types uniformly here)
+    (return-from %elem-items
+      (mapcar (lambda (x)
+                (unless (and (tok-p x) (member (tok-kind x) '(:id :nat)))
+                  (%text-error (if (tok-p x) (tok-pos x) 0)
+                               "bad elem funcidx item"))
+                (vector (make-wasm-instr :ref.func
+                                         (list :func (%id-or-num x
+                                                             (penv-funcs penv)
+                                                             "func"))
+                                         #() 0)
+                        (make-wasm-instr :end nil #() 0)))
+              items)))
+  (mapcar (lambda (x)
+            (unless (tok-elem-p x)
+              (%text-error (if (tok-p x) (tok-pos x) 0)
+                           "elem item must be an expression"))
+            (%parse-expr (list x) penv))
+          items))
+
+(defun %elem-offset-expr (items penv)
+  "The offset of an active elem: a bare (i32.const n) style expression
+list, or an (offset expr) wrapper. Returns (values expr rest)."
+ (cond
+  ((and items (tok-elem-p (car items))
+        (string= (%tok-keyword (%first-tok (car items))) "offset"))
+   (values (%parse-expr (cddr (car items)) penv) (cdr items)))
+  ((and items (tok-elem-p (car items))
+        (member (%tok-keyword (%first-tok (car items)))
+                '("i32.const" "global.get") :test #'string=))
+   (values (%parse-expr (list (car items)) penv) (cdr items)))
+  (t (values nil items))))
+
+(defun %parse-elem-field (node penv)
+  "Parse an (elem ...) field, all forms:
+ (elem $id? (table x)? (offset e|e) reftype? item*)   active
+ (elem $id? reftype item*)                            passive
+ (elem $id? declare reftype? item*)                   declarative
+ (elem $id? funcidx*)                                 active on table 0
+ item := funcidx | (ref.func x) | (offset ...)-free expr | (item expr)"
+  (let* ((items (cddr node))
+         (pos (or (and items (tok-p (car items)) (tok-pos (car items))) 0)))
+    (multiple-value-bind (id rest) (%opt-id items)
+      (when id
+        (%register-id id (penv-elems penv) "elem" (tok-pos id)))
+      ;; declare form
+      (cond
+       ((and rest (tok-p (car rest))
+             (string= (%tok-keyword (car rest)) "declare"))
+        (let* ((tail (cdr rest))
+               (rt :funcref)
+               (tail2 tail))
+          ;; optional reftype (funcref/externref) or 'func'
+          (when (and tail2 (tok-p (car tail2))
+                     (member (%tok-keyword (car tail2))
+                             '("funcref" "externref" "func")
+                             :test #'string=))
+            (when (string= (%tok-keyword (car tail2)) "externref")
+              (setf rt :externref))
+            (setf tail2 (cdr tail2)))
+          (push (make-wasm-elem '(:declarative) rt
+                                (%elem-items tail2 rt penv))
+                (penv-elems-list penv))))
+       (t
+        ;; (table x)? prefix
+        (let ((tableidx 0) (tail rest) (active nil))
+          (when (and tail (tok-elem-p (car tail))
+                     (string= (%tok-keyword (%first-tok (car tail))) "table"))
+            (setf tableidx (%id-or-num (third (car tail))
+                                       (penv-tables penv) "table")
+                  active t
+                  tail (cdr tail)))
+          ;; offset / bare expression
+          (multiple-value-bind (expr tail2)
+              (%elem-offset-expr tail penv)
+            (if active
+                ;; ACTIVE: expr required
+                (let* ((rt :funcref)
+                       (tail3 tail2))
+                  (when (and tail3 (tok-p (car tail3))
+                             (member (%tok-keyword (car tail3))
+                                     '("funcref" "externref" "func")
+                                     :test #'string=))
+                    (when (string= (%tok-keyword (car tail3)) "externref")
+                      (setf rt :externref))
+                    (setf tail3 (cdr tail3)))
+                  (push (make-wasm-elem (list :active tableidx expr) rt
+                                        (%elem-items tail3 rt penv))
+                        (penv-elems-list penv)))
+                ;; no (table x): if an offset was found it is active on
+                ;; table 0; else funcref/passive decision by head
+                (let ((rt :funcref))
+                  (cond
+                   (expr
+                    (let ((tail3 tail2))
+                      (when (and tail3 (tok-p (car tail3))
+                                 (member (%tok-keyword (car tail3))
+                                         '("funcref" "externref" "func")
+                                         :test #'string=))
+                        (when (string= (%tok-keyword (car tail3)) "externref")
+                          (setf rt :externref))
+                        (setf tail3 (cdr tail3)))
+                      (push (make-wasm-elem (list :active 0 expr) rt
+                                            (%elem-items tail3 rt penv))
+                            (penv-elems-list penv))))
+                   ((and tail2 (tok-p (car tail2))
+                         (member (%tok-keyword (car tail2))
+                                 '("funcref" "externref") :test #'string=))
+                    ;; passive with explicit reftype
+                    (push (make-wasm-elem '(:passive)
+                                          (%valtype (car tail2))
+                                          (%elem-items (cdr tail2)
+                                                      (%valtype (car tail2))
+                                                      penv))
+                          (penv-elems-list penv)))
+                   ((and tail2 (tok-p (car tail2))
+                         (string= (%tok-keyword (car tail2)) "func"))
+                    ;; passive funcidx list
+                    (push (make-wasm-elem '(:passive) :funcref
+                                          (%elem-items (cdr tail2) :funcref
+                                                       penv))
+                          (penv-elems-list penv)))
+                   (t
+                    ;; bare funcidx list: active on table 0
+                    (push (make-wasm-elem
+                           (list :active 0
+                                 (vector (make-wasm-instr :i32.const
+                                                         (list :value 0) #() 0)
+                                         (make-wasm-instr :end nil #() 0)))
+                           :funcref
+                           (%elem-items tail2 :funcref penv))
+                          (penv-elems-list penv)))))))))))
+      ;; keep the elem index space in sync: unnamed segments occupy
+      ;; an index too (numeric elemidx references count all fields)
+      (setf (gethash (symbol-name (gensym "ELEM-UNUSED"))
+                     (penv-elems penv))
+            (hash-table-count (penv-elems penv)))))
+
+(defun %parse-data-field (node penv)
+  "Parse a (data ...) field:
+ (data $id? (memory x)? (offset e|e) \"s\"*)  active
+ (data $id? \"s\"*)                           passive"
+  (let* ((items (cddr node))
+         (pos (or (and items (tok-p (car items)) (tok-pos (car items))) 0)))
+    (multiple-value-bind (id rest) (%opt-id items)
+      (declare (ignore id))
+      (let ((memidx 0) (tail rest) (mem-p nil))
+        (when (and tail (tok-elem-p (car tail))
+                   (string= (%tok-keyword (%first-tok (car tail))) "memory"))
+          (setf memidx (%id-or-num (third (car tail)) (penv-mems penv)
+                                   "memory")
+                mem-p t
+                tail (cdr tail)))
+        (multiple-value-bind (expr tail2)
+            (%elem-offset-expr tail penv)
+          (if (or mem-p expr)
+              ;; active
+              (progn
+                (unless expr
+                  (%text-error pos "active data segment needs an offset"))
+                (push (make-wasm-data (list :active memidx expr)
+                                      (%data-bytes tail2))
+                      (penv-datas-list penv)))
+              ;; passive
+              (push (make-wasm-data '(:passive) (%data-bytes tail2))
+                    (penv-datas-list penv))))))))
+
+;;; ---------------------------------------------------------------
+;;; Module assembly and entry points.
+
+(defun %parse-module-fields (nodes penv)
+  "Dispatch each top-level field :list node to its parser."
+  (dolist (node nodes)
+   (let* ((head (%first-tok node))
+          (k (and head (%tok-keyword head))))
+     (cond
+      ((string= k "type") (%parse-type-field node penv))
+      ((string= k "import") (%parse-import-field node penv))
+      ((string= k "func") (%parse-func-field node penv))
+      ((string= k "table") (%parse-table-field node penv))
+      ((string= k "memory") (%parse-memory-field node penv))
+      ((string= k "global") (%parse-global-field node penv))
+      ((string= k "export") (%parse-export-field node penv))
+      ((string= k "start") (%parse-start-field node penv))
+      ((string= k "elem") (%parse-elem-field node penv))
+      ((string= k "data") (%parse-data-field node penv))
+      (t (%text-error (and head (tok-pos head))
+                     "unknown module field ~a" k))))))
+
+(defun parse-wat (s)
+  "Parse WAT text (a string) into a wasm-module IR identical to the
+binary decoder's output (CONTRACTS.md). Signals wasmdown:decode-error
+with :offset (token index) on malformed text."
+  (let* ((tokens (%tokenize s))
+         (nodes (%parse-tokens tokens))
+         (penv (make-penv)))
+    (unless (= (length nodes) 1)
+      (%text-error 0 "expected exactly one (module ...)"))
+    (let ((node (first nodes)))
+      (unless (and (tok-elem-p node)
+                   (string= (%tok-keyword (%first-tok node)) "module"))
+        (%text-error 0 "expected a (module ...) form")))
+    ;; NOTE: the module keyword may be omitted?  No: require it.
+    ;; items of the module list
+    (let ((items (cddr (first nodes))))
+      ;; register elem/data ids AFTER fields parse (their indices are
+      ;; positional); the elem/data parsers use hash-table-count.
+      (%parse-module-fields items penv)
+      (make-wasm-module
+       :types (coerce (reverse (penv-types-list penv)) 'vector)
+       :imports (coerce (reverse (penv-imports-list penv)) 'vector)
+       :funcs (coerce (reverse (penv-funcs-list penv)) 'vector)
+       :tables (coerce (reverse (penv-tables-list penv)) 'vector)
+       :mems (coerce (reverse (penv-mems-list penv)) 'vector)
+       :globals (coerce (reverse (penv-globals-list penv)) 'vector)
+       :exports (coerce (reverse (penv-exports-list penv)) 'vector)
+       :start (penv-start penv)
+       :elems (coerce (reverse (penv-elems-list penv)) 'vector)
+       :datas (coerce (reverse (penv-datas-list penv)) 'vector)
+       :data-count (let ((n (length (penv-datas-list penv))))
+                     (if (zerop n) nil n))))))
+
+(defun parse-wat-file (path)
+  "Read PATH (pathname or namestring) as UTF-8 text and parse it as a
+WAT module via PARSE-WAT."
+  (let ((text (with-open-file (in path :external-format :utf-8)
+                (let ((out (make-array 4096 :element-type 'character
+                                       :fill-pointer 0 :adjustable t)))
+                  (loop for ch = (read-char in nil nil)
+                        while ch
+                        do (vector-push-extend ch out))
+                  (coerce out 'string)))))
+    (parse-wat text)))

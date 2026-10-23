@@ -562,37 +562,44 @@ terminating :end, which IS included in the result. R is a reader."
 
 (defun %read-elem-section (r)
   "All flags 0..7: legacy funcidx forms and elemexpr forms, active /
-  passive / declarative modes."
+passive / declarative modes. Inits are normalized to LISTS of expr
+vectors (the wasm-elem contract; runtime/validate iterate with IN)."
   (read-vec r
             (lambda (r)
               (let ((flags (read-u32 r)))
                 (ecase flags
-                    (0 (let ((expr (decode-instr-seq r))
-                             (inits (read-vec r #'%read-elem-funcidx "elem funcidx")))
-                         (make-wasm-elem (list :active 0 expr) :funcref inits)))
-                    (1 (let ((inits (read-vec r #'%read-elem-funcidx "elem funcidx")))
-                         (make-wasm-elem (list :passive) :funcref inits)))
-                    (2 (let ((table (read-u32 r))
-                             (expr (decode-instr-seq r))
-                             (inits (read-vec r #'%read-elem-funcidx "elem funcidx")))
-                         (make-wasm-elem (list :active table expr) :funcref inits)))
-                    (3 (let ((inits (read-vec r #'%read-elem-funcidx "elem funcidx")))
-                         (make-wasm-elem (list :declarative) :funcref inits)))
-                    (4 (let ((expr (decode-instr-seq r))
-                             (inits (read-vec r #'%read-elemexpr "elem expr")))
-                         (make-wasm-elem (list :active 0 expr) :funcref inits)))
-                    (5 (let ((rt (%read-reftype r))
-                             (inits (read-vec r #'%read-elemexpr "elem expr")))
-                         (make-wasm-elem (list :passive) rt inits)))
-                    (6 (let ((table (read-u32 r))
-                             (expr (decode-instr-seq r))
-                             (rt (%read-reftype r))
-                             (inits (read-vec r #'%read-elemexpr "elem expr")))
-                         (make-wasm-elem (list :active table expr) rt inits)))
-                    (7 (let ((rt (%read-reftype r))
-                             (inits (read-vec r #'%read-elemexpr "elem expr")))
-                         (make-wasm-elem (list :declarative) rt inits))))))
+                  (0 (let ((expr (decode-instr-seq r)))
+                       (make-wasm-elem (list :active 0 expr) :funcref
+                                       (%elem-funcidx-inits r))))
+                  (1 (make-wasm-elem (list :passive) :funcref
+                                     (%elem-funcidx-inits r)))
+                  (2 (let ((table (read-u32 r))
+                           (expr (decode-instr-seq r)))
+                       (make-wasm-elem (list :active table expr) :funcref
+                                       (%elem-funcidx-inits r))))
+                  (3 (make-wasm-elem (list :declarative) :funcref
+                                     (%elem-funcidx-inits r)))
+                  (4 (let ((expr (decode-instr-seq r)))
+                       (make-wasm-elem (list :active 0 expr) :funcref
+                                       (%elem-expr-inits r))))
+                  (5 (let ((rt (%read-reftype r)))
+                       (make-wasm-elem (list :passive) rt
+                                       (%elem-expr-inits r))))
+                  (6 (let ((table (read-u32 r))
+                           (expr (decode-instr-seq r))
+                           (rt (%read-reftype r)))
+                       (make-wasm-elem (list :active table expr) rt
+                                       (%elem-expr-inits r))))
+                  (7 (let ((rt (%read-reftype r)))
+                       (make-wasm-elem (list :declarative) rt
+                                       (%elem-expr-inits r)))))))
             "element"))
+
+(defun %elem-funcidx-inits (r)
+  (coerce (read-vec r #'%read-elem-funcidx "elem funcidx") 'list))
+
+(defun %elem-expr-inits (r)
+  (coerce (read-vec r #'%read-elemexpr "elem expr") 'list))
 
 (defun %read-code-section (r typeidxs)
   "Each entry: u32 size, then locals vec + body expr. The entry count

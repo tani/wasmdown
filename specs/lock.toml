@@ -1,0 +1,43 @@
+# WASMDOWN pinned standards & conformance-suite manifest (PLAN.md §12.1).
+# Machine-readable: keys are stable identifiers, values are exact pins.
+# Policy: never use floating branches in release CI; a separate scheduled
+# job tests newer upstream commits and proposes deliberate updates.
+
+[spec.core]
+name        = "WebAssembly Core Specification (source repository)"
+repo        = "https://github.com/WebAssembly/spec"
+commit      = "b0ec1f3f449525c217dbff3f1dfab435a756ea92"
+commit_date = "2026-10-22"
+vendored    = "tests/spec-core/*.wast  (97 files, test/core)"
+note        = "Core 3.0 draft tree; authoritative source for core tests per PLAN.md §12.1"
+
+[spec.testsuite-aggregate]
+name        = "WebAssembly aggregated testsuite mirror"
+repo        = "https://github.com/WebAssembly/testsuite"
+commit      = "not-vendored"
+note        = "Discovery-only mirror; core cases counted from WebAssembly/spec, never double-counted"
+
+[component.model]
+name        = "WebAssembly Component Model"
+repo        = "https://github.com/WebAssembly/component-model"
+commit      = "not-yet-vendored"
+note        = "Required at M7; see PLAN.md §12.1"
+
+[wasi]
+release     = "0.3.2 (2026-10-13)"
+wit_commit  = "not-yet-vendored"
+note        = "Required at M8+; vendor exact stable WIT snapshots + SHA-256"
+
+[toolchain]
+sbcl        = "2.6.4"
+architecture = "linux-aarch64 (dev); x86-64 primary per PLAN.md §1"
+lisp_deps   = "0 mandatory Quicklisp/third-party"
+
+[tooling.dev-only]
+wabt        = "not pinned (test-only wast2json allowed per PLAN.md §12.2)"
+wasm_tools  = "not pinned"
+wasmtime    = "not pinned"
+
+[status]
+declared_support = "partial"
+note = "Engine executes core subset: MVP + bulk-memory + sign-ext + non-trapping-float + multi-value + reference-types. NOT Core 3.0 conformant; no SIMD/GC/EH/tail-call/memory64."

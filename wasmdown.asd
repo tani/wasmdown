@@ -19,6 +19,7 @@
    (:file "src/interp")
    (:file "src/codegen")
    (:file "src/api")
+   (:file "src/text")
    (:file "src/cli")))
 
 (asdf:defsystem #:wasmdown/test
@@ -32,4 +33,5 @@
    (:file "tests/validate")
    (:file "tests/runtime")
    (:file "tests/interp")
-   (:file "tests/api")))
+   (:file "tests/api")
+   (:file "tests/text")))

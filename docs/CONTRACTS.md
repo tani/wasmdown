@@ -35,7 +35,9 @@ Signed views: `wasmdown.numops:i32-s`, `i64-s` (and `_u` identity helpers).
   `:global.get`/`:global.set` use `(:global n)`;
   `:table.get`/`:table.set` use `(:table n)`;
   `:select` uses `(:types vector-or-nil)`;
-  `:i32.const`/`:i64.const` use `(:val n)`;
+  `:i32.const`/`:i64.const` use `(:value n)` where n is the SIGNED
+  literal from the source (decoder reads s32/s64; interp/codegen wrap
+  into the unsigned domain at use);
   `:f32.const`/`:f64.const` use `(:bits n)` (raw bit pattern).
 - Structured op keywords are hyphenated: `:br-if`, `:br-table`,
   `:call-indirect`, `:memory.init`, `:data.drop`, `:memory.copy`,
