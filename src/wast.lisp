@@ -1004,9 +1004,23 @@ by the plain substring scan; this catches (ref 0)-style indices)."
         finally (return nil)))
 
 (defun %unsupported-feature-p (text)
-  "Scan module text for features outside this engine slice (SIMD, GC,
-tail calls, EH, typed funcrefs, memory64, threads). Keyword-level only:
-the classification is honest, never a silent pass."
+  "Scan module text for features outside this engine slice (SIMD, GC
+value types, annotations). Keyword-level only: the classification is
+honest, never a silent pass.
+
+TYPED FUNCTION REFERENCES (Core 3.0) are IMPLEMENTED as of loop 19:
+valtypes ((ref $t) (ref null $t) (ref func) (ref extern) (ref exn)
+(ref any) + the null*/anyref shorthand bottoms), the five opcodes
+\(call_ref, return_call_ref, br_on_null, br_on_non_null,
+ref.as_non_null), typed tables/globals/locals/elem segments and the
+\(ref null $t) typeuses — decode (0x63/0x64, heap s33), validate
+\(lattice + definite init), interp, encode. NO classification arm
+for any of those: the honest pipeline runs.
+
+What STAYS out of scope (honest :unsupported): the GC VALUE families
+\(struct/array/i31 — br_on_cast, ref.cast, ref.eq, and their
+eqref/structref/arrayref/i31ref valtype spellings), rec groups,
+ref.test, any.convert_extern/extern.convert_any, annotations."
   (flet ((has (s) (and (search s text :test #'char-equal) t))
          (tok (s) (%token-present-p text s)))
     (cond
@@ -1021,33 +1035,23 @@ the classification is honest, never a silent pass."
      ((has "(@") :annotations)
      ((or (tok "v128") (tok "i8x16") (tok "i16x8") (tok "i32x4")
           (tok "i64x2") (tok "f32x4") (tok "f64x2")) :simd)
-     ;; tail calls return_call/return_call_indirect are IN the engine
-     ;; slice (Core 3.0 §6.2, interp trampoline); only the typed
-     ;; function-reference return_call_ref remains out of scope
-     ;; (call_ref family, classified with GC below).
-     ;; EH (Core 3.0) is IMPLEMENTED (tag section, try_table/throw/
-     ;; throw_ref validation + interp, exnref valtype, tag imports/
-     ;; exports): no classification arm — EH shapes run the honest
-     ;; pipeline. The GC arm below still catches typed-ref spellings.
+     ;; GC VALUE families + rec groups stay out of the slice. The
+     ;; typed-function-reference shapes ((ref $t), (ref null func),
+     ;; anyref, call_ref, br_on_null, ...) are IMPLEMENTED (loop 19)
+     ;; and intentionally NOT matched here anymore. eq/struct/array/
+     ;; i31 heap spellings remain GC scope (their value families are
+     ;; unimplemented); ref.eq/ref.test/ref.cast/br_on_cast and the
+     ;; any<->extern conversions likewise.
      ((or (has "(struct") (has "(array") (has "(i31")
-          (has "(rec") (tok "call_ref") (tok "return_call_ref")
-          (has "br_on_cast")
-          (has "ref.cast") (tok "anyref") (tok "eqref")
-          ;; typed references: (ref null $t) and non-null (ref $t)
-          (has "(ref null") (has "(ref func") (has "(ref extern")
-          (has "(ref i31") (has "(ref any") (has "(ref eq")
-          (has "(ref struct") (has "(ref array")
-          ;; typed references by index: (ref $t)/(ref null $t) and
-          ;; (ref 0)/(ref null 0) typeuses. Previously these crashed
-          ;; %valtype with a host TYPE-ERROR on the (:LIST ...) node
-          ;; (func.wast ::117, ref.wast, type-equivalence.wast,
-          ;; type-rec.wast harness-errors); classify honestly here,
-          ;; before parse.
-          (has "(ref $") (has "(ref null $")
-          (%ref-typeuse-index-p text)
+          (has "(rec")
+          (has "(ref eq") (has "(ref struct") (has "(ref array")
+          (has "(ref i31")
+          (has "br_on_cast") (has "ref.cast") (has "ref.test")
+          (has "ref.eq")
+          (tok "eqref") (tok "structref") (tok "arrayref")
+          (tok "i31ref")
+          (has "any.convert_extern") (has "extern.convert_any")
           (has "nonmatching (ref")) :gc)
-     ((or (has "br_on_null") (has "br_on_non_null")
-          (has "ref.as_non_null")) :typed-funcrefs)
      (t nil))))
 
 
@@ -1158,13 +1162,16 @@ module object is needed; signals a catchable wasmdown:decode-error."
       (%werr 0 "function and code section have inconsistent lengths: ~d vs ~d"
              func-count code-count))))
 (defun %binary-gc-table-p (bytes)
-  "Whether a binary payload's Table section uses a GC typed-reference
-element type (a reftype byte other than funcref/externref in
-table-type position — elem.wast's (table 1 (ref func) ...) fixtures).
-Only the FIRST table entry is inspected (entries are delimited by
-their limits, which the detector does not parse; every suite fixture
-declaring a GC table declares it first). Such modules are GC scope,
-classified :unsupported rather than decode-failed."
+  "Whether a binary payload's Table section uses a GC VALUE-family
+element type — the struct/array/i31/eq/any abstract heaps (0x6A/0x6B/
+0x6C/0x6D/0x6E) or a composite-type prefix in table-type position.
+Typed function references ARE decodable table element types now
+(loop 19: 0x64 (ref ht), 0x63 (ref null ht), 0x70/0x6f/0x69 legacy),
+so elem.wast's (table 1 (ref func) ...) fixtures decode and RUN; only
+the value-family bytes stay :unsupported. Only the FIRST table entry
+is inspected (entries are delimited by their limits, which the
+detector does not parse; every suite fixture declaring a GC table
+declares it first)."
   (when (< (length bytes) 8) (return-from %binary-gc-table-p nil))
   (handler-case
       (let ((r (wasmdown.binary:make-reader bytes))
@@ -1179,7 +1186,7 @@ classified :unsupported rather than decode-failed."
             (when (= id 4)
               (wasmdown.binary:read-u32 r)        ; entry count
               (unless (member (wasmdown.binary:read-byte-at r)
-                              '(#x70 #x6f))
+                              '(#x70 #x6f #x69 #x63 #x64))
                 (setf gc-p t)))
             (setf (wasmdown.binary:reader-offset r) end)
             (when gc-p (return))))
@@ -1187,16 +1194,16 @@ classified :unsupported rather than decode-failed."
     (error () nil)))
 
 (defun %binary-gc-valtype-p (bytes)
-  "Whether a binary payload's TYPE section carries a GC typed-reference
-valtype form (0x63/0x64 shorthand, or 0x6B/0x6C absolute-heap-type
-encodings) inside a functype's param/result vector — binary.wast
-::127's (func (param (ref null ...))) fixtures. This engine's decoder
-rejects those bytes at DECODE ('unknown type form'), but they are
-GC-scope features, not malformed-in-slice shapes: classify
-:unsupported BEFORE the decode pipeline runs. Every suite fixture is
-a single functype whose vectors are scanned linearly; the probe is
-best-effort (any malformed shape falls through to NIL and the normal
-decode reports the honest error)."
+  "Whether a binary payload's TYPE section carries a GC VALUE-family
+type form — the struct/array/composite heap bytes (0x6A array, 0x6B
+struct, 0x6C i31, 0x6D eq, plus the comptype prefixes 0x5E/0x5F and
+the rec/sub markers 0x4E/0x4F/0x50). The typed-function-reference
+bytes 0x63/0x64 are DECODABLE as of loop 19 (with their s33 heap
+typeuses) and no longer flag GC — binary.wast ::1241's (ref null
+0x8000_0000) decodes and fails 'unknown type' at VALIDATE (its
+assert_invalid phase), and elem.wast's typed-table fixtures decode
+and run. The scan stays best-effort: malformed shapes fall through
+to NIL and the honest decode reports the real error."
   (when (< (length bytes) 8) (return-from %binary-gc-valtype-p nil))
   (handler-case
       (let ((r (wasmdown.binary:make-reader bytes))
@@ -1212,13 +1219,16 @@ decode reports the honest error)."
                        (<= end (length bytes)))
               (let ((n (wasmdown.binary:read-u32 r)))
                 (declare (ignore n))
-                ;; scan the raw section bytes for GC valtype forms;
-                ;; 0x60 (functype) and the MVP/reftype forms are
-                ;; byte-identical to other sections' payload so the
-                ;; scan stays inside [offset, end).
+                ;; scan the raw section bytes for the GC value-family
+                ;; forms only; 0x60/0x63/0x64 and the MVP forms are
+                ;; decodable. NB 0x6E (any heap) and 0x69 (exn heap)
+                ;; are typed-funcrefs-scope and admitted; the
+                ;; byte-identical-to-other-payloads caveat keeps the
+                ;; scan inside [offset, end).
                 (loop while (< (wasmdown.binary:reader-offset r) end)
                       for b = (wasmdown.binary:read-byte-at r)
-                      when (member b '(#x63 #x64 #x6b #x6c))
+                      when (member b '(#x5e #x5f #x6a #x6b #x6c #x6d
+                                      #x4e #x4f #x50))
                         do (setf gc-p t))))
             (setf (wasmdown.binary:reader-offset r) end)
             (when gc-p (return))))

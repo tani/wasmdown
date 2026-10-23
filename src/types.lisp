@@ -45,7 +45,7 @@
 
 (defstruct wasm-global
   "A global definition from the globals section."
-  (type :i32 :type keyword)
+  (type :i32 :type (or keyword cons))
   (mutable nil :type boolean)
   (init nil :type (vector wasm-instr)))
 
@@ -70,12 +70,17 @@
 
 (defstruct (wasm-elem (:constructor make-wasm-elem (mode type inits &optional from-table-init)))
   "Element segment. MODE: (:active tableidx expr) | (:passive) | (:declarative).
-TYPE is the reference valtype; INITS is a list of expressions (vectors of instr).
-FROM-TABLE-INIT marks a segment desugared from a table field's inline
-initializer expr (the function-references extended syntax): per the
-reference its const exprs may only use IMPORTED globals (global.wast
-::120 expects 'unknown global' at VALIDATION for a defined-global
-global.get)."
+TYPE is the reference valtype, or the special marker :ELEMKIND-FUNC
+for the binary elemkind/text 'func' forms whose segment type the
+reference VALIDATOR treats as the target table's element type when
+active (elem.wast ::51: (elem (i32.const 0) func 0) into a
+\(ref func) table VALIDATES, while the explicit funcref spelling of
+the same segment is assert_invalid ::516). INITS is a list of
+expressions (vectors of instr). FROM-TABLE-INIT marks a segment
+desugared from a table field's inline initializer expr (the
+function-references extended syntax): per the reference its const
+exprs may only use IMPORTED globals (global.wast ::120 expects
+'unknown global' at VALIDATION for a defined-global global.get)."
   mode
   type
   inits
@@ -150,9 +155,11 @@ global.get)."
   (if (typed-ref-nullable-p t_) (third t_) (second t_)))
 
 (defun %heap-kind (heap types)
-  "The lattice bucket of HEAP in the type vector TYPES:
-:FUNC (function heap), :EXTERN, :EXN, :ANY, or :BOT (the null
-bottoms, which are below everything in their bucket only)."
+  "The lattice bucket of HEAP in the type vector TYPES: :FUNC
+\(function heap), :EXTERN, :EXN, or :ANY. The null bottoms map to
+their buckets (:nofunc→:func etc; :none→:ANY — none is the bottom of
+the whole ANY hierarchy, ref_null.wast's (global anyref
+\(ref.null none))) and relate downward via %HEAP-SUB-P's bottom arm."
   (declare (type (or keyword (cons (eql :type) (cons t null))) heap)
            (type (simple-vector) types))
   (etypecase heap
@@ -161,48 +168,82 @@ bottoms, which are below everything in their bucket only)."
                ((:extern :noextern) :extern)
                ((:exn :noexn) :exn)
                (:any :any)
-               (:none :bot)
+               (:none :any)
                (:eq :any)))
     (cons
      (let ((idx (second heap)))
        (cond ((not (and (integerp idx) (<= 0 idx) (< idx (length types))))
-              (error "unknown type ~a" idx))
+              ;; an out-of-range typeuse heap ('unknown type',
+              ;; ref.wast's assert_invalid batch): a CATCHABLE
+              ;; validation-error, never a raw Lisp error leaking
+              ;; through the wast harness as harness-error
+              ;; (func.wast ::113 regressed here when validate
+              ;; gained typed-ref lattice calls before its own
+              ;; check-valtype pass).
+              (error 'wasmdown:validation-error
+                     :message (format nil "unknown type ~a" idx)))
              (t :func))))))
 
+(defun %heap-sub-p (h1 h2 types)
+  "Heap subtyping in the rec-free slice (no declared subtyping): h1
+<: h2 iff
+  - h1 = h2 (nominal equality — typeuse vs typeuse by INDEX), OR
+  - h1 is a typeuse and h2 is the bucket's abstract top keyword
+    (:func/:extern/:exn) — every typeuse is below its bucket top, OR
+  - h1 is a bucket's null bottom (:nofunc/:noextern/:noexn — and
+    :none, the ANY hierarchy's bottom: (:ref null :none) <:
+    (:ref null :any), ref_null.wast module 1's (global anyref
+    (ref.null none))) and h2 is anything in the same bucket (typeuse
+    or top).
+Cross-typeuse (:TYPE N) <: (:TYPE M), N≠M, is NOT a subtype
+(return_call_ref $t with a (ref $u) operand, $u≠$t nominal: the
+sibling's repro pin — assert_invalid 'type mismatch')."
+  (declare (type (or keyword (cons (eql :type) (cons t null))) h1 h2)
+           (type (simple-vector) types))
+  (labels ((kind (h) (%heap-kind h types)))
+    (cond
+     ((equal h1 h2) t)
+     ;; typeuse <: abstract top of its bucket
+     ((and (consp h1) (keywordp h2)
+           (member h2 '(:func :extern :exn))
+           (eq (kind h1) (kind h2)))
+      t)
+     ;; null bottom <: anything in its bucket
+     ((and (keywordp h1)
+           (member h1 '(:nofunc :noextern :noexn :none))
+           (eq (kind h1) (kind h2)))
+      t)
+     (t nil))))
+
+(defun %expand-reftype (t_)
+  "The canonical (REF NULL? HEAP) form of a reftype: legacy keywords
+expand to their bucket-tops (:funcref = (ref null func) etc.), typed
+refs pass through. Values of either spelling compare uniformly."
+  (etypecase t_
+    (keyword
+     (list :ref 'null
+           (ecase t_
+             (:funcref :func) (:externref :extern) (:exnref :exn))))
+    (cons t_)))
+
 (defun reftype-sub-p (sub super types)
-  "Whether reftype SUB is a subtype of SUPER in the type vector
-TYPES (Core 3.0 function-references lattice, rec-free slice):
-legacy keywords and typed refs mix; null <: nullable-everything-in-
-bucket; (:TYPE N) <: :FUNC (every typeuse is a function heap type in
-this slice). Equality is a subtype of itself."
-  (labels ((bucket (t_)
-             (etypecase t_
-               (keyword (ecase t_
-                          (:funcref :func) (:externref :extern) (:exnref :exn)))
-               (cons (%heap-kind (typed-ref-heap t_) types)))))
-    (let ((s sub) (u super))
-      (cond
-       ((equal s u) t)
-       ;; typed <: typed-nullable of the same bucket
-       ((and (consp s) (typed-ref-p s)
-             (consp u) (typed-ref-nullable-p u)
-             (eq (bucket s) (bucket u)))
-        t)
-       ;; legacy keyword <: typed-nullable of the same bucket:
-       ;; funcref <: (:ref null func)
-       ((and (keywordp s)
-             (consp u) (typed-ref-nullable-p u)
-             (eq (bucket s) (bucket u)))
-        t)
-       ;; typed non-null <: legacy keyword: (:ref func) <: funcref
-       ((and (consp s) (typed-ref-p s) (not (typed-ref-nullable-p s))
-             (keywordp u)
-             (eq (bucket s) (bucket u))
-             (eq (typed-ref-heap s)
-                 (ecase u (:funcref :func) (:externref :extern)
-                        (:exnref :exn))))
-        t)
-       (t nil)))))
+  "Whether reftype SUB is a subtype of SUPER in the type vector TYPES
+(Core 3.0 function-references lattice, rec-free slice). Both sides
+expand to canonical (REF NULL? HEAP) form (a legacy keyword IS its
+bucket's nullable top), then: equality, or NULLABILITY ONLY WIDENS
+\(nullable <: nullable and non-null <: nullable pass; nullable <:
+non-null fails) AND the heaps relate by %HEAP-SUB-P. This admits
+(ref $t) <: funcref, (ref null $t) <: funcref, funcref <:
+(ref null func), (ref null nofunc) <: (ref null $t); rejects
+(ref (:type 1)) <: (ref null (:type 0)) — nominal typeuses compare
+by equality only."
+  (let ((s (%expand-reftype sub))
+        (u (%expand-reftype super)))
+    (or (equal s u)
+        (and (or (not (typed-ref-nullable-p s))
+                 (typed-ref-nullable-p u))
+             (%heap-sub-p (typed-ref-heap s) (typed-ref-heap u)
+                          types)))))
 
 (defun defaultable-valtype-p (t_)
   "Whether the default value exists for the type in this slice.

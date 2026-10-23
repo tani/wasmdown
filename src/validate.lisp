@@ -48,7 +48,45 @@ the types contract exports wasm-limits-has-max-p)."
   (member t_ '(:i32 :i64 :f32 :f64)))
 
 (defun reftype-p (t_)
-  (member t_ '(:funcref :externref :exnref)))
+  "A reference type: the legacy keywords or the typed-ref lattice
+shapes (:REF NULL? HEAP) of wasmdown.types (typed-ref-p). Pure SHAPE
+check — a (:TYPE N) heap's index range is checked separately at
+check-valtype ('unknown type', ref.wast's assert_invalid batch)."
+  (or (member t_ '(:funcref :externref :exnref))
+      (and (consp t_) (wasmdown.types:typed-ref-p t_))))
+
+(defun valid-heaptype-p (heap types)
+  "Whether HEAP is well-formed against a type vector: an abstract
+keyword, or (:TYPE N) with N in range ('unknown type', ref.wast)."
+  (etypecase heap
+    (keyword t)
+    (cons (and (integerp (second heap))
+               (>= (second heap) 0)
+               (< (second heap) (length types))))))
+
+(defun check-valtype (t_ types what)
+  "Validate valtype T_ against the type vector TYPES, signaling
+'unknown type' for an out-of-range (:TYPE N) heap (ref.wast's full
+assert_invalid batch: params, results, locals, globals, tables,
+elems, blocktype results)."
+  (unless (and (reftype-p t_) (valid-heaptype-p
+                               (wasmdown.types:typed-ref-heap t_) types))
+    (verr "~a: unknown type ~a" what
+          (if (consp t_)
+              (second (wasmdown.types:typed-ref-heap t_))
+              t_)))
+  t_)
+
+(defun check-valtype-list (types what &rest lists)
+  "Every valtype in LISTS (flattened) must be well-formed: shape
+\(valtype-p) AND, for typed refs, an in-range (:TYPE N) heap
+\('unknown type', ref.wast's local/blocktype/select positions)."
+  (dolist (lst lists)
+    (dolist (t_ lst)
+      (unless (valtype-p t_)
+        (verr "~a: invalid value type ~a" what t_))
+      (when (and (reftype-p t_) (consp t_))
+        (check-valtype t_ types what)))))
 
 (defun valtype-p (t_)
   (or (numtype-p t_) (reftype-p t_)))
@@ -59,10 +97,15 @@ the types contract exports wasm-limits-has-max-p)."
   nil)
 
 (defun valid-blocktype-params-results (module bt)
-  "Resolve a blocktype to (params results) lists, or signal."
+  "Resolve a blocktype to (params results) lists, or signal. A
+typed-ref valtype blocktype's (:TYPE N) heap must resolve ('unknown
+type', ref.wast's block/loop/if batch)."
   (cond
     ((null bt) (values nil nil))
-    ((valtype-p bt) (values nil (list bt)))
+    ((valtype-p bt)
+     (when (and (reftype-p bt) (consp bt))
+       (check-valtype bt (wasm-module-types module) "blocktype"))
+     (values nil (list bt)))
     ((and (consp bt) (eq (car bt) :typeidx))
      (let ((ft (func-type-at module (cdr bt) "blocktype")))
        (values (wasm-func-type-params ft) (wasm-func-type-results ft))))
@@ -273,10 +316,23 @@ exclusive upper bound of global indices referenceable via global.get
                  ((eq op :f64.const) (push1 :f64))
                  ((eq op :ref.null)
                   (let ((ht (getf imms :type)))
-                    (unless (reftype-p ht)
-                      (verr "~a: ref.null of invalid heap type ~a"
-                            what ht))
-                    (push1 ht)))
+                    (cond
+                     ;; legacy shorthand keywords: push as-is
+                     ((member ht '(:funcref :externref :exnref))
+                      (push1 ht))
+                     ;; typed heap: (:type N) or abstract keyword —
+                     ;; ref.null pushes the NULLABLE typed ref
+                     ((or (keywordp ht) (consp ht))
+                      (let ((types (wasm-module-types
+                                    (vctx-module ctx))))
+                        (let ((v (list :ref 'null ht)))
+                          (unless (and (reftype-p v)
+                                       (valid-heaptype-p ht types))
+                            (verr "~a: ref.null of invalid heap type ~a"
+                                  what ht))
+                          (push1 v))))
+                     (t (verr "~a: ref.null of invalid heap type ~a"
+                              what ht)))))
                  ((eq op :ref.func)
                   (let ((x (getf imms :func))
                         (nf (length (vctx-func-typeidxs ctx))))
@@ -286,7 +342,14 @@ exclusive upper bound of global indices referenceable via global.get
                     (unless (gethash x (vctx-declared-refs ctx))
                       (verr "~a: ref.func ~a is not declared by an element segment or export"
                             what x))
-                    (push1 :funcref)))
+                    ;; spec: ref.func's type is [t1*] -> [(ref $t)]
+                    ;; where $t is the function's OWN typeuse — the
+                    ;; minimal type (call_ref.wast: local.set into a
+                    ;; (ref $ii) local needs exactly this).
+                    (push1 (list :ref
+                                 (list :type
+                                       (svref (vctx-func-typeidxs ctx)
+                                              x))))))
                 ((eq op :global.get)
                  (let* ((x (getf imms :global))
                         (g (and (integerp x) (>= x 0)
@@ -335,7 +398,12 @@ exclusive upper bound of global indices referenceable via global.get
   start-types
   end-types
   val-height
-  unreachable)
+  unreachable
+  ;; definite-init snapshot at frame entry (local_init.wast): the
+  ;; frame's end RESTORES it — a set inside a block/if is not proven
+  ;; after the join (a br may skip it); the :func frame holds NIL
+  ;; (nothing to restore).
+  (inits-snapshot nil))
 
 (defstruct fv
   "Function-validation state."
@@ -343,6 +411,10 @@ exclusive upper bound of global indices referenceable via global.get
   locals                       ; vector of valtypes
   vals                         ; list-as-stack of valtypes (top = car)
   ctrls                        ; list-as-stack of ctrl-frame (top = car)
+  ;; definite initialization (local_init.wast): bit vector marking
+  ;; locals PROVEN initialized on every path; only non-defaultable
+  ;; locals (wasmdown.types:defaultable-valtype-p NIL) matter.
+  (inits nil :type (or null (vector bit)))
   (offset 0))
 
 (declaim (inline %cur-frame))
@@ -362,19 +434,54 @@ exclusive upper bound of global indices referenceable via global.get
         (pop (fv-vals fv)))))
 
 (defun %pop-val-expect (fv expect)
+  "Pop one operand and require it <: EXPECT (spec: operand subtyping
+at every pop site — reftype-sub-p for reference types, EQUAL for the
+rest; :bot (stack-polymorphic bottom) always passes)."
   (let ((actual (%pop-val fv)))
-    (unless (or (eq actual :bot) (equal actual expect))
+    (unless (or (eq actual :bot)
+                (equal actual expect)
+                (and (reftype-p actual) (reftype-p expect)
+                     (wasmdown.types:reftype-sub-p
+                      actual expect
+                      (wasm-module-types (vctx-module (fv-ctx fv))))))
       (verr "type mismatch at offset ~a: expected ~a, got ~a"
             (fv-offset fv) expect actual))
     actual))
 
 (defun %pop-ref (fv)
-  "Pop any reference type (:bot passes as :funcref placeholder)."
+  "Pop any reference type; the polymorphic :bot (post-unreachable)
+passes through unchanged — every client normalizes it (the typed
+arms via %non-null-view's :bot passthrough; %pop-val-expect's
+wildcard). The old :funcref placeholder predates the typed lattice
+and poisoned unreachable-stack ref operands (br_on_non_null.wast's
+  'unreachable' export: (br_on_non_null $l (unreachable)) computed
+  (:ref :func) where the label wanted (:ref (:type 0)))."
   (let ((actual (%pop-val fv)))
-    (cond ((eq actual :bot) :funcref)
+    (cond ((eq actual :bot) :bot)
           ((reftype-p actual) actual)
           (t (verr "type mismatch at offset ~a: expected a reference type, got ~a"
                     (fv-offset fv) actual)))))
+
+(defun %non-null-view (r what)
+  "The NON-NULL view of a reference type R for ref.as_non_null /
+br_on_null / br_on_non_null: a typed ref keeps its heap (nullable
+loses the null); a legacy keyword is its nullable spelling, so the
+view is (:ref :func)/(:ref :extern)/(:ref :exn). The polymorphic
+BOTTOM (post-unreachable operand) passes through unchanged — bottom's
+non-null view is still bottom, satisfying any label (br_on_non_null.
+wast's 'unreachable' export: (br_on_non_null $l (unreachable))).
+Signals a validation error for non-reference operands (WHAT names
+the op)."
+  (cond
+   ((eq r :bot) :bot)
+   ((and (consp r) (wasmdown.types:typed-ref-p r))
+    (if (wasmdown.types:typed-ref-nullable-p r)
+        (list :ref (wasmdown.types:typed-ref-heap r))
+        r))
+   ((keywordp r)
+    (list :ref (ecase r (:funcref :func) (:externref :extern)
+                      (:exnref :exn))))
+   (t (verr "~a: operand ~a is not a reference" what r))))
 
 (defun %push-vals (fv types)
   (dolist (t_ types) (%push-val fv t_)))
@@ -388,7 +495,13 @@ exclusive upper bound of global indices referenceable via global.get
   (push (make-ctrl-frame :opcode opcode
                          :start-types in :end-types out
                          :val-height (length (fv-vals fv))
-                         :unreachable nil)
+                         :unreachable nil
+                         ;; definite-init snapshot at entry
+                         ;; (local_init.wast): restored at the
+                         ;; frame's end — a set inside a block is
+                         ;; not proven after the join.
+                         :inits-snapshot (and (fv-inits fv)
+                                              (copy-seq (fv-inits fv))))
         (fv-ctrls fv))
   (when seed-stack (%push-vals fv in)))
 
@@ -401,6 +514,10 @@ exclusive upper bound of global indices referenceable via global.get
       (verr "values remaining on stack at end of block (offset ~a): ~s extra"
             (fv-offset fv)
             (- (length (fv-vals fv)) (ctrl-frame-val-height frame))))
+    ;; restore the entry's definite-init state (the join is as
+    ;; conservative as the entry: branches may skip any inner set).
+    (when (and (ctrl-frame-inits-snapshot frame) (fv-inits fv))
+      (replace (fv-inits fv) (ctrl-frame-inits-snapshot frame)))
     (pop (fv-ctrls fv))
     frame))
 
@@ -439,6 +556,18 @@ payload values, plus an exnref for the _ref clauses)."
   (and (= (length a) (length b))
        (every (lambda (x y) (or (eq x :bot) (eq y :bot) (equal x y)))
               a b)))
+
+(defun %results-sub-p (callee caller types)
+  "Per-element result subtyping for tail calls: each callee result
+must be <: the caller's declared slot — numeric types EQUAL,
+reference types via reftype-sub-p (return_call.wast's result
+subtyping: ((ref null $t)) <: (funcref))."
+  (and (= (length callee) (length caller))
+       (every (lambda (x y)
+                (or (equal x y)
+                    (and (reftype-p x) (reftype-p y)
+                         (wasmdown.types:reftype-sub-p x y types))))
+              callee caller)))
 
 ;;; ---------------------------------------------------------------
 ;;; Static type signatures (params -> results) for every simple opcode
@@ -585,6 +714,24 @@ align.wast 'offset out of range' with offset=2^32 and above)."
             localidx (length locals)))
     (svref locals localidx)))
 
+(defun %init-all-defaultable-p (locals)
+  "Whether every local is defaultable (numeric or nullable ref): no
+definite-init tracking is needed at all (the historical fast path —
+the 286-test suite's modules never construct the INITS vector)."
+  (loop for t_ across locals
+        always (wasmdown.types:defaultable-valtype-p t_)))
+
+(defun %local-initialized-p (fv localidx)
+  (let ((v (fv-inits fv)))
+    (or (not v)
+        (plusp (aref v localidx)))))
+
+(defun %mark-local-initialized (fv localidx)
+  "local.set/tee of LOCALIDX: the local becomes definitely
+initialized from this point (union/monotone — set bits never clear)."
+  (let ((v (fv-inits fv)))
+    (when v (setf (aref v localidx) 1))))
+
 (defun %global-type (fv globalidx what)
   (first (vctx-global-at (fv-ctx fv) globalidx what)))
 
@@ -707,14 +854,19 @@ bodies of their :end terminator; bodies of :if carry no :else/:end)."
            (%push-vals fv (wasm-func-type-results ft))))
         ;; --- tail calls (Core 3.0 §6.2) ---
         ;; Like call/call-indirect, plus the callee's RESULT types
-        ;; must match the enclosing function's declared results
-        ;; (return_call semantics: the callee's return IS this
-        ;; function's return). No subtyping in this slice: EQUAL.
+        ;; must match the enclosing function's declared results.
+        ;; Result matching is PER-ELEMENT subtyping: numeric types
+        ;; EQUAL, reference types via reftype-sub-p callee <: caller
+        ;; (return_call.wast ::96-98: callee results ((ref null $t))
+        ;; <: caller results (funcref) — $t is a function typeuse so
+        ;; its nullable ref is below funcref = (ref null func)).
         ((eq op :return-call)
          (let* ((ft (vctx-func-type (fv-ctx fv) (imm :func) "return_call"))
                 (results (ctrl-frame-end-types
                           (car (last (fv-ctrls fv))))))
-           (unless (equal (wasm-func-type-results ft) results)
+           (unless (%results-sub-p (wasm-func-type-results ft) results
+                                    (wasm-module-types
+                                     (vctx-module (fv-ctx fv))))
              (verr "type mismatch: return_call result types ~a do not match function results ~a"
                    (wasm-func-type-results ft) results))
            (%pop-vals fv (wasm-func-type-params ft))
@@ -726,10 +878,19 @@ bodies of their :end terminator; bodies of :if carry no :else/:end)."
                                   "return_call_indirect type"))
                 (results (ctrl-frame-end-types
                           (car (last (fv-ctrls fv))))))
-           (unless (eq (wasm-table-type table) :funcref)
+           ;; the table's element type must admit function references:
+           ;; legacy :funcref, or a typed-funcref reftype BELOW funcref
+           ;; ((ref null $t) tables — the subtype direction is
+           ;; table-type <: funcref, never the reverse).
+           (unless (and (reftype-p (wasm-table-type table))
+                        (wasmdown.types:reftype-sub-p
+                         (wasm-table-type table) :funcref
+                         (wasm-module-types (vctx-module (fv-ctx fv)))))
              (verr "return_call_indirect: table ~a must have type funcref, got ~a"
                    (imm :table) (wasm-table-type table)))
-           (unless (equal (wasm-func-type-results ft) results)
+           (unless (%results-sub-p (wasm-func-type-results ft) results
+                                    (wasm-module-types
+                                     (vctx-module (fv-ctx fv))))
              (verr "type mismatch: return_call_indirect result types ~a do not match function results ~a"
                    (wasm-func-type-results ft) results))
            (%pop-val-expect fv :i32)
@@ -808,6 +969,11 @@ bodies of their :end terminator; bodies of :if carry no :else/:end)."
                   (let ((t_ (elt types 0)))
                     (unless (valtype-p t_)
                       (verr "select: invalid value type ~a" t_))
+                    ;; typed-ref heaps must resolve ('unknown type',
+                    ;; ref.wast's select case)
+                    (when (and (reftype-p t_) (consp t_))
+                      (check-valtype t_ (wasm-module-types module)
+                                     "select"))
                     (%pop-val-expect fv :i32)
                     (%pop-val-expect fv t_)
                     (%pop-val-expect fv t_)
@@ -826,12 +992,24 @@ bodies of their :end terminator; bodies of :if carry no :else/:end)."
                                    t1 t2))))))))
         ;; --- variable ---
         ((eq op :local.get)
-         (%push-val fv (%local-type fv (imm :local))))
+         (let ((x (imm :local)))
+           ;; definite initialization (local_init.wast): a
+           ;; non-defaultable local must be proven set on every path
+           ;; before get ('uninitialized local' assert_invalid).
+           (let ((t_ (%local-type fv x)))
+             (unless (or (wasmdown.types:defaultable-valtype-p t_)
+                         (%local-initialized-p fv x))
+               (verr "uninitialized local ~a" x))
+             (%push-val fv t_))))
         ((eq op :local.set)
-         (%pop-val-expect fv (%local-type fv (imm :local))))
+         (let ((x (imm :local)))
+           (%pop-val-expect fv (%local-type fv x))
+           (%mark-local-initialized fv x)))
         ((eq op :local.tee)
-         (let ((t_ (%local-type fv (imm :local))))
+         (let* ((x (imm :local))
+                (t_ (%local-type fv x)))
            (%pop-val-expect fv t_)
+           (%mark-local-initialized fv x)
            (%push-val fv t_)))
         ((eq op :global.get)
          (%push-val fv (%global-type fv (imm :global) "global.get")))
@@ -878,7 +1056,14 @@ bodies of their :end terminator; bodies of :if carry no :else/:end)."
                                       "table.init"))
                 (ert (vctx-elem-type-at (fv-ctx fv) (imm :elem)
                                         "table.init")))
-           (unless (eq ert (wasm-table-type table))
+           ;; the ELEMKIND form's segment type is the target table's
+           ;; element type (check-elems' rule; table.init consumes it)
+           (when (eq ert :elemkind-func)
+             (setf ert (wasm-table-type table)))
+           (unless (or (eq ert (wasm-table-type table))
+                       (wasmdown.types:reftype-sub-p
+                        ert (wasm-table-type table)
+                        (wasm-module-types module)))
              (verr "table.init: element type ~a does not match table type ~a"
                    ert (wasm-table-type table)))
            (%pop-val-expect fv :i32)
@@ -917,10 +1102,20 @@ bodies of their :end terminator; bodies of :if carry no :else/:end)."
                  (imm :data) (vctx-data-count (fv-ctx fv)))))
         ;; --- reference ---
         ((eq op :ref.null)
-         (let ((ht (imm :type)))
-           (unless (reftype-p ht)
-             (verr "ref.null: invalid heap type ~a" ht))
-           (%push-val fv ht)))
+         (let ((ht (imm :type))
+               (types (wasm-module-types module)))
+           (cond
+            ((member ht '(:funcref :externref :exnref))
+             (%push-val fv ht))
+            ;; typed heap: (:type N) or abstract keyword; the result
+            ;; is the NULLABLE typed ref (:ref null ht)
+            ((or (keywordp ht) (consp ht))
+             (let ((v (list :ref 'null ht)))
+               (unless (and (reftype-p v)
+                            (valid-heaptype-p ht types))
+                 (verr "ref.null: invalid heap type ~a" ht))
+               (%push-val fv v)))
+            (t (verr "ref.null: invalid heap type ~a" ht)))))
         ((eq op :ref.is-null)
          (%pop-ref fv)
          (%push-val fv :i32))
@@ -930,7 +1125,93 @@ bodies of their :end terminator; bodies of :if carry no :else/:end)."
            (unless (gethash x (vctx-declared-refs (fv-ctx fv)))
              (verr "ref.func: function ~a is not declared by an element segment or export"
                    x))
-           (%push-val fv :funcref)))
+           ;; spec: [t1*] -> [(ref $t)] with $t the function's own
+           ;; typeuse — the minimal type (call_ref.wast's local.set
+           ;; into (ref $ii) locals validates via reftype-sub-p).
+           (let ((typeidx (svref (vctx-func-typeidxs (fv-ctx fv)) x)))
+             (%push-val fv (list :ref (list :type typeidx))))))
+        ;; --- typed function references (Core 3.0) ---
+        ((eq op :ref.as-non-null)
+         ;; [(ref null ht)] -> [(ref ht)]: legacy keywords are their
+         ;; nullable spellings (funcref = (ref null func)), so the
+         ;; non-null view of a funcref/externref/exnref operand is
+         ;; (:ref :func)/(:ref :extern)/(:ref :exn).
+         (%push-val fv (%non-null-view (%pop-ref fv) "ref.as_non_null")))
+        ((eq op :br-on-null)
+         ;; br_on_null l : [t* (ref null ht)] -> [t* (ref ht)]
+         ;; fallthrough; the branch label l carries just [t*]
+         ;; (br_on_null.wast ::4-9; a funcref operand is legal —
+         ;; ::88). gc#516: the label check runs through the full
+         ;; pop/push cycle AND pushes back the DECLARED label types
+         ;; — the reference's label join re-types the prefix to the
+         ;; label's declared [t*] (a (ref null $t) prefix slot that
+         ;; the label declares funcref comes back as funcref, and
+         ;; the downstream call's (ref null $t) expectation fails:
+         ;; ::81-90's assert_invalid 'type mismatch').
+         (let* ((frame (%ctrl-label fv (imm :label) "br_on_null"))
+                (r (%pop-ref fv))
+                (label-types (%label-types frame)))
+           (%pop-vals fv label-types)
+           (%push-vals fv label-types)
+           (%push-val fv (%non-null-view r "br_on_null"))))
+        ((eq op :br-on-non-null)
+         ;; br_on_non_null l : [t* (ref null ht)] -> [t*] fallthrough
+         ;; (the null case); the branch label l carries [t* (ref ht)]
+         ;; — the label's LAST slot is satisfied by the operand's
+         ;; non-null view (br_on_non_null.wast ::57-61). gc#516: the
+         ;; label check runs the full pop/push cycle pushing the
+         ;; DECLARED label types back (same join rule as br_on_null:
+         ;; ::91-103's assert_invalid).
+         (let* ((frame (%ctrl-label fv (imm :label) "br_on_non_null"))
+                (r (%pop-ref fv))
+                (nn (%non-null-view r "br_on_non_null"))
+                (label-types (%label-types frame)))
+           ;; arity sanity: the label must have at least the ref slot
+           (unless (and (consp label-types) (plusp (length label-types)))
+             (verr "br_on_non_null: label ~a carries no reference slot"
+                   (imm :label)))
+           (%push-val fv nn)
+           (%pop-vals fv label-types)
+           (%push-vals fv label-types)
+           ;; fallthrough [t*]: the ref is consumed by the branch
+           (%pop-val fv)))
+        ((eq op :call-ref)
+         ;; [t1* (ref null? $t)] -> [t2*] where the typeuse $t is
+         ;; [t1*] -> [t2*]. The ref operand must be <: (ref null $t)
+         ;; — a bare :funcref is REJECTED (call_ref.wast ::210-217:
+         ;; funcref is not a subtype of the typeuse's ref).
+         (let* ((ft (func-type-at module (imm :type) "call_ref type"))
+                (params (wasm-func-type-params ft))
+                (results (wasm-func-type-results ft))
+                (want (list :ref 'null (list :type (imm :type)))))
+           (%pop-val-expect fv want)
+           (%pop-vals fv params)
+           (%push-vals fv results)))
+        ((eq op :return-call-ref)
+         ;; call_ref's typing plus the tail-call rule: the callee's
+         ;; results must be SUBTYPES of the caller's declared results
+         ;; (return_call_ref.wast ::220-228's mixed nullable/non-null
+         ;; lattice batch), then unreachable (mirrors :return-call).
+         (let* ((ft (func-type-at module (imm :type)
+                                   "return_call_ref type"))
+                (params (wasm-func-type-params ft))
+                (results (wasm-func-type-results ft))
+                (want (list :ref 'null (list :type (imm :type))))
+                (types (wasm-module-types module))
+                (caller-results (ctrl-frame-end-types
+                                 (car (last (fv-ctrls fv))))))
+           (unless (and (= (length results) (length caller-results))
+                        (every (lambda (r cr)
+                                 (or (equal r cr)
+                                     (and (reftype-p r) (reftype-p cr)
+                                          (wasmdown.types:reftype-sub-p
+                                           r cr types))))
+                               results caller-results))
+             (verr "type mismatch: return_call_ref result types ~a do not match function results ~a"
+                   results caller-results))
+           (%pop-val-expect fv want)
+           (%pop-vals fv params)
+           (%unreachable fv)))
         ;; --- consts ---
         ((eq op :i32.const) (%push-val fv :i32))
         ((eq op :i64.const) (%push-val fv :i64))
@@ -973,7 +1254,21 @@ expanded. Also validates local valtypes."
 (defun validate-function-body (ctx body locals params results &key (what "function"))
   "Run the operand/control-stack algorithm over BODY (vector of
 wasm-instr including the trailing :end)."
-  (let ((fv (make-fv :ctx ctx :locals locals :vals nil :ctrls nil)))
+  (let ((fv (make-fv :ctx ctx :locals locals :vals nil :ctrls nil
+                     ;; definite initialization: track set-bits only
+                     ;; when some local is non-defaultable (nil inits
+                     ;; = every local assumed initialized, the
+                     ;; historical fast path).
+                     :inits (unless (%init-all-defaultable-p locals)
+                              (let ((v (make-array (length locals)
+                                                   :element-type 'bit
+                                                   :initial-element 0)))
+                                ;; params arrive with arguments: always
+                                ;; initialized (local_init.wast's param
+                                ;; carriers must validate).
+                                (loop for i below (length params)
+                                      do (setf (aref v i) 1))
+                                v)))))
     (%push-ctrl fv :func params results :seed-stack nil)
     (loop for instr across body
           for op = (wasm-instr-op instr)
@@ -1016,12 +1311,23 @@ wasmdown:validation-error."
   t)
 
 (defun check-types-section (module)
-  (loop for ft across (wasm-module-types module)
-        for i from 0
-        do (loop for t_ in (append (wasm-func-type-params ft)
-                                   (wasm-func-type-results ft))
-                 unless (valtype-p t_)
-                   do (verr "type ~a: invalid value type ~a" i t_))))
+  (let ((types (wasm-module-types module)))
+    (loop for ft across types
+          for i from 0
+          do (loop for t_ in (append (wasm-func-type-params ft)
+                                     (wasm-func-type-results ft))
+                   unless (valtype-p t_)
+                     do (verr "type ~a: invalid value type ~a" i t_)
+                   ;; typed-ref (:TYPE N) heaps must resolve
+                   ;; ('unknown type', ref.wast ::27-62 batch)
+                   when (and (reftype-p t_)
+                             (consp t_)
+                             (not (valid-heaptype-p
+                                   (wasmdown.types:typed-ref-heap t_)
+                                   types)))
+                     do (verr "type ~a: unknown type ~a" i
+                              (second
+                               (wasmdown.types:typed-ref-heap t_)))))))
 
 (defun check-imports (module)
   (loop for imp across (wasm-module-imports module)
@@ -1071,13 +1377,19 @@ surface here as 'unknown type' (the vctx slot holds NIL for them)."
              (verr "tag ~a: tag type must be empty" i)))))
 
 (defun check-tables-and-mems (ctx)
-  (let ((module (vctx-module ctx)))
+  (let ((module (vctx-module ctx))
+        (types (wasm-module-types (vctx-module ctx))))
     (loop for table across (wasm-module-tables module)
           for i from 0
           do (progn
                (unless (reftype-p (wasm-table-type table))
                  (verr "table ~a: invalid element type ~a"
                        i (wasm-table-type table)))
+               ;; typed-ref heaps must resolve ('unknown type',
+               ;; ref.wast's table case)
+               (when (consp (wasm-table-type table))
+                 (check-valtype (wasm-table-type table) types
+                                (format nil "table ~a" i)))
                (check-limits (wasm-table-limits table)
                              (format nil "table ~a" i)
                              *max-table-size*)))
@@ -1088,29 +1400,68 @@ surface here as 'unknown type' (the vctx slot holds NIL for them)."
 
 (defun check-globals (ctx)
   "Globals are validated sequentially: each init may reference only
-imported or previously-defined globals (spec note on const exprs)."
+imported or previously-defined globals (spec note on const exprs).
+The init's type must be a SUBTYPE of the declared type
+(wasmdown.types:reftype-sub-p — ref_null.wast's (global (ref null $t)
+\(ref.null nofunc)) and funcref globals)."
   (let ((module (vctx-module ctx))
-        (nimported (vctx-imported-global-count ctx)))
+        (nimported (vctx-imported-global-count ctx))
+        (types (wasm-module-types (vctx-module ctx))))
     (loop for g across (wasm-module-globals module)
           for i from 0
           for limit = (+ nimported i)     ; exclusive bound
-          do (let ((type (const-expr-type ctx (wasm-global-init g)
-                                          :global-limit limit
-                                          :what (format nil
-                                                        "global ~a init" i))))
-               (unless (equal type (wasm-global-type g))
-                 (verr "global ~a: init expression type ~a does not match declared type ~a"
-                       i type (wasm-global-type g)))))))
+          do (progn
+               (when (consp (wasm-global-type g))
+                 (check-valtype (wasm-global-type g) types
+                                (format nil "global ~a" i)))
+               (let ((type (const-expr-type ctx (wasm-global-init g)
+                                               :global-limit limit
+                                               :what (format nil
+                                                             "global ~a init"
+                                                             i))))
+                 (unless (or (equal type (wasm-global-type g))
+                             (and (reftype-p type)
+                                  (reftype-p (wasm-global-type g))
+                                  (wasmdown.types:reftype-sub-p
+                                   type (wasm-global-type g) types)))
+                   (verr "global ~a: init expression type ~a does not match declared type ~a"
+                         i type (wasm-global-type g))))))))
 
 (defun check-elems (ctx)
-  (let ((module (vctx-module ctx)))
+  "Element segments: item init types must be SUBTYPES of the segment
+type (reftype-sub-p), and an ACTIVE segment's type a subtype of its
+table's type (spec: elem type <: table type; elem.wast ::516-536's
+\(elem (i32.const 0) funcref (ref.func 0)) into a (ref func) table is
+REJECTED — funcref (nullable) is not <: (ref func))."
+  (let ((module (vctx-module ctx))
+        (types (wasm-module-types (vctx-module ctx))))
     (loop for elem across (wasm-module-elems module)
           for i from 0
           do (let ((mode (wasm-elem-mode elem))
                    (etype (wasm-elem-type elem)))
+               ;; the ELEMKIND form ('func' / bare funcidx lists): the
+               ;; segment type is the TARGET TABLE's element type when
+               ;; active (elem.wast ::51's (elem (i32.const 0) func 0)
+               ;; into a (ref func) table VALIDATES; the explicit
+               ;; funcref spelling of the same shape is assert_invalid
+               ;; ::516). Items carry their own minimal types and are
+               ;; checked against the table's type directly.
+               (when (eq etype :elemkind-func)
+                 (let ((table-type
+                         (if (and (consp mode) (eq (first mode) :active))
+                             (wasm-table-type
+                              (vctx-table-at ctx (second mode)
+                                             (format nil
+                                                     "element segment ~a"
+                                                     i)))
+                             :funcref)))
+                   (setf etype table-type)))
                (unless (reftype-p etype)
                  (verr "element segment ~a: invalid element type ~a"
                        i etype))
+               (when (consp etype)
+                 (check-valtype etype types
+                                (format nil "element segment ~a" i)))
                (loop for expr in (wasm-elem-inits elem)
                      for j from 0
                      do (let ((type (const-expr-type
@@ -1128,7 +1479,10 @@ imported or previously-defined globals (spec note on const exprs)."
                                      :what (format nil
                                                    "element segment ~a item ~a"
                                                    i j))))
-                          (unless (equal type etype)
+                          (unless (or (equal type etype)
+                                      (and (reftype-p type)
+                                           (wasmdown.types:reftype-sub-p
+                                            type etype types)))
                             (verr "element segment ~a item ~a: type ~a does not match segment type ~a"
                                   i j type etype))))
                (when (and (consp mode) (eq (first mode) :active))
@@ -1138,7 +1492,9 @@ imported or previously-defined globals (spec note on const exprs)."
                                                (format nil
                                                        "element segment ~a"
                                                        i))))
-                     (unless (eq etype (wasm-table-type table))
+                     (unless (or (eq etype (wasm-table-type table))
+                                 (wasmdown.types:reftype-sub-p
+                                  etype (wasm-table-type table) types))
                        (verr "element segment ~a: type ~a does not match table ~a type ~a"
                              i etype tableidx (wasm-table-type table))))
                    (let ((type (const-expr-type
@@ -1249,6 +1605,13 @@ imported or previously-defined globals (spec note on const exprs)."
                   (params (wasm-func-type-params ft))
                   (results (wasm-func-type-results ft))
                   (locals (expand-locals params (wasm-func-locals f))))
+             ;; typed-ref heaps in declared locals must resolve
+             ;; ('unknown type', ref.wast's local case)
+             (dolist (entry (wasm-func-locals f))
+               (check-valtype-list (wasm-module-types module)
+                                   (format nil "function ~a local"
+                                           funcidx)
+                                   (list (car entry))))
              (validate-function-body ctx (wasm-func-body f) locals
                                      params results
                                      :what (format nil "function ~a"

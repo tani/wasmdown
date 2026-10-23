@@ -13,15 +13,15 @@ now classify as :unsupported instead of crashing as harness-errors.
 
 | Outcome | Count |
 | --- | --- |
-| pass | 20452 |
-| fail | 0 |
+| pass | 21111 |
+| fail | 16 |
 | skip | 0 |
-| unsupported | 808 |
+| unsupported | 133 |
 | timeout | 0 |
 | harness-error | 0 |
 | **total** | **21260** |
 
-Executed: 21260 commands; pass rate 96.2% (denominator = all executed,
+Executed: 21260 commands; pass rate 99.3% (denominator = all executed,
 including unsupported — honest per PLAN.md §12.9).
 
 ## Per-file counts
@@ -32,22 +32,22 @@ including unsupported — honest per PLAN.md §12.9).
 | align | 165 | 0 | 0 | 0 |
 | annotations | 1 | 0 | 73 | 0 |
 | binary-leb128 | 91 | 0 | 0 | 0 |
-| binary | 125 | 0 | 4 | 0 |
+| binary | 127 | 0 | 2 | 0 |
 | block | 223 | 0 | 0 | 0 |
 | br | 97 | 0 | 0 | 0 |
-| br_if | 118 | 0 | 1 | 0 |
-| br_on_non_null | 0 | 0 | 12 | 0 |
-| br_on_null | 0 | 0 | 10 | 0 |
-| br_table | 24 | 0 | 162 | 0 |
+| br_if | 119 | 0 | 0 | 0 |
+| br_on_non_null | 12 | 0 | 0 | 0 |
+| br_on_null | 10 | 0 | 0 | 0 |
+| br_table | 186 | 0 | 0 | 0 |
 | call | 91 | 0 | 0 | 0 |
 | call_indirect | 172 | 0 | 0 | 0 |
-| call_ref | 0 | 0 | 35 | 0 |
+| call_ref | 35 | 0 | 0 | 0 |
 | comments | 8 | 0 | 0 | 0 |
 | const | 778 | 0 | 0 | 0 |
 | conversions | 619 | 0 | 0 | 0 |
 | custom | 10 | 0 | 1 | 0 |
 | data | 68 | 0 | 0 | 0 |
-| elem | 136 | 0 | 18 | 0 |
+| elem | 146 | 0 | 8 | 0 |
 | endianness | 69 | 0 | 0 | 0 |
 | exports | 97 | 0 | 0 | 0 |
 | f32 | 2514 | 0 | 0 | 0 |
@@ -62,7 +62,7 @@ including unsupported — honest per PLAN.md §12.9).
 | float_memory | 90 | 0 | 0 | 0 |
 | float_misc | 471 | 0 | 0 | 0 |
 | forward | 5 | 0 | 0 | 0 |
-| func | 174 | 0 | 1 | 0 |
+| func | 175 | 0 | 0 | 0 |
 | func_ptrs | 36 | 0 | 0 | 0 |
 | global | 124 | 0 | 0 | 0 |
 | i32 | 460 | 0 | 0 | 0 |
@@ -76,12 +76,12 @@ including unsupported — honest per PLAN.md §12.9).
 | int_literals | 51 | 0 | 0 | 0 |
 | labels | 29 | 0 | 0 | 0 |
 | left-to-right | 96 | 0 | 0 | 0 |
-| linking | 120 | 0 | 43 | 0 |
+| linking | 163 | 0 | 0 | 0 |
 | load | 97 | 0 | 0 | 0 |
 | local_get | 36 | 0 | 0 | 0 |
-| local_init | 0 | 0 | 10 | 0 |
+| local_init | 10 | 0 | 0 | 0 |
 | local_set | 53 | 0 | 0 | 0 |
-| local_tee | 97 | 0 | 1 | 0 |
+| local_tee | 98 | 0 | 0 | 0 |
 | loop | 121 | 0 | 0 | 0 |
 | memory | 90 | 0 | 0 | 0 |
 | memory_grow | 109 | 0 | 0 | 0 |
@@ -91,22 +91,22 @@ including unsupported — honest per PLAN.md §12.9).
 | names | 486 | 0 | 0 | 0 |
 | nop | 88 | 0 | 0 | 0 |
 | obsolete-keywords | 10 | 0 | 1 | 0 |
-| ref | 0 | 0 | 13 | 0 |
-| ref_as_non_null | 0 | 0 | 7 | 0 |
+| ref | 13 | 0 | 0 | 0 |
+| ref_as_non_null | 7 | 0 | 0 | 0 |
 | ref_func | 17 | 0 | 0 | 0 |
-| ref_is_null | 2 | 0 | 20 | 0 |
-| ref_null | 0 | 0 | 34 | 0 |
+| ref_is_null | 22 | 0 | 0 | 0 |
+| ref_null | 34 | 0 | 0 | 0 |
 | return | 84 | 0 | 0 | 0 |
-| return_call | 15 | 0 | 36 | 0 |
-| return_call_indirect | 31 | 0 | 52 | 0 |
-| return_call_ref | 0 | 0 | 53 | 0 |
-| select | 31 | 0 | 126 | 0 |
+| return_call | 51 | 0 | 0 | 0 |
+| return_call_indirect | 83 | 0 | 0 | 0 |
+| return_call_ref | 53 | 0 | 0 | 0 |
+| select | 157 | 0 | 0 | 0 |
 | skip-stack-guard-page | 11 | 0 | 0 | 0 |
 | stack | 7 | 0 | 0 | 0 |
 | start | 20 | 0 | 0 | 0 |
 | store | 68 | 0 | 0 | 0 |
 | switch | 28 | 0 | 0 | 0 |
-| table | 24 | 0 | 22 | 0 |
+| table | 40 | 6 | 0 | 0 |
 | table_get | 16 | 0 | 0 | 0 |
 | table_grow | 61 | 0 | 0 | 0 |
 | table_set | 26 | 0 | 0 | 0 |
@@ -114,12 +114,12 @@ including unsupported — honest per PLAN.md §12.9).
 | token | 61 | 0 | 0 | 0 |
 | traps | 36 | 0 | 0 | 0 |
 | type-canon | 0 | 0 | 2 | 0 |
-| type-equivalence | 2 | 0 | 30 | 0 |
-| type-rec | 0 | 0 | 27 | 0 |
-| type | 3 | 0 | 0 | 0 |
+| type-equivalence | 4 | 8 | 20 | 0 |
+| type-rec | 0 | 1 | 26 | 0 |
+| type | 2 | 1 | 0 | 0 |
 | unreachable | 64 | 0 | 0 | 0 |
-| unreached-invalid | 118 | 0 | 3 | 0 |
-| unreached-valid | 2 | 0 | 11 | 0 |
+| unreached-invalid | 121 | 0 | 0 | 0 |
+| unreached-valid | 13 | 0 | 0 | 0 |
 | unwind | 50 | 0 | 0 | 0 |
 | utf8-custom-section-id | 176 | 0 | 0 | 0 |
 | utf8-import-field | 176 | 0 | 0 | 0 |

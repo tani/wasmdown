@@ -795,6 +795,15 @@ rational value. Hex floats (0xh.hhhp±d) and decimal floats
   (n-imported-globals 0)
   (n-imported-tags 0))
 
+(defparameter *penv* nil
+  "Dynamic parse environment for %VALTYPE's heap-type resolution:
+typeuse indices inside (ref $t)/(ref 0) resolve against the RUNNING
+type list even from call sites that historically passed no penv
+\(params/results lists, local/param fields, select immediates). The
+resolution is ID-only (a $t/number lookup in penv-types); the found
+index is re-checked against the module's FINAL type vector at
+VALIDATION ('unknown type', ref.wast's assert_invalid batch).")
+
 (defun %id-or-num (tok table what)
   "Resolve an index token: $id via TABLE (an equal-hash), or a plain
 number. Signals decode-error for unknown ids or malformed tokens."
@@ -844,23 +853,92 @@ or adjacent to the 0x prefix) — int_literals.wast pins 1__000,
 ;;; ---------------------------------------------------------------
 ;;; Value types and typeuses.
 
-(defun %valtype (x)
-  "The valtype keyword for token X, or decode-error."
+(defun %heaptype (x penv)
+  "Parse one heap-type item — the element of a (ref ...)/(ref null ...)
+valtype or the immediate of ref.null: an abstract name (func/extern/
+exn/any/none/nofunc/noextern/noexn) as a keyword, or a typeuse ($id or
+number) as (:TYPE N) resolved against PENV's running type list. The
+index is LAZY: out-of-range indices parse fine and surface as
+'unknown type' at VALIDATION (ref.wast's assert_invalid batch)."
   (let ((k (%tok-keyword x)))
     (cond
-     ((string= k "i32") :i32)
-     ((string= k "i64") :i64)
-     ((string= k "f32") :f32)
-     ((string= k "f64") :f64)
-     ((string= k "funcref") :funcref)
-     ((string= k "externref") :externref)
-     ;; EH-scope admission (ref_null.wast): exnref is the nullable
-     ;; exception-reference type of Core 3.0 EH. Only the ABSOLUTE
-     ;; shorthand is admitted here — typed-ref spellings ((ref $t)
-     ;; etc.) remain GC scope.
-     ((string= k "exnref") :exnref)
-     (t (%text-error (tok-pos x) "unknown value type ~a"
+     ((member k '("func" "extern" "exn" "any" "none"
+                  "nofunc" "noextern" "noexn")
+              :test #'string=)
+      (intern (string-upcase k) :keyword))
+     ((and (tok-p x) (member (tok-kind x) '(:id :nat)))
+      (list :type (%id-or-num x (penv-types penv) "type")))
+     (t (%text-error (if (tok-p x) (tok-pos x) 0)
+                     "unknown heap type ~a"
                      (if (tok-p x) (tok-text x) k))))))
+
+(defun reftype-valtype-p (v)
+  "Whether the parsed valtype V is a reference type: a legacy keyword
+or one of the typed-ref lattice shapes (wasmdown.types:typed-ref-p).
+Shared by the reftype positions (table/elem) and the validator's
+grammar checks."
+  (or (member v '(:funcref :externref :exnref))
+      (and (consp v) (wasmdown.types:typed-ref-p v))))
+
+(defun %reftype-item (x penv)
+  "Parse a valtype in REFTYPE position (table/elem element types):
+any legacy/typed valtype EXCEPT the numerics — a bare :i32 in
+reftype position is 'unknown reference type' at DECODE (the table/
+elem grammar's reftype nonterminal), while an unparseable heap-type
+list also rejects here. PENV is accepted for parity but the token
+grammar needs no index context."
+  (declare (ignore penv))
+  (let ((v (%valtype x)))
+    (if (reftype-valtype-p v)
+        v
+        (%text-error (if (tok-p x) (tok-pos x) 0)
+                     "unknown reference type"))))
+
+(defun %valtype (x)
+  "The valtype for item X — a token OR a (ref null? heaptype) list
+node. Tokens keep their keyword forms; typed refs become the
+(:REF NULL HEAP)/(REF HEAP) lattice shapes of wasmdown.types (HEAP a
+keyword or (:TYPE N) typeuse)."
+  (cond
+   ;; (ref null ht) / (ref ht): a :list node whose head tok is "ref"
+   ((and (tok-elem-p x)
+         (string= (%tok-keyword (%first-tok x)) "ref"))
+    (let* ((args (cddr x))
+           (null-p (and args (tok-p (car args))
+                         (string= (%tok-keyword (car args)) "null"))))
+      (unless (and args (tok-p (car args)))
+        (%text-error 0 "bad (ref) type"))
+      (if null-p
+          (let ((rest (cdr args)))
+            (unless (= (length rest) 1)
+              (%text-error 0 "(ref null) needs exactly one heap type"))
+            (list :ref 'null (%heaptype (car rest) *penv*)))
+          (progn
+            (unless (= (length args) 1)
+              (%text-error 0 "(ref) needs exactly one heap type"))
+            (list :ref (%heaptype (car args) *penv*))))))
+   (t
+    (let ((k (%tok-keyword x)))
+      (cond
+       ((string= k "i32") :i32)
+       ((string= k "i64") :i64)
+       ((string= k "f32") :f32)
+       ((string= k "f64") :f64)
+       ((string= k "funcref") :funcref)
+       ((string= k "externref") :externref)
+       ;; EH-scope admission (ref_null.wast): exnref is the nullable
+       ;; exception-reference type of Core 3.0 EH.
+       ((string= k "exnref") :exnref)
+       ;; Core 3.0 shorthand bottoms (ref_null.wast's null* spellings):
+       ;; each is the lattice's null bottom in its heap bucket.
+       ((string= k "anyref") (list :ref 'null :any))
+       ((string= k "nullref") (list :ref 'null :none))
+       ((string= k "nullfuncref") (list :ref 'null :nofunc))
+       ((string= k "nullexternref") (list :ref 'null :noextern))
+       ((string= k "nullexnref") (list :ref 'null :noexn))
+       (t (%text-error (if (tok-p x) (tok-pos x) 0)
+                       "unknown value type ~a"
+                       (if (tok-p x) (tok-text x) k))))))))
 
 (defun %params (node penv)
   "Parse a (param ...) list NODE: named params register in PENV-LOCALS
@@ -870,7 +948,8 @@ the running param count and clears it between functions."
   (let ((rest (cddr node)))
     ;; (param $x i32) or (param i32 i64)
     (if (and rest (tok-p (car rest)) (eq (tok-kind (car rest)) :id))
-        (if (and (= (length rest) 2) (tok-p (second rest)))
+        (if (and (= (length rest) 2)
+                 (or (tok-p (second rest)) (tok-elem-p (second rest))))
             (let ((ty (%valtype (second rest)))
                   (pname (tok-text (car rest))))
               ;; duplicate $id in the func's local namespace (params +
@@ -1115,6 +1194,13 @@ underscore)."
             ;; the other multi-word control ops; throw_ref likewise.
             ((string= text "try_table") "try-table")
             ((string= text "throw_ref") "throw-ref")
+            ;; Typed function references (Core 3.0): the br_on_* and
+            ;; call_ref family hyphenate like br_if/br_table.
+            ((string= text "br_on_null") "br-on-null")
+            ((string= text "br_on_non_null") "br-on-non-null")
+            ((string= text "call_ref") "call-ref")
+            ((string= text "return_call_ref") "return-call-ref")
+            ((string= text "ref.as_non_null") "ref.as-non-null")
             (t text)))
           :keyword))
 
@@ -1179,6 +1265,8 @@ underscore)."
                     "br_if" "br_table" "call_indirect" "select"
                     "return_call" "return_call_indirect"
                     "throw" "throw_ref"
+                    "br_on_null" "br_on_non_null" "call_ref"
+                    "return_call_ref" "ref.as_non_null"
                      "table.get" "table.set" "table.grow" "table.size"
                      "table.fill" "table.init" "table.copy" "elem.drop"
                      "memory.size" "memory.grow" "memory.init" "data.drop"
@@ -1654,7 +1742,12 @@ rest of the plain sequence."
       (multiple-value-bind (x items)
           (%take-index rest (penv-elems penv) "elem")
         (values (make-wasm-instr op-key (list :elem x) #() 0) items)))
-     ;; ref.null func|extern
+     ;; ref.null <heaptype>: legacy shorthand keywords stay
+     ;; :funcref/:externref/:exnref (ref_null.wast's spellings); the
+     ;; other abstract heaps and typeuse indices become the typed-ref
+     ;; lattice forms — (:TYPE N) for a $id/number typeuse, the
+     ;; keyword otherwise. Lazy: an out-of-range index validates as
+     ;; 'unknown type', never a parse error.
      ((string= k "ref.null")
       (unless (and rest (tok-p (car rest)))
         (funcall bad))
@@ -1665,10 +1758,11 @@ rest of the plain sequence."
                                               ((string= ht "extern") :externref)
                                               ;; EH (ref_null.wast): (ref.null exn)
                                               ((string= ht "exn") :exnref)
-                                              (t (%text-error
-                                                  (tok-pos (car rest))
-                                                  "bad ref.null type ~a"
-                                                  (tok-text (car rest))))))
+                                              ;; typed heap types:
+                                              ;; any/none/nofunc/
+                                              ;; noextern/noexn plus
+                                              ;; typeuse indices
+                                              (t (%heaptype (car rest) penv))))
                                  #() 0)
                 (cdr rest))))
      ;; call_indirect / return_call_indirect: optional table index then
@@ -1702,6 +1796,42 @@ rest of the plain sequence."
                                                      (%find-or-add-type
                                                       params results penv))
                                            :table table)
+                                     #() 0)
+                    tail)))))
+     ;; br_on_null / br_on_non_null: one label (typed function
+     ;; references, Core 3.0).
+     ((member k '("br_on_null" "br_on_non_null") :test #'string=)
+      (multiple-value-bind (label items) (%take-label rest penv k)
+        (values (make-wasm-instr op-key (list :label label) #() 0) items)))
+     ;; ref.as_non_null: no immediates.
+     ((string= k "ref.as_non_null")
+      (values (make-wasm-instr op-key nil #() 0) rest))
+     ;; call_ref / return_call_ref: one typeuse (the callee's type),
+     ;; call_indirect's blocktype grammar (explicit (type x) plus
+     ;; inline (param)/(result) must match syntactically).
+     ;; call_ref / return_call_ref: one typeuse (the callee's type).
+     ;; The ABBREVIATION is a bare type index (call_ref $t / call_ref 0
+     ;; — call_ref.wast's universal spelling); the full (type x)
+     ;; (param)* (result)* grammar also parses (blocktype rules).
+     ((member k '("call_ref" "return_call_ref") :test #'string=)
+      (let ((items rest) (typeidx nil))
+        ;; bare index token first ($t or number)
+        (when (and items (tok-p (car items))
+                   (member (tok-kind (car items)) '(:id :nat)))
+          (setf typeidx (%id-or-num (car items) (penv-types penv) "type")
+                items (cdr items)))
+        (multiple-value-bind (params results typeidx2)
+            (%block-typeuse items penv)
+          (let ((tail items))
+            (loop while (and tail (tok-elem-p (car tail))
+                             (member (%tok-keyword (%first-tok (car tail)))
+                                     '("type" "param" "result")
+                                     :test #'string=))
+                  do (pop tail))
+            (values (make-wasm-instr op-key
+                                     (list :type (or typeidx typeidx2
+                                                     (%find-or-add-type
+                                                      params results penv)))
                                      #() 0)
                     tail)))))
      ;; select: (result t)* immediates
@@ -1912,12 +2042,15 @@ nat token is the max (a reftype/id after the min is NOT a max)."
           (values (make-wasm-limits min max) (cddr items)))
         (values (make-wasm-limits min) (cdr items)))))
 
-(defun %type-field-signature (node)
+(defun %type-field-signature (node penv)
   "The (params . results) signature of an explicit (type $id? (func
 ...)) field node, or a decode-error when the shape is wrong. Split
 out of %PARSE-TYPE-FIELD so the two-pass scheme (pass 1 registers
 every explicit type before any body parses; pass 2 parses the rest)
-can compute signatures without growing the penv."
+can compute signatures without growing the penv. PENV is the SHARED
+parse environment — heap-type forward refs ((ref $t2) in $t1's
+signature, type_equivalence.wast) resolve against the pre-registered
+type id hash."
   (multiple-value-bind (id rest) (%opt-id (cddr node))
     (let ((funclist (first rest)))
       (unless (and funclist (tok-elem-p funclist)
@@ -1925,7 +2058,7 @@ can compute signatures without growing the penv."
         (%text-error (or (and id (tok-p id) (tok-pos id)) 0)
                      "(type) needs a (func ...) list"))
       (multiple-value-bind (params results typeidx)
-          (%typeuse (cddr funclist) (make-penv))
+          (%typeuse (cddr funclist) penv)
         (declare (ignore typeidx))
         (values id params results)))))
 
@@ -1940,28 +2073,38 @@ later explicit type with an equal signature is REUSED, never
 duplicated). Because the $id hash now holds explicit ids before any
 body parses, forward references like (func (type $forward)) resolve
 to their final index (func.wast module 1, imports.wast)."
+  ;; pre-pass: register every explicit type's $id with its FINAL
+  ;; index BEFORE any signature parses, so forward heap-type refs
+  ;; ((type $t1 (func (param (ref $t2)))) — type_equivalence.wast's
+  ;; mutual recursion) resolve during %type-field-signature.
+  (let ((n 0))
+    (dolist (node nodes)
+      (let* ((head (%first-tok node))
+             (k (and head (%tok-keyword head))))
+        (when (and k (string= k "type"))
+          (let ((id (first (cddr node))))
+            (when (and id (tok-p id) (eq (tok-kind id) :id))
+              (when (gethash (tok-text id) (penv-types penv))
+                (%text-error (tok-pos id) "duplicate identifier ~a"
+                             (tok-text id)))
+              (setf (gethash (tok-text id) (penv-types penv)) n))
+            (incf n))))))
   (dolist (node nodes)
     (let* ((head (%first-tok node))
            (k (and head (%tok-keyword head))))
       (when (and k (string= k "type"))
         (multiple-value-bind (id params results)
-            (%type-field-signature node)
+            (%type-field-signature node penv)
+          (declare (ignore id))
           (push (make-wasm-func-type params results)
-                (penv-types-list penv))
-          (when (and id (tok-p id) (eq (tok-kind id) :id))
-            (when (gethash (tok-text id) (penv-types penv))
-              (%text-error (tok-pos id) "duplicate identifier ~a"
-                           (tok-text id)))
-            (setf (gethash (tok-text id) (penv-types penv))
-                  (1- (length (penv-types-list penv))))))))))
+                (penv-types-list penv)))))))
 
 (defun %parse-type-field (node penv)
-  "Pass-2 handler for an explicit (type ...) field: pass 1
-(%PRESCAN-TYPES) already appended its functype and registered its
-$id, so this only re-checks the shape (keeping duplicate-$id and
+  "Pass-2 handler for an explicit (type ...) field: pass 1 already
+appended its functype and registered its $id (see %PRESCAN-TYPES),
+so this only re-checks the shape (keeping duplicate-$id and
 missing-(func) diagnostics at the same source positions)."
-  (declare (ignore penv))
-  (%type-field-signature node))
+  (%type-field-signature node penv))
 
 (defun %import-desc (desc penv kind)
   "Parse an import descriptor list ((func|table|memory|global|tag) $id?
@@ -2009,18 +2152,18 @@ at the kind's running import count (its true index-space position)."
            (%resolve-typeuse rest penv)))))))
 
 (defun %import-table-type (k rest pos)
-  "Table import type: limits (n n?) then reftype, per the text grammar
-((table n n? funcref) in the official suite)."
+  "Table import type: limits (n n?) then reftype (legacy keyword or
+typed (ref ...) form), per the text grammar."
   (declare (ignore k))
-  (unless (and rest (tok-p (car rest)))
+  (unless rest
     (%text-error pos "imported table needs limits and a type"))
   (multiple-value-bind (limits tail)
       (%limits-tail rest pos "imported table")
     (let ((rt (and tail (car tail))))
-      (unless (and rt (tok-p rt))
+      (unless rt
         (%text-error pos "imported table needs a reference type"))
-      (let ((rty (%valtype rt)))
-        (unless (member rty '(:funcref :externref))
+      (let ((rty (%reftype-item rt *penv*)))
+        (unless (reftype-valtype-p rty)
           (%text-error pos "table type must be a reference type"))
         (make-wasm-table rty limits)))))
 
@@ -2275,7 +2418,8 @@ An inline (import) turns the func into an import entry instead."
                                            lname))
                                         (setf (gethash lname (penv-locals penv))
                                               (%next-local-index penv)))
-                                       (push (cons (%valtype (second lrest)) 1)
+                                       (push (cons (%valtype (second lrest))
+                                                   1)
                                              locals))
                                      (dolist (t_ lrest)
                                        (push (cons (%valtype t_) 1)
@@ -2344,14 +2488,36 @@ wasm-table inits) where INITS is the elem segment's init list for the
 inline form, or NIL."
   (cond
    ;; inline elem: (table reftype (elem item*)) — the elem list itself
-   ;; is the LAST item
+   ;; is the LAST item; the reftype defaults to funcref (the legacy
+   ;; abbreviation) but may be any reftype token or typed-ref list
+   ;; when present as the leading item.
    ((and (>= (length items) 1)
          (tok-elem-p (car (last items)))
          (string= (%tok-keyword (%first-tok (car (last items)))) "elem"))
     (let* ((elemlist (car (last items)))
+           (pre (butlast items))
+           (rt (cond ((null pre) :funcref)
+                     ;; limits n [n] then reftype — the legacy
+                     ;; (table 1 funcref (elem $f)) shape: strip the
+                     ;; leading n/n n tokens, the reftype follows
+                     ((and (>= (length pre) 2)
+                           (tok-p (car pre))
+                           (or (tok-p (car pre)) (nat-p (car pre)))
+                           (or (and (= (length pre) 2)
+                                    (tok-p (second pre))
+                                    (or (nat-p (second pre))
+                                        (reftype-token-p (second pre))))
+                               (and (= (length pre) 3)
+                                    (nat-p (second pre)))))
+                      (let ((rttok (car (last pre))))
+                        (%reftype-item rttok penv)))
+                     ((and (= (length pre) 1)
+                           (or (tok-p (car pre)) (tok-elem-p (car pre))))
+                      (%reftype-item (car pre) penv))
+                     (t (%text-error pos "bad table inline elem form"))))
            (eitems (cddr elemlist))
            (n (length eitems)))
-      (values (make-wasm-table :funcref (make-wasm-limits n))
+      (values (make-wasm-table rt (make-wasm-limits n))
               eitems)))
    (t
     ;; (table n n? reftype): limits first, reftype last
@@ -2360,10 +2526,12 @@ inline form, or NIL."
     (multiple-value-bind (limits tail)
         (%limits-tail items pos "table")
       (let ((rt (and tail (car tail))))
-        (unless (and rt (tok-p rt))
+        (unless rt
           (%text-error pos "table needs a reference type"))
-        (let ((rty (%valtype rt)))
-          (unless (member rty '(:funcref :externref))
+        ;; reftype: legacy keywords, shorthand bottoms, or the typed
+        ;; (ref null? heaptype) list forms (table.wast ::12-14).
+        (let ((rty (%reftype-item rt penv)))
+          (unless (reftype-valtype-p rty)
             (%text-error pos "table type must be a reference type"))
           (if (and (cdr tail) (tok-elem-p (second tail)))
               ;; (table n n? reftype <expr>): the WAT extended table
@@ -2416,15 +2584,19 @@ abbreviation (which also emits the elem segment)."
               (let ((tableidx (+ (penv-n-imported-tables penv)
                                  (1- (length (penv-tables-list penv))))))
                 ;; inline (elem ...): an ACTIVE elem segment targeting
-                ;; this table at offset 0
+                ;; this table at offset 0. The segment's type is the
+                ;; TABLE's element type (spec abbreviation; br_table.
+                ;; wast ::1018's (table $t (ref null $t) (elem $tf)) —
+                ;; a hardcoded :funcref fails check-elems' subtyping
+                ;; since funcref is not <: (ref null $t)).
                 (when inits
                   (push (make-wasm-elem
                          (list :active tableidx
                                (vector (make-wasm-instr :i32.const
                                                         (list :value 0) #() 0)
                                        (make-wasm-instr :end nil #() 0)))
-                         :funcref
-                         (%elem-items inits :funcref penv))
+                         (wasm-table-type tab)
+                         (%elem-items inits (wasm-table-type tab) penv))
                         (penv-elems-list penv)))
                 ;; extended initializer expr: [expr x min] segment,
                 ;; marked from-table-init so check-elems applies the
@@ -2508,6 +2680,11 @@ import, then limits (n [n]) or the (data ...) abbreviation."
     (unless (third item)
       (%text-error pos "(mut) needs a type"))
     (values (%valtype (third item)) t))
+   ;; typed-ref valtype: (ref null? heaptype) list node (ref.wast's
+   ;; global shapes)
+   ((and (tok-elem-p item)
+         (string= (%tok-keyword (%first-tok item)) "ref"))
+    (values (%valtype item) nil))
    (t (%text-error pos "bad global type"))))
 
 (defun %parse-global-field (node penv)
@@ -2666,20 +2843,59 @@ expression vectors (each INCLUDING its :end)."
                 (%parse-expr (list x) penv)))
           items))
 
+(defun %elem-reftype-list-p (x)
+  "Whether list node X is a REFTYPE-shaped (ref null? heaptype) node —
+the passive/active elem forms' leading element type (elem.wast
+::542's (elem (ref func) (ref.func 0))) rather than the offset
+abbreviation's expression. Exactly (ref ht) / (ref null ht)."
+  (and (tok-elem-p x)
+       (string= (%tok-keyword (%first-tok x)) "ref")
+       ;; (:LIST "ref" ht) length 3; (:LIST "ref" "null" ht) length 4
+       (<= 3 (length x) 4)))
+
 (defun %elem-offset-expr (items penv)
   "The offset of an active elem/data: an (offset expr*) wrapper, or
-the single-instruction abbreviation — ANY leading folded list (strings
+the single-instruction abbreviation — any leading folded list (strings
 are :string tokens, reftypes keywords, so a leading list is always the
-offset per the WAT grammar's offset abbreviation). Returns (values
-expr rest). The expression's arity/constness is checked at
-VALIDATION, not here."
+offset per the WAT grammar's offset abbreviation). EXCEPT a
+reftype-shaped (ref null? ht) node, which is the passive elem's
+element type (elem.wast ::542), never an offset. Returns (values expr
+rest). The expression's arity/constness is checked at VALIDATION, not
+here."
  (cond
   ((and items (tok-elem-p (car items))
         (string= (%tok-keyword (%first-tok (car items))) "offset"))
    (values (%parse-expr (cddr (car items)) penv) (cdr items)))
-  ((and items (tok-elem-p (car items)))
+  ((and items (tok-elem-p (car items))
+        (not (%elem-reftype-list-p (car items))))
    (values (%parse-expr (list (car items)) penv) (cdr items)))
   (t (values nil items))))
+
+(defun %elem-rt-item (x penv)
+  "The optional reftype/func marker of an elem field: a token in
+{funcref externref func anyref nullref nullfuncref nullexternref
+nullexnref exnref}, or a typed (ref ...)/(ref null ...) list node.
+Returns (values reftype found-p): REFTYPE is the segment's element
+type ('func' keeps :FUNCREF semantics with funcidx items); FOUND is
+NIL when the item is not a reftype marker at all."
+  (declare (ignore penv))
+  (cond
+   ((and (tok-p x)
+         (member (%tok-keyword x)
+                 '("funcref" "externref" "func" "exnref" "anyref"
+                   "nullref" "nullfuncref" "nullexternref" "nullexnref")
+                 :test #'string=))
+    (values (if (string= (%tok-keyword x) "func")
+                ;; the elemkind form's segment type is the TARGET
+                ;; TABLE's element type when active (elem.wast ::51);
+                ;; the validator re-types via the marker
+                :elemkind-func
+                (%valtype x))
+            t))
+   ((and (tok-elem-p x)
+         (string= (%tok-keyword (%first-tok x)) "ref"))
+    (values (%valtype x) t))
+   (t (values nil nil))))
 
 (defun %parse-elem-field (node penv)
   "Parse an (elem ...) field, all forms:
@@ -2701,14 +2917,11 @@ VALIDATION, not here."
         (let* ((tail (cdr rest))
                (rt :funcref)
                (tail2 tail))
-          ;; optional reftype (funcref/externref) or 'func'
-          (when (and tail2 (tok-p (car tail2))
-                     (member (%tok-keyword (car tail2))
-                             '("funcref" "externref" "func")
-                             :test #'string=))
-            (when (string= (%tok-keyword (car tail2)) "externref")
-              (setf rt :externref))
-            (setf tail2 (cdr tail2)))
+          ;; optional reftype: legacy keyword, 'func' abbreviation
+          ;; (funcref with funcidx items), or typed (ref ...) form
+          (multiple-value-bind (r found)
+              (%elem-rt-item (car tail2) penv)
+            (when found (setf rt r tail2 (cdr tail2))))
           (push (make-wasm-elem '(:declarative) rt
                                 (%elem-items tail2 rt penv))
                 (penv-elems-list penv))))
@@ -2726,15 +2939,16 @@ VALIDATION, not here."
               (%elem-offset-expr tail penv)
             (if active
                 ;; ACTIVE: expr required
-                (let* ((rt :funcref)
+                (let* ((rt :elemkind-func)
                        (tail3 tail2))
-                  (when (and tail3 (tok-p (car tail3))
-                             (member (%tok-keyword (car tail3))
-                                     '("funcref" "externref" "func")
-                                     :test #'string=))
-                    (when (string= (%tok-keyword (car tail3)) "externref")
-                      (setf rt :externref))
-                    (setf tail3 (cdr tail3)))
+                  (multiple-value-bind (r found)
+                      (%elem-rt-item (car tail3) penv)
+                    ;; no reftype marker + funcidx items = the
+                    ;; elemkind abbreviation (elem.wast ::87-92's
+                    ;; bare (elem (i32.const 3) $g) into a (ref
+                    ;; func) table); an EXPLICIT reftype keeps its
+                    ;; own type
+                    (when found (setf rt r tail3 (cdr tail3))))
                   (push (make-wasm-elem (list :active tableidx expr) rt
                                         (%elem-items tail3 rt penv))
                         (penv-elems-list penv)))
@@ -2744,19 +2958,28 @@ VALIDATION, not here."
                   (cond
                    (expr
                     (let ((tail3 tail2))
-                      (when (and tail3 (tok-p (car tail3))
-                                 (member (%tok-keyword (car tail3))
-                                         '("funcref" "externref" "func")
-                                         :test #'string=))
-                        (when (string= (%tok-keyword (car tail3)) "externref")
-                          (setf rt :externref))
-                        (setf tail3 (cdr tail3)))
-                      (push (make-wasm-elem (list :active 0 expr) rt
-                                            (%elem-items tail3 rt penv))
-                            (penv-elems-list penv))))
-                   ((and tail2 (tok-p (car tail2))
-                         (member (%tok-keyword (car tail2))
-                                 '("funcref" "externref") :test #'string=))
+                      ;; bare funcidx items after the offset = the
+                      ;; elemkind abbreviation (elem.wast ::51)
+                      (let ((rt :elemkind-func))
+                        (multiple-value-bind (r found)
+                            (%elem-rt-item (car tail3) penv)
+                          (when found
+                            (setf rt r tail3 (cdr tail3))))
+                        (push (make-wasm-elem (list :active 0 expr) rt
+                                              (%elem-items tail3 rt penv))
+                              (penv-elems-list penv)))))
+                   ((and tail2 (or (and (tok-p (car tail2))
+                                        (member (%tok-keyword (car tail2))
+                                                '("funcref" "externref"
+                                                  "anyref" "nullref"
+                                                  "nullfuncref"
+                                                  "nullexternref"
+                                                  "nullexnref")
+                                                :test #'string=))
+                                   (and (tok-elem-p (car tail2))
+                                        (string= (%tok-keyword
+                                                  (%first-tok (car tail2)))
+                                                 "ref"))))
                     ;; passive with explicit reftype
                     (push (make-wasm-elem '(:passive)
                                           (%valtype (car tail2))
@@ -2766,20 +2989,26 @@ VALIDATION, not here."
                           (penv-elems-list penv)))
                    ((and tail2 (tok-p (car tail2))
                          (string= (%tok-keyword (car tail2)) "func"))
-                    ;; passive funcidx list
-                    (push (make-wasm-elem '(:passive) :funcref
-                                          (%elem-items (cdr tail2) :funcref
-                                                       penv))
+                    ;; passive funcidx list: elemkind form (the
+                    ;; segment type is the consumer table's type —
+                    ;; passive segments are consumed via table.init
+                    ;; whose check uses the ELEMKIND marker)
+                    (push (make-wasm-elem '(:passive) :elemkind-func
+                                          (%elem-items (cdr tail2)
+                                                        :elemkind-func penv))
                           (penv-elems-list penv)))
                    (t
-                    ;; bare funcidx list: active on table 0
+                    ;; bare funcidx list: active on table 0 — the
+                    ;; elemkind form (elem.wast ::448-451: (func)
+                    ;; (table 1 (ref func) (ref.func 0)) (elem
+                    ;; (i32.const 0) func 0) VALIDATES)
                     (push (make-wasm-elem
                            (list :active 0
                                  (vector (make-wasm-instr :i32.const
                                                          (list :value 0) #() 0)
                                          (make-wasm-instr :end nil #() 0)))
-                           :funcref
-                           (%elem-items tail2 :funcref penv))
+                           :elemkind-func
+                           (%elem-items tail2 :elemkind-func penv))
                           (penv-elems-list penv)))))))))))
       ;; (index space bookkeeping is by list length; nothing to sync)
       ))
@@ -2981,11 +3210,12 @@ with :offset (token index) on malformed text."
       ;; block (suite pin: func.wast module 2, (func (type 0)) is the
       ;; LATER explicit $t; module 3's implicit index 3 is the first
       ;; complex-sig use).
-      (%prescan-types items penv)
-      ;; forward $id references: pre-register the six index spaces
-      ;; before any field body parses (WAT allows forward refs)
-      (%prescan-ids items penv)
-      (%parse-module-fields items penv)
+      (let ((*penv* penv))
+        (%prescan-types items penv)
+        ;; forward $id references: pre-register the six index spaces
+        ;; before any field body parses (WAT allows forward refs)
+        (%prescan-ids items penv)
+        (%parse-module-fields items penv))
       (make-wasm-module
        :types (coerce (reverse (penv-types-list penv)) 'vector)
        :imports (coerce (reverse (penv-imports-list penv)) 'vector)

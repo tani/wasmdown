@@ -121,20 +121,58 @@
 ;;; ---------------------------------------------------------------
 ;;; Value types, limits, blocktypes.
 
+(defun enc-heaptype (e heap)
+  "A heap type: abstract keyword -> its single byte (the absheaptype
+encodings; a minimal negative s33), (:TYPE N) typeuse -> positive
+s33 N."
+  (etypecase heap
+    (keyword
+     (enc-byte e (ecase heap
+                   (:func #x70) (:extern #x6f) (:exn #x69)
+                   (:any #x6e) (:none #x71)
+                   (:nofunc #x73) (:noextern #x72) (:noexn #x74))))
+    (cons (enc-s33 e (second heap)))))
+
+(defun enc-reftype (e t_)
+  "A reference type: legacy keywords as their shorthand bytes
+(= (ref null ht)), typed refs as 0x64 (ref ht) / 0x63 (ref null ht)
+plus the heap type."
+  (etypecase t_
+    (keyword (enc-byte e (%valtype-byte t_)))
+    (cons
+     (if (eq (second t_) 'null)
+         (progn (enc-byte e #x63)
+                (enc-heaptype e (third t_)))
+         (progn (enc-byte e #x64)
+                (enc-heaptype e (second t_)))))))
+
 (defun %valtype-byte (t_)
-  (ecase t_
-    (:i32 #x7F) (:i64 #x7E) (:f32 #x7D) (:f64 #x7C)
-    (:funcref #x70) (:externref #x6F)
-    ;; EH (Core 3.0): exnref 0x69.
-    (:exnref #x69)))
+  (etypecase t_
+    (keyword
+     (ecase t_
+       (:i32 #x7F) (:i64 #x7E) (:f32 #x7D) (:f64 #x7C)
+       (:funcref #x70) (:externref #x6F)
+       ;; EH (Core 3.0): exnref 0x69.
+       (:exnref #x69)))
+    ;; typed refs are NOT single bytes: ENC-VALTYPE dispatches them
+    ;; to ENC-REFTYPE; the etypecase's one-line fallthrough keeps an
+    ;; accidental bare call a compile-time error instead of a silent
+    ;; wrong byte.
+    (cons (error "use enc-reftype for typed refs"))))
 
 (defun enc-valtype (e t_)
-  (enc-byte e (%valtype-byte t_)))
+  "A valtype: numerics/legacy refs as one byte, typed refs via
+ENC-REFTYPE (0x63/0x64 + heap type)."
+  (if (and (consp t_) (eq (first t_) :ref))
+      (enc-reftype e t_)
+      (enc-byte e (%valtype-byte t_))))
 
 (defun enc-blocktype (e bt)
-  "NIL -> 0x40; valtype -> its byte; (:typeidx . n) -> s33 n."
+  "NIL -> 0x40; valtype -> its bytes (typed refs included);
+\(:typeidx . n) -> s33 n."
   (cond ((null bt) (enc-byte e #x40))
-        ((consp bt) (enc-s33 e (cdr bt)))
+        ((and (consp bt) (eq (first bt) :typeidx))
+         (enc-s33 e (cdr bt)))
         (t (enc-valtype e bt))))
 
 (defun enc-limits (e limits)
@@ -349,9 +387,31 @@ low word first, then high word."
       (:f64.const (enc-byte e #x44) (enc-f64-bits e (getf imms :bits)))
       (:ref.null
        (enc-byte e #xD0)
-       (enc-byte e (%valtype-byte (getf imms :type))))
+       ;; the imm is a HEAP type: legacy shorthand keywords
+       ;; (:funcref/:externref/:exnref), the lattice's abstract
+       ;; keywords, or (:TYPE N) — all via ENC-HEAPTYPE's etypecase
+       ;; (the legacy keywords map to their = (ref null ht) bytes).
+       (let ((ht (getf imms :type)))
+         (etypecase ht
+           (keyword
+            (enc-byte e (ecase ht
+                          (:funcref #x70) (:externref #x6f)
+                          (:exnref #x69)
+                          (:func #x70) (:extern #x6f) (:exn #x69)
+                          (:any #x6e) (:none #x71)
+                          (:nofunc #x73) (:noextern #x72)
+                          (:noexn #x74))))
+           (cons (enc-heaptype e ht)))))
       (:ref.is-null (enc-byte e #xD1))
       (:ref.func (enc-byte e #xD2) (enc-u32 e (getf imms :func)))
+      ;; typed function references (Core 3.0): ref.as_non_null 0xD4,
+      ;; br_on_null 0xD5 / br_on_non_null 0xD6 (labelidx),
+      ;; call_ref 0x14 / return_call_ref 0x15 (typeidx).
+      (:ref.as-non-null (enc-byte e #xD4))
+      (:br-on-null (enc-byte e #xD5) (enc-u32 e (getf imms :label)))
+      (:br-on-non-null (enc-byte e #xD6) (enc-u32 e (getf imms :label)))
+      (:call-ref (enc-byte e #x14) (enc-u32 e (getf imms :type)))
+      (:return-call-ref (enc-byte e #x15) (enc-u32 e (getf imms :type)))
       ((:i32.trunc_sat_f32_s :i32.trunc_sat_f32_u
         :i32.trunc_sat_f64_s :i32.trunc_sat_f64_u
         :i64.trunc_sat_f32_s :i64.trunc_sat_f32_u
@@ -501,7 +561,8 @@ legacy funcidx item form; returns the funcidx or nil."
                     (let ((tableidx (second mode))
                           (expr (third mode)))
                       (cond
-                        ((and (eql tableidx 0) (eq type :funcref)
+                        ((and (eql tableidx 0)
+                              (member type '(:funcref :elemkind-func))
                               (every #'elem-init-legacy-funcidx-p inits))
                          (enc-u32 e 0)      ; flag 0: legacy active
                          (enc-instrs e expr)
@@ -514,6 +575,18 @@ legacy funcidx item form; returns the funcidx or nil."
                          (enc-instrs e expr)
                          (enc-u32 e (length inits))
                          (loop for init in inits do (enc-instrs e init)))
+                        ((eq type :elemkind-func)
+                         ;; elemkind form with a non-zero table index:
+                         ;; flag 2 (active, table, elemkind byte 0x00,
+                         ;; funcidx vector) — the elemkind form IS the
+                         ;; funcidx form binary-wise; no reftype byte.
+                         (enc-u32 e 2)
+                         (enc-u32 e tableidx)
+                         (enc-instrs e expr)
+                         (enc-byte e 0)    ; elemkind funcref
+                         (enc-u32 e (length inits))
+                         (loop for init in inits
+                               do (enc-u32 e (elem-init-ref-func-index init))))
                         (t
                          (enc-u32 e 6)      ; flag 6: active, elemexpr, type
                          (enc-u32 e tableidx)
@@ -523,18 +596,13 @@ legacy funcidx item form; returns the funcidx or nil."
                          (loop for init in inits do (enc-instrs e init))))))
                    ((equal mode '(:passive))
                     (cond
-                      ((and (eq type :funcref)
+                      ((and (member type '(:funcref :elemkind-func))
                             (every #'elem-init-legacy-funcidx-p inits))
                        (enc-u32 e 1)
                        (enc-byte e 0)    ; elemkind funcref
                        (enc-u32 e (length inits))
                        (loop for init in inits
                              do (enc-u32 e (elem-init-ref-func-index init))))
-                      ((eq type :funcref)
-                       (enc-u32 e 5)
-                       (enc-valtype e type)
-                       (enc-u32 e (length inits))
-                       (loop for init in inits do (enc-instrs e init)))
                       (t
                        (enc-u32 e 5)
                        (enc-valtype e type)
@@ -542,7 +610,7 @@ legacy funcidx item form; returns the funcidx or nil."
                        (loop for init in inits do (enc-instrs e init)))))
                    ((equal mode '(:declarative))
                     (cond
-                      ((and (eq type :funcref)
+                      ((and (member type '(:funcref :elemkind-func))
                             (every #'elem-init-legacy-funcidx-p inits))
                        (enc-u32 e 3)
                        (enc-byte e 0)    ; elemkind funcref

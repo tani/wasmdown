@@ -204,41 +204,41 @@
               (register \"I2\" $I2)")))
     (wasmdown.test:is (equal '(:pass :pass :pass :pass :pass) os))))
 
-(wasmdown.test:test wast/typed-ref-typeuse-unsupported-no-crash
-  ;; Regression (loop 16, the biggest single-fix family): (ref $t),
-  ;; (ref null $t) and (ref 0)/(ref null 0) typeuses are GC-scope
-  ;; typed references. They used to reach %valtype with a (:LIST ...)
-  ;; node and crash the host with a TYPE-ERROR, misclassifying the
-  ;; suite's assert_invalid cases as harness-errors (ref.wast,
-  ;; type-equivalence.wast, type-rec.wast, func.wast ::117). The
-  ;; %unsupported-feature-p scan must classify them :unsupported
-  ;; BEFORE parse — honest GC scope, never a host crash.
+(wasmdown.test:test wast/typed-ref-typeuse-implemented
+  ;; Loop 19: typed function references are IMPLEMENTED. The loop-16
+  ;; pin asserted :unsupported (honest then: the forms crashed
+  ;; %valtype). Now: a (ref $t) local read before set is a REAL
+  ;; validation error ('uninitialized local' — non-nullable typed
+  ;; refs are not defaultable), the (ref 1) out-of-range typeuse
+  ;; fails at VALIDATE ('unknown type'), and the param carrier
+  ;; parses+validates cleanly.
   (let ((os (%outcomes
              "(assert_invalid
                 (module (type $t (func))
                   (func $f (local $x (ref $t)) (drop (local.get $x))))
                 \"uninitialized local\")")))
-    (wasmdown.test:is (equal '(:unsupported) os)))
-  ;; (ref <digit>) index spelling, same family:
+    (wasmdown.test:is (equal '(:pass) os)))
+  ;; (ref <digit>) index spelling: out-of-range = 'unknown type' at
+  ;; VALIDATE (ref.wast's assert_invalid batch).
   (let ((os (%outcomes
              "(assert_invalid
                 (module (type (func (param (ref 1)))) )
                 \"unknown type\")")))
-    (wasmdown.test:is (equal '(:unsupported) os)))
-  ;; named-param carrier (type-equivalence ::0 shape): the module is
-  ;; GC-scope even though the param spelling is (param $r (ref $t1)).
+    (wasmdown.test:is (equal '(:pass) os)))
+  ;; named-param carrier (type-equivalence ::0 shape): implements.
   (let ((os (%outcomes
              "(module (type $t1 (func))
                 (func $f1 (param $r (ref $t1)) (call $f1 (local.get $r))))")))
-    (wasmdown.test:is (equal '(:unsupported) os))))
+    (wasmdown.test:is (equal '(:pass) os))))
 
-(wasmdown.test:test wast/binary-gc-valtype-section-unsupported
-  ;; Regression (loop 16): binary.wast ::127's type section uses the GC
-  ;; typed-ref valtype forms (0x63 (ref null x) / 0x64 (ref x)) inside a
-  ;; functype. The decoder reports 'unknown type form 0x63' at DECODE,
-  ;; which misclassified the assert_invalid fixture as a phase FAIL;
-  ;; these bytes are GC scope and must classify :unsupported before
-  ;; the decode pipeline runs.
+(wasmdown.test:test wast/binary-typed-ref-valtype-decodable
+  ;; Loop 19: 0x63/0x64 typed-ref valtype bytes are DECODABLE (0x63 =
+  ;; (ref null ht), 0x64 = (ref ht); heap = s33, positive is a typeuse
+  ;; index, negatives are abstract heaps). The loop-16 pin asserted
+  ;; :unsupported for 0x63 (honest then: decode crashed). binary.wast
+  ;; ::127's shape — a huge positive typeuse in a functype param —
+  ;; now decodes and fails 'unknown type' at VALIDATE, the fixture's
+  ;; own expected phase.
   (let ((os (%outcomes
              "(assert_invalid
                 (module binary
@@ -246,7 +246,7 @@
                   \"\\01\\0a\\01\"
                   \"\\60\\01\\63\\80\\80\\80\\80\\08\\00\")
                 \"unknown type\")")))
-    (wasmdown.test:is (equal '(:unsupported) os))))
+    (wasmdown.test:is (equal '(:pass) os))))
 
 (wasmdown.test:test wast/table-init-expr-parses
   ;; Regression (loop 16, cluster 2): the WAT extended table
@@ -774,20 +774,36 @@
       (wasmdown.test:is (equal (wasmdown.types:wasm-instr-imms instr)
                                '(:func 1))))))
 
-(wasmdown.test:test wast/return-call-ref-still-gc-unsupported
-  ;; return_call_ref (typed function references) is OUT of the engine
-  ;; slice: with the TAIL-CALLS arm gone (return_call/return_call_
-  ;; indirect are implemented), the call_ref-family token keeps
-  ;; return_call_ref.wast's modules honestly classified :unsupported
-  ;; via the GC arm — never a decode-phase fail.
+(wasmdown.test:test wast/return-call-ref-implemented
+  ;; Loop 19: return_call_ref is IMPLEMENTED (typing: the ref operand
+  ;; must be <: (ref null? $t) for the instruction's typeuse; results
+  ;; must EQUAL the caller's declared results; interp goes through
+  ;; the loop-18 tail-call trampoline). The positive shape declares
+  ;; the callee (type $t) so ref.func's static type matches the
+  ;; typeuse (spec: ref.func : (ref <callee-typeidx>) — an undeclared
+  ;; func's auto-type would mismatch $t, honestly assert_invalid).
   (let ((os (%outcomes
-             "(module (type $t (func))
+             "(module (type $t (func (result i32)))
                       (elem declare func $f)
-                      (func $f (result (ref $t)) (ref.func $f))
+                      (func $f (type $t) (result i32) (i32.const 7))
                       (func (export \"g\") (result i32)
                         (return_call_ref $t (ref.func $f))))
-              (invoke \"g\")")))
-    (wasmdown.test:is (equal '(:unsupported :unsupported) os))))
+              (assert_return (invoke \"g\") (i32.const 7))")))
+    (wasmdown.test:is (equal '(:pass :pass) os))
+    ;; the mismatched-typeuse shape rejects: the callee's signature
+    ;; DIFFERS from $t ((result i64) vs (result i32)) — find-or-add
+    ;; gives it a distinct typeidx, so ref.func's (ref (:type 1)) is
+    ;; not <: (ref null (:type 0)). (An identical signature would
+    ;; DEDUP onto $t's index and validate — not a mismatch.)
+    (let ((os2 (%outcomes
+                "(assert_invalid
+                   (module (type $t (func (result i32)))
+                     (elem declare func $f)
+                     (func $f (result i64) (i64.const 7))
+                     (func (export \"g\") (result i32)
+                       (return_call_ref $t (ref.func $f))))
+                   \"type mismatch\")")))
+      (wasmdown.test:is (equal '(:pass) os2)))))
 
 (wasmdown.test:test wast/tag-import-type-mismatch
   ;; Loop 18 EH pin 1 (imports.wast shapes): tag imports type-match
@@ -914,3 +930,338 @@
               (assert_exhaustion (invoke \"fac-rec\" (i64.const 1073741824))
                                 \"call stack exhausted\")")))
     (wasmdown.test:is (equal '(:pass :pass) os))))
+
+;;; ================================================================
+;;; Loop 19, slice A pins: typed function references — text grammar,
+;;; validation lattice, definite initialization, the five opcodes.
+;;; Oracle: ref.wast, ref_null.wast, local_init.wast, call_ref.wast,
+;;; br_on_null.wast, br_on_non_null.wast, ref_as_non_null.wast,
+;;; select.wast, return_call_ref.wast.
+
+(wasmdown.test:test wast/typed-ref-grammar-accepts
+  ;; ref.wast module 0: the full (ref null? heaptype) grammar in param
+  ;; position — abstract heaps, typeuse indices (both spellings) and
+  ;; the null forms, mixed with the legacy keywords.
+  (let ((os (%outcomes
+             "(module (type $t (func))
+                (func (param funcref externref (ref func) (ref extern)
+                                  (ref 0) (ref $t) (ref 0) (ref $t)
+                                  (ref null func) (ref null extern)
+                                  (ref null 0) (ref null $t))))")))
+    (wasmdown.test:is (equal '(:pass) os)))
+  ;; ref.wast's 'unknown type' assert_invalid batch: every position
+  ;; (param/result/local/global/table/elem/blocktype/select) rejects
+  ;; an out-of-range typeuse heap at VALIDATION — the parser keeps
+  ;; the raw index, check-valtype reports it.
+  (let ((os (%outcomes
+             "(assert_invalid (module (type $a (func (param (ref 1))))) \"unknown type\")
+              (assert_invalid (module (type $a (func (result (ref 1))))) \"unknown type\")
+              (assert_invalid (module (global $g (ref null 1) (ref.null 1))) \"unknown type\")
+              (assert_invalid (module (table $t 10 (ref null 1))) \"unknown type\")
+              (assert_invalid (module (elem $e (ref 1))) \"unknown type\")
+              (assert_invalid (module (func $f (param (ref 1)))) \"unknown type\")
+              (assert_invalid (module (func $f (result (ref 1)))) \"unknown type\")
+              (assert_invalid (module (func $f (local (ref null 1)))) \"unknown type\")
+              (assert_invalid (module (func $f (drop (block (result (ref 1)) (unreachable))))) \"unknown type\")
+              (assert_invalid (module (func $f (drop (loop (result (ref 1)) (unreachable))))) \"unknown type\")
+              (assert_invalid (module (func $f (drop (if (result (ref 1)) (then) (else))))) \"unknown type\")
+              (assert_invalid (module (func $f (drop (select (result (ref 1)) (unreachable))))) \"unknown type\")")))
+    (wasmdown.test:is (every (lambda (o) (eq o :pass)) os))))
+
+(wasmdown.test:test wast/typed-ref-null-spellings
+  ;; ref_null.wast module 0 + module 1: every null spelling — the
+  ;; abstract heaps, the shorthand bottoms (nullref/nullfuncref/
+  ;; nullexternref/nullexnref/anyref), the typeuse forms, and the
+  ;; lattice flows ((ref.null nofunc) initializes a (ref null $t)
+  ;; global — the null bottom is below every typeuse in the bucket).
+  (let ((os (%outcomes
+             "(module (type $t (func))
+                (func (export \"anyref\") (result anyref) (ref.null any))
+                (func (export \"funcref\") (result funcref) (ref.null func))
+                (func (export \"exnref\") (result exnref) (ref.null exn))
+                (func (export \"externref\") (result externref) (ref.null extern))
+                (func (export \"ref\") (result (ref null $t)) (ref.null $t))
+                (global anyref (ref.null any))
+                (global funcref (ref.null func))
+                (global exnref (ref.null exn))
+                (global externref (ref.null extern))
+                (global (ref null $t) (ref.null $t)))")))
+    (wasmdown.test:is (equal '(:pass) os)))
+  (let ((os (%outcomes
+             "(module (type $t (func))
+                (global $null nullref (ref.null none))
+                (global $nullfunc nullfuncref (ref.null nofunc))
+                (global $nullexn nullexnref (ref.null noexn))
+                (global $nullextern nullexternref (ref.null noextern))
+                (func (export \"anyref\") (result anyref) (global.get $null))
+                (func (export \"nullref\") (result nullref) (global.get $null))
+                (func (export \"funcref\") (result funcref) (global.get $nullfunc))
+                (func (export \"ref\") (result (ref null $t)) (global.get $nullfunc))
+                (global anyref (ref.null any))
+                (global anyref (ref.null none))
+                (global funcref (ref.null func))
+                (global funcref (ref.null nofunc))
+                (global exnref (ref.null exn))
+                (global exnref (ref.null noexn))
+                (global externref (ref.null extern))
+                (global externref (ref.null noextern))
+                (global nullref (ref.null none))
+                (global nullfuncref (ref.null nofunc))
+                (global nullexnref (ref.null noexn))
+                (global nullexternref (ref.null noextern))
+                (global (ref null $t) (ref.null $t))
+                (global (ref null $t) (ref.null nofunc)))")))
+    (wasmdown.test:is (equal '(:pass) os))))
+
+(wasmdown.test:test wast/local-definite-init
+  ;; local_init.wast, the full battery: non-defaultable locals
+  ;; ((ref extern)) require PROVEN initialization before local.get;
+  ;; the ctrl-frame snapshot restores at every block end (a set inside
+  ;; a block is not proven after the join — $uninit-after-end; the
+  ;; if/else joins are as conservative as the entry — $uninit-in-else
+  ;; and $uninit-from-if), while sets/tees at the CURRENT level carry
+  ;; (get-after-set, get-after-tee, tee-init) and nested reads inside
+  ;; the same block see the set (get-in-block-after-set).
+  (let ((os (%outcomes
+             "(module
+                (func (export \"get-after-set\") (param $p (ref extern)) (result (ref extern))
+                  (local $x (ref extern))
+                  (local.set $x (local.get $p))
+                  (local.get $x))
+                (func (export \"get-after-tee\") (param $p (ref extern)) (result (ref extern))
+                  (local $x (ref extern))
+                  (drop (local.tee $x (local.get $p)))
+                  (local.get $x))
+                (func (export \"get-in-block-after-set\") (param $p (ref extern)) (result (ref extern))
+                  (local $x (ref extern))
+                  (local.set $x (local.get $p))
+                  (block (result (ref extern)) (local.get $x))))")))
+    (wasmdown.test:is (equal '(:pass) os)))
+  (dolist (script
+           '("(assert_invalid
+                (module (func $uninit (local $x (ref extern)) (drop (local.get $x))))
+                \"uninitialized local\")"
+             "(assert_invalid
+                (module (func $uninit-after-end (param $p (ref extern))
+                  (local $x (ref extern))
+                  (block (local.set $x (local.get $p)) (drop (local.tee $x (local.get $p))))
+                  (drop (local.get $x))))
+                \"uninitialized local\")"
+             "(assert_invalid
+                (module (func $uninit-in-else (param $p (ref extern))
+                  (local $x (ref extern))
+                  (if (i32.const 0)
+                    (then (local.set $x (local.get $p)))
+                    (else (local.get $x)))))
+                \"uninitialized local\")"
+             "(assert_invalid
+                (module (func $uninit-from-if (param $p (ref extern))
+                  (local $x (ref extern))
+                  (if (i32.const 0)
+                    (then (local.set $x (local.get $p)))
+                    (else (local.set $x (local.get $p))))
+                  (drop (local.get $x))))
+                \"uninitialized local\")"))
+    (wasmdown.test:is (eq :pass (first (%outcomes script)))))
+  (let ((os (%outcomes
+             "(module
+                (func (export \"tee-init\") (param $p (ref extern)) (result (ref extern))
+                  (local $x (ref extern))
+                  (drop (local.tee $x (local.get $p)))
+                  (local.get $x)))")))
+    (wasmdown.test:is (equal '(:pass) os))))
+
+(wasmdown.test:test wast/call-ref-typing
+  ;; call_ref.wast: the callee's ref operand must be <: (ref null? $t)
+  ;; for the instruction's OWN typeuse — ref.func's minimal type
+  ;; ((ref <callee-typeidx>) via vctx-func-typeidxs) flows into
+  ;; (ref $ii) locals/globals via the lattice, and a bare funcref (or
+  ;; externref) operand is REJECTED (funcref is the bucket's nullable
+  ;; TOP, not a subtype of a typeuse's ref).
+  (let ((os (%outcomes
+             "(module (type $ii (func (param i32) (result i32)))
+                (func $apply (param $f (ref $ii)) (param $x i32) (result i32)
+                  (call_ref $ii (local.get $x) (local.get $f)))
+                (func $f (type $ii) (i32.mul (local.get 0) (local.get 0)))
+                (func $g (type $ii) (i32.sub (i32.const 0) (local.get 0)))
+                (elem declare func $f $g))")))
+    (wasmdown.test:is (equal '(:pass) os)))
+  ;; local.set of ref.func into a (ref null $ii) local, then call_ref
+  ;; through it (call_ref.wast ::13-19's run shape).
+  (let ((os (%outcomes
+             "(module (type $ii (func (param i32) (result i32)))
+                (func $f (type $ii) (i32.mul (local.get 0) (local.get 0)))
+                (elem declare func $f)
+                (func (export \"run\") (param $x i32) (result i32)
+                  (local $rf (ref null $ii))
+                  (local.set $rf (ref.func $f))
+                  (call_ref $ii (local.get $x) (local.get $rf))))")))
+    (wasmdown.test:is (equal '(:pass) os)))
+  ;; the operand-rejection batch (::200-217).
+  (let ((os (%outcomes
+             "(assert_invalid
+                (module (type $t (func))
+                  (func $f (param $r funcref) (call_ref $t (local.get $r))))
+                \"type mismatch\")
+              (assert_invalid
+                (module (type $t (func))
+                  (func $f (param $r externref) (call_ref $t (local.get $r))))
+                \"type mismatch\")")))
+    (wasmdown.test:is (every (lambda (o) (eq o :pass)) os))))
+
+(wasmdown.test:test wast/typed-select-join
+  ;; select.wast join-funcnull: typed select's (result (ref null
+  ;; func)) joins ref.func's minimal type with ref.null func — both
+  ;; operands <: the declared result through the lattice.
+  (let ((os (%outcomes
+             "(module (type $t (func))
+                (func $tf) (elem declare func $tf)
+                (func (export \"join-funcnull\") (param i32) (result (ref null func))
+                  (select (result (ref null func))
+                    (ref.func $tf)
+                    (ref.null func)
+                    (local.get 0))))")))
+    (wasmdown.test:is (equal '(:pass) os))))
+
+(wasmdown.test:test wast/br-on-null-typing
+  ;; br_on_null: [t* (ref null ht)] -> [t* (ref ht)] fallthrough
+  ;; (the non-null view feeds the call_ref), branch label [t*]; both
+  ;; nullable and non-nullable operands accepted ((ref ht) <:
+  ;; (ref null ht)); gc#516: the label check runs through the full
+  ;; pop/push cycle, catching the two-funcref stack confusion.
+  (let ((os (%outcomes
+             "(module (type $t (func (result i32)))
+                (func $nn (param $r (ref $t)) (result i32)
+                  (block $l
+                    (return (call_ref $t (br_on_null $l (local.get $r)))))
+                  (i32.const -1))
+                (func $n (param $r (ref null $t)) (result i32)
+                  (block $l
+                    (return (call_ref $t (br_on_null $l (local.get $r)))))
+                  (i32.const -1))
+                (elem func $f)
+                (func $f (result i32) (i32.const 7)))")))
+    (wasmdown.test:is (equal '(:pass) os)))
+  (let ((os (%outcomes
+             "(assert_invalid
+                (module (type $t (func))
+                  (func $f (param (ref null $t)) (result funcref) (local.get 0))
+                  (func (param funcref) (result funcref)
+                    (ref.null $t)
+                    (local.get 0)
+                    (br_on_null 0)
+                    (drop)
+                    (call $f)))
+                \"type mismatch\")")))
+    (wasmdown.test:is (equal '(:pass) os))))
+
+(wasmdown.test:test wast/br-on-non-null-typing
+  ;; br_on_non_null: [t* (ref null ht)] -> [t*] fallthrough, branch
+  ;; label [t* (ref ht)] — the label's LAST slot is the operand's
+  ;; non-null view (a block (result (ref $t)) with nothing else on
+  ;; the stack validates); gc#516's two-funcref mirror.
+  (let ((os (%outcomes
+             "(module (type $t (func (result i32)))
+                (func $nn (param $r (ref $t)) (result i32)
+                  (call_ref $t
+                    (block $l (result (ref $t))
+                      (br_on_non_null $l (local.get $r))
+                      (return (i32.const -1)))))
+                (func $n (param $r (ref null $t)) (result i32)
+                  (call_ref $t
+                    (block $l (result (ref $t))
+                      (br_on_non_null $l (local.get $r))
+                      (return (i32.const -1)))))
+                (elem func $f)
+                (func $f (result i32) (i32.const 7)))")))
+    (wasmdown.test:is (equal '(:pass) os)))
+  (let ((os (%outcomes
+             "(assert_invalid
+                (module (type $t (func))
+                  (func $f (param (ref null $t)) (result funcref) (local.get 0))
+                  (func (param funcref) (result funcref funcref)
+                    (ref.null $t)
+                    (local.get 0)
+                    (br_on_non_null 0)
+                    (call $f)
+                    (local.get 0)))
+                \"type mismatch\")")))
+    (wasmdown.test:is (equal '(:pass) os))))
+
+(wasmdown.test:test wast/ref-as-non-null-typing
+  ;; ref.as_non_null: [(ref null ht)] -> [(ref ht)]; a null operand
+  ;; trapped (interp); the (ref.null $t)-into-(ref $t)-param mismatch
+  ;; rejects at VALIDATION.
+  (let ((os (%outcomes
+             "(module (type $t (func (result i32)))
+                (func $nn (param $r (ref $t)) (result i32)
+                  (call_ref $t (ref.as_non_null (local.get $r))))
+                (func $n (param $r (ref null $t)) (result i32)
+                  (call_ref $t (ref.as_non_null (local.get $r))))
+                (elem func $f)
+                (func $f (result i32) (i32.const 7)))")))
+    (wasmdown.test:is (equal '(:pass) os)))
+  (let ((os (%outcomes
+             "(assert_invalid
+                (module (type $t (func (result i32)))
+                  (func $g (param $r (ref $t)) (drop (ref.as_non_null (local.get $r))))
+                  (func (call $g (ref.null $t))))
+                \"type mismatch\")")))
+    (wasmdown.test:is (equal '(:pass) os)))
+  ;; the abstract-heap forms (ref func)/(ref extern) with nullable
+  ;; operands (ref_as_non_null.wast ::41-46).
+  (let ((os (%outcomes
+             "(module (type $t (func))
+                (func (param $r (ref $t)) (drop (ref.as_non_null (local.get $r))))
+                (func (param $r (ref func)) (drop (ref.as_non_null (local.get $r))))
+                (func (param $r (ref extern)) (drop (ref.as_non_null (local.get $r)))))")))
+    (wasmdown.test:is (equal '(:pass) os))))
+
+(wasmdown.test:test wast/return-call-ref-result-lattice
+  ;; return_call_ref: the callee's results must be SUBTYPES of the
+  ;; caller's declared results (return_call_ref.wast ::213-228's
+  ;; t1/t2/t3/t4 lattice batch — (ref $t) results flow into (ref null
+  ;; $t) and (ref null func) callers), the arity/i64-vs-i32 mismatches
+  ;; reject, and a funcref operand rejects like call_ref's.
+  (let ((os (%outcomes
+             "(module (type $t (func))
+                (type $t1 (func (result (ref $t))))
+                (type $t2 (func (result (ref null $t))))
+                (type $t3 (func (result (ref func))))
+                (type $t4 (func (result (ref null func))))
+                (elem declare func $f11 $f22 $f33 $f44)
+                (func $f11 (result (ref $t)) (return_call_ref $t1 (ref.func $f11)))
+                (func $f21 (result (ref null $t)) (return_call_ref $t1 (ref.func $f11)))
+                (func $f22 (result (ref null $t)) (return_call_ref $t2 (ref.func $f22)))
+                (func $f31 (result (ref func)) (return_call_ref $t1 (ref.func $f11)))
+                (func $f33 (result (ref func)) (return_call_ref $t3 (ref.func $f33)))
+                (func $f41 (result (ref null func)) (return_call_ref $t1 (ref.func $f11)))
+                (func $f42 (result (ref null func)) (return_call_ref $t2 (ref.func $f22)))
+                (func $f43 (result (ref null func)) (return_call_ref $t3 (ref.func $f33)))
+                (func $f44 (result (ref null func)) (return_call_ref $t4 (ref.func $f44))))")))
+    (wasmdown.test:is (equal '(:pass) os)))
+  (let ((os (%outcomes
+             "(assert_invalid
+                (module (type $t (func))
+                  (type $t2 (func (result (ref null $t))))
+                  (elem declare func $f22)
+                  (func $f12 (result (ref $t)) (return_call_ref $t2 (ref.func $f22)))
+                  (func $f22 (result (ref null $t)) (return_call_ref $t2 (ref.func $f22))))
+                \"type mismatch\")
+              (assert_invalid
+                (module (type $type-result-more (func (result i32 i32)))
+                  (func $type-result-more (param (ref $type-result-more)) (result i32)
+                    local.get 0
+                    return_call_ref $type-result-more))
+                \"type mismatch\")
+              (assert_invalid
+                (module (type $type-result-i64-vs-i32 (func (result i64)))
+                  (func $f (param (ref $type-result-i64-vs-i32)) (result i32)
+                    local.get 0
+                    return_call_ref $type-result-i64-vs-i32))
+                \"type mismatch\")
+              (assert_invalid
+                (module (type $t (func))
+                  (func $f (param $r funcref) (return_call_ref $t (local.get $r))))
+                \"type mismatch\")")))
+    (wasmdown.test:is (every (lambda (o) (eq o :pass)) os))))

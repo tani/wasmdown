@@ -875,6 +875,52 @@ args, apply, and throw to the function frame exactly like :return."
        (push (if v 0 1) s1)))
     ((eq op :ref.func)
      (push (%func-at (getf imms :func)) s))
+    ;; ---- typed function references (Core 3.0) ----
+    ((eq op :ref.as-non-null)
+     ;; pop the ref; null traps, non-null pushes back. The static
+     ;; type narrows to the non-null ref — the VALUE is unchanged.
+     (multiple-value-bind (v s1) (pop-val s)
+       (when (null v)
+         (%trap :null-reference "null function reference"))
+       (push v s1)))
+    ((eq op :br-on-null)
+     ;; pop the ref: NULL -> branch to the label WITHOUT it (the
+     ;; label receives only the below values); non-null -> push back
+     ;; and continue.
+     (multiple-value-bind (v s1) (pop-val s)
+       (if (null v)
+           (progn (%br-depth-throw (getf imms :label) s1 block-stack)
+                  (%trap :unreachable "br_on_null fell through"))
+           (push v s1))))
+    ((eq op :br-on-non-null)
+     ;; pop the ref: NON-null -> branch to the label WITH it on top
+     ;; of the below values; null -> continue without it.
+     (multiple-value-bind (v s1) (pop-val s)
+       (if (null v)
+           s1
+           (progn (%br-depth-throw (getf imms :label) (cons v s1)
+                                   block-stack)
+                  (%trap :unreachable "br_on_non_null fell through")))))
+    ((eq op :call-ref)
+     ;; call_ref: params below, the callee ref ON TOP. A null ref
+     ;; traps :null-reference ('null function reference',
+     ;; call_ref.wast); a :host callee cannot appear (its ref would
+     ;; need a typed funcref, but host funcs carry the legacy shape —
+     ;; still, dispatch like %DO-CALL does for safety).
+     (multiple-value-bind (ref s1) (pop-val s)
+       (unless (wasmdown.runtime:func-instance-p ref)
+         (%trap :null-reference "null function reference"))
+       (%do-call ref s1)))
+    ((eq op :return-call-ref)
+     ;; return_call_ref: pop the ref (params below), trap on null,
+     ;; then unwind to the tail-call trampoline like
+     ;; return_call/return_call_indirect (loop 18's protocol).
+     (multiple-value-bind (ref s1) (pop-val s)
+       (unless (wasmdown.runtime:func-instance-p ref)
+         (%trap :null-reference "null function reference"))
+       (if (eq (wasmdown.runtime:func-instance-kind ref) :host)
+           (%do-tail-host ref s1)
+           (%do-tail-call ref s1))))
     ;; ---- table ----
     ((eq op :table.get)
      (multiple-value-bind (idx s1) (pop-val s)
@@ -983,12 +1029,22 @@ args, apply, and throw to the function frame exactly like :return."
 ;;; at the top of this file.
 
 (defun %default-value (valtype)
+  "The default value of VALTYPE. Typed refs default to null when
+NULLABLE; a NON-NULLABLE typed ref has no default — but the
+definite-initialization validator (wasmdown.validate) guarantees a
+local.set covers every local.get of one, so %LOCALS-VECTOR's binding
+of nil is never OBSERVED through validated code. local_init.wast's
+'uninitialized local' cases fail at VALIDATE, never here."
   (case valtype
     (:i32 0) (:i64 0)
     (:f32 (f32-from-bits 0)) (:f64 (f64-from-bits 0))
     (:funcref nil) (:externref nil)
     ;; EH (Core 3.0): exnref is nullable; its default is null.
     (:exnref nil)
+    ;; typed refs (Core 3.0): the null bottom in every heap bucket;
+    ;; nullable or not the RUNTIME value is nil (a typed ref value is
+    ;; just a func-instance / host object / nil — the TYPING is
+    ;; static).
     (t (if (and (consp valtype) (eq (first valtype) :ref))
             nil
             (%trap :unreachable "no default for type ~a" valtype)))))

@@ -80,16 +80,20 @@ individual arguments returning a results list."
 
 (defstruct (table-instance (:constructor %make-table-instance))
   "A table of references; ELEMS is a simple vector of func-instances /
-host objects / NIL (null ref)."
+host objects / NIL (null ref). TYPE is the element reftype: a legacy
+keyword (:funcREF/:externref/:exnref) or a typed-ref cons
+\(:REF [NULL] HEAP) — typed function references, Core 3.0."
   (elems (make-array 0) :type simple-vector)
-  (type :funcref :type keyword)
+  (type :funcref)
   (max *max-table-size* :type (integer 0))
   (has-max-p nil :type boolean))
 
 (defstruct (global-instance (:constructor %make-global-instance))
+  "A global. TYPE is the valtype — keyword or typed-ref cons
+\(:REF [NULL] HEAP), Core 3.0 function references."
   (value 0)
   (mutable nil :type boolean)
-  (type :i32 :type keyword))
+  (type :i32))
 
 (defstruct (elem-seg-state (:constructor make-elem-seg-state))
   "Element segment state: dropped segments retain no contents (they
@@ -425,7 +429,10 @@ Elements initialize to the null reference (NIL)."
                  (wasm-import-module import) (wasm-import-field import)
                  (type-of value)))
   (let ((expected (wasm-import-type import)))
-    (unless (eq (wasm-table-type expected) (table-instance-type value))
+    ;; spec: import matching on the element type is EQUALITY in this
+    ;; slice (table types match by equal reftype; the cons typed-ref
+    ;; forms compare structurally, legacy keywords by eq).
+    (unless (equal (wasm-table-type expected) (table-instance-type value))
       (%link-error "import ~a.~a: table element type mismatch"
                    (wasm-import-module import) (wasm-import-field import)))
     (unless (%limits-match-p (wasm-table-limits expected)
@@ -447,18 +454,34 @@ Elements initialize to the null reference (NIL)."
     (%link-error "import ~a.~a: memory limits mismatch"
                  (wasm-import-module import) (wasm-import-field import))))
 
-(defun %check-global-import (import value)
+(defun %check-global-import (import value module)
+  "Global import matching: kind, then type. IMMUTABLE globals match
+COVARIANTLY (provided <: declared — linking.wast's (ref func)
+provided < (ref null func) declared); MUTABLE must be EQUAL. MODULE
+is the raw wasm-module being linked (the importer); its types
+vector serves the abstract-heap subtyping cases."
   (unless (global-instance-p value)
     (%link-error "import ~a.~a: expected a global, got ~s"
                  (wasm-import-module import) (wasm-import-field import)
                  (type-of value)))
-  (let* ((spec (wasm-import-type import))   ; (valtype . mutable-p)
-         (type (car spec))
-         (mutable (cdr spec)))
-    (unless (and (eq type (global-instance-type value))
+  (let* ((spec (wasm-import-type import))     ; (valtype . mutable-p)
+         (declared (car spec))
+         (mutable (cdr spec))
+         (actual (global-instance-type value))
+         (import-reftype-p (lambda (t_)
+                             (or (member t_ '(:funcref :externref :exnref))
+                                 (and (consp t_)
+                                      (wasmdown.types:typed-ref-p t_))))))
+    (unless (and (or (equal actual declared)
+                     (and (not mutable)
+                          (funcall import-reftype-p actual)
+                          (funcall import-reftype-p declared)
+                          (wasmdown.types:reftype-sub-p
+                           actual declared (wasm-module-types module))))
                  (eq mutable (global-instance-mutable value)))
       (%link-error "import ~a.~a: global type or mutability mismatch"
-                   (wasm-import-module import) (wasm-import-field import)))))
+                   (wasm-import-module import)
+                   (wasm-import-field import)))))
 
 (defun %check-tag-import (import value module)
   "Tag imports match by functype equality (spec external type of a
@@ -485,7 +508,7 @@ tag: its type's params only, results being empty by construction).
     (:func (%check-func-import import value module))
     (:table (%check-table-import import value))
     (:memory (%check-memory-import import value))
-    (:global (%check-global-import import value))
+    (:global (%check-global-import import value module))
     (:tag (%check-tag-import import value module))
     (t (%link-error "unknown import kind ~a" (wasm-import-kind import)))))
 

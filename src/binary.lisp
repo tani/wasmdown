@@ -196,7 +196,16 @@ degrade to a simple-vector (data-seg-state's slot type)."
         (coerce (mapcar #'code-char (nreverse code-points)) 'string)))))
 
 ;;; ---------------------------------------------------------------
-;;; Value types, block types, limits, heaptype (funcref/externref only).
+;;; Value types, block types, limits, heaptype.
+;;;
+;;; Typed function references (Core 3.0, the gc-less function-
+;;; references subset): valtype bytes 0x64 (ref ht) and 0x63
+;;; (ref null ht), heap types as the abstract single bytes (0x70
+;;; func .. 0x74 noexn, identical to the absheaptype encodings of
+;;; binary/types.html) or a positive s33 typeuse -> (:TYPE N). The
+;;; struct/array/i31/eq abstract heaps (0x6A/0x6B/0x6C/0x6D) stay
+;;; out of scope: they decode-error here (the wast classifier marks
+;;; those modules :unsupported before decode).
 
 (defun %read-valtype (r)
   (let ((b (read-byte-at r)))
@@ -206,6 +215,11 @@ degrade to a simple-vector (data-seg-state's slot type)."
       ;; EH (Core 3.0): exnref 0x69 in valtype position
       ;; (ref_null.wast's binary mirror of (ref.null exn)).
       (#x69 :exnref)
+      ;; typed refs: 0x64 (ref ht), 0x63 (ref null ht) — the byte
+      ;; order pinned by binary/types.html (0x63 = ref null ht,
+      ;; 0x64 = ref ht) and elem.wast ::458's "\64\70" = (ref func).
+      (#x64 (list :ref (%read-heaptype r)))
+      (#x63 (list :ref 'null (%read-heaptype r)))
       (t (%decode-error r "unknown type form 0x~x" b)))))
 
 (defun %read-reftype (r)
@@ -214,22 +228,50 @@ degrade to a simple-vector (data-seg-state's slot type)."
       (#x70 :funcref) (#x6f :externref)
       ;; EH (Core 3.0): table/global element type exnref (0x69).
       (#x69 :exnref)
+      ;; typed refs in table/elem element position: 0x64/0x63
+      ;; (elem.wast ::458's table byte stream "\40\00\64\70").
+      (#x64 (list :ref (%read-heaptype r)))
+      (#x63 (list :ref 'null (%read-heaptype r)))
       (t (%decode-error r "unknown type form 0x~x" b)))))
 
 (defun %read-heaptype (r)
-  "For ref.null: the shorthand heap types of this slice, plus EH's
-exn (0x69) — ref_null.wast's (ref.null exn) binary form."
-  (let ((b (read-byte-at r)))
+  "A heap type: the abstract single bytes of this slice's lattice
+(func/extern/exn/any/none/nofunc/noextern/noexn) or a positive s33
+typeuse index -> (:TYPE N). The struct/array/i31/eq bytes are NOT in
+this slice. A negative multi-byte s33 (malformed abstract heap) is a
+decode error; the single abstract bytes ARE minimal negative s33
+encodings (0x70 = -16, 0x6f = -17, ... one's complement), so the
+byte case catches them before the s33 read."
+  (let ((start (reader-offset r))
+        (b (peek-byte-at r)))
     (case b
-      (#x70 :funcref) (#x6f :externref)
-      (#x69 :exnref)
-      (t (%decode-error r "unknown type form 0x~x" b)))))
+      ;; abstract heap types: single bytes that ARE minimal negative
+      ;; s33 encodings (0x70 = -16 = one's complement). Peek then
+      ;; consume — the byte case fires only on the exact byte, so the
+      ;; s33 read below never sees a partially-consumed LEB.
+      (#x70 (read-byte-at r) :func)
+      (#x6f (read-byte-at r) :extern)
+      (#x69 (read-byte-at r) :exn)
+      (#x6e (read-byte-at r) :any)
+      (#x71 (read-byte-at r) :none)
+      (#x73 (read-byte-at r) :nofunc)
+      (#x72 (read-byte-at r) :noextern)
+      (#x74 (read-byte-at r) :noexn)
+      (t
+       (let ((n (read-s33 r)))
+         (if (>= n 0)
+             (list :type n)
+             ;; binary.wast ::1241's (ref null 0x8000_0000) decodes
+             ;; fine here; 'unknown type' surfaces at VALIDATE.
+             ;; A negative multi-byte s33 (binary.wast ::1250) is a
+             ;; malformed abstract heap: decode error.
+             (decode-error-at start "unknown type form 0x~x" b)))))))
 
 (defun %read-blocktype (r)
   "NIL (empty), a valtype, or (:typeidx . n)."
   (let ((b (peek-byte-at r)))
     (cond ((= b #x40) (read-byte-at r) nil)
-          ((member b '(#x7f #x7e #x7d #x7c #x70 #x6f #x69))
+          ((member b '(#x7f #x7e #x7d #x7c #x70 #x6f #x69 #x63 #x64))
            (%read-valtype r))
           (t
            (let ((start (reader-offset r))
@@ -268,7 +310,7 @@ forms are rejected as decode-error."
   #(
     :unreachable :nop nil nil nil :else nil nil   ; 0x00-0x07
     nil nil :throw-ref nil :br :br-if :br-table :return   ; 0x08-0x0F (0x0A throw_ref, EH)
-    :call :call-indirect nil nil nil nil nil nil   ; 0x10-0x17
+    :call :call-indirect :call-ref :return-call-ref nil nil nil nil   ; 0x10-0x17 (0x14/0x15 typed refs)
     nil nil :drop :select nil nil nil nil   ; 0x18-0x1F
     :local.get :local.set :local.tee :global.get :global.set :table.get :table.set nil   ; 0x20-0x27
     :i32.load :i64.load :f32.load :f64.load :i32.load8_s :i32.load8_u :i32.load16_s :i32.load16_u   ; 0x28-0x2F
@@ -292,7 +334,13 @@ forms are rejected as decode-error."
     :f64.convert_i32_u :f64.convert_i64_s :f64.convert_i64_u :f64.promote_f32 :i32.reinterpret_f32 :i64.reinterpret_f64 :f32.reinterpret_i32 :f64.reinterpret_i64   ; 0xB8-0xBF
     :i32.extend8_s :i32.extend16_s :i64.extend8_s :i64.extend16_s :i64.extend32_s nil nil nil   ; 0xC0-0xC7
     nil nil nil nil nil nil nil nil   ; 0xC8-0xCF
-    :ref.null :ref.is-null :ref.func))
+    ;; 0xD0-0xD6: ref.null carries a heaptype immediate, ref.is_null
+    ;; and ref.func (funcidx) have dedicated clauses; 0xD3 ref.eq is
+    ;; GC scope (nil here, unknown-opcode error at decode);
+    ;; 0xD4-0xD6 sit in the table so the ENCODER's reverse lookup
+    ;; finds them (their decoder clauses match first).
+    :ref.null :ref.is-null :ref.func nil :ref.as-non-null
+    :br-on-null :br-on-non-null))
 
 (defun %simple-op (byte)
   (and (< byte (length *simple-ops*)) (svref *simple-ops* byte)))
@@ -461,11 +509,26 @@ markers (keywords) for the block terminators."
           #xB3 #xB4 #xB5 #xB6 #xB7 #xB8 #xB9 #xBA #xBB #xBC #xBD
           #xBE #xBF #xC0 #xC1 #xC2 #xC3 #xC4)
          (mk (%simple-op b) nil))
-        ((#xD0 #xD1 #xD2)
+        ((#xD0 #xD1 #xD2 #xD4 #xD5 #xD6)
+         ;; typed function references (Core 3.0 binary format,
+         ;; instructions.html): ref.as_non_null 0xD4 (no imm),
+         ;; br_on_null 0xD5 / br_on_non_null 0xD6 (labelidx u32);
+         ;; call_ref 0x14 / return_call_ref 0x15 are DEDICATED top
+         ;; bytes (not 0xFC sub-opcodes) — see the 0x14/0x15 clauses.
+         ;; ref.eq 0xD3 stays GC scope (unimplemented, falls to the
+         ;; unknown-opcode error below).
          (case b
            (#xD0 (mk :ref.null (list :type (%read-heaptype r))))
            (#xD1 (mk :ref.is-null nil))
-           (#xD2 (mk :ref.func (list :func (read-u32 r))))))
+           (#xD2 (mk :ref.func (list :func (read-u32 r))))
+           (#xD4 (mk :ref.as-non-null nil))
+           (#xD5 (mk :br-on-null (list :label (read-u32 r))))
+           (#xD6 (mk :br-on-non-null (list :label (read-u32 r))))))
+        ((#x14 #x15)
+         ;; call_ref 0x14 / return_call_ref 0x15: typeidx u32
+         ;; immediate (Core 3.0 moved these OFF the 0xFC prefix).
+         (mk (if (= b #x14) :call-ref :return-call-ref)
+             (list :type (read-u32 r))))
         (#xFC
          (let ((sub (read-u32 r)))
            (case sub
@@ -578,10 +641,52 @@ terminating :end, which IS included in the result. R is a reader."
   (read-vec r #'read-u32 "function"))
 
 (defun %read-table-section (r)
-  (read-vec r
-            (lambda (r)
-              (make-wasm-table (%read-reftype r) (%read-limits r)))
-            "table"))
+  "Table entries: plain tabletype (reftype limits), or the Core 3.0
+extended form 0x40 0x00 + tabletype + init EXPR — elem.wast ::458's
+'\40\00\64\70\00\01\d2\00\0b' = (table 1 (ref func) (ref.func 0)).
+The extended form desugars exactly like the WAT (table n reft expr):
+an ACTIVE elem segment [expr x min] at offset 0, marked
+from-table-init (imported-globals-only const rule at validate).
+Returns (values tables-list desugared-elems-list)."
+  (let ((tables '()) (elems '()))
+    (read-vec r
+              (lambda (r)
+                (if (and (= (peek-byte-at r) #x40)
+                         ;; disambiguate: 0x40 could start a reftype?
+                         ;; No — 0x40 is not a reftype byte; the plain
+                         ;; form starts with the reftype itself.
+                         t)
+                    (let ((start (reader-offset r)))
+                      (read-byte-at r)                   ; 0x40
+                      (let ((flags (read-byte-at r)))
+                        (unless (zerop flags)
+                          (decode-error-at start
+                                           "malformed table entry flags 0x~x"
+                                           flags)))
+                      (let* ((rt (%read-reftype r))
+                             (limits (%read-limits r))
+                             (expr (decode-instr-seq r)))
+                        (push (make-wasm-table rt limits) tables)
+                        ;; active elem at offset 0, [expr x min]
+                        (push (make-wasm-elem
+                               (list :active (length tables)
+                                     (vector
+                                      (make-wasm-instr :i32.const
+                                                       (list :value 0) #()
+                                                       (reader-offset r))
+                                      (make-wasm-instr :end nil #()
+                                                       (reader-offset r))))
+                               rt
+                               (loop repeat (wasm-limits-min limits)
+                                     collect expr)
+                               t)
+                              elems)))
+                    (let ((tab (make-wasm-table (%read-reftype r)
+                                                 (%read-limits r))))
+                      (push tab tables))))
+              "table")
+    (values (coerce (nreverse tables) 'vector)
+            (nreverse elems))))
 
 (defun %read-mem-section (r)
   (read-vec r
@@ -641,19 +746,27 @@ vectors (the wasm-elem contract; runtime/validate iterate with IN)."
                   (0 (let ((expr (decode-instr-seq r)))
                        ;; flags 0: implicit funcref elemkind is NOT
                        ;; in the byte stream (reference decoder:
-                       ;; active_zero then vec(elem_index) directly)
-                       (make-wasm-elem (list :active 0 expr) :funcref
+                       ;; active_zero then vec(elem_index) directly).
+                       ;; :ELEMKIND-FUNC (not :funcref): the funcidx
+                       ;; form's marker — the TEXT parser emits the
+                       ;; same one for the mirrored form (elem.wast
+                       ;; ::448-497's text/binary pairs), so
+                       ;; encode/decode round-trips stay EQUALP and
+                       ;; validate re-types it by the target table.
+                       (make-wasm-elem (list :active 0 expr)
+                                       :elemkind-func
                                        (%elem-funcidx-inits r))))
                   (1 (%read-elemkind r)
-                     (make-wasm-elem (list :passive) :funcref
+                     (make-wasm-elem (list :passive) :elemkind-func
                                      (%elem-funcidx-inits r)))
                   (2 (let ((table (read-u32 r))
                            (expr (decode-instr-seq r)))
                        (%read-elemkind r)
-                       (make-wasm-elem (list :active table expr) :funcref
+                       (make-wasm-elem (list :active table expr)
+                                       :elemkind-func
                                        (%elem-funcidx-inits r))))
                   (3 (%read-elemkind r)
-                     (make-wasm-elem (list :declarative) :funcref
+                     (make-wasm-elem (list :declarative) :elemkind-func
                                      (%elem-funcidx-inits r)))
                   (4 (let ((expr (decode-instr-seq r)))
                        (make-wasm-elem (list :active 0 expr) :funcref
@@ -815,7 +928,12 @@ wasmdown:decode-error (with :offset) on any malformation."
                (1 (setf types (%read-type-section r)))
                (2 (setf imports (%read-import-section r)))
                (3 (setf func-typeidxs (%read-func-section r)))
-               (4 (setf tables (%read-table-section r)))
+               (4 (multiple-value-bind (tabs desugared)
+                      (%read-table-section r)
+                    (setf tables tabs)
+                    (when desugared
+                      (setf elems (concatenate 'vector elems
+                                               (coerce desugared 'vector))))))
                (5 (setf mems (%read-mem-section r)))
                (6 (setf globals (%read-global-section r)))
                (7 (setf exports (%read-export-section r)))
