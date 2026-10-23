@@ -517,3 +517,25 @@ EQUALP (canonical-encode agreement oracle)."
    (%wat "(module (type $s (func (param i32 f64 i32) (result i32 f64 i32))) (func (i32.const 0) (f64.const 0) (i32.const 0) (loop (type $s) (param i32) (param f64 i32) (result i32 f64) (result i32)) (drop) (drop) (drop)))"))
   (wasmdown:validate-module
    (%wat "(module (type $p (func)) (table 1 funcref) (func (block (call_indirect (type $p) (param) (result) (i32.const 0)))))")))
+
+(wasmdown.test:test text/ref-is-null-keyword
+  ;; Regression (loop 8): %kw interned ref.is_null VERBATIM as
+  ;; :REF.IS_NULL while every consumer (binary decoder, validator,
+  ;; interp, codegen) dispatches on the hyphenated :ref.is-null —
+  ;; table_get.wast's whole module-0 failed validation with
+  ;; 'unknown opcode REF.IS_NULL'. Structured-op hyphenation
+  ;; (CONTRACTS.md) must cover ref.is_null like br_if/br_table/
+  ;; call_indirect.
+  (let* ((m (%round-trip
+             "(module (table $t 1 externref)
+                        (func (export \"n\") (param $i i32) (result i32)
+                          (ref.is_null (table.get $t (local.get $i)))))"))
+         (ops (map 'list #'wasm-instr-op (%instrs m 0))))
+    (wasmdown.test:is (find :ref.is-null ops :test #'eq))
+    (wasmdown.test:is (not (find :ref.is_null ops :test #'eq))))
+  ;; the whole (minimal) table_get shape validates + executes
+  (let ((inst (wasmdown:instantiate
+               (%wat "(module (table $t 2 externref)
+                        (func (export \"g\") (param $i i32) (result i32)
+                          (ref.is_null (table.get $t (local.get $i)))))"))))
+    (wasmdown.test:is (equal '(1) (wasmdown:invoke inst "g" 0)))))

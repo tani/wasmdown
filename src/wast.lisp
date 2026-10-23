@@ -1078,8 +1078,22 @@ per docs/CONTRACTS.md (i32/i64 unsigned, f32/f64 floats, refs)."
             do (let ((directive (%expected-to-lisp e)))
                  (unless (%value-matches a directive)
                    (return (values nil
-                                  (format nil "result ~a: got ~s" i a)))))
+                                  (format nil "result ~a: got ~a"
+                                          i (%opaque-value a))))))
             finally (return (values t "ok")))))
+
+(defun %opaque-value (v)
+  "A cycle-safe printable form of a result value. Runtime objects
+(func-instances, module-instances) contain backpointers — printing
+the structure itself recurses forever without *print-circle*. Print
+an opaque type tag; numbers/floats print verbatim."
+  (typecase v
+    (wasmdown.runtime:func-instance "#<func-instance>")
+    (wasmdown.runtime:module-instance "#<module-instance>")
+    (wasmdown.runtime:memory-instance "#<memory-instance>")
+    (wasmdown.runtime:table-instance "#<table-instance>")
+    (wasmdown.runtime:global-instance "#<global-instance>")
+    (t v)))
 
 ;;; ---------------------------------------------------------------
 ;;; Trap-kind mapping from assertion messages.
@@ -1162,16 +1176,19 @@ module text out of assertion forms).")
   "Execute a .wast script (string or pathname) against fresh state.
 Returns the list of wast-result records, one per command. STREAM, when
 given, receives a JSONL line per result (PLAN.md 12.8)."
-  (let* ((text (if (pathnamep source)
-                   (with-open-file (s source :external-format :utf-8)
-                     (let ((out (make-string-output-stream)))
-                       (loop for c = (read-char s nil nil)
-                             while c do (write-char c out))
-                       (get-output-stream-string out)))
-                   source))
-         (state (make-wast-state
-                  :spectest (make-spectest-instance)))
-         (results '()))
+  (let ((*print-circle* t)
+        (*print-level* 4)
+        (*print-length* 8))
+    (let* ((text (if (pathnamep source)
+                     (with-open-file (s source :external-format :utf-8)
+                       (let ((out (make-string-output-stream)))
+                         (loop for c = (read-char s nil nil)
+                               while c do (write-char c out))
+                         (get-output-stream-string out)))
+                     source))
+           (state (make-wast-state
+                    :spectest (make-spectest-instance)))
+           (results '()))
     (let ((*script-source* text)
           (*current-wast-state* state)
           (*spectest-calls* '()))
@@ -1207,7 +1224,7 @@ given, receives a JSONL line per result (PLAN.md 12.8)."
                   (record cmd :harness-error nil
                           (format nil "unexpected error: ~a" c)
                           nil))))))))
-      (nreverse results))))
+      (nreverse results)))))
 
 (defun %execute-command (state cmd record)
   "Execute one command, calling (record cmd outcome phase detail msg)."

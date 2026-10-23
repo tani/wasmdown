@@ -13,15 +13,15 @@ now classify as :unsupported instead of crashing as harness-errors.
 
 | Outcome | Count |
 | --- | --- |
-| pass | 20086 |
-| fail | 309 |
+| pass | 20110 |
+| fail | 287 |
 | skip | 0 |
 | unsupported | 725 |
 | timeout | 0 |
-| harness-error | 67 |
+| harness-error | 65 |
 | **total** | **21187** |
 
-Executed: 21187 commands; pass rate 94.8% (denominator = all executed,
+Executed: 21187 commands; pass rate 94.9% (denominator = all executed,
 including unsupported — honest per PLAN.md §12.9).
 
 ## Per-file counts
@@ -93,23 +93,23 @@ including unsupported — honest per PLAN.md §12.9).
 | obsolete-keywords | 10 | 0 | 1 | 0 |
 | ref | 0 | 1 | 4 | 8 |
 | ref_as_non_null | 0 | 0 | 7 | 0 |
-| ref_func | 5 | 10 | 0 | 2 |
+| ref_func | 11 | 6 | 0 | 0 |
 | ref_is_null | 2 | 0 | 20 | 0 |
 | ref_null | 0 | 0 | 34 | 0 |
 | return | 84 | 0 | 0 | 0 |
 | return_call | 0 | 0 | 51 | 0 |
 | return_call_indirect | 1 | 0 | 82 | 0 |
 | return_call_ref | 0 | 0 | 53 | 0 |
-| select | 30 | 2 | 125 | 0 |
+| select | 31 | 1 | 125 | 0 |
 | skip-stack-guard-page | 11 | 0 | 0 | 0 |
 | stack | 7 | 0 | 0 | 0 |
 | start | 20 | 0 | 0 | 0 |
 | store | 68 | 0 | 0 | 0 |
 | switch | 23 | 5 | 0 | 0 |
 | table | 18 | 18 | 9 | 1 |
-| table_get | 5 | 10 | 0 | 1 |
-| table_grow | 43 | 17 | 0 | 1 |
-| table_set | 7 | 19 | 0 | 0 |
+| table_get | 13 | 2 | 0 | 1 |
+| table_grow | 47 | 13 | 0 | 1 |
+| table_set | 12 | 14 | 0 | 0 |
 | table_size | 39 | 0 | 0 | 0 |
 | token | 55 | 0 | 0 | 6 |
 | traps | 36 | 0 | 0 | 0 |

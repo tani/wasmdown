@@ -149,6 +149,7 @@
   (:export
    #:make-instance-store
    #:make-module-instance
+   #:module-instance
    #:module-instance-memories #:module-instance-tables
    #:module-instance-globals #:module-instance-funcs
    #:module-instance-module #:module-instance-exports

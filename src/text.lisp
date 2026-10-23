@@ -712,10 +712,27 @@ entry when no equal one exists."
     "i64.trunc_sat_f64_s" "i64.trunc_sat_f64_u"
     "ref.is_null"))
 
+(defun %kw (text)
+  "Intern lowercase op text as the IR keyword. Multi-word control ops
+use hyphens (:br-if :br-table :call-indirect :ref.is-null); every
+other op keeps the text name verbatim (:i32.load8_s keeps its
+underscore)."
+  (intern (string-upcase
+           (cond
+            ((string= text "br_if") "br-if")
+            ((string= text "br_table") "br-table")
+            ((string= text "call_indirect") "call-indirect")
+            ((string= text "ref.is_null") "ref.is-null")
+            (t text)))
+          :keyword))
+
 (defparameter *plain-op-keywords*
   (let ((h (make-hash-table :test #'equal)))
     (dolist (s *plain-ops* h)
-      (setf (gethash s h) (intern (string-upcase s) :keyword)))))
+      ;; Intern through %kw: structured-op names hyphenate
+      ;; (ref.is_null -> :ref.is-null) exactly like the folded path,
+      ;; so plain and folded forms produce the same IR keyword.
+      (setf (gethash s h) (%kw s)))))
 
 (defparameter *memarg-ops*
   '(("i32.load" 4) ("i64.load" 8) ("f32.load" 4) ("f64.load" 8)
@@ -732,16 +749,6 @@ entry when no equal one exists."
     (dolist (p *memarg-ops* h)
       (setf (gethash (car p) h) (intern (string-upcase (car p)) :keyword)))))
 
-(defun %kw (text)
-  "Intern lowercase op text as the IR keyword. Multi-word control ops use hyphens (:br-if :br-table :call-indirect); every other op keeps
-the text name verbatim (:i32.load8_s keeps its underscore)."
-  (intern (string-upcase
-           (cond
-            ((string= text "br_if") "br-if")
-            ((string= text "br_table") "br-table")
-            ((string= text "call_indirect") "call-indirect")
-            (t text)))
-          :keyword))
 
 (defun %wrap32 (v)
   "Wrap a signed integer into the unsigned 32-bit domain (i32.const)."
