@@ -490,7 +490,7 @@ truncated remainder via THROW."
                      (frame (make-block-frame :kind :loop
                                               :params nparams :results nresults
                                               :height (- (length s) nparams))))
-                (loop
+                (setf s (loop
                   (multiple-value-bind (vals leftover)
                       (catch frame
                         ;; one iteration; fallthrough finishes the
@@ -505,10 +505,16 @@ truncated remainder via THROW."
                                   (append (subseq s2 0 nresults)
                                           (nthcdr nparams s)))))
                     (if (eq vals :fallthrough)
-                        (return s)   ; finished: exit with the new stack
+                        ;; finished: the loop's result stack — the
+                        ;; body's results stacked below the consumed
+                        ;; params — NOT the entry stack (a resultful
+                        ;; loop would drop its results; a resultless
+                        ;; loop is unchanged since the tail IS the
+                        ;; entry stack minus params).
+                        (return leftover)
                         ;; br to the loop: restart with the branch
                         ;; operands as the new loop params.
-                        (setf s (append vals leftover)))))))
+                        (setf s (append vals leftover))))))))
              (t
               (multiple-value-setq (s) (%exec-other op instr imms locals block-stack s))))
         finally (return s)))

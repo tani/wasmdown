@@ -405,6 +405,52 @@ EQUALP (canonical-encode agreement oracle)."
      (equal '(:i32.const :call-indirect :end)
             (mapcar #'wasm-instr-op body)))))
 
+(wasmdown.test:test text/forward-type-reference
+  ;; Regression (loop 5): (func (type $forward)) referencing a
+  ;; (type $forward ...) defined LATER in the module (func.wast
+  ;; module 1, imports.wast). Two-pass scheme: explicit (type)
+  ;; fields register before any body parses.
+  ;; (a) forward typeuse in a func
+  (let* ((m (%round-trip
+             "(module (func (type $f)) (type $f (func)) )"))
+         (ft (aref (wasm-module-types m)
+                   (wasm-func-typeidx (aref (wasm-module-funcs m) 0)))))
+    (wasmdown.test:is (null (wasm-func-type-params ft)))
+    (wasmdown.test:is (null (wasm-func-type-results ft))))
+  ;; (b) forward type in call_indirect (the $t definition comes
+  ;; AFTER the use; only ONE definition, or it is a genuine
+  ;; duplicate-identifier error)
+  (let* ((m (%round-trip
+             "(module (table 1 funcref)
+                        (func (call_indirect (type $t) (i32.const 0) (i32.const 0)))
+                        (type $t (func (param i32) (result i32))))"))
+         (body (%instrs m 0))
+         (ci (find :call-indirect body :key #'wasm-instr-op)))
+    (wasmdown.test:is (= 0 (getf (wasm-instr-imms ci) :type))))
+  ;; (d) the func.wast module-1 slice parses and validates
+  (let ((m (%wat "(module (type $sig (func)) (func $dummy) (func (type $sig)) (func (type $forward)) (type $forward (func)))")))
+    (wasmdown.test:is (wasmdown:validate-module m))))
+
+(wasmdown.test:test text/explicit-types-precede-implicit
+  ;; Regression (loop 5): the suite's numeric pins (func.wast module 2)
+  ;; prove explicit (type) fields occupy indices 0..n-1 in field order
+  ;; and implicit find-or-add entries dedup-append AFTER them:
+  ;;   (func $f (result f64))  -> implicit (result f64)
+  ;;   (func $g (param i32))   -> REUSES the later explicit $t
+  ;;   (type $t (func (param i32))) is index 0, implicit is index 1.
+  ;; (c) mixed explicit+implicit ordering creates no duplicates.
+  (let* ((m (%round-trip
+             "(module (func $f (result f64) (f64.const 0)) (func $g (param i32)) (type $t (func (param i32))) (func $h (result f64) (f64.const 1)))"))
+         (types (wasm-module-types m)))
+    (wasmdown.test:is (= 2 (length types)))
+    (wasmdown.test:is (equal '(:i32) (wasm-func-type-params (aref types 0))))
+    (wasmdown.test:is (null (wasm-func-type-results (aref types 0))))
+    (wasmdown.test:is (null (wasm-func-type-params (aref types 1))))
+    (wasmdown.test:is (equal '(:f64) (wasm-func-type-results (aref types 1))))
+    ;; $g's typeidx must be 0 (the explicit $t), $f/$h's must be 1
+    (let ((idxs (map 'list #'wasm-func-typeidx (wasm-module-funcs m))))
+      (wasmdown.test:is (equal '(1 0 1) idxs)))))
+
 (wasmdown.test:test text/named-module-id-parse
   ;; Regression (loop 4): (module $M ...) — the optional $id after
   ;; the module keyword must be skipped, not parsed as a field.

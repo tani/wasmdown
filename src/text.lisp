@@ -1299,30 +1299,56 @@ nat token is the max (a reftype/id after the min is NOT a max)."
           (values (make-wasm-limits min max) (cddr items)))
         (values (make-wasm-limits min) (cdr items)))))
 
+(defun %type-field-signature (node)
+  "The (params . results) signature of an explicit (type $id? (func
+...)) field node, or a decode-error when the shape is wrong. Split
+out of %PARSE-TYPE-FIELD so the two-pass scheme (pass 1 registers
+every explicit type before any body parses; pass 2 parses the rest)
+can compute signatures without growing the penv."
+  (multiple-value-bind (id rest) (%opt-id (cddr node))
+    (let ((funclist (first rest)))
+      (unless (and funclist (tok-elem-p funclist)
+                   (string= (%tok-keyword (%first-tok funclist)) "func"))
+        (%text-error (or (and id (tok-p id) (tok-pos id)) 0)
+                     "(type) needs a (func ...) list"))
+      (multiple-value-bind (params results typeidx)
+          (%typeuse (cddr funclist) (make-penv))
+        (declare (ignore typeidx))
+        (values id params results)))))
+
+(defun %prescan-types (nodes penv)
+  "Pass 1 of the two-pass type scheme: parse every explicit (type ...)
+field IN FIELD ORDER and append its functype to the type list,
+registering $id -> typeidx. Explicit types therefore occupy indices
+0..n-1 BEFORE any implicit typeuse materializes; a find-or-add MISS
+in pass 2 appends after them (spec: the inline typeuse rule appends
+the new functype, deduplicating against the whole current list, so a
+later explicit type with an equal signature is REUSED, never
+duplicated). Because the $id hash now holds explicit ids before any
+body parses, forward references like (func (type $forward)) resolve
+to their final index (func.wast module 1, imports.wast)."
+  (dolist (node nodes)
+    (let* ((head (%first-tok node))
+           (k (and head (%tok-keyword head))))
+      (when (and k (string= k "type"))
+        (multiple-value-bind (id params results)
+            (%type-field-signature node)
+          (push (make-wasm-func-type params results)
+                (penv-types-list penv))
+          (when (and id (tok-p id) (eq (tok-kind id) :id))
+            (when (gethash (tok-text id) (penv-types penv))
+              (%text-error (tok-pos id) "duplicate identifier ~a"
+                           (tok-text id)))
+            (setf (gethash (tok-text id) (penv-types penv))
+                  (1- (length (penv-types-list penv))))))))))
+
 (defun %parse-type-field (node penv)
-  "Parse a (type $id? (func ...)) field."
-  (let* ((id (third node))
-         (funclist (fourth node)))
-    (unless (and funclist (tok-elem-p funclist)
-                 (string= (%tok-keyword (%first-tok funclist)) "func"))
-      (%text-error (or (and id (tok-p id) (tok-pos id)) 0)
-                   "(type) needs a (func ...) list"))
-    ;; register the $id AFTER pushing: the types index space counts
-    ;; implicit types created by earlier typeuses (find-or-add), which
-    ;; occupy list slots without hash entries, so the id's index is
-    ;; the list length, not the hash count.
-    (multiple-value-bind (params results typeidx)
-        (%typeuse (cddr funclist) penv)
-      (when typeidx
-        (%text-error 0 "(type) functype cannot reference another type"))
-      (push (make-wasm-func-type params results)
-            (penv-types-list penv))
-      (when (and id (tok-p id) (eq (tok-kind id) :id))
-        (when (gethash (tok-text id) (penv-types penv))
-          (%text-error (tok-pos id) "duplicate identifier ~a"
-                       (tok-text id)))
-        (setf (gethash (tok-text id) (penv-types penv))
-              (1- (length (penv-types-list penv))))))))
+  "Pass-2 handler for an explicit (type ...) field: pass 1
+(%PRESCAN-TYPES) already appended its functype and registered its
+$id, so this only re-checks the shape (keeping duplicate-$id and
+missing-(func) diagnostics at the same source positions)."
+  (declare (ignore penv))
+  (%type-field-signature node))
 
 (defun %import-desc (desc penv kind)
   "Parse an import descriptor list ((func|table|memory|global) $id?
@@ -2074,6 +2100,14 @@ with :offset (token index) on malformed text."
       (when (and items (tok-p (first items))
                  (eq (tok-kind (first items)) :id))
         (setf items (rest items)))
+      ;; two-pass types: pass 1 registers every explicit (type ...)
+      ;; field (indices 0..n-1, field order) BEFORE any body parses,
+      ;; so forward $type references resolve to final indices and
+      ;; implicit find-or-add misses dedup-append AFTER the explicit
+      ;; block (suite pin: func.wast module 2, (func (type 0)) is the
+      ;; LATER explicit $t; module 3's implicit index 3 is the first
+      ;; complex-sig use).
+      (%prescan-types items penv)
       ;; forward $id references: pre-register the six index spaces
       ;; before any field body parses (WAT allows forward refs)
       (%prescan-ids items penv)

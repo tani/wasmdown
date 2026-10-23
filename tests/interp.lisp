@@ -491,3 +491,21 @@
      '())
     "f")
    '(42)))
+
+(wasmdown.test:test interp/loop-resultful-fallthrough
+  ;; A RESULTFUL loop returning by fallthrough must feed its result
+  ;; stack back to the enclosing sequence (was: the case arm's loop
+  ;; value was discarded AND (return s) returned the entry stack —
+  ;; block.wast as-loop-first/as-loop-mid crashed SUBSEQ at exit).
+  (expect
+   (call-export
+    (make-module-instance
+     (mmod
+      :types (vector (ft '() '(:i32)))
+      :funcs (vector (fn 0 (vector (i :loop (list :bt :i32)
+                                   (vector (i :i32.const (list :value 7))))
+                                   (i :end))))
+      :exports (vector (make-wasm-export "g" :func 0)))
+     '())
+    "g")
+   '(7)))
