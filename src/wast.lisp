@@ -846,6 +846,19 @@ shapes must not trip on 0x4/-0x8 literals or $x2 locals)."
         do (return-from %token-present-p t)
         finally (return nil)))
 
+(defun %ref-typeuse-index-p (text)
+  "True when TEXT contains a (ref <digit>...) typeuse — a typed
+reference by type index, GC scope (the (ref $id) spelling is caught
+by the plain substring scan; this catches (ref 0)-style indices)."
+  (loop for start = (search "(ref " text :test #'char-equal)
+          then (search "(ref " text :start2 (1+ start)
+                        :test #'char-equal)
+        while start
+        when (and (< (+ start 5) (length text))
+                  (digit-char-p (char text (+ start 5))))
+          do (return-from %ref-typeuse-index-p t)
+        finally (return nil)))
+
 (defun %unsupported-feature-p (text)
   "Scan module text for features outside this engine slice (SIMD, GC,
 tail calls, EH, typed funcrefs, memory64, threads). Keyword-level only:
@@ -865,6 +878,14 @@ the classification is honest, never a silent pass."
           (has "(ref null") (has "(ref func") (has "(ref extern")
           (has "(ref i31") (has "(ref any") (has "(ref eq")
           (has "(ref struct") (has "(ref array")
+          ;; typed references by index: (ref $t)/(ref null $t) and
+          ;; (ref 0)/(ref null 0) typeuses. Previously these crashed
+          ;; %valtype with a host TYPE-ERROR on the (:LIST ...) node
+          ;; (func.wast ::117, ref.wast, type-equivalence.wast,
+          ;; type-rec.wast harness-errors); classify honestly here,
+          ;; before parse.
+          (has "(ref $") (has "(ref null $")
+          (%ref-typeuse-index-p text)
           (has "nonmatching (ref")) :gc)
      ((or (has "br_on_null") (has "br_on_non_null")
           (has "ref.as_non_null")) :typed-funcrefs)
@@ -1006,6 +1027,45 @@ classified :unsupported rather than decode-failed."
         gc-p)
     (error () nil)))
 
+(defun %binary-gc-valtype-p (bytes)
+  "Whether a binary payload's TYPE section carries a GC typed-reference
+valtype form (0x63/0x64 shorthand, or 0x6B/0x6C absolute-heap-type
+encodings) inside a functype's param/result vector — binary.wast
+::127's (func (param (ref null ...))) fixtures. This engine's decoder
+rejects those bytes at DECODE ('unknown type form'), but they are
+GC-scope features, not malformed-in-slice shapes: classify
+:unsupported BEFORE the decode pipeline runs. Every suite fixture is
+a single functype whose vectors are scanned linearly; the probe is
+best-effort (any malformed shape falls through to NIL and the normal
+decode reports the honest error)."
+  (when (< (length bytes) 8) (return-from %binary-gc-valtype-p nil))
+  (handler-case
+      (let ((r (wasmdown.binary:make-reader bytes))
+            (gc-p nil))
+        (dotimes (_ 8) (wasmdown.binary:read-byte-at r))
+        (loop
+          (when (>= (wasmdown.binary:reader-offset r) (length bytes))
+            (return))
+          (let* ((id (wasmdown.binary:read-byte-at r))
+                 (size (wasmdown.binary:read-u32 r))
+                 (end (+ (wasmdown.binary:reader-offset r) size)))
+            (when (and (= id 1)
+                       (<= end (length bytes)))
+              (let ((n (wasmdown.binary:read-u32 r)))
+                (declare (ignore n))
+                ;; scan the raw section bytes for GC valtype forms;
+                ;; 0x60 (functype) and the MVP/reftype forms are
+                ;; byte-identical to other sections' payload so the
+                ;; scan stays inside [offset, end).
+                (loop while (< (wasmdown.binary:reader-offset r) end)
+                      for b = (wasmdown.binary:read-byte-at r)
+                      when (member b '(#x63 #x64 #x6b #x6c))
+                        do (setf gc-p t))))
+            (setf (wasmdown.binary:reader-offset r) end)
+            (when gc-p (return))))
+        gc-p)
+    (error () nil)))
+
 
 (defun %module-unsupported-import-p (cmd state)
   "Whether the module command's text imports from a registered name
@@ -1049,10 +1109,11 @@ instantiate/execute. Returns (values outcome phase detail instance)."
               (values :unsupported nil
                       (wast-cmd-message cmd)))))
         (when (and (wast-cmd-bytes cmd)
-                   (%binary-gc-table-p (wast-cmd-bytes cmd)))
+                   (or (%binary-gc-table-p (wast-cmd-bytes cmd))
+                       (%binary-gc-valtype-p (wast-cmd-bytes cmd))))
           (return-from %module-outcome
             (values :unsupported nil
-                    "uses unsupported feature gc (typed-ref table in binary)")))
+                    "uses unsupported feature gc (typed-ref in binary)")))
         (when (wast-cmd-bytes cmd)
           (%preflight-binary-sections (wast-cmd-bytes cmd)))
         (let ((module (%decode-module-form cmd)))

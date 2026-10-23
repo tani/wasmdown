@@ -66,6 +66,7 @@
    ;; segments
    #:make-wasm-elem #:wasm-elem #:wasm-elem-p
    #:wasm-elem-mode #:wasm-elem-type #:wasm-elem-inits #:copy-wasm-elem
+   #:wasm-elem-from-table-init
    #:make-wasm-data #:wasm-data #:wasm-data-p
    #:wasm-data-mode #:wasm-data-bytes #:copy-wasm-data
    #:make-wasm-custom #:wasm-custom #:wasm-custom-p

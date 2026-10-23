@@ -201,3 +201,93 @@
               (register \"I1\" $I1)")))
     (wasmdown.test:is (equal '(:unsupported :unsupported :unsupported)
                              os))))
+
+(wasmdown.test:test wast/typed-ref-typeuse-unsupported-no-crash
+  ;; Regression (loop 16, the biggest single-fix family): (ref $t),
+  ;; (ref null $t) and (ref 0)/(ref null 0) typeuses are GC-scope
+  ;; typed references. They used to reach %valtype with a (:LIST ...)
+  ;; node and crash the host with a TYPE-ERROR, misclassifying the
+  ;; suite's assert_invalid cases as harness-errors (ref.wast,
+  ;; type-equivalence.wast, type-rec.wast, func.wast ::117). The
+  ;; %unsupported-feature-p scan must classify them :unsupported
+  ;; BEFORE parse — honest GC scope, never a host crash.
+  (let ((os (%outcomes
+             "(assert_invalid
+                (module (type $t (func))
+                  (func $f (local $x (ref $t)) (drop (local.get $x))))
+                \"uninitialized local\")")))
+    (wasmdown.test:is (equal '(:unsupported) os)))
+  ;; (ref <digit>) index spelling, same family:
+  (let ((os (%outcomes
+             "(assert_invalid
+                (module (type (func (param (ref 1)))) )
+                \"unknown type\")")))
+    (wasmdown.test:is (equal '(:unsupported) os)))
+  ;; named-param carrier (type-equivalence ::0 shape): the module is
+  ;; GC-scope even though the param spelling is (param $r (ref $t1)).
+  (let ((os (%outcomes
+             "(module (type $t1 (func))
+                (func $f1 (param $r (ref $t1)) (call $f1 (local.get $r))))")))
+    (wasmdown.test:is (equal '(:unsupported) os))))
+
+(wasmdown.test:test wast/binary-gc-valtype-section-unsupported
+  ;; Regression (loop 16): binary.wast ::127's type section uses the GC
+  ;; typed-ref valtype forms (0x63 (ref null x) / 0x64 (ref x)) inside a
+  ;; functype. The decoder reports 'unknown type form 0x63' at DECODE,
+  ;; which misclassified the assert_invalid fixture as a phase FAIL;
+  ;; these bytes are GC scope and must classify :unsupported before
+  ;; the decode pipeline runs.
+  (let ((os (%outcomes
+             "(assert_invalid
+                (module binary
+                  \"\\00asm\\01\\00\\00\\00\"
+                  \"\\01\\0a\\01\"
+                  \"\\60\\01\\63\\80\\80\\80\\80\\08\\00\")
+                \"unknown type\")")))
+    (wasmdown.test:is (equal '(:unsupported) os))))
+
+(wasmdown.test:test wast/table-init-expr-parses
+  ;; Regression (loop 16, cluster 2): the WAT extended table
+  ;; initializer (table n reftype <expr>) — table.wast ::13/14's
+  ;; (table 1 funcref (ref.null func)) — is a VALID shape the parser
+  ;; used to reject as 'junk after table type' at DECODE. It parses to
+  ;; the table plus an active elem segment [expr x min] at offset 0;
+  ;; the non-const shape (global.wast ::120) still fails at
+  ;; VALIDATION, never DECODE.
+  (let ((os (%outcomes
+             "(module (table 1 funcref (ref.null func)))
+              (assert_invalid
+                (module (global $g funcref (ref.null func))
+                        (table $t 10 funcref (global.get $g)))
+                \"unknown global\")")))
+    (wasmdown.test:is (equal '(:pass :pass) os))))
+
+(wasmdown.test:test wast/elem-data-offset-defined-global
+  ;; Regression (loop 16, cluster 2): elem/data OFFSET and item const
+  ;; exprs may global.get any immutable global INCLUDING defined ones
+  ;; (data.wast ::9/10, elem.wast ::15/16, global.wast ::113) — the
+  ;; imported-or-previously-defined restriction applies only to
+  ;; global INIT exprs, but the validator had passed the imported
+  ;; count as the limit for elem/data too, failing valid modules.
+  (let ((os (%outcomes
+             "(module (memory 1) (global i32 (i32.const 0))
+                (data (global.get 0) \"a\"))
+              (module (table 1 funcref) (global i32 (i32.const 0))
+                (func $f) (elem (global.get 0) $f))")))
+    (wasmdown.test:is (equal '(:pass :pass) os))))
+
+(wasmdown.test:test wast/declared-refs-include-global-inits
+  ;; Regression (loop 16): a ref.func in a GLOBAL init declares its
+  ;; target for the whole module (spec funcidx(globals) — elem.wast
+  ;; ::135's (global (export \"f\") funcref (ref.func 0)), ref_func
+  ;; ::14). The validator only collected elem/export declarations, so
+  ;; valid modules failed 'is not declared by an element segment or
+  ;; export' and cascaded register/import failures after them.
+  (let ((os (%outcomes
+             "(module $m4 (func (result i32) (i32.const 42))
+                (global (export \"f\") funcref (ref.func 0)))
+              (register \"m4\" $m4)
+              (module (import \"m4\" \"f\" (global funcref))
+                (table 1 funcref)
+                (elem (i32.const 0) funcref (global.get 0)))")))
+    (wasmdown.test:is (equal '(:pass :pass :pass) os))))

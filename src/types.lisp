@@ -68,12 +68,18 @@
   body                                   ; (vector instr)
   offset)                                ; byte offset of body start in binary
 
-(defstruct (wasm-elem (:constructor make-wasm-elem (mode type inits)))
+(defstruct (wasm-elem (:constructor make-wasm-elem (mode type inits &optional from-table-init)))
   "Element segment. MODE: (:active tableidx expr) | (:passive) | (:declarative).
-TYPE is the reference valtype; INITS is a list of expressions (vectors of instr)."
+TYPE is the reference valtype; INITS is a list of expressions (vectors of instr).
+FROM-TABLE-INIT marks a segment desugared from a table field's inline
+initializer expr (the function-references extended syntax): per the
+reference its const exprs may only use IMPORTED globals (global.wast
+::120 expects 'unknown global' at VALIDATION for a defined-global
+global.get)."
   mode
   type
-  inits)
+  inits
+  from-table-init)
 
 (defstruct (wasm-data (:constructor make-wasm-data (mode bytes)))
   "Data segment. MODE: (:active memidx expr) | (:passive)."

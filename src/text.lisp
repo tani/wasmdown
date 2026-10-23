@@ -2070,7 +2070,7 @@ Returns the remaining items."
              (pop rest))
         finally (return rest)))
 
-(defun %table-type-items (items pos)
+(defun %table-type-items (items pos penv)
   "Parse a defined table's type from ITEMS: reftype then limits
 (n [n]), OR the inline (elem ...) abbreviation. Returns (values
 wasm-table inits) where INITS is the elem segment's init list for the
@@ -2098,9 +2098,22 @@ inline form, or NIL."
         (let ((rty (%valtype rt)))
           (unless (member rty '(:funcref :externref))
             (%text-error pos "table type must be a reference type"))
-          (unless (null (cdr tail))
-            (%text-error pos "junk after table type"))
-          (values (make-wasm-table rty limits) nil)))))))
+          (if (and (cdr tail) (tok-elem-p (second tail)))
+              ;; (table n n? reftype <expr>): the WAT extended table
+              ;; initializer — every entry is initialized from the ONE
+              ;; constant expression. Returns the table plus a THIRD
+              ;; value: the pre-parsed init expr (each entry is a copy;
+              ;; the caller emits the active elem segment directly).
+              ;; Constness/type checks fire at VALIDATION (the shape
+              ;; parses per the grammar — table.wast ::13/14,
+              ;; global.wast ::113/120).
+              (values (make-wasm-table rty limits)
+                      nil
+                      (%parse-expr (cdr tail) penv))
+              (progn
+                (unless (null (cdr tail))
+                  (%text-error pos "junk after table type"))
+                (values (make-wasm-table rty limits) nil nil)))))))))
 
 (defun %parse-table-field (node penv)
   "Parse a (table ...) field: $id?, inline exports, optional inline
@@ -2130,14 +2143,14 @@ abbreviation (which also emits the elem segment)."
               (%register-id id (penv-tables penv) "table" (tok-pos id)
                              (+ (penv-n-imported-tables penv)
                                 (length (penv-tables-list penv)))))
-            (multiple-value-bind (tab inits)
-                (%table-type-items rest pos)
+            (multiple-value-bind (tab inits init-expr)
+                (%table-type-items rest pos penv)
               (push tab (penv-tables-list penv))
-              ;; the inline (elem) also defines an ACTIVE elem segment
-              ;; targeting this table at offset 0
-              (when inits
-                (let ((tableidx (+ (penv-n-imported-tables penv)
-                                   (1- (length (penv-tables-list penv))))))
+              (let ((tableidx (+ (penv-n-imported-tables penv)
+                                 (1- (length (penv-tables-list penv))))))
+                ;; inline (elem ...): an ACTIVE elem segment targeting
+                ;; this table at offset 0
+                (when inits
                   (push (make-wasm-elem
                          (list :active tableidx
                                (vector (make-wasm-instr :i32.const
@@ -2145,6 +2158,21 @@ abbreviation (which also emits the elem segment)."
                                        (make-wasm-instr :end nil #() 0)))
                          :funcref
                          (%elem-items inits :funcref penv))
+                        (penv-elems-list penv)))
+                ;; extended initializer expr: [expr x min] segment,
+                ;; marked from-table-init so check-elems applies the
+                ;; imported-globals-only rule to its items
+                (when init-expr
+                  (push (make-wasm-elem
+                         (list :active tableidx
+                               (vector (make-wasm-instr :i32.const
+                                                        (list :value 0) #() 0)
+                                       (make-wasm-instr :end nil #() 0)))
+                         (wasm-table-type tab)
+                         (loop repeat (wasm-limits-min
+                                       (wasm-table-limits tab))
+                               collect init-expr)
+                         t)
                         (penv-elems-list penv))))))))))
 
 (defun %parse-memory-field (node penv)

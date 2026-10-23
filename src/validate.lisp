@@ -151,9 +151,15 @@ afterwards)."
 
 (defun %declared-func-refs (module)
   "The funcidx set legal for ref.func (spec: funcidx(globals mems tables
-  elems exports)): every function referenced by an element segment or by
-  any export."
+  elems exports)): every function referenced by a global initializer's
+  ref.func, by an element segment, or by any export."
   (let ((refs (make-hash-table)))
+    (loop for g across (wasm-module-globals module)
+          do (loop for instr across (wasm-global-init g)
+                   when (eq (wasm-instr-op instr) :ref.func)
+                     do (setf (gethash (getf (wasm-instr-imms instr)
+                                             :func)
+                                       refs) t)))
     (loop for elem across (wasm-module-elems module)
           do (loop for expr in (wasm-elem-inits elem)
                    do (loop for instr across expr
@@ -955,8 +961,16 @@ imported or previously-defined globals (spec note on const exprs)."
                      for j from 0
                      do (let ((type (const-expr-type
                                      ctx expr
+                                     ;; Items of a table-field
+                                     ;; initializer segment may only
+                                     ;; reference IMPORTED globals
+                                     ;; (function-references extended
+                                     ;; syntax; global.wast ::120
+                                     ;; rejects defined-global
+                                     ;; global.get at VALIDATE).
                                      :global-limit
-                                     (vctx-imported-global-count ctx)
+                                     (when (wasmdown.types:wasm-elem-from-table-init elem)
+                                       (vctx-imported-global-count ctx))
                                      :what (format nil
                                                    "element segment ~a item ~a"
                                                    i j))))
@@ -975,8 +989,13 @@ imported or previously-defined globals (spec note on const exprs)."
                              i etype tableidx (wasm-table-type table))))
                    (let ((type (const-expr-type
                                 ctx expr
-                                :global-limit
-                                (vctx-imported-global-count ctx)
+                                ;; spec: elem/data offsets may use
+                                ;; global.get of ANY immutable global
+                                ;; (defined included — data.wast ::9/10,
+                                ;; elem.wast ::15/16, global.wast
+                                ;; ::113): the sequential
+                                ;; imported-or-previous restriction
+                                ;; applies only to global INIT exprs.
                                 :what (format nil
                                               "element segment ~a offset"
                                               i))))
@@ -996,8 +1015,8 @@ imported or previously-defined globals (spec note on const exprs)."
                                 (format nil "data segment ~a" i))
                    (let ((type (const-expr-type
                                 ctx expr
-                                :global-limit
-                                (vctx-imported-global-count ctx)
+                                ;; as with elem offsets: any immutable
+                                ;; global is legal here
                                 :what (format nil
                                               "data segment ~a offset"
                                               i))))
