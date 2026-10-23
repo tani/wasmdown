@@ -588,6 +588,18 @@ spec treats the parts as consecutive source lines)."
             unless first do (write-char #\newline acc)
             do (write-string p acc)))))
 
+(defun %byte-string-to-string (s)
+  "Decode a BYTE-STRING (chars = UTF-8 bytes, as %read-string
+produces) into a proper Lisp string. The engine's export registry
+stores UTF-8-DECODED names (via the text parser's %name-string), so
+action names (invoke/get) and register names must be decoded the
+same way or lookups mismatch for any non-ASCII name (names.wast)."
+  (let ((bytes (make-array (length s) :element-type '(unsigned-byte 8))))
+    (loop for c across s for i from 0
+          do (setf (aref bytes i) (char-code c)))
+    ;; reuse the text parser's UTF-8 decoder semantics
+    (wasmdown.text::%name-string bytes)))
+
 ;;; ---------------------------------------------------------------
 ;;; Top-level command dispatch: script source -> wast-cmd list.
 
@@ -600,7 +612,7 @@ Returns (values kind mod-id name args)."
         (unless (and name-tok (stoken-p name-tok)
                      (eq (stoken-kind name-tok) :string))
           (%werr 0 "action needs a string name"))
-        (values mid (stoken-text name-tok)
+        (values mid (%byte-string-to-string (stoken-text name-tok))
                 (mapcar #'%const-value (rest rest)))))))
 
 (defun parse-script (source)
@@ -646,7 +658,7 @@ Returns (values kind mod-id name args)."
                          (%werr 0 "register needs a string name"))
                        (multiple-value-bind (id rest)
                            (%opt-id (rest items))
-                       (mk :name-arg (stoken-text name) :id id))))
+                       (mk :name-arg (%byte-string-to-string (stoken-text name)) :id id))))
                     ((string= head "invoke")
                      (multiple-value-bind (mid name args)
                          (%parse-action node)

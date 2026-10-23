@@ -158,7 +158,13 @@ parse-wat input are UTF-8 encoded here so both entry paths agree."
            ((char= c #\")
             (return (values (coerce out 'vector) (1+ i))))
            ((char/= c #\\)
-            (if (< (char-code c) #x100)
+            ;; Raw source chars >= U+0080 must be UTF-8 ENCODED —
+            ;; byte-dumping them (the old < #x100 test) produces a
+            ;; lone lead byte for U+0080..U+00FF (e.g. U+00C5 Å
+            ;; became 0xC5, an invalid UTF-8 start; names.wast
+            ;; module-3's 480-fail cascade). Only chars < U+0080
+            ;; are their own byte.
+            (if (< (char-code c) #x80)
                 (put (char-code c))
                 (put-utf8 (char-code c)))
             (incf i))
