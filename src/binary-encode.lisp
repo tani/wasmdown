@@ -466,6 +466,7 @@ legacy funcidx item form; returns the funcidx or nil."
                               (every #'elem-init-legacy-funcidx-p inits))
                          (enc-u32 e 0)      ; flag 0: legacy active
                          (enc-instrs e expr)
+                         ;; flags 0: elemkind is implicit, not encoded
                          (enc-u32 e (length inits))
                          (loop for init in inits
                                do (enc-u32 e (elem-init-ref-func-index init))))
@@ -486,6 +487,7 @@ legacy funcidx item form; returns the funcidx or nil."
                       ((and (eq type :funcref)
                             (every #'elem-init-legacy-funcidx-p inits))
                        (enc-u32 e 1)
+                       (enc-byte e 0)    ; elemkind funcref
                        (enc-u32 e (length inits))
                        (loop for init in inits
                              do (enc-u32 e (elem-init-ref-func-index init))))
@@ -504,6 +506,7 @@ legacy funcidx item form; returns the funcidx or nil."
                       ((and (eq type :funcref)
                             (every #'elem-init-legacy-funcidx-p inits))
                        (enc-u32 e 3)
+                       (enc-byte e 0)    ; elemkind funcref
                        (enc-u32 e (length inits))
                        (loop for init in inits
                              do (enc-u32 e (elem-init-ref-func-index init))))

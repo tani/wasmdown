@@ -588,15 +588,21 @@ vectors (the wasm-elem contract; runtime/validate iterate with IN)."
               (let ((flags (read-u32 r)))
                 (ecase flags
                   (0 (let ((expr (decode-instr-seq r)))
+                       ;; flags 0: implicit funcref elemkind is NOT
+                       ;; in the byte stream (reference decoder:
+                       ;; active_zero then vec(elem_index) directly)
                        (make-wasm-elem (list :active 0 expr) :funcref
                                        (%elem-funcidx-inits r))))
-                  (1 (make-wasm-elem (list :passive) :funcref
+                  (1 (%read-elemkind r)
+                     (make-wasm-elem (list :passive) :funcref
                                      (%elem-funcidx-inits r)))
                   (2 (let ((table (read-u32 r))
                            (expr (decode-instr-seq r)))
+                       (%read-elemkind r)
                        (make-wasm-elem (list :active table expr) :funcref
                                        (%elem-funcidx-inits r))))
-                  (3 (make-wasm-elem (list :declarative) :funcref
+                  (3 (%read-elemkind r)
+                     (make-wasm-elem (list :declarative) :funcref
                                      (%elem-funcidx-inits r)))
                   (4 (let ((expr (decode-instr-seq r)))
                        (make-wasm-elem (list :active 0 expr) :funcref
@@ -613,6 +619,18 @@ vectors (the wasm-elem contract; runtime/validate iterate with IN)."
                        (make-wasm-elem (list :declarative) rt
                                        (%elem-expr-inits r)))))))
             "element"))
+
+(defun %read-elemkind (r)
+  "The elemkind byte of the legacy funcidx elem forms (flags 0..3):
+  only 0x00 (funcref) is defined in this engine slice; any other
+  byte is a decode error. Previously the byte was NOT consumed,
+  so any module whose legacy elem segment carried elemkind + a
+  funcidx vector misparsed (elemkind read as the vec count) and
+  failed the section-size check (binary-leb128.wast ::5-89)."
+  (let ((start (reader-offset r))
+        (b (read-byte-at r)))
+    (unless (zerop b)
+      (decode-error-at start "bad element kind 0x~x" b))))
 
 (defun %elem-funcidx-inits (r)
   (coerce (read-vec r #'%read-elem-funcidx "elem funcidx") 'list))

@@ -478,9 +478,19 @@ unsupported named-form cases), or signals decode-error on bad shape."
              (eq (stoken-kind (first rest)) :keyword)
              (member (string-downcase (stoken-text (first rest)))
                      '("definition" "instance") :test #'string=))
-        (values (intern (string-upcase
-                         (stoken-text (first rest))) :keyword)
-                 id nil))
+        ;; (module definition $M ...)/(module instance $I $M): the
+        ;; form's $id is the first id AFTER the keyword; capture it so
+        ;; later (register "n" $I) commands classify :unsupported
+        ;; (instance.wast ::3-4, ::17) instead of 'no module to
+        ;; register' fails.
+        (let ((nid (or id
+                       (let ((after (rest rest)))
+                         (and after (stoken-p (first after))
+                              (eq (stoken-kind (first after)) :id)
+                              (stoken-text (first after)))))))
+          (values (intern (string-upcase
+                           (stoken-text (first rest))) :keyword)
+                  nid nil)))
        ;; binary/quote keywords
        ((and rest (stoken-p (first rest))
              (eq (stoken-kind (first rest)) :keyword)
@@ -883,11 +893,20 @@ keeps every allocation bounded and reports the honest phase.")
     error). Signals a catchable wasmdown:validation-error with an
     honest message (PLAN.md 10.1)."
   (loop for f across (wasmdown.types:wasm-module-funcs module)
-        for type = (aref (wasmdown.types:wasm-module-types module)
-                         (wasmdown.types:wasm-func-typeidx f))
-        for total = (+ (length (wasmdown.types:wasm-func-type-params type))
-                       (reduce #'+ (wasmdown.types:wasm-func-locals f)
-                               :key #'cdr :initial-value 0))
+        for tyidx = (wasmdown.types:wasm-func-typeidx f)
+        ;; func.wast ::91-112: an out-of-range (type N) reaches the
+        ;; validator as-is; this preflight must not AREF-crash on it
+        ;; (a host error would misclassify assert_invalid cases as
+        ;; harness-errors). Skip the func — the validator reports the
+        ;; real 'type index out of range'.
+        for type = (when (and (>= tyidx 0)
+                              (< tyidx (length (wasmdown.types:wasm-module-types module))))
+                     (aref (wasmdown.types:wasm-module-types module) tyidx))
+        for total = (if type
+                        (+ (length (wasmdown.types:wasm-func-type-params type))
+                           (reduce #'+ (wasmdown.types:wasm-func-locals f)
+                                   :key #'cdr :initial-value 0))
+                        0)
         when (> total #xffffffff)
           do (%werr 0 "too many locals")
         when (> total *wast-max-locals-per-func*)
@@ -1012,6 +1031,23 @@ standard pipeline runs."
 instantiate/execute. Returns (values outcome phase detail instance)."
   (handler-case
       (progn
+        ;; (module definition ...)/(module instance ...): Core 3.0
+        ;; named forms, out of the engine slice (PLAN.md §2, ADR-005).
+        ;; The command carries neither text nor bytes (payload nil);
+        ;; classify :unsupported BEFORE the decode pipeline would
+        ;; parse-wat(NIL) and misreport 'expected exactly one
+        ;; (module ...)'. Also record the $id so later register
+        ;; commands classify :unsupported (instance.wast ::0-4).
+        (when (and (null (wast-cmd-text cmd))
+                   (null (wast-cmd-bytes cmd))
+                   (wast-cmd-message cmd))
+          (let ((mid (wast-cmd-id cmd)))
+            (when mid
+              (setf (gethash mid (wast-state-unsupported-named state))
+                    t))
+            (return-from %module-outcome
+              (values :unsupported nil
+                      (wast-cmd-message cmd)))))
         (when (and (wast-cmd-bytes cmd)
                    (%binary-gc-table-p (wast-cmd-bytes cmd)))
           (return-from %module-outcome

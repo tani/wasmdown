@@ -112,6 +112,21 @@ with :lparen/:rparen balanced; strings are decoded (with escapes)."
            ;; the memarg immediates offset=/align=
            ((char= c #\#)
             (%text-error i "unexpected character ~c" c))
+           ;; id $"..." (string-form identifier, spec lexer.mll
+           ;; '$'(string as s)): the decoded, UTF-8-validated string
+           ;; content IS the id name; empty -> 'empty identifier'
+           ;; (id.wast assert_malformed batch). Plain $id atoms are
+           ;; read by %read-atom below.
+           ((and (char= c #\$)
+                 (< (1+ i) n)
+                 (char= (char s (1+ i)) #\"))
+            (multiple-value-bind (decoded next)
+                (%read-string s (1+ i))
+              (let ((name (%name-string (%utf8-validate decoded (1+ i)))))
+                (when (zerop (length name))
+                  (%text-error i "empty identifier"))
+                (emit :id (concatenate 'string "$" name))
+                (setf i next))))
            ;; id $... / keyword op / number
            (t
             (multiple-value-bind (kind text next)
@@ -164,9 +179,18 @@ parse-wat input are UTF-8 encoded here so both entry paths agree."
             ;; became 0xC5, an invalid UTF-8 start; names.wast
             ;; module-3's 480-fail cascade). Only chars < U+0080
             ;; are their own byte.
-            (if (< (char-code c) #x80)
-                (put (char-code c))
-                (put-utf8 (char-code c)))
+            ;;
+            ;; Raw CONTROL characters (< U+0020, or U+007F) are not
+            ;; string characters per the WAT grammar (only \\t \\n
+            ;; \\r escapes produce them): 'illegal control character
+            ;; in string literal' malformed text (id.wast
+            ;; assert_malformed "(func $\"a\\nb\")" — the quote payload
+            ;; carries a raw newline).
+            (cond
+             ((or (< (char-code c) #x20) (= (char-code c) #x7F))
+              (%text-error i "illegal control character in string literal"))
+             ((< (char-code c) #x80) (put (char-code c)))
+             (t (put-utf8 (char-code c))))
             (incf i))
            (t
             (incf i)
@@ -276,8 +300,23 @@ fields can require numeric forms; keyword classification happens later."
           do (incf i))
     (when (= i start)
       (%text-error start "unexpected character ~c" (char s start)))
+    ;; spec lexer.mll: reserved = (idchar | string)+ — an atom
+    ;; abutting a string literal with no space (e.g. `(data"a")`,
+    ;; `$l"a"`) is ONE reserved token, never keyword+string
+    ;; (token.wast 'Space required between strings and
+    ;; non-parenthesis tokens' assert_malformed batch: 'unknown
+    ;; operator'). Reject here so the downstream never sees a bare
+    ;; string in an immediate position.
+    (when (and (< i n) (char= (char s i) #\"))
+      (%text-error i
+                   "unknown operator ~a\"..." (subseq s start i)))
     (let* ((text (subseq s start i))
            (c0 (char text 0)))
+      ;; spec lexer.mll: a bare '$' with no id chars / string is
+      ;; 'empty identifier' malformed text (id.wast assert_malformed
+      ;; "(func $)").
+      (when (and (char= c0 #\$) (= (length text) 1))
+        (%text-error start "empty identifier"))
       (values
        (cond ((char= c0 #\$) :id)
              (t (%atom-kind text)))
@@ -790,8 +829,15 @@ the running param count and clears it between functions."
     ;; (param $x i32) or (param i32 i64)
     (if (and rest (tok-p (car rest)) (eq (tok-kind (car rest)) :id))
         (if (and (= (length rest) 2) (tok-p (second rest)))
-            (let ((ty (%valtype (second rest))))
-              (setf (gethash (tok-text (car rest)) (penv-locals penv))
+            (let ((ty (%valtype (second rest)))
+                  (pname (tok-text (car rest))))
+              ;; duplicate $id in the func's local namespace (params +
+              ;; locals) is malformed text (func.wast ::172-174
+              ;; assert_malformed 'duplicate local' batch)
+              (when (gethash pname (penv-locals penv))
+                (%text-error (tok-pos (car rest))
+                             "duplicate local identifier ~a" pname))
+              (setf (gethash pname (penv-locals penv))
                     (%next-local-index penv))
               (list ty))
             (%text-error (tok-pos (car rest))
@@ -880,6 +926,18 @@ entry when no equal one exists."
     (cond (typeidx typeidx)
           (t (%find-or-add-type params results penv)))))
 
+(defun %types-at (typeidx penv what pos)
+  "The functype at TYPEIDX in PENV's running type list, or a
+decode-error. The text parser resolves (type N) indices eagerly;
+an out-of-range N must be a catchable decode-error ('unknown type',
+func.wast assert_invalid ::91-112 / assert_malformed batches), never
+a host TYPE-ERROR on NIL."
+  (let ((ft (nth typeidx (reverse (penv-types-list penv)))))
+    (unless ft
+      (%text-error (or pos 0)
+                   "~a: unknown type index ~a" what typeidx))
+    ft))
+
 (defun %block-typeuse (items penv)
   "Parse a BLOCKTYPE typeuse from ITEMS (the head items after the
 optional label of a block/loop/if). Per the spec text grammar
@@ -937,10 +995,17 @@ Returns (values params results typeidx-or-nil)."
                                      (mapcar #'%valtype (cddr x))))
                (pop rest))))
     ;; (type x) + inline declarations: syntactic equality required.
+    ;; An out-of-range (type N) WITHOUT inline declarations parses
+    ;; fine — the module is invalid at VALIDATE ('unknown type',
+    ;; func.wast assert_invalid ::91-112: the reference parser keeps
+    ;; the numeric typeuse and validation reports it). WITH inline
+    ;; (param)/(result) the parser must resolve the referenced
+    ;; functype for the equality check, so an unresolvable index is
+    ;; malformed at DECODE (func.wast ::447 assert_malformed batch) —
+    ;; a catchable decode-error, never a host TYPE-ERROR on NIL.
     (when (and typeidx (or params results))
-      (let ((ft (nth typeidx (reverse (penv-types-list penv)))))
-        (unless (and ft
-                     (equal (wasm-func-type-params ft) params)
+      (let ((ft (%types-at typeidx penv "typeuse" 0)))
+        (unless (and (equal (wasm-func-type-params ft) params)
                      (equal (wasm-func-type-results ft) results))
           (%text-error 0
                        "inline function type does not match explicit type"))))
@@ -1867,13 +1932,28 @@ An inline (import) turns the func into an import entry instead."
               ;; inline functype must be syntactically EQUAL to the
               ;; referenced one ('inline function type' malformed at
               ;; DECODE) — plain find-or-create does not apply.
-              (when (and typeidx (or params results))
-                (let ((ft (nth typeidx (reverse (penv-types-list penv)))))
-                  (unless (and ft
-                               (equal (wasm-func-type-params ft) params)
-                               (equal (wasm-func-type-results ft) results))
-                    (%text-error pos
-                                 "inline function type does not match explicit type"))))
+              ;; func.wast ::91-112 (assert_invalid "unknown type"):
+              ;; an out-of-range (type N) WITHOUT inline declarations
+              ;; parses fine — the VALIDATOR rejects it ('unknown
+              ;; type index'), matching the suite's expected phase.
+              ;; WITH inline (param)/(result) the parser must resolve
+              ;; the functype for the equality check, so an
+              ;; unresolvable index is malformed at DECODE — a
+              ;; catchable decode-error, never a host TYPE-ERROR on
+              ;; NIL from the unchecked lookups below.
+              (let ((type-exists-p
+                      (and typeidx
+                           (>= typeidx 0)
+                           (< typeidx (length (penv-types-list penv))))))
+                (when (and typeidx (not type-exists-p)
+                           (or params results))
+                  (%text-error pos "unknown type index ~a" typeidx))
+                (when (and typeidx (or params results))
+                  (let ((ft (%types-at typeidx penv "func" pos)))
+                    (unless (and (equal (wasm-func-type-params ft) params)
+                                 (equal (wasm-func-type-results ft) results))
+                      (%text-error pos
+                                   "inline function type does not match explicit type")))))
               (let ((skipped 0)
                     (scan rest))
                 (loop while (and scan (tok-elem-p (car scan))
@@ -1888,15 +1968,20 @@ An inline (import) turns the func into an import entry instead."
                   ;; seed the running local counter with the type's
                   ;; param count (func.wast ::94-95: a func with
                   ;; (type $sig) and (local $var i32) must map $var
-                  ;; to param-count + 0).
-                  (let ((nparams (if typeidx
-                                     (let ((ft (nth typeidx
-                                                    (reverse (penv-types-list penv)))))
-                                       (length (wasm-func-type-params ft)))
-                                     (length params))))
-                    (declare (ignorable nparams))
-                    (when (and nparams (plusp nparams))
-                      (setf (gethash nil (penv-locals penv)) nparams)))
+                  ;; to param-count + 0). An out-of-range (type N)
+                  ;; (deferred to the validator above) seeds nothing;
+                  ;; the module never reaches local-index use.
+                  (let ((ft (and typeidx
+                                 (>= typeidx 0)
+                                 (< typeidx (length (penv-types-list penv)))
+                                 (nth typeidx
+                                      (reverse (penv-types-list penv))))))
+                    (let ((nparams (if ft
+                                       (length (wasm-func-type-params ft))
+                                       (length params))))
+                      (declare (ignorable nparams))
+                      (when (and nparams (plusp nparams))
+                        (setf (gethash nil (penv-locals penv)) nparams))))
                   ;; locals: (local $id? t)* / (local t*)
                   (let ((locals '())
                         (cursor body-items))
@@ -1910,10 +1995,21 @@ An inline (import) turns the func into an import entry instead."
                                (let ((lrest (cddr l)))
                                  (if (and lrest (tok-p (car lrest))
                                           (eq (tok-kind (car lrest)) :id))
-                                     (progn
-                                       (setf (gethash (tok-text (car lrest))
-                                                     (penv-locals penv))
-                                             (%next-local-index penv))
+                                    (progn
+                                      ;; duplicate $id in the func's
+                                      ;; local namespace (params +
+                                      ;; locals) is malformed text
+                                      ;; (func.wast ::172-174
+                                      ;; assert_malformed 'duplicate
+                                      ;; local' batch)
+                                      (let ((lname (tok-text (car lrest))))
+                                        (when (gethash lname (penv-locals penv))
+                                          (%text-error
+                                           (tok-pos (car lrest))
+                                           "duplicate local identifier ~a"
+                                           lname))
+                                        (setf (gethash lname (penv-locals penv))
+                                              (%next-local-index penv)))
                                        (push (cons (%valtype (second lrest)) 1)
                                              locals))
                                      (dolist (t_ lrest)
