@@ -201,6 +201,22 @@ EQUALP (canonical-encode agreement oracle)."
                                thereis (and (eq (wasm-instr-op i) :f32.const)
                                             (getf (wasm-instr-imms i)
                                                   :bits))))))
+  ;; nan:0x400000 (quiet bit) and nan:0x7fffff (all-ones) are legal
+  ;; payloads: WAT allows 0 < payload < 2^significand (float_literals)
+  (let ((m (%round-trip "(module (func (result f32) (f32.const nan:0x400000)))")))
+    (wasmdown.test:is (= (logior #x7F800000 #x400000)
+                         (loop for i across (wasm-func-body
+                                            (aref (wasm-module-funcs m) 0))
+                               thereis (and (eq (wasm-instr-op i) :f32.const)
+                                            (getf (wasm-instr-imms i)
+                                                  :bits))))))
+  (let ((m (%round-trip "(module (func (result f32) (f32.const -nan:0x7fffff)))")))
+    (wasmdown.test:is (= (logior #xFF800000 #x7FFFFF)
+                         (loop for i across (wasm-func-body
+                                            (aref (wasm-module-funcs m) 0))
+                               thereis (and (eq (wasm-instr-op i) :f32.const)
+                                            (getf (wasm-instr-imms i)
+                                                  :bits))))))
   ;; -inf
   (let ((m (%round-trip "(module (func (result f32) (f32.const -inf)))")))
     (wasmdown.test:is (= #xFF800000

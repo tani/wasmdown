@@ -345,7 +345,9 @@ unsigned bit pattern (sign + exponent field + mantissa field)."
                 (ash 1 (- mant-w 1))))       ; canonical NaN payload
        ((and (> (length body) 4) (string= body "nan:" :end1 4))
         (let ((payload (parse-integer body :start 6 :radix 16)))
-          (when (or (zerop payload) (>= payload (ash 1 (- mant-w 1))))
+          ;; WAT grammar: 0 < payload < 2^significand (the FULL
+          ;; significand, not the canonical-quiet sub-range).
+          (when (or (zerop payload) (>= payload (ash 1 (- p 1))))
             (%text-error 0 "NaN payload 0x~x out of range" payload))
           (logior (ash (sign-bit) sign-pos)
                   (ash exp-all-ones mant-w)
@@ -2066,8 +2068,12 @@ with :offset (token index) on malformed text."
                    (string= (%tok-keyword (%first-tok node)) "module"))
         (%text-error 0 "expected a (module ...) form")))
     ;; NOTE: the module keyword may be omitted?  No: require it.
-    ;; items of the module list
+    ;; items of the module list: skip the optional $id name (the WAT
+    ;; (module $id ...) grammar; linking.wast/elem.wast name modules)
     (let ((items (cddr (first nodes))))
+      (when (and items (tok-p (first items))
+                 (eq (tok-kind (first items)) :id))
+        (setf items (rest items)))
       ;; forward $id references: pre-register the six index spaces
       ;; before any field body parses (WAT allows forward refs)
       (%prescan-ids items penv)

@@ -12,15 +12,15 @@ typed-funcrefs/memory64), never silently passed.
 
 | Outcome | Count |
 | --- | --- |
-| pass | 18880 |
-| fail | 1956 |
+| pass | 19684 |
+| fail | 710 |
 | skip | 0 |
-| unsupported | 277 |
+| unsupported | 725 |
 | timeout | 0 |
-| harness-error | 74 |
+| harness-error | 68 |
 | **total** | **21187** |
 
-Executed: 21187 commands; pass rate 89.1% (denominator = all executed,
+Executed: 21187 commands; pass rate 92.9% (denominator = all executed,
 including unsupported — honest per PLAN.md §12.9).
 
 ## Per-file counts
@@ -28,37 +28,37 @@ including unsupported — honest per PLAN.md §12.9).
 | File | pass | fail | unsupported | other |
 | --- | --- | --- | --- | --- |
 | address | 257 | 3 | 0 | 0 |
-| align | 161 | 3 | 1 | 0 |
+| align | 162 | 3 | 0 | 0 |
 | annotations | 0 | 0 | 0 | 1 |
 | binary-leb128 | 83 | 4 | 0 | 4 |
 | binary | 128 | 1 | 0 | 0 |
-| block | 170 | 52 | 1 | 0 |
+| block | 213 | 10 | 0 | 0 |
 | br | 93 | 4 | 0 | 0 |
 | br_if | 115 | 3 | 1 | 0 |
-| br_on_non_null | 0 | 8 | 4 | 0 |
-| br_on_null | 0 | 6 | 4 | 0 |
-| br_table | 24 | 161 | 1 | 0 |
+| br_on_non_null | 0 | 0 | 12 | 0 |
+| br_on_null | 0 | 0 | 10 | 0 |
+| br_table | 24 | 0 | 162 | 0 |
 | call | 91 | 0 | 0 | 0 |
 | call_indirect | 157 | 15 | 0 | 0 |
-| call_ref | 0 | 27 | 8 | 0 |
+| call_ref | 0 | 0 | 35 | 0 |
 | comments | 4 | 4 | 0 | 0 |
-| const | 645 | 62 | 69 | 2 |
-| conversions | 609 | 10 | 0 | 0 |
+| const | 776 | 0 | 0 | 2 |
+| conversions | 613 | 6 | 0 | 0 |
 | custom | 10 | 0 | 0 | 1 |
 | data | 50 | 18 | 0 | 0 |
-| elem | 74 | 70 | 10 | 0 |
+| elem | 93 | 51 | 10 | 0 |
 | endianness | 69 | 0 | 0 | 0 |
-| exports | 82 | 14 | 1 | 0 |
-| f32 | 2371 | 143 | 0 | 0 |
-| f32_bitwise | 345 | 19 | 0 | 0 |
+| exports | 92 | 4 | 1 | 0 |
+| f32 | 2512 | 2 | 0 | 0 |
+| f32_bitwise | 364 | 0 | 0 | 0 |
 | f32_cmp | 2407 | 0 | 0 | 0 |
-| f64 | 2371 | 143 | 0 | 0 |
-| f64_bitwise | 345 | 19 | 0 | 0 |
+| f64 | 2512 | 2 | 0 | 0 |
+| f64_bitwise | 364 | 0 | 0 | 0 |
 | f64_cmp | 2407 | 0 | 0 | 0 |
 | fac | 8 | 0 | 0 | 0 |
-| float_exprs | 888 | 36 | 3 | 0 |
-| float_literals | 79 | 98 | 2 | 0 |
-| float_memory | 38 | 44 | 2 | 6 |
+| float_exprs | 911 | 16 | 0 | 0 |
+| float_literals | 179 | 0 | 0 | 0 |
+| float_memory | 72 | 18 | 0 | 0 |
 | float_misc | 455 | 16 | 0 | 0 |
 | forward | 5 | 0 | 0 | 0 |
 | func | 73 | 99 | 0 | 3 |
@@ -68,57 +68,57 @@ including unsupported — honest per PLAN.md §12.9).
 | i64 | 401 | 15 | 0 | 0 |
 | id | 6 | 1 | 0 | 0 |
 | if | 214 | 27 | 0 | 0 |
-| imports | 178 | 30 | 8 | 2 |
+| imports | 178 | 29 | 9 | 2 |
 | inline-module | 0 | 0 | 0 | 1 |
-| instance | 0 | 20 | 3 | 0 |
+| instance | 0 | 8 | 15 | 0 |
 | int_exprs | 108 | 0 | 0 | 0 |
-| int_literals | 20 | 30 | 1 | 0 |
-| labels | 3 | 25 | 1 | 0 |
+| int_literals | 51 | 0 | 0 | 0 |
+| labels | 26 | 3 | 0 | 0 |
 | left-to-right | 96 | 0 | 0 | 0 |
-| linking | 10 | 110 | 27 | 16 |
+| linking | 50 | 65 | 29 | 19 |
 | load | 97 | 0 | 0 | 0 |
 | local_get | 35 | 1 | 0 | 0 |
-| local_init | 0 | 4 | 6 | 0 |
+| local_init | 0 | 0 | 10 | 0 |
 | local_set | 53 | 0 | 0 | 0 |
 | local_tee | 93 | 4 | 1 | 0 |
-| loop | 42 | 78 | 1 | 0 |
+| loop | 42 | 79 | 0 | 0 |
 | memory | 84 | 3 | 0 | 3 |
-| memory_grow | 101 | 8 | 0 | 0 |
-| memory_redundancy | 0 | 4 | 1 | 3 |
+| memory_grow | 104 | 4 | 0 | 1 |
+| memory_redundancy | 8 | 0 | 0 | 0 |
 | memory_size | 42 | 0 | 0 | 0 |
 | memory_trap | 182 | 0 | 0 | 0 |
 | names | 486 | 0 | 0 | 0 |
 | nop | 84 | 4 | 0 | 0 |
 | obsolete-keywords | 10 | 0 | 1 | 0 |
 | ref | 0 | 1 | 4 | 8 |
-| ref_as_non_null | 0 | 4 | 3 | 0 |
+| ref_as_non_null | 0 | 0 | 7 | 0 |
 | ref_func | 5 | 10 | 0 | 2 |
-| ref_is_null | 2 | 16 | 2 | 2 |
-| ref_null | 0 | 32 | 2 | 0 |
+| ref_is_null | 2 | 0 | 20 | 0 |
+| ref_null | 0 | 0 | 34 | 0 |
 | return | 84 | 0 | 0 | 0 |
-| return_call | 0 | 34 | 17 | 0 |
-| return_call_indirect | 1 | 50 | 32 | 0 |
-| return_call_ref | 0 | 35 | 18 | 0 |
-| select | 30 | 126 | 1 | 0 |
-| skip-stack-guard-page | 0 | 10 | 1 | 0 |
+| return_call | 0 | 0 | 51 | 0 |
+| return_call_indirect | 1 | 0 | 82 | 0 |
+| return_call_ref | 0 | 0 | 53 | 0 |
+| select | 30 | 2 | 125 | 0 |
+| skip-stack-guard-page | 11 | 0 | 0 | 0 |
 | stack | 7 | 0 | 0 | 0 |
 | start | 20 | 0 | 0 | 0 |
 | store | 68 | 0 | 0 | 0 |
 | switch | 23 | 5 | 0 | 0 |
 | table | 18 | 18 | 9 | 1 |
 | table_get | 5 | 10 | 0 | 1 |
-| table_grow | 40 | 21 | 0 | 0 |
+| table_grow | 43 | 17 | 0 | 1 |
 | table_set | 7 | 19 | 0 | 0 |
 | table_size | 39 | 0 | 0 | 0 |
 | token | 55 | 0 | 0 | 6 |
 | traps | 36 | 0 | 0 | 0 |
 | type-canon | 0 | 2 | 0 | 0 |
 | type-equivalence | 11 | 9 | 4 | 8 |
-| type-rec | 0 | 5 | 22 | 0 |
+| type-rec | 0 | 1 | 26 | 0 |
 | type | 2 | 1 | 0 | 0 |
 | unreachable | 64 | 0 | 0 | 0 |
 | unreached-invalid | 118 | 0 | 3 | 0 |
-| unreached-valid | 2 | 9 | 2 | 0 |
+| unreached-valid | 2 | 0 | 11 | 0 |
 | unwind | 50 | 0 | 0 | 0 |
 | utf8-custom-section-id | 176 | 0 | 0 | 0 |
 | utf8-import-field | 176 | 0 | 0 | 0 |

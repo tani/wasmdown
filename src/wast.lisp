@@ -711,7 +711,12 @@ behavior."
   (registry (make-hash-table :test #'equal) :type hash-table)
   (named-instances (make-hash-table :test #'equal) :type hash-table)
   (current nil)
-  (spectest nil))
+  (spectest nil)
+  ;; names of $id modules that decoded as out-of-scope-unsupported;
+  ;; later actions referencing them classify :unsupported, not :fail
+  (unsupported-named (make-hash-table :test #'equal) :type hash-table)
+  ;; true when the CURRENT module position holds an unsupported module
+  (current-unsupported nil :type boolean))
 
 (defun %import-entries (state)
   "The full imports alist: spectest entries + registered instances'
@@ -743,19 +748,40 @@ or :unsupported when the text uses out-of-scope features."
         (return-from %decode-module-form :unsupported))
       (wasmdown.text:parse-wat text)))))
 
+(defun %token-present-p (text token)
+  "True when TOKEN appears in TEXT as a standalone identifier: not
+embedded in a longer name and not a hex-literal fragment (the SIMD
+shapes must not trip on 0x4/-0x8 literals or $x2 locals)."
+  (loop for start = (search token text :test #'char-equal)
+          then (search token text :start2 (1+ start) :test #'char-equal)
+        while start
+        when (and (or (zerop start)
+                      (not (or (alphanumericp (char text (1- start)))
+                               (char= (char text (1- start)) #\_)
+                               (char= (char text (1- start)) #\$))))
+                  (let ((end (+ start (length token))))
+                    (or (= end (length text))
+                        (not (or (alphanumericp (char text end))
+                                 (char= (char text end) #\_)
+                                 (char= (char text end) #\.))))))
+        do (return-from %token-present-p t)
+        finally (return nil)))
+
 (defun %unsupported-feature-p (text)
   "Scan module text for features outside this engine slice (SIMD, GC,
 tail calls, EH, typed funcrefs, memory64, threads). Keyword-level only:
 the classification is honest, never a silent pass."
-  (flet ((has (s) (and (search s text :test #'char-equal) t)))
+  (flet ((has (s) (and (search s text :test #'char-equal) t))
+         (tok (s) (%token-present-p text s)))
     (cond
-     ((or (has "v128") (has "x4") (has "x8") (has "x2 ")) :simd)
-     ((or (has "return_call")) :tail-calls)
-     ((or (has "try_table") (has "(throw") (has "tag")
-          (has "exnref")) :exception-handling)
+     ((or (tok "v128") (tok "i8x16") (tok "i16x8") (tok "i32x4")
+          (tok "i64x2") (tok "f32x4") (tok "f64x2")) :simd)
+     ((has "return_call") :tail-calls)
+     ((or (has "try_table") (has "(throw") (tok "tag")
+          (tok "exnref")) :exception-handling)
      ((or (has "(struct") (has "(array") (has "(i31")
-          (has "(rec ") (has "call_ref") (has "br_on_cast")
-          (has "ref.cast") (has "anyref") (has "eqref")
+          (has "(rec ") (tok "call_ref") (has "br_on_cast")
+          (has "ref.cast") (tok "anyref") (tok "eqref")
           ;; typed references: (ref null $t) and non-null (ref $t)
           (has "(ref null") (has "(ref func") (has "(ref extern")
           (has "(ref i31") (has "(ref any") (has "(ref eq")
@@ -764,6 +790,7 @@ the classification is honest, never a silent pass."
      ((or (has "br_on_null") (has "br_on_non_null")
           (has "ref.as_non_null")) :typed-funcrefs)
      (t nil))))
+
 
 (defparameter *wast-max-locals-per-func* 1000000
   "Ceiling on a function's total declared locals (params + local
@@ -1074,14 +1101,35 @@ per docs/CONTRACTS.md (i32/i64 unsigned, f32/f64 floats, refs)."
 ;;; ---------------------------------------------------------------
 ;;; Actions: (invoke ...) / (get ...) against runner state.
 
+(define-condition unsupported-action (wasmdown:host-error)
+  ()
+  (:documentation
+   "An action cannot run because its target module uses an out-of-scope
+feature (classified :unsupported, never :fail)."))
+
 (defun %resolve-action-instance (state cmd-or-id)
   "The module instance an action addresses: $id -> named instance, else
-the current module."
+the current module. Signals unsupported-action when the target module
+itself was unsupported (out-of-scope features); plain host-error when
+no module was ever instantiated."
   (cond
-   ((null cmd-or-id) (wast-state-current state))
+   ((null cmd-or-id)
+    (or (wast-state-current state)
+        (if (wast-state-current-unsupported state)
+            (error 'unsupported-action
+                   :message "action targets an unsupported module")
+            (error 'wasmdown:host-error
+                   :message
+                   "no module to act on (no module instantiated yet)"))))
    (t (or (gethash cmd-or-id (wast-state-named-instances state))
-          (error 'wasmdown:host-error
-                 :message (format nil "unknown module ~a" cmd-or-id))))))
+          (if (gethash cmd-or-id (wast-state-unsupported-named state))
+              (error 'unsupported-action
+                     :message (format nil
+                                      "module ~a uses an unsupported feature"
+                                      cmd-or-id))
+              (error 'wasmdown:host-error
+                     :message (format nil "unknown module ~a"
+                                      cmd-or-id)))))))
 
 (defun %run-invoke (state cmd)
   "Execute an invoke action. Returns (values results-list). Signals
@@ -1166,15 +1214,25 @@ given, receives a JSONL line per result (PLAN.md 12.8)."
           (%module-outcome cmd state)
         (cond
          ((eq outcome :pass)
-          (setf (wast-state-current state) inst)
+          (setf (wast-state-current state) inst
+                (wast-state-current-unsupported state) nil)
           (when (wast-cmd-id cmd)
+            (remhash (wast-cmd-id cmd)
+                     (wast-state-unsupported-named state))
             (setf (gethash (wast-cmd-id cmd)
                            (wast-state-named-instances state))
                   inst))
           (funcall record cmd :pass nil "ok" nil))
          ((eq outcome :unsupported)
-          ;; unsupported module: keep state; later actions against it
-          ;; will resolve to whatever current instance exists.
+          ;; unsupported module: remember its $id (and that the current
+          ;; position holds an unsupported module) so later actions
+          ;; classify :unsupported rather than fail on a missing
+          ;; instance.
+          (when (wast-cmd-id cmd)
+            (setf (gethash (wast-cmd-id cmd)
+                           (wast-state-unsupported-named state))
+                  t))
+          (setf (wast-state-current-unsupported state) t)
           (funcall record cmd :unsupported nil detail nil))
          (t (funcall record cmd outcome phase detail nil)))))
      ((eq name :register)
@@ -1182,19 +1240,34 @@ given, receives a JSONL line per result (PLAN.md 12.8)."
                       (gethash (wast-cmd-id cmd)
                                (wast-state-named-instances state))
                       (wast-state-current state))))
-        (if inst
-            (progn
-              (setf (gethash (wast-cmd-name-arg cmd)
-                             (wast-state-registry state))
-                    inst)
-              (funcall record cmd :pass nil "ok" nil))
-            (funcall record cmd :fail nil "no module to register" nil))))
+        (cond
+         (inst
+          (setf (gethash (wast-cmd-name-arg cmd)
+                         (wast-state-registry state))
+                inst)
+          (funcall record cmd :pass nil "ok" nil))
+         ((or (and (wast-cmd-id cmd)
+                   (gethash (wast-cmd-id cmd)
+                            (wast-state-unsupported-named state)))
+              (and (null (wast-cmd-id cmd))
+                   (wast-state-current-unsupported state)))
+          (funcall record cmd :unsupported nil
+                   "register targets an out-of-scope module" nil))
+         (t (funcall record cmd :fail nil "no module to register" nil)))))
      ((eq name :invoke)
-      (%run-invoke state cmd)
-      (funcall record cmd :pass nil "ok" nil))
+      (handler-case
+          (progn (%run-invoke state cmd)
+                 (funcall record cmd :pass nil "ok" nil))
+        (unsupported-action ()
+          (funcall record cmd :unsupported nil
+                   "action targets an out-of-scope module" nil))))
      ((eq name :get)
-      (%run-get state cmd)
-      (funcall record cmd :pass nil "ok" nil))
+      (handler-case
+          (progn (%run-get state cmd)
+                 (funcall record cmd :pass nil "ok" nil))
+        (unsupported-action ()
+          (funcall record cmd :unsupported nil
+                   "action targets an out-of-scope module" nil))))
      ((eq name :assert_return)
       (%exec-assert-return state cmd record))
      ((member name '(:assert_malformed :assert_invalid :assert_unlinkable
@@ -1249,6 +1322,10 @@ classes (PLAN.md 12.2)."
                    (format nil "unexpected trap: ~a"
                            (wasmdown:wasmdown-error-message c))
                    (wast-cmd-message cmd)))
+        (unsupported-action ()
+          (funcall record cmd :unsupported nil
+                   "action targets an out-of-scope module"
+                   (wast-cmd-message cmd)))
         (error (c)
           (funcall record cmd :fail nil
                    (format nil "~a" c)
@@ -1294,6 +1371,9 @@ exhausted."
                                      (format nil "trap kind ~a, want ~a"
                                               actual want)
                                      msg))))))
+              (unsupported-action ()
+                (funcall record cmd :unsupported nil
+                         "action targets an out-of-scope module" msg))
               (error (c)
                 (funcall record cmd :fail nil
                          (format nil "~a" c) msg))))

@@ -214,11 +214,13 @@
     (sb-kernel:make-double-float hi lo)))
 
 (defun canonical-nan-p (x)
-  "NaN with payload exactly the all-ones quiet form (canonical NaN)."
+  "Canonical NaN: exponent all-ones, payload exactly the quiet bit.
+The sign bit is unconstrained (spec nan:canonical class): a negative
+canonical NaN (e.g. hardware propagation from -nan operands) matches."
   (and (nan-p x)
        (etypecase x
-         (single-float (= (logand (f32-bits x) #xffffffff) #x7fc00000))
-         (double-float (= (logand (f64-bits x) #xffffffffffffffff)
+         (single-float (= (logand (f32-bits x) #x7fffffff) #x7fc00000))
+         (double-float (= (logand (f64-bits x) #x7fffffffffffffff)
                           #x7ff8000000000000)))))
 
 (defun arithmetic-nan-p (x)

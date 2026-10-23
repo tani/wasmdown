@@ -199,6 +199,18 @@
   (is (canonical-nan-p (f64-min 1.0d0 (f64-from-bits #x7ff8000000000000))))
   (is (canonical-nan-p (f64-max (f64-from-bits #x7ff8000000000000) 2.0d0))))
 
+
+(wasmdown.test:test numops/canonical-nan-sign-unconstrained
+  ;; The nan:canonical result class ignores the sign bit: a negative
+  ;; canonical NaN (hardware propagation from -nan operands, f32.wast
+  ;; add cases) must satisfy canonical-nan-p.
+  (is (canonical-nan-p (f32-from-bits #xffc00000)))
+  (is (canonical-nan-p (f32-from-bits #x7fc00000)))
+  (is (not (canonical-nan-p (f32-from-bits #xffe00000))))
+  (is (canonical-nan-p (f64-from-bits #xfff8000000000000)))
+  (is (canonical-nan-p (f64-from-bits #x7ff8000000000000)))
+  (is (not (canonical-nan-p (f64-from-bits #xfff9000000000000)))))
+
 (wasmdown.test:test numops/float-cmp
   ;; NaN → false except ne → true
   (is (zerop (f32-eq (f32-from-bits #x7fc00000) 1.0f0)))
