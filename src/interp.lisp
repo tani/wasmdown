@@ -1073,17 +1073,21 @@ exceptions trap), never leaking a Lisp condition past the invoke."
                              (handler-bind
                                  ((wasmdown:wasm-exception
                                     (lambda (ex)
-                                      (declare (ignore ex))
-                                      ;; uncaught at the function
-                                      ;; boundary: a wasm exception
-                                      ;; escapes the invocation as a
-                                      ;; trap category, never a Lisp
-                                      ;; error leak (spec: uncaught
-                                      ;; exceptions trap).
-                                      (error 'wasmdown:wasm-trap
-                                             :kind :uncaught-exception
-                                             :message
-                                             "uncaught exception"))))
+                                      ;; Uncaught only at the OUTERMOST
+                                      ;; invoke (spec: the boundary is
+                                      ;; the host<->guest edge): a
+                                      ;; NESTED call's exception must
+                                      ;; propagate to the CALLER's
+                                      ;; try_table handlers (a
+                                      ;; cross-call throw escaping a
+                                      ;; callee must reach the caller's
+                                      ;; catch clause — pinned by
+                                      ;; wast/try-table-catch-dispatch).
+                                      (when (zerop saved-depth)
+                                        (error 'wasmdown:wasm-trap
+                                               :kind :uncaught-exception
+                                               :message
+                                               "uncaught exception")))))
                                (multiple-value-bind (vals leftover)
                                    (catch fn-frame
                                      ;; fallthrough: top NRESULTS values

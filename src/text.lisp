@@ -2088,7 +2088,13 @@ at the kind's running import count (its true index-space position)."
                (pop scan))
       (let ((leftovers (nthcdr consumed items)))
         (cond (stray-result
-               (%text-error 0 "unexpected token: (result) in a tag type"))
+               ;; The typeuse grammar admits (result); a tag type with
+               ;; non-empty results is a VALIDATION error (spec: tag
+               ;; types are [t*] -> []), not decode — the inline form
+               ;; registers the full type and check-tags rejects it.
+               (values (or typeidx
+                          (%find-or-add-type params results penv))
+                       leftovers))
               (leftovers
                ;; junk after the typeuse (the loop stopped at a
                ;; non-type/param/result item): the caller decides

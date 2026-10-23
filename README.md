@@ -20,8 +20,8 @@ The official core suite (97 `.wast` files, pinned at
 executed through the stateful runner with failure-phase classification:
 
 ```
-pass 20367 | fail 0 | unsupported 893 | harness-error 0 | total 21260
-pass rate 95.8% (denominator = all executed, incl. unsupported)
+pass 20452 | fail 0 | unsupported 808 | harness-error 0 | total 21260
+pass rate 96.2% (denominator = all executed, incl. unsupported)
 ```
 
 Regenerate with `make report-conformance` (writes `CONFORMANCE.md` +

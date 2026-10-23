@@ -788,3 +788,129 @@
                         (return_call_ref $t (ref.func $f))))
               (invoke \"g\")")))
     (wasmdown.test:is (equal '(:unsupported :unsupported) os))))
+
+(wasmdown.test:test wast/tag-import-type-mismatch
+  ;; Loop 18 EH pin 1 (imports.wast shapes): tag imports type-match
+  ;; at LINK — (import "m" "tag" (func)) against a registered tag
+  ;; export is 'incompatible import type' (assert_unlinkable),
+  ;; and an unknown tag field import fails at LINK too.
+  (let ((os (%outcomes
+             "(module (tag (export \"tag\")))
+              (register \"test\")
+              (assert_unlinkable
+                (module (import \"test\" \"tag\" (func)))
+                \"incompatible import type\")
+              (assert_unlinkable
+                (module (tag (import \"test\" \"tag\") (param f32)))
+                \"incompatible import type\")
+              (assert_unlinkable
+                (module (tag (import \"test\" \"unknown\")))
+                \"unknown import\")")))
+    (wasmdown.test:is (equal '(:pass :pass :pass :pass :pass) os))))
+
+(wasmdown.test:test wast/try-table-catch-dispatch
+  ;; Loop 18 EH pin 2 (instance.wast shapes): try_table catch
+  ;; dispatch — a matching (catch $t l) branches to its label with
+  ;; the tag's payload; catch_all catches anything; a non-matching
+  ;; tag with only (catch $other l) is uncaught (traps); the _ref
+  ;; clauses deliver an exnref. The catch_all clause record is
+  ;; [kind label] — its label reads at SECOND, not THIRD (the
+  ;; instance.wast ::5-14 fail block was exactly that bug).
+  (let ((rs (wasmdown.wast:run-script
+             "(module
+                (tag $e (param i32))
+                (tag $other)
+                (func $thrower (param i32) (throw $e (local.get 0)))
+                (func (export \"payload\") (result i32)
+                  (block $h (result i32)
+                    (try_table (catch $e $h)
+                      (call $thrower (i32.const 42)))
+                    (i32.const 0)))
+                (func (export \"all\") (result i32)
+                  (block $h2
+                    (try_table (catch_all $h2)
+                      (throw $other)))
+                  (i32.const 7))
+                (func (export \"miss\") (result i32)
+                  (block $h3 (result i32)
+                    (try_table (catch $e $h3)
+                      (throw $other))
+                    (i32.const 0))))
+              (assert_return (invoke \"payload\") (i32.const 42))
+              (assert_return (invoke \"all\") (i32.const 7))
+              (assert_trap (invoke \"miss\") \"uncaught exception\")")))
+    ;; module + three asserts
+    (wasmdown.test:is (equal '(:pass :pass :pass :pass)
+                             (map 'list #'wasmdown.wast:wast-result-outcome
+                                  rs)))))
+
+(wasmdown.test:test wast/definition-instance-generativity
+  ;; Loop 18 pin 3 (instance.wast): instantiation is generative —
+  ;; two instances of one definition have DISTINCT state: writing
+  ;; through one import does not read through the other.
+  (let ((rs (wasmdown.wast:run-script
+             "(module definition $M
+                (global (export \"glob\") (mut i32) (i32.const 0)))
+              (module instance $I1 $M)
+              (module instance $I2 $M)
+              (register \"I1\" $I1)
+              (register \"I2\" $I2)
+              (module
+                (import \"I1\" \"glob\" (global $g1 (mut i32)))
+                (import \"I2\" \"glob\" (global $g2 (mut i32)))
+                (func (export \"both\") (result i32)
+                  (global.set $g1 (i32.const 1))
+                  (global.get $g2)))
+              (assert_return (invoke \"both\") (i32.const 0))")))
+    (wasmdown.test:is (equal '(:pass :pass :pass :pass :pass :pass :pass)
+                             (map 'list #'wasmdown.wast:wast-result-outcome
+                                  rs)))))
+
+(wasmdown.test:test wast/tag-type-results-empty
+  ;; Loop 18 pin 4: a tag's type must be a function type with EMPTY
+  ;; results — (tag (param i32) (result i32)) is a VALIDATION error,
+  ;; never decode.
+  (let ((os (%outcomes
+             "(assert_invalid
+                (module (tag $bad (param i32) (result i32)))
+                \"tag type must be empty\")
+              (assert_invalid
+                (module (type $t (func (param i32) (result i32)))
+                        (tag $bad2 (type $t)))
+                \"tag type must be empty\")")))
+    (wasmdown.test:is (equal '(:pass :pass) os))))
+
+(wasmdown.test:test wast/binary-eh-roundtrip
+  ;; Loop 18 pin 5: a module with a tag section, throw and try_table
+  ;; encodes to bytes and decodes back to the SAME bytes (canonical
+  ;; section order; tag section id 13 after data).
+  (let* ((m (wasmdown.text:parse-wat
+             "(module (tag $e (param i32))
+                      (func $t (param i32) (throw $e (local.get 0)))
+                      (func (export \"c\") (result i32)
+                        (block $h (result i32)
+                          (try_table (catch $e $h) (call $t (i32.const 5)))
+                          (i32.const 0))))"))
+         (b1 (wasmdown.binary:encode-module m))
+         (m2 (wasmdown.binary:decode-module b1))
+         (b2 (wasmdown.binary:encode-module m2)))
+    (wasmdown.test:is (equalp b1 b2))))
+
+(wasmdown.test:test wast/fac-rec-exhaustion-guard
+  ;; Loop 18 pin 6 (fac.wast): deep non-tail recursion traps
+  ;; :call-stack-exhausted — the guard must fire BEFORE the host
+  ;; control stack faults. The limit was re-measured after the
+  ;; tail-call trampoline + EH handler-bind grew per-invoke host
+  ;; frames (ceiling ~1400 at the 2MB default control stack; limit
+  ;; 1000 with margin; the suite lane also runs --control-stack-size
+  ;; 16). This pin would catch a per-frame cost regression.
+  (let ((os (%outcomes
+             "(module (func (export \"fac-rec\") (param i64) (result i64)
+                (if (result i64) (i64.eq (local.get 0) (i64.const 0))
+                  (then (i64.const 1))
+                  (else (i64.mul (local.get 0)
+                          (call 0 (i64.sub (local.get 0)
+                                           (i64.const 1))))))))
+              (assert_exhaustion (invoke \"fac-rec\" (i64.const 1073741824))
+                                \"call stack exhausted\")")))
+    (wasmdown.test:is (equal '(:pass :pass) os))))
