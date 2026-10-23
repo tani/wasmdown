@@ -260,13 +260,22 @@ exclusive upper bound of global indices referenceable via global.get
                         (verr "~a: global.get ~a must reference an imported or previously defined global"
                               what x)))
                     (push1 (first g))))
-                 ;; Core (non-extended) constant expressions allow only
-                 ;; t.const / global.get / ref.null / ref.func — the
-                 ;; runtime's const-expr evaluator (interp-const-expr)
-                 ;; implements exactly this set, so validation must
-                 ;; agree or instantiation would fail on a "valid"
-                 ;; module. Arithmetic stays non-constant here.
-                 (t (verr "~a: instruction ~a is not constant" what op))))
+                ;; Extended-const expressions (Core 3.0): i32/i64
+                ;; add/sub/mul over constant operands are constant.
+                ;; Both operands must carry the op's type.
+                ((member op '(:i32.add :i32.sub :i32.mul))
+                 (let ((b (pop1)) (a (pop1)))
+                   (unless (and (eq a :i32) (eq b :i32))
+                     (verr "~a: ~a operand type mismatch (~a, ~a)"
+                           what op a b))
+                   (push1 :i32)))
+                ((member op '(:i64.add :i64.sub :i64.mul))
+                 (let ((b (pop1)) (a (pop1)))
+                   (unless (and (eq a :i64) (eq b :i64))
+                     (verr "~a: ~a operand type mismatch (~a, ~a)"
+                           what op a b))
+                   (push1 :i64)))
+                (t (verr "~a: instruction ~a is not constant" what op))))
       (unless (= (length stack) 1)
         (verr "~a: expression must produce exactly one value (produces ~a)"
               what (length stack)))

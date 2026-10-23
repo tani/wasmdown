@@ -13,22 +13,22 @@ now classify as :unsupported instead of crashing as harness-errors.
 
 | Outcome | Count |
 | --- | --- |
-| pass | 19948 |
-| fail | 444 |
+| pass | 20086 |
+| fail | 309 |
 | skip | 0 |
 | unsupported | 725 |
 | timeout | 0 |
-| harness-error | 70 |
+| harness-error | 67 |
 | **total** | **21187** |
 
-Executed: 21187 commands; pass rate 94.2% (denominator = all executed,
+Executed: 21187 commands; pass rate 94.8% (denominator = all executed,
 including unsupported — honest per PLAN.md §12.9).
 
 ## Per-file counts
 
 | File | pass | fail | unsupported | other |
 | --- | --- | --- | --- | --- |
-| address | 257 | 3 | 0 | 0 |
+| address | 259 | 1 | 0 | 0 |
 | align | 162 | 3 | 0 | 0 |
 | annotations | 0 | 0 | 0 | 1 |
 | binary-leb128 | 83 | 4 | 0 | 4 |
@@ -44,10 +44,10 @@ including unsupported — honest per PLAN.md §12.9).
 | call_ref | 0 | 0 | 35 | 0 |
 | comments | 4 | 4 | 0 | 0 |
 | const | 776 | 0 | 0 | 2 |
-| conversions | 613 | 6 | 0 | 0 |
+| conversions | 619 | 0 | 0 | 0 |
 | custom | 10 | 0 | 0 | 1 |
 | data | 50 | 18 | 0 | 0 |
-| elem | 93 | 51 | 10 | 0 |
+| elem | 105 | 39 | 10 | 0 |
 | endianness | 69 | 0 | 0 | 0 |
 | exports | 96 | 0 | 1 | 0 |
 | f32 | 2512 | 2 | 0 | 0 |
@@ -57,14 +57,14 @@ including unsupported — honest per PLAN.md §12.9).
 | f64_bitwise | 364 | 0 | 0 | 0 |
 | f64_cmp | 2407 | 0 | 0 | 0 |
 | fac | 8 | 0 | 0 | 0 |
-| float_exprs | 911 | 16 | 0 | 0 |
+| float_exprs | 927 | 0 | 0 | 0 |
 | float_literals | 179 | 0 | 0 | 0 |
-| float_memory | 72 | 18 | 0 | 0 |
-| float_misc | 455 | 16 | 0 | 0 |
+| float_memory | 90 | 0 | 0 | 0 |
+| float_misc | 471 | 0 | 0 | 0 |
 | forward | 5 | 0 | 0 | 0 |
 | func | 169 | 2 | 0 | 4 |
 | func_ptrs | 35 | 0 | 0 | 1 |
-| global | 46 | 76 | 0 | 2 |
+| global | 111 | 13 | 0 | 0 |
 | i32 | 450 | 10 | 0 | 0 |
 | i64 | 401 | 15 | 0 | 0 |
 | id | 6 | 1 | 0 | 0 |
@@ -76,12 +76,12 @@ including unsupported — honest per PLAN.md §12.9).
 | int_literals | 51 | 0 | 0 | 0 |
 | labels | 29 | 0 | 0 | 0 |
 | left-to-right | 96 | 0 | 0 | 0 |
-| linking | 82 | 32 | 29 | 20 |
+| linking | 84 | 31 | 29 | 19 |
 | load | 97 | 0 | 0 | 0 |
 | local_get | 36 | 0 | 0 | 0 |
 | local_init | 0 | 0 | 10 | 0 |
 | local_set | 53 | 0 | 0 | 0 |
-| local_tee | 96 | 1 | 1 | 0 |
+| local_tee | 97 | 0 | 1 | 0 |
 | loop | 120 | 1 | 0 | 0 |
 | memory | 84 | 3 | 0 | 3 |
 | memory_grow | 104 | 4 | 0 | 1 |

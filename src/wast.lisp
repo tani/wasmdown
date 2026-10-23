@@ -985,7 +985,11 @@ comparison directive list."
               (:nan-arithmetic
                (list :nan-arithmetic (second spec)))
               (:nan-payload
-               (list :nan-payload (second spec) (third spec)))))
+               (list :nan-payload (second spec)
+                     (logand (third spec)
+                             (if (eq (second spec) :f32)
+                                 #x7fffff
+                                 #xfffffffffffff))))))
     (:ref-func (if (second spec)
                    (list :ref-func-id (second spec))
                    (list :ref-non-null)))

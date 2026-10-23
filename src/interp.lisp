@@ -111,7 +111,8 @@ tables, memories, globals).")
   "Evaluate a constant expression EXPR (vector of instr incl. the
  trailing :end) against INSTANCE. Supported: i32.const/i64.const/
  f32.const/f64.const/global.get (imported or any already-instantiated
- global)/ref.null/ref.func. Returns the single value."
+ global)/ref.null/ref.func, plus extended-const i32/i64 add/sub/mul
+ (Core 3.0) with numops semantics. Returns the single value."
   (let ((stack '()))
     (loop for instr across expr
           for op = (wasm-instr-op instr)
@@ -137,9 +138,23 @@ tables, memories, globals).")
                 (push (svref (wasmdown.runtime:module-instance-funcs instance)
                              (getf (wasm-instr-imms instr) :func))
                       stack))
+               ;; Extended-const (Core 3.0): i32/i64 add/sub/mul with
+               ;; numops semantics (the same functions %numops uses).
                (t
-                (error 'wasmdown:validation-error
-                       :message (format nil "not a constant expression: ~a" op)))))
+                (let ((entry (gethash op *numops*)))
+                  (unless entry
+                    (error 'wasmdown:validation-error
+                           :message (format nil
+                                           "not a constant expression: ~a"
+                                           op)))
+                  ;; pop args in wasm order: the first popped is
+                  ;; the top (second operand); numops takes (a b).
+                  (let ((nargs (car entry))
+                        (fn (cdr entry))
+                        (args '()))
+                    (dotimes (i nargs)
+                      (push (pop stack) args))
+                    (push (apply fn args) stack))))))
     (first stack)))
 
 ;;; ---------------------------------------------------------------

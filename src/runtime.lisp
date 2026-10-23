@@ -551,15 +551,29 @@ IMPORTS-ALIST maps ((\"mod\" \"field\") . value)."
               (module-instance-memories inst)
               (coerce (append imems dmems) 'vector))
         ;; globals: imported then defined; init exprs may reference
-        ;; imported globals and this module's funcs (ref.func).
-        (let* ((dglobals
-                 (loop for g across (wasm-module-globals module)
-                       collect (make-global-instance
-                                (%const-eval const-eval inst (wasm-global-init g))
-                                :type (wasm-global-type g)
-                                :mutable (wasm-global-mutable g))))
-               (all-globals (coerce (append iglobals dglobals) 'vector)))
+        ;; imported globals and this module's funcs (ref.func), and —
+        ;; per the spec's imported-or-previously-defined rule —
+        ;; each defined global is evaluated in order, with the
+        ;; instance's globals vector grown incrementally so later
+        ;; inits can global.get the earlier ones.
+        (let ((all-globals (coerce iglobals 'vector)))
+          ;; publish the imported globals FIRST: init exprs evaluate
+          ;; against the instance's globals slot (interp-const-expr),
+          ;; so global.get of imported globals must resolve before any
+          ;; defined global is evaluated.
           (setf (module-instance-globals inst) all-globals)
+          (loop for g across (wasm-module-globals module)
+                for gi = (make-global-instance
+                          (%const-eval const-eval inst (wasm-global-init g))
+                          :type (wasm-global-type g)
+                          :mutable (wasm-global-mutable g))
+                ;; grow the slot after each global so later inits can
+                ;; global.get the previously-defined ones (spec: const
+                ;; exprs see the global index space up to the current
+                ;; global).
+                do (setf all-globals
+                         (concatenate 'vector all-globals (vector gi))
+                         (module-instance-globals inst) all-globals))
           ;; elem/data segment states (inits evaluated eagerly so the
           ;; segment contents are fixed before any table mutation).
           (let ((estates (coerce
@@ -617,7 +631,7 @@ IMPORTS-ALIST maps ((\"mod\" \"field\") . value)."
                                       (:func (svref all-funcs idx))
                                       (:table (svref (module-instance-tables inst) idx))
                                       (:memory (svref (module-instance-memories inst) idx))
-                                      (:global (svref all-globals idx)))
+                                      (:global (svref (module-instance-globals inst) idx)))
                         collect (cons (wasm-export-name ex) value)))
             ;; start function: run after exports exist so it may call
             ;; exported paths; traps propagate untouched.
