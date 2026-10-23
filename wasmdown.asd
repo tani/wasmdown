@@ -19,8 +19,9 @@
    (:file "src/interp")
    (:file "src/codegen")
    (:file "src/api")
+   (:file "src/cli")
    (:file "src/text")
-   (:file "src/cli")))
+   (:file "src/wast")))
 
 (asdf:defsystem #:wasmdown/test
   :description "WASMDOWN unit and integration tests."
@@ -33,5 +34,7 @@
    (:file "tests/validate")
    (:file "tests/runtime")
    (:file "tests/interp")
+   (:file "tests/codegen")
    (:file "tests/api")
-   (:file "tests/text")))
+   (:file "tests/text")
+   (:file "tests/wast")))

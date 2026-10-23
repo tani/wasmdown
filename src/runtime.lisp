@@ -27,7 +27,10 @@
          :message (apply #'format nil format-control args)))
 
 (defparameter *page-size* 65536)
-(defparameter *max-pages* 65536)         ; 64 KiB pages, 4 GiB address space
+(defparameter *max-pages* 1024)          ; impl limit (PLAN.md 3.4): 64 MiB
+                                         ; default; raise for real workloads.
+                                         ; 65536 (4 GiB) would exhaust the
+                                         ; SBCL heap on eager allocation.
 (defparameter *max-table-size* 4294967295)
 
 ;;; ---------------------------------------------------------------

@@ -14,7 +14,7 @@
 (load (merge-pathnames "tests/harness" *root*))
 (dolist (f '("tests/numops" "tests/binary" "tests/validate"
              "tests/runtime" "tests/interp" "tests/codegen" "tests/api"
-             "tests/text"))
+             "tests/text" "tests/wast"))
   (load (merge-pathnames f *root*)))
 
 (multiple-value-bind (passed failed) (wasmdown.test:run-all-tests)
