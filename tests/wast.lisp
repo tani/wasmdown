@@ -162,3 +162,28 @@
                  \"\\0b\")
                \"too many locals\")")))
     (wasmdown.test:is (eq o :pass))))
+
+(wasmdown.test:test wast/nan-payload-comparator
+  ;; The assert_return nan:0x... directive must compare the PAYLOAD
+  ;; FIELD (not raw bits) against the actual value's payload. Pin the
+  ;; mask semantics both ways: matching payload passes; mismatching
+  ;; payload fails (raw-bits comparison would fail BOTH ways, so this
+  ;; pair proves the mask).
+  ;; f32: bits 0x7FA00000 = nan with payload 0x200000.
+  (let ((os (%outcomes
+             "(module (func (export \"f\") (result f32)
+                            (f32.reinterpret_i32 (i32.const 0x7fa00000))))
+              (assert_return (invoke \"f\") (f32.const nan:0x200000))")))
+    (wasmdown.test:is (equal '(:pass :pass) os)))
+  ;; negative: payload 0x400000 must NOT match payload 0x200000
+  (let ((os (%outcomes
+             "(module (func (export \"f\") (result f32)
+                            (f32.reinterpret_i32 (i32.const 0x7fa00000))))
+              (assert_return (invoke \"f\") (f32.const nan:0x400000))")))
+    (wasmdown.test:is (equal '(:pass :fail) os)))
+  ;; f64 mirror: bits 0x7FF4000000000000 = nan payload 0x4000000000000.
+  (let ((os (%outcomes
+             "(module (func (export \"g\") (result f64)
+                            (f64.reinterpret_i64 (i64.const 0x7ff4000000000000))))
+              (assert_return (invoke \"g\") (f64.const nan:0x4000000000000))")))
+    (wasmdown.test:is (equal '(:pass :pass) os))))
