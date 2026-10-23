@@ -605,3 +605,119 @@ EQUALP (canonical-encode agreement oracle)."
   ;; MATCHING inline declarations next to (type x) are legal.
   (wasmdown:validate-module
    (%wat "(module (type $sig (func (result i32))) (func (block (type $sig) (result i32) (i32.const 0)) (drop)))")))
+
+(wasmdown.test:test text/int-const-range-malformed
+  ;; Regression (loop 14, const.wast 'constant out of range' batch):
+  ;; i32 accepts [-2^31, 2^32-1] (the s32/u32 encoding); i64 likewise.
+  ;; Wider spellings are DECODE-time 'constant out of range' malformed
+  ;; text, not silent bignum truncation.
+  (dolist (bad
+           '("(module (func (i32.const 0x100000000) drop))"
+             "(module (func (i32.const -0x80000001) drop))"
+             "(module (func (i32.const 4294967296) drop))"
+             "(module (func (i32.const -2147483649) drop))"
+             "(module (func (i64.const 0x10000000000000000) drop))"
+             "(module (func (i64.const -0x8000000000000001) drop))"
+             "(module (func (i64.const 18446744073709551616) drop))"
+             "(module (func (i64.const -9223372036854775809) drop))"))
+    (wasmdown.test:assert-raises wasmdown:decode-error
+      (%wat bad)))
+  ;; Boundary spellings stay legal (the valid modules around each batch).
+  (dolist (ok
+           '("(module (func (i32.const 0xffffffff) drop))"
+             "(module (func (i32.const -0x80000000) drop))"
+             "(module (func (i64.const 18446744073709551615) drop))"
+             "(module (func (i64.const -9223372036854775808) drop))"))
+    (%wat ok)))
+
+(wasmdown.test:test text/float-const-range-malformed
+  ;; Regression (loop 14, const.wast 'constant out of range' batch):
+  ;; a float literal that rounds to infinity overflows the target
+  ;; format and is DECODE-time malformed text: f32 (0x1p128, 0x1.ffffffp127,
+  ;; 1e39, the >2^128 decimal) and the f64 counterparts (0x1p1024,
+  ;; 0x1.fffffffffffff8p1023, 1e309, the >2^1024 decimal).
+  (dolist (bad
+           '("(module (func (f32.const 0x1p128) drop))"
+             "(module (func (f32.const -0x1p128) drop))"
+             "(module (func (f32.const 0x1.ffffffp127) drop))"
+             "(module (func (f32.const 1e39) drop))"
+             "(module (func (f32.const 340282356779733661637539395458142568448) drop))"
+             "(module (func (f64.const 0x1p1024) drop))"
+             "(module (func (f64.const 0x1.fffffffffffff8p1023) drop))"
+             "(module (func (f64.const 1e309) drop))"
+             "(module (func (f64.const 269653970229347356221791135597556535197105851288767494898376215204735891170042808140884337949150317257310688430271573696351481990334196274152701320055306275479074865864826923114368235135583993416113802762682700913456874855354834422248712838998185022412196739306217084753107265771378949821875606039276187287552) drop))"))
+    (wasmdown.test:assert-raises wasmdown:decode-error
+      (%wat bad)))
+  ;; Largest finite spellings stay legal: exact max, RNE-up-to-max,
+  ;; and sticky-tail hex forms (const.wast valid modules pin these).
+  (dolist (ok
+           '("(module (func (f32.const 0x1p127) drop))"
+             "(module (func (f32.const 0x1.fffffep127) drop))"
+             "(module (func (f32.const 0x1.fffffe7p127) drop))"
+             "(module (func (f32.const 0x1.fffffefffffff8000000p127) drop))"
+             "(module (func (f32.const 1e38) drop))"
+             "(module (func (f64.const 0x1p1023) drop))"
+             "(module (func (f64.const 0x1.fffffffffffffp1023) drop))"
+             "(module (func (f64.const 0x1.fffffffffffff7p1023) drop))"
+             "(module (func (f64.const 1e308) drop))"
+             "(module (func (f64.const inf) drop))"
+             "(module (func (f32.const nan:0x1) drop))"))
+    (%wat ok)))
+
+(wasmdown.test:test text/call-indirect-typeuse-malformed
+  ;; Regression (loop 14, call_indirect.wast ::142-146 'unexpected
+  ;; token' / 'inline function type' + func.wast ::108-111): a
+  ;; call_indirect typeuse follows BLOCKTYPE grammar — an explicit
+  ;; (type x) plus inline (param)/(result) items must be syntactically
+  ;; equal to the referenced functype, inline params cannot be named,
+  ;; and (type) must come first.
+  (dolist (bad
+           '("(module (type $sig (func)) (table 0 funcref) (func (result i32) (call_indirect (type $sig) (result i32) (i32.const 0))))"
+             "(module (type $sig (func (param i32) (result i32))) (table 0 funcref) (func (result i32) (call_indirect (type $sig) (result i32) (i32.const 0))))"
+             "(module (type $sig (func (param i32) (result i32))) (table 0 funcref) (func (result i32) (call_indirect (type $sig) (param i32) (i32.const 0))))"
+             "(module (type $sig (func (param i32 i32) (result i32))) (table 0 funcref) (func (result i32) (call_indirect (type $sig) (param i32) (result i32) (unreachable))))"
+             "(module (table 0 funcref) (func (call_indirect (param $x i32) (i32.const 0) (i32.const 0))))"
+             "(module (type $sig (func (param i32) (result i32))) (table 0 funcref) (func (result i32) (call_indirect (param i32) (type $sig) (result i32) (i32.const 0) (i32.const 0))))"))
+    (wasmdown.test:assert-raises wasmdown:decode-error
+      (%wat bad)))
+  ;; Matching inline typeuse next to (type x), and bare inline
+  ;; (param)/(result) (find-or-create), stay legal.
+  (dolist (ok
+           '("(module (type $sig (func (param i32) (result i32))) (table 0 funcref) (func (result i32) (call_indirect (type $sig) (param i32) (result i32) (i32.const 0) (i32.const 0))))"
+             "(module (table 0 funcref) (func (call_indirect (param i32) (i32.const 0) (i32.const 0))))"))
+    (%wat ok)))
+
+(wasmdown.test:test text/func-inline-typeuse-malformed
+  ;; Regression (loop 14, func.wast ::108-111 'inline function type'):
+  ;; a (func ...) field's explicit (type x) plus inline
+  ;; (param)/(result) items must be syntactically EQUAL to the
+  ;; referenced functype — plain find-or-create does not apply.
+  (dolist (bad
+           '("(module (type $sig (func)) (func (type $sig) (result i32) (i32.const 0)))"
+             "(module (type $sig (func (param i32) (result i32))) (func (type $sig) (result i32) (i32.const 0)))"
+             "(module (type $sig (func (param i32) (result i32))) (func (type $sig) (param i32) (i32.const 0)))"
+             "(module (type $sig (func (param i32 i32) (result i32))) (func (type $sig) (param i32) (result i32) (unreachable)))"))
+    (wasmdown.test:assert-raises wasmdown:decode-error
+      (%wat bad)))
+  ;; Matching inline declarations (imports.wast p6) stay legal.
+  (%wat "(module (type $t (func (param i32))) (func (export \"p6\") (import \"spectest\" \"print_i32\") (type $t) (param i32) (result)))"))
+
+(wasmdown.test:test text/func-typeonly-param-local-indexing
+  ;; Regression (loop 14, func.wast ::94-95 'result 0: got 42'): when
+  ;; a func's signature comes from an explicit (type x) (no inline
+  ;; (param $id ...) items), the running local-index counter must be
+  ;; seeded with the type's param count BEFORE (local $id ...) items
+  ;; register; otherwise (local $var i32) maps to the param's index.
+  (let ((m (%wat "(module
+  (type $sig (func (param i32) (result i32)))
+  (func (export \"f\") (type $sig)
+    (local $var i32)
+    (local.get $var)))"))
+        (fidx 0))
+    (let* ((f (aref (wasm-module-funcs m) fidx))
+           (body (coerce (wasm-func-body f) 'list))
+           (lg (find :local.get body :key #'wasm-instr-op)))
+      (wasmdown.test:is (= 1 (getf (wasm-instr-imms lg) :local))))
+    ;; and executing f yields 0 (the local default), not the argument.
+    (let ((inst (wasmdown:instantiate m)))
+      (wasmdown.test:is (equal '(0) (wasmdown:invoke inst "f" 42))))))

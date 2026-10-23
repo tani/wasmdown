@@ -772,7 +772,20 @@ behavior."
   ;; later actions referencing them classify :unsupported, not :fail
   (unsupported-named (make-hash-table :test #'equal) :type hash-table)
   ;; true when the CURRENT module position holds an unsupported module
-  (current-unsupported nil :type boolean))
+  (current-unsupported nil :type boolean)
+  ;; registered names whose instance is out-of-scope-unsupported;
+  ;; imports from them classify :unsupported, never 'unknown import'
+  (unsupported-registry (make-hash-table :test #'equal) :type hash-table))
+
+(defun %register-unsupported (state name)
+  "Record that registered name NAME holds an out-of-scope-unsupported
+module: importing from it must classify :unsupported (the instance's
+exports — typically EH tags — are outside this engine slice), never
+fail as 'unknown import'."
+  (setf (gethash name (wast-state-unsupported-registry state)) t))
+
+(defun %registered-unsupported-p (state module-name)
+  (gethash module-name (wast-state-unsupported-registry state)))
 
 (defun %import-entries (state)
   "The full imports alist: spectest entries + registered instances'
@@ -975,10 +988,28 @@ classified :unsupported rather than decode-failed."
     (error () nil)))
 
 
+(defun %module-unsupported-import-p (cmd state)
+  "Whether the module command's text imports from a registered name
+whose instance is an out-of-scope module (EH tags etc.): the import is
+out-of-scope too and must classify :unsupported rather than fail the
+link with 'unknown import' (imports.wast: 'test' exports include tags).
+The probe is a pure classification aid: ANY parse problem (unsupported
+typed-funcref shapes the normal pipeline classifies first, decode
+errors that the normal pipeline reports) falls through to NIL so the
+standard pipeline runs."
+  (let ((text (wast-cmd-text cmd)))
+    (and text
+         (null (%unsupported-feature-p text))
+         (handler-case
+             (let ((module (wasmdown.text:parse-wat text)))
+               (loop for imp across (wasmdown.types:wasm-module-imports module)
+                     thereis (%registered-unsupported-p
+                              state (wasmdown.types:wasm-import-module imp))))
+           (error () nil)))))
+
 (defun %module-outcome (cmd state)
   "Run a (module ...) command through decode/validate/link/
 instantiate/execute. Returns (values outcome phase detail instance)."
-  (declare (ignore state))
   (handler-case
       (progn
         (when (and (wast-cmd-bytes cmd)
@@ -998,6 +1029,15 @@ instantiate/execute. Returns (values outcome phase detail instance)."
                 (%preflight-locals module)
                 (%preflight-datacount module)
                 (wasmdown:validate-module module)
+                ;; Only at the LINK boundary: decode+validate run
+                ;; honestly first (assert_invalid/assert_malformed
+                ;; keep their real phase); importing from a registered
+                ;; name whose instance is out-of-scope (EH tags) is
+                ;; out-of-scope too, never a link 'unknown import' fail.
+                (when (%module-unsupported-import-p cmd state)
+                  (return-from %module-outcome
+                    (values :unsupported nil
+                            "imports from an out-of-scope module")))
                 (let ((inst (wasmdown:instantiate
                              module
                              :imports (%state-imports-for module))))
@@ -1213,7 +1253,7 @@ an opaque type tag; numbers/floats print verbatim."
   ()
   (:documentation
    "An action cannot run because its target module uses an out-of-scope
-feature (classified :unsupported, never :fail)."))
+feature (classified :unsupported, never :fail)"))
 
 (defun %resolve-action-instance (state cmd-or-id)
   "The module instance an action addresses: $id -> named instance, else
@@ -1241,10 +1281,23 @@ no module was ever instantiated."
 
 (defun %run-invoke (state cmd)
   "Execute an invoke action. Returns (values results-list). Signals
-traps/errors per the engine."
+traps/errors per the engine. When the current module position is an
+out-of-scope module, a missing export (wasmdown:link-error from
+invoke) is re-signaled as unsupported-action: the action targets the
+out-of-scope module (imports.wast print32/print64 after the EH-tag
+module), never a fresh :fail."
   (let* ((inst (%resolve-action-instance state (wast-cmd-module-arg cmd)))
          (args (mapcar #'%arg-to-lisp (wast-cmd-args cmd))))
-    (apply #'wasmdown:invoke inst (wast-cmd-name-arg cmd) args)))
+    (handler-case
+        (apply #'wasmdown:invoke inst (wast-cmd-name-arg cmd) args)
+      (wasmdown:link-error (c)
+        (if (wast-state-current-unsupported state)
+            (error 'unsupported-action
+                   :message (format nil
+                                    "export of an out-of-scope module: ~a"
+                                    (wasmdown:wasmdown-error-message c)))
+            (error c))))))
+
 
 (defun %run-get (state cmd)
   "Execute a get action: the exported global's value."
@@ -1338,7 +1391,9 @@ given, receives a JSONL line per result (PLAN.md 12.8)."
           ;; unsupported module: remember its $id (and that the current
           ;; position holds an unsupported module) so later actions
           ;; classify :unsupported rather than fail on a missing
-          ;; instance.
+          ;; instance. The previous instance is DROPPED: an action now
+          ;; targets the new (out-of-scope) module, not the stale one.
+          (setf (wast-state-current state) nil)
           (when (wast-cmd-id cmd)
             (setf (gethash (wast-cmd-id cmd)
                            (wast-state-unsupported-named state))
@@ -1362,6 +1417,10 @@ given, receives a JSONL line per result (PLAN.md 12.8)."
                             (wast-state-unsupported-named state)))
               (and (null (wast-cmd-id cmd))
                    (wast-state-current-unsupported state)))
+          ;; remember the NAME too: later modules importing from it
+          ;; classify :unsupported (the instance's exports include
+          ;; out-of-scope EH tags), never 'unknown import'
+          (%register-unsupported state (wast-cmd-name-arg cmd))
           (funcall record cmd :unsupported nil
                    "register targets an out-of-scope module" nil))
          (t (funcall record cmd :fail nil "no module to register" nil)))))

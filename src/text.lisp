@@ -541,7 +541,27 @@ unsigned bit pattern (sign + exponent field + mantissa field)."
        (t
         (let* ((v (%literal-value body))
                (bits (%round-and-encode v p bias)))
+          ;; overflow to infinity is malformed text per the spec
+          ;; text grammar: a float literal must denote a value in the
+          ;; target format's range (const.wast 'constant out of range'
+          ;; batch: 0x1p128 / 1e39 / 0x1.ffffffp127 for f32, and the
+          ;; f64 counterparts).
+          (when (%float-overflow-p v p bias)
+            (%text-error 0 "constant out of range"))
           (logior (ash (sign-bit) sign-pos) bits)))))))
+
+(defun %float-overflow-p (v p bias)
+  "Whether the exact positive rational V, rounded to precision P with
+exponent bias BIAS, overflows the finite range (rounds to infinity).
+Overflow is re > emax after RNE, where emax is the largest normal
+exponent; a value that rounds UP to 2^(emax+1) overflows too (the
+rounding carry bumps re past emax — same test)."
+  (and (plusp v)
+       (multiple-value-bind (m re)
+           (%scaled-mantissa v p bias)
+         (declare (ignore m))
+         (let ((emax (- (- (ash 1 (integer-length (* 2 bias))) 1) bias)))
+           (> re emax)))))
 
 (defun %round-and-encode (v p bias)
   "Encode the exact positive rational V as the low (p+bias) bits of an
@@ -1254,15 +1274,21 @@ rest of the plain sequence."
      ;; STRICT: the immediate must be a well-formed integer token;
      ;; i32.const nan:* / 1x / 0x etc are 'unknown operator'
      ;; malformed text (i32.wast/i64.wast/const.wast assert_malformed).
-     ((member k '("i32.const" "i64.const") :test #'string=)
-      (unless (and rest (tok-p (car rest)))
-        (funcall bad))
-      (let ((tok (car rest)))
-        (unless (member (tok-kind tok) '(:nat :int))
-          (funcall bad))
-        (let ((v (%parse-int (tok-text tok) (tok-pos tok))))
-          (values (make-wasm-instr op-key (list :value v) #() 0)
-                  (cdr rest)))))
+    ((member k '("i32.const" "i64.const") :test #'string=)
+     (unless (and rest (tok-p (car rest)))
+       (funcall bad))
+     (let* ((tok (car rest))
+            (v (%parse-int (tok-text tok) (tok-pos tok))))
+       ;; Range check at DECODE: i32 accepts [-2^31, 2^32-1] (the
+       ;; s32/u32 encoding), i64 [-2^63, 2^64-1]; wider spellings are
+       ;; 'constant out of range' malformed text (const.wast
+       ;; assert_malformed batch pins both spellings).
+       (unless (if (string= k "i32.const")
+                  (<= -2147483648 v 4294967295)
+                  (<= -9223372036854775808 v 18446744073709551615))
+         (%text-error (tok-pos tok) "constant out of range"))
+       (values (make-wasm-instr op-key (list :value v) #() 0)
+               (cdr rest))))
      ;; float consts (exact bit patterns). STRICT: the immediate must
      ;; be a :float-classified token; f32.const nan:canonical /
      ;; nan:arithmetic / 0x / 1x are 'unknown operator' malformed text
@@ -1408,29 +1434,38 @@ rest of the plain sequence."
                                                   (tok-text (car rest))))))
                                  #() 0)
                 (cdr rest))))
-     ;; call_indirect: optional table index then typeuse
+     ;; call_indirect: optional table index then typeuse. The typeuse
+     ;; follows BLOCKTYPE semantics (func.wast ::108-111, call_indirect
+     ;; ::143-146): an explicit (type x) plus inline (param)/(result)
+     ;; items must be syntactically EQUAL to the referenced functype
+     ;; ('inline function type' malformed at DECODE); named params in
+     ;; the inline items are 'unexpected token' (blocktype grammar).
      ((string= k "call_indirect")
       (let ((table 0) (items rest))
         (when (and items (tok-p (car items))
                    (member (tok-kind (car items)) '(:id :nat)))
           (setf table (%id-or-num (car items) (penv-tables penv) "table")
                 items (cdr items)))
-        (let ((typeidx (%resolve-typeuse items penv))
-              (tail nil))
-          ;; the typeuse consumed only (type)/(param)/(result) items;
-          ;; everything after it is operands (folded) / rest of the
-          ;; plain sequence. %resolve-typeuse does not report how
-          ;; many items it consumed, so re-scan the typeuse prefix.
-          (setf tail items)
-          (loop while (and tail (tok-elem-p (car tail))
-                           (member (%tok-keyword (%first-tok (car tail)))
-                                   '("type" "param" "result")
-                                   :test #'string=))
-                do (pop tail))
-          (values (make-wasm-instr op-key
-                                   (list :type typeidx :table table)
-                                   #() 0)
-                  tail))))
+        (multiple-value-bind (params results typeidx)
+            (%block-typeuse items penv)
+          (let ((tail nil))
+            ;; the typeuse consumed only (type)/(param)/(result) items;
+            ;; everything after it is operands (folded) / rest of the
+            ;; plain sequence. %block-typeuse does not report how many
+            ;; items it consumed, so re-scan the typeuse prefix.
+            (setf tail items)
+            (loop while (and tail (tok-elem-p (car tail))
+                             (member (%tok-keyword (%first-tok (car tail)))
+                                     '("type" "param" "result")
+                                     :test #'string=))
+                  do (pop tail))
+            (values (make-wasm-instr op-key
+                                     (list :type (or typeidx
+                                                     (%find-or-add-type
+                                                      params results penv))
+                                           :table table)
+                                     #() 0)
+                    tail)))))
      ;; select: (result t)* immediates
      ((string= k "select")
       (let ((types '()) (items rest))
@@ -1827,7 +1862,18 @@ An inline (import) turns the func into an import entry instead."
             (%reset-locals penv)
             (multiple-value-bind (params results typeidx)
                 (%typeuse rest penv)
-              ;; count typeuse items consumed
+              ;; func.wast ::108-111: when an explicit (type x) AND
+              ;; inline (param)/(result) items are both present, the
+              ;; inline functype must be syntactically EQUAL to the
+              ;; referenced one ('inline function type' malformed at
+              ;; DECODE) — plain find-or-create does not apply.
+              (when (and typeidx (or params results))
+                (let ((ft (nth typeidx (reverse (penv-types-list penv)))))
+                  (unless (and ft
+                               (equal (wasm-func-type-params ft) params)
+                               (equal (wasm-func-type-results ft) results))
+                    (%text-error pos
+                                 "inline function type does not match explicit type"))))
               (let ((skipped 0)
                     (scan rest))
                 (loop while (and scan (tok-elem-p (car scan))
@@ -1836,6 +1882,21 @@ An inline (import) turns the func into an import entry instead."
                                          :test #'string=))
                       do (incf skipped) (pop scan))
                 (let ((body-items (nthcdr skipped rest)))
+                  ;; local indices start AFTER the params: when the
+                  ;; signature comes from an explicit (type x) (no
+                  ;; inline (param $id ...) registration happened),
+                  ;; seed the running local counter with the type's
+                  ;; param count (func.wast ::94-95: a func with
+                  ;; (type $sig) and (local $var i32) must map $var
+                  ;; to param-count + 0).
+                  (let ((nparams (if typeidx
+                                     (let ((ft (nth typeidx
+                                                    (reverse (penv-types-list penv)))))
+                                       (length (wasm-func-type-params ft)))
+                                     (length params))))
+                    (declare (ignorable nparams))
+                    (when (and nparams (plusp nparams))
+                      (setf (gethash nil (penv-locals penv)) nparams)))
                   ;; locals: (local $id? t)* / (local t*)
                   (let ((locals '())
                         (cursor body-items))

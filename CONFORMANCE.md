@@ -13,15 +13,15 @@ now classify as :unsupported instead of crashing as harness-errors.
 
 | Outcome | Count |
 | --- | --- |
-| pass | 20272 |
-| fail | 131 |
+| pass | 20255 |
+| fail | 79 |
 | skip | 0 |
-| unsupported | 746 |
+| unsupported | 816 |
 | timeout | 0 |
-| harness-error | 38 |
+| harness-error | 37 |
 | **total** | **21187** |
 
-Executed: 21187 commands; pass rate 95.7% (denominator = all executed,
+Executed: 21187 commands; pass rate 95.6% (denominator = all executed,
 including unsupported — honest per PLAN.md §12.9).
 
 ## Per-file counts
@@ -40,10 +40,10 @@ including unsupported — honest per PLAN.md §12.9).
 | br_on_null | 0 | 0 | 10 | 0 |
 | br_table | 24 | 0 | 162 | 0 |
 | call | 91 | 0 | 0 | 0 |
-| call_indirect | 167 | 5 | 0 | 0 |
+| call_indirect | 172 | 0 | 0 | 0 |
 | call_ref | 0 | 0 | 35 | 0 |
 | comments | 8 | 0 | 0 | 0 |
-| const | 754 | 24 | 0 | 0 |
+| const | 778 | 0 | 0 | 0 |
 | conversions | 619 | 0 | 0 | 0 |
 | custom | 9 | 0 | 1 | 1 |
 | data | 66 | 2 | 0 | 0 |
@@ -62,21 +62,21 @@ including unsupported — honest per PLAN.md §12.9).
 | float_memory | 90 | 0 | 0 | 0 |
 | float_misc | 471 | 0 | 0 | 0 |
 | forward | 5 | 0 | 0 | 0 |
-| func | 161 | 9 | 0 | 5 |
+| func | 168 | 3 | 0 | 4 |
 | func_ptrs | 35 | 0 | 0 | 1 |
 | global | 117 | 7 | 0 | 0 |
 | i32 | 460 | 0 | 0 | 0 |
 | i64 | 416 | 0 | 0 | 0 |
 | id | 0 | 2 | 0 | 5 |
 | if | 241 | 0 | 0 | 0 |
-| imports | 197 | 12 | 9 | 0 |
+| imports | 159 | 0 | 59 | 0 |
 | inline-module | 0 | 0 | 0 | 1 |
 | instance | 0 | 8 | 15 | 0 |
 | int_exprs | 108 | 0 | 0 | 0 |
 | int_literals | 51 | 0 | 0 | 0 |
 | labels | 29 | 0 | 0 | 0 |
 | left-to-right | 96 | 0 | 0 | 0 |
-| linking | 126 | 4 | 29 | 4 |
+| linking | 120 | 4 | 35 | 4 |
 | load | 97 | 0 | 0 | 0 |
 | local_get | 36 | 0 | 0 | 0 |
 | local_init | 0 | 0 | 10 | 0 |
@@ -106,7 +106,7 @@ including unsupported — honest per PLAN.md §12.9).
 | start | 20 | 0 | 0 | 0 |
 | store | 68 | 0 | 0 | 0 |
 | switch | 28 | 0 | 0 | 0 |
-| table | 22 | 15 | 9 | 0 |
+| table | 21 | 10 | 15 | 0 |
 | table_get | 16 | 0 | 0 | 0 |
 | table_grow | 61 | 0 | 0 | 0 |
 | table_set | 26 | 0 | 0 | 0 |
@@ -114,7 +114,7 @@ including unsupported — honest per PLAN.md §12.9).
 | token | 44 | 14 | 0 | 3 |
 | traps | 36 | 0 | 0 | 0 |
 | type-canon | 0 | 0 | 2 | 0 |
-| type-equivalence | 11 | 1 | 12 | 8 |
+| type-equivalence | 3 | 1 | 20 | 8 |
 | type-rec | 0 | 0 | 26 | 1 |
 | type | 3 | 0 | 0 | 0 |
 | unreachable | 64 | 0 | 0 | 0 |
