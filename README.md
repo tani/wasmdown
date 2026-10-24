@@ -30,11 +30,19 @@ either a genuine pass or an honestly-attributed `unsupported` for
 a named out-of-scope family. The 73 unsupported are the TERMINAL
 honest set: annotations 73 (an unadopted proposal — permanently
 out of scope per PLAN.md §3.3); the formerly-unsupported
-obsolete-keywords::10 SIMD row now PASSES at decode (loop 24).
 The struct/array type declarations (loop 21), rec
 groups + canonicalization (loop 20), typed function references
 (loop 19), exception handling + named modules (loop 18) and tail
 calls all pass.
+
+The component lane (`make test-component`, the vendored
+component-model suite at commit `d095e2f60dd...` per
+`specs/lock.toml`) measures the M7 foundation: **94 pass / 0
+fail / 545 unsupported / 0 harness-error of 639** in
+{binary,validation} minus nyi.txt — every decodable binary
+fixture passes; the unsupported are text-form components (the
+component text parser is the next M7 slice) and valid binaries
+awaiting instantiation. See `CONFORMANCE-COMPONENT.md`.
 
 Regenerate with `make report-conformance` (writes `CONFORMANCE.md` +
 `tests/spec-core-results.jsonl`, one JSONL line per command); the full
@@ -82,9 +90,11 @@ harness-errors.
 | Interpreter | `src/interp.lisp` | Reference evaluator; guest recursion traps `:call-stack-exhausted` before host stack exhaustion. |
 | Codegen | `src/codegen.lisp` | Baseline backend: SBCL `COMPILE` of emitted `LET`/`TAGBODY`/`GO` forms; interp-vs-compiled parity tests. |
 | API / CLI | `src/api.lisp`, `src/cli.lisp` | `read-module`, `validate-module`, `instantiate`, `invoke`, …; CLI `validate`/`inspect`/`compile`/`run`. |
+| Component | `src/component.lisp` | M7 slice 1: layer discrimination (magic + version 0x0D + layer byte), the full component binary reader (all 12 sections, WIT value types incl. map 0x63, aliases, canon incl. all 47 async built-ins, value sections), the label/index/max-size validator, the `(component ...)` script-command family, `make test-component`. |
 
-Not implemented (see `PLAN.md` for the full contract): Component
-Model, Canonical ABI, WASI (all versions),
+Not implemented (see `PLAN.md` for the full contract): the
+component TEXT parser, component instantiation + linking, the
+Canonical ABI, resources, async, WASI (all versions),
 threads/atomics, FASL cache, annotations (an unadopted proposal —
 permanently out of scope per PLAN.md §3.3). SIMD (v128 + relaxed,
 loop 24: the full 236-op v128 family + the 20 relaxed ops with
@@ -154,33 +164,39 @@ SBCL (developed against 2.6.4, Linux ARM64). Zero third-party Lisp
 libraries; no ASDF ecosystem dependencies. ANSI-portable core logic with
 SBCL-specific numeric internals where documented.
 
-## Roadmap (residual Core 3.0 gaps)
+## Roadmap (residual gaps)
+
+NAMING CONVENTION: engine-slice feature loops are tracked by loop
+number (18–24); the Component Model work is tracked by PLAN.md
+§14 milestone id (M7 slices) — the two counters never renumber
+each other.
 
 The vendored core suite (97 files, pinned) is FULLY attributed —
 no fails, and the 73 unsupported are the unadopted-annotations
 proposal (permanently out of scope per PLAN.md §3.3). PLAN.md
 §3.1's Core 3.0 opcode/type inventory is COMPLETE in the engine
-slice (every row; SIMD was the last family). What remains is
-§3.2's Component/WASI layer, M7-M12 territory per PLAN.md §14:
+slice. The vendored component suite (75 files, pinned
+`d095e2f60ddae1f9a1e9b1e2fb547ec1114da677`) measures M7:
+94 pass / 0 fail / 545 unsupported (text-form components +
+instantiation-pending binaries). What remains, per milestone:
 
-1. **Component Model** (§8.1: layer discrimination, nested core
-   modules/components, aliases, WIT types incl. map<K,V>/
-   implements/external-id) — requires vendoring the
-   component-model spec + suite per §12.1's pin discipline.
-2. **Canonical ABI** (§8.2: lift/lower, flattening, resources,
-   post-return) + **async runtime** (§8.3: the task state
-   machine, may-suspend propagation).
-3. **WASI 0.3.2 providers** (§9: cli/clocks/random/filesystem/
-   sockets/http over the pinned WIT) + the 0.1/0.2 facades.
-4. **The §12 remaining gates** for the conformant claim:
-   compiler-backend parity matrix (§12.3 — the :baseline mode
-   covers a slice; :optimized/:aot and the differential oracle
-   remain), the property/fuzz lanes (§12.6), and the §12.7 CI
-   lanes (test-component/test-wasi-*/test-differential).
+1. **M7 rest**: the component TEXT parser (the validation
+   suite's 545 rows), instantiation + linking (the linking
+   suite), the canonical ABI (the values suite), resources,
+   async (the 45-file async suite).
+2. **Canonical ABI + async runtime** (§8.2/§8.3: lift/lower,
+   flattening, resources, post-return, the task state machine,
+   may-suspend propagation).
+3. **WASI 0.3.2 providers** (§9) + the 0.1/0.2 facades (M8-M10).
+4. **The §12 remaining gates**: compiler-backend parity matrix
+   (§12.3's :optimized/:aot + the differential oracle), the
+   property/fuzz lanes (§12.6), the remaining CI lanes (M11).
 
 DONE: loop 18 (tail calls, EH, named modules), loop 19 (typed
 function references), loop 20 (rec groups + canonicalization +
 iso-recursive equivalence), loop 21 (struct/array declarations),
 loop 22 (GC value opcodes end to end), loop 23 (multi-memory
 runtime + memory64), loop 24 (SIMD — v128 + relaxed, the last
-opcode family; 32 self-authored pins).
+opcode family; 32 self-authored pins), **M7 slice 1** (the
+component binary reader + WIT value types + the validation rules
++ `make test-component`).

@@ -15,7 +15,11 @@ conformance gates. This repository delivers an honest **partial** slice
    end (decode → validate → interpret → compile → invoke). SIMD/GC/EH/
    tail-calls/memory64/WAT/Component/WASI/threads/FASL cache are out of
    scope and rejected with clear errors, not silently.
-   *Superseded in part (loops 18–24, 2026-10-24): tail calls
+   *Naming convention: the engine-slice feature loops (18–24) are
+   tracked by loop number; the Component Model work is tracked by
+   PLAN.md §14 milestone id (M7 slices) — the two counters never
+   renumber each other.*
+   *Superseded in part (loops 18–24 + M7 slice 1, 2026-10-24): tail calls
    (`return_call`/`return_call_indirect`, constant-stack trampoline),
    exception handling (tags, `try_table`, `throw`, named module
    definition/instance forms), typed function references
@@ -32,11 +36,16 @@ conformance gates. This repository delivers an honest **partial** slice
    runtime + memory64 (memidx immediates on every memory op,
    cross-memory copy with bounds on both backings, i64
    addressing with the addrtype-typed size/grow/fill/init
-   rules — self-authored tests, no vendored fixture), and SIMD (v128 + relaxed — the full 236-op v128 family and the 20 relaxed ops with documented canonical choices, scalarized per §7.3; the one vendored SIMD fixture passes at decode) are now
+   implemented, and M7 slice 1 (Component Model foundation: the
+   component binary reader — layer discrimination, all sections,
+   WIT value types incl. map 0x63, aliases, canon, values — plus
+   the label/index/max-size validation rules and the
+   `make test-component` lane against the vendored suite) is
    implemented. The vendored core suite is fully attributed
-   (0 fails; the 74 unsupported are the unadopted-annotations
-   proposal + one SIMD fixture). Still out of scope: WAT-level
-   Component/WASI, threads, FASL cache.
+   (0 fails; the 73 unsupported are the unadopted-annotations
+   proposal). Still out of scope: the component TEXT parser,
+   instantiation/linking, the canonical ABI, resources, async,
+   WIT-level Component/WASI, threads, FASL cache.
    `declared_support` stays `partial`.*
 2. **Failure phases are distinct conditions** (PLAN.md §12.2):
    `decode-error` → `validation-error` → `link-error` →
