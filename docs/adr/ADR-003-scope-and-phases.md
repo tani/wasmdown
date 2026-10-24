@@ -19,7 +19,7 @@ conformance gates. This repository delivers an honest **partial** slice
    tracked by loop number; the Component Model work is tracked by
    PLAN.md §14 milestone id (M7 slices) — the two counters never
    renumber each other.*
-   *Superseded in part (loops 18–24 + M7 slice 1, 2026-10-24): tail calls
+   *Superseded in part (loops 18–24 + M7 slices 1–2, 2026-10-25): tail calls
    (`return_call`/`return_call_indirect`, constant-stack trampoline),
    exception handling (tags, `try_table`, `throw`, named module
    definition/instance forms), typed function references
@@ -43,9 +43,19 @@ conformance gates. This repository delivers an honest **partial** slice
    `make test-component` lane against the vendored suite) is
    implemented. The vendored core suite is fully attributed
    (0 fails; the 73 unsupported are the unadopted-annotations
-   proposal). Still out of scope: the component TEXT parser,
-   instantiation/linking, the canonical ABI, resources, async,
-   WIT-level Component/WASI, threads, FASL cache.
+   proposal). M7 slice 2 (2026-10-25: the component TEXT parser
+   — src/component-text.lisp, the full text grammar into the
+   binary reader's IR; the validator's canonopt lift/lower rules
+   per CanonicalABI.md, the words/remove-annotations externname
+   grammar, imported/exported type placeholders, outer-alias
+   count+target validation, nested-component recursion) is
+   implemented; the component lane measures 305 pass / 280 fail /
+   38 unsupported / 16 harness-error of 639. Still out of scope:
+   the validator-extension families (instantiation arg/type
+   matching, version-suffix semver, external-visibility,
+   annotated-name shapes), instantiation/linking, the canonical
+   ABI, resources, async, WIT-level Component/WASI, threads,
+   FASL cache.
    `declared_support` stays `partial`.*
 2. **Failure phases are distinct conditions** (PLAN.md §12.2):
    `decode-error` → `validation-error` → `link-error` →

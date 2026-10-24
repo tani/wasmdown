@@ -37,12 +37,14 @@ calls all pass.
 
 The component lane (`make test-component`, the vendored
 component-model suite at commit `d095e2f60dd...` per
-`specs/lock.toml`) measures the M7 foundation: **94 pass / 0
-fail / 545 unsupported / 0 harness-error of 639** in
-{binary,validation} minus nyi.txt — every decodable binary
-fixture passes; the unsupported are text-form components (the
-component text parser is the next M7 slice) and valid binaries
-awaiting instantiation. See `CONFORMANCE-COMPONENT.md`.
+`specs/lock.toml`) measures M7: **305 pass / 280 fail / 38
+unsupported / 16 harness-error of 639** in {binary,validation} minus
+nyi.txt — the component TEXT parser (M7 slice 2) parses + validates
+the whole validation suite's text grammar; the fails are the
+instantiation/type-matching, version-suffix, external-visibility
+and annotated-name validator-extension families (the next slice),
+and the unsupported are valid binaries awaiting instantiation.
+See `CONFORMANCE-COMPONENT.md`.
 
 Regenerate with `make report-conformance` (writes `CONFORMANCE.md` +
 `tests/spec-core-results.jsonl`, one JSONL line per command); the full
@@ -90,10 +92,13 @@ harness-errors.
 | Interpreter | `src/interp.lisp` | Reference evaluator; guest recursion traps `:call-stack-exhausted` before host stack exhaustion. |
 | Codegen | `src/codegen.lisp` | Baseline backend: SBCL `COMPILE` of emitted `LET`/`TAGBODY`/`GO` forms; interp-vs-compiled parity tests. |
 | API / CLI | `src/api.lisp`, `src/cli.lisp` | `read-module`, `validate-module`, `instantiate`, `invoke`, …; CLI `validate`/`inspect`/`compile`/`run`. |
-| Component | `src/component.lisp` | M7 slice 1: layer discrimination (magic + version 0x0D + layer byte), the full component binary reader (all 12 sections, WIT value types incl. map 0x63, aliases, canon incl. all 47 async built-ins, value sections), the label/index/max-size validator, the `(component ...)` script-command family, `make test-component`. |
+| Component | `src/component.lisp` | M7 slices 1–2: layer discrimination (magic + version 0x0D + layer byte), the full component binary reader (all 12 sections, WIT value types incl. map 0x63, aliases, canon incl. all 47 async built-ins, value sections), the label/index/max-size validator + the canonopt lift/lower rules, the `(component ...)` script-command family, `make test-component`. |
+| Component text | `src/component-text.lisp` | M7 slice 2: the full component TEXT grammar into the same IR (valtypes, functypes, imports/exports + attributes, canon lift/lower + built-ins upright/inverted, core module via `parse-wat`, core instance, aliases incl. outer-alias sugar + projections, the named-form `(component definition ...)` marker). |
 
 Not implemented (see `PLAN.md` for the full contract): the
-component TEXT parser, component instantiation + linking, the
+validator-extension families (instantiation arg/type matching,
+version-suffix semver, external-visibility, annotated-name shape
+rules), component instantiation + linking, the
 Canonical ABI, resources, async, WASI (all versions),
 threads/atomics, FASL cache, annotations (an unadopted proposal —
 permanently out of scope per PLAN.md §3.3). SIMD (v128 + relaxed,
@@ -177,12 +182,17 @@ proposal (permanently out of scope per PLAN.md §3.3). PLAN.md
 §3.1's Core 3.0 opcode/type inventory is COMPLETE in the engine
 slice. The vendored component suite (75 files, pinned
 `d095e2f60ddae1f9a1e9b1e2fb547ec1114da677`) measures M7:
-94 pass / 0 fail / 545 unsupported (text-form components +
-instantiation-pending binaries). What remains, per milestone:
+305 pass / 280 fail / 38 unsupported / 16 harness-error of 639 —
+the component TEXT parser (M7 slice 2) parses + validates the whole
+validation suite's text grammar; the 280 fails are the
+instantiation/arg-matching, version-suffix, external-visibility and
+annotated-name-shape validator-extension families (the next slice).
+What remains, per milestone:
 
-1. **M7 rest**: the component TEXT parser (the validation
-   suite's 545 rows), instantiation + linking (the linking
-   suite), the canonical ABI (the values suite), resources,
+1. **M7 rest**: the validator-extension families (instantiation
+   arg/type matching, version-suffix semver, external-visibility,
+   annotated-name shape rules), instantiation + linking (the
+   linking suite), the canonical ABI (the values suite), resources,
    async (the 45-file async suite).
 2. **Canonical ABI + async runtime** (§8.2/§8.3: lift/lower,
    flattening, resources, post-return, the task state machine,
