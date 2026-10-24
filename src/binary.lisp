@@ -666,10 +666,20 @@ Returns (values tables-list desugared-elems-list)."
                       (let* ((rt (%read-reftype r))
                              (limits (%read-limits r))
                              (expr (decode-instr-seq r)))
+                        ;; tables accumulates in push order; the
+                        ;; entry just pushed sits at (1- length) in
+                        ;; DECLARATION order — the elem targets it
+                        ;; 0-based (check-tables' exemption compares
+                        ;; i + imported-count, both 0-based; the
+                        ;; import partition happens at module
+                        ;; assembly, not here).
                         (push (make-wasm-table rt limits) tables)
-                        ;; active elem at offset 0, [expr x min]
+                        ;; active elem at offset 0, [expr x min]; the
+                        ;; just-pushed table sits at (1- length) in
+                        ;; DECLARATION order — 0-based, matching
+                        ;; check-tables' i + imported-count.
                         (push (make-wasm-elem
-                               (list :active (length tables)
+                               (list :active (1- (length tables))
                                      (vector
                                       (make-wasm-instr :i32.const
                                                        (list :value 0) #()
@@ -938,7 +948,8 @@ wasmdown:decode-error (with :offset) on any malformation."
                (6 (setf globals (%read-global-section r)))
                (7 (setf exports (%read-export-section r)))
                (8 (setf start (%read-start-section r)))
-               (9 (setf elems (%read-elem-section r)))
+               (9 (setf elems (concatenate 'vector elems
+                                           (%read-elem-section r))))
                (10 (setf funcs (%read-code-section r (or func-typeidxs #()))))
                (11 (setf datas (%read-data-section r)))
                (12 (setf data-count (%read-datacount-section r)))

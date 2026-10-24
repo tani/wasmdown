@@ -13,15 +13,15 @@ now classify as :unsupported instead of crashing as harness-errors.
 
 | Outcome | Count |
 | --- | --- |
-| pass | 21154 |
+| pass | 21186 |
 | fail | 0 |
 | skip | 0 |
-| unsupported | 106 |
+| unsupported | 74 |
 | timeout | 0 |
 | harness-error | 0 |
 | **total** | **21260** |
 
-Executed: 21260 commands; pass rate 99.5% (denominator = all executed,
+Executed: 21260 commands; pass rate 99.7% (denominator = all executed,
 including unsupported — honest per PLAN.md §12.9).
 
 ## Per-file counts
@@ -32,7 +32,7 @@ including unsupported — honest per PLAN.md §12.9).
 | align | 165 | 0 | 0 | 0 |
 | annotations | 1 | 0 | 73 | 0 |
 | binary-leb128 | 91 | 0 | 0 | 0 |
-| binary | 127 | 0 | 2 | 0 |
+| binary | 129 | 0 | 0 | 0 |
 | block | 223 | 0 | 0 | 0 |
 | br | 97 | 0 | 0 | 0 |
 | br_if | 119 | 0 | 0 | 0 |
@@ -45,9 +45,9 @@ including unsupported — honest per PLAN.md §12.9).
 | comments | 8 | 0 | 0 | 0 |
 | const | 778 | 0 | 0 | 0 |
 | conversions | 619 | 0 | 0 | 0 |
-| custom | 10 | 0 | 1 | 0 |
+| custom | 11 | 0 | 0 | 0 |
 | data | 68 | 0 | 0 | 0 |
-| elem | 146 | 0 | 8 | 0 |
+| elem | 154 | 0 | 0 | 0 |
 | endianness | 69 | 0 | 0 | 0 |
 | exports | 97 | 0 | 0 | 0 |
 | f32 | 2514 | 0 | 0 | 0 |
@@ -115,7 +115,7 @@ including unsupported — honest per PLAN.md §12.9).
 | traps | 36 | 0 | 0 | 0 |
 | type-canon | 2 | 0 | 0 | 0 |
 | type-equivalence | 32 | 0 | 0 | 0 |
-| type-rec | 6 | 0 | 21 | 0 |
+| type-rec | 27 | 0 | 0 | 0 |
 | type | 3 | 0 | 0 | 0 |
 | unreachable | 64 | 0 | 0 | 0 |
 | unreached-invalid | 121 | 0 | 0 | 0 |

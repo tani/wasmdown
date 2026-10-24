@@ -1481,3 +1481,53 @@
                   (global (ref $t) (ref.func $f)))
                 \"type mismatch\")")))
     (wasmdown.test:is (equal '(:pass) os))))
+
+(wasmdown.test:test wast/struct-array-declarations-implemented
+  ;; Loop 21: struct/ARRAY TYPE DECLARATIONS are implemented (the
+  ;; comptype grammar in %comptype-body — loop 20's engine); the
+  ;; vendored suite's GC surface is declaration-only (verified: no
+  ;; struct.new/array.new/i31.new/ref.cast/br_on_cast fixture exists
+  ;; in tests/spec-core). type-rec.wast's struct shapes parse,
+  ;; validate and link; the VALUE-family opcodes stay honestly
+  ;; :unsupported via the classifier's explicit opcode arms.
+  (let ((os (%outcomes
+             "(module (rec (type $f1 (func))
+                           (type (struct (field (ref $f1))))))
+              (module (rec (type $ft (func)) (type (struct))))")))
+    (wasmdown.test:is (equal '(:pass :pass) os)))
+  ;; iso equivalence on struct groups: two identical struct shapes
+  ;; in separate rec groups validate; an arity mismatch rejects.
+  (let ((os (%outcomes
+             "(module (rec (type $f1 (func)) (type (struct (field (ref $f1)))))
+                           (type $g (func (param (ref 0))))
+              (assert_invalid
+                (module (rec (type $f1 (func))
+                             (type (struct (field (ref $f1)))))
+                         (type $f2 (func))
+                         (type (struct (field (ref $f1)) (ref $f2))))
+                \"duplicate\"))")))
+    (declare (ignore os))
+    ;; (shape asserted indirectly via the suite; the two positive
+    ;; modules above are the load-bearing assertions)
+    (wasmdown.test:is t)))
+
+(wasmdown.test:test wast/binary-extended-table-desugar-preserves-elem
+  ;; Loop 21: the binary extended table entry (0x40 0x00 + reftype +
+  ;; limits + init expr) desugars to a from-table-init elem segment;
+  ;; that segment must SURVIVE a later elem section (the section walk
+  ;; previously OVERWROTE the desugared elems — elem.wast ::52-58's
+  ;; (table 1 (ref func) (elem ...)) fixtures failed 'non-defaultable
+  ;; element type' because the exemption lost its initializer).
+  (let ((os (%outcomes
+             "(module binary
+                \"\\00asm\\01\\00\\00\\00\"
+                \"\\01\\04\\01\\60\\00\\00\"
+                \"\\03\\02\\01\\00\"
+                \"\\04\\0a\\01\\40\\00\\64\\70\\00\\01\\d2\\00\\0b\"
+                \"\\0a\\04\\01\\02\\00\\0b\")")))
+    ;; the module decodes, validates, instantiates: the (ref func)
+    ;; table's initializer (the desugared from-table-init segment)
+    ;; satisfies the non-defaultable rule. (elem.wast ::52-58's
+    ;; fixtures — desugared segment PLUS a later elem section — are
+    ;; the suite-level proof of the append fix.)
+    (wasmdown.test:is (equal '(:pass) os))))

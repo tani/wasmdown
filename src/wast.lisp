@@ -1038,20 +1038,24 @@ ref.test, any.convert_extern/extern.convert_any, annotations."
      ;; GC VALUE families stay out of scope. RECURSION GROUPS (loop
      ;; 20) are IMPLEMENTED for FUNC/STRUCT/ARRAY comptypes at the
      ;; TYPE level: (rec ...) parses, validates and links (the
-     ;; iso-recursive equivalence engine in wasmdown.types), so NO
-     ;; standalone (rec arm anymore — but a rec group carrying GC
-     ;; VALUE composites is still caught here by the (struct/(array/
-     ;; (i31 substring arms (type-rec.wast's struct fixtures): their
-     ;; VALUE families (struct.new/array.new/br_on_cast/...) are
-     ;; unimplemented, so those modules classify :unsupported
-     ;; honestly. eq/struct/array/i31 heap spellings, ref.eq/ref.test/
-     ;; ref.cast/br_on_cast and the any<->extern conversions remain
-     ;; GC scope.
-     ((or (has "(struct") (has "(array") (has "(i31")
+     ;; iso-recursive equivalence engine in wasmdown.types), and
+     ;; struct/ARRAY TYPE DECLARATIONS (the comptype grammar in
+     ;; %comptype-body) parse and validate too — type-rec.wast's 21
+     ;; struct rows are declaration-only (fields are plain (ref $t),
+     ;; no packed fields, no mut, zero GC opcodes anywhere in the
+     ;; vendored suite — verified: no struct.new/array.new/i31.new/
+     ;; ref.cast/br_on_cast fixture exists in tests/spec-core). So
+     ;; the (struct/(array declaration arms RELEASE; what stays GC
+     ;; scope is the VALUE family: the eq/struct/array/i31 heap
+     ;; spellings IN REFTYPES, ref.eq/ref.test/ref.cast/br_on_cast,
+     ;; any<->extern conversions and i31.
+     ((or (has "(i31")
           (has "(ref eq") (has "(ref struct") (has "(ref array")
           (has "(ref i31")
           (has "br_on_cast") (has "ref.cast") (has "ref.test")
           (has "ref.eq")
+          (has "struct.new") (has "array.new") (has "struct.get")
+          (has "array.get") (has "struct.set") (has "array.set")
           (tok "eqref") (tok "structref") (tok "arrayref")
           (tok "i31ref")
           (has "any.convert_extern") (has "extern.convert_any")
@@ -1167,15 +1171,16 @@ module object is needed; signals a catchable wasmdown:decode-error."
              func-count code-count))))
 (defun %binary-gc-table-p (bytes)
   "Whether a binary payload's Table section uses a GC VALUE-family
-element type — the struct/array/i31/eq/any abstract heaps (0x6A/0x6B/
-0x6C/0x6D/0x6E) or a composite-type prefix in table-type position.
-Typed function references ARE decodable table element types now
-(loop 19: 0x64 (ref ht), 0x63 (ref null ht), 0x70/0x6f/0x69 legacy),
-so elem.wast's (table 1 (ref func) ...) fixtures decode and RUN; only
-the value-family bytes stay :unsupported. Only the FIRST table entry
-is inspected (entries are delimited by their limits, which the
-detector does not parse; every suite fixture declaring a GC table
-declares it first)."
+element type. INVERTED FLAG DESIGN: flag ONLY the known GC-value
+bytes (0x6A array / 0x6B struct / 0x6C i31 / 0x6D eq heaps) in
+element-type position — everything else falls through to the real
+decoder, whose malformed errors are the honest assert_malformed
+outcomes (an unknown byte yields 'unknown type form' at decode, the
+fixture's own expected phase). The decodable set (0x70/0x6F/0x69
+legacy reftypes, 0x63/0x64 typed refs, and the 0x40 0x00 extended
+table prefix that precedes them — elem.wast ::52-58's fixtures)
+never flags. Only the FIRST table entry is inspected (every suite
+fixture declaring a GC table declares it first)."
   (when (< (length bytes) 8) (return-from %binary-gc-table-p nil))
   (handler-case
       (let ((r (wasmdown.binary:make-reader bytes))
@@ -1183,60 +1188,46 @@ declares it first)."
         ;; magic + version
         (dotimes (_ 8) (wasmdown.binary:read-byte-at r))
         (loop
-          (when (>= (wasmdown.binary:reader-offset r) (length bytes)) (return))
+          (when (>= (wasmdown.binary:reader-offset r) (length bytes))
+            (return))
           (let* ((id (wasmdown.binary:read-byte-at r))
                  (size (wasmdown.binary:read-u32 r))
                  (end (+ (wasmdown.binary:reader-offset r) size)))
             (when (= id 4)
               (wasmdown.binary:read-u32 r)        ; entry count
-              (unless (member (wasmdown.binary:read-byte-at r)
-                              '(#x70 #x6f #x69 #x63 #x64))
-                (setf gc-p t)))
+              (let ((first (wasmdown.binary:read-byte-at r)))
+                ;; the extended table form: 0x40 0x00 prefix then
+                ;; the reftype — the prefix never flags
+                (when (= first #x40)
+                  (wasmdown.binary:read-byte-at r) ; the 0x00
+                  (setf first
+                        (wasmdown.binary:read-byte-at r)))
+                ;; flag ONLY the known GC value-family heaps
+                (when (member first '(#x6a #x6b #x6c #x6d))
+                  (setf gc-p t))))
             (setf (wasmdown.binary:reader-offset r) end)
             (when gc-p (return))))
         gc-p)
     (error () nil)))
 
 (defun %binary-gc-valtype-p (bytes)
-  "Whether a binary payload's TYPE section carries a GC VALUE-family
-type form — the struct/array/composite heap bytes (0x6A array, 0x6B
-struct, 0x6C i31, 0x6D eq, plus the comptype prefixes 0x5E/0x5F and
-the rec/sub markers 0x4E/0x4F/0x50). The typed-function-reference
-bytes 0x63/0x64 are DECODABLE as of loop 19 (with their s33 heap
-typeuses) and no longer flag GC — binary.wast ::1241's (ref null
-0x8000_0000) decodes and fails 'unknown type' at VALIDATE (its
-assert_invalid phase), and elem.wast's typed-table fixtures decode
-and run. The scan stays best-effort: malformed shapes fall through
-to NIL and the honest decode reports the real error."
-  (when (< (length bytes) 8) (return-from %binary-gc-valtype-p nil))
+  "Whether a binary payload's DECODED type graph carries a GC
+VALUE-family comptype (struct/array forms). DECODE-MEDIATED: no
+byte heuristics — decode the module; on decode-error return NIL
+and let the real pipeline surface its own honest error (binary.
+wast ::110/::117's garbage fixtures expect assert_malformed at
+DECODE — the old raw scan false-positived the magic's 'm' = 0x6D);
+on success, inspect the actual type entries. The rec/sub markers
+(0x4E/0x4F/0x50) and the typed-function-reference bytes are
+loop-19/20 implemented and never flag."
   (handler-case
-      (let ((r (wasmdown.binary:make-reader bytes))
-            (gc-p nil))
-        (dotimes (_ 8) (wasmdown.binary:read-byte-at r))
-        (loop
-          (when (>= (wasmdown.binary:reader-offset r) (length bytes))
-            (return))
-          (let* ((id (wasmdown.binary:read-byte-at r))
-                 (size (wasmdown.binary:read-u32 r))
-                 (end (+ (wasmdown.binary:reader-offset r) size)))
-            (when (and (= id 1)
-                       (<= end (length bytes)))
-              (let ((n (wasmdown.binary:read-u32 r)))
-                (declare (ignore n))
-                ;; scan the raw section bytes for the GC value-family
-                ;; forms only; 0x60/0x63/0x64 and the MVP forms are
-                ;; decodable. NB 0x6E (any heap) and 0x69 (exn heap)
-                ;; are typed-funcrefs-scope and admitted; the
-                ;; byte-identical-to-other-payloads caveat keeps the
-                ;; scan inside [offset, end).
-                (loop while (< (wasmdown.binary:reader-offset r) end)
-                      for b = (wasmdown.binary:read-byte-at r)
-                      when (member b '(#x5e #x5f #x6a #x6b #x6c #x6d
-                                      #x4e #x4f #x50))
-                        do (setf gc-p t))))
-            (setf (wasmdown.binary:reader-offset r) end)
-            (when gc-p (return))))
-        gc-p)
+      (let ((m (wasmdown.binary:decode-module bytes)))
+        (loop for ty across (wasmdown.types:wasm-module-types m)
+              thereis (and (wasmdown.types:wasm-rec-type-p ty)
+                           (let ((ct (wasmdown.types:wasm-rec-type-comptype ty)))
+                             (and ct
+                                  (not (eq (wasmdown.types:wasm-comptype-kind ct)
+                                           :func)))))))
     (error () nil)))
 
 
