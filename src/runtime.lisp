@@ -415,11 +415,20 @@ Elements initialize to the null reference (NIL)."
                  (wasm-import-module import) (wasm-import-field import)
                  (type-of value)))
   (let* ((expected (aref (wasm-module-types module) (wasm-import-type import)))
-         (actual (func-instance-type value)))
-    (unless (and (equal (wasm-func-type-params expected)
-                         (wasm-func-type-params actual))
-                 (equal (wasm-func-type-results expected)
-                         (wasm-func-type-results actual)))
+         (actual (func-instance-type value))
+         ;; the providing module: the DEFINING module of the func
+         ;; instance (its type vector gives the typeuse context —
+         ;; cross-module indices are meaningless positionally, so
+         ;; the comparator is structural with the iso-recursive
+         ;; group rule; loop 20, type-equivalence.wast ::191-324's
+         ;; link-time cases). A host function has no module: a bare
+         ;; module context works (its type is a plain functype).
+         (actual-module (or (and (func-instance-module value)
+                                 (module-instance-module
+                                  (func-instance-module value)))
+                            (make-wasm-module))))
+    (unless (wasmdown.types:func-type-match-p
+             expected actual module actual-module)
       (%link-error "import ~a.~a: function type mismatch"
                    (wasm-import-module import) (wasm-import-field import)))))
 
@@ -495,11 +504,13 @@ tag: its type's params only, results being empty by construction).
                  (type-of value)))
   (let* ((expected-typeidx (wasm-import-type import))
          (expected (svref (wasm-module-types module) expected-typeidx))
-         (actual (tag-instance-type value)))
-    (unless (and (equal (wasm-func-type-params expected)
-                        (wasm-func-type-params actual))
-                 (equal (wasm-func-type-results expected)
-                        (wasm-func-type-results actual)))
+         (actual (tag-instance-type value))
+         (actual-module (or (and (tag-instance-module value)
+                                 (module-instance-module
+                                  (tag-instance-module value)))
+                            (make-wasm-module))))
+    (unless (wasmdown.types:func-type-match-p
+             expected actual module actual-module)
       (%link-error "import ~a.~a: tag type mismatch"
                    (wasm-import-module import) (wasm-import-field import)))))
 

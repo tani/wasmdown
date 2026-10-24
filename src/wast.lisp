@@ -1035,15 +1035,19 @@ ref.test, any.convert_extern/extern.convert_any, annotations."
      ((has "(@") :annotations)
      ((or (tok "v128") (tok "i8x16") (tok "i16x8") (tok "i32x4")
           (tok "i64x2") (tok "f32x4") (tok "f64x2")) :simd)
-     ;; GC VALUE families + rec groups stay out of the slice. The
-     ;; typed-function-reference shapes ((ref $t), (ref null func),
-     ;; anyref, call_ref, br_on_null, ...) are IMPLEMENTED (loop 19)
-     ;; and intentionally NOT matched here anymore. eq/struct/array/
-     ;; i31 heap spellings remain GC scope (their value families are
-     ;; unimplemented); ref.eq/ref.test/ref.cast/br_on_cast and the
-     ;; any<->extern conversions likewise.
+     ;; GC VALUE families stay out of scope. RECURSION GROUPS (loop
+     ;; 20) are IMPLEMENTED for FUNC/STRUCT/ARRAY comptypes at the
+     ;; TYPE level: (rec ...) parses, validates and links (the
+     ;; iso-recursive equivalence engine in wasmdown.types), so NO
+     ;; standalone (rec arm anymore — but a rec group carrying GC
+     ;; VALUE composites is still caught here by the (struct/(array/
+     ;; (i31 substring arms (type-rec.wast's struct fixtures): their
+     ;; VALUE families (struct.new/array.new/br_on_cast/...) are
+     ;; unimplemented, so those modules classify :unsupported
+     ;; honestly. eq/struct/array/i31 heap spellings, ref.eq/ref.test/
+     ;; ref.cast/br_on_cast and the any<->extern conversions remain
+     ;; GC scope.
      ((or (has "(struct") (has "(array") (has "(i31")
-          (has "(rec")
           (has "(ref eq") (has "(ref struct") (has "(ref array")
           (has "(ref i31")
           (has "br_on_cast") (has "ref.cast") (has "ref.test")

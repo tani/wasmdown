@@ -142,7 +142,13 @@ type', ref.wast's block/loop/if batch)."
   (declared-refs nil)          ; list of funcidx declared via elem/export
   ;; EH (Core 3.0): tag index space — vector of tag functypes
   ;; (imports first, then the tag section's typeidx-resolved types).
-  (tags #()))
+  (tags #())
+  ;; CANONICALIZATION (loop 20): vector typeidx -> min equivalent
+  ;; typeidx (iso-recursive equivalence classes; spec: a module's
+  ;; structurally-equal types are ONE canonical type). Computed once
+  ;; at build-vctx; %HEAP-SUB-P and every typeuse comparison route
+  ;; through it.
+  (canon #() :type vector))
 
 (defun imported-kind-count (module kind)
   (count kind (wasm-module-imports module) :key #'wasm-import-kind))
@@ -210,7 +216,35 @@ afterwards)."
                :elems (wasm-module-elems module)
                :data-count (length (wasm-module-datas module))
                :declared-refs (%declared-func-refs module)
-               :tags tags)))
+               :tags tags
+               :canon (%build-canon module))))
+
+(defun %build-canon (module)
+  "The canonicalization map (loop 20): vector canon[i] = the MINIMUM
+typeidx equivalent to i under iso-recursive equivalence (spec: within
+a module, structurally-equal types are one canonical type; the class
+representative is the least index — deterministic). Equivalence is
+symmetric and transitive by construction of the spec's rule, so a
+single min-scan per index is sound: canon[i] = min{ j : j equiv i }.
+Non-plain entries (rec groups) memoize via the types comparator;
+plain functype-only modules keep the raw EQUAL fast path (the same
+result as the iso rule for plain types: no group sharing)."
+  (let* ((types (wasm-module-types module))
+         (n (length types))
+         (canon (make-array n)))
+    (when (zerop n) (return-from %build-canon canon))
+    ;; fast path: no rec entries at all -> identity EXCEPT plain
+    ;; duplicates (type.wast: (type $t (func)) x2 are canonicalized
+    ;; too — find-or-add already dedups implicit uses, but explicit
+    ;; duplicates may appear; equivalence for plain entries is plain
+    ;; structural equality)
+    (loop for i from 0 below n
+          do (let ((min-idx i))
+               (loop for j from 0 below i
+                     when (wasmdown.types:type-equiv-p module j module i)
+                       do (setf min-idx (min min-idx j)))
+               (setf (aref canon i) min-idx)))
+    canon))
 
 (defun %declared-func-refs (module)
   "The funcidx set legal for ref.func (spec: funcidx(globals mems tables
@@ -443,7 +477,8 @@ rest; :bot (stack-polymorphic bottom) always passes)."
                 (and (reftype-p actual) (reftype-p expect)
                      (wasmdown.types:reftype-sub-p
                       actual expect
-                      (wasm-module-types (vctx-module (fv-ctx fv))))))
+                      (wasm-module-types (vctx-module (fv-ctx fv)))
+                      (vctx-canon (fv-ctx fv)))))
       (verr "type mismatch at offset ~a: expected ~a, got ~a"
             (fv-offset fv) expect actual))
     actual))
@@ -557,16 +592,18 @@ payload values, plus an exnref for the _ref clauses)."
        (every (lambda (x y) (or (eq x :bot) (eq y :bot) (equal x y)))
               a b)))
 
-(defun %results-sub-p (callee caller types)
+(defun %results-sub-p (callee caller types &optional canon)
   "Per-element result subtyping for tail calls: each callee result
 must be <: the caller's declared slot — numeric types EQUAL,
 reference types via reftype-sub-p (return_call.wast's result
-subtyping: ((ref null $t)) <: (funcref))."
+subtyping: ((ref null $t)) <: (funcref); CANON routes the
+typeuse-equivalence cases, loop 20)."
   (and (= (length callee) (length caller))
        (every (lambda (x y)
                 (or (equal x y)
                     (and (reftype-p x) (reftype-p y)
-                         (wasmdown.types:reftype-sub-p x y types))))
+                         (wasmdown.types:reftype-sub-p
+                          x y types canon))))
               callee caller)))
 
 ;;; ---------------------------------------------------------------
@@ -866,7 +903,8 @@ bodies of their :end terminator; bodies of :if carry no :else/:end)."
                           (car (last (fv-ctrls fv))))))
            (unless (%results-sub-p (wasm-func-type-results ft) results
                                     (wasm-module-types
-                                     (vctx-module (fv-ctx fv))))
+                                     (vctx-module (fv-ctx fv)))
+                                    (vctx-canon (fv-ctx fv)))
              (verr "type mismatch: return_call result types ~a do not match function results ~a"
                    (wasm-func-type-results ft) results))
            (%pop-vals fv (wasm-func-type-params ft))
@@ -890,7 +928,8 @@ bodies of their :end terminator; bodies of :if carry no :else/:end)."
                    (imm :table) (wasm-table-type table)))
            (unless (%results-sub-p (wasm-func-type-results ft) results
                                     (wasm-module-types
-                                     (vctx-module (fv-ctx fv))))
+                                     (vctx-module (fv-ctx fv)))
+                                    (vctx-canon (fv-ctx fv)))
              (verr "type mismatch: return_call_indirect result types ~a do not match function results ~a"
                    (wasm-func-type-results ft) results))
            (%pop-val-expect fv :i32)
@@ -1063,7 +1102,8 @@ bodies of their :end terminator; bodies of :if carry no :else/:end)."
            (unless (or (eq ert (wasm-table-type table))
                        (wasmdown.types:reftype-sub-p
                         ert (wasm-table-type table)
-                        (wasm-module-types module)))
+                        (wasm-module-types module)
+                        (vctx-canon (fv-ctx fv))))
              (verr "table.init: element type ~a does not match table type ~a"
                    ert (wasm-table-type table)))
            (%pop-val-expect fv :i32)
@@ -1205,7 +1245,8 @@ bodies of their :end terminator; bodies of :if carry no :else/:end)."
                                  (or (equal r cr)
                                      (and (reftype-p r) (reftype-p cr)
                                           (wasmdown.types:reftype-sub-p
-                                           r cr types))))
+                                           r cr types
+                                           (vctx-canon (fv-ctx fv))))))
                                results caller-results))
              (verr "type mismatch: return_call_ref result types ~a do not match function results ~a"
                    results caller-results))
@@ -1310,25 +1351,69 @@ wasmdown:validation-error."
     (validate-all-funcs module ctx))
   t)
 
+(defun %comptype-valtypes (comptype)
+  "The valtype lists a comptype exposes (validate-side mirror of the
+types helper): params+results for a func, field types for struct."
+  (ecase (wasmdown.types:wasm-comptype-kind comptype)
+    (:func (append (wasmdown.types:wasm-comptype-params comptype)
+                   (wasmdown.types:wasm-comptype-results comptype)))
+    ((:struct :array)
+     (mapcar #'first (wasmdown.types:wasm-comptype-fields comptype)))))
+
 (defun check-types-section (module)
+  "Type-section well-formedness, RECURSION-GROUP AWARE:
+  1. every exposed valtype is a valtype;
+  2. every typed-ref (:TYPE N) heap is in range ('unknown type',
+     ref.wast ::27-62);
+  3. REC FORWARD-REFERENCE RULE (type-equivalence.wast ::76-82,
+     type-rec.wast ::21-33): a typeuse inside type I may reference
+     only members of I's OWN rec group or types with index <
+     GROUP-START — a reference to a LATER type outside the group
+     is 'unknown type' (the whole point of (rec ...): only group
+     members may be mutually recursive)."
   (let ((types (wasm-module-types module)))
     (loop for ft across types
           for i from 0
-          do (loop for t_ in (append (wasm-func-type-params ft)
-                                     (wasm-func-type-results ft))
-                   unless (valtype-p t_)
-                     do (verr "type ~a: invalid value type ~a" i t_)
-                   ;; typed-ref (:TYPE N) heaps must resolve
-                   ;; ('unknown type', ref.wast ::27-62 batch)
-                   when (and (reftype-p t_)
-                             (consp t_)
-                             (not (valid-heaptype-p
-                                   (wasmdown.types:typed-ref-heap t_)
-                                   types)))
-                     do (verr "type ~a: unknown type ~a" i
-                              (second
-                               (wasmdown.types:typed-ref-heap t_)))))))
-
+          do (let* ((rec-p (wasmdown.types:wasm-rec-type-p ft))
+                    (gstart (if rec-p
+                                (wasmdown.types:wasm-rec-type-group-start ft)
+                                i))
+                    (grp (if rec-p (wasmdown.types:wasm-rec-type-group ft)
+                             nil))
+                    (vs (if rec-p
+                            (%comptype-valtypes
+                             (wasmdown.types:wasm-rec-type-comptype ft))
+                            (append (wasm-func-type-params ft)
+                                    (wasm-func-type-results ft)))))
+               (loop for t_ in vs
+                     unless (valtype-p t_)
+                       do (verr "type ~a: invalid value type ~a" i t_)
+                     ;; (:TYPE N) heaps must resolve in range
+                     when (and (reftype-p t_) (consp t_)
+                               (not (valid-heaptype-p
+                                     (wasmdown.types:typed-ref-heap t_)
+                                     types)))
+                       do (verr "type ~a: unknown type ~a" i
+                                (second
+                                 (wasmdown.types:typed-ref-heap t_)))
+                     ;; forward-reference bound: the target must be
+                     ;; in the entry's own rec group or STRICTLY
+                     ;; BEFORE the group's start (an abstract heap
+                     ;; like :any is not a typeuse — skip it)
+                     when (and rec-p (reftype-p t_) (consp t_)
+                               (consp (wasmdown.types:typed-ref-heap t_))
+                               (let ((tgt (second
+                                           (wasmdown.types:typed-ref-heap
+                                            t_))))
+                                 (and (integerp tgt) (>= tgt 0)
+                                      (< tgt (length types))
+                                      (>= tgt gstart)
+                                      (not (eq (wasmdown.types:rec-group-of
+                                                module tgt)
+                                               grp)))))
+                       do (verr "type ~a: unknown type ~a" i
+                                (second
+                                 (wasmdown.types:typed-ref-heap t_))))))))
 (defun check-imports (module)
   (loop for imp across (wasm-module-imports module)
         for i from 0
@@ -1446,7 +1531,8 @@ The init's type must be a SUBTYPE of the declared type
                              (and (reftype-p type)
                                   (reftype-p (wasm-global-type g))
                                   (wasmdown.types:reftype-sub-p
-                                   type (wasm-global-type g) types)))
+                                   type (wasm-global-type g) types
+                                   (vctx-canon ctx))))
                    (verr "global ~a: init expression type ~a does not match declared type ~a"
                          i type (wasm-global-type g))))))))
 
@@ -1505,7 +1591,8 @@ REJECTED — funcref (nullable) is not <: (ref func))."
                           (unless (or (equal type etype)
                                       (and (reftype-p type)
                                            (wasmdown.types:reftype-sub-p
-                                            type etype types)))
+                                            type etype types
+                                            (vctx-canon ctx))))
                             (verr "element segment ~a item ~a: type ~a does not match segment type ~a"
                                   i j type etype))))
                (when (and (consp mode) (eq (first mode) :active))
@@ -1517,7 +1604,8 @@ REJECTED — funcref (nullable) is not <: (ref func))."
                                                        i))))
                      (unless (or (eq etype (wasm-table-type table))
                                  (wasmdown.types:reftype-sub-p
-                                  etype (wasm-table-type table) types))
+                                  etype (wasm-table-type table) types
+                                  (vctx-canon ctx)))
                        (verr "element segment ~a: type ~a does not match table ~a type ~a"
                              i etype tableidx (wasm-table-type table))))
                    (let ((type (const-expr-type

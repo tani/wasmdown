@@ -89,7 +89,20 @@
    #:valtype-width
    #:defaultable-valtype-p
    #:typed-ref-p #:typed-ref-nullable-p #:typed-ref-heap
-   #:reftype-sub-p))
+   #:reftype-sub-p
+   ;; recursion groups + iso-recursive equivalence (loop 20)
+   #:make-wasm-comptype #:wasm-comptype #:wasm-comptype-p
+   #:wasm-comptype-kind #:wasm-comptype-heap
+   #:wasm-comptype-fields #:wasm-comptype-params
+   #:wasm-comptype-results
+   #:make-wasm-rectype-group #:wasm-rectype-group #:wasm-rectype-group-p
+   #:wasm-rectype-group-types
+   #:wasm-rec-type #:wasm-rec-type-p
+   #:wasm-rec-type-comptype #:wasm-rec-type-group
+   #:wasm-rec-type-group-idx #:wasm-rec-type-group-start
+   #:make-rec-type-entry #:make-singleton-rec-type #:wrap-func-type-as-rec
+   #:module-type-comptype #:rec-group-of
+   #:type-equiv-p #:func-type-match-p #:func-type-equal-p))
 
 (defpackage #:wasmdown.numops
   (:use #:cl)

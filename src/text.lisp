@@ -1029,16 +1029,36 @@ does not just stop at the first mismatching item, it REJECTS it."
     (values params results typeidx)))
 
 (defun %find-or-add-type (params results penv)
-  "Return the typeidx of the functype (params -> results), adding a new
-entry when no equal one exists."
-  (let ((types (penv-types-list penv)))
+  "Return the typeidx of the functype (params -> results), adding a
+new entry when no equal one exists. RECURSION-GROUP AWARE (Core 3.0):
+an implicit typeuse unifies with an existing type only when the
+existing type's rec group is a SINGLETON and its comptype is
+structurally equal (type-rec.wast ::197-202: a plain (func (param
+(ref $s))) typeuse IS equivalent to the singleton (rec (type $t
+(func (param (ref $s)))) — same group-of-one shape; ::51-58 /
+::204-226: a member of a NON-singleton group never absorbs an
+implicit typeuse). Plain-list entries keep the legacy fast path."
+  (let ((types (reverse (penv-types-list penv))))
     (loop for i from 0
-          for ft in (reverse types)
+          for ft in types
           when (and (equal (wasm-func-type-params ft) params)
-                    (equal (wasm-func-type-results ft) results))
-            do (return-from %find-or-add-type i)))
-  (push (make-wasm-func-type params results) (penv-types-list penv))
-  (1- (length (penv-types-list penv))))
+                    (equal (wasm-func-type-results ft) results)
+                    (or (not (wasmdown.types:wasm-rec-type-p ft))
+                        ;; singleton rec group: legal implicit match
+                        (= 1 (length (wasmdown.types:wasm-rectype-group-types
+                                      (wasmdown.types:wasm-rec-type-group ft))))))
+            do (return-from %find-or-add-type i))
+    ;; miss: append a plain singleton — a fresh wasm-rec-type with its
+    ;; own group (uniform model; group-start = its final index so a
+    ;; later type's forward refs validate)
+    ;; miss: append a fresh singleton rec entry — ONE comptype object
+    ;; shared by the entry and its group (the uniform model)
+    (let* ((idx (length types))
+           (ct (make-wasm-comptype :func nil '() params results)))
+      (push (wasmdown.types:make-rec-type-entry
+             ct (make-wasm-rectype-group (vector ct)) 0 idx)
+            (penv-types-list penv))
+      idx)))
 
 (defun %resolve-typeuse (items penv)
   "Resolve a typeuse to a typeidx (explicit (type x) wins; bare
@@ -2042,74 +2062,158 @@ nat token is the max (a reftype/id after the min is NOT a max)."
           (values (make-wasm-limits min max) (cddr items)))
         (values (make-wasm-limits min) (cdr items)))))
 
-(defun %type-field-signature (node penv)
-  "The (params . results) signature of an explicit (type $id? (func
-...)) field node, or a decode-error when the shape is wrong. Split
-out of %PARSE-TYPE-FIELD so the two-pass scheme (pass 1 registers
-every explicit type before any body parses; pass 2 parses the rest)
-can compute signatures without growing the penv. PENV supplies the
-SHARED type id hash — heap-type forward refs ((ref $t2) in $t1's
-signature, type_equivalence.wast) resolve against the pre-registered
-ids — but the parse uses a SHADOW penv with a FRESH locals hash:
-type-field params are NOT function locals, and registering their
-names would collide when an equal signature repeats (type.wast ::6-7
-and type-equivalence.wast's (param $x ...) twins — 'duplicate local'
-harness noise) or bleed into the first func's namespace."
+(defun %comptype-body (node penv what)
+  "Parse the comptype BODY of one (type $id? (func|struct|array ...))
+member node: the second child list. Returns (values comptype id-tok).
+FUNC bodies reuse %TYPEUSE (the params/results grammar incl. named
+params — legal here per type.wast ::6-7, the shadow penv keeps their
+names out of the function namespace); STRUCT/ARRAY bodies parse the
+field storage shapes (type-rec.wast's static-matching fixtures —
+parsed for equivalence, never executed: the GC value families stay
+:unsupported at the wast classifier, but the TYPE-level shapes must
+validate so (rec (type $f1 (func)) (type (struct ...)))) parses)."
   (let ((shadow (make-penv :types (penv-types penv))))
     (multiple-value-bind (id rest) (%opt-id (cddr node))
-      (let ((funclist (first rest)))
-        (unless (and funclist (tok-elem-p funclist)
-                     (string= (%tok-keyword (%first-tok funclist)) "func"))
+      (let ((body (first rest)))
+        (unless (and body (tok-elem-p body))
           (%text-error (or (and id (tok-p id) (tok-pos id)) 0)
-                       "(type) needs a (func ...) list"))
-        (multiple-value-bind (params results typeidx)
-            (%typeuse (cddr funclist) shadow)
-          (declare (ignore typeidx))
-          (values id params results))))))
+                       "(type) needs a (func ...) or (struct/array ...) list"))
+        (let* ((head (%first-tok body))
+               (k (and head (%tok-keyword head))))
+          (cond
+           ((string= k "func")
+            (multiple-value-bind (params results typeidx)
+                (%typeuse (cddr body) shadow)
+              (declare (ignore typeidx))
+              (values (make-wasm-comptype :func nil '() params results) id)))
+           ((string= k "struct")
+            (values (%parse-struct-fields body shadow :struct) id))
+           ((string= k "array")
+            (values (%parse-struct-fields body shadow :array) id))
+           (t (%text-error (or (and head (tok-p head) (tok-pos head)) 0)
+                           "~a: unknown type definition ~a" what
+                           (or k (and head (tok-p head) (tok-text head)))))))))))
+
+(defun %parse-struct-fields (body penv kind)
+  "Parse a (struct (field ...)*) or (array (field t mut?)) comptype
+body into a wasm-comptype with FIELDS as (valtype . mutable-p)
+pairs. Only the STORAGE shape is kept (mutability + valtypes) —
+enough for static equivalence; the GC value families are out of the
+engine's runtime slice."
+  (let ((items (cddr body))
+        (fields '()))
+    (dolist (f items)
+      (unless (and (tok-elem-p f)
+                   (string= (%tok-keyword (%first-tok f)) "field"))
+        (%text-error 0 "bad field list in ~(~a~)" kind))
+      ;; (field storage*) per the WAT grammar: one (field ...) node may
+      ;; carry MULTIPLE storages (type-rec.wast ::83's (field (ref $f1)
+      ;; (ref $f1) (ref $f2))); storage = mut? valtype, the mut
+      ;; modifier applying to the single storage that follows it
+      (let ((fitems (cddr f))
+            (pending-mut nil))
+        (dolist (it fitems)
+          (cond
+           ((and (tok-p it) (string= (%tok-keyword it) "mut"))
+            (when pending-mut
+              (%text-error 0 "consecutive (mut) in a field list"))
+            (setf pending-mut t))
+           ((or (tok-p it) (tok-elem-p it))
+            (push (cons (%valtype it) (or pending-mut nil)) fields)
+            (setf pending-mut nil))
+           (t (%text-error 0 "bad field storage ~a" it))))
+        (when pending-mut
+          (%text-error 0 "(mut) needs a following type"))))
+    (make-wasm-comptype kind nil (nreverse fields) '() '())))
+
+(defun %type-nodes-of (node)
+  "The (type ...) member nodes of a module field NODE: a plain
+\(type ...) field yields itself; a (rec (type ...)*) field yields
+its member nodes. Returns (values nodes rec-p)."
+  (let* ((head (%first-tok node))
+         (k (and head (%tok-keyword head))))
+    (cond
+     ((string= k "type") (values (list node) nil))
+     ((string= k "rec")
+      (let ((members (cddr node)))
+        (dolist (m members)
+          (unless (and (tok-elem-p m)
+                       (string= (%tok-keyword (%first-tok m)) "type"))
+            (%text-error 0 "(rec) members must be (type ...)")))
+        (values members t)))
+     (t (values nil nil)))))
 
 (defun %prescan-types (nodes penv)
-  "Pass 1 of the two-pass type scheme: parse every explicit (type ...)
-field IN FIELD ORDER and append its functype to the type list,
-registering $id -> typeidx. Explicit types therefore occupy indices
-0..n-1 BEFORE any implicit typeuse materializes; a find-or-add MISS
-in pass 2 appends after them (spec: the inline typeuse rule appends
-the new functype, deduplicating against the whole current list, so a
-later explicit type with an equal signature is REUSED, never
-duplicated). Because the $id hash now holds explicit ids before any
-body parses, forward references like (func (type $forward)) resolve
-to their final index (func.wast module 1, imports.wast)."
-  ;; pre-pass: register every explicit type's $id with its FINAL
-  ;; index BEFORE any signature parses, so forward heap-type refs
-  ;; ((type $t1 (func (param (ref $t2)))) — type_equivalence.wast's
-  ;; mutual recursion) resolve during %type-field-signature.
+  "Pass 1 of the two-pass type scheme — RECURSION-GROUP AWARE:
+  - Every (type ...) field and every (rec (type ...)*) member
+    occupies consecutive typeidxs in FIELD ORDER.
+  - Every rec block builds ONE wasm-rectype-group object shared
+    (EQ) by its members; a plain (type ...) is a SINGLETON group.
+  - $ids register with their FINAL index BEFORE any signature
+    parses, so intra-group forward refs ((rec (type $t1 (func
+    (param (ref $t2)))) (type $t2 ...))) resolve; a NON-rec forward
+    ref also PARSES (the $id hash is pre-populated) but VALIDATION
+    rejects it — 'unknown type' — via the entry's GROUP-START bound
+    (type-equivalence.wast ::76-82).
+  - Implicit typeuses (find-or-add in pass 2) append AFTER all
+    explicit types, preserving the loop-19 ordering pins.
+Entries are wasm-rec-type objects (comptype + group + group-idx +
+group-start) — the uniform rec model. Pass 2's field parsers re-walk
+the same node list and append everything else."
+  ;; phase A: register $ids with final indices (rec members count
+  ;; individually, in field order)
   (let ((n 0))
     (dolist (node nodes)
-      (let* ((head (%first-tok node))
-             (k (and head (%tok-keyword head))))
-        (when (and k (string= k "type"))
-          (let ((id (first (cddr node))))
+      (multiple-value-bind (tnodes rec-p) (%type-nodes-of node)
+        (declare (ignore rec-p))
+        (dolist (tn tnodes)
+          (let ((id (first (cddr tn))))
             (when (and id (tok-p id) (eq (tok-kind id) :id))
               (when (gethash (tok-text id) (penv-types penv))
                 (%text-error (tok-pos id) "duplicate identifier ~a"
                              (tok-text id)))
               (setf (gethash (tok-text id) (penv-types penv)) n))
             (incf n))))))
+  ;; phase B: parse comptypes and push rec entries in field order;
+  ;; each rec block shares ONE group object
   (dolist (node nodes)
-    (let* ((head (%first-tok node))
-           (k (and head (%tok-keyword head))))
-      (when (and k (string= k "type"))
-        (multiple-value-bind (id params results)
-            (%type-field-signature node penv)
-          (declare (ignore id))
-          (push (make-wasm-func-type params results)
-                (penv-types-list penv)))))))
+    (multiple-value-bind (tnodes rec-p) (%type-nodes-of node)
+      (cond
+       ((null tnodes) nil)
+       ((not rec-p)
+        ;; singleton: its own group, group-idx 0, group-start = its
+        ;; own typeidx
+        (let* ((start (length (penv-types-list penv)))
+               (id-start start))
+          (declare (ignore id-start))
+          (multiple-value-bind (ct id)
+              (%comptype-body (first tnodes) penv "type")
+            (declare (ignore id))
+            (push (make-rec-type-entry
+                   ct (make-wasm-rectype-group (vector ct)) 0 start)
+                  (penv-types-list penv)))))
+       (t
+        ;; rec block: parse all members FIRST (ids already registered
+        ;; — forward refs resolve), share one group, consecutive idxs
+        (let* ((start (length (penv-types-list penv)))
+               (cts (mapcar (lambda (tn)
+                              (%comptype-body tn penv "rec type"))
+                            tnodes))
+               (grp (make-wasm-rectype-group (coerce cts 'vector))))
+          (loop for ct in cts
+                for i from 0
+                do (push (make-rec-type-entry ct grp i start)
+                         (penv-types-list penv)))))))))
 
 (defun %parse-type-field (node penv)
-  "Pass-2 handler for an explicit (type ...) field: pass 1 already
-appended its functype and registered its $id (see %PRESCAN-TYPES),
-so this only re-checks the shape (keeping duplicate-$id and
-missing-(func) diagnostics at the same source positions)."
-  (%type-field-signature node penv))
+  "Pass-2 handler for an explicit (type ...) or (rec ...) field:
+pass 1 already appended the entries and registered the ids (see
+%PRESCAN-TYPES), so this only re-checks the shape (keeping the
+duplicate-$id and bad-body diagnostics at the same positions)."
+  (multiple-value-bind (tnodes rec-p) (%type-nodes-of node)
+    (declare (ignore rec-p))
+    (dolist (tn tnodes)
+      (%comptype-body tn penv "type"))))
 
 (defun %import-desc (desc penv kind)
   "Parse an import descriptor list ((func|table|memory|global|tag) $id?
@@ -3157,6 +3261,7 @@ assert_malformed cases."
              (k (and head (%tok-keyword head))))
         (cond
          ((string= k "type") (%parse-type-field node penv))
+         ((string= k "rec") (%parse-type-field node penv))
          ((string= k "import")
           (when seen-def
             (%text-error (and head (tok-pos head))

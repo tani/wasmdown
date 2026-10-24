@@ -797,15 +797,24 @@ args, apply, and throw to the function frame exactly like :return."
            (unless (wasmdown.runtime:func-instance-p ref)
              (%trap :null-reference
                     "call_indirect on null reference ~d" elemidx))
-           ;; structural type check against the expected type
+           ;; structural type check against the expected type, via
+           ;; the iso-recursive comparator (the callee may come from
+           ;; a DIFFERENT module — cross-module typeuses compare
+           ;; structurally, loop 20)
            (let* ((expected (svref (wasm-module-types
-                                   (wasmdown.runtime:module-instance-module *frame-module*))
-                                  typeidx))
-                  (actual (wasmdown.runtime:func-instance-type ref)))
-             (unless (and (equal (wasm-func-type-params expected)
-                                 (wasm-func-type-params actual))
-                          (equal (wasm-func-type-results expected)
-                                 (wasm-func-type-results actual)))
+                                    (wasmdown.runtime:module-instance-module
+                                     *frame-module*))
+                                   typeidx))
+                  (actual (wasmdown.runtime:func-instance-type ref))
+                  (actual-module
+                    (or (and (wasmdown.runtime:func-instance-module ref)
+                             (wasmdown.runtime:module-instance-module
+                              (wasmdown.runtime:func-instance-module ref)))
+                        (wasmdown.types:make-wasm-module))))
+             (unless (wasmdown.types:func-type-match-p
+                      expected actual
+                      (wasmdown.runtime:module-instance-module *frame-module*)
+                      actual-module)
                (%trap :indirect-call-type-mismatch
                       "call_indirect type mismatch at index ~d" elemidx)))
            (%do-call ref s1)))))
@@ -838,11 +847,16 @@ args, apply, and throw to the function frame exactly like :return."
                                      (wasmdown.runtime:module-instance-module
                                       *frame-module*))
                                     typeidx))
-                  (actual (wasmdown.runtime:func-instance-type ref)))
-             (unless (and (equal (wasm-func-type-params expected)
-                                 (wasm-func-type-params actual))
-                          (equal (wasm-func-type-results expected)
-                                 (wasm-func-type-results actual)))
+                  (actual (wasmdown.runtime:func-instance-type ref))
+                  (actual-module
+                    (or (and (wasmdown.runtime:func-instance-module ref)
+                             (wasmdown.runtime:module-instance-module
+                              (wasmdown.runtime:func-instance-module ref)))
+                        (wasmdown.types:make-wasm-module))))
+             (unless (wasmdown.types:func-type-match-p
+                      expected actual
+                      (wasmdown.runtime:module-instance-module *frame-module*)
+                      actual-module)
                (%trap :indirect-call-type-mismatch
                       "return_call_indirect type mismatch at index ~d"
                       elemidx)))

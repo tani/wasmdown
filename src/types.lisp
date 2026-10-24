@@ -24,6 +24,92 @@
   params
   results)
 
+(defstruct (wasm-comptype (:constructor make-wasm-comptype (kind &optional heap fields params results)))
+  "A composite type (one rec-group member): KIND :FUNC/:STRUCT/:ARRAY.
+Storage is uniform across kinds so the iso-recursive comparator walks
+one shape: a FUNC keeps PARAMS/RESULTS (valtype lists); STRUCT/ARRAY
+keep FIELDS as (valtype mutable-p) pairs (shapes parsed for
+equivalence, never executed — GC value families stay :unsupported at
+the wast classifier; only their STATIC matching in type-rec.wast
+runs)."
+  kind
+  heap
+  (fields '())
+  (params '())
+  (results '()))
+
+(defstruct (wasm-rectype-group (:constructor make-wasm-rectype-group (types)))
+  "A recursion group: the UNIT of iso-recursive equivalence. TYPES is
+a vector of wasm-comptype; all members share this object (EQ)."
+  (types #() :type vector))
+
+(defstruct (wasm-rec-type
+            (:include wasm-func-type)
+            (:predicate wasm-rec-type-p))
+  "One type section entry (a typeidx): a comptype that IS a func
+type (comptype-kind :func; the included PARAMS/RESULTS slots mirror
+the comptype's), or — for GC composites parsed by the text parser
+only for STATIC equivalence — a struct/array comptype standing in a
+type slot the VALIDATOR rejects for func-typed uses. Including
+wasm-func-type means every existing consumer (func-type-at,
+preflight, codegen, interp, encode) reads params/results through
+the same accessors; for non-func composites those slots are ().
+GROUP is the rec group shared (EQ) by every member; GROUP-IDX the
+member's position inside it; GROUP-START the typeidx of the group's
+first member (the forward-reference bound: a typeuse may reference
+its own group's members or any typeidx < GROUP-START — a non-rec
+forward ref is 'unknown type' at validation, type-equivalence.wast
+::76-82 / type-rec.wast ::21-33)."
+  comptype
+  group
+  (group-idx 0 :type (integer 0))
+  (group-start 0 :type (integer 0)))
+
+(defun make-rec-type-entry (comptype group group-idx group-start)
+  "Build a rec entry mirroring the comptype's func slots."
+  (make-wasm-rec-type
+   :params (wasm-comptype-params comptype)
+   :results (wasm-comptype-results comptype)
+   :comptype comptype :group group :group-idx group-idx
+   :group-start group-start))
+
+(defun make-singleton-rec-type (comptype)
+  "A rec entry for a comptype defining its OWN singleton group (a
+bare (type ...) field outside (rec ...))."
+  (make-rec-type-entry comptype
+                      (make-wasm-rectype-group (vector comptype)) 0 0))
+
+(defun wrap-func-type-as-rec (fty &optional (idx 0))
+  "The rec entry for a plain wasm-func-type built by the binary
+decoder or the legacy constructors: its own singleton group (the
+uniform rec model — a bare functype definition is a singleton rec
+group; a group of one that references ITSELF is a distinct type,
+type-rec.wast ::46-49 vs ::51-58). IDX is the entry's typeidx (the
+forward-reference bound)."
+  (if (wasm-rec-type-p fty)
+      fty
+      (make-rec-type-entry
+       (make-wasm-comptype :func nil '()
+                           (wasm-func-type-params fty)
+                           (wasm-func-type-results fty))
+       (make-wasm-rectype-group
+        (vector (make-wasm-comptype :func nil '()
+                                    (wasm-func-type-params fty)
+                                    (wasm-func-type-results fty))))
+       0 idx)))
+
+(defun module-type-comptype (module typeidx)
+  "The comptype at TYPEIDX (NIL when out of range)."
+  (let ((types (wasm-module-types module)))
+    (and (integerp typeidx) (>= typeidx 0) (< typeidx (length types))
+         (let ((ty (svref types typeidx)))
+           (if (wasm-rec-type-p ty)
+               (wasm-rec-type-comptype ty)
+               (make-wasm-comptype
+                :func nil '()
+                (wasm-func-type-params ty)
+                (wasm-func-type-results ty)))))))
+
 (defstruct (wasm-limits (:constructor make-wasm-limits (min &optional (max nil max-p) &aux (has-max max-p))))
   (min 0 :type (integer 0))
   (max nil :type (or null (integer 0)))
@@ -184,9 +270,8 @@ the whole ANY hierarchy, ref_null.wast's (global anyref
                      :message (format nil "unknown type ~a" idx)))
              (t :func))))))
 
-(defun %heap-sub-p (h1 h2 types)
-  "Heap subtyping in the rec-free slice (no declared subtyping): h1
-<: h2 iff
+(defun %heap-sub-p (h1 h2 types &optional canon)
+  "Heap subtyping (no declared subtyping in this slice): h1 <: h2 iff
   - h1 = h2 (nominal equality — typeuse vs typeuse by INDEX), OR
   - h1 is a typeuse and h2 is the bucket's abstract top keyword
     (:func/:extern/:exn) — every typeuse is below its bucket top, OR
@@ -194,15 +279,29 @@ the whole ANY hierarchy, ref_null.wast's (global anyref
     :none, the ANY hierarchy's bottom: (:ref null :none) <:
     (:ref null :any), ref_null.wast module 1's (global anyref
     (ref.null none))) and h2 is anything in the same bucket (typeuse
-    or top).
-Cross-typeuse (:TYPE N) <: (:TYPE M), N≠M, is NOT a subtype
-(return_call_ref $t with a (ref $u) operand, $u≠$t nominal: the
-sibling's repro pin — assert_invalid 'type mismatch')."
+    or top), OR
+  - CANONICALIZED TYPEUSE EQUALITY (loop 20): with a CANON map
+    \(typeidx -> min equivalent typeidx), (:TYPE N) <: (:TYPE M)
+    when canon[N] = canon[M] — structurally-equal functypes and
+    iso-recursively-equivalent rec members are ONE canonical type
+    (type-equivalence.wast's whole file: (ref $t1) flows into
+    (ref $t2)-typed slots when the types are equivalent). Without
+    CANON, cross-index typeuses are NOT subtypes (the rec-free
+    nominal rule: return_call_ref $t with a (ref $u) operand,
+    $u≠$t nominal — the sibling's repro pin)."
   (declare (type (or keyword (cons (eql :type) (cons t null))) h1 h2)
            (type (simple-vector) types))
-  (labels ((kind (h) (%heap-kind h types)))
+  (labels ((kind (h) (%heap-kind h types))
+           (canon-eq (n m)
+             (and canon
+                  (array-in-bounds-p canon n) (array-in-bounds-p canon m)
+                  (= (aref canon n) (aref canon m)))))
     (cond
      ((equal h1 h2) t)
+     ;; canonicalized typeuse <: typeuse (iso-recursive equivalence)
+     ((and canon (consp h1) (consp h2)
+           (canon-eq (second h1) (second h2)))
+      t)
      ;; typeuse <: abstract top of its bucket
      ((and (consp h1) (keywordp h2)
            (member h2 '(:func :extern :exn))
@@ -226,24 +325,25 @@ refs pass through. Values of either spelling compare uniformly."
              (:funcref :func) (:externref :extern) (:exnref :exn))))
     (cons t_)))
 
-(defun reftype-sub-p (sub super types)
+(defun reftype-sub-p (sub super types &optional canon)
   "Whether reftype SUB is a subtype of SUPER in the type vector TYPES
-(Core 3.0 function-references lattice, rec-free slice). Both sides
-expand to canonical (REF NULL? HEAP) form (a legacy keyword IS its
-bucket's nullable top), then: equality, or NULLABILITY ONLY WIDENS
-\(nullable <: nullable and non-null <: nullable pass; nullable <:
-non-null fails) AND the heaps relate by %HEAP-SUB-P. This admits
-(ref $t) <: funcref, (ref null $t) <: funcref, funcref <:
-(ref null func), (ref null nofunc) <: (ref null $t); rejects
-(ref (:type 1)) <: (ref null (:type 0)) — nominal typeuses compare
-by equality only."
+(Core 3.0 function-references lattice). Both sides expand to
+canonical (REF NULL? HEAP) form (a legacy keyword IS its bucket's
+nullable top), then: equality, or NULLABILITY ONLY WIDENS (nullable
+<: nullable and non-null <: nullable pass; nullable <: non-null
+fails) AND the heaps relate by %HEAP-SUB-P (which consults CANON —
+the module's canonicalization map — for typeuse-vs-typeuse
+equivalence, loop 20). This admits (ref $t) <: funcref, (ref null
+$t) <: funcref, funcref <: (ref null func), (ref null nofunc) <:
+(ref null $t), and — with CANON — (ref $t1) <: (ref $t2) whenever
+the two typeidxs are equivalent (type-equivalence.wast)."
   (let ((s (%expand-reftype sub))
         (u (%expand-reftype super)))
     (or (equal s u)
         (and (or (not (typed-ref-nullable-p s))
                  (typed-ref-nullable-p u))
              (%heap-sub-p (typed-ref-heap s) (typed-ref-heap u)
-                          types)))))
+                          types canon)))))
 
 (defun defaultable-valtype-p (t_)
   "Whether the default value exists for the type in this slice.
@@ -252,4 +352,278 @@ not (spec: default values need a null; the definite-initialization
 validator tracks local.set coverage for those)."
   (not (and (consp t_) (typed-ref-p t_)
             (not (typed-ref-nullable-p t_)))))
+
+;;; ---------------------------------------------------------------
+;;; Iso-recursive type equivalence (Core 3.0 recursive types).
+;;;
+;;; Model: every typeidx is a wasm-rec-type — a comptype plus a rec
+;;; group object shared (EQ) by all members of its (rec ...) block.
+;;; Plain type fields are SINGLETON groups. Two typeidxs are
+;;; equivalent iff their unrolled definitions match, where a
+;;; typeuse ref to a position inside the compared group maps to the
+;;; OTHER group's same position (the iso-recursive hypothesis).
+
+(defun rec-group-of (module typeidx)
+  "The rec group object of TYPEIDX (NIL when out of range)."
+  (let* ((types (wasm-module-types module))
+         (ty (and (integerp typeidx) (>= typeidx 0)
+                  (< typeidx (length types)) (svref types typeidx))))
+    (and ty (wasm-rec-type-p ty) (wasm-rec-type-group ty))))
+
+(defun %comptype-valtypes (comptype)
+  "The valtype lists a comptype exposes for structural comparison:
+params+results for a func, the field types for struct/array."
+  (ecase (wasm-comptype-kind comptype)
+    (:func (append (wasm-comptype-params comptype)
+                   (wasm-comptype-results comptype)))
+    ((:struct :array)
+     (mapcar #'first (wasm-comptype-fields comptype)))))
+
+(defun %valtype-equiv-p (a b module1 module2 g1 g2 bindings1 bindings2)
+  "Valtype equality under iso-recursive equivalence: numerics by
+EQUAL; typed refs compare with heap equivalence, nullability equal."
+  (cond
+   ((and (typed-ref-p a) (typed-ref-p b))
+    ;; typed refs ALWAYS go through the iso rule — even when
+    ;; EQUAL (same index): cross-group/internal-external cases
+    ;; depend on the OWNING groups, not the index (type-rec.wast
+    ;; ::93-101: group2's (ref $f1) with group1's internal (ref
+    ;; $f1) are equal-shaped but NOT equivalent)
+    (let ((ha (typed-ref-heap a))
+          (hb (typed-ref-heap b))
+          (na (typed-ref-nullable-p a))
+          (nb (typed-ref-nullable-p b)))
+      (and (eq na nb)
+           (%heap-equiv-p ha hb module1 module2 g1 g2
+                         bindings1 bindings2))))
+   ((equal a b) t)
+   (t nil)))
+
+(defun %heap-equiv-p (ha hb module1 module2 g1 g2 bindings1 bindings2)
+  "Heap-type equivalence: abstract keywords by EQ; (:TYPE N) pairs by
+the iso-recursive rule. G1/G2 are the OWNING groups of the members
+whose valtypes are being compared: a ref to a type whose group is EQ
+to the owning group is INTERNAL — it must map to the other group's
+ref at the SAME POSITION (both sides internal, positions equal); a
+ref to any other type is EXTERNAL — both sides must be external and
+recursively equivalent by index pair. The internal/external MIX is
+not equivalent (type-rec.wast ::93-122: a rolled-up group is NOT
+equal to its unrolled copy)."
+  (declare (type (or keyword (cons (eql :type) (cons t null))) ha hb))
+  (cond
+   ((and (keywordp ha) (keywordp hb)) (eq ha hb))
+   ((and (consp ha) (consp hb))
+    (let ((ia (second ha)) (ib (second hb)))
+      (multiple-value-bind (ga pa) (%target-group-of ia module1)
+        (multiple-value-bind (gb pb) (%target-group-of ib module2)
+          (cond
+           ;; both internal: same position in the two groups
+           ((and (eq ga g1) (eq gb g2)) (= pa pb))
+           ;; both external: equivalence by index pair
+           ((and (not (eq ga g1)) (not (eq gb g2)))
+            (%rec-ref-equiv-p ia ib module1 module2 bindings1 bindings2))
+           ;; internal vs external: not equivalent
+           (t nil))))))
+   (t nil)))
+
+(defun %target-group-of (typeidx module)
+  "Values (group position) of the rec group owning TYPEIDX."
+  (let ((e (and (integerp typeidx) (>= typeidx 0)
+                (< typeidx (length (wasm-module-types module)))
+                (svref (wasm-module-types module) typeidx))))
+    (if (and e (wasm-rec-type-p e))
+        (values (wasm-rec-type-group e) (wasm-rec-type-group-idx e))
+        (values nil 0))))
+
+(defun %rec-ref-equiv-p (ia ib module1 module2 bindings1 bindings2)
+  "The heart of iso-recursive equivalence: are typeidx IA of
+MODULE1 and IB of MODULE2 equivalent? The modules may be the same
+object (intra-module canonicalization) or distinct (cross-module
+link/indirect checks).
+  - An (IA . IB) pair already under comparison is assumed equal (the
+    recursive hypothesis; terminates on cyclic structure).
+  - Otherwise unfold ONE level: the defining groups must have equal
+    arity and pairwise-equivalent members; a member's refs to its
+    OWN group map positionally, refs outside the group recurse by
+    index pair.
+Memoization/assumption set: BINDINGS1 is a hash of open pairs.
+  A repeated pair short-circuits TRUE without re-unfolding, and is
+  retracted when the enclosing comparison fails so sibling branches
+  re-check it honestly."
+  (let ((key (cons ia ib)))
+    (when (gethash key bindings1) (return-from %rec-ref-equiv-p t))
+    (let* ((types1 (wasm-module-types module1))
+           (types2 (wasm-module-types module2)))
+      (unless (and (integerp ia) (>= ia 0) (< ia (length types1))
+                   (integerp ib) (>= ib 0) (< ib (length types2)))
+        (return-from %rec-ref-equiv-p nil))
+      ;; groups: the entry may be a plain wasm-func-type (binary or
+      ;; legacy paths) with NO group object — treat it as its own
+      ;; singleton group on the fly.
+      (multiple-value-bind (g1 p1 t1)
+          (%entry-group-of (svref types1 ia) types1 ia)
+        (multiple-value-bind (g2 p2 t2)
+            (%entry-group-of (svref types2 ib) types2 ib)
+          (declare (ignore p1 p2))
+          (unless (= (length t1) (length t2))
+            (return-from %rec-ref-equiv-p nil))
+          (setf (gethash key bindings1) t)
+          (let ((ok t))
+            (dotimes (i (length t1))
+              (unless (%comptype-equiv-p (svref t1 i) (svref t2 i)
+                                         module1 module2
+                                         g1 g2 bindings1 bindings2)
+                (setf ok nil) (return)))
+            (unless ok (remhash key bindings1))
+            ok))))))
+
+(defun %entry-group-of (ty types idx)
+  "Values (group group-idx member-vector) for the type entry TY at
+IDX inside TYPES. Plain functypes (binary/legacy paths, no rec
+object) become on-the-fly singleton groups."
+  (declare (ignore types idx))
+  (if (wasm-rec-type-p ty)
+      (let ((grp (wasm-rec-type-group ty)))
+        (values grp (wasm-rec-type-group-idx ty)
+                (wasm-rectype-group-types grp)))
+      (let* ((ct (make-wasm-comptype :func nil '()
+                                     (wasm-func-type-params ty)
+                                     (wasm-func-type-results ty)))
+             (grp (make-wasm-rectype-group (vector ct))))
+        (values grp 0 (wasm-rectype-group-types grp)))))
+
+(defun %comptype-equiv-p (ct1 ct2 module1 module2 g1 g2 bindings1 bindings2)
+  "Structural comparison of two comptypes. KIND must match; a FUNC's
+  PARAMS and RESULTS compare as SEPARATE lists (never concatenated:
+  (func (param i32)) is NOT (func (result i32)) — imports.wast ::31's
+  'incompatible import type' case); a STRUCT/ARRAY's fields compare
+  positionally (valtype + mutability). G1/G2 are the OWNING groups
+  of the two members: a typeuse ref whose target's group is EQ to
+  the owning group is INTERNAL (maps positionally to the other
+  group's same position); a target outside is EXTERNAL (recurses by
+  index pair through %REC-REF-EQUIV-P); an internal/external mix is
+  NOT equivalent."
+  (unless (eq (wasm-comptype-kind ct1) (wasm-comptype-kind ct2))
+    (return-from %comptype-equiv-p nil))
+  (macrolet ((vt-equiv (vs1 vs2)
+               `(and (= (length ,vs1) (length ,vs2))
+                     (loop for v1 in ,vs1
+                           for v2 in ,vs2
+                           always (%valtype-equiv-p v1 v2 module1 module2
+                                                    g1 g2 bindings1 bindings2)))))
+    (ecase (wasm-comptype-kind ct1)
+      (:func
+       (and (vt-equiv (wasm-comptype-params ct1) (wasm-comptype-params ct2))
+            (vt-equiv (wasm-comptype-results ct1) (wasm-comptype-results ct2))))
+      ((:struct :array)
+       (let ((f1 (wasm-comptype-fields ct1))
+             (f2 (wasm-comptype-fields ct2)))
+         (and (= (length f1) (length f2))
+              (vt-equiv (mapcar #'first f1) (mapcar #'first f2))
+              (every (lambda (a b) (eq (cdr a) (cdr b))) f1 f2)))))))
+
+(defun type-equiv-p (module1 idx1 module2 idx2)
+  "PUBLIC: whether typeidx IDX1 of MODULE1 and IDX2 of MODULE2 are
+equivalent under iso-recursive equivalence (the same module twice
+for intra-module canonicalization; two modules for link-time and
+call_indirect checks)."
+  (let ((bindings1 (make-hash-table :test #'equal)))
+    (%rec-ref-equiv-p idx1 idx2 module1 module2 bindings1 nil)))
+
+(defun %functype-entry-of (fty module)
+  "Values (group comptype typeidx) for the functype FTY in MODULE's
+type vector: the entry whose object IS FTY (the func-instance's
+type is the defining module's entry object, so EQ finds it). A
+plain (non-rec) entry in the vector still yields its typeidx (its
+on-the-fly singleton group is materialized by %REC-REF-EQUIV-P).
+A functype NOT in the vector (host functions, ad-hoc functypes)
+yields typeidx NIL: no group, no index — only signature compare
+applies."
+  (let ((types (wasm-module-types module)))
+    (loop for i from 0
+          for ty across types
+          when (eq ty fty)
+            do (return-from %functype-entry-of
+                 (if (wasm-rec-type-p ty)
+                     (values (wasm-rec-type-group ty)
+                             (wasm-rec-type-comptype ty)
+                             i)
+                     (values nil
+                             (make-wasm-comptype
+                              :func nil '()
+                              (wasm-func-type-params ty)
+                              (wasm-func-type-results ty))
+                             i)))))
+  (values nil
+          (make-wasm-comptype :func nil '()
+                              (wasm-func-type-params fty)
+                              (wasm-func-type-results fty))
+          nil))
+
+(defun %functype-group-of (fty module)
+  "Values (group comptype) — the two-value view of
+%FUNCTYPE-ENTRY-OF (host/ad-hoc functypes yield a fresh comptype
+and no group)."
+  (multiple-value-bind (grp ct idx) (%functype-entry-of fty module)
+    (declare (ignore idx))
+    (values grp ct)))
+
+(defun func-type-match-p (expected actual expected-module actual-module)
+  "PUBLIC: whether functype EXPECTED (of EXPECTED-MODULE) and ACTUAL
+\(of ACTUAL-MODULE — possibly a DIFFERENT module, the definer of a
+func-instance) match as external function types. TWO levels:
+  - Both sides are MODULE TYPE ENTRIES: full iso-recursive
+    equivalence of the two TYPEIDXs (%REC-REF-EQUIV-P — the group
+    shape is part of the type: type-rec.wast ::148-162 pins that a
+    2-member rec member with a plain (func) signature does NOT match
+    a singleton (func) — arity mismatch at the group level, even
+    though the signatures are trivially equal).
+  - Either side is a HOST/ad-hoc functype (not in a type vector):
+    signature compare only (params/results pairwise via the
+    iso-recursive valtype rule, with each side's owning group for
+    internal/external classification when known).
+Replaces the raw EQUAL compares at the link boundary
+(%check-func-import), the tag-import boundary and the
+indirect-call boundary (interp)."
+  (multiple-value-bind (ga cta ia) (%functype-entry-of expected
+                                                     expected-module)
+    (multiple-value-bind (gb ctb ib) (%functype-entry-of actual
+                                                        actual-module)
+      (declare (ignore ga gb))
+      (cond
+       ;; both module entries: the TYPEIDXs carry the group shape
+       ((and ia ib)
+        (type-equiv-p expected-module ia actual-module ib))
+       ;; signature compare (host funcs, ad-hoc functypes)
+       (t
+        (let ((bindings1 (make-hash-table :test #'equal)))
+          (multiple-value-bind (ga2 cta2) (%functype-group-of expected
+                                                             expected-module)
+            (multiple-value-bind (gb2 ctb2) (%functype-group-of actual
+                                                                actual-module)
+              (flet ((vs (ct dir)
+                       (ecase dir
+                         (:params (wasm-comptype-params ct))
+                         (:results (wasm-comptype-results ct)))))
+                (and (= (length (vs cta2 :params)) (length (vs ctb2 :params)))
+                     (= (length (vs cta2 :results)) (length (vs ctb2 :results)))
+                     (loop for pa in (vs cta2 :params)
+                           for pb in (vs ctb2 :params)
+                           always (%valtype-equiv-p pa pb
+                                                     expected-module
+                                                     actual-module
+                                                     ga2 gb2 bindings1 nil))
+                     (loop for ra in (vs cta2 :results)
+                           for rb in (vs ctb2 :results)
+                           always (%valtype-equiv-p ra rb
+                                                     expected-module
+                                                     actual-module
+                                                     ga2 gb2 bindings1 nil))))))))))))
+
+(defun func-type-equal-p (a b)
+  "PUBLIC: plain structural equality of two functypes (the legacy
+find-or-add / canonicalization fast path: no rec groups, plain
+valtypes — EQUAL on params/results)."
+  (and (equal (wasm-func-type-params a) (wasm-func-type-params b))
+       (equal (wasm-func-type-results a) (wasm-func-type-results b))))
 

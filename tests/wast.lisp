@@ -1263,5 +1263,221 @@
               (assert_invalid
                 (module (type $t (func))
                   (func $f (param $r funcref) (return_call_ref $t (local.get $r))))
+                \"type mismatch\")")))    (wasmdown.test:is (every (lambda (o) (eq o :pass)) os))))
+
+;;; ---------------------------------------------------------------
+;;; Loop 20: recursion groups, canonicalization, iso-recursive
+;;; equivalence (the wasmdown.types engine + validate canon map).
+;;; Fixture shapes verified against the engine; the rec-carrying
+;;; GC composite (struct/array) fixtures stay out of scope at the
+;;; classifier, so every shape below is FUNC-only.
+
+(wasmdown.test:test wast/rec-group-parse-validate
+  ;; (rec ...) groups parse and validate: mutual forward refs INSIDE
+  ;; a group are legal (the group is the unit of recursion; member
+  ;; typeidxs consecutive in field order, one shared group object).
+  ;; NEGATIVE: the same mutual recursion WITHOUT the (rec ...) wrapper
+  ;; is 'unknown type' at VALIDATION (type-equivalence.wast ::76-82;
+  ;; type-rec.wast ::21-33) — a non-rec forward reference to a later
+  ;; typeidx is out of scope by the group-start bound.
+  (let ((os (%outcomes
+             "(module
+                (rec (type $t1 (func (param i32 (ref $t2))))
+                     (type $t2 (func (param i32 (ref $t1)))))
+                (func $f (type $t1)))")))
+    (wasmdown.test:is (equal '(:pass) os)))
+  (let ((os (%outcomes
+             "(assert_invalid
+                (module
+                  (type $t1 (func (param (ref $t2))))
+                  (type $t2 (func (param (ref $t1)))))
+                \"unknown type\")")))
+    (wasmdown.test:is (equal '(:pass) os)))
+  (let ((os (%outcomes
+             "(assert_invalid
+                (module
+                  (rec (type $t1 (func (param (ref $t2)))))
+                  (rec (type $t2 (func))))
+                \"unknown type\")")))
+    (wasmdown.test:is (equal '(:pass) os))))
+
+(wasmdown.test:test wast/canonicalization-simple-indirect
+  ;; Canonicalization (canon map: typeidx -> min equivalent): two
+  ;; structurally-equal functypes are ONE canonical type, so values
+  ;; flow through each other's (ref $t) slots — the simple named-param
+  ;; twins (type-equivalence.wast ::4-11), the indirect nested-ref
+  ;; equivalence (::16-24), and the RUNTIME shape of the 'Semantic
+  ;; types (run time)' section: call_indirect through the twin types
+  ;; (::89-102's cross-typed table calls).
+  (let ((os (%outcomes
+             "(module
+                (type $t1 (func (param f32 f32) (result f32)))
+                (type $t2 (func (param $x f32) (param $y f32) (result f32)))
+                (func $f1 (param $r (ref $t1)) (call $f2 (local.get $r)))
+                (func $f2 (param $r (ref $t2)) (call $f1 (local.get $r))))")))
+    (wasmdown.test:is (equal '(:pass) os)))
+  (let ((os (%outcomes
+             "(module
+                (type $s0 (func (param i32) (result f32)))
+                (type $s1 (func (param i32 (ref $s0)) (result (ref $s0))))
+                (type $s2 (func (param i32 (ref $s0)) (result (ref $s0))))
+                (type $t1 (func (param (ref $s1)) (result (ref $s2))))
+                (type $t2 (func (param (ref $s2)) (result (ref $s1))))
+                (func $f1 (param $r (ref $t1)) (call $f2 (local.get $r)))
+                (func $f2 (param $r (ref $t2)) (call $f1 (local.get $r))))")))
+    (wasmdown.test:is (equal '(:pass) os)))
+  (let ((os (%outcomes
+             "(module
+                (type $t1 (func (param f32 f32)))
+                (type $t2 (func (param $x f32) (param $y f32)))
+                (func $f1 (type $t1))
+                (func $f2 (type $t2))
+                (table funcref (elem $f1 $f2))
+                (func (export \"run\")
+                  (call_indirect (type $t1) (f32.const 1) (f32.const 2) (i32.const 1))
+                  (call_indirect (type $t2) (f32.const 1) (f32.const 2) (i32.const 0))))
+              (assert_return (invoke \"run\"))")))
+    (wasmdown.test:is (equal '(:pass :pass) os))))
+
+(wasmdown.test:test wast/iso-recursive-two-member-groups
+  ;; The iso-recursive rule: two rec groups are equivalent iff their
+  ;; members match positionally with internal refs mapped to the
+  ;; other group's same position (the recursive hypothesis). The
+  ;; isomorphic two-member case (type-equivalence.wast ::49-71's
+  ;; $f0-$f3 chain) validates; NEGATIVE: the arity mismatch (2-member
+  ;; vs 3-member group) REJECTS — group shape is part of the type
+  ;; (type-rec.wast ::114-122's family).
+  (let ((os (%outcomes
+             "(module
+                (rec
+                  (type $t0 (func (param i32 (ref $t1))))
+                  (type $t1 (func (param i32 (ref $t0)))))
+                (rec
+                  (type $t2 (func (param i32 (ref $t3))))
+                  (type $t3 (func (param i32 (ref $t2)))))
+                (func $f0 (param $r (ref $t0))
+                  (call $f2 (local.get $r)))
+                (func $f1 (param $r (ref $t1))
+                  (call $f3 (local.get $r)))
+                (func $f2 (param $r (ref $t2))
+                  (call $f0 (local.get $r)))
+                (func $f3 (param $r (ref $t3))
+                  (call $f1 (local.get $r))))")))
+    (wasmdown.test:is (equal '(:pass) os)))
+  (let ((os (%outcomes
+             "(assert_invalid
+                (module
+                  (rec
+                    (type $t0 (func (param i32 (ref $t1))))
+                    (type $t1 (func (param i32 (ref $t0)))))
+                  (rec
+                    (type $a (func (param i32 (ref $b))))
+                    (type $b (func (param i32 (ref $a))))
+                    (type $c (func)))
+                  (func (param $r (ref $t0))
+                    (call $f (local.get $r)))
+                  (func $f (param $r (ref $a)) (call $f (local.get $r))))
                 \"type mismatch\")")))
+    (wasmdown.test:is (equal '(:pass) os))))
+
+(wasmdown.test:test wast/iso-internal-vs-external-ref
+  ;; The internal/external separation (the heart of the iso rule): a
+  ;; ref whose target is in the compared member's OWN group maps
+  ;; POSITIONALLY; a ref to a type outside the group is compared by
+  ;; index pair. A MIX — one side internal, the other external — is
+  ;; NOT equivalent even when the referenced type is itself the same
+  ;; (the func-only analogue of type-rec.wast ::93-122: a rolled-up
+  ;; group never equals its unrolled copy). $a's (ref $b) is
+  ;; internal; $c's (ref $b) is external — not equivalent. The
+  ;; isomorphic control (both internal, same positions) validates.
+  (let ((os (%outcomes
+             "(module
+                (rec (type $a (func (param (ref $b)))) (type $b (func)))
+                (rec (type $c (func (param (ref $d)))) (type $d (func)))
+                (func $f (type $a))
+                (global (ref $c) (ref.func $f)))")))
+    (wasmdown.test:is (equal '(:pass) os)))
+  (let ((os (%outcomes
+             "(assert_invalid
+                (module
+                  (rec (type $a (func (param (ref $b)))) (type $b (func)))
+                  (rec (type $c (func (param (ref $b)))) (type $d (func)))
+                  (func $f (type $a))
+                  (global (ref $c) (ref.func $f)))
+                \"type mismatch\")")))
+    (wasmdown.test:is (equal '(:pass) os))))
+
+(wasmdown.test:test wast/cross-module-func-type-match
+  ;; Link-time equivalence: func-type-match-p compares the importing
+  ;; module's declared type against the PROVIDING module's func
+  ;; instance type structurally (cross-module typeuse indices are
+  ;; meaningless positionally — the iso rule runs with each side's own
+  ;; group context). Equal-signature types across modules LINK
+  ;; (type-equivalence.wast ::191-228's N family), the recursive iso
+  ;; case links too (::231-241's Mr1); NEGATIVE: a non-singleton rec
+  ;; member does NOT match a plain singleton functype across modules
+  ;; (the func-only analogue of type-rec.wast ::148-162's
+  ;; 'incompatible import type').
+  (let ((os (%outcomes
+             "(module
+                (type $s0 (func (param i32) (result f32)))
+                (type $s1 (func (param i32 (ref $s0)) (result (ref $s0))))
+                (type $s2 (func (param i32 (ref $s0)) (result (ref $s0))))
+                (type $t1 (func (param (ref $s1)) (result (ref $s2))))
+                (type $t2 (func (param (ref $s2)) (result (ref $s1))))
+                (func (export \"f1\") (param (ref $t1)))
+                (func (export \"f2\") (param (ref $t1))))
+              (register \"N\")
+              (module
+                (type $s0 (func (param i32) (result f32)))
+                (type $s1 (func (param i32 (ref $s0)) (result (ref $s0))))
+                (type $s2 (func (param i32 (ref $s0)) (result (ref $s0))))
+                (type $t1 (func (param (ref $s1)) (result (ref $s2))))
+                (type $t2 (func (param (ref $s2)) (result (ref $s1))))
+                (func (import \"N\" \"f1\") (param (ref $t1)))
+                (func (import \"N\" \"f1\") (param (ref $t2))))")))
+    (wasmdown.test:is (every (lambda (o) (eq o :pass)) os)))
+  (let ((os (%outcomes
+             "(module $Mr1
+                (rec (type $t1 (func (param i32 (ref $t1)))))
+                (func (export \"f\") (param (ref $t1))))
+              (register \"Mr1\" $Mr1)
+              (module
+                (rec (type $t2 (func (param i32 (ref $t2)))))
+                (func (import \"Mr1\" \"f\") (param (ref $t2))))")))
+    (wasmdown.test:is (every (lambda (o) (eq o :pass)) os)))
+  (let ((os (%outcomes
+             "(module $M
+                (rec (type $f1 (func)) (type $g (func)))
+                (func (export \"f\") (type $f1)))
+              (register \"M\" $M)
+              (assert_unlinkable
+                (module
+                  (type $f2 (func))
+                  (func (import \"M\" \"f\") (type $f2)))
+                \"function type mismatch\")")))
     (wasmdown.test:is (every (lambda (o) (eq o :pass)) os))))
+
+(wasmdown.test:test wast/implicit-typeuse-singleton-unification
+  ;; %find-or-add-type's rec rule: an IMPLICIT typeuse (bare
+  ;; (param)/(result), no (type x)) unifies with an existing type only
+  ;; when that type's rec group is a SINGLETON of equal signature —
+  ;; the func-only analogue of type-rec.wast ::197-202 (accept: the
+  ;; plain (func (param (ref $s))) typeuse IS the singleton rec $t)
+  ;; vs ::216-226 (reject: a member of a NON-singleton group never
+  ;; absorbs the implicit use).
+  (let ((os (%outcomes
+             "(module
+                (type $s (func (param i32)))
+                (rec (type $t (func (param (ref $s)))))
+                (func $f (param (ref $s)))
+                (global (ref $t) (ref.func $f)))")))
+    (wasmdown.test:is (equal '(:pass) os)))
+  (let ((os (%outcomes
+             "(assert_invalid
+                (module
+                  (rec (type $x (func (param i32))) (type $t (func)))
+                  (func $f)
+                  (global (ref $t) (ref.func $f)))
+                \"type mismatch\")")))
+    (wasmdown.test:is (equal '(:pass) os))))
