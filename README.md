@@ -20,17 +20,19 @@ The official core suite (97 `.wast` files, pinned at
 executed through the stateful runner with failure-phase classification:
 
 ```
-pass 21154 | fail 0 | unsupported 106 | harness-error 0 | total 21260
-pass rate 99.4% (denominator = all executed, incl. unsupported)
+pass 21186 | fail 0 | unsupported 74 | harness-error 0 | total 21260
+pass rate 99.7% (denominator = all executed, incl. unsupported)
 ```
 
 Zero fails. Every command in the vendored official core suite is
 either a genuine pass or an honestly-attributed `unsupported` for
-an out-of-scope family. The 106 unsupported: annotations 73, GC
-value types (type-rec struct rows 21, binary typed-ref 11, elem
-8, binary 2), SIMD 1, custom/obsolete 1+1 — the rec-group
-func-only rows all pass since loop 20 (rec groups +
-canonicalization + iso-recursive equivalence).
+a named out-of-scope family. The 74 unsupported are the TERMINAL
+honest set: annotations 73 (an unadopted proposal — permanently
+out of scope per PLAN.md §3.3) and obsolete-keywords::10 (a SIMD
+fixture). The struct/array type declarations (loop 21), rec
+groups + canonicalization (loop 20), typed function references
+(loop 19), exception handling + named modules (loop 18) and tail
+calls all pass.
 
 Regenerate with `make report-conformance` (writes `CONFORMANCE.md` +
 `tests/spec-core-results.jsonl`, one JSONL line per command); the full
@@ -80,10 +82,13 @@ harness-errors.
 | API / CLI | `src/api.lisp`, `src/cli.lisp` | `read-module`, `validate-module`, `instantiate`, `invoke`, …; CLI `validate`/`inspect`/`compile`/`run`. |
 
 Not implemented (see `PLAN.md` for the full contract): SIMD (v128),
-Wasm GC values (struct/array/i31 — the struct-carrying type-rec
-rows stay honestly `:unsupported`), memory64, multi-memory runtime
+Wasm GC value OPCODES (struct.new/array.new/i31, ref.cast/
+br_on_cast/ref.test/ref.eq, any↔extern conversions — the type
+declaration layer IS implemented; the vendored suite's entire GC
+surface was declaration-only), memory64, multi-memory runtime
 (text accepts memidx forms), Component Model, Canonical ABI, WASI
-(all versions), threads/atomics, FASL cache, annotations. Tail
+(all versions), threads/atomics, FASL cache, annotations (an
+unadopted proposal — permanently out of scope per PLAN.md §3.3). Tail
 calls `return_call`/`return_call_indirect`, exception handling
 (tags, `try_table`, `throw`, cross-call propagation, uncaught
 boundary at the outermost guest frame), typed function references
@@ -136,23 +141,27 @@ SBCL (developed against 2.6.4, Linux ARM64). Zero third-party Lisp
 libraries; no ASDF ecosystem dependencies. ANSI-portable core logic with
 SBCL-specific numeric internals where documented.
 
-## Roadmap (residual families, in loop order)
+## Roadmap (residual Core 3.0 gaps, in loop order)
 
-1. **GC values (struct/array/i31)** — the largest remaining
-   `unsupported` family; struct/array/i31 heap types, `struct.new`
-   and friends, `ref.cast`/`br_on_cast`, packed fields. The loop-20
-   equivalence engine (wasm-comptype/rectype-group, the iso
-   comparator, struct/array grammar in %comptype-body) is the
-   foundation this builds on.
-2. **memory64 / multi-memory runtime / SIMD** — the remaining
-   Core 3.0 feature gaps after GC.
+The vendored core suite (97 files, pinned) is FULLY attributed —
+no fails, and the 74 unsupported are named out-of-scope families.
+The remaining Core 3.0 feature work (PLAN.md §3.1) has NO vendored
+fixture coverage; each lands with self-authored tests per the
+§12 gap-test discipline:
 
-DONE in loop 20 (`fa623ec`): `rec` type groups + canonicalization
-+ iso-recursive equivalence — the former 7-fail family and the
-rec-carrier unsupported rows all pass; type-equivalence.wast is
-32/32 and type-canon.wast 2/2.
+1. **GC value opcodes** (struct.new/get/set, array.new/get/set/
+   len/fill/copy, i31, ref.cast/ref.test/br_on_cast, ref.eq,
+   any↔extern conversions) — the declaration/type machinery is
+   complete (loops 20-21); the opcode layer + runtime heap objects
+   (PLAN.md §7.5: Lisp-managed structs/arrays with packed-field
+   normalization) is the build.
+2. **memory64 / multi-memory runtime** — text/binary already admit
+   memidx forms; the runtime is single-memory32.
+3. **SIMD (v128 + relaxed)** — full opcode surface, scalarized
+   reference semantics first per PLAN.md §7.3.
+4. **Component Model / WASI** — PLAN.md §8-9; M7-M12 territory.
 
-The 106 `unsupported` rows: annotations 73 (an unadopted
-proposal), GC value types (type-rec struct rows 21, binary
-typed-ref 11, elem 8, binary 2), SIMD 1, custom/obsolete 1+1 —
-every non-pass is attributed per file in `CONFORMANCE.md`.
+DONE: loop 18 (tail calls, EH, named modules), loop 19 (typed
+function references), loop 20 (rec groups + canonicalization +
+iso-recursive equivalence), loop 21 (struct/array declarations;
+the vendored suite's entire GC surface was declaration-only).

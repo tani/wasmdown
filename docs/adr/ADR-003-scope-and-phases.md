@@ -15,19 +15,21 @@ conformance gates. This repository delivers an honest **partial** slice
    end (decode → validate → interpret → compile → invoke). SIMD/GC/EH/
    tail-calls/memory64/WAT/Component/WASI/threads/FASL cache are out of
    scope and rejected with clear errors, not silently.
-   *Superseded in part (loops 18–20, 2026-10-24): tail calls
+   *Superseded in part (loops 18–21, 2026-10-24): tail calls
    (`return_call`/`return_call_indirect`, constant-stack trampoline),
    exception handling (tags, `try_table`, `throw`, named module
    definition/instance forms), typed function references
    (`(ref $t)`/`(ref null $t)` lattice, `call_ref`,
    `return_call_ref`, `br_on_null`/`br_on_non_null`,
-   `ref.as_non_null`, definite initialization), and `rec` type
+   `ref.as_non_null`, definite initialization), `rec` type
    groups with canonicalization + iso-recursive equivalence
-   (the wasm-comptype/rectype-group engine) are now implemented
-   end to end. Still out of scope: SIMD, GC values
-   (struct/array/i31), memory64, multi-memory runtime, WAT-level
-   Component/WASI, threads, FASL cache, annotations.
-   `declared_support` stays `partial`.*
+   (the wasm-comptype/rectype-group engine), and struct/array
+   TYPE declarations are now implemented end to end — the vendored
+   core suite is fully attributed (0 fails; the 74 unsupported
+   are the unadopted-annotations proposal + one SIMD fixture).
+   Still out of scope: GC value OPCODES, SIMD, memory64,
+   multi-memory runtime, WAT-level Component/WASI, threads,
+   FASL cache. `declared_support` stays `partial`.*
 2. **Failure phases are distinct conditions** (PLAN.md §12.2):
    `decode-error` → `validation-error` → `link-error` →
    `instantiation-error` → `wasm-trap`. A decode error can never be
