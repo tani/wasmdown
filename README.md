@@ -82,25 +82,28 @@ harness-errors.
 | API / CLI | `src/api.lisp`, `src/cli.lisp` | `read-module`, `validate-module`, `instantiate`, `invoke`, …; CLI `validate`/`inspect`/`compile`/`run`. |
 
 Not implemented (see `PLAN.md` for the full contract): SIMD (v128),
-Wasm GC value OPCODES (struct.new/array.new/i31, ref.cast/
-br_on_cast/ref.test/ref.eq, any↔extern conversions — the type
-declaration layer IS implemented; the vendored suite's entire GC
-surface was declaration-only), memory64, multi-memory runtime
-(text accepts memidx forms), Component Model, Canonical ABI, WASI
-(all versions), threads/atomics, FASL cache, annotations (an
-unadopted proposal — permanently out of scope per PLAN.md §3.3). Tail
-calls `return_call`/`return_call_indirect`, exception handling
-(tags, `try_table`, `throw`, cross-call propagation, uncaught
-boundary at the outermost guest frame), typed function references
-(the `(ref $t)`/`(ref null $t)` lattice, `call_ref`,
-`return_call_ref`, `br_on_null`, `br_on_non_null`,
-`ref.as_non_null`, definite initialization for non-defaultable
-locals), `rec` type groups with canonicalization and
-iso-recursive equivalence (the wasm-comptype/rectype-group engine,
-cross-module `func-type-match-p`), and the named module
-definition/instance script forms **are** implemented. The `.wat`
-text format and `.wast` spec runner **are** implemented
-(`src/text.lisp`, `src/wast.lisp`), as is conformance reporting.
+memory64, multi-memory runtime (text accepts memidx forms),
+Component Model, Canonical ABI, WASI (all versions),
+threads/atomics, FASL cache, annotations (an unadopted proposal —
+permanently out of scope per PLAN.md §3.3). Tail calls
+`return_call`/`return_call_indirect`, exception handling (tags,
+`try_table`, `throw`, cross-call propagation, uncaught boundary
+at the outermost guest frame), typed function references (the
+`(ref $t)`/`(ref null $t)` lattice, `call_ref`, `return_call_ref`,
+`br_on_null`, `br_on_non_null`, `ref.as_non_null`, definite
+initialization for non-defaultable locals), `rec` type groups
+with canonicalization + iso-recursive equivalence (the
+wasm-comptype/rectype-group engine, cross-module
+`func-type-match-p`), GC values END TO END (struct/array type
+declarations + the full opcode surface: struct.new/get/set with
+packed-field normalization, array.new/get/set/len/fill/copy/
+init, i31 with 31-bit payload semantics, ref.cast/ref.test/
+br_on_cast(_fail) with the heap lattice, ref.eq, any↔extern
+conversions — self-authored tests per PLAN.md §12 since no
+vendored fixture exists), and the named module definition/instance
+script forms **are** implemented. The `.wat` text format and
+`.wast` spec runner **are** implemented (`src/text.lisp`,
+`src/wast.lisp`), as is conformance reporting.
 
 ## Error/phase taxonomy (PLAN.md §12.2)
 
@@ -144,24 +147,19 @@ SBCL-specific numeric internals where documented.
 ## Roadmap (residual Core 3.0 gaps, in loop order)
 
 The vendored core suite (97 files, pinned) is FULLY attributed —
-no fails, and the 74 unsupported are named out-of-scope families.
-The remaining Core 3.0 feature work (PLAN.md §3.1) has NO vendored
-fixture coverage; each lands with self-authored tests per the
-§12 gap-test discipline:
+no fails, and the 74 unsupported are named out-of-scope families
+(annotations 73 + 1 SIMD fixture). The remaining Core 3.0 feature
+work (PLAN.md §3.1) has NO vendored fixture coverage; each lands
+with self-authored tests per the §12 gap-test discipline:
 
-1. **GC value opcodes** (struct.new/get/set, array.new/get/set/
-   len/fill/copy, i31, ref.cast/ref.test/br_on_cast, ref.eq,
-   any↔extern conversions) — the declaration/type machinery is
-   complete (loops 20-21); the opcode layer + runtime heap objects
-   (PLAN.md §7.5: Lisp-managed structs/arrays with packed-field
-   normalization) is the build.
-2. **memory64 / multi-memory runtime** — text/binary already admit
-   memidx forms; the runtime is single-memory32.
-3. **SIMD (v128 + relaxed)** — full opcode surface, scalarized
+1. **memory64 / multi-memory runtime** — text/binary already
+   admit memidx forms; the runtime is single-memory32.
+2. **SIMD (v128 + relaxed)** — full opcode surface, scalarized
    reference semantics first per PLAN.md §7.3.
-4. **Component Model / WASI** — PLAN.md §8-9; M7-M12 territory.
+3. **Component Model / WASI** — PLAN.md §8-9; M7-M12 territory.
 
 DONE: loop 18 (tail calls, EH, named modules), loop 19 (typed
 function references), loop 20 (rec groups + canonicalization +
-iso-recursive equivalence), loop 21 (struct/array declarations;
-the vendored suite's entire GC surface was declaration-only).
+iso-recursive equivalence), loop 21 (struct/array declarations),
+loop 22 (GC value opcodes end to end — the full 0xFB family,
+i31, casts, ref.eq, conversions; 8 self-authored test families).
