@@ -1532,3 +1532,268 @@
     ;; fixtures — desugared segment PLUS a later elem section — are
     ;; the suite-level proof of the append fix.)
     (wasmdown.test:is (equal '(:pass) os))))
+
+
+(wasmdown.test:test wast/gc-struct-family
+  ;; Loop 22, family 1: struct.new/new_default/get/get_s/get_u/set.
+  ;; POSITIVE: a two-field struct (i32 + mut i8) round-trips - the
+  ;; packed store WRAPS (300 -> 44) and get_u zero-extends; get_s
+  ;; sign-extends (200-256 = -56 -> 4294967240 in the u32 domain).
+  ;; Every export is SELF-CONTAINED (the script grammar's invoke
+  ;; arguments are literals - struct refs are built inside).
+  (let ((os (%outcomes
+             "(module (type $pt (struct (field i32) (field (mut i8))))
+                (func (export \"chain\") (result i32)
+                  (struct.get $pt 0 (struct.new $pt (i32.const 42) (i32.const 300))))
+                (func (export \"get1u\") (result i32)
+                  (struct.get_u $pt 1 (struct.new $pt (i32.const 42) (i32.const 300))))
+                (func (export \"get1s\") (result i32)
+                  (struct.get_s $pt 1 (struct.new $pt (i32.const 42) (i32.const 200))))
+                (func (export \"setget\") (result i32)
+                  (local $s (ref null $pt))
+                  (local.set $s (struct.new $pt (i32.const 1) (i32.const 0)))
+                  (struct.set $pt 1 (local.get $s) (i32.const 200))
+                  (struct.get_s $pt 1 (local.get $s))))
+              (assert_return (invoke \"chain\") (i32.const 42))
+              (assert_return (invoke \"get1u\") (i32.const 44))
+              (assert_return (invoke \"get1s\") (i32.const -56))
+              (assert_return (invoke \"setget\") (i32.const -56))")))
+    (wasmdown.test:is (every (lambda (o) (eq o :pass)) os)))
+  ;; NEGATIVE 1: struct.get_s on a NON-packed field rejects at
+  ;; VALIDATE ('on non-packed field type').
+  (let ((os (%outcomes
+             "(assert_invalid
+                (module (type $s (struct (field i32)))
+                  (func (param (ref null $s)) (result i32)
+                    (struct.get_s $s 0 (local.get 0))))
+                \"type mismatch\")")))
+    (wasmdown.test:is (equal '(:pass) os)))
+  ;; NEGATIVE 2: struct.set on an IMMUTABLE field rejects.
+  (let ((os (%outcomes
+             "(assert_invalid
+                (module (type $s (struct (field i32)))
+                  (func (param (ref null $s))
+                    (struct.set $s 0 (local.get 0) (i32.const 1))))
+                \"type mismatch\")")))
+    (wasmdown.test:is (equal '(:pass) os)))
+  ;; NEGATIVE 3: struct.get on NULL traps 'null reference'.
+  (let ((os (%outcomes
+             "(module (type $s (struct (field i32)))
+                (func (export \"g\") (result i32)
+                  (struct.get $s 0 (ref.null none))))
+              (assert_trap (invoke \"g\") \"null reference\")")))
+    (wasmdown.test:is (equal '(:pass :pass) os))))
+
+(wasmdown.test:test wast/gc-struct-default-family
+  ;; Loop 22: struct.new_default zeroes every field (packed 0).
+  (let ((os (%outcomes
+             "(module (type $s (struct (field i32) (field (mut i8))))
+                (func (export \"d\") (result i32)
+                  (struct.get_u $s 1 (struct.new_default $s)))
+                (func (export \"d0\") (result i32)
+                  (struct.get $s 0 (struct.new_default $s))))
+              (assert_return (invoke \"d\") (i32.const 0))
+              (assert_return (invoke \"d0\") (i32.const 0))")))
+    (wasmdown.test:is (every (lambda (o) (eq o :pass)) os)))
+  ;; NEGATIVE: new_default of a NON-DEFAULTABLE field (a non-null
+  ;; ref) rejects at VALIDATE.
+  (let ((os (%outcomes
+             "(assert_invalid
+                (module (type $s (struct (field (ref $s))))
+                  (func (result (ref $s)) (struct.new_default $s)))
+                \"type mismatch\")")))
+    (wasmdown.test:is (equal '(:pass) os))))
+
+(wasmdown.test:test wast/gc-array-family
+  ;; Loop 22, family 2: array.new/new_default/new_fixed/get/get_s/
+  ;; get_u/set/len. POSITIVE: the packed i8 element wraps and
+  ;; sign/zero-extends exactly like struct fields.
+  (let ((os (%outcomes
+             "(module (type $ai8 (array (mut i8)))
+                (func (export \"new\") (result i32)
+                  (array.get_s $ai8 (array.new $ai8 (i32.const 200) (i32.const 1)) (i32.const 0)))
+                (func (export \"newu\") (result i32)
+                  (array.get_u $ai8 (array.new $ai8 (i32.const 200) (i32.const 1)) (i32.const 0)))
+                (func (export \"dflt\") (param i32) (result i32)
+                  (array.len (array.new_default $ai8 (local.get 0))))
+                (func (export \"fixed\") (result i32)
+                  (array.len (array.new_fixed $ai8 3 (i32.const 1) (i32.const 2) (i32.const 3))))
+                (func (export \"setget\") (result i32)
+                  (local $a (ref null $ai8))
+                  (local.set $a (array.new_default $ai8 (i32.const 2))
+)
+                  (array.set $ai8 (local.get $a) (i32.const 1) (i32.const 254))
+                  (array.get_s $ai8 (local.get $a) (i32.const 1))))
+              (assert_return (invoke \"new\") (i32.const -56))
+              (assert_return (invoke \"newu\") (i32.const 200))
+              (assert_return (invoke \"dflt\" (i32.const 7)) (i32.const 7))
+              (assert_return (invoke \"fixed\") (i32.const 3))
+              (assert_return (invoke \"setget\") (i32.const -2))")))
+    (wasmdown.test:is (every (lambda (o) (eq o :pass)) os)))
+  ;; NEGATIVE: array.set on an IMMUTABLE array rejects.
+  (let ((os (%outcomes
+             "(assert_invalid
+                (module (type $a (array i32))
+                  (func (param (ref null $a))
+                    (array.set $a (local.get 0) (i32.const 0) (i32.const 1))))
+                \"type mismatch\")")))
+    (wasmdown.test:is (equal '(:pass) os)))
+  ;; NEGATIVE: array.get OOB traps 'out of bounds'.
+  (let ((os (%outcomes
+             "(module (type $a (array (mut i32)))
+                (func (export \"g\") (result i32)
+                  (array.get $a (array.new_default $a (i32.const 1)) (i32.const 1))))
+              (assert_trap (invoke \"g\") \"out of bounds\")")))
+    (wasmdown.test:is (equal '(:pass :pass) os))))
+
+(wasmdown.test:test wast/gc-i31-family
+  ;; Loop 22, family 3: i31 round-trips. get_s sign-extends from bit
+  ;; 30 (payload 0x7FFFFFFF -> -1 -> 4294967295 in the u32 domain);
+  ;; get_u zero-extends; the store WRAPS to the 31-bit domain first.
+  (let ((os (%outcomes
+             "(module
+                (func (export \"s\") (param i32) (result i32)
+                  (i31.get_s (ref.i31 (local.get 0))))
+                (func (export \"u\") (param i32) (result i32)
+                  (i31.get_u (ref.i31 (local.get 0)))))
+              (assert_return (invoke \"s\" (i32.const 42)) (i32.const 42))
+              (assert_return (invoke \"s\" (i32.const 2147483647)) (i32.const -1))
+              (assert_return (invoke \"u\" (i32.const 2147483647)) (i32.const 2147483647))
+              (assert_return (invoke \"u\" (i32.const 4294967295)) (i32.const 2147483647))")))
+    (wasmdown.test:is (every (lambda (o) (eq o :pass)) os))))
+
+(wasmdown.test:test wast/gc-cast-family
+  ;; Loop 22, family 4: ref.test/ref.cast accept+reject. A struct
+  ;; value tests 1 against its own typeuse and 0 against another
+  ;; struct type; ref.cast traps 'cast failure' on the mismatch.
+  (let ((os (%outcomes
+             "(module (type $a (struct (field i32))) (type $b (struct))
+                (func (export \"t-self\") (result i32)
+                  (ref.test (ref $a) (struct.new $a (i32.const 1))))
+                (func (export \"t-other\") (result i32)
+                  (ref.test (ref $b) (struct.new $a (i32.const 1))))
+                (func (export \"t-null\") (result i32)
+                  (ref.test (ref $a) (ref.null none)))
+                (func (export \"t-nulln\") (result i32)
+                  (ref.test (ref null $a) (ref.null none)))
+                (func (export \"c-self\") (result i32)
+                  (ref.is_null (ref.cast (ref $a) (struct.new $a (i32.const 1)))))
+                (func (export \"c-other\") (result (ref $b))
+                  (ref.cast (ref $b) (struct.new $a (i32.const 1)))))
+              (assert_return (invoke \"t-self\") (i32.const 1))
+              (assert_return (invoke \"t-other\") (i32.const 0))
+              (assert_return (invoke \"t-null\") (i32.const 0))
+              (assert_return (invoke \"t-nulln\") (i32.const 1))
+              (assert_return (invoke \"c-self\") (i32.const 0))
+              (assert_trap (invoke \"c-other\") \"cast failure\")")))
+    (wasmdown.test:is (every (lambda (o) (eq o :pass)) os))))
+
+(wasmdown.test:test wast/gc-br-on-cast-family
+  ;; Loop 22, family 5: br_on_cast/br_on_cast_fail branch/fallthrough.
+  ;; br_on_cast: SUCCESS branches with the NARROWED value (the label
+  ;; carries the cast's target type); FAILURE falls through with the
+  ;; original. br_on_cast_fail mirrors: the FAILURE branches.
+  ;; The blocks' result types are the BRANCH reftypes; the i32 answers
+  ;; come from the fallthrough/branch continuation code.
+  (let ((os (%outcomes
+             "(module (type $a (struct))
+                (func (export \"bc\") (result i32)
+                  (block $l (result (ref $a))
+                    (br_on_cast $l anyref (ref $a) (struct.new_default $a))
+                    (drop)
+                    (i32.const 0)
+                    (return))
+                  (drop)
+                  (i32.const 1))
+                (func (export \"bc-n\") (result i32)
+                  (block $l (result (ref $a))
+                    (br_on_cast $l anyref (ref $a) (ref.null none))
+                    (drop)
+                    (i32.const 0)
+                    (return))
+                  (drop)
+                  (i32.const 1))
+                (func (export \"bcf\") (result i32)
+                  (block $l (result anyref)
+                    (br_on_cast_fail $l anyref (ref $a) (struct.new_default $a))
+                    (drop)
+                    (i32.const 1)
+                    (return))
+                  (drop)
+                  (i32.const 0))
+                (func (export \"bcf-n\") (result i32)
+                  (block $l (result anyref)
+                    (br_on_cast_fail $l anyref (ref $a) (ref.null none))
+                    (drop)
+                    (i32.const 1)
+                    (return))
+                  (drop)
+                  (i32.const 0)))
+              (assert_return (invoke \"bc\") (i32.const 1))
+              (assert_return (invoke \"bc-n\") (i32.const 0))
+              (assert_return (invoke \"bcf\") (i32.const 1))
+              (assert_return (invoke \"bcf-n\") (i32.const 0))")))
+    (wasmdown.test:is (every (lambda (o) (eq o :pass)) os))))
+
+(wasmdown.test:test wast/gc-ref-eq-conversions
+  ;; Loop 22, families 6+7: ref.eq identity and any<->extern.
+  (let ((os (%outcomes
+             "(module (type $a (struct))
+                (func (export \"eq-i31\") (result i32)
+                  (ref.eq (ref.i31 (i32.const 5)) (ref.i31 (i32.const 5))))
+                (func (export \"ne-i31\") (result i32)
+                  (ref.eq (ref.i31 (i32.const 5)) (ref.i31 (i32.const 6))))
+                (func (export \"ne-struct\") (result i32)
+                  (ref.eq (struct.new_default $a) (struct.new_default $a)))
+                (func (export \"rt\") (result i32)
+                  (ref.test (ref $a)
+                    (any.convert_extern (extern.convert_any (struct.new_default $a)))))
+                (func (export \"rt-null\") (result i32)
+                  (ref.is_null (any.convert_extern (extern.convert_any (ref.null none))))))
+              (assert_return (invoke \"eq-i31\") (i32.const 1))
+              (assert_return (invoke \"ne-i31\") (i32.const 0))
+              (assert_return (invoke \"ne-struct\") (i32.const 0))
+              (assert_return (invoke \"rt\") (i32.const 1))
+              (assert_return (invoke \"rt-null\") (i32.const 1))")))
+    (wasmdown.test:is (every (lambda (o) (eq o :pass)) os)))
+  ;; NEGATIVE: ref.eq on non-eq operands (funcref) rejects at VALIDATE.
+  (let ((os (%outcomes
+             "(assert_invalid
+                (module (func (param funcref funcref) (result i32)
+                  (ref.eq (local.get 0) (local.get 1))))
+                \"type mismatch\")")))
+    (wasmdown.test:is (equal '(:pass) os))))
+
+(wasmdown.test:test wast/gc-binary-roundtrip
+  ;; Loop 22, the ROUND-TRIP pin: a module using struct/array/i31/
+  ;; casts encodes and decodes byte-stable (parse -> encode ->
+  ;; decode -> encode gives EQUALP bytes).
+  (let ((m (wasmdown.text:parse-wat
+            "(module (type $pt (struct (field i32) (field (mut i8)) (field (ref null $pt))))
+               (type $arr (array (mut i64)))
+               (func (export \"mk\") (result (ref $pt))
+                 (struct.new $pt (i32.const 5) (i32.const 300) (ref.null $pt)))
+               (func (export \"g\") (param (ref null $pt)) (result i32)
+                 (struct.get_u $pt 1 (local.get 0)))
+               (func (export \"s\") (param (ref null $pt)) (param i32)
+                 (struct.set $pt 1 (local.get 0) (local.get 1)))
+               (func (export \"a\") (result i32)
+                 (array.len (array.new_default $arr (i32.const 4))))
+               (func (export \"cast\") (param anyref) (result i32)
+                 (ref.test (ref $pt) (local.get 0)))
+               (func (export \"bc\") (param eqref) (result i32)
+                 (block $l (result eqref)
+                   (br_on_cast_fail $l eqref (ref $pt) (local.get 0)))
+                 (drop)
+                 (i32.const 1))
+               (func (export \"i31\") (result i32)
+                 (i31.get_s (ref.i31 (i32.const 42))))
+               (func (export \"eq\") (param eqref eqref) (result i32)
+                 (ref.eq (local.get 0) (local.get 1)))
+               (func (export \"conv\") (param externref) (result anyref)
+                 (any.convert_extern (local.get 0))))")))
+    (wasmdown:validate-module m)
+    (let* ((b1 (wasmdown.binary:encode-module m))
+           (d (wasmdown.binary:decode-module b1))
+           (b2 (wasmdown.binary:encode-module d)))
+      (wasmdown.test:is (equalp b1 b2)))))

@@ -195,6 +195,16 @@
    #:take-elem-ref #:take-data-bytes
    #:global-instance #:global-instance-p
    #:make-global-instance #:global-value #:global-set-value
+   ;; GC value objects (loop 22): struct/array/i31 heap values.
+   #:wasm-struct-instance #:wasm-struct-instance-p
+   #:wasm-struct-instance-typeidx #:wasm-struct-instance-fields
+   #:make-wasm-struct-value #:struct-field-count
+   #:struct-field-get #:struct-field-set
+   #:wasm-array-instance #:wasm-array-instance-p
+   #:wasm-array-instance-typeidx #:wasm-array-instance-contents
+   #:make-wasm-array-value #:array-length
+   #:array-element-get #:array-element-set
+   #:make-i31 #:i31-get-s #:i31-get-u #:i31-p
    #:export-value
    #:wasm-call))
 

@@ -758,6 +758,327 @@ the 286-test suite's modules never construct the INITS vector)."
   (loop for t_ across locals
         always (wasmdown.types:defaultable-valtype-p t_)))
 
+;;; ---------------------------------------------------------------
+;;; GC value opcodes (loop 22): the typing rules, a separate defun so
+;;; the main cond stays small. The helpers resolve comptypes from the
+;;; module's type vector (uniform rec model).
+
+(defun %comptype-at (fv typeidx what)
+  "The comptype at TYPEIDX ('unknown type' when out of range)."
+  (let ((types (wasm-module-types (vctx-module (fv-ctx fv)))))
+    (unless (and (integerp typeidx) (>= typeidx 0)
+                 (< typeidx (length types)))
+      (verr "~a: unknown type ~a" what typeidx))
+    (let* ((entry (svref types typeidx))
+           (ct (if (wasmdown.types:wasm-rec-type-p entry)
+                   (wasmdown.types:wasm-rec-type-comptype entry)
+                   (make-wasm-comptype
+                    :func nil '()
+                    (wasm-func-type-params entry)
+                    (wasm-func-type-results entry)))))
+      ct)))
+
+(defun %struct-comptype-at (fv typeidx what)
+  (let ((ct (%comptype-at fv typeidx what)))
+    (unless (eq (wasmdown.types:wasm-comptype-kind ct) :struct)
+      (verr "~a: type ~a is not a struct" what typeidx))
+    ct))
+
+(defun %array-comptype-at (fv typeidx what)
+  (let ((ct (%comptype-at fv typeidx what)))
+    (unless (eq (wasmdown.types:wasm-comptype-kind ct) :array)
+      (verr "~a: type ~a is not an array" what typeidx))
+    ct))
+
+(defun %struct-fields (ct)
+  (wasmdown.types:wasm-comptype-fields ct))
+
+(defun %array-elem-pair (ct)
+  "The array comptype's single (valtype . mutable-p) field pair."
+  (first (wasmdown.types:wasm-comptype-fields ct)))
+
+(defun %field-pair-at (ct fieldidx what)
+  (let ((fs (%struct-fields ct)))
+    (unless (and (integerp fieldidx) (>= fieldidx 0) (< fieldidx (length fs)))
+      (verr "~a: unknown field ~a" what fieldidx))
+    (nth fieldidx fs)))
+
+(defun %packed-p (valtype)
+  (member valtype '(:i8 :i16)))
+
+(defun %storage-value-type (st)
+  "The OPERAND type of a possibly-packed storage type: i8/i16
+storages exchange i32 VALUES (the normalization happens at interp)."
+  (if (%packed-p st) :i32 st))
+
+(defun %ref-of (heap &optional (nullable t))
+  (if nullable (list :ref 'null heap) (list :ref heap)))
+
+(defparameter *gc-opcodes*
+  (let ((h (make-hash-table :test 'eq)))
+    (dolist (op '(:struct.new :struct.new-default :struct.get
+                  :struct.get-s :struct.get-u :struct.set
+                  :array.new :array.new-default :array.new-fixed
+                  :array.new-data :array.new-elem :array.get
+                  :array.get-s :array.get-u :array.set :array.len
+                  :array.fill :array.copy :array.init-data
+                  :array.init-elem
+                  :ref.test :ref.cast :br-on-cast :br-on-cast-fail
+                  :ref.eq :any.convert-extern :extern.convert-any
+                  :ref.i31 :i31.get-s :i31.get-u))
+      (setf (gethash op h) t))
+    h))
+
+(defun validate-gc-instr (fv op imms module)
+  "The GC value family's operand rules (loop 22, PLAN.md §3.1).
+  - struct.new: [ft*] -> [(ref $t)]; struct.get/set per field
+    (+packed _s/_u on i8/i16 only, i32 at the operand level)
+  - array.*: new/default/fixed/new_data/new_elem produce (ref $t);
+    get/set/len/fill/copy/init_* consume; copy: src-elt <: dst-elt
+  - ref.test/ref.cast: STATIC top-bucket check; DYNAMIC check at
+    interp (:cast-failure / 0)
+  - br_on_cast/br_on_cast_fail: dst <: src; label takes the branch
+    operand, fallthrough keeps the complement
+  - ref.eq [eqref eqref] -> [i32]; the any<->extern bridges; i31."
+  (declare (ignorable module))
+  (flet ((imm (key) (getf imms key)))
+    (case op
+      (:struct.new
+       (let* ((ct (%struct-comptype-at fv (imm :type) "struct.new"))
+              (fts (mapcar #'%storage-value-type
+                           (mapcar #'first (%struct-fields ct)))))
+         (%pop-vals fv fts)
+         (%push-val fv (%ref-of (list :type (imm :type)) nil))))
+      (:struct.new-default
+       (let* ((ct (%struct-comptype-at fv (imm :type)
+                                       "struct.new_default"))
+              (fs (%struct-fields ct)))
+         (dolist (f fs)
+           (unless (or (%packed-p (first f))
+                       (wasmdown.types:defaultable-valtype-p
+                        (first f)))
+             (verr "struct.new_default: field type ~a is not defaultable"
+                   (first f))))
+         (%push-val fv (%ref-of (list :type (imm :type)) nil))))
+      ((:struct.get :struct.get-s :struct.get-u)
+       (let* ((t_ (imm :type))
+              (ct (%struct-comptype-at fv t_ (string op)))
+              (f (%field-pair-at ct (imm :field) (string op)))
+              (ft (first f)))
+         (when (and (member op '(:struct.get-s :struct.get-u))
+                    (not (%packed-p ft)))
+           (verr "~a on non-packed field type ~a" op ft))
+         (%pop-val-expect fv (%ref-of (list :type t_)))
+         (%push-val fv (if (member op '(:struct.get-s :struct.get-u))
+                           :i32
+                           (%storage-value-type ft)))))
+      (:struct.set
+       (let* ((t_ (imm :type))
+              (ct (%struct-comptype-at fv t_ "struct.set"))
+              (f (%field-pair-at ct (imm :field) "struct.set")))
+         (unless (cdr f)
+           (verr "struct.set on immutable field ~a" (imm :field)))
+         (%pop-val-expect fv (%storage-value-type (first f)))
+         (%pop-val-expect fv (%ref-of (list :type t_)))))
+      (:array.new
+       (let* ((ct (%array-comptype-at fv (imm :type) "array.new"))
+              (et (first (%array-elem-pair ct))))
+         (%pop-val-expect fv :i32)
+         (%pop-val-expect fv (%storage-value-type et))
+         (%push-val fv (%ref-of (list :type (imm :type)) nil))))
+      (:array.new-default
+       (let* ((ct (%array-comptype-at fv (imm :type)
+                                      "array.new_default"))
+              (et (first (%array-elem-pair ct))))
+         (unless (or (%packed-p et)
+                     (wasmdown.types:defaultable-valtype-p et))
+           (verr "array.new_default: element type ~a is not defaultable"
+                 et))
+         (%pop-val-expect fv :i32)
+         (%push-val fv (%ref-of (list :type (imm :type)) nil))))
+      (:array.new-fixed
+       (let* ((ct (%array-comptype-at fv (imm :type) "array.new_fixed"))
+              (et (first (%array-elem-pair ct)))
+              (n (imm :count)))
+         (unless (and (integerp n) (>= n 0))
+           (verr "array.new_fixed: bad count ~a" n))
+         (%pop-vals fv (make-list n
+                                  :initial-element
+                                  (%storage-value-type et)))
+         (%push-val fv (%ref-of (list :type (imm :type)) nil))))
+      (:array.new-data
+       (let* ((ct (%array-comptype-at fv (imm :type) "array.new_data"))
+              (et (first (%array-elem-pair ct))))
+         (unless (member et '(:i8 :i16 :i32))
+           (verr "array.new_data: element type ~a is not packed/numeric"
+                 et))
+         (unless (vctx-data-in-range-p (fv-ctx fv) (imm :data))
+           (verr "array.new_data: data segment index ~a out of range"
+                 (imm :data)))
+         (%pop-val-expect fv :i32)
+         (%pop-val-expect fv :i32)
+         (%push-val fv (%ref-of (list :type (imm :type)) nil))))
+      (:array.new-elem
+       (let* ((ct (%array-comptype-at fv (imm :type) "array.new_elem"))
+              (et (first (%array-elem-pair ct))))
+         (unless (and (consp et) (eq (first et) :ref))
+           (verr "array.new_elem: element type ~a is not a reftype" et))
+         (vctx-elem-type-at (fv-ctx fv) (imm :elem) "array.new_elem")
+         (%pop-val-expect fv :i32)
+         (%pop-val-expect fv :i32)
+         (%push-val fv (%ref-of (list :type (imm :type)) nil))))
+      ((:array.get :array.get-s :array.get-u)
+       (let* ((ct (%array-comptype-at fv (imm :type) (string op)))
+              (et (first (%array-elem-pair ct))))
+         (when (and (member op '(:array.get-s :array.get-u))
+                    (not (%packed-p et)))
+           (verr "~a on non-packed element type ~a" op et))
+         (%pop-val-expect fv :i32)
+         (%pop-val-expect fv (%ref-of (list :type (imm :type))))
+         (%push-val fv (if (member op '(:array.get-s :array.get-u))
+                           :i32
+                           (%storage-value-type et)))))
+      (:array.set
+       (let* ((ct (%array-comptype-at fv (imm :type) "array.set"))
+              (f (%array-elem-pair ct)))
+         (unless (cdr f)
+           (verr "array.set on immutable array"))
+         (%pop-val-expect fv (%storage-value-type (first f)))
+         (%pop-val-expect fv :i32)
+         (%pop-val-expect fv (%ref-of (list :type (imm :type))))))
+      (:array.len
+       ;; NO immediate (binary 0xFB 0x0F): the operand is ANY
+       ;; array-typed ref — the abstract (ref null array) admits
+       ;; every concrete array typeuse via the lattice.
+       (%pop-val-expect fv (%ref-of :array))
+       (%push-val fv :i32))
+      (:array.fill
+       (let* ((ct (%array-comptype-at fv (imm :type) "array.fill"))
+              (f (%array-elem-pair ct)))
+         (unless (cdr f)
+           (verr "array.fill on immutable array"))
+         (%pop-val-expect fv :i32)
+         (%pop-val-expect fv (%storage-value-type (first f)))
+         (%pop-val-expect fv :i32)
+         (%pop-val-expect fv (%ref-of (list :type (imm :type))))))
+      (:array.copy
+       (let* ((types (wasm-module-types
+                      (vctx-module (fv-ctx fv))))
+              (dct (%array-comptype-at fv (imm :dst) "array.copy"))
+              (sct (%array-comptype-at fv (imm :src) "array.copy"))
+              (det (first (%array-elem-pair dct)))
+              (set_ (first (%array-elem-pair sct))))
+         (unless (or (equal det set_)
+                     (and (reftype-p det) (reftype-p set_)
+                          (wasmdown.types:reftype-sub-p
+                           set_ det types (vctx-canon (fv-ctx fv)))))
+           (verr "array.copy: source element type ~a does not match ~a"
+                 set_ det))
+         (unless (cdr (%array-elem-pair dct))
+           (verr "array.copy on immutable array"))
+         (%pop-val-expect fv :i32)
+         (%pop-val-expect fv :i32)
+         (%pop-val-expect fv (%ref-of (list :type (imm :src))))
+         (%pop-val-expect fv :i32)
+         (%pop-val-expect fv (%ref-of (list :type (imm :dst))))))
+      (:array.init-data
+       (let ((ct (%array-comptype-at fv (imm :type) "array.init_data")))
+         (unless (cdr (%array-elem-pair ct))
+           (verr "array.init_data on immutable array"))
+         (unless (vctx-data-in-range-p (fv-ctx fv) (imm :data))
+           (verr "array.init_data: data segment index ~a out of range"
+                 (imm :data)))
+         (%pop-val-expect fv :i32)
+         (%pop-val-expect fv :i32)
+         (%pop-val-expect fv :i32)
+         (%pop-val-expect fv (%ref-of (list :type (imm :type))))))
+      (:array.init-elem
+       (let ((ct (%array-comptype-at fv (imm :type) "array.init_elem")))
+         (unless (cdr (%array-elem-pair ct))
+           (verr "array.init_elem on immutable array"))
+         (vctx-elem-type-at (fv-ctx fv) (imm :elem) "array.init_elem")
+         (%pop-val-expect fv :i32)
+         (%pop-val-expect fv :i32)
+         (%pop-val-expect fv :i32)
+         (%pop-val-expect fv (%ref-of (list :type (imm :type))))))
+      ((:ref.test :ref.cast)
+       (let* ((types (wasm-module-types
+                      (vctx-module (fv-ctx fv))))
+              (heap (imm :type))
+              (target (%ref-of heap (imm :nullable)))
+              (r (%pop-ref fv)))
+         (declare (ignorable types))
+         (unless (or (eq r :bot)
+                     (etypecase heap
+                       (keyword t)
+                       (cons (valid-heaptype-p heap types))))
+           (verr "~a: invalid target heap ~a" op heap))
+         (unless (or (eq r :bot)
+                     (and (reftype-p r)
+                          (eq (wasmdown.types::%heap-top
+                               (wasmdown.types:typed-ref-heap r)
+                               types)
+                              (wasmdown.types::%heap-top heap types))))
+           (verr "~a: target ~a is outside the operand's hierarchy ~a"
+                 op target r))
+         (if (eq op :ref.test)
+             (%push-val fv :i32)
+             (%push-val fv target))))
+      ((:br-on-cast :br-on-cast-fail)
+       (let* ((types (wasm-module-types
+                      (vctx-module (fv-ctx fv))))
+              (src (%ref-of (imm :src) (imm :src-nullable)))
+              (dst (%ref-of (imm :dst) (imm :dst-nullable)))
+              (r (%pop-ref fv)))
+         (unless (or (eq r :bot)
+                     (wasmdown.types:reftype-sub-p dst src types
+                                                   (vctx-canon
+                                                    (fv-ctx fv))))
+           (verr "~a: target ~a is not a subtype of source ~a"
+                 op dst src))
+         ;; The branch takes the ref slot (plus the below-vals, which
+         ;; the block entry already type-checked): the label's LAST
+         ;; slot must admit the branch value. The cycle does NOT
+         ;; push the label types back — the ref LEFT with the branch.
+         (let* ((branch-val (if (eq op :br-on-cast) dst r))
+                (frame (%ctrl-label fv (imm :label) (string op)))
+                (lt (%label-types frame)))
+           (unless (and (consp lt) (plusp (length lt)))
+             (verr "~a: label ~a carries no reference slot"
+                   op (imm :label)))
+           ;; the label's LAST slot must be a REFTYPE admitting the
+           ;; branch value (an i32/i64 label cannot take the cast ref)
+           (let ((last-slot (first (last lt))))
+             (unless (reftype-p last-slot)
+               (verr "~a: label ~a's last slot ~a is not a reference"
+                     op (imm :label) last-slot))
+             (unless (or (eq branch-val :bot)
+                         (wasmdown.types:reftype-sub-p
+                          branch-val last-slot types
+                          (vctx-canon (fv-ctx fv))))
+               (verr "~a: branch value ~a does not match label ~a"
+                     op branch-val lt))))
+         ;; fallthrough keeps the complement: the original operand
+         ;; for br_on_cast (cast failed), the narrowed target for
+         ;; br_on_cast_fail (cast succeeded).
+         (%push-val fv (if (eq op :br-on-cast-fail) dst r))))
+      (:ref.eq
+       (%pop-val-expect fv (%ref-of :eq))
+       (%pop-val-expect fv (%ref-of :eq))
+       (%push-val fv :i32))
+      (:any.convert-extern
+       (%pop-val-expect fv :externref)
+       (%push-val fv (%ref-of :any)))
+      (:extern.convert-any
+       (%pop-val-expect fv (%ref-of :any))
+       (%push-val fv :externref))
+      (:ref.i31
+       (%pop-val-expect fv :i32)
+       (%push-val fv (list :ref :i31)))
+      ((:i31.get-s :i31.get-u)
+       (%pop-val-expect fv (%ref-of :i31))
+       (%push-val fv :i32)))))
+
 (defun %local-initialized-p (fv localidx)
   (let ((v (fv-inits fv)))
     (or (not v)
@@ -1170,6 +1491,11 @@ bodies of their :end terminator; bodies of :if carry no :else/:end)."
            ;; into (ref $ii) locals validates via reftype-sub-p).
            (let ((typeidx (svref (vctx-func-typeidxs (fv-ctx fv)) x)))
              (%push-val fv (list :ref (list :type typeidx))))))
+        ;; --- GC value opcodes (loop 22): the ~30-opcode family
+        ;; lives in VALIDATE-GC-INSTR (a separate defun — keeping
+        ;; this cond small); the dispatch consults the op table.
+        ((gethash op *gc-opcodes*)
+         (validate-gc-instr fv op imms module))
         ;; --- typed function references (Core 3.0) ---
         ((eq op :ref.as-non-null)
          ;; [(ref null ht)] -> [(ref ht)]: legacy keywords are their
@@ -1386,7 +1712,13 @@ types helper): params+results for a func, field types for struct."
                             (append (wasm-func-type-params ft)
                                     (wasm-func-type-results ft)))))
                (loop for t_ in vs
-                     unless (valtype-p t_)
+                     unless (or (valtype-p t_)
+                                ;; packed storagetypes (loop 22,
+                                ;; binary/types.html storagetype):
+                                ;; legal ONLY in struct/array FIELD
+                                ;; position — %COMPTYPE-VALTYPES
+                                ;; exposes exactly those.
+                                (member t_ '(:i8 :i16)))
                        do (verr "type ~a: invalid value type ~a" i t_)
                      ;; (:TYPE N) heaps must resolve in range
                      when (and (reftype-p t_) (consp t_)

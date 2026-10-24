@@ -122,17 +122,19 @@
 ;;; Value types, limits, blocktypes.
 
 (defun enc-heaptype (e heap)
-  "A heap type: abstract keyword -> its single byte (the absheaptype
-encodings; a minimal negative s33), (:TYPE N) typeuse -> positive
-s33 N."
+  "A heap type: abstract keyword -> its single byte (binary/types
+\.html absheaptype encodings — a minimal negative s33), (:TYPE N)
+typeuse -> positive s33 N."
   (etypecase heap
     (keyword
      (enc-byte e (ecase heap
                    (:func #x70) (:extern #x6f) (:exn #x69)
                    (:any #x6e) (:none #x71)
+                   ;; the GC heaps (loop 22): eq 0x6D, i31 0x6C,
+                   ;; struct 0x6B, array 0x6A.
+                   (:eq #x6d) (:i31 #x6c) (:struct #x6b) (:array #x6a)
                    (:nofunc #x73) (:noextern #x72) (:noexn #x74))))
     (cons (enc-s33 e (second heap)))))
-
 (defun enc-reftype (e t_)
   "A reference type: legacy keywords as their shorthand bytes
 (= (ref null ht)), typed refs as 0x64 (ref ht) / 0x63 (ref null ht)
@@ -151,6 +153,9 @@ plus the heap type."
     (keyword
      (ecase t_
        (:i32 #x7F) (:i64 #x7E) (:f32 #x7D) (:f64 #x7C)
+       ;; packed storage types (loop 22, binary/types.html
+       ;; storagetype): i8 0x78, i16 0x77 — field positions only.
+       (:i8 #x78) (:i16 #x77)
        (:funcref #x70) (:externref #x6F)
        ;; EH (Core 3.0): exnref 0x69.
        (:exnref #x69)))
@@ -270,6 +275,26 @@ ENC-REFTYPE (0x63/0x64 + heap type)."
    (cons :global.get #x23) (cons :global.set #x24)
    (cons :table.get #x25) (cons :table.set #x26)
    (cons :ref.func #xD2)))
+
+;;; 0xFB sub-opcode table (loop 22, the GC value family — mirrors
+;;; the decoder's 0xFB clause; binary/instructions.html).
+(defparameter *fb-op->sub*
+  (list
+   (cons :struct.new 0) (cons :struct.new-default 1)
+   (cons :struct.get 2) (cons :struct.get-s 3)
+   (cons :struct.get-u 4) (cons :struct.set 5)
+   (cons :array.new 6) (cons :array.new-default 7)
+   (cons :array.new-fixed 8) (cons :array.new-data 9)
+   (cons :array.new-elem 10) (cons :array.get 11)
+   (cons :array.get-s 12) (cons :array.get-u 13)
+   (cons :array.set 14) (cons :array.len 15)
+   (cons :array.fill 16) (cons :array.copy 17)
+   (cons :array.init-data 18) (cons :array.init-elem 19)
+   (cons :any.convert-extern 26) (cons :extern.convert-any 27)
+   (cons :ref.i31 28) (cons :i31.get-s 29) (cons :i31.get-u 30)))
+
+(defun fb-op-sub (op)
+  (cdr (assoc op *fb-op->sub*)))
 
 ;;; ---------------------------------------------------------------
 ;;; Instruction encoding.
@@ -432,6 +457,65 @@ low word first, then high word."
          (:table.grow (enc-u32 e (getf imms :table)))
          (:table.size (enc-u32 e (getf imms :table)))
          (:table.fill (enc-u32 e (getf imms :table)))))
+      ;; GC value opcodes (loop 22, the 0xFB prefix family —
+      ;; mirrors the decoder's immediates exactly).
+      ((:struct.new :struct.new-default :struct.get :struct.get-s
+        :struct.get-u :struct.set
+        :array.new :array.new-default :array.new-fixed
+        :array.new-data :array.new-elem :array.get :array.get-s
+        :array.get-u :array.set :array.len :array.fill
+        :array.copy :array.init-data :array.init-elem
+        :any.convert-extern :extern.convert-any
+        :ref.i31 :i31.get-s :i31.get-u)
+       (enc-byte e #xFB)
+       (enc-u32 e (fb-op-sub op))
+       (case op
+         (:struct.new (enc-u32 e (getf imms :type)))
+         (:struct.new-default (enc-u32 e (getf imms :type)))
+         (:struct.get (enc-u32 e (getf imms :type))
+                      (enc-u32 e (getf imms :field)))
+         (:struct.get-s (enc-u32 e (getf imms :type))
+                        (enc-u32 e (getf imms :field)))
+         (:struct.get-u (enc-u32 e (getf imms :type))
+                        (enc-u32 e (getf imms :field)))
+         (:struct.set (enc-u32 e (getf imms :type))
+                      (enc-u32 e (getf imms :field)))
+         (:array.new (enc-u32 e (getf imms :type)))
+         (:array.new-default (enc-u32 e (getf imms :type)))
+         (:array.new-fixed (enc-u32 e (getf imms :type))
+                           (enc-u32 e (getf imms :count)))
+         (:array.new-data (enc-u32 e (getf imms :type))
+                          (enc-u32 e (getf imms :data)))
+         (:array.new-elem (enc-u32 e (getf imms :type))
+                          (enc-u32 e (getf imms :elem)))
+         (:array.get (enc-u32 e (getf imms :type)))
+         (:array.get-s (enc-u32 e (getf imms :type)))
+         (:array.get-u (enc-u32 e (getf imms :type)))
+         (:array.set (enc-u32 e (getf imms :type)))
+         (:array.fill (enc-u32 e (getf imms :type)))
+         (:array.copy (enc-u32 e (getf imms :dst))
+                      (enc-u32 e (getf imms :src)))
+         (:array.init-data (enc-u32 e (getf imms :type))
+                           (enc-u32 e (getf imms :data)))
+         (:array.init-elem (enc-u32 e (getf imms :type))
+                           (enc-u32 e (getf imms :elem)))))
+      ;; ref.test/ref.cast (loop 22): the :NULLABLE flag chooses the
+      ;; nullable (0x14/0x16) vs non-null (0x15/0x17) byte; the
+      ;; heaptype immediate follows.
+      ((:ref.test :ref.cast)
+       (enc-byte e #xFB)
+       (enc-u32 e (ecase op
+                    (:ref.test (if (getf imms :nullable) 20 21))
+                    (:ref.cast (if (getf imms :nullable) 22 23))))
+       (enc-heaptype e (getf imms :type)))
+      ;; br_on_cast 0x18 / br_on_cast_fail 0x19: labelidx + the two
+      ;; heap immediates.
+      ((:br-on-cast :br-on-cast-fail)
+       (enc-byte e #xFB)
+       (enc-u32 e (if (eq op :br-on-cast) 24 25))
+       (enc-u32 e (getf imms :label))
+       (enc-heaptype e (getf imms :src))
+       (enc-heaptype e (getf imms :dst)))
       (t
        (let ((byte (simple-op-byte op)))
          (if byte
@@ -460,16 +544,82 @@ low word first, then high word."
 ;;; ---------------------------------------------------------------
 ;;; Section encoders.
 
+(defun %enc-comptype (e ct)
+  "One comptype in the binary type section (binary/types.html):
+  functype 0x60 (params, results), structtype 0x5F (fieldtype
+  vec), arraytype 0x5E (one fieldtype). A fieldtype is the storage
+  valtype + a mutability byte."
+  (ecase (wasm-comptype-kind ct)
+    (:func
+     (enc-byte e #x60)
+     (enc-u32 e (length (wasm-comptype-params ct)))
+     (loop for t_ in (wasm-comptype-params ct) do (enc-valtype e t_))
+     (enc-u32 e (length (wasm-comptype-results ct)))
+     (loop for t_ in (wasm-comptype-results ct) do (enc-valtype e t_)))
+    (:struct
+     (enc-byte e #x5F)
+     (enc-u32 e (length (wasm-comptype-fields ct)))
+     (loop for f in (wasm-comptype-fields ct)
+           do (enc-valtype e (car f))
+              (enc-byte e (if (cdr f) 1 0))))
+    (:array
+     (let ((f (first (wasm-comptype-fields ct))))
+       (enc-byte e #x5E)
+       (enc-valtype e (car f))
+       (enc-byte e (if (cdr f) 1 0))))))
+
 (defun enc-type-section (e types)
+  "The type section with RECURSION GROUPS (loop 22 mirrors the
+decoder): consecutive wasm-rec-type entries sharing one group
+object (EQ) regroup into a single 0x4E REC entry (one comptype per
+member); a SINGLETON group whose members never reference their own
+group may emit as a bare comptype — but for byte-stability this
+encoder always emits the bare form ONLY for plain non-rec
+wasm-func-type entries (the legacy pre-GC shapes round-trip
+byte-identical), and 0x4E for every rec group.
+
+  TYPEVEC is the module's flat wasm-rec-type vector (or legacy
+  plain functypes). The SECTION ENTRY COUNT is the number of
+  rectype entries, not members."
   (enc-section e 1
     (lambda (e)
-      (enc-u32 e (length types))
-      (loop for ft across types
-            do (enc-byte e #x60)
-               (enc-u32 e (length (wasm-func-type-params ft)))
-               (loop for t_ in (wasm-func-type-params ft) do (enc-valtype e t_))
-               (enc-u32 e (length (wasm-func-type-results ft)))
-               (loop for t_ in (wasm-func-type-results ft) do (enc-valtype e t_))))))
+      ;; regroup: walk the vector, collecting (group . members)
+      ;; runs; a plain functype entry is its own singleton run.
+      (let ((runs '()))
+        (loop for ty across types
+              for i from 0
+              do (let ((grp (and (wasm-rec-type-p ty)
+                                 (wasm-rec-type-group ty))))
+                   (cond ((and grp runs (eq (first (first runs)) grp))
+                          (push ty (rest (first runs))))
+                         (t (push (list grp ty) runs)))))
+        (setf runs (nreverse runs))
+        (enc-u32 e (length runs))
+        (dolist (run runs)
+          (let* ((grp (first run))
+                 (members (nreverse (rest run))))
+            (cond
+             ((null grp)
+              ;; a plain legacy functype (no rec wrapper): bare
+              ;; 0x60 form
+              (%enc-comptype
+               e
+               (let ((ty (first members)))
+                 (make-wasm-comptype
+                  :func nil '()
+                  (wasm-func-type-params ty)
+                  (wasm-func-type-results ty)))))
+             ((= 1 (length members))
+              ;; SINGLETON rec group: the bare comptype form — the
+              ;; decoder rebuilds it as its own singleton group, so
+              ;; round-trips stay byte-stable.
+              (%enc-comptype e (wasm-rec-type-comptype (first members))))
+             (t
+              ;; a multi-member group: 0x4E REC
+              (enc-byte e #x4E)
+              (enc-u32 e (length members))
+              (loop for m in members
+                    do (%enc-comptype e (wasm-rec-type-comptype m)))))))))))
 
 (defun enc-import-section (e imports)
   (enc-section e 2

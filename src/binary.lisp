@@ -214,7 +214,20 @@ degrade to a simple-vector (data-seg-state's slot type)."
       (#x70 :funcref) (#x6f :externref)
       ;; EH (Core 3.0): exnref 0x69 in valtype position
       ;; (ref_null.wast's binary mirror of (ref.null exn)).
-      (#x69 :exnref)
+      ;; packed storage types (loop 22, binary/types.html
+      ;; storagetype): i8 0x78, i16 0x77 — field positions only;
+      ;; the VALIDATOR rejects them in value positions.
+      (#x78 :i8) (#x77 :i16)
+      ;; GC shorthand reftypes (loop 22, binary/types.html): the
+      ;; abstract any/eq/i31/struct/array heap bytes 0x6E/0x6D/
+      ;; 0x6C/0x6B/0x6A in VALTYPE position are the nullable
+      ;; shorthand spellings anyref/eqref/i31ref/structref/
+      ;; arrayref = (ref null ht).
+      (#x6e (list :ref 'null :any))
+      (#x6d (list :ref 'null :eq))
+      (#x6c (list :ref 'null :i31))
+      (#x6b (list :ref 'null :struct))
+      (#x6a (list :ref 'null :array))
       ;; typed refs: 0x64 (ref ht), 0x63 (ref null ht) — the byte
       ;; order pinned by binary/types.html (0x63 = ref null ht,
       ;; 0x64 = ref ht) and elem.wast ::458's "\64\70" = (ref func).
@@ -227,7 +240,14 @@ degrade to a simple-vector (data-seg-state's slot type)."
     (case b
       (#x70 :funcref) (#x6f :externref)
       ;; EH (Core 3.0): table/global element type exnref (0x69).
-      (#x69 :exnref)
+      ;; GC shorthand reftypes (loop 22): anyref 0x6E / eqref 0x6D /
+      ;; i31ref 0x6C / structref 0x6B / arrayref 0x6A in table/elem
+      ;; element position (binary/types.html reftype).
+      (#x6e (list :ref 'null :any))
+      (#x6d (list :ref 'null :eq))
+      (#x6c (list :ref 'null :i31))
+      (#x6b (list :ref 'null :struct))
+      (#x6a (list :ref 'null :array))
       ;; typed refs in table/elem element position: 0x64/0x63
       ;; (elem.wast ::458's table byte stream "\40\00\64\70").
       (#x64 (list :ref (%read-heaptype r)))
@@ -235,13 +255,14 @@ degrade to a simple-vector (data-seg-state's slot type)."
       (t (%decode-error r "unknown type form 0x~x" b)))))
 
 (defun %read-heaptype (r)
-  "A heap type: the abstract single bytes of this slice's lattice
-(func/extern/exn/any/none/nofunc/noextern/noexn) or a positive s33
-typeuse index -> (:TYPE N). The struct/array/i31/eq bytes are NOT in
-this slice. A negative multi-byte s33 (malformed abstract heap) is a
-decode error; the single abstract bytes ARE minimal negative s33
-encodings (0x70 = -16, 0x6f = -17, ... one's complement), so the
-byte case catches them before the s33 read."
+  "A heap type (binary/types.html heaptype): the abstract single
+bytes — func 0x70, extern 0x6F, exn 0x69, any 0x6E, none 0x71,
+nofunc 0x73, noextern 0x72, noexn 0x74, and (loop 22) the GC
+heaps eq 0x6D / i31 0x6C / struct 0x6B / array 0x6A — or a
+positive s33 typeuse index -> (:TYPE N). A negative multi-byte s33
+\(malformed abstract heap) is a decode error; the single abstract
+bytes ARE minimal negative s33 encodings (0x70 = -16, one's
+complement), so the byte case catches them before the s33 read."
   (let ((start (reader-offset r))
         (b (peek-byte-at r)))
     (case b
@@ -253,6 +274,12 @@ byte case catches them before the s33 read."
       (#x6f (read-byte-at r) :extern)
       (#x69 (read-byte-at r) :exn)
       (#x6e (read-byte-at r) :any)
+      ;; the GC heaps (loop 22, binary/types.html): eq 0x6D,
+      ;; i31 0x6C, struct 0x6B, array 0x6A.
+      (#x6d (read-byte-at r) :eq)
+      (#x6c (read-byte-at r) :i31)
+      (#x6b (read-byte-at r) :struct)
+      (#x6a (read-byte-at r) :array)
       (#x71 (read-byte-at r) :none)
       (#x73 (read-byte-at r) :nofunc)
       (#x72 (read-byte-at r) :noextern)
@@ -271,7 +298,10 @@ byte case catches them before the s33 read."
   "NIL (empty), a valtype, or (:typeidx . n)."
   (let ((b (peek-byte-at r)))
     (cond ((= b #x40) (read-byte-at r) nil)
-          ((member b '(#x7f #x7e #x7d #x7c #x70 #x6f #x69 #x63 #x64))
+          ;; the GC shorthand bytes 0x6E..0x6A (loop 22) are valtype
+          ;; spellings too — dispatch through %read-valtype.
+          ((member b '(#x7f #x7e #x7d #x7c #x70 #x6f #x69 #x63 #x64
+                       #x6e #x6d #x6c #x6b #x6a))
            (%read-valtype r))
           (t
            (let ((start (reader-offset r))
@@ -335,11 +365,11 @@ forms are rejected as decode-error."
     :i32.extend8_s :i32.extend16_s :i64.extend8_s :i64.extend16_s :i64.extend32_s nil nil nil   ; 0xC0-0xC7
     nil nil nil nil nil nil nil nil   ; 0xC8-0xCF
     ;; 0xD0-0xD6: ref.null carries a heaptype immediate, ref.is_null
-    ;; and ref.func (funcidx) have dedicated clauses; 0xD3 ref.eq is
-    ;; GC scope (nil here, unknown-opcode error at decode);
-    ;; 0xD4-0xD6 sit in the table so the ENCODER's reverse lookup
-    ;; finds them (their decoder clauses match first).
-    :ref.null :ref.is-null :ref.func nil :ref.as-non-null
+    ;; and ref.func (funcidx) have dedicated clauses; ref.eq 0xD3
+    ;; (loop 22, GC reference identity) is immediate-free and lives
+    ;; here; 0xD4-0xD6 sit in the table so the ENCODER's reverse
+    ;; lookup finds them (their decoder clauses match first).
+    :ref.null :ref.is-null :ref.func :ref.eq :ref.as-non-null
     :br-on-null :br-on-non-null))
 
 (defun %simple-op (byte)
@@ -515,8 +545,9 @@ markers (keywords) for the block terminators."
          ;; br_on_null 0xD5 / br_on_non_null 0xD6 (labelidx u32);
          ;; call_ref 0x14 / return_call_ref 0x15 are DEDICATED top
          ;; bytes (not 0xFC sub-opcodes) — see the 0x14/0x15 clauses.
-         ;; ref.eq 0xD3 stays GC scope (unimplemented, falls to the
-         ;; unknown-opcode error below).
+         ;; ref.eq 0xD3 (loop 22, GC reference identity) is
+         ;; immediate-free: it decodes via *SIMPLE-OPS*' 0xD3 entry
+         ;; through the generic fallback clause below.
          (case b
            (#xD0 (mk :ref.null (list :type (%read-heaptype r))))
            (#xD1 (mk :ref.is-null nil))
@@ -555,6 +586,80 @@ markers (keywords) for the block terminators."
              (16 (mk :table.size (list :table (read-u32 r))))
              (17 (mk :table.fill (list :table (read-u32 r))))
              (t (%decode-error r "unknown 0xFC opcode ~d" sub)))))
+        ;; GC value opcodes (loop 22, the 0xFB prefix family —
+        ;; binary/instructions.html). Struct ops:
+        ;;   0x00 struct.new t, 0x01 struct.new_default t,
+        ;;   0x02 struct.get t f, 0x03 struct.get_s, 0x04 struct.get_u,
+        ;;   0x05 struct.set t f
+        ;; Array ops: 0x06 array.new t, 0x07 array.new_default t,
+        ;;   0x08 array.new_fixed t n, 0x09 array.new_data t d,
+        ;;   0x0A array.new_elem t e, 0x0B array.get t,
+        ;;   0x0C array.get_s, 0x0D array.get_u, 0x0E array.set t,
+        ;;   0x0F array.len, 0x10 array.fill t, 0x11 array.copy t1 t2,
+        ;;   0x12 array.init_data t d, 0x13 array.init_elem t e
+        ;; Casts: 0x14/0x15 ref.test (nullable/non-null),
+        ;;   0x16/0x17 ref.cast, 0x18 br_on_cast l ht1 ht2,
+        ;;   0x19 br_on_cast_fail
+        ;; Conversions: 0x1A any.convert_extern, 0x1B extern.convert_any
+        ;; i31: 0x1C ref.i31, 0x1D i31.get_s, 0x1E i31.get_u
+        (#xFB
+         (let ((sub (read-u32 r)))
+           (case sub
+             (0 (mk :struct.new (list :type (read-u32 r))))
+             (1 (mk :struct.new-default (list :type (read-u32 r))))
+             (2 (mk :struct.get (list :type (read-u32 r)
+                                      :field (read-u32 r))))
+             (3 (mk :struct.get-s (list :type (read-u32 r)
+                                        :field (read-u32 r))))
+             (4 (mk :struct.get-u (list :type (read-u32 r)
+                                        :field (read-u32 r))))
+             (5 (mk :struct.set (list :type (read-u32 r)
+                                      :field (read-u32 r))))
+             (6 (mk :array.new (list :type (read-u32 r))))
+             (7 (mk :array.new-default (list :type (read-u32 r))))
+             (8 (mk :array.new-fixed (list :type (read-u32 r)
+                                           :count (read-u32 r))))
+             (9 (mk :array.new-data (list :type (read-u32 r)
+                                         :data (read-u32 r))))
+             (10 (mk :array.new-elem (list :type (read-u32 r)
+                                          :elem (read-u32 r))))
+             (11 (mk :array.get (list :type (read-u32 r))))
+             (12 (mk :array.get-s (list :type (read-u32 r))))
+             (13 (mk :array.get-u (list :type (read-u32 r))))
+             (14 (mk :array.set (list :type (read-u32 r))))
+             (15 (mk :array.len nil))
+             (16 (mk :array.fill (list :type (read-u32 r))))
+             (17 (mk :array.copy (list :dst (read-u32 r)
+                                        :src (read-u32 r))))
+             (18 (mk :array.init-data (list :type (read-u32 r)
+                                            :data (read-u32 r))))
+             (19 (mk :array.init-elem (list :type (read-u32 r)
+                                            :elem (read-u32 r))))
+             ;; ref.test/ref.cast: heaptype immediate follows; the
+             ;; immediate flags NULLABLE (0x14/0x16) vs NON-NULL
+             ;; (0x15/0x17) are separate op keywords.
+             (20 (mk :ref.test (list :type (%read-heaptype r)
+                                     :nullable t)))
+             (21 (mk :ref.test (list :type (%read-heaptype r))))
+             (22 (mk :ref.cast (list :type (%read-heaptype r)
+                                     :nullable t)))
+             (23 (mk :ref.cast (list :type (%read-heaptype r))))
+             ;; br_on_cast l ht1 ht2: labelidx, the source's heap
+             ;; (must be a supertype of ht2) and the target heap.
+             (24 (mk :br-on-cast
+                     (list :label (read-u32 r)
+                           :src (%read-heaptype r)
+                           :dst (%read-heaptype r))))
+             (25 (mk :br-on-cast-fail
+                     (list :label (read-u32 r)
+                           :src (%read-heaptype r)
+                           :dst (%read-heaptype r))))
+             (26 (mk :any.convert-extern nil))
+             (27 (mk :extern.convert-any nil))
+             (28 (mk :ref.i31 nil))
+             (29 (mk :i31.get-s nil))
+             (30 (mk :i31.get-u nil))
+             (t (%decode-error r "unknown 0xFB opcode ~d" sub)))))
         (t
          (let ((simple (%simple-op b)))
            (if simple
@@ -599,16 +704,110 @@ terminating :end, which IS included in the result. R is a reader."
 ;;; may appear anywhere after the magic/version). Section sizes are
 ;;; enforced: content must exactly fill the declared size.
 
+(defun %read-fieldtype (r)
+  "A fieldtype (binary/types.html): storage valtype + mutability
+byte 0/1. Stored as a (valtype . mutable-p) pair, matching the
+text parser's comptype FIELDS contract."
+  (let ((vt (%read-valtype r))
+        (mut (read-byte-at r)))
+    (unless (or (= mut 0) (= mut 1))
+      (%decode-error r "malformed field mutability 0x~x" mut))
+    (cons vt (= mut 1))))
+
+(defun %read-comptype-body (r)
+  "A comptype after any sub-count (binary/types.html comptype):
+  functype 0x60, structtype 0x5F (fieldtype vec), arraytype 0x5E
+  \(one fieldtype). Returns a wasm-comptype — the uniform rec
+  model: all kinds keep FIELDS as (valtype . mutable-p) pairs;
+  func keeps params/results."
+  (let ((form (read-byte-at r)))
+    (case form
+      (#x60 (make-wasm-comptype
+             :func nil '()
+             (coerce (read-vec r #'%read-valtype "functype param") 'list)
+             (coerce (read-vec r #'%read-valtype "functype result") 'list)))
+      (#x5F (make-wasm-comptype
+             :struct nil
+             (coerce (read-vec r #'%read-fieldtype "struct field") 'list)
+             '() '()))
+      (#x5E (let ((ft (%read-fieldtype r)))
+              (make-wasm-comptype :array nil (list ft) '() '())))
+      (t (%decode-error r "unknown type form 0x~x" form)))))
+
+(defun %read-sub-count (r)
+  "A subtype's sub-count byte (binary/types.html subtype): 0x00 =
+  no explicit supertypes, 0x01 = a supertypevec follows. The
+  non-null flag forms (0x03/0x04) are not in this slice (no
+  declared subtyping): decode error, the same honesty as
+  malformed limits flags. Returns the number of supertypes read."
+  (let ((b (read-byte-at r)))
+    (case b
+      (#x00 0)
+      (#x01 (let ((n (read-u32 r)))
+              (dotimes (_ n) (read-u32 r))
+              n))
+      (t (%decode-error r "malformed subtype form 0x~x" b)))))
+
+(defun %read-rectype (r group-start)
+  "One type-section entry (binary/types.html rectype): a bare
+  comptype (functype 0x60 / structtype 0x5F / arraytype 0x5E — its
+  own singleton group, NO sub-count byte), 0x50 SUB (sub-count then
+  one comptype) or 0x4E REC (comptype vec). Returns one
+  wasm-rec-type per MEMBER, all sharing one group object,
+  consecutive typeidxs from GROUP-START (the loop-20 uniform rec
+  model), in DECLARATION order."
+  (let ((b (peek-byte-at r)))
+    (cond
+     ((= b #x4E)
+      (read-byte-at r)
+      (let* ((cts (read-vec r
+                            ;; each rec member is a BARE comptype
+                            ;; (binary/types.html rectype: the
+                            ;; sub-count byte belongs to the SUB
+                            ;; form, not rec members)
+                            #'%read-comptype-body
+                            "rec comptype"))
+             (grp (make-wasm-rectype-group cts)))
+        (loop for ct across cts
+              for i from 0
+              collect (make-rec-type-entry ct grp i group-start))))
+     ((= b #x50)
+      ;; SUB: sub-count then ONE comptype (no declared subtyping in
+      ;; this slice; the supertypes are read and discarded — the
+      ;; nominal heap lattice governs subtyping)
+      (read-byte-at r)
+      (let* ((sub-n (%read-sub-count r))
+             (ct (%read-comptype-body r))
+             (grp (make-wasm-rectype-group (vector ct))))
+        (declare (ignore sub-n))
+        (list (make-rec-type-entry ct grp 0 group-start))))
+     ;; a bare comptype: no sub-count byte at all (binary/types.html
+     ;; rectype's first alternative — the pre-GC module shape every
+     ;; legacy fixture uses)
+     (t
+      (let* ((ct (%read-comptype-body r))
+             (grp (make-wasm-rectype-group (vector ct))))
+        (list (make-rec-type-entry ct grp 0 group-start)))))))
+
 (defun %read-type-section (r)
-  (read-vec r
-            (lambda (r)
-              (let ((form (read-byte-at r)))
-                (unless (= form #x60)
-                  (%decode-error r "unknown type form 0x~x" form))
-                (make-wasm-func-type
-                 (coerce (read-vec r #'%read-valtype "functype param") 'list)
-                 (coerce (read-vec r #'%read-valtype "functype result") 'list))))
-            "type"))
+  "The type section (binary/types.html typesec): a vec of RECTYPE
+  entries — bare comptypes (singleton rec groups) or REC blocks.
+  Every entry expands to a LIST of wasm-rec-type members; the
+  section's flat member sequence is the module's type vector (spec:
+  a rec block's members occupy CONSECUTIVE typeidxs, one per
+  member, not one per block)."
+  (let ((start (reader-offset r))
+        (count (read-u32 r)))
+    (when (> count (- (reader-limit r) (reader-offset r)))
+      (decode-error-at start "length out of bounds: type vector declares ~d entries" count))
+    (let ((members '()))
+      (dotimes (_ count)
+        ;; group-start of the NEXT entry: the members flattened so
+        ;; far (the rec model's forward-reference bound). %READ-
+        ;; RECTYPE returns DECLARATION order; append keeps it.
+        (let ((gs (length members)))
+          (setf members (nconc members (%read-rectype r gs)))))
+      (coerce members 'vector))))
 
 (defun %read-import-section (r)
   (read-vec r

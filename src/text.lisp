@@ -855,15 +855,18 @@ or adjacent to the 0x prefix) — int_literals.wast pins 1__000,
 
 (defun %heaptype (x penv)
   "Parse one heap-type item — the element of a (ref ...)/(ref null ...)
-valtype or the immediate of ref.null: an abstract name (func/extern/
-exn/any/none/nofunc/noextern/noexn) as a keyword, or a typeuse ($id or
+valtype or the immediate of ref.null/ref.test/ref.cast: an abstract
+name (func/extern/exn/any/none/nofunc/noextern/noexn, and — loop 22 —
+the GC heaps eq/i31/struct/array) as a keyword, or a typeuse ($id or
 number) as (:TYPE N) resolved against PENV's running type list. The
 index is LAZY: out-of-range indices parse fine and surface as
 'unknown type' at VALIDATION (ref.wast's assert_invalid batch)."
   (let ((k (%tok-keyword x)))
     (cond
      ((member k '("func" "extern" "exn" "any" "none"
-                  "nofunc" "noextern" "noexn")
+                  "nofunc" "noextern" "noexn"
+                  ;; the GC abstract heaps (loop 22)
+                  "eq" "i31" "struct" "array")
               :test #'string=)
       (intern (string-upcase k) :keyword))
      ((and (tok-p x) (member (tok-kind x) '(:id :nat)))
@@ -922,6 +925,14 @@ keyword or (:TYPE N) typeuse)."
       (cond
        ((string= k "i32") :i32)
        ((string= k "i64") :i64)
+       ;; packed field types (loop 22, text/types.html storagetype):
+       ;; i8/i16 are STORAGE types — legal only in struct/array
+       ;; field position; the VALIDATOR rejects them in value
+       ;; positions (params/results/locals/globals), the honest
+       ;; 'invalid value type' at VALIDATE per the spec's valtype
+       ;; grammar.
+       ((string= k "i8") :i8)
+       ((string= k "i16") :i16)
        ((string= k "f32") :f32)
        ((string= k "f64") :f64)
        ((string= k "funcref") :funcref)
@@ -932,6 +943,12 @@ keyword or (:TYPE N) typeuse)."
        ;; Core 3.0 shorthand bottoms (ref_null.wast's null* spellings):
        ;; each is the lattice's null bottom in its heap bucket.
        ((string= k "anyref") (list :ref 'null :any))
+       ;; GC shorthand reftypes (loop 22, the abstract GC heaps'
+       ;; nullable spellings): eqref/i31ref/structref/arrayref.
+       ((string= k "eqref") (list :ref 'null :eq))
+       ((string= k "i31ref") (list :ref 'null :i31))
+       ((string= k "structref") (list :ref 'null :struct))
+       ((string= k "arrayref") (list :ref 'null :array))
        ((string= k "nullref") (list :ref 'null :none))
        ((string= k "nullfuncref") (list :ref 'null :nofunc))
        ((string= k "nullexternref") (list :ref 'null :noextern))
@@ -1221,8 +1238,68 @@ underscore)."
             ((string= text "call_ref") "call-ref")
             ((string= text "return_call_ref") "return-call-ref")
             ((string= text "ref.as_non_null") "ref.as-non-null")
+            ;; GC value ops (loop 22): the multiword spellings
+            ((string= text "br_on_cast") "br-on-cast")
+            ((string= text "br_on_cast_fail") "br-on-cast-fail")
+            ((string= text "any.convert_extern") "any.convert-extern")
+            ((string= text "extern.convert_any") "extern.convert-any")
+            ((string= text "ref.i31") "ref.i31")
+            ((string= text "i31.get_s") "i31.get-s")
+            ((string= text "i31.get_u") "i31.get-u")
+            ((string= text "struct.new_default") "struct.new-default")
+            ((string= text "struct.get_s") "struct.get-s")
+            ((string= text "struct.get_u") "struct.get-u")
+            ((string= text "array.new_default") "array.new-default")
+            ((string= text "array.new_fixed") "array.new-fixed")
+            ((string= text "array.new_data") "array.new-data")
+            ((string= text "array.new_elem") "array.new-elem")
+            ((string= text "array.get_s") "array.get-s")
+            ((string= text "array.get_u") "array.get-u")
+            ((string= text "array.init_data") "array.init-data")
+            ((string= text "array.init_elem") "array.init-elem")
             (t text)))
           :keyword))
+
+
+;;; GC value opcodes (loop 22): the immediate-free subset — array.len,
+;;; ref.i31, i31.get_s/u, any.convert_extern/extern.convert_any,
+;;; ref.eq. Every op that carries immediates (struct.*, array.new*,
+;;; casts) gets a %SPLIT-IMMS clause instead.
+(defparameter *gc-plain-ops*
+  '("array.len" "ref.i31" "i31.get_s" "i31.get_u"
+    "any.convert_extern" "extern.convert_any" "ref.eq"))
+
+(defparameter *gc-plain-op-keywords*
+  (let ((h (make-hash-table :test #'equal)))
+    (dolist (s *gc-plain-ops* h)
+      (setf (gethash s h) (%kw s)))))
+
+;;; GC immediate-bearing ops: op text -> immediate shape.
+;;;   :type       — one typeidx (struct.new/new_default, array.*)
+;;;   :type-field — typeidx + fieldidx (struct.get/_s/_u, struct.set)
+;;;   :type-count — typeidx + count (array.new_fixed)
+;;;   :type-data  — typeidx + dataidx (array.new_data/init_data)
+;;;   :type-elem  — typeidx + elemidx (array.new_elem/init_elem)
+;;;   :copy       — dst typeidx + src typeidx (array.copy)
+;;;   :cast       — a (ref null? ht) reftype-shaped list (ref.test/
+;;;                ref.cast)
+;;;   :br-on-cast — label + two reftype-shaped lists (br_on_cast,
+;;;                br_on_cast_fail)
+(defparameter *gc-imm-op-shapes*
+  '(("struct.new" . :type) ("struct.new_default" . :type)
+    ("struct.get" . :type-field) ("struct.get_s" . :type-field)
+    ("struct.get_u" . :type-field) ("struct.set" . :type-field)
+    ("array.new" . :type) ("array.new_default" . :type)
+    ("array.new_fixed" . :type-count)
+    ("array.new_data" . :type-data) ("array.new_elem" . :type-elem)
+    ("array.get" . :type) ("array.get_s" . :type)
+    ("array.get_u" . :type) ("array.set" . :type)
+    ("array.fill" . :type)
+    ("array.copy" . :copy)
+    ("array.init_data" . :type-data) ("array.init_elem" . :type-elem)
+    ("ref.test" . :cast) ("ref.cast" . :cast)
+    ("br_on_cast" . :br-on-cast)
+    ("br_on_cast_fail" . :br-on-cast)))
 
 (defparameter *plain-op-keywords*
   (let ((h (make-hash-table :test #'equal)))
@@ -1277,7 +1354,11 @@ underscore)."
   "Whether TOK item X starts a plain (immediate-bearing) instruction."
   (and (tok-p x)
        (or (gethash (%tok-keyword x) *plain-op-keywords*)
+           (gethash (%tok-keyword x) *gc-plain-op-keywords*)
            (gethash (%tok-keyword x) *memarg-op-keywords*)
+           ;; GC immediate-bearing ops (loop 22)
+           (cdr (assoc (%tok-keyword x) *gc-imm-op-shapes*
+                       :test #'string=))
            (member (%tok-keyword x)
                    '("i32.const" "i64.const" "f32.const" "f64.const"
                      "local.get" "local.set" "local.tee" "global.get"
@@ -1881,6 +1962,118 @@ rest of the plain sequence."
       (multiple-value-bind (x items)
           (%take-index rest (penv-datas penv) "data")
         (values (make-wasm-instr op-key (list :data x) #() 0) items)))
+     ;; ---- GC value opcodes (loop 22) ----
+     ;; immediate-free GC ops: no immediates
+     ((gethash k *gc-plain-op-keywords*)
+      (values (make-wasm-instr op-key nil #() 0) rest))
+     ;; immediate-bearing GC ops, by shape table
+     ((cdr (assoc k *gc-imm-op-shapes* :test #'string=))
+      (ecase (cdr (assoc k *gc-imm-op-shapes* :test #'string=))
+        (:type
+         (multiple-value-bind (x items)
+             (%take-index rest (penv-types penv) "type")
+           (values (make-wasm-instr op-key (list :type x) #() 0) items)))
+        (:type-field
+         (multiple-value-bind (x items)
+             (%take-index rest (penv-types penv) "type")
+           (multiple-value-bind (f items2)
+               (%take-index items (penv-types penv) "field")
+             ;; fieldidx is a plain number, not a typeuse id: the
+             ;; field index space is positional. %TAKE-INDEX against
+             ;; the types hash would reject a bare nat only if it
+             ;; were an $id; numbers pass through, which is the
+             ;; legal spelling (struct fields have no $ids).
+             (values (make-wasm-instr op-key
+                                     (list :type x :field f) #() 0)
+                     items2))))
+        (:type-count
+         (multiple-value-bind (x items)
+             (%take-index rest (penv-types penv) "type")
+           (unless (and items (tok-p (car items))
+                        (eq (tok-kind (car items)) :nat))
+             (funcall bad))
+           (values (make-wasm-instr
+                    op-key
+                    (list :type x
+                          :count (%parse-nat (tok-text (car items))
+                                             (tok-pos (car items))))
+                    #() 0)
+                   (cdr items))))
+        (:type-data
+         (multiple-value-bind (x items)
+             (%take-index rest (penv-types penv) "type")
+           (multiple-value-bind (d items2)
+               (%take-index items (penv-datas penv) "data")
+             (values (make-wasm-instr op-key
+                                     (list :type x :data d) #() 0)
+                     items2))))
+        (:type-elem
+         (multiple-value-bind (x items)
+             (%take-index rest (penv-types penv) "type")
+           (multiple-value-bind (el items2)
+               (%take-index items (penv-elems penv) "elem")
+             (values (make-wasm-instr op-key
+                                     (list :type x :elem el) #() 0)
+                     items2))))
+        (:copy
+         (multiple-value-bind (d items)
+             (%take-index rest (penv-types penv) "type")
+           (multiple-value-bind (s items2)
+               (%take-index items (penv-types penv) "type")
+             (values (make-wasm-instr op-key
+                                     (list :dst d :src s) #() 0)
+                     items2))))
+        (:cast
+         ;; ref.test/ref.cast <reftype>: the immediate is the cast
+         ;; TARGET, a (ref null? ht) list — nullable keeps
+         ;; :nullable t (choosing the 0x14/0x16 encodings).
+         (unless (and rest (tok-elem-p (car rest)))
+           (funcall bad))
+         (let ((rt (%valtype (car rest))))
+           (unless (and (consp rt) (eq (first rt) :ref))
+             (%text-error pos "~a needs a (ref ...) target" k))
+           (values (make-wasm-instr
+                    op-key
+                    (list :type (wasmdown.types:typed-ref-heap rt)
+                          :nullable (wasmdown.types:typed-ref-nullable-p
+                                     rt))
+                    #() 0)
+                   (cdr rest))))
+        (:br-on-cast
+         ;; br_on_cast $l rt1 rt2: label + the SOURCE reftype + the
+         ;; TARGET reftype. Both may be (ref null? ht) LISTS or the
+         ;; shorthand TOKENS (anyref/eqref/i31ref/structref/
+         ;; arrayref/funcref...): the immediates keep the heap +
+         ;; nullability of either spelling.
+         (multiple-value-bind (label items)
+             (%take-label rest penv k)
+           (flet ((rt-of (x what)
+                    (let ((rt (%valtype x)))
+                      (unless (and (consp rt) (eq (first rt) :ref))
+                        (%text-error pos "~a needs a reference type for the ~a"
+                                      k what))
+                      rt)))
+             (unless (and items (or (tok-p (car items))
+                                    (tok-elem-p (car items))))
+               (funcall bad))
+             (let ((src-rt (rt-of (car items) "source")))
+               (unless (and (cdr items) (or (tok-p (second items))
+                                            (tok-elem-p (second items))))
+                 (funcall bad))
+               (let ((dst-rt (rt-of (second items) "target")))
+                 (values (make-wasm-instr
+                          op-key
+                          (list :label label
+                                :src (wasmdown.types:typed-ref-heap src-rt)
+                                :src-nullable
+                                (wasmdown.types:typed-ref-nullable-p
+                                 src-rt)
+                                :dst (wasmdown.types:typed-ref-heap dst-rt)
+                                :dst-nullable
+                                (wasmdown.types:typed-ref-nullable-p
+                                 dst-rt))
+                          #() 0)
+                         (cddr items)))))))))
      (t (funcall bad)))))
 
 (defun %block-label-and-type (node penv)
@@ -2089,11 +2282,33 @@ validate so (rec (type $f1 (func)) (type (struct ...)))) parses)."
            ((string= k "struct")
             (values (%parse-struct-fields body shadow :struct) id))
            ((string= k "array")
-            (values (%parse-struct-fields body shadow :array) id))
+            (values (%parse-array-field body shadow) id))
            (t (%text-error (or (and head (tok-p head) (tok-pos head)) 0)
                            "~a: unknown type definition ~a" what
                            (or k (and head (tok-p head) (tok-text head)))))))))))
 
+
+(defun %parse-array-field (body penv)
+  "Parse an (array fieldtype) comptype body (text/types.html
+arraytype): fieldtype is `mut? storagetype` — either a bare
+storagetype or the (mut st) list form — with NO (field ...)
+wrapper (that is the STRUCT grammar; arrays carry exactly one)."
+  (let* ((items (cddr body))
+         (f (first items)))
+    (unless (= (length items) 1)
+      (%text-error 0 "array needs exactly one field type"))
+    (cond
+     ;; (mut st): the list form
+     ((and (tok-elem-p f)
+           (= (length f) 3)
+           (string= (%tok-keyword (%first-tok f)) "mut"))
+      (make-wasm-comptype :array nil (list (cons (%valtype (third f)) t))
+                          '() '()))
+     ;; bare storagetype (immutable)
+     ((or (tok-p f) (tok-elem-p f))
+      (make-wasm-comptype :array nil (list (cons (%valtype f) nil))
+                          '() '()))
+     (t (%text-error 0 "bad array field type")))))
 (defun %parse-struct-fields (body penv kind)
   "Parse a (struct (field ...)*) or (array (field t mut?)) comptype
 body into a wasm-comptype with FIELDS as (valtype . mutable-p)
@@ -2114,6 +2329,16 @@ engine's runtime slice."
             (pending-mut nil))
         (dolist (it fitems)
           (cond
+           ;; (mut t): the LIST form of the storage modifier (the
+           ;; spec's field grammar — same spelling as global types;
+           ;; loop 22: the GC fixtures' canonical form).
+           ((and (tok-elem-p it)
+                 (= (length it) 3)
+                 (string= (%tok-keyword (%first-tok it)) "mut"))
+            (when pending-mut
+              (%text-error 0 "consecutive (mut) in a field list"))
+            (push (cons (%valtype (third it)) t) fields)
+            (setf pending-mut nil))
            ((and (tok-p it) (string= (%tok-keyword it) "mut"))
             (when pending-mut
               (%text-error 0 "consecutive (mut) in a field list"))

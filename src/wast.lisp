@@ -1035,33 +1035,17 @@ ref.test, any.convert_extern/extern.convert_any, annotations."
      ((has "(@") :annotations)
      ((or (tok "v128") (tok "i8x16") (tok "i16x8") (tok "i32x4")
           (tok "i64x2") (tok "f32x4") (tok "f64x2")) :simd)
-     ;; GC VALUE families stay out of scope. RECURSION GROUPS (loop
-     ;; 20) are IMPLEMENTED for FUNC/STRUCT/ARRAY comptypes at the
-     ;; TYPE level: (rec ...) parses, validates and links (the
-     ;; iso-recursive equivalence engine in wasmdown.types), and
-     ;; struct/ARRAY TYPE DECLARATIONS (the comptype grammar in
-     ;; %comptype-body) parse and validate too — type-rec.wast's 21
-     ;; struct rows are declaration-only (fields are plain (ref $t),
-     ;; no packed fields, no mut, zero GC opcodes anywhere in the
-     ;; vendored suite — verified: no struct.new/array.new/i31.new/
-     ;; ref.cast/br_on_cast fixture exists in tests/spec-core). So
-     ;; the (struct/(array declaration arms RELEASE; what stays GC
-     ;; scope is the VALUE family: the eq/struct/array/i31 heap
-     ;; spellings IN REFTYPES, ref.eq/ref.test/ref.cast/br_on_cast,
-     ;; any<->extern conversions and i31.
-     ((or (has "(i31")
-          (has "(ref eq") (has "(ref struct") (has "(ref array")
-          (has "(ref i31")
-          (has "br_on_cast") (has "ref.cast") (has "ref.test")
-          (has "ref.eq")
-          (has "struct.new") (has "array.new") (has "struct.get")
-          (has "array.get") (has "struct.set") (has "array.set")
-          (tok "eqref") (tok "structref") (tok "arrayref")
-          (tok "i31ref")
-          (has "any.convert_extern") (has "extern.convert_any")
-          (has "nonmatching (ref")) :gc)
+     ;; GC VALUE families (loop 22): IMPLEMENTED — struct/array/i31
+     ;; heaps in the L2 lattice, the 0xFB opcode family decoded/
+     ;; encoded/validated/executed, ref.eq, casts, the any<->extern
+     ;; bridges. The opcode spellings, the eqref/structref/arrayref/
+     ;; i31ref shorthands and the (ref eq|struct|array|i31) forms no
+     ;; longer classify :unsupported — the honest pipeline runs.
+     ;; (Annotations and SIMD stay out of scope;
+     ;; "nonmatching (ref" is obsolete-keywords.wast's malformed-text
+     ;; probe, kept.)
+     ((has "nonmatching (ref") :gc)
      (t nil))))
-
 
 (defparameter *wast-max-locals-per-func* 1000000
   "Ceiling on a function's total declared locals (params + local

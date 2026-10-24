@@ -240,12 +240,49 @@ exprs may only use IMPORTED globals (global.wast ::120 expects
   "The typed reftype T_'s heap type."
   (if (typed-ref-nullable-p t_) (third t_) (second t_)))
 
+(defun %heap-top (heap types)
+  "The TOP BUCKET of HEAP in the type vector TYPES: :FUNC, :EXTERN,
+:EXN or :ANY (the GC hierarchy — eq/i31/struct/array and their
+typeuses — lives under :ANY; PLAN.md §3.1 References and GC). Null
+bottoms map to their own bucket's top. An out-of-range typeuse
+signals the catchable 'unknown type' validation-error (never a raw
+Lisp error through the wast harness)."
+  (declare (type (or keyword (cons (eql :type) (cons t null))) heap)
+           (type (simple-vector) types))
+  (etypecase heap
+    (keyword (ecase heap
+               ((:func :nofunc) :func)
+               ((:extern :noextern) :extern)
+               ((:exn :noexn) :exn)
+               ((:any :eq :i31 :struct :array :none) :any)))
+    (cons
+     (let ((idx (second heap)))
+       (cond ((not (and (integerp idx) (<= 0 idx) (< idx (length types))))
+              ;; an out-of-range typeuse heap ('unknown type'):
+              ;; a CATCHABLE validation-error, never a raw Lisp
+              ;; error leaking through the wast harness as a
+              ;; harness-error.
+              (error 'wasmdown:validation-error
+                     :message (format nil "unknown type ~a" idx)))
+             ;; the uniform rec model: a typeuse's bucket is its
+             ;; comptype's kind — func/struct/array (loop 22; the
+             ;; pre-GC shape of every typeuse being a functype
+             ;; keeps :FUNC, so the loop-19 pins are unchanged).
+             (t (ecase (wasm-comptype-kind
+                        (if (wasm-rec-type-p (svref types idx))
+                            (wasm-rec-type-comptype (svref types idx))
+                            (make-wasm-comptype
+                             :func nil '()
+                             (wasm-func-type-params (svref types idx))
+                             (wasm-func-type-results (svref types idx)))))
+                  (:func :func) (:struct :any) (:array :any))))))))
+
 (defun %heap-kind (heap types)
-  "The lattice bucket of HEAP in the type vector TYPES: :FUNC
-\(function heap), :EXTERN, :EXN, or :ANY. The null bottoms map to
-their buckets (:nofunc→:func etc; :none→:ANY — none is the bottom of
-the whole ANY hierarchy, ref_null.wast's (global anyref
-\(ref.null none))) and relate downward via %HEAP-SUB-P's bottom arm."
+  "The fine-grained bucket of HEAP: for the GC hierarchy this is the
+CONCRETE kind a rank-1 comparison needs — :I31, :STRUCT or :ARRAY for
+the abstract keywords, and a typeuse's COMPTYPE KIND (:STRUCT or
+:ARRAY; a func typeuse is :FUNC). The null bottoms keep their
+bucket-topped spellings. Used only by %HEAP-SUB-P's equal-rank arm."
   (declare (type (or keyword (cons (eql :type) (cons t null))) heap)
            (type (simple-vector) types))
   (etypecase heap
@@ -254,64 +291,107 @@ the whole ANY hierarchy, ref_null.wast's (global anyref
                ((:extern :noextern) :extern)
                ((:exn :noexn) :exn)
                (:any :any)
-               (:none :any)
-               (:eq :any)))
+               (:eq :eq)
+               (:none :none)
+               (:i31 :i31)
+               (:struct :struct)
+               (:array :array)))
     (cons
-     (let ((idx (second heap)))
-       (cond ((not (and (integerp idx) (<= 0 idx) (< idx (length types))))
-              ;; an out-of-range typeuse heap ('unknown type',
-              ;; ref.wast's assert_invalid batch): a CATCHABLE
-              ;; validation-error, never a raw Lisp error leaking
-              ;; through the wast harness as harness-error
-              ;; (func.wast ::113 regressed here when validate
-              ;; gained typed-ref lattice calls before its own
-              ;; check-valtype pass).
-              (error 'wasmdown:validation-error
-                     :message (format nil "unknown type ~a" idx)))
-             (t :func))))))
+     (let* ((idx (second heap))
+            (ct (and (integerp idx) (<= 0 idx) (< idx (length types))
+                     (let ((ty (svref types idx)))
+                       (if (wasm-rec-type-p ty)
+                           (wasm-rec-type-comptype ty)
+                           (make-wasm-comptype
+                            :func nil '()
+                            (wasm-func-type-params ty)
+                            (wasm-func-type-results ty)))))))
+       (ecase (wasm-comptype-kind ct)
+         (:func :func)
+         (:struct :struct)
+         (:array :array))))))
+
+(defun %heap-rank (heap types)
+  "The lattice RANK of HEAP within its top bucket (loop 22, the GC
+heap lattice; PLAN.md §3.1):
+  0 — the null bottoms (:none/:nofunc/:noextern/:noexn)
+  1 — CONCRETE heaps: every typeuse (nominal concrete types) and
+      the GC's kind keywords :i31/:struct/:array (the immediate
+      supertypes of concrete typeuses)
+  2 — the bucket TOPS (:func/:extern/:exn) and :eq
+  3 — :any (the top of the whole GC hierarchy)
+h1 <: h2 (same top bucket) iff rank(h1) < rank(h2), or the ranks
+are equal AND the rank-1 kinds match — at rank 1 a TYPEUSE relates
+to the abstract kind keyword of its comptype ((ref $s) <:
+structref), and never to another typeuse (nominal; the canon-eq arm
+in %HEAP-SUB-P handles equivalent typeuses first)."
+  (declare (type (or keyword (cons (eql :type) (cons t null))) heap)
+           (type (simple-vector) types))
+  (etypecase heap
+    (keyword (ecase heap
+               ((:none :nofunc :noextern :noexn) 0)
+               ((:i31 :struct :array) 1)
+               ((:func :extern :exn :eq) 2)
+               (:any 3)))
+    (cons 1)))
 
 (defun %heap-sub-p (h1 h2 types &optional canon)
   "Heap subtyping (no declared subtyping in this slice): h1 <: h2 iff
   - h1 = h2 (nominal equality — typeuse vs typeuse by INDEX), OR
-  - h1 is a typeuse and h2 is the bucket's abstract top keyword
-    (:func/:extern/:exn) — every typeuse is below its bucket top, OR
-  - h1 is a bucket's null bottom (:nofunc/:noextern/:noexn — and
-    :none, the ANY hierarchy's bottom: (:ref null :none) <:
-    (:ref null :any), ref_null.wast module 1's (global anyref
-    (ref.null none))) and h2 is anything in the same bucket (typeuse
-    or top), OR
   - CANONICALIZED TYPEUSE EQUALITY (loop 20): with a CANON map
     \(typeidx -> min equivalent typeidx), (:TYPE N) <: (:TYPE M)
-    when canon[N] = canon[M] — structurally-equal functypes and
-    iso-recursively-equivalent rec members are ONE canonical type
-    (type-equivalence.wast's whole file: (ref $t1) flows into
-    (ref $t2)-typed slots when the types are equivalent). Without
-    CANON, cross-index typeuses are NOT subtypes (the rec-free
-    nominal rule: return_call_ref $t with a (ref $u) operand,
-    $u≠$t nominal — the sibling's repro pin)."
+    when canon[N] = canon[M]. Without CANON, cross-index typeuses
+    are NOT subtypes (the rec-free nominal rule).
+  - both are within the SAME top bucket AND rank(h1) < rank(h2):
+    every concrete heap/typeuse is below its bucket top (:func,
+    :extern, :exn, and — the GC lattice, loop 22 — eq < any,
+    i31/struct/array < eq, typeuse-struct < struct < eq < any), and
+    the null bottoms (:none/:nofunc/:noextern/:noexn) are below
+    everything in their bucket; OR the ranks are equal and the
+    rank-1 kinds match ((ref $s) <: structref, (ref $t) <: funcref,
+    but i31 is NOT <: struct and (:TYPE a) is NOT <: (:TYPE b)
+    nominal).
+The heap buckets: i31 <: eq <: any; struct(N) <: eq; array(N) <: eq;
+none is the bottom of the whole any hierarchy (ref_null.wast's
+\(global anyref (ref.null none)))."
   (declare (type (or keyword (cons (eql :type) (cons t null))) h1 h2)
            (type (simple-vector) types))
-  (labels ((kind (h) (%heap-kind h types))
-           (canon-eq (n m)
+  (labels ((canon-eq (n m)
              (and canon
                   (array-in-bounds-p canon n) (array-in-bounds-p canon m)
-                  (= (aref canon n) (aref canon m)))))
+                  (= (aref canon n) (aref canon m))))
+           (same-top-p (a b)
+             (eq (%heap-top a types) (%heap-top b types)))
+           (below-p (a b)
+             (let ((ra (%heap-rank a types))
+                   (rb (%heap-rank b types)))
+               (cond ((< ra rb) t)
+                     ((> ra rb) nil)
+                     ;; equal ranks: only rank 1 hosts DISTINCT
+                     ;; heaps. A TYPEUSE relates to the abstract
+                     ;; kind keyword of its comptype kind —
+                     ;; (ref $s) <: structref, (ref $t) <: funcref
+                     ;; — and never to another typeuse (nominal;
+                     ;; the canon-eq arm already handled
+                     ;; equivalents). The abstract keywords
+                     ;; :i31/:struct/:array never relate to each
+                     ;; other.
+                     ((and (= ra 1) (consp a) (consp b)) nil)
+                     ((and (= ra 1) (consp a))
+                      (eq (%heap-kind a types) b))
+                     ((and (= ra 1) (consp b))
+                      (eq (%heap-kind b types) a))
+                     (t (equal a b))))))
     (cond
      ((equal h1 h2) t)
      ;; canonicalized typeuse <: typeuse (iso-recursive equivalence)
      ((and canon (consp h1) (consp h2)
            (canon-eq (second h1) (second h2)))
       t)
-     ;; typeuse <: abstract top of its bucket
-     ((and (consp h1) (keywordp h2)
-           (member h2 '(:func :extern :exn))
-           (eq (kind h1) (kind h2)))
-      t)
+     ;; anything below an abstract/typed supertype within its bucket:
+     ;; typeuse <: top keyword, abstract keyword <: higher keyword,
      ;; null bottom <: anything in its bucket
-     ((and (keywordp h1)
-           (member h1 '(:nofunc :noextern :noexn :none))
-           (eq (kind h1) (kind h2)))
-      t)
+     ((and (same-top-p h1 h2) (below-p h1 h2)) t)
      (t nil))))
 
 (defun %expand-reftype (t_)

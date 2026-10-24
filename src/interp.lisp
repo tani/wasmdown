@@ -729,6 +729,83 @@ args, apply, and throw to the function frame exactly like :return."
     (throw *return-tag*
       (values (subseq results 0 *frame-nresults*) nil))))
 
+
+;;; ---------------------------------------------------------------
+;;; GC value helpers (loop 22): packed normalization, the dynamic
+;;; cast check, and a data-segment memory proxy for array.new_data.
+
+(defun %normalize-packed (v storage-type)
+  "The STORE side of packed normalization (PLAN.md §7.5): an i8/i16
+storage wraps the value to its width; every other storage keeps the
+value (the validator proved the type)."
+  (case storage-type
+    (:i8 (mod v #x100))
+    (:i16 (mod v #x10000))
+    (t v)))
+
+(defun %extend-packed (v storage-type op)
+  "The LOAD side of packed normalization: struct/array _s sign-
+extends from the storage width, _u zero-extends (the stored value
+is width-wrapped, so zero-extension is the identity). The plain
+struct.get/array.get return the raw stored value."
+  (case storage-type
+    (:i8 (if (eq op :struct.get-s)
+             (let ((sv (if (>= v #x80) (- v #x100) v)))
+               (mod sv #x100000000))
+             (if (eq op :array.get-s)
+                 (let ((sv (if (>= v #x80) (- v #x100) v)))
+                   (mod sv #x100000000))
+                 v)))
+    (:i16 (if (or (eq op :struct.get-s) (eq op :array.get-s))
+              (let ((sv (if (>= v #x8000) (- v #x10000) v)))
+                (mod sv #x100000000))
+              v))
+    (t v)))
+
+(defun %value-heap (v module)
+  "The HEAP of a runtime reference value for the dynamic cast check:
+  - a func-instance -> :func
+  - a struct-instance -> its concrete typeuse (:TYPE typeidx)
+  - an array-instance -> the typeuse
+  - an i31 payload (a non-negative fixnum below 2^31) -> :i31
+  - a host object / other -> :extern (the anyref/externref bridge
+    treats foreign values as opaque)
+  - null -> the null bottom :none (callers handle null checks
+    first)."
+  (declare (ignore module))
+  (cond
+   ((wasmdown.runtime:func-instance-p v) :func)
+   ((wasmdown.runtime:wasm-struct-instance-p v)
+    (list :type (wasmdown.runtime:wasm-struct-instance-typeidx v)))
+   ((wasmdown.runtime:wasm-array-instance-p v)
+    (list :type (wasmdown.runtime:wasm-array-instance-typeidx v)))
+   ((wasmdown.runtime:i31-p v) :i31)
+   ((null v) :none)
+   (t :extern)))
+
+(defun %cast-succeeds-p (v heap nullable)
+  "The DYNAMIC cast rule (loop 22): whether V's shape is <: the
+target (REF NULL? HEAP). Null succeeds only against NULLABLE
+targets. Concrete shapes check through the L2 lattice against the
+module's type vector (the exact typeuse for struct/array values,
+the abstract kind for i31)."
+  (let* ((module (wasmdown.runtime:module-instance-module *frame-module*))
+         (types (wasm-module-types module)))
+    (cond
+     ((null v) (and nullable t))
+     (t (let ((target (if nullable
+                          (list :ref 'null heap)
+                          (list :ref heap)))
+              (actual (list :ref (%value-heap v module))))
+          (wasmdown.types:reftype-sub-p actual target types))))))
+
+(defun %load-segment-le (bytes ea width)
+  "A little-endian WIDTH-byte read at EA from a data segment's BYTES
+\(array.new_data/array.init_data fill sources; bounds checked by the
+caller)."
+  (loop for i from 0 below width
+        sum (ash (aref bytes (+ ea i)) (* 8 i))))
+
 (defun %exec-other (op instr imms locals block-stack s)
   "Dispatch every opcode family not handled inline in %EXEC-SEQ.
  Returns the new operand stack."
@@ -935,6 +1012,339 @@ args, apply, and throw to the function frame exactly like :return."
        (if (eq (wasmdown.runtime:func-instance-kind ref) :host)
            (%do-tail-host ref s1)
            (%do-tail-call ref s1))))
+    ;; ---- GC value opcodes (loop 22) ----
+    ((eq op :struct.new)
+     ;; [ft*] -> [(ref $t)]: pop the fields (top of stack = LAST
+     ;; field), normalize packed ones, allocate.
+     (let* ((module (wasmdown.runtime:module-instance-module *frame-module*))
+            (types (wasm-module-types module))
+            (ct (wasmdown.types:wasm-rec-type-comptype
+                 (svref types (getf imms :type))))
+            (fs (wasmdown.types:wasm-comptype-fields ct))
+            (n (length fs)))
+       (multiple-value-bind (vals s1) (%pop-n s n)
+         (push (wasmdown.runtime:make-wasm-struct-value
+                (getf imms :type)
+                (mapcar (lambda (v f)
+                          (%normalize-packed v (first f)))
+                        vals fs))
+               s1))))
+    ((eq op :struct.new-default)
+     ;; [] -> [(ref $t)]: every field's default (packed 0, numeric
+     ;; 0/0.0, nullable refs null — the VALIDATOR proved
+     ;; defaultability).
+     (let* ((module (wasmdown.runtime:module-instance-module *frame-module*))
+            (types (wasm-module-types module))
+            (ct (wasmdown.types:wasm-rec-type-comptype
+                 (svref types (getf imms :type))))
+            (fs (wasmdown.types:wasm-comptype-fields ct)))
+       (push (wasmdown.runtime:make-wasm-struct-value
+              (getf imms :type)
+              (mapcar (lambda (f) (%default-value (first f))) fs))
+             s)))
+    ((member op '(:struct.get :struct.get-s :struct.get-u))
+     ;; [(ref null $t)] -> [field value]: null traps; packed loads
+     ;; sign/zero-extend per the variant (the storage is kept
+     ;; width-wrapped).
+     (multiple-value-bind (ref s1) (pop-val s)
+       (when (null ref)
+         (%trap :null-reference "null struct reference"))
+       (let* ((module (wasmdown.runtime:module-instance-module *frame-module*))
+              (types (wasm-module-types module))
+              (ct (wasmdown.types:wasm-rec-type-comptype
+                   (svref types (getf imms :type))))
+              (f (nth (getf imms :field)
+                      (wasmdown.types:wasm-comptype-fields ct)))
+              (v (wasmdown.runtime:struct-field-get
+                  ref (getf imms :field))))
+         (push (%extend-packed v (first f) op) s1))))
+    ((eq op :struct.set)
+     ;; [(ref null $t) ft]: null traps; the value NORMALIZES to the
+     ;; field's storage width (store wraps).
+     (multiple-value-bind (v s1) (pop-val s)
+       (multiple-value-bind (ref s2) (pop-val s1)
+         (when (null ref)
+           (%trap :null-reference "null struct reference"))
+         (let* ((module (wasmdown.runtime:module-instance-module *frame-module*))
+                (types (wasm-module-types module))
+                (ct (wasmdown.types:wasm-rec-type-comptype
+                     (svref types (getf imms :type))))
+                (f (nth (getf imms :field)
+                        (wasmdown.types:wasm-comptype-fields ct))))
+           (wasmdown.runtime:struct-field-set
+            ref (getf imms :field)
+            (%normalize-packed v (first f)))
+           s2))))
+    ((eq op :array.new)
+     ;; [et i32] -> [(ref $t)]: the length caps at the impl limit —
+     ;; a hostile huge length traps before allocating.
+     (multiple-value-bind (len s1) (pop-val s)
+       (multiple-value-bind (v s2) (pop-val s1)
+         (let* ((module (wasmdown.runtime:module-instance-module *frame-module*))
+                (types (wasm-module-types module))
+                (ct (wasmdown.types:wasm-rec-type-comptype
+                     (svref types (getf imms :type))))
+                (f (first (wasmdown.types:wasm-comptype-fields ct))))
+           (push (wasmdown.runtime:make-wasm-array-value
+                  (getf imms :type)
+                  (make-list (or len 0)
+                             :initial-element
+                             (%normalize-packed v (first f))))
+                 s2)))))
+    ((eq op :array.new-default)
+     (multiple-value-bind (len s1) (pop-val s)
+       (let* ((module (wasmdown.runtime:module-instance-module *frame-module*))
+              (types (wasm-module-types module))
+              (ct (wasmdown.types:wasm-rec-type-comptype
+                   (svref types (getf imms :type))))
+              (f (first (wasmdown.types:wasm-comptype-fields ct))))
+         (push (wasmdown.runtime:make-wasm-array-value
+                (getf imms :type)
+                (make-list (or len 0)
+                           :initial-element
+                           (%default-value (first f))))
+               s1))))
+    ((eq op :array.new-fixed)
+     ;; [et^n] -> [(ref $t)].
+     (let* ((module (wasmdown.runtime:module-instance-module *frame-module*))
+            (types (wasm-module-types module))
+            (ct (wasmdown.types:wasm-rec-type-comptype
+                 (svref types (getf imms :type))))
+            (f (first (wasmdown.types:wasm-comptype-fields ct)))
+            (n (getf imms :count)))
+       (multiple-value-bind (vals s1) (%pop-n s n)
+         (push (wasmdown.runtime:make-wasm-array-value
+                (getf imms :type)
+                (mapcar (lambda (v)
+                          (%normalize-packed v (first f)))
+                        vals))
+               s1))))
+    ((eq op :array.new-data)
+     ;; [i32 i32] -> [(ref $t)]: offset + length into a data
+     ;; segment; bounds-checked against the segment.
+     (multiple-value-bind (len s1) (pop-val s)
+       (multiple-value-bind (off s2) (pop-val s1)
+         (let* ((module (wasmdown.runtime:module-instance-module *frame-module*))
+                (types (wasm-module-types module))
+                (ct (wasmdown.types:wasm-rec-type-comptype
+                     (svref types (getf imms :type))))
+                (f (first (wasmdown.types:wasm-comptype-fields ct)))
+                (st (first f))
+                (width (ecase st (:i8 1) (:i16 2) (:i32 4)))
+                (bytes (wasmdown.runtime:take-data-bytes
+                        *frame-module* (getf imms :data))))
+           (unless (<= (+ off len) (/ (length bytes) width))
+             (%trap :out-of-bounds-table
+                    "out of bounds array.new_data: [~d,~d) not within ~d"
+                    off len (/ (length bytes) width)))
+           (push (wasmdown.runtime:make-wasm-array-value
+                  (getf imms :type)
+                  (loop for i below len
+                        collect (%normalize-packed
+                                 (%load-segment-le
+                                  bytes (* (+ off i) width) width)
+                                 st)))
+                 s2)))))
+    ((eq op :array.new-elem)
+     ;; [i32 i32] -> [(ref $t)]: offset + length into an elem
+     ;; segment's evaluated refs.
+     (multiple-value-bind (len s1) (pop-val s)
+       (multiple-value-bind (off s2) (pop-val s1)
+         (let ((refs (wasmdown.runtime:take-elem-ref
+                      *frame-module* (getf imms :elem))))
+           (unless (<= (+ off len) (length refs))
+             (%trap :out-of-bounds-table
+                    "out of bounds array.new_elem: [~d,~d) not within ~d"
+                    off len (length refs)))
+           (push (wasmdown.runtime:make-wasm-array-value
+                  (getf imms :type)
+                  (subseq refs off (+ off len)))
+                 s2)))))
+    ((member op '(:array.get :array.get-s :array.get-u))
+     ;; [(ref null $t) i32] -> [element]: null and OOB trap.
+     (multiple-value-bind (idx s1) (pop-val s)
+       (multiple-value-bind (ref s2) (pop-val s1)
+         (when (null ref)
+           (%trap :null-reference "null array reference"))
+         (let* ((module (wasmdown.runtime:module-instance-module *frame-module*))
+                (types (wasm-module-types module))
+                (ct (wasmdown.types:wasm-rec-type-comptype
+                     (svref types (getf imms :type))))
+                (f (first (wasmdown.types:wasm-comptype-fields ct))))
+           (push (%extend-packed
+                  (wasmdown.runtime:array-element-get ref idx)
+                  (first f) op)
+                 s2)))))
+    ((eq op :array.set)
+     ;; [(ref null $t) i32 et]: normalize on store.
+     (multiple-value-bind (v s1) (pop-val s)
+       (multiple-value-bind (idx s2) (pop-val s1)
+         (multiple-value-bind (ref s3) (pop-val s2)
+           (when (null ref)
+             (%trap :null-reference "null array reference"))
+           (let* ((module (wasmdown.runtime:module-instance-module *frame-module*))
+                  (types (wasm-module-types module))
+                  (ct (wasmdown.types:wasm-rec-type-comptype
+                       (svref types (getf imms :type))))
+                  (f (first (wasmdown.types:wasm-comptype-fields ct))))
+             (wasmdown.runtime:array-element-set
+              ref idx (%normalize-packed v (first f)))
+             s3)))))
+    ((eq op :array.len)
+     ;; [(ref null $t)] -> [i32]: NO immediate.
+     (multiple-value-bind (ref s1) (pop-val s)
+       (when (null ref)
+         (%trap :null-reference "null array reference"))
+       (push (wasmdown.runtime:array-length ref) s1)))
+    ((eq op :array.fill)
+     ;; [(ref null $t) i32 et i32].
+     (multiple-value-bind (len s1) (pop-val s)
+       (multiple-value-bind (v s2) (pop-val s1)
+         (multiple-value-bind (off s3) (pop-val s2)
+           (multiple-value-bind (ref s4) (pop-val s3)
+             (when (null ref)
+               (%trap :null-reference "null array reference"))
+             (let* ((module (wasmdown.runtime:module-instance-module *frame-module*))
+                    (types (wasm-module-types module))
+                    (ct (wasmdown.types:wasm-rec-type-comptype
+                         (svref types (getf imms :type))))
+                    (f (first (wasmdown.types:wasm-comptype-fields ct))))
+               (unless (<= (+ off len)
+                           (wasmdown.runtime:array-length ref))
+                 (%trap :out-of-bounds-table
+                        "out of bounds array.fill: [~d,~d) not within ~d"
+                        off len (wasmdown.runtime:array-length ref)))
+               (loop for i from off below (+ off len)
+                     do (wasmdown.runtime:array-element-set
+                         ref i (%normalize-packed v (first f))))
+               s4))))))
+    ((eq op :array.copy)
+     ;; [(ref null $td) i32 (ref null $ts) i32 i32].
+     (multiple-value-bind (len s1) (pop-val s)
+       (multiple-value-bind (src-off s2) (pop-val s1)
+         (multiple-value-bind (src s3) (pop-val s2)
+           (multiple-value-bind (dst-off s4) (pop-val s3)
+             (multiple-value-bind (dst s5) (pop-val s4)
+               (when (null dst)
+                 (%trap :null-reference "null array reference"))
+               (when (null src)
+                 (%trap :null-reference "null array reference"))
+               (unless (<= (+ src-off len)
+                           (wasmdown.runtime:array-length src))
+                 (%trap :out-of-bounds-table
+                        "out of bounds array.copy source"))
+               (unless (<= (+ dst-off len)
+                           (wasmdown.runtime:array-length dst))
+                 (%trap :out-of-bounds-table
+                        "out of bounds array.copy destination"))
+               (loop for i below len
+                     do (wasmdown.runtime:array-element-set
+                         dst (+ dst-off i)
+                         (wasmdown.runtime:array-element-get
+                          src (+ src-off i))))
+               s5))))))
+    ((eq op :array.init-data)
+     ;; [(ref null $t) i32 i32 i32].
+     (multiple-value-bind (len s1) (pop-val s)
+       (multiple-value-bind (off s2) (pop-val s1)
+         (multiple-value-bind (dst-idx s3) (pop-val s2)
+           (multiple-value-bind (ref s4) (pop-val s3)
+             (when (null ref)
+               (%trap :null-reference "null array reference"))
+             (let* ((module (wasmdown.runtime:module-instance-module *frame-module*))
+                    (types (wasm-module-types module))
+                    (ct (wasmdown.types:wasm-rec-type-comptype
+                         (svref types (getf imms :type))))
+                    (st (first (first
+                                (wasmdown.types:wasm-comptype-fields ct))))
+                    (width (ecase st (:i8 1) (:i16 2) (:i32 4)))
+                    (bytes (wasmdown.runtime:take-data-bytes
+                            *frame-module* (getf imms :data))))
+               (unless (<= (+ off len) (/ (length bytes) width))
+                 (%trap :out-of-bounds-table
+                        "out of bounds array.init_data source"))
+               (unless (<= (+ dst-idx len)
+                           (wasmdown.runtime:array-length ref))
+                 (%trap :out-of-bounds-table
+                        "out of bounds array.init_data destination"))
+               (loop for i below len
+                     do (wasmdown.runtime:array-element-set
+                         ref (+ dst-idx i)
+                         (%normalize-packed
+                          (%load-segment-le
+                           bytes (* (+ off i) width) width)
+                          st)))
+               s4))))))
+    ((eq op :array.init-elem)
+     (multiple-value-bind (len s1) (pop-val s)
+       (multiple-value-bind (off s2) (pop-val s1)
+         (multiple-value-bind (dst-idx s3) (pop-val s2)
+           (multiple-value-bind (ref s4) (pop-val s3)
+             (when (null ref)
+               (%trap :null-reference "null array reference"))
+             (let ((refs (wasmdown.runtime:take-elem-ref
+                          *frame-module* (getf imms :elem))))
+               (unless (<= (+ off len) (length refs))
+                 (%trap :out-of-bounds-table
+                        "out of bounds array.init_elem source"))
+               (unless (<= (+ dst-idx len)
+                           (wasmdown.runtime:array-length ref))
+                 (%trap :out-of-bounds-table
+                        "out of bounds array.init_elem destination"))
+               (loop for i below len
+                     do (wasmdown.runtime:array-element-set
+                         ref (+ dst-idx i) (nth (+ off i) refs)))
+               s4))))))
+    ;; casts: the DYNAMIC check — the value's shape against the
+    ;; target heap via the L2 lattice; null fails non-null targets.
+    ((member op '(:ref.test :ref.cast))
+     (multiple-value-bind (v s1) (pop-val s)
+       (let ((ok (%cast-succeeds-p v (getf imms :type)
+                                    (getf imms :nullable))))
+         (if (eq op :ref.test)
+             (push (if ok 1 0) s1)
+             (if ok
+                 (push v s1)
+                 (%trap :cast-failure "cast failure"))))))
+    ((member op '(:br-on-cast :br-on-cast-fail))
+     ;; pop the ref; the cast check decides branch vs fallthrough.
+     ;; br_on_cast: SUCCESS -> branch WITH the value; FAILURE ->
+     ;; fallthrough with the original. br_on_cast_fail mirrors.
+     (multiple-value-bind (v s1) (pop-val s)
+       (let ((ok (%cast-succeeds-p v (getf imms :dst)
+                                    (getf imms :dst-nullable))))
+         (cond ((eq (eq op :br-on-cast) ok)
+                (%br-depth-throw (getf imms :label) (cons v s1)
+                                 block-stack)
+                (%trap :unreachable "br_on_cast fell through"))
+               (t (push v s1))))))
+    ((eq op :ref.eq)
+     ;; [eqref eqref] -> [i32]: reference IDENTITY.
+     (multiple-value-bind (b s1) (pop-val s)
+       (multiple-value-bind (a s2) (pop-val s1)
+         (push (if (eql a b) 1 0) s2))))
+    ((eq op :any.convert-extern)
+     ;; [externref] -> [anyref]: the VALUE passes through; only the
+     ;; static typing widens (host objects and null bridge as-is).
+     s)
+    ((eq op :extern.convert-any)
+     ;; [anyref] -> [externref]: the identity-preserving mirror.
+     s)
+    ((eq op :ref.i31)
+     ;; [i32] -> [(ref i31)]: wrap into the 31-bit payload.
+     (multiple-value-bind (v s1) (pop-val s)
+       (push (wasmdown.runtime:make-i31 v) s1)))
+    ((member op '(:i31.get-s :i31.get-u))
+     ;; [(ref i31)] -> [i32]: sign/zero-extend bit 30. A non-i31
+     ;; operand cannot occur (validation proves the typing), but a
+     ;; null traps honestly.
+     (multiple-value-bind (v s1) (pop-val s)
+       (when (null v)
+         (%trap :null-reference "null i31 reference"))
+       (push (if (eq op :i31.get-s)
+                 (wasmdown.runtime:i31-get-s v)
+                 (wasmdown.runtime:i31-get-u v))
+             s1)))
     ;; ---- table ----
     ((eq op :table.get)
      (multiple-value-bind (idx s1) (pop-val s)
@@ -1052,6 +1462,8 @@ of nil is never OBSERVED through validated code. local_init.wast's
   (case valtype
     (:i32 0) (:i64 0)
     (:f32 (f32-from-bits 0)) (:f64 (f64-from-bits 0))
+    ;; packed storages (loop 22): the default is the zero byte
+    (:i8 0) (:i16 0)
     (:funcref nil) (:externref nil)
     ;; EH (Core 3.0): exnref is nullable; its default is null.
     (:exnref nil)

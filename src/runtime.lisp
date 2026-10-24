@@ -116,6 +116,119 @@ instance (instance.wast's import/export generativity tests pin this)."
   (module nil)
   (type (make-wasm-func-type '() '()) :type wasm-func-type))
 
+;;; ---------------------------------------------------------------
+;;; GC value objects (PLAN.md §7.5: "Represent Wasm-GC structs and
+;;; arrays as Lisp-managed objects... Use Lisp GC for backing
+;;; storage, but explicitly implement Wasm subtype, field mutability
+;;; and cast rules"). No registry is needed — the Lisp GC owns
+;;; storage; identity is EQ on the struct instances themselves.
+
+(defstruct (wasm-struct-instance (:constructor %make-wasm-struct-instance))
+  "A struct value (loop 22, L1). TYPEIDX is the defining module's
+typeidx of its comptype; FIELDS is a simple vector of field values
+in declaration order. PACKED fields (i8/i16) normalize on write:
+struct-set stores the width-wrapped value, struct.get_s/get_u extend
+per the variant (the normalization lives in wasmdown.interp, which
+knows the field type from the comptype)."
+  (typeidx 0 :type (integer 0))
+  (fields (make-array 0) :type simple-vector))
+
+(defstruct (wasm-array-instance (:constructor %make-wasm-array-instance))
+  "An array value (loop 22, L1). TYPEIDX as for structs; CONTENTS a
+simple vector of element values. The element valtype is recovered
+from the comptype at use sites (validate/interp), so it is not
+redundantly stored."
+  (typeidx 0 :type (integer 0))
+  (contents (make-array 0) :type simple-vector))
+
+;;; i31 values: a FIXNUM-tagged representation. The payload is kept
+;;; wrapped to the spec's 31-bit domain (0..2^31-1) at creation;
+;;; i31.get_s sign-extends from bit 30, i31.get_u zero-extends. The
+;;; distinction from ordinary i32 stack values is POSITIONAL (only
+;;; ref.i31 produces them), the same convention the reference
+;;; interpreter uses for its abstract (ref i31) tagging.
+
+(defun make-i31 (value)
+  "Wrap VALUE into the i31 payload domain (2^31; the spec's 31-bit
+payload, interpreted as an i32 field: store wraps)."
+  (mod value (ash 1 31)))
+
+(defun i31-get-s (i31)
+  "The SIGNED view: sign-extend from bit 30, wrapped into the i32
+unsigned domain (CONTRACTS.md: i32 values are 0..2^32-1)."
+  (let ((v (mod i31 (ash 1 31))))
+    (if (>= v (ash 1 30))
+        (+ (- v (ash 1 31)) (ash 1 32))
+        v)))
+
+(defun i31-get-u (i31)
+  "The UNSIGNED view: the payload zero-extended into the i32 domain."
+  (mod i31 (ash 1 31)))
+
+(defun i31-p (v)
+  "Whether V is an i31 payload (a non-negative fixnum below 2^31).
+Any such fixnum on the operand stack in a reference position is an
+i31 — the only producer is ref.i31."
+  (and (integerp v) (>= v 0) (< v (ash 1 31))))
+
+(defun make-wasm-struct-value (typeidx fields)
+  "Allocate a struct value: TYPEIDX the defining module's typeidx,
+FIELDS a LIST or VECTOR of already-normalized field values."
+  (%make-wasm-struct-instance
+   :typeidx typeidx
+   :fields (coerce fields 'simple-vector)))
+
+(defun make-wasm-array-value (typeidx contents)
+  "Allocate an array value: CONTENTS a LIST or VECTOR of
+already-normalized element values."
+  (%make-wasm-array-instance
+   :typeidx typeidx
+   :contents (coerce contents 'simple-vector)))
+
+(defun struct-field-count (struct)
+  (length (wasm-struct-instance-fields struct)))
+
+(defun struct-field-get (struct fieldidx)
+  (unless (and (>= fieldidx 0) (< fieldidx (struct-field-count struct)))
+    (%trap :null-reference "struct field index out of range"))
+  (svref (wasm-struct-instance-fields struct) fieldidx))
+
+(defun struct-field-set (struct fieldidx value)
+  (unless (and (>= fieldidx 0) (< fieldidx (struct-field-count struct)))
+    (%trap :null-reference "struct field index out of range"))
+  (setf (svref (wasm-struct-instance-fields struct) fieldidx) value)
+  (values))
+
+(defun array-length (array)
+  (length (wasm-array-instance-contents array)))
+
+(declaim (inline %check-array-range))
+(defun %check-array-range (array idx)
+  (unless (and (>= idx 0) (< idx (length (wasm-array-instance-contents array))))
+    (%trap :out-of-bounds-table
+           "out of bounds array access: index ~d not within ~d"
+           idx (length (wasm-array-instance-contents array)))))
+
+(defun array-element-get (array idx)
+  (%check-array-range array idx)
+  (svref (wasm-array-instance-contents array) idx))
+
+(defun array-element-set (array idx value)
+  (%check-array-range array idx)
+  (setf (svref (wasm-array-instance-contents array) idx) value)
+  (values))
+
+(defun %check-array-span (array start end)
+  "END exclusive; traps when [START, END) leaves the array. Arrays
+are tables-of-values per the loop-22 trap taxonomy: the TABLE OOB
+kind covers array bounds (PLAN.md §7.5 lists 'out-of-bounds
+memory/table')."
+  (unless (and (<= start end)
+               (<= end (length (wasm-array-instance-contents array))))
+    (%trap :out-of-bounds-table
+           "out of bounds array access: [~d,~d) not within ~d"
+           start end (length (wasm-array-instance-contents array)))))
+
 (defun global-value (g) (global-instance-value g))
 (defun (setf global-value) (v g) (setf (global-instance-value g) v))
 (defun global-set-value (g v) (setf (global-instance-value g) v))
