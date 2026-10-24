@@ -1495,21 +1495,22 @@
                            (type (struct (field (ref $f1))))))
               (module (rec (type $ft (func)) (type (struct))))")))
     (wasmdown.test:is (equal '(:pass :pass) os)))
-  ;; iso equivalence on struct groups: two identical struct shapes
-  ;; in separate rec groups validate; an arity mismatch rejects.
+  ;; two-field struct + typed-ref param through the iso lattice
   (let ((os (%outcomes
-             "(module (rec (type $f1 (func)) (type (struct (field (ref $f1)))))
-                           (type $g (func (param (ref 0))))
-              (assert_invalid
-                (module (rec (type $f1 (func))
-                             (type (struct (field (ref $f1)))))
-                         (type $f2 (func))
-                         (type (struct (field (ref $f1)) (ref $f2))))
-                \"duplicate\"))")))
-    (declare (ignore os))
-    ;; (shape asserted indirectly via the suite; the two positive
-    ;; modules above are the load-bearing assertions)
-    (wasmdown.test:is t)))
+             "(module (rec (type $f1 (func))
+                           (type (struct (field (ref $f1)) (field (ref $f1)))))
+                 (func $use (param (ref 1)) (result i32)
+                   (ref.is_null (local.get 0)))
+                 (elem declare func $use))")))
+    (wasmdown.test:is (equal '(:pass) os)))
+  ;; negative: a struct field with an out-of-range typeuse rejects
+  ;; 'unknown type' at VALIDATE (the declaration grammar admits the
+  ;; shape at parse; the typeuse range check fires).
+  (let ((os (%outcomes
+             "(assert_invalid
+                (module (rec (type $f1 (func)) (type (struct (field (ref 5))))))
+                \"unknown type\")")))
+    (wasmdown.test:is (equal '(:pass) os))))
 
 (wasmdown.test:test wast/binary-extended-table-desugar-preserves-elem
   ;; Loop 21: the binary extended table entry (0x40 0x00 + reftype +
