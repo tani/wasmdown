@@ -82,7 +82,6 @@ harness-errors.
 | API / CLI | `src/api.lisp`, `src/cli.lisp` | `read-module`, `validate-module`, `instantiate`, `invoke`, …; CLI `validate`/`inspect`/`compile`/`run`. |
 
 Not implemented (see `PLAN.md` for the full contract): SIMD (v128),
-memory64, multi-memory runtime (text accepts memidx forms),
 Component Model, Canonical ABI, WASI (all versions),
 threads/atomics, FASL cache, annotations (an unadopted proposal —
 permanently out of scope per PLAN.md §3.3). Tail calls
@@ -100,10 +99,15 @@ packed-field normalization, array.new/get/set/len/fill/copy/
 init, i31 with 31-bit payload semantics, ref.cast/ref.test/
 br_on_cast(_fail) with the heap lattice, ref.eq, any↔extern
 conversions — self-authored tests per PLAN.md §12 since no
-vendored fixture exists), and the named module definition/instance
-script forms **are** implemented. The `.wat` text format and
-`.wast` spec runner **are** implemented (`src/text.lisp`,
-`src/wast.lisp`), as is conformance reporting.
+vendored fixture exists), multi-memory runtime + memory64 END TO
+END (loop 23: memidx immediates on every memory op, cross-memory
+copy with bounds on both backings, i64 addressing with the
+addrtype-typed size/grow/fill/init rules, the (memory i64 ...)
+text marker and limits flags 0x04 — self-authored tests), and
+the named module definition/instance script forms **are**
+implemented. The `.wat` text format and `.wast` spec runner
+**are** implemented (`src/text.lisp`, `src/wast.lisp`), as is
+conformance reporting.
 
 ## Error/phase taxonomy (PLAN.md §12.2)
 
@@ -152,14 +156,15 @@ no fails, and the 74 unsupported are named out-of-scope families
 work (PLAN.md §3.1) has NO vendored fixture coverage; each lands
 with self-authored tests per the §12 gap-test discipline:
 
-1. **memory64 / multi-memory runtime** — text/binary already
-   admit memidx forms; the runtime is single-memory32.
-2. **SIMD (v128 + relaxed)** — full opcode surface, scalarized
+1. **SIMD (v128 + relaxed)** — full opcode surface, scalarized
    reference semantics first per PLAN.md §7.3.
-3. **Component Model / WASI** — PLAN.md §8-9; M7-M12 territory.
+2. **Component Model / WASI** — PLAN.md §8-9; M7-M12 territory.
 
 DONE: loop 18 (tail calls, EH, named modules), loop 19 (typed
 function references), loop 20 (rec groups + canonicalization +
 iso-recursive equivalence), loop 21 (struct/array declarations),
 loop 22 (GC value opcodes end to end — the full 0xFB family,
-i31, casts, ref.eq, conversions; 8 self-authored test families).
+i31, casts, ref.eq, conversions; 8 self-authored test families),
+loop 23 (multi-memory runtime + memory64 — memidx immediates,
+cross-memory copy, i64 addressing; 4 self-authored test
+families).
