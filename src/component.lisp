@@ -87,9 +87,21 @@
            #:externname-kind
            #:parse-externname
            #:canonicalize-externname
+           ;; interfaceversion grammar (M7: version-suffix +
+           ;; extern-names lanes; the pins exercise both directly)
+           #:canonversion-p
+           #:split-canonical-version
            #:elem-size))
 
 (in-package #:wasmdown.component)
+
+;;; SBCL inline-expands these small helpers into VALIDATE-COMPONENT;
+;;; the expansion's record accessors then narrow the validation loop's
+;;; PAYLOAD binding across every arm (spurious 'deleting unreachable
+;;; code' notes + a bogus derived-type WARNING that ASDF treats as
+;;; fatal). Keep them outline from the start of the file.
+(declaim (notinline %check-name-attrs %check-externname
+                    %check-outer-alias %check-externtype))
 
 ;;; ---------------------------------------------------------------
 ;;; Decoding error helpers (shared reader offsets; wasmdown:decode-error
@@ -1754,10 +1766,15 @@ not < 2^28 (Binary.md lines 295-297; max-value-size.wast)."
                            (dt (cond ((<= (length cases) 256) 1)
                                      ((<= (length cases) 65536) 2)
                                      (t 4)))
-                           (ma (or (loop for (nil . cvt) across cases
-                                         when cvt maximize
-                                         (%valtype-align cvt state))
-                                   1))
+                           ;; LOOP's MAXIMIZE returns 0 (not NIL)
+                           ;; when every case's payload is empty, so
+                           ;; the (or ... 1) fallback never fires and
+                           ;; (ceiling dt ma) divided by zero
+                           ;; (external-visibility.wast ::15's empty
+                           ;; variant). Clamp to the minimum 1.
+                           (ma (max 1 (loop for (nil . cvt) across cases
+                                            when cvt maximize
+                                            (%valtype-align cvt state))))
                            (payload (or (loop for (nil . cvt) across cases
                                               when cvt maximize (es cvt))
                                         0)))
@@ -1892,6 +1909,260 @@ message (the fixtures' messages embed the bad name)."
      ((label-p name) (values :plain nil))
      (t (kebab-bad name)))))
 
+;;; ---- interface versions + version-suffix (Explainer.md lines
+;;; 2785-2793, 2962-3021; Binary.md lines 409-411, 472-476). The
+;;; interfaceversion grammar accepts a `valid semver` (Semantic
+;;; Versioning 2.0.0) or a `canonversion`; the version-suffix
+;;; attribute carries the semversuffix split off the canonical name.
+;;; All of these are VALIDATE-time rules (the fixtures pin them as
+;;; assert_invalid; the binary reader accepts any name bytes).
+
+(defun %semver-numeric-id-p (s)
+  "A semver `numeric identifier`: digits only, no leading zero unless
+the whole value is 0 (semver.org BNF <numeric identifier>)."
+  (declare (type string s))
+  (and (plusp (length s))
+       (every #'%digit-p s)
+       (or (char/= (char s 0) #\0) (= (length s) 1))))
+
+(defun %semver-identifier-p (s)
+  "A semver build/pre-release `identifier`: [0-9A-Za-z-]+, non-empty."
+  (declare (type string s))
+  (and (plusp (length s))
+       (loop for ch across s
+             always (or (%digit-p ch)
+                        (and (char<= #\a ch) (char<= ch #\z))
+                        (and (char<= #\A ch) (char<= ch #\Z))
+                        (char= ch #\-)))))
+
+(defun %semver-dotted-ids-p (s)
+  "A semver `dot-separated build identifiers` list. Returns the error
+detail 'empty identifier segment' when any segment is empty or
+malformed, NIL (ok) otherwise."
+  (declare (type string s))
+  (loop with start = 0
+        for i from 0 to (length s)
+        when (or (= i (length s)) (char= (char s i) #\.))
+          do (unless (%semver-identifier-p (subseq s start i))
+               (return-from %semver-dotted-ids-p
+                 "empty identifier segment"))
+             (setf start (1+ i)))
+  nil)
+
+(defun %semver-parse (s)
+  "Parse S as a strict `valid semver` (semver.org 2.0.0 BNF):
+major.minor.patch(-pre)?(+build)? with no leading zeros in the
+numeric identifiers and no empty identifier segments. Returns NIL on
+success; on failure returns the parse detail the extern-names fixtures
+pin ('empty string', \"unexpected character 'X'\", 'unexpected end of
+input', 'empty identifier segment')."
+  (declare (type string s))
+  (labels
+      ((read-number (s i)
+         "Consume a numeric identifier at I: a digit run with no
+leading zero. Returns (values end-pos error-detail); END-POS is I on
+error."
+         (cond
+          ((>= i (length s))
+           (values i "unexpected end of input"))
+          ((char= (char s i) #\0)
+           ;; lone 0 is legal; 0 followed by a digit is a leading zero
+           (if (and (< (1+ i) (length s)) (%digit-p (char s (1+ i))))
+               (values i
+                       (format nil "unexpected character '~a'"
+                               (char s (1+ i))))
+               (values (1+ i) nil)))
+          ((not (%digit-p (char s i)))
+           (values i
+                   (format nil "unexpected character '~a'" (char s i))))
+          (t
+           (let ((j i))
+             (loop while (and (< j (length s)) (%digit-p (char s j)))
+                   do (incf j))
+             (values j nil)))))
+       (expect-dot (s i)
+         "The char at I must be '.' or the end is malformed."
+         (cond
+          ((>= i (length s)) "unexpected end of input")
+          ((char/= (char s i) #\.)
+           (format nil "unexpected character '~a'" (char s i)))
+          (t nil))))
+    (cond
+     ((zerop (length s)) "empty string")
+     (t
+      (multiple-value-bind (i err) (read-number s 0)
+        (cond
+         (err err)
+         ((setq err (expect-dot s i)) err)
+         (t
+          (multiple-value-bind (i err) (read-number s (1+ i))
+            (cond
+             (err err)
+             ((setq err (expect-dot s i)) err)
+             (t
+              (multiple-value-bind (i err) (read-number s (1+ i))
+                (cond
+                 (err err)
+                 ;; optional -pre, then optional +build
+                 ((and (< i (length s)) (char= (char s i) #\-))
+                  (let* ((plus (position #\+ s :start (1+ i)))
+                         (pre (subseq s (1+ i)
+                                      (or plus (length s))))
+                         (build (if plus (subseq s (1+ plus)) nil)))
+                    (or (%semver-dotted-ids-p pre)
+                        (and build (%semver-dotted-ids-p build))
+                        ;; nothing may trail the build
+                        nil)))
+                 ((and (< i (length s)) (char= (char s i) #\+))
+                  (%semver-dotted-ids-p (subseq s (1+ i))))
+                 ((< i (length s))
+                  (format nil "unexpected character '~a'" (char s i)))
+                 (t nil)))))))))))))
+
+(defun %semver-version-core-p (core)
+  "A semver <version core> X.Y.Z: exactly three numeric identifiers."
+  (declare (type string core))
+  (let ((nums (loop with start = 0
+                    for i from 0 to (length core)
+                    when (or (= i (length core))
+                             (char= (char core i) #\.))
+                      collect (prog1 (subseq core start i)
+                                (setf start (1+ i))))))
+    (and (= (length nums) 3)
+         (every #'%semver-numeric-id-p nums))))
+
+(defun canonversion-p (v)
+  "True when V matches the `canonversion` production (Explainer lines
+2787-2791): [1-9][0-9]* | 0.[1-9][0-9]* | 0.0.[1-9][0-9]* | 0.0.0 |
+<version core> '-' <pre-release> (a full X.Y.Z-pre)."
+  (declare (type string v))
+  (cond
+   ;; [1-9][0-9]*
+   ((and (plusp (length v))
+         (char<= #\1 (char v 0)) (char<= (char v 0) #\9)
+         (every #'%digit-p v))
+    t)
+   ;; 0.[1-9][0-9]*
+   ((and (> (length v) 2) (string= v "0." :end1 2)
+         (char<= #\1 (char v 2)) (char<= (char v 2) #\9)
+         (every #'%digit-p (subseq v 3)))
+    t)
+   ;; 0.0.[1-9][0-9]*
+   ((and (> (length v) 4) (string= v "0.0." :end1 4)
+         (char<= #\1 (char v 4)) (char<= (char v 4) #\9)
+         (every #'%digit-p (subseq v 5)))
+    t)
+   ;; 0.0.0
+   ((string= v "0.0.0") t)
+   ;; <version core> '-' <pre-release>: the core before the FIRST '-'
+   ;; is a full X.Y.Z; the pre-release is a dotted identifier list
+   ((let ((dash (position #\- v)))
+      (and dash
+           (%semver-version-core-p (subseq v 0 dash))
+           (null (%semver-dotted-ids-p (subseq v (1+ dash))))))
+    t)
+   (t nil)))
+
+(defun split-canonical-version (version)
+  "The canonical-name split (Explainer.md lines 2983-3001, matching
+upstream wasmparser names.rs): given a full
+major.minor.patch(-pre)?(+build)?, returns (values canon suffix) —
+CANON the canonversion prefix, SUFFIX the remaining semversuffix (nil
+when empty) — or (values nil nil) when VERSION is not a valid semver."
+  (declare (type string version))
+  (labels
+      ((identifier-p (s)
+         (and (plusp (length s))
+              (loop for ch across s
+                    always (or (%digit-p ch)
+                               (and (char<= #\a ch) (char<= ch #\z))
+                               (and (char<= #\A ch) (char<= ch #\Z))
+                               (char= ch #\-)))))
+       (dotted-ids-ok-p (s)
+         (loop with start = 0
+               for i from 0 to (length s)
+               when (or (= i (length s)) (char= (char s i) #\.))
+                 do (unless (identifier-p (subseq s start i))
+                      (return-from dotted-ids-ok-p nil))
+                    (setf start (1+ i)))
+         t))
+    ;; peel +build
+    (let* ((plus (position #\+ version))
+           (without-build (if plus (subseq version 0 plus) version))
+           (build (if plus (subseq version (1+ plus)) nil)))
+      (when (and build (not (dotted-ids-ok-p build)))
+        (return-from split-canonical-version (values nil nil)))
+      ;; peel -pre
+      (let* ((dash (position #\- without-build))
+             (core (if dash (subseq without-build 0 dash) without-build))
+             (pre (if dash (subseq without-build (1+ dash)) nil)))
+        (when (and pre (not (dotted-ids-ok-p pre)))
+          (return-from split-canonical-version (values nil nil)))
+        ;; three numeric identifiers, no leading zeros
+        (let ((nums (loop with start = 0
+                          for i from 0 to (length core)
+                          when (or (= i (length core))
+                                   (char= (char core i) #\.))
+                            collect (prog1 (subseq core start i)
+                                      (setf start (1+ i))))))
+          (unless (and (= (length nums) 3)
+                       (every #'%semver-numeric-id-p nums))
+            (return-from split-canonical-version (values nil nil)))
+          ;; the split point per the Explainer rules
+          (let* ((major (first nums)) (minor (second nums))
+                 (split (cond
+                         ;; pre-release: the version itself is not
+                         ;; split; only +build moves to the suffix
+                         (dash (length without-build))
+                         ;; major > 0: split immediately after major
+                         ((string/= major "0") (length major))
+                         ;; minor > 0: split immediately after minor
+                         ((string/= minor "0")
+                          (+ (length major) 1 (length minor)))
+                         ;; 0.0.z: the core is canonical; any +build
+                         ;; still moves to the suffix (upstream's
+                         ;; 0.0.1+b.1 -> ("0.0.1", "+b.1"))
+                         (t (length without-build)))))
+            (values (subseq version 0 split)
+                    (let ((suffix (subseq version split)))
+                      (if (zerop (length suffix)) nil suffix)))))))))
+
+(defun interface-name-version (name)
+  "The '@' version part of an interfacename, or NIL when the name has
+no interfaceversion. NAME is the full import/export name string."
+  (declare (type string name))
+  (let ((at (position #\@ name)))
+    (and at (subseq name (1+ at)))))
+
+(defun validate-interface-version (prefix suffix)
+  "The version rule shared by the name itself and the `implements`
+attribute (upstream InterfaceName::version). PREFIX is the
+interfaceversion in the name (nil when absent), SUFFIX the
+version-suffix attribute (nil when absent). Signals %verr on any
+violation."
+  (cond
+   ((and (null prefix) (null suffix)) nil)
+   ((null prefix)
+    ;; a suffix with no version in the name
+    (%verr "a version suffix requires the name to have a version"))
+   ((null suffix)
+    ;; no suffix: the version must be a full valid semver (a bare
+    ;; canonversion like `1` or `0.2` is not)
+    (let ((err (%semver-parse prefix)))
+      (when err (%verr "invalid interface version: ~a" err))))
+   (t
+    (let ((full (concatenate 'string prefix suffix)))
+      (let ((err (%semver-parse full)))
+        (when err (%verr "invalid interface version: ~a" err)))
+      (multiple-value-bind (canon suffix-parsed)
+          (split-canonical-version full)
+        (declare (ignore suffix-parsed))
+        ;; canonicalizing FULL must split exactly into PREFIX and
+        ;; SUFFIX (Explainer line 3007-3010)
+        (unless (and canon (string= canon prefix))
+          (%verr "`~a` is not the canonical version of `~a`"
+                 prefix full)))))))
+
 ;;; --- the validator walk ---
 
 (defun %check-valtype (vt state what)
@@ -1904,10 +2175,15 @@ type')."
       (unless (ct-defvaltype-p c)
         (%verr "type index ~d is not a defined type" (cdr vt))))))
 
-(defun %check-defvaltype (c state)
+(defun %check-defvaltype (c state &optional (type-depth 1) (outer state))
   "Validate one defined (value) type: label rules, non-emptiness, the
 32-flag limit, type-index bounds + defined-ness, own/borrow resource
-targets, and the elem_size < 2^28 bound."
+targets, and the elem_size < 2^28 bound. TYPE-DEPTH: see
+%check-deftype (threaded through the component/instance arms). OUTER
+is the ENCLOSING component's validator state — the type-index space
+where the text parser's interner lands inline externtypes; only the
+(:component :instance) arm uses it (the :type/:value bounds of a
+type's own declarators stay against STATE, the inner space)."
   (case (ct-kind c)
     (:prim nil)
     (:record
@@ -2003,13 +2279,29 @@ targets, and the elem_size < 2^28 bound."
     ;; component/instance types: their decls are validated in a fresh
     ;; scope with the type index space extended (Explainer: each
     ;; component/instance type is validated with an initially-empty
-    ;; type index space + outer aliases pull in outer types)
+    ;; type index space + outer aliases pull in outer types). The
+    ;; inline externtypes the TEXT parser interns (e.g. an
+    ;; (export "f" (instance)) declarator's inline instance type)
+    ;; land in the ENCLOSING component's type space — Explainer
+    ;; 'Declarators': the text format desugars inline type
+    ;; expressions "into out-of-line type definitions" — so their
+    ;; indices resolve against OUTER (the enclosing state), while
+    ;; :type (eq i) bounds and :value bounds resolve against INNER
+    ;; (binary.wast ::81: the exportdecl's (type (eq 0)) sees the
+    ;; instancetype's own aliased type 0).
     ((:component :instance)
      (let ((inner (make-cval :types (make-array 16 :fill-pointer 0
                                                 :adjustable t)
                              :func-types (make-array 16
                                                     :fill-pointer 0
-                                                    :adjustable t))))
+                                                    :adjustable t)
+                             ;; the TYPE's import/export names are
+                             ;; strongly-unique WITHIN the type
+                             ;; (Binary.md: each component/instance
+                             ;; type is its own scope; kebab.wast
+                             ;; ::28-30 pin the conflict message)
+                             :imports (make-hash-table :test #'equal)
+                             :exports (make-hash-table :test #'equal))))
        (dolist (d (coerce (ct-payload c) 'list))
          (case (typedecl-kind d)
            (:core-type nil)     ; core types keep their own space
@@ -2018,13 +2310,16 @@ targets, and the elem_size < 2^28 bound."
               (when (ct-resourcetype-p ty)
                 ;; Binary.md line 280: no resource defs inside types
                 (%verr "resources can only be defined within a concrete component"))
-              (%check-deftype ty inner)
+              (%check-deftype ty inner (1+ type-depth) outer)
               (vector-push-extend ty (cval-types inner))))
            (:alias
             (let ((a (typedecl-payload d)))
               (when (eq (aliasrec-kind a) :outer)
-                ;; outer aliases inside types cross a scope
-                (when (> (aliasrec-count a) 1)
+                ;; outer aliases inside types may cross TYPE-DEPTH
+                ;; scopes (each nested component/instance TYPE
+                ;; declarator adds one boundary; outer-alias.wast
+                ;; ::12's count of 2 inside doubly-nested types)
+                (when (> (aliasrec-count a) type-depth)
                   (%verr "invalid outer alias count of ~d" (aliasrec-count a)))
                 ;; the aliased type index is bounds-checked against the
                 ;; OUTER state below (via %check-outer-alias)
@@ -2036,17 +2331,33 @@ targets, and the elem_size < 2^28 bound."
                    (name (first payload))
                    (attrs (second payload))
                    (et (third payload)))
-              (declare (ignore attrs))
-              ;; names must be strongly-unique in the type's scope
-              (multiple-value-bind (kind detail)
-                  (parse-externname name)
-                (when (eq kind :invalid)
-                  (%verr "is not a valid extern name: ~a" detail)))
-              ;; the ascribed indices resolve against the TYPE's own
-              ;; scope (the inner index space built by the preceding
-              ;; type decls), per Explainer: each component/instance
-              ;; type validates with an initially-empty type space
-              (%check-externtype et inner inner)
+              ;; the externname grammar + strongly-unique within the
+              ;; TYPE's own scope (the fresh tables on INNER carry
+              ;; the per-type uniqueness; kebab.wast ::28-30 pin the
+              ;; conflict message)
+              (%check-externname name inner
+                                 (eq (typedecl-kind d) :import))
+              ;; the attribute rules apply inside types too
+              ;; (attributes.wast ::15/::18/::21: implements rules in
+              ;; component/instance types); the sort comes from the
+              ;; ascribed externtype
+              (%check-name-attrs name attrs (car et))
+              ;; the ascribed indices resolve INNER-FIRST: Binary.md's
+              ;; componenttype/instancetype rule (each validates with
+              ;; an initially-empty type space; the declarator
+              ;; sequence — type decls, importdecls, exportdecls —
+              ;; builds it; binary.wast ::80's export (func (type 2))
+              ;; and ::81's (type (eq 0)) both resolve in-sequence).
+              ;; When the index is out of bounds in the type's own
+              ;; space, fall back to the ENCLOSING component's space
+              ;; (the Explainer's text-format out-of-line (type i)
+              ;; references + outer-alias pull-ins).
+              (flet ((resolve-et (space)
+                       (handler-case
+                           (%check-externtype et space inner)
+                         (wasmdown:validation-error () nil))))
+                (unless (resolve-et inner)
+                  (resolve-et outer)))
               ;; BOTH imports and exports introduce a new type index
               ;; (Binary.md line 274: exportdecl introduces a new
               ;; index; importdecls occupy their position in the
@@ -2056,13 +2367,19 @@ targets, and the elem_size < 2^28 bound."
                (make-ct :kind :prim :payload :imported-or-exported-type)
                (cval-types inner))))))))))
 
-(defun %check-deftype (c state)
-  "Dispatch: defined value types get the full check; func/resource and
-component/instance types get their own shapes."
+(defun %check-deftype (c state &optional (type-depth 1) (outer state))
+  "Dispatch: defined value types get the full check; func/resource
+and component/instance types get their own shapes. TYPE-DEPTH is the
+number of enclosing component/instance TYPE boundaries (1 at a
+concrete component's decls); outer aliases inside a type may cross
+that many scopes (outer-alias.wast ::12's count of 2 inside
+(type (component (type (component ...))))). OUTER is the enclosing
+component's state (see %check-defvaltype) — the space the text
+parser's interner lands inline externtypes in."
   (if (ct-defvaltype-p c)
-      (progn (%check-defvaltype c state)
+      (progn (%check-defvaltype c state type-depth outer)
              (elem-size c state))
-      (%check-defvaltype c state)))
+      (%check-defvaltype c state type-depth outer)))
 
 (defun %check-outer-alias (a state outer-depth)
   "Outer alias validation (outer-alias.wast): the count must be <=
@@ -2287,7 +2604,9 @@ bounds', ...)."
 
 (defun %check-externname (name state import-p)
   "The externname grammar + strongly-unique within the scope
-(kebab.wast, extern-names.wast)."
+(kebab.wast, extern-names.wast) + the interfaceversion grammar
+(extern-names.wast's @-version rows: a version must be a `valid
+semver` or a `canonversion`)."
   (multiple-value-bind (kind detail) (parse-externname name)
     (when (eq kind :invalid)
       ;; kebab-bad's detail names the offending FRAGMENT (or an
@@ -2300,6 +2619,15 @@ bounds', ...)."
                              detail)))
           (%verr "`~a` is not in kebab case" detail)
           (%verr "is not a valid extern name"))))
+  ;; the @version grammar: a valid semver OR a canonversion (the
+  ;; semver-parse detail is the message the fixtures pin: 'empty
+  ;; string', \"unexpected character '.'\", 'unexpected end of
+  ;; input', 'empty identifier segment')
+  (let ((version (interface-name-version name)))
+    (when version
+      (unless (canonversion-p version)
+        (let ((err (%semver-parse version)))
+          (when err (%verr "~a" err))))))
   ;; strongly-unique (Explainer Name Uniqueness): canonicalize = strip
   ;; annotations per the rules; compare case-insensitively
   (let ((canon (%kebab-key (remove-annotations name)))
@@ -2311,11 +2639,13 @@ bounds', ...)."
 
 (defun remove-annotations (name)
   "Canonicalization steps 1.2/1.3 (Explainer Name Uniqueness):
-  1.2: if the name is [...]*l.l, replace with l (the FIRST label —
-       [method]foo.bar and [static]foo.baz both reduce to foo);
+  1.2: if the name is [...]*l.l, replace with l (the FIRST label);
   1.3: strip [...] annotations besides [constructor] and [set].
-Step 1.1 (hyphen removal + lowercasing) is %kebab-key's job; this
-function returns the pre-1.1 name."
+Step 1.1 (hyphen removal + lowercasing, %kebab-key) applies BEFORE
+the 1.2 match: [static]foo-bar.FO-ob-AR's folded labels BOTH reduce
+to `foobar`, so the pair matches and reduces to `foo-bar` — kebab.wast
+::34 pins the conflict with the plain `foo-bar` import. Returns the
+pre-1.1 name (the caller %kebab-key's the result)."
   (declare (type string name))
   (labels
       ((strip-annotations (s)
@@ -2337,16 +2667,16 @@ function returns the pre-1.1 name."
                                     tail))))))))
     (if (and (plusp (length name)) (char= (char name 0) #\[))
         ;; an annotated name: split the annotation prefix off, apply
-        ;; 1.2's reduction (ONLY when the l.l labels MATCH — the
-        ;; Explainer's reduction example is [method]foo.foo -> foo;
-        ;; a differing pair [method]foo.bar keeps its distinct
-        ;; identity), then reattach [constructor]/[set] per 1.3
+        ;; 1.2's reduction when the FOLDED labels match (differing
+        ;; pairs like [method]foo.bar keep their distinct identity),
+        ;; then reattach [constructor]/[set] per 1.3
         (let* ((close (position #\] name :from-end t))
                (body (and close (subseq name (1+ close))))
                (dot (and body (position #\. body)))
                (l1 (and dot (subseq body 0 dot)))
                (l2 (and dot (subseq body (1+ dot))))
-               (matches (and l1 l2 (string= l1 l2)))
+               (matches (and l1 l2
+                             (string= (%kebab-key l1) (%kebab-key l2))))
                (reduced (cond
                          ((and dot matches) l1)
                          (dot body)
@@ -2358,6 +2688,80 @@ function returns the pre-1.1 name."
             (concatenate 'string (subseq name 0 (1+ close)) reduced))
            (t reduced)))
         (strip-annotations name))))
+
+(defun parse-externname-kind (name)
+  "The KIND of (parse-externname NAME): :plain, :interface or
+:invalid — the uniqueness/name rules below only branch on it."
+  (parse-externname name))
+
+(defun %attr-of-kind (attrs kind)
+  "The value of the first attribute of KIND (:implements /
+:version-suffix / :external-id), or NIL. ATTRS is the importrec/
+exportrec attrs list of (kind value) lists."
+  (let ((hit (assoc kind attrs :test #'eq)))
+    (cond ((null hit) nil)
+          ;; the binary reader builds (kind value) lists; the text
+          ;; parser builds (kind . value) conses — accept both.
+          ((consp (cdr hit)) (second hit))
+          (t (cdr hit)))))
+
+
+(defun %check-name-attrs (name attrs sort)
+  "The implements/version-suffix attribute rules (Binary.md lines
+438-476, upstream validate_extern's ordering). NAME is the import/
+export externname, ATTRS the attribute list, SORT the external sort.
+Order per upstream: version-suffix (instance-only, non-empty, needs an
+interfacename or implements), then implements (bare-plain name,
+instance-only, interfacename value + version check), then the NAME's
+own interfaceversion check."
+  (let ((suffix (%attr-of-kind attrs :version-suffix))
+        (implements (%attr-of-kind attrs :implements)))
+    ;; ---- version-suffix ----
+    (when suffix
+      (unless (eq sort :instance)
+        (%verr "only instances can have a `version-suffix`"))
+      (when (zerop (length suffix))
+        (%verr "version suffix cannot be empty"))
+      ;; without `implements` the suffix applies to NAME: it must be
+      ;; an interfacename (the version itself is checked below)
+      (unless (or implements
+                 (eq (parse-externname-kind name) :interface))
+        (%verr "`version-suffix` requires an interface name or `implements`")))
+    ;; ---- implements ----
+    (when implements
+      ;; the import/export name must be a BARE plain name
+      (unless (and (eq (parse-externname-kind name) :plain)
+                   (not (and (plusp (length name))
+                             (char= (char name 0) #\[))))
+        (%verr "name `~a` is not valid with `implements`" name))
+      (unless (eq sort :instance)
+        (%verr "only instances can have an `implements`"))
+      ;; the implements value must be an interfacename; an INVALID
+      ;; value reports the malformed-name message (attributes.wast:
+      ;; 'not a valid name' for the empty string)
+      (let ((ikind (parse-externname-kind implements)))
+        (cond
+         ((eq ikind :interface) nil)
+         ((eq ikind :invalid)
+          (%verr "`~a` is not a valid name" implements))
+         (t (%verr "name `~a` must be an interface" implements))))
+      ;; the version check runs against the implements interfacename
+      (validate-interface-version (interface-name-version implements)
+                                  suffix))
+    ;; ---- the NAME's own interfaceversion (applies with or without
+    ;; attributes — extern-names.wast's semver rows; the suffix applies
+    ;; to the name only when there is no implements)
+    (unless implements
+      (let ((version (interface-name-version name)))
+        (when (or version suffix)
+          ;; a version WITHOUT a suffix must be a full valid semver
+          ;; (a bare canonversion like `1` is not — version-suffix.wast
+          ;; ::11/::12); a SUFFIX with no version in the name is the
+          ;; (nil, suffix) case — 'a version suffix requires the name
+          ;; to have a version' (version-suffix.wast ::23); with both
+          ;; the concatenation must be a valid semver AND split back
+          ;; into (version, suffix)
+          (validate-interface-version version suffix))))))
 
 (defun validate-component (comp &key (outer-depth 0))
   "Validate a decoded component. Signals wasmdown:validation-error on
@@ -2407,17 +2811,36 @@ number of enclosing component/type scopes (outer aliases)."
                      (loop for (nil . si) across (instrec-exports payload)
                            do (%check-sortidx si state))
                      ;; the inline-export NAMES are externnames:
-                     ;; kebab + strongly-unique within this scope
-                    (loop for pair across (instrec-exports payload)
-                          do (%check-externname
-                              ;; pair shapes: (name sort . idx) from
-                              ;; %parse-inline-export; ((name attrs)
-                              ;; . sortidx) from instance-def's export
-                              ;; arms — the NAME is what validates.
-                              (if (consp (car pair))
-                                  (first (car pair))
-                                  (car pair))
-                              state nil))))
+                     ;; kebab + strongly-unique WITHIN THIS INSTANCE
+                     ;; (Binary.md: 'The externnames of all exports in
+                     ;; a given component, instance, component-type
+                     ;; or instance-type must be strongly-unique' —
+                     ;; the instance is its OWN scope; a bag may reuse
+                     ;; a name the enclosing component also exports,
+                     ;; attributes.wast ::0's final bag exporting "a"
+                     ;; alongside the component's export "a")
+                     (loop with table = (make-hash-table :test #'equal)
+                           for pair across (instrec-exports payload)
+                           ;; the attribute rules apply to bag exports
+                           ;; too (attributes.wast ::19/::24: implements
+                           ;; must name an interface even inside a bag;
+                           ;; the pair carries ((name attrs) . sortidx))
+                           do (let* ((name (if (consp (car pair))
+                                               (first (car pair))
+                                               (car pair)))
+                                     (attrs (if (consp (car pair))
+                                                (second (car pair))
+                                                nil))
+                                     (sort (sortidx-sort (cdr pair))))
+                                (%check-name-attrs name attrs sort)
+                                (%check-externname
+                                 name
+                                 (make-cval
+                                  :types (cval-types state)
+                                  :core-types (cval-core-types state)
+                                  :func-types (cval-func-types state)
+                                  :exports table)
+                                 nil)))))
                   (incf (cval-instances state)))
                  (:alias
                   (case (aliasrec-kind payload)
@@ -2506,6 +2929,9 @@ number of enclosing component/type scopes (outer aliases)."
                  (:import
                   (%check-externname (importrec-name payload) state t)
                   (%check-externtype (importrec-type payload) state nil)
+                  (%check-name-attrs (importrec-name payload)
+                                     (importrec-attrs payload)
+                                     (car (importrec-type payload)))
                   ;; imports extend the imported sort's space
                   (case (car (importrec-type payload))
                     (:func (incf (cval-funcs state))
@@ -2534,6 +2960,10 @@ number of enclosing component/type scopes (outer aliases)."
                  (:export
                   (%check-externname (exportrec-name payload) state nil)
                   (%check-sortidx (exportrec-sortidx payload) state)
+                  (%check-name-attrs (exportrec-name payload)
+                                     (exportrec-attrs payload)
+                                     (sortidx-sort
+                                      (exportrec-sortidx payload)))
                   (when (exportrec-type payload)
                     (%check-externtype (exportrec-type payload) state nil))
                   ;; every export introduces a new index of its sort

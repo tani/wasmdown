@@ -290,6 +290,225 @@ wast runner's string-to-bytes decoder (same grammar as the suite)."
                     (wasmdown:wasmdown-error-message c)))))))
 
 
+
+
+(test component/shape-family-pins
+  (flet ((expect-invalid (thunk)
+           (block nil
+             (handler-case (funcall thunk)
+               (wasmdown:validation-error (c) (return c)))
+             (error "expected wasmdown:validation-error")))
+         (expect-decode-error (thunk)
+           (block nil
+             (handler-case (funcall thunk)
+               (wasmdown:decode-error (c) (return c)))
+             (error "expected wasmdown:decode-error")))
+         (parse-ok (src)
+           (wasmdown.component:validate-component
+            (wasmdown.component.text::parse-component-text src))))
+    ;; elem-size's variant arm: an all-empty-payload variant must not
+    ;; divide by zero (external-visibility.wast ::15's DIVISION crash)
+    (parse-ok "(component (type $V (variant (case \"a\") (case \"b\"))))")
+    (parse-ok (concatenate 'string "(component"
+                " (core module $m (func (export \"f\") (result i32) unreachable))"
+                " (core instance $i (instantiate $m))"
+                " (type $V (variant (case \"a\") (case \"b\")))"
+                " (func $f (result $V) (canon lift (core func $i \"f\")))"
+                " (export \"f\" (func $f)))"))
+    ;; a NONEMPTY variant still elem-sizes (ma > 1 path)
+    (parse-ok (concatenate 'string "(component"
+                " (core module $m (func (export \"f\") (result i32) unreachable))"
+                " (core instance $i (instantiate $m))"
+                " (type $V (variant (case \"a\" u32) (case \"b\")))"
+                " (func $f (result $V) (canon lift (core func $i \"f\"))))"))
+    ;; the (core module ...) externtype interns a core type; the $id
+    ;; binds in the core-module space (indicies.wast ::14's MODULETYPE
+    ;; crash + the (with \"x\" (core module $m)) projection)
+    (parse-ok (concatenate 'string "(component"
+                " (import \"m\" (core module $m))"
+                " (import \"C\" (component $c))"
+                " (instance (instantiate $c (with \"x\" (core module $m)))))"))
+    ;; an inline moduletype import: the empty decl vector reaches the
+    ;; validator as a (:moduletype . #()) core type
+    (parse-ok "(component (import \"a\" (core module)))")
+    ;; the inverted canon forms: (core func $d (canon resource.drop
+    ;; $T)) has NO trailing (core func ...) target (resources.wast
+    ;; ::69, abi.wast ::3's 'expected (core func ...)' family)
+    (parse-ok (concatenate 'string "(component"
+                " (type $T (resource (rep i32)))"
+                " (core func $d (canon resource.drop $T)))"))
+    (parse-ok (concatenate 'string "(component"
+                " (import \"f\" (func $f))"
+                " (core func $f' (canon lower (func $f))))"))
+    ;; (alias core export ... (core func $f)) binds $f in the CORE
+    ;; func space, and canon lift then resolves it (indicies.wast ::4)
+    (parse-ok (concatenate 'string "(component"
+                " (core module $M (func (export \"f\")))"
+                " (core instance $m (instantiate $M))"
+                " (alias core export $m \"f\" (core func $f))"
+                " (canon lift (core func $f) (func)))"))
+    ;; the (with \"x\" (instance $j \"k\")) projection chain: the atom
+    ;; + export-name shape is an alias chain, NOT an inline-export bag
+    ;; — it must PARSE (indicies.wast ::0's STOKEN crash was a DECODE
+    ;; TYPE-ERROR, fixed at the parser level; the validator's
+    ;; alias-sortidx bounds check is the next slice's work)
+    (wasmdown.component.text::parse-component-text
+     (concatenate 'string "(component"
+       " (import \"j\" (instance $j (export \"k\" (instance))))"
+       " (import \"C\" (component $c))"
+       " (instance (instantiate $c (with \"x\" (instance $j \"k\")))))"))
+    ;; %bind: a $id reused across SORTS is legal (instantiation.wast
+    ;; ::51's $libc is both a core module and a core instance); a
+    ;; same-sort collision still errors at decode
+    (parse-ok (concatenate 'string "(component"
+                " (core module $libc (func (export \"f\")))"
+                " (core instance $libc (instantiate $libc)))"))
+    (let ((c (expect-decode-error
+              (lambda ()
+                (wasmdown.component.text::parse-component-text
+                 "(component (type $t u32) (type $t u32))")))))
+      (is (search "duplicate identifier"
+                  (wasmdown:wasmdown-error-message c))))))
+
+
+(test component/kebab-fold-pins
+  (flet ((expect-invalid (thunk)
+           (block nil
+             (handler-case (funcall thunk)
+               (wasmdown:validation-error (c) (return c)))
+             (error "expected wasmdown:validation-error"))))
+    ;; Explainer Name Uniqueness 1.1 (the fold) applies BEFORE the
+    ;; 1.2 reduction: [static]foo-bar.FO-ob-AR's folded labels match,
+    ;; so it reduces to foo-bar and CONFLICTS with the plain import
+    ;; (kebab.wast ::34); [method]foo-bar.foobar ditto (::35)
+    (is (string= "foo-bar"
+                 (wasmdown.component:remove-annotations
+                  "[static]foo-bar.FO-ob-AR")))
+    ;; distinct folded labels keep their identity: no conflict
+    (is (string= "foo-bar.bazbar"
+                 (wasmdown.component:remove-annotations
+                  "[method]foo-bar.bazbar")))
+    (let ((src (concatenate 'string "(component"
+                             " (import \"foo-bar\" (type (sub resource)))"
+                             " (import \"[static]foo-bar.FO-ob-AR\" (func)))")))
+      (let ((c (expect-invalid
+                (lambda ()
+                  (wasmdown.component:validate-component
+                   (wasmdown.component.text::parse-component-text src))))))
+        (is (search "conflicts with previous name"
+                    (wasmdown:wasmdown-error-message c)))))
+    (let ((src (concatenate 'string "(component"
+                             " (import \"foo-bar\" (type (sub resource)))"
+                             " (import \"[method]foo-bar.foobar\" (func)))")))
+      (let ((c (expect-invalid
+                (lambda ()
+                  (wasmdown.component:validate-component
+                   (wasmdown.component.text::parse-component-text src))))))
+        (is (search "conflicts with previous name"
+                    (wasmdown:wasmdown-error-message c)))))
+    ;; the control: a genuinely distinct second label stays OK
+    (wasmdown.component:validate-component
+     (wasmdown.component.text::parse-component-text
+      (concatenate 'string "(component"
+        " (import \"foo-bar\" (type (sub resource)))"
+        " (import \"[method]foo-bar.bazbar\" (func)))")))))
+
+(test component/version-grammar-pins
+  (flet ((expect-invalid (thunk)
+           (block nil
+             (handler-case (funcall thunk)
+               (wasmdown:validation-error (c) (return c)))
+             (error "expected wasmdown:validation-error")))
+         (valid (src)
+           (wasmdown.component:validate-component
+            (wasmdown.component.text::parse-component-text src))))
+    ;; ---- the canonversion production (Explainer 2787-2791) ----
+    (is (wasmdown.component:canonversion-p "1"))
+    (is (wasmdown.component:canonversion-p "10"))
+    (is (wasmdown.component:canonversion-p "0.2"))
+    (is (wasmdown.component:canonversion-p "0.0.12"))
+    (is (wasmdown.component:canonversion-p "0.0.0"))
+    (is (wasmdown.component:canonversion-p "0.0.1-alpha"))
+    (is (wasmdown.component:canonversion-p "1.2.3-alpha.1"))
+    (is (not (wasmdown.component:canonversion-p "0")))
+    (is (not (wasmdown.component:canonversion-p "01")))
+    (is (not (wasmdown.component:canonversion-p "0.0")))
+    (is (not (wasmdown.component:canonversion-p "0.02")))
+    (is (not (wasmdown.component:canonversion-p "1.2")))
+    (is (not (wasmdown.component:canonversion-p "x")))
+    ;; ---- the canonical split (Explainer 2983-3001; the
+    ;; major-split, minor-split, 0.0.z, pre-release and build cases;
+    ;; non-semver inputs split to (nil nil)) ----
+    (flet ((split (v)
+             (multiple-value-bind (canon suffix)
+                 (wasmdown.component:split-canonical-version v)
+               (list canon suffix))))
+      (is (equal '("1" ".2.3") (split "1.2.3")))
+      (is (equal '("1" ".2.3+sha.5114f85") (split "1.2.3+sha.5114f85")))
+      (is (equal '("0.2" ".6") (split "0.2.6")))
+      (is (equal '("0.2" ".6+sha.5114f85") (split "0.2.6+sha.5114f85")))
+      (is (equal '("0.0.1" nil) (split "0.0.1")))
+      (is (equal '("0.0.1" "+sha.5114f85") (split "0.0.1+sha.5114f85")))
+      (is (equal '("0.0.12" "+b") (split "0.0.12+b")))
+      (is (equal '("1.2.3-alpha" nil) (split "1.2.3-alpha")))
+      (is (equal '("1.2.3-alpha.1" "+sha.5114") (split "1.2.3-alpha.1+sha.5114")))
+      (is (equal '("0.2.6-rc.1" "+b") (split "0.2.6-rc.1+b")))
+      (is (equal '(nil nil) (split "1.2")))
+      (is (equal '(nil nil) (split "0.1.0-a+b-c+d"))))
+    ;; ---- end-to-end: the version-suffix attribute rules
+    ;; (version-suffix.wast ::1-::33, extern-names.wast's @ rows) ----
+    ;; positive: @1 + .2.3 reconstructs the canonical 1.2.3
+    (is (valid "(component (import \"a:b/c@1\" (version-suffix \".2.3\") (instance)))"))
+    ;; a pre-release can't be split off the name's canonversion
+    (let ((c (expect-invalid
+              (lambda ()
+                (valid "(component (import \"a:b/c@1\" (version-suffix \".2.3-alpha\") (instance)))")))))
+      (is (search "is not the canonical version of `1.2.3-alpha`"
+                  (wasmdown:wasmdown-error-message c))))
+    ;; the empty suffix
+    (let ((c (expect-invalid
+              (lambda ()
+                (valid "(component (import \"a:b/c@0.0.1\" (version-suffix \"\") (instance)))")))))
+      (is (search "version suffix cannot be empty"
+                  (wasmdown:wasmdown-error-message c))))
+    ;; a bare canonversion name needs a suffix (::11)
+    (let ((c (expect-invalid
+              (lambda ()
+                (valid "(component (import \"a:b/c@1\" (instance)))")))))
+      (is (search "invalid interface version"
+                  (wasmdown:wasmdown-error-message c))))
+    ;; the suffix applies to the implements interfacename (::29)
+    (let ((c (expect-invalid
+              (lambda ()
+                (valid "(component (import \"a\" (implements \"a:b/c@1\") (instance)))")))))
+      (is (search "invalid interface version"
+                  (wasmdown:wasmdown-error-message c))))
+    ;; only instances can have a version-suffix (::24)
+    (let ((c (expect-invalid
+              (lambda ()
+                (valid "(component (import \"a:b/c@1\" (version-suffix \".2.3\") (func)))")))))
+      (is (search "only instances can have a `version-suffix`"
+                  (wasmdown:wasmdown-error-message c))))
+    ;; the @version grammar in externnames (extern-names.wast ::2-::9)
+    (let ((c (expect-invalid
+              (lambda ()
+                (valid "(component (import \"a:b/c@\" (func)))")))))
+      (is (search "empty string" (wasmdown:wasmdown-error-message c))))
+    (let ((c (expect-invalid
+              (lambda ()
+                (valid "(component (import \"a:b/c@2.0.0+\" (func)))")))))
+      (is (search "empty identifier segment"
+                  (wasmdown:wasmdown-error-message c))))
+    ;; the implements-attributed instancetype declarator shape (::28)
+    (is (valid "(component (type (instance (export \"f\" (implements \"a:b/c@1\") (version-suffix \".2.3\") (instance)))))"))
+    ;; a bag export may reuse a name the component also exports
+    ;; (attributes.wast ::0: per-instance uniqueness scope)
+    (is (valid "(component (import \"a\" (instance)) (instance $a) (export \"a\" (instance $a)) (instance (export \"a\" (instance $a))))"))
+    ;; binary.wast ::80: a componenttype's exportdecl ascription
+    ;; (func (type 2)) resolves against the TYPE's OWN declarator
+    ;; sequence [type, import, type] — inner-first, outer-fallback
+    (is (valid "(component (type (component (type (instance)) (import \"a\" (type (eq 0))) (type (func)) (export \"b\" (func (type 2))))))"))))
+
 (defun run-component-pins ()
   "Run the component pins (registered via TEST; returns T)."
   (let ((wasmdown.test::*tests*
@@ -301,7 +520,10 @@ wast runner's string-to-bytes decoder (same grammar as the suite)."
                       component/section-positive-and-malformed
                       component/validator-label-pins
                       component/canonopt-memory-rules
-                      component/externname-grammar-pins)))
+                      component/externname-grammar-pins
+                      component/shape-family-pins
+                      component/kebab-fold-pins
+                      component/version-grammar-pins)))
           wasmdown.test::*tests*)))
     (multiple-value-bind (passed failed)
         (wasmdown.test:run-all-tests)
