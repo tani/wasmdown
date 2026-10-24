@@ -1,0 +1,609 @@
+# Component Model Binary Format Explainer
+
+This document defines the binary format for the AST defined in the
+[explainer](Explainer.md). The top-level production is `component` and the
+convention is that a file suffixed in `.wasm` may contain either a
+[`core:module`] *or* a `component`, using the `layer` field to discriminate
+between the two in the first 8 bytes (see [below](#component-definitions) for
+more details).
+
+Note: this document is not meant to completely define the decoding or validation
+rules, but rather merge the minimal need-to-know elements of both, with just
+enough detail to create a prototype. A complete definition of the binary format
+and validation will be present in the [formal specification](../../spec/).
+
+See [Gated Features](Explainer.md#gated-features) for an explanation of emoji
+annotations like 🪙 and 🔧.
+
+
+## Component Definitions
+
+(See [Component Definitions](Explainer.md#component-definitions) in the explainer.)
+```ebnf
+component ::= <preamble> s*:<section>*            => (component flatten(s*))
+preamble  ::= <magic> <version> <layer>
+magic     ::= 0x00 0x61 0x73 0x6D
+version   ::= 0x0d 0x00
+layer     ::= 0x01 0x00
+section   ::=    section_0(<core:custom>)         => ϵ
+            | m: section_1(<core:module>)         => [core-prefix(m)]
+            | i*:section_2(vec(<core:instance>))  => core-prefix(i)*
+            | t*:section_3(vec(<core:type>))      => core-prefix(t)*
+            | c: section_4(<component>)           => [c]
+            | i*:section_5(vec(<instance>))       => i*
+            | a*:section_6(vec(<alias>))          => a*
+            | t*:section_7(vec(<type>))           => t*
+            | c*:section_8(vec(<canon>))          => c*
+            | s: section_9(<start>)               => [s] 🪙
+            | i*:section_10(vec(<import>))        => i*
+            | e*:section_11(vec(<export>))        => e*
+            | v*:section_12(vec(<value>))         => v* 🪙
+```
+Notes:
+* Reused Core binary rules: [`core:section`], [`core:custom`], [`core:module`]
+* The `core-prefix(t)` meta-function inserts a `core` token after the leftmost
+  paren of `t` (e.g., `core-prefix( (module (func)) )` is `(core module (func))`).
+* The `version` given above is pre-standard. As the proposal changes before
+  final standardization, `version` will be bumped from `0x0d` upwards to
+  coordinate prototypes. When the standard is finalized, `version` will be
+  changed one last time to `0x1`. (This mirrors the path taken for the Core
+  WebAssembly 1.0 spec.)
+* The `layer` field is meant to distinguish modules from components early in
+  the binary format. (Core WebAssembly modules already implicitly have a
+  `layer` field of `0x0` if the existing 4-byte [`core:version`] field is
+  reinterpreted as two 2-byte fields. This implies that the Core WebAssembly
+  spec needs to make a backwards-compatible spec change to split `core:version`
+  and fix `layer` to forever be `0x0`.)
+
+
+## Instance Definitions
+
+(See [Instance Definitions](Explainer.md#instance-definitions) in the explainer.)
+```ebnf
+core:instance       ::= ie:<core:instanceexpr>                             => (instance ie)
+core:instanceexpr   ::= 0x00 m:<moduleidx> arg*:vec(<core:instantiatearg>) => (instantiate m arg*)
+                      | 0x01 e*:vec(<core:inlineexport>)                   => e*
+core:instantiatearg ::= n:<core:name> 0x12 i:<instanceidx>                 => (with n (instance i))
+core:sortidx        ::= sort:<core:sort> idx:<u32>                         => (sort idx)
+core:sort           ::= 0x00                                               => func
+                      | 0x01                                               => table
+                      | 0x02                                               => memory
+                      | 0x03                                               => global
+                      | 0x04                                               => tag
+                      | 0x10                                               => type
+                      | 0x11                                               => module
+                      | 0x12                                               => instance
+core:inlineexport   ::= n:<core:name> si:<core:sortidx>                    => (export n si)
+
+instance            ::= ie:<instanceexpr>                                  => (instance ie)
+instanceexpr        ::= 0x00 c:<componentidx> arg*:vec(<instantiatearg>)   => (instantiate c arg*)
+                      | 0x01 e*:vec(<inlineexport>)                        => e*
+instantiatearg      ::= n:<name>  si:<sortidx>                             => (with n si)
+name                ::= n:<core:name>                                      => n
+sortidx             ::= sort:<sort> idx:<u32>                              => (sort idx)
+sort                ::= 0x00 cs:<core:sort>                                => core cs
+                      | 0x01                                               => func
+                      | 0x02                                               => value 🪙
+                      | 0x03                                               => type
+                      | 0x04                                               => component
+                      | 0x05                                               => instance
+inlineexport        ::= na:<nameattributes> si:<sortidx>                   => (export na si)
+```
+Notes:
+* Reused Core binary rules: [`core:name`], (variable-length encoded) [`core:u32`]
+* The `core:sort` values are chosen to match the discriminant opcodes of
+  [`core:externtype`].
+* `type` is added to `core:sort` in anticipation of the [type-imports] proposal. Until that
+  proposal, core modules won't be able to actually import or export types, however, the
+  `type` sort is allowed as part of outer aliases (below).
+* `module` and `instance` are added to `core:sort` in anticipation of the [module-linking]
+  proposal, which would add these types to Core WebAssembly. Until then, they are useful
+  for aliases (below).
+* Validation of `core:instantiatearg` initially only allows the `instance`
+  sort, but would be extended to accept other sorts as core wasm is extended.
+* Validation of `instantiate` requires each `<externname>` in `c` to match a
+  `name` in a `with` argument (using plain string equality) and for the types to
+  match.
+* When validating `instantiate`, after each individual type-import is supplied
+  via `with`, the actual type supplied is immediately substituted for all uses
+  of the import, so that subsequent imports and all exports are now specialized
+  to the actual type.
+* The indices in `sortidx` are validated according to their `sort`'s index
+  spaces, which are built incrementally as each definition is validated.
+
+
+## Alias Definitions
+
+(See [Alias Definitions](Explainer.md#alias-definitions) in the explainer.)
+```ebnf
+alias ::= s:<sort> 0x00 i:<instanceidx> n:<name>           => (alias export i n (s))
+        | s:<sort> 0x01 i:<core:instanceidx> n:<core:name> => (alias core export i n (s))
+        | s:<sort> 0x02 ct:<u32> idx:<u32>                 => (alias outer ct idx (s))  (if s in outeraliassort)
+```
+Notes:
+* Reused Core binary rules: (variable-length encoded) [`core:u32`]
+* For (`core`) `export` aliases, `i` is validated to refer to a (core) instance
+  in the (core) instance index space that exports `n` with the specified `sort`.
+* For `outer` aliases:
+  * `ct` is validated to be *less than or equal to* the number of enclosing
+    "scopes" (where a "scope" is one of: a `component` definition, a `component`
+    type, an `instance` type)
+  * `i` is validated to be a valid index in the `s` index space of the target
+    scope (counting outward, starting with `0` referring to the current scope)
+  * if `ct` is greater than 0 and crosses a component (as opposed to type)
+    boundary and `s` is `type`, the target type may not transitively refer to a
+    resource type.
+
+
+## Type Definitions
+
+(See [Type Definitions](Explainer.md#type-definitions) in the explainer.)
+```ebnf
+core:type        ::= dt:<core:deftype>                                    => (type dt)
+core:deftype     ::= rt:<core:rectype>                                    => rt               (WebAssembly 3.0)
+                   | 0x00 0x50 x*:vec(<core:typeidx>) ct:<core:comptype>  => sub x* ct        (WebAssembly 3.0)
+                   | mt:<core:moduletype>                                 => mt
+core:moduletype  ::= 0x50 md*:vec(<core:moduledecl>)                      => (module md*)
+core:moduledecl  ::= 0x00 i:<core:import>                                 => i
+                   | 0x01 rt:<core:rectype>                               => (type rt)
+                   | 0x02 a:<core:alias>                                  => a
+                   | 0x03 e:<core:exportdecl>                             => e
+core:alias       ::= 0x10 0x01 ct:<u32> idx:<u32>                         => (alias outer ct idx (type))
+core:importdecl  ::= i:<core:import>                                      => i
+core:exportdecl  ::= n:<core:name> t:<core:externtype>                    => (export n t)
+```
+Notes:
+* Reused Core binary rules: [`core:import`], [`core:externtype`],
+  [`core:rectype`]
+* Unfortunately, the `core:deftype` rule results in an encoding ambiguity: the
+  `0x50` opcode is used by both `core:moduletype` and a non-final
+  `core:subtype`, which can be decoded as a top-level form of `core:rectype`. To
+  resolve this, prior to v1.0 of this specification, we require `core:subtype`
+  to be prefixed by `0x00` in this context (i.e., a non-final `sub` as a
+  component core type is `0x00 0x50`; elsewhere, `0x50`). By the v1.0 release of
+  this specification, `core:moduletype` will receive a new, non-overlapping
+  opcode.
+* The ambiguity above does not arise within a `core:moduletype`: the `type`
+  declarators of `core:moduledecl` contain a `core:rectype` directly, using the
+  same encoding as a Core WebAssembly type section. Thus, within a
+  `core:moduletype`, a non-final `sub` is encoded as `0x50` without a `0x00`
+  prefix, and a `core:moduletype` cannot be nested.
+* Validation of `core:moduledecl` rejects `outer` aliases of
+  `core:moduletype` definitions. Thus, as an invariant, when validating a
+  `core:moduletype`, the core type index space will not contain any core module
+  types.
+* As described in the explainer, each module type is validated with an
+  initially-empty type index space.
+* In `core:alias`, the first `0x10` is the opcode for `type` in `core:sort` and
+  `0x01` is an opcode to distinguish `outer` aliases from potential future
+  `export` aliases.
+
+```ebnf
+type          ::= dt:<deftype>                             => (type dt)
+deftype       ::= dvt:<defvaltype>                         => dvt
+                | ft:<functype>                            => ft
+                | ct:<componenttype>                       => ct
+                | it:<instancetype>                        => it
+                | rt:<resourcetype>                        => rt
+primvaltype   ::= 0x7f                                     => bool
+                | 0x7e                                     => s8
+                | 0x7d                                     => u8
+                | 0x7c                                     => s16
+                | 0x7b                                     => u16
+                | 0x7a                                     => s32
+                | 0x79                                     => u32
+                | 0x78                                     => s64
+                | 0x77                                     => u64
+                | 0x76                                     => f32
+                | 0x75                                     => f64
+                | 0x74                                     => char
+                | 0x73                                     => string
+                | 0x64                                     => error-context 📝
+defvaltype    ::= pvt:<primvaltype>                        => pvt
+                | 0x72 lt*:vec(<labelvaltype>)             => (record (field lt)*)    (if |lt*| > 0)
+                | 0x71 case*:vec(<case>)                   => (variant case+) (if |case*| > 0)
+                | 0x70 t:<valtype>                         => (list t)
+                | 0x67 t:<valtype> len:<u32>               => (list t len)  (if len > 0) 🔧
+                | 0x6f t*:vec(<valtype>)                   => (tuple t+)    (if |t*| > 0)
+                | 0x6e l*:vec(<labellit>)                  => (flags l+)    (if 0 < |l*| <= 32)
+                | 0x6d l*:vec(<labellit>)                  => (enum l+)     (if |l*| > 0)
+                | 0x6b t:<valtype>                         => (option t)
+                | 0x6a t?:<valtype>? u?:<valtype>?         => (result t? (error u)?)
+                | 0x69 i:<typeidx>                         => (own i)
+                | 0x68 i:<typeidx>                         => (borrow i)
+                | 0x66 t?:<valtype>?                       => (stream t?) 🔀
+                | 0x65 t?:<valtype>?                       => (future t?) 🔀
+                | 0x63 k:<valtype> v:<valtype>             => (map k v) (if k is in <keytype>) 🗺️
+labelvaltype  ::= l:<labellit> t:<valtype>                 => l t
+case          ::= l:<labellit> t?:<valtype>? 0x00          => (case l t?)
+labellit      ::= len:<u32> l:<label>                      => "l"  (if len = |l|)
+<T>?          ::= 0x00                                     =>
+                | 0x01 t:<T>                               => t
+valtype       ::= i:<typeidx>                              => i
+                | pvt:<primvaltype>                        => pvt
+resourcetype  ::= 0x3f t:<core:valtype> f?:<core:funcidx>? => (resource (rep t) (dtor f)?)
+functype      ::= 0x40 ps:<paramlist> rs:<resultlist>      => (func ps rs)
+                | 0x43 ps:<paramlist> rs:<resultlist>      => (func async ps rs)
+paramlist     ::= lt*:vec(<labelvaltype>)                  => (param lt)*
+resultlist    ::= 0x00 t:<valtype>                         => (result t)
+                | 0x01 0x00                                =>
+componenttype ::= 0x41 cd*:vec(<componentdecl>)            => (component cd*)
+instancetype  ::= 0x42 id*:vec(<instancedecl>)             => (instance id*)
+componentdecl ::= 0x03 id:<importdecl>                     => id
+                | id:<instancedecl>                        => id
+instancedecl  ::= 0x00 t:<core:type>                       => t
+                | 0x01 t:<type>                            => t
+                | 0x02 a:<alias>                           => a
+                | 0x04 ed:<exportdecl>                     => ed
+importdecl    ::= na:<nameattributes> et:<externtype>      => (import na et)
+exportdecl    ::= na:<nameattributes> et:<externtype>      => (export na et)
+externtype    ::= 0x00 0x11 i:<core:typeidx>               => (core module (type i))
+                | 0x01 i:<typeidx>                         => (func (type i))
+                | 0x02 b:<valuebound>                      => (value b) 🪙
+                | 0x03 b:<typebound>                       => (type b)
+                | 0x04 i:<typeidx>                         => (component (type i))
+                | 0x05 i:<typeidx>                         => (instance (type i))
+typebound     ::= 0x00 i:<typeidx>                         => (eq i)
+                | 0x01                                     => (sub resource)
+valuebound    ::= 0x00 i:<valueidx>                        => (eq i) 🪙
+                | 0x01 t:<valtype>                         => t 🪙
+```
+Notes:
+* The type opcodes follow the same negative-SLEB128 scheme as Core WebAssembly,
+  with type opcodes starting at SLEB128(-1) (`0x7f`) and going down,
+  reserving the nonnegative SLEB128s for type indices.
+* Validation of `valtype` requires the `typeidx` to refer to a `defvaltype`.
+* Validation of `own` and `borrow` requires the `typeidx` to refer to a
+  resource type.
+* Validation of `functype` rejects any transitive use of `borrow` in a
+  `result` type. Similarly, validation of components and component types
+  rejects any transitive use of `borrow` in an exported value type.
+* Validation of `stream` and `future` rejects element types that transitively
+  contain a `borrow`.
+* Validation of `stream` rejects `(stream char)` as a temporary
+  [TODO](Concurrency.md#TODO).
+* Validation of `resourcetype` requires the destructor (if present) to have
+  type `[i32] -> []`.
+* In addition to the validation rules for `alias` *definitions* mentioned above,
+  validation of `alias` *declarators* also requires:
+  * `export` aliases only alias the `instance` and `type` sorts
+  * `outer` aliases only alias the `core type` and `type` sorts
+* As described in the explainer, each component and instance type is validated
+  with an initially-empty type index space. (Outer aliases can be used to pull
+  in type definitions from containing `component` and `type` scopes.)
+* `exportdecl` introduces a new type index that can be used by subsequent type
+  definitions. In the `(eq i)` case, the new type index is effectively an alias
+  to type `i`. In the `(sub resource)` case, the new type index refers to a
+  *fresh* abstract type unequal to every existing type in all existing type
+  index spaces. (Note: *subsequent* aliases can introduce new type indices
+  equivalent to this fresh type.)
+* Validation rejects `resourcetype` type definitions inside `componenttype` and
+  `instancetype`. Thus, handle types inside a `componenttype` can only refer
+  to resource types that are imported or exported.
+* `<label>` is defined as part of the
+   [text format](Explainer.md#import-and-export-definitions).
+* All parameter labels, result labels, record field labels, variant case
+  labels, flag labels, enum case labels, component import names, component
+  export names, instance import names and instance export names must be
+  [strongly-unique] in their containing scope.
+* Validation of `externtype` requires the various `typeidx` type constructors
+  to match the preceding `sort`.
+* (The `0x00` immediate of `case` may be reinterpreted in the future as the
+  `none` case of an optional immediate.)
+* 🔧 for fixed-sized lists the length of the list must be larger than 0 to pass
+  validation.
+* Validation requires that, for every `defvaltype` `t`, `elem_size(t, 'i64')` is
+  less than 2<sup>28</sup>, as defined by the
+  [Canonical ABI](CanonicalABI.md#element-size).
+
+
+## Canonical Definitions
+
+(See [Canonical Definitions](Explainer.md#canonical-definitions) in the explainer.)
+```ebnf
+canon    ::= 0x00 0x00 f:<core:funcidx> opts:<opts> ft:<typeidx> => (canon lift f opts type-index-space[ft])
+           | 0x01 0x00 f:<funcidx> opts:<opts>                   => (canon lower f opts (core func))
+           | 0x02 rt:<typeidx>                                   => (canon resource.new rt (core func))
+           | 0x03 rt:<typeidx>                                   => (canon resource.drop rt (core func))
+           | 0x04 rt:<typeidx>                                   => (canon resource.rep rt (core func))
+           | 0x24                                                => (canon backpressure.inc (core func)) 🔀
+           | 0x25                                                => (canon backpressure.dec (core func)) 🔀
+           | 0x09 rs:<resultlist> opts:<opts>                    => (canon task.return rs opts (core func)) 🔀
+           | 0x05                                                => (canon task.cancel (core func)) 🔀
+           | 0x0a t:<core:valtype> i:<u32>                       => (canon context.get t i (core func)) 🔀
+           | 0x0b t:<core:valtype> i:<u32>                       => (canon context.set t i (core func)) 🔀
+           | 0x06 async?:<async?>                                => (canon subtask.cancel async? (core func)) 🔀
+           | 0x0d                                                => (canon subtask.drop (core func)) 🔀
+           | 0x0e t:<typeidx>                                    => (canon stream.new t (core func)) 🔀
+           | 0x0f t:<typeidx> opts:<opts>                        => (canon stream.read t opts (core func)) 🔀
+           | 0x10 t:<typeidx> opts:<opts>                        => (canon stream.write t opts (core func)) 🔀
+           | 0x11 t:<typeidx> async?:<async?>                    => (canon stream.cancel-read t async? (core func)) 🔀
+           | 0x12 t:<typeidx> async?:<async?>                    => (canon stream.cancel-write t async? (core func)) 🔀
+           | 0x13 t:<typeidx>                                    => (canon stream.drop-readable t (core func)) 🔀
+           | 0x14 t:<typeidx>                                    => (canon stream.drop-writable t (core func)) 🔀
+           | 0x2e t:<typeidx>                                    => (canon stream.forward t (core func)) ➡️
+           | 0x15 t:<typeidx>                                    => (canon future.new t (core func)) 🔀
+           | 0x16 t:<typeidx> opts:<opts>                        => (canon future.read t opts (core func)) 🔀
+           | 0x17 t:<typeidx> opts:<opts>                        => (canon future.write t opts (core func)) 🔀
+           | 0x18 t:<typeidx> async?:<async?>                    => (canon future.cancel-read t async? (core func)) 🔀
+           | 0x19 t:<typeidx> async?:<async?>                    => (canon future.cancel-write t async? (core func)) 🔀
+           | 0x1a t:<typeidx>                                    => (canon future.drop-readable t (core func)) 🔀
+           | 0x1b t:<typeidx>                                    => (canon future.drop-writable t (core func)) 🔀
+           | 0x2f t:<typeidx>                                    => (canon future.forward t (core func)) ➡️
+           | 0x1c opts:<opts>                                    => (canon error-context.new opts (core func)) 📝
+           | 0x1d opts:<opts>                                    => (canon error-context.debug-message opts (core func)) 📝
+           | 0x1e                                                => (canon error-context.drop (core func)) 📝
+           | 0x1f                                                => (canon waitable-set.new (core func)) 🔀
+           | 0x20 0x00 m:<core:memoryidx>                        => (canon waitable-set.wait (memory m) (core func)) 🔀
+           | 0x21 0x00 m:<core:memoryidx>                        => (canon waitable-set.poll (memory m) (core func)) 🔀
+           | 0x22                                                => (canon waitable-set.drop (core func)) 🔀
+           | 0x23                                                => (canon waitable.join (core func)) 🔀
+           | 0x26                                                => (canon thread.index (core func)) 🧵
+           | 0x27 ft:<core:typeidx> t:<core:tableidx>            => (canon thread.new-indirect ft t (core func)) 🧵
+           | 0x28                                                => (canon thread.resume-later (core func)) 🧵
+           | 0x29 0x00                                           => (canon thread.suspend (core func)) 🧵
+           | 0x0c 0x00                                           => (canon thread.yield (core func)) 🔀
+           | 0x2a 0x00                                           => (canon thread.suspend-then-resume (core func)) 🧵
+           | 0x2b 0x00                                           => (canon thread.yield-then-resume (core func)) 🧵
+           | 0x2c 0x00                                           => (canon thread.suspend-then-promote (core func)) 🧵
+           | 0x2d 0x00                                           => (canon thread.yield-then-promote (core func)) 🧵
+           | 0x40 sh?:<sh?> ft:<core:typeidx>                    => (canon thread.spawn-ref sh? ft (core func)) 🧵②
+           | 0x41 sh?:<sh?> ft:<core:typeidx> t:<core:tableidx>  => (canon thread.spawn-indirect sh? ft t (core func)) 🧵②
+           | 0x42 sh?:<sh?>                                      => (canon thread.available-parallelism sh? (core func)) 🧵②
+async?   ::= 0x00                                                =>
+           | 0x01                                                => async
+sh?      ::= 0x00                                                =>
+           | 0x01                                                => shared 🧵②
+opts     ::= opt*:vec(<canonopt>)                                => opt*
+canonopt ::= 0x00                                                => string-encoding=utf8
+           | 0x01                                                => string-encoding=utf16
+           | 0x02                                                => string-encoding=latin1+utf16
+           | 0x03 m:<core:memoryidx>                             => (memory m)
+           | 0x04 f:<core:funcidx>                               => (realloc f)
+           | 0x05 f:<core:funcidx>                               => (post-return f)
+           | 0x06                                                => async 🔀
+           | 0x07 f:<core:funcidx>                               => (callback f) 🔀
+```
+Notes:
+* The second `0x00` byte in `canon` stands for the `func` sort and thus the
+  `0x00 <u32>` pair standards for a `func` `sortidx` or `core:sortidx`.
+* Validation prevents duplicate or conflicting `canonopt`.
+* When there is no `string-encoding` present, the default value is `utf8`.
+  For all other values, the default value is "none".
+* Validation of the individual canonical definitions is described in
+  [`CanonicalABI.md`](CanonicalABI.md#canonical-definitions).
+
+
+## 🪙 Start Definitions
+
+(See [Start Definitions](Explainer.md#start-definitions) in the explainer.)
+```ebnf
+start ::= f:<funcidx> arg*:vec(<valueidx>) r:<u32> => (start f (value arg)* (result (value))ʳ)
+```
+Notes:
+* Validation requires `f` have `functype` with `param` arity and types matching `arg*`
+  and `result` arity `r`.
+* Validation appends the `result` types of `f` to the value index space (making
+  them available for reference by subsequent definitions).
+
+In addition to the type-compatibility checks mentioned above, the validation
+rules for value definitions additionally require that each value is consumed
+exactly once. Thus, during validation, each value has an associated "consumed"
+boolean flag. When a value is first added to the value index space (via
+`import`, `instance`, `alias` or `start`), the flag is clear. When a value is
+used (via `export`, `instantiate` or `start`), the flag is set. After
+validating the last definition of a component, validation requires all values'
+flags are set.
+
+
+## Import and Export Definitions
+
+(See [Import and Export Definitions](Explainer.md#import-and-export-definitions)
+in the explainer.)
+```ebnf
+import         ::= na:<nameattributes> et:<externtype>                  => (import na et)
+export         ::= na:<nameattributes> si:<sortidx> et?:<externtype>?   => (export na si et?)
+nameattributes ::= 0x00 len:<u32> en:<externname>                       => "en"                 (if len = |en|)
+                 | 0x01 len:<u32> en:<externname>                       => "en"                 (if len = |en|)
+                 | 0x02 len:<u32> en:<externname> a*:vec(<attribute>)   => "en" a*              (if len = |en|) 🏷️/🔗
+attribute      ::= 0x00 len:<u32> in:<interfacename>                    => (implements "in")    (if len = |in|) 🏷️
+                 | 0x01 len:<u32> s:<semversuffix>                      => (version-suffix "s") (if len = |vs|) 🔗
+                 | 0x02 n:<name>                                        => (external-id n) 🏷️
+```
+
+Notes:
+* All exports (of all `sort`s) introduce a new index that aliases the exported
+  definition and can be used by all subsequent definitions just like an alias.
+* Validation requires that all resource types transitively used in the type of an
+  export are introduced by a preceding `importdecl` or `exportdecl`.
+* Validation requires any exported `sortidx` to have a valid `externtype`
+  (which disallows core sorts other than `core module`). When the optional
+  `externtype` immediate is present, validation requires it to be a supertype
+  of the inferred `externtype` of the `sortidx`.
+* `<externname>`, `<interfacename>` and `<semversuffix>` are defined as part of
+  the [text format](Explainer.md#import-and-export-definitions).
+* The redundant `0x00`/`0x01` cases of `nameattributes` will
+  [be cleaned up for a 1.0 release](#binary-format-warts-to-fix-in-a-10-release).
+* The `externname`s of all imports in a given component or component-type must
+  be [strongly-unique]; attributes are ignored.
+* The `externname`s of all exports in a given component, instance, component-
+  type or instance-type must be [strongly-unique]; attributes are ignored.
+* Validation requires that `plainname`s annotated with `[constructor]`,
+  `[method]`, `[static]`, 📡 `[get]`, or 📡 `[set]` only occur on `func` imports
+  or exports.
+* Validation requires that, for `plainname`s annotated with `[constructor]`,
+  `[method]`, or `[static]`, the first `label` matches the `plainname` of a
+  preceding `resource` import or export, respectively, in the same scope
+  (component, component type or instance type).
+* 🏷️ Validation requires that `implements`-annotated imports or exports are
+  `instance`-typed and have a `plainname` name.
+* 🏷️/🔗 Validation requires that a `vec(<attribute>)` contains each kind of
+  `attribute` at most once.
+* 🏷️/🔗 Even though `componenttype` and `instancetype` structurally contain a
+  `vec(<attribute>)`, this list is entirely ignored when validating the types
+  of components and instances.
+* Validation of `[constructor]` names requires a `func` type whose result type
+  is either `(own $R)` or `(result (own $R) (error $E)?)`, where `$R` is the
+  named resource type.
+* Validation of `[method]` names requires the first parameter of the function
+  to be `(param "self" (borrow $R))`, where `$R` is the named resource type.
+* 📡 Validation of `[get]` names requires that the function have no parameters,
+  unless the name is also annotated with `[method]`, in which case `self` must
+  be the only parameter (subject to the `[method]` validation rules above).
+* 📡 Validation of `[get]` names requires that the function have a result type.
+  If the result type is `(result $V? (error $E)?)`, then it must have an inner
+  value type (and may or may not have an error type).
+* 📡 A getter's *property type* is its result type, except that if the result
+  type is `(result $V (error $E)?)`, the property type is `$V`. (In other
+  words, the property type "unwraps" the result type.)
+* 📡 If a name with `[set]` is defined as an import or export within a
+  particular scope, it must be preceded by a corresponding `[get]` in the same
+  scope. That is, there must already be an import or export respectively in the
+  same scope where the entire name is identical (*before* canonicalization),
+  except that the `[set]` annotation is replaced with `[get]`.
+* 📡 Validation of `[set]` names requires that the function have exactly one
+  parameter, unless the name is also annotated with `[method]`, in which case
+  there must be two parameters, the first of which is `self` (subject to the
+  `[method]` validation rules above). The type of this parameter must match the
+  corresponding getter's *property type*.
+* 📡 Validation of `[set]` names requires that the function have either no
+  result type or a result type of `(result (error $E)?)` (with no value type).
+* 🔀/📡 Functions with `[get]` or `[set]` names must not be `async`.
+* 🔗 Validation requires that a `version-suffix` is only present on
+  `instance`-typed imports or exports that have either an `implements`
+  attribute or an `interfacename` name.
+* 🔗 Validation requires that every `interfacename` with an `interfaceversion`
+  satisfies the [canonical interface name] rules.
+
+## 🪙 Value Definitions
+
+(See [Value Definitions](Explainer.md#value-definitions) in the explainer.)
+
+```ebnf
+value                      ::= t:<valtype> len:<core:u32> v:<val(t)>   => (value t v) (where len = ||v||)
+val(bool)                  ::= 0x00                                    => false
+                             | 0x01                                    => true
+val(u8)                    ::= v:<core:byte>                           => v
+val(s8)                    ::= v:<core:byte>                           => v' (where v' = v if v < 128 else (v - 256))
+val(s16)                   ::= v:<core:s16>                            => v
+val(u16)                   ::= v:<core:u16>                            => v
+val(s32)                   ::= v:<core:s32>                            => v
+val(u32)                   ::= v:<core:u32>                            => v
+val(s64)                   ::= v:<core:s64>                            => v
+val(u64)                   ::= v:<core:u64>                            => v
+val(f32)                   ::= v:<core:f32>                            => v (if !isnan(v))
+                             | 0x00 0x00 0xC0 0x7F                     => nan
+val(f64)                   ::= v:<core:f64>                            => v (if !isnan(v))
+                             | 0x00 0x00 0x00 0x00 0x00 0x00 0xF8 0x7F => nan
+val(char)                  ::= b*:<core:byte>*                         => c (where b* = core:utf8(c))
+val(string)                ::= v:<core:name>                           => v
+val(i:<typeidx>)           ::= v:<val(type-index-space[i])>            => v
+val((record (field l t)+)) ::= v+:<val(t)>+                            => (record v+)
+val((variant (case l t?)+) ::= i:<core:u32> v?:<val(t[i])>?            => (variant l[i] v?)
+val((list t))              ::= v:vec(<val(t)>)                         => (list v)
+val((list t len))          ::= (v:<val(t)>)^len                        => (list v^len) 🔧
+val((tuple t+))            ::= v+:<val(t)>+                            => (tuple v+)
+val((flags l+))            ::= (v:<core:byte>)^N                       => (flags (l[i] for i in 0..|l+|-1 if v[floor(i / 8)] & 2^(i mod 8) > 0)) (where N = ceil(|l+| / 8))
+val((enum l+))             ::= i:<core:u32>                            => (enum l[i])
+val((option t))            ::= 0x00                                    => none
+                             | 0x01 v:<val(t)>                         => (some v)
+val((result))              ::= 0x00                                    => ok
+                             | 0x01                                    => error
+val((result t))            ::= 0x00 v:<val(t)>                         => (ok v)
+                             | 0x01                                    => error
+val((result (error u)))    ::= 0x00                                    => ok
+                             | 0x01 v:<val(u)>                         => (error v)
+val((result t (error u)))  ::= 0x00 v:<val(t)>                         => (ok v)
+                             | 0x01 v:<val(u)>                         => (error v)
+val((map k v))             ::= e*:vec(<entryval(k, v)>)                => (map e*) 🗺️
+entryval(k, v)             ::= key:<val(k)> val:<val(v)>               => (entry key val) 🗺️
+```
+
+Notes:
+* Reused Core binary rules and functions:
+    - [`core:name`]
+    - [`core:byte`]
+    - [`core:s16`]
+    - [`core:s32`]
+    - [`core:s64`]
+    - [`core:u16`]
+    - [`core:u32`]
+    - [`core:u64`]
+    - [`core:f32`]
+    - [`core:f64`]
+    - [`core:utf8`]
+* `&` operator is used to denote bitwise AND operation, which performs AND on every bit of two numbers in their binary form
+* `isnan` is a function, which takes a floating point number as a parameter and returns `true` iff it represents a NaN as defined in [IEEE 754 standard]
+* `||B||` is the length of the byte sequence generated from the production `B` in a derivation as defined in [Core convention auxiliary notation]
+
+## Name Section
+
+Like the core wasm [name
+section](https://webassembly.github.io/spec/core/appendix/custom.html#name-section)
+a similar `name` custom section is specified here for components to be able to
+name all the declarations that can happen within a component. Similarly like its
+core wasm counterpart validity of this custom section is not required and
+engines should not reject components which have an invalid `name` section.
+
+```ebnf
+namesec    ::= section_0(namedata)
+namedata   ::= n:<name>                (if n = 'component-name')
+               name:<componentnamesubsec>?
+               sortnames*:<sortnamesubsec>*
+namesubsection_N(B) ::= N:<byte> size:<u32> B     (if size == |B|)
+
+componentnamesubsec ::= namesubsection_0(<name>)
+sortnamesubsec ::= namesubsection_1(<sortnames>)
+sortnames ::= sort:<sort> names:<namemap>
+
+namemap ::= names:vec(<nameassoc>)
+nameassoc ::= idx:<u32> name:<name>
+```
+
+where `namemap` is the same as for core wasm. A particular `sort` should only
+appear once within a `name` section, for example component instances can only be
+named once.
+
+
+## Binary Format Warts to Fix in a 1.0 Release
+
+* The opcodes (for types, canon built-ins, etc) should be re-sorted
+* The two `list` type codes should be merged into one with an optional immediate
+  and similarly for `func`.
+* The redundant `0x00` and `0x01` opcodes of `nameattributes` will be merged.
+* The vestigial `0x00` in `thread.*` and `waitable-set.*` built-ins may be
+  removed.
+* Most built-ins should have a `<canonopt>*` immediate instead of an ad hoc
+  subset of `canonopt`s.
+* Add optional `shared` immediate to all canonical definitions (explicitly or
+  via `<canonopt>`) when shared-everything-threads (🧵②) is added.
+
+
+[`core:byte`]: https://webassembly.github.io/spec/core/binary/values.html#binary-byte
+[`core:s16`]: https://webassembly.github.io/spec/core/binary/values.html#integers
+[`core:u16`]: https://webassembly.github.io/spec/core/binary/values.html#integers
+[`core:s32`]: https://webassembly.github.io/spec/core/binary/values.html#integers
+[`core:u32`]: https://webassembly.github.io/spec/core/binary/values.html#integers
+[`core:s64`]: https://webassembly.github.io/spec/core/binary/values.html#integers
+[`core:u64`]: https://webassembly.github.io/spec/core/binary/values.html#integers
+[`core:f32`]: https://webassembly.github.io/spec/core/binary/values.html#floating-point
+[`core:f64`]: https://webassembly.github.io/spec/core/binary/values.html#floating-point
+[`core:utf8`]: https://webassembly.github.io/spec/core/binary/values.html#binary-utf8
+[`core:section`]: https://webassembly.github.io/spec/core/binary/modules.html#binary-section
+[`core:custom`]: https://webassembly.github.io/spec/core/binary/modules.html#custom-section
+[`core:module`]: https://webassembly.github.io/spec/core/binary/modules.html#binary-module
+[`core:version`]: https://webassembly.github.io/spec/core/binary/modules.html#binary-version
+[`core:name`]: https://webassembly.github.io/spec/core/binary/values.html#binary-name
+[`core:import`]: https://webassembly.github.io/spec/core/binary/modules.html#binary-import
+[`core:externtype`]: https://webassembly.github.io/spec/core/binary/types.html#binary-externtype
+[`core:functype`]: https://webassembly.github.io/spec/core/binary/types.html#binary-functype
+[`core:rectype]: https://webassembly.github.io/gc/core/binary/types.html#recursive-types
+
+[Strongly-unique]: Explainer.md#name-uniqueness
+[Canonical Interface Name]: Explainer.md#-canonical-interface-name
+
+[type-imports]: https://github.com/WebAssembly/proposal-type-imports/blob/master/proposals/type-imports/Overview.md
+[module-linking]: https://github.com/WebAssembly/module-linking/blob/main/proposals/module-linking/Explainer.md
+
+[IEEE 754 standard]: https://ieeexplore.ieee.org/document/8766229
+[Core convention auxiliary notation]: https://webassembly.github.io/spec/core/binary/conventions.html#auxiliary-notation

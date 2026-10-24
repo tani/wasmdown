@@ -20,8 +20,10 @@ note        = "Discovery-only mirror; core cases counted from WebAssembly/spec, 
 [component.model]
 name        = "WebAssembly Component Model"
 repo        = "https://github.com/WebAssembly/component-model"
-commit      = "not-yet-vendored"
-note        = "Required at M7; see PLAN.md §12.1"
+commit      = "d095e2f60ddae1f9a1e9b1e2fb547ec1114da677"
+commit_date = "2026-10-24"
+vendored    = "tests/component/*.wast (75 files: async 45, binary 1, linking 4, resources 3, validation 14, values 8; nyi.txt carried) + specs/{Binary,CanonicalABI,WIT,Linking,Explainer}.md (design/mvp)"
+note        = "M7 prerequisite vendored per PLAN.md §12.1; the layer byte is 0x01 0x00, version 0x0d pre-standardization"
 
 [wasi]
 release     = "0.3.2 (2026-10-13)"
