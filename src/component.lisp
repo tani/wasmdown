@@ -51,6 +51,29 @@
            #:ct-offset
            #:component-type-p
            #:make-ct
+           ;; IR constructors (M7 slice 2: the TEXT parser builds the
+           ;; SAME IR records the binary reader builds; :use only
+           ;; inherits exports, so these must be explicit)
+           #:make-compdef #:make-comp #:comp-defs #:compdef-kind
+           #:compdef-payload #:compdef-offset
+           #:make-aliasrec #:aliasrec-kind #:aliasrec-sort
+           #:aliasrec-count #:aliasrec-target #:aliasrec-index
+           #:aliasrec-name #:aliasrec-offset
+           #:make-typedecl #:typedecl-kind #:typedecl-payload
+           #:make-importrec #:importrec-name #:importrec-type
+           #:importrec-attrs
+           #:make-exportrec #:exportrec-name #:exportrec-attrs
+           #:exportrec-sortidx #:exportrec-type #:exportrec-offset
+           #:make-instrec #:instrec-kind #:instrec-index
+           #:instrec-args #:instrec-exports
+           #:make-coreinstrec #:coreinstrec-kind #:coreinstrec-index
+           #:coreinstrec-args #:coreinstrec-exports
+           #:make-canonrec #:canonrec-kind #:canonrec-func
+           #:canonrec-typeidx #:canonrec-opts #:canonrec-imms
+           #:canonrec-offset
+           #:make-startrec #:startrec-func #:startrec-args
+           ;; canonopt validation helpers (slice 2 canon rules)
+           #:cval-func-types
            ;; value type predicates used by the validator
            #:ct-primitive-p
            #:ct-defvaltype-p
@@ -59,6 +82,8 @@
            #:validate-component
            ;; labels + externnames
            #:label-p
+           #:words-p
+           #:remove-annotations
            #:externname-kind
            #:parse-externname
            #:canonicalize-externname
@@ -125,6 +150,33 @@ no empty fragments (`a-`, `a--`, empty are all rejected)."
                  do (cond ((and (< start i)
                                 (%frag-range-p s start i first))
                            (setf start (1+ i) first nil))
+                          (t (setf ok nil))))
+         ok)))
+
+(defun %word-range-p (s start end)
+  "One `word` (Explainer line 2776): [0-9a-z]+ — lowercase/digits."
+  (declare (type string s) (type fixnum start end))
+  (when (<= end start) (return-from %word-range-p nil))
+  (loop for i from start below end
+        always (let ((c (char s i)))
+                 (or (and (char<= #\a c) (char<= c #\z)) (%digit-p c)))))
+
+(defun words-p (s)
+  "A `words` (Explainer line 2783): first-word ('-' word)* where
+first-word ::= [a-z][0-9a-z]* — LOWERCASE-starting only, unlike
+`label` (which permits first-acronyms). The namespace and package
+of an interface name use this stricter form (kebab.wast: `A:b/c`,
+`1:b/c`, `ns-A:b/c`, `ns:pkg-A/b` are all invalid interface names)."
+  (and (stringp s) (plusp (length s))
+       (char<= #\a (char s 0))
+       (char<= (char s 0) #\z)
+       (let ((start 0) (ok t))
+         (declare (type fixnum start))
+         (loop for i from 0 to (length s)
+               while ok
+               when (or (= i (length s)) (char= (char s i) #\-))
+                 do (cond ((%word-range-p s start i)
+                           (setf start (1+ i)))
                           (t (setf ok nil))))
          ok)))
 
@@ -1562,6 +1614,16 @@ declaration order) + the outer scope stack."
   (instances 0 :type (integer 0))
   (core-instances 0 :type (integer 0))
   (core-modules 0 :type (integer 0))
+  (core-memories 0 :type (integer 0))
+  (core-tables 0 :type (integer 0))
+  (core-globals 0 :type (integer 0))
+  (core-tags 0 :type (integer 0))
+  ;; parallel func index space: the ct (functype) of each func
+  ;; (import / lift / alias / export) in declaration order; entries
+  ;; may be nil for funcs whose type is not locally resolvable
+  ;; (outer-aliased or forward-referenced) — the canon lower rules
+  ;; skip a nil entry.
+  (func-types #() :type vector)
   (exports '())                           ; (name kind) records seen
   (imports '()))
 
@@ -1813,8 +1875,8 @@ message (the fixtures' messages embed the bad name)."
              (iface-part (subseq name (1+ slash)))
              (at (position #\@ iface-part)))
         (cond
-         ((not (label-p ns-part)) (kebab-bad ns-part))
-         ((not (label-p pkg-part)) (kebab-bad pkg-part))
+         ((not (words-p ns-part)) (kebab-bad ns-part))
+         ((not (words-p pkg-part)) (kebab-bad pkg-part))
          (at
           (let ((base (subseq iface-part 0 at)))
             (if (label-p base)
@@ -1944,7 +2006,10 @@ targets, and the elem_size < 2^28 bound."
     ;; type index space + outer aliases pull in outer types)
     ((:component :instance)
      (let ((inner (make-cval :types (make-array 16 :fill-pointer 0
-                                                :adjustable t))))
+                                                :adjustable t)
+                             :func-types (make-array 16
+                                                    :fill-pointer 0
+                                                    :adjustable t))))
        (dolist (d (coerce (ct-payload c) 'list))
          (case (typedecl-kind d)
            (:core-type nil)     ; core types keep their own space
@@ -2000,11 +2065,30 @@ component/instance types get their own shapes."
       (%check-defvaltype c state)))
 
 (defun %check-outer-alias (a state outer-depth)
-  "Outer alias counts: ct must be <= the number of enclosing scopes
-(outer-alias.wast / binary.wast: 'invalid outer alias count of N')."
+  "Outer alias validation (outer-alias.wast): the count must be <=
+the number of enclosing scopes ('invalid outer alias count of N');
+when count==outer-depth the target index must be in bounds of the
+ALIASING scope's own index space ('index out of bounds' — an alias
+outer 0 0 sees the current component's types)."
   (let ((ct (aliasrec-count a)))
     (unless (<= ct outer-depth)
-      (%verr "invalid outer alias count of ~d" ct))))
+      (%verr "invalid outer alias count of ~d" ct)))
+  ;; count == outer-depth targets THIS scope's index spaces
+  (when (= (aliasrec-count a) outer-depth)
+    (let ((target (aliasrec-target a))
+          (sort (aliasrec-sort a)))
+      (case sort
+        (:type (when (>= target (length (cval-types state)))
+                 (%verr "type index out of bounds")))
+        (:core-type (when (>= target (length (cval-core-types state)))
+                      (%verr "core type index out of bounds")))
+        (:core-module (when (>= target (cval-core-modules state))
+                        (%verr "module index out of bounds")))
+        (:component (when (>= target (cval-components state))
+                      (%verr "component index out of bounds")))
+        (:func (when (>= target (cval-funcs state))
+                 (%verr "function index out of bounds")))
+        (t nil)))))
 
 (defun %check-externtype (et state inner)
   "The sort checks of an externtype against the type spaces: a func
@@ -2034,14 +2118,143 @@ indicies.wast)."
        (if (eq payload :sub-resource)
            nil
            (let ((c (%ct-at state (second payload))))
-             (unless (ct-defvaltype-p c)
-               (%verr "type index ~d is not a defined type" (second payload))))))
+             (unless (or (ct-defvaltype-p c)
+                         (ct-resourcetype-p c))
+               (%verr "type index ~d is not a defined type"
+                      (second payload))))))
       (:value
        (when (and (consp payload) (eq (car payload) :eq))
          (when (>= (second payload) (cval-values state))
            (%verr "value index out of bounds"))))
       (t nil))
     nil))
+
+
+(defun %opt (opts key)
+  "A canonopt lookup: OPTS is an assoc-list of (KEY value) lists
+\(both the text parser and the binary reader build it this way)."
+  (assoc key opts :test #'eq))
+
+(defun %flat-count (vt state)
+  "The flattened core-value count of a component valtype per
+CanonicalABI.md flatten_type: bool/u8/u16/u32/s8/s16/s32/char/
+error-context/flags/own/borrow/stream/future -> 1 flat; string ->
+2 (ptr pair); s64/u64 -> 1 (i64); f32/f64 -> 1; record/tuple
+flatten to the SUM of their fields; variant the MAX over cases;
+list recurses on its element; :idx resolves through the type
+space."
+  (let ((c (if (and (consp vt) (eq (car vt) :idx))
+               (%ct-at state (cdr vt))
+               (if (ct-p vt) vt (make-ct :kind :prim :payload vt)))))
+    (ecase (ct-kind c)
+      ((:prim :flags :enum :option :own :borrow :stream :future
+        :resource :func :instance :component)
+       (if (and (eq (ct-kind c) :prim) (eq (ct-payload c) :string))
+           2 1))
+      ((:record) (reduce #'+ (ct-payload c)
+                         :key (lambda (f) (%flat-count (cdr f) state))))
+      ((:tuple) (reduce #'+ (ct-payload c)
+                        :key (lambda (v) (%flat-count v state))))
+      ((:list) (%flat-count (car (ct-payload c)) state))
+      ((:variant) (let ((best 0))
+                    (loop for (nil . v) across (ct-payload c)
+                          do (when v
+                               (setf best (max best
+                                               (%flat-count v state)))))
+                    best))
+      ((:result) (let ((v (second (ct-payload c))))
+                   (if v (%flat-count v state) 0)))
+      ((:map) 2))))
+
+(defun %needs-memory-p (vt state)
+  "lower(T)/lift(T) memory forcing: a LIST or STRING anywhere in T
+\(CanonicalABI.md 'canonopt Validation')."
+  (let ((c (if (and (consp vt) (eq (car vt) :idx))
+               (%ct-at state (cdr vt))
+               (if (ct-p vt) vt (make-ct :kind :prim :payload vt)))))
+    (ecase (ct-kind c)
+      ((:prim) (eq (ct-payload c) :string))
+      ((:list) t)
+      ((:record) (loop for (nil . v) across (ct-payload c)
+                       thereis (%needs-memory-p v state)))
+      ((:tuple) (loop for v across (ct-payload c)
+                      thereis (%needs-memory-p v state)))
+      ((:variant) (loop for (nil . v) across (ct-payload c)
+                         thereis (and v (%needs-memory-p v state))))
+      ((:option :result :own :borrow :stream :future :flags :enum
+        :map :func :instance :component :resource) nil))))
+
+(defun %check-canon-opts (cr state context)
+  "The canon lift/lower option rules (CanonicalABI.md):
+realloc implies memory (canonopt rule); lift(T) requires realloc
+for list/string params; lower(T) requires memory for list/string
+params/results; memory is required when flat params exceed
+MAX_FLAT_PARAMS (16) or flat results exceed MAX_FLAT_RESULTS (1).
+For :lift the functype is the canonrec's explicit typeidx; for
+:lower it is the LOWERED func's type from the validator's parallel
+func-type space. This slice implements the SYNC rules; the async
+task-return shapes are a later slice."
+  (let* ((opts (canonrec-opts cr))
+         (mem (%opt opts :memory))
+         (realloc (%opt opts :realloc))
+         (typeidx (canonrec-typeidx cr))
+         (ft (if (eq context :lift)
+                 (when typeidx (%ct-at state typeidx))
+                 (let ((f (canonrec-func cr)))
+                   (when (and (< f (length (cval-func-types state)))
+                              (aref (cval-func-types state) f))
+                     (aref (cval-func-types state) f))))))
+    ;; canonopt: realloc implies memory (abi.wast pins the message)
+    (when (and realloc (not mem))
+      (%verr "canonical option `realloc` requires `memory` to also be specified"))
+    (when ft
+      (let* ((params (first (ct-payload ft)))
+             (results (second (ct-payload ft))))
+        ;; NOTE: the functype payload is
+        ;; (params-vector single-result-valtype-or-nil async-p):
+        ;; RESULTS is ONE valtype, not a sequence.
+        (let ((bad
+                (cond
+                 ((eq context :lift)
+                  (loop for (nil . vt) across params
+                        thereis (%needs-memory-p vt state)))
+                 ((eq context :lower)
+                  (or (loop for (nil . vt) across params
+                            thereis (%needs-memory-p vt state))
+                      (and results
+                           (%needs-memory-p results state)))))))
+          (when bad
+            ;; fixture precedence (abi.wast ::4-::5): when BOTH memory
+            ;; and realloc are absent, the `memory` message is
+            ;; expected; realloc's message fires only when memory is
+            ;; present but realloc is not.
+            (ecase context
+              (:lift (cond
+                      ((not mem)
+                       (%verr "canonical option `memory` is required"))
+                      ((not realloc)
+                       (%verr "canonical option `realloc` is required"))))
+              (:lower (unless mem
+                        (%verr "canonical option `memory` is required"))))))
+        ;; flat-count rules: params > 16 or result flats > 1
+        (let ((nparams (loop for (nil . vt) across params
+                             sum (%flat-count vt state)))
+              (nresults (if results (%flat-count results state) 0)))
+          (when (> nparams 16)
+            (ecase context
+              (:lift (cond
+                      ((not mem)
+                       (%verr "canonical option `memory` is required"))
+                      ((not realloc)
+                       (%verr "canonical option `realloc` is required"))))
+              (:lower (unless mem
+                        (%verr "canonical option `memory` is required")))))
+          (when (> nresults 1)
+            (ecase context
+              (:lift (unless mem
+                       (%verr "canonical option `memory` is required")))
+              (:lower (unless mem
+                        (%verr "canonical option `memory` is required"))))))))))
 
 (defun %check-sortidx (si state)
   "A sortidx's index must be in bounds for its sort's index space
@@ -2077,12 +2290,15 @@ bounds', ...)."
 (kebab.wast, extern-names.wast)."
   (multiple-value-bind (kind detail) (parse-externname name)
     (when (eq kind :invalid)
-      (if (and detail (search "kebab" detail :test #'char-equal))
-          (%verr "`~a` is not in kebab case"
-                 (if (and (>= (length detail) 3)
-                          (char= (char detail 0) #\`))
-                     (subseq detail 1 (position #\` detail :start 1))
-                     name))
+      ;; kebab-bad's detail names the offending FRAGMENT (or an
+      ;; explanatory string): a fragment-shaped detail maps to the
+      ;; kebab message the fixtures pin (kebab.wast: "`1` is not in
+      ;; kebab case"); anything else is the generic invalid-name.
+      (if (and detail (plusp (length detail))
+               (not (find-if (lambda (ch)
+                               (or (char= ch #\ ) (char= ch #\`)))
+                             detail)))
+          (%verr "`~a` is not in kebab case" detail)
           (%verr "is not a valid extern name"))))
   ;; strongly-unique (Explainer Name Uniqueness): canonicalize = strip
   ;; annotations per the rules; compare case-insensitively
@@ -2094,10 +2310,54 @@ bounds', ...)."
     (setf (gethash canon table) name)))
 
 (defun remove-annotations (name)
-  "Canonicalization step 1.2/1.3 (Explainer Name Uniqueness): the
-[...]*l.l method/static forms reduce to l; [constructor]/[set] and
-plain annotations are stripped for the comparison."
-  name)
+  "Canonicalization steps 1.2/1.3 (Explainer Name Uniqueness):
+  1.2: if the name is [...]*l.l, replace with l (the FIRST label —
+       [method]foo.bar and [static]foo.baz both reduce to foo);
+  1.3: strip [...] annotations besides [constructor] and [set].
+Step 1.1 (hyphen removal + lowercasing) is %kebab-key's job; this
+function returns the pre-1.1 name."
+  (declare (type string name))
+  (labels
+      ((strip-annotations (s)
+         ;; step 1.3, applied to a PLAIN (non-annotated) name
+         (let ((open (position #\[ s)))
+           (if (null open)
+               s
+               (let ((close (position #\] s :start open)))
+                 (if (null close)
+                     s
+                     (let* ((ann (subseq s (1+ open) close))
+                            (keep (or (string= ann "constructor")
+                                      (string= ann "set")))
+                            (tail (strip-annotations
+                                   (subseq s (1+ close)))))
+                       (concatenate 'string
+                                    (subseq s 0 open)
+                                    (if keep (subseq s open (1+ close)) "")
+                                    tail))))))))
+    (if (and (plusp (length name)) (char= (char name 0) #\[))
+        ;; an annotated name: split the annotation prefix off, apply
+        ;; 1.2's reduction (ONLY when the l.l labels MATCH — the
+        ;; Explainer's reduction example is [method]foo.foo -> foo;
+        ;; a differing pair [method]foo.bar keeps its distinct
+        ;; identity), then reattach [constructor]/[set] per 1.3
+        (let* ((close (position #\] name :from-end t))
+               (body (and close (subseq name (1+ close))))
+               (dot (and body (position #\. body)))
+               (l1 (and dot (subseq body 0 dot)))
+               (l2 (and dot (subseq body (1+ dot))))
+               (matches (and l1 l2 (string= l1 l2)))
+               (reduced (cond
+                         ((and dot matches) l1)
+                         (dot body)
+                         (t body)))
+               (ann (and close (subseq name 1 close))))
+          (cond
+           ((null close) name)
+           ((or (string= ann "constructor") (string= ann "set"))
+            (concatenate 'string (subseq name 0 (1+ close)) reduced))
+           (t reduced)))
+        (strip-annotations name))))
 
 (defun validate-component (comp &key (outer-depth 0))
   "Validate a decoded component. Signals wasmdown:validation-error on
@@ -2106,6 +2366,7 @@ number of enclosing component/type scopes (outer aliases)."
   (let ((state (make-cval
                 :types (make-array 16 :fill-pointer 0 :adjustable t)
                 :core-types (make-array 16 :fill-pointer 0 :adjustable t)
+                :func-types (make-array 16 :fill-pointer 0 :adjustable t)
                 :imports (make-hash-table :test #'equal)
                 :exports (make-hash-table :test #'equal)))
         (core-funcs 0) (memories 0) (tables 0) (globals 0))
@@ -2127,7 +2388,13 @@ number of enclosing component/type scopes (outer aliases)."
                  (:core-type
                   ;; core types: rectypes + the 0x50 moduletype shape
                   (vector-push-extend payload (cval-core-types state)))
-                 (:component (incf (cval-components state)))
+                 (:component
+                  ;; a nested component is a full component: validate
+                  ;; its defs with one more enclosing scope (an alias
+                  ;; outer 1 ... inside it sees THIS scope).
+                  (validate-component payload
+                                      :outer-depth (1+ outer-depth))
+                  (incf (cval-components state)))
                  (:instance
                   (ecase (instrec-kind payload)
                     (:instantiate
@@ -2138,7 +2405,19 @@ number of enclosing component/type scopes (outer aliases)."
                            do (%check-sortidx si state)))
                     (:inline-exports
                      (loop for (nil . si) across (instrec-exports payload)
-                           do (%check-sortidx si state))))
+                           do (%check-sortidx si state))
+                     ;; the inline-export NAMES are externnames:
+                     ;; kebab + strongly-unique within this scope
+                    (loop for pair across (instrec-exports payload)
+                          do (%check-externname
+                              ;; pair shapes: (name sort . idx) from
+                              ;; %parse-inline-export; ((name attrs)
+                              ;; . sortidx) from instance-def's export
+                              ;; arms — the NAME is what validates.
+                              (if (consp (car pair))
+                                  (first (car pair))
+                                  (car pair))
+                              state nil))))
                   (incf (cval-instances state)))
                  (:alias
                   (case (aliasrec-kind payload)
@@ -2162,14 +2441,20 @@ number of enclosing component/type scopes (outer aliases)."
                     (:type (vector-push-extend
                             (make-ct :kind :prim :payload :outer-aliased)
                             (cval-types state)))
-                    (:func (incf (cval-funcs state)))
+                    (:func (incf (cval-funcs state))
+                           (vector-push-extend nil (cval-func-types state)))
                     (:component (incf (cval-components state)))
                     (:instance (incf (cval-instances state)))
                     (:value (incf (cval-values state)))
                     (:core-module (incf (cval-core-modules state)))
                     (:core-type (vector-push-extend :aliased
                                                      (cval-core-types state)))
-                    (:core-func (incf (cval-core-funcs state)))))
+                    (:core-func (incf (cval-core-funcs state)))
+                    (:core-instance (incf (cval-core-instances state)))
+                    (:core-memory (incf (cval-core-memories state)))
+                    (:core-table (incf (cval-core-tables state)))
+                    (:core-global (incf (cval-core-globals state)))
+                    (:core-tag (incf (cval-core-tags state)))))
                  (:type
                   (%check-deftype payload state)
                   (vector-push-extend payload (cval-types state)))
@@ -2183,11 +2468,19 @@ number of enclosing component/type scopes (outer aliases)."
                        (let ((c (%ct-at state (canonrec-typeidx payload))))
                          (unless (ct-functype-p c)
                            (%verr "type index ~d is not a function type"
-                                  (canonrec-typeidx payload))))))
+                                  (canonrec-typeidx payload)))))
+                     ;; lift requires realloc for list/string params
+                     ;; and memory for >MAX_FLAT flat results
+                     ;; (CanonicalABI.md 'canon lift').
+                     (%check-canon-opts payload state :lift))
                     (:lower
                      (when (>= (canonrec-func payload)
                                (cval-funcs state))
-                       (%verr "function index out of bounds")))
+                       (%verr "function index out of bounds"))
+                     ;; lower requires memory for list/string and for
+                     ;; >MAX_FLAT params/results (CanonicalABI.md
+                     ;; 'canon lower').
+                     (%check-canon-opts payload state :lower))
                     ((:resource-new :resource-drop :resource-rep)
                      (let ((c (%ct-at state (canonrec-typeidx payload))))
                        (unless (ct-resourcetype-p c)
@@ -2200,15 +2493,40 @@ number of enclosing component/type scopes (outer aliases)."
                        (when (and (integerp imm)
                                   (>= imm (length (cval-types state))))
                          (%verr "type index out of bounds")))))
-                  (incf (cval-funcs state)))
+                  (incf (cval-funcs state))
+                  (vector-push-extend
+                   ;; a lifted func carries its functype (via the
+                   ;; canonrec's typeidx); lower/builtins introduce a
+                   ;; core-side func — no component functype to track.
+                   (if (and (eq (canonrec-kind payload) :lift)
+                            (canonrec-typeidx payload))
+                       (aref (cval-types state) (canonrec-typeidx payload))
+                       nil)
+                   (cval-func-types state)))
                  (:import
                   (%check-externname (importrec-name payload) state t)
                   (%check-externtype (importrec-type payload) state nil)
                   ;; imports extend the imported sort's space
                   (case (car (importrec-type payload))
-                    (:func (incf (cval-funcs state)))
-                    (:type (vector-push-extend :imported-type
-                                               (cval-types state)))
+                    (:func (incf (cval-funcs state))
+                           (vector-push-extend
+                            (aref (cval-types state)
+                                  (cdr (importrec-type payload)))
+                            (cval-func-types state)))
+                    ;; an imported type is an opaque DEFINED type;
+                    ;; a (sub resource) import IS a resource type —
+                    ;; own/borrow must accept it (annotated-names
+                    ;; pins the positive).
+                    (:type (vector-push-extend
+                            (if (eq (cdr (importrec-type payload))
+                                    :sub-resource)
+                                (make-ct :kind :resource
+                                        :payload '(0 . nil)
+                                        :offset 0)
+                                (make-ct :kind :prim
+                                        :payload :imported
+                                        :offset 0))
+                            (cval-types state)))
                     (:value (incf (cval-values state)))
                     (:component (incf (cval-components state)))
                     (:instance (incf (cval-instances state)))
@@ -2220,9 +2538,33 @@ number of enclosing component/type scopes (outer aliases)."
                     (%check-externtype (exportrec-type payload) state nil))
                   ;; every export introduces a new index of its sort
                   (case (sortidx-sort (exportrec-sortidx payload))
-                    (:func (incf (cval-funcs state)))
-                    (:type (vector-push-extend :exported-type
-                                               (cval-types state)))
+                    (:func (incf (cval-funcs state))
+                           (vector-push-extend nil (cval-func-types state)))
+                    (:type (vector-push-extend
+                            ;; the exported type's SHAPE is the
+                            ;; sortidx'd type's ct (an export
+                            ;; re-exports the definition); an
+                            ;; ascription overrides it. Opaque
+                            ;; prim marker otherwise.
+                            (let ((ti (sortidx-idx
+                                       (exportrec-sortidx payload))))
+                              (if (and (exportrec-type payload)
+                                       (consp (cdr (exportrec-type
+                                                    payload)))
+                                       (eq (car (cdr (exportrec-type
+                                                      payload)))
+                                           :sub-resource))
+                                  (make-ct :kind :resource
+                                           :payload '(0 . nil)
+                                           :offset 0)
+                                  (if (and (< ti (length (cval-types state)))
+                                           (ct-p (aref (cval-types state)
+                                                       ti)))
+                                      (aref (cval-types state) ti)
+                                      (make-ct :kind :prim
+                                               :payload :exported
+                                               :offset 0))))
+                            (cval-types state)))
                     (:value (incf (cval-values state)))
                     (:component (incf (cval-components state)))
                     (:instance (incf (cval-instances state)))

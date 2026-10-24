@@ -219,6 +219,77 @@ wast runner's string-to-bytes decoder (same grammar as the suite)."
      (wasmdown.component:decode-component
       (%comp (%type-sec "\\01\\67\\7d\\ff\\ff\\ff\\ff\\00"))))))
 
+;;; ---- M7 slice 2 pins: canonopt rules + the TEXT grammar ----
+
+(test component/canonopt-memory-rules
+  (flet ((expect-invalid (thunk)
+           (block nil
+             (handler-case (funcall thunk)
+               (wasmdown:validation-error (c) (return c)))
+             (error "expected wasmdown:validation-error"))))
+    ;; (canon lower ...) of an 8-u64-tuple result: flat results 8 > 1
+    ;; so memory is REQUIRED (abi.wast).
+    (let ((src "(component (import \"foo\" (func $foo (result (tuple u64 u64 u64 u64)))) (canon lower (func $foo) (core func $foo')))"))
+      (let ((c (expect-invalid
+                (lambda ()
+                  (wasmdown.component:validate-component
+                   (wasmdown.component.text::parse-component-text src))))))
+        (is (search "canonical option `memory` is required"
+                    (wasmdown:wasmdown-error-message c)))))
+    ;; realloc without memory: the exact abi.wast message
+    (let ((src "(component (import \"foo\" (func $foo)) (canon lower (func $foo) (realloc (core func 0)) (core func $foo')))"))
+      (let ((c (expect-invalid
+                (lambda ()
+                  (wasmdown.component:validate-component
+                   (wasmdown.component.text::parse-component-text src))))))
+        (is (search "canonical option `realloc` requires `memory` to also be specified"
+                    (wasmdown:wasmdown-error-message c)))))
+    ;; small-result lower with memory+realloc: VALID
+    (let ((src "(component (import \"foo\" (func $foo (param \"x\" u32) (result u32))) (core module $M (memory (export \"mem\") 1) (func (export \"realloc\") (param i32 i32 i32 i32) (result i32) unreachable)) (core instance $i (instantiate $M)) (canon lower (func $foo) (memory (core memory $i \"mem\")) (realloc (core func $i \"realloc\")) (core func $foo')))"))
+      (wasmdown.component:validate-component
+       (wasmdown.component.text::parse-component-text src)))
+    ;; inverted lift, list param, no memory: memory message (abi.wast)
+    (let ((src "(component (core module $M (func (export \"f\") (param i32 i32))) (core instance $i (instantiate $M)) (func $f (param \"p\" (list u8)) (canon lift (core func $i \"f\"))))"))
+      (let ((c (expect-invalid
+                (lambda ()
+                  (wasmdown.component:validate-component
+                   (wasmdown.component.text::parse-component-text src))))))
+        (is (search "canonical option `memory` is required"
+                    (wasmdown:wasmdown-error-message c)))))))
+
+(test component/externname-grammar-pins
+  (flet ((expect-invalid (thunk)
+           (block nil
+             (handler-case (funcall thunk)
+               (wasmdown:validation-error (c) (return c)))
+             (error "expected wasmdown:validation-error"))))
+    ;; interface names: namespace/package use the STRICT words
+    ;; grammar (lowercase-start) — kebab.wast's `A:b/c`, `1:b/c`
+    (is (wasmdown.component:words-p "ns"))
+    (is (wasmdown.component:words-p "ns-pkg"))
+    (is (not (wasmdown.component:words-p "A")))
+    (is (not (wasmdown.component:words-p "1")))
+    (is (not (wasmdown.component:words-p "ns-A")))
+    ;; the strongly-unique reduction: [method]foo.foo -> foo (conflict),
+    ;; [method]foo.bar keeps its identity (no conflict)
+    (is (string= "foo"
+                 (wasmdown.component:remove-annotations "[method]foo.foo")))
+    (is (string= "foo.bar"
+                 (wasmdown.component:remove-annotations "[method]foo.bar")))
+    (is (string= "[constructor]foo"
+                 (wasmdown.component:remove-annotations
+                  "[constructor]foo")))
+    (is (string= "foo" (wasmdown.component:remove-annotations "foo")))
+    ;; the inline-export names validate: `1` is not a kebab label
+    (let ((src "(component (import \"f\" (func $f)) (instance (export \"1\" (func $f))))"))
+      (let ((c (expect-invalid
+                (lambda ()
+                  (wasmdown.component:validate-component
+                   (wasmdown.component.text::parse-component-text src))))))
+        (is (search "is not in kebab case"
+                    (wasmdown:wasmdown-error-message c)))))))
+
+
 (defun run-component-pins ()
   "Run the component pins (registered via TEST; returns T)."
   (let ((wasmdown.test::*tests*
@@ -228,7 +299,9 @@ wast runner's string-to-bytes decoder (same grammar as the suite)."
                     '(component/preamble-discrimination
                       component/defined-type-roundtrip
                       component/section-positive-and-malformed
-                      component/validator-label-pins)))
+                      component/validator-label-pins
+                      component/canonopt-memory-rules
+                      component/externname-grammar-pins)))
           wasmdown.test::*tests*)))
     (multiple-value-bind (passed failed)
         (wasmdown.test:run-all-tests)

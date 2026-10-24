@@ -23,7 +23,8 @@
    (:file "src/api")
    (:file "src/cli")
    (:file "src/text")
-   (:file "src/wast")))
+   (:file "src/wast")
+   (:file "src/component-text")))
 
 (asdf:defsystem #:wasmdown/test
   :description "WASMDOWN unit and integration tests."

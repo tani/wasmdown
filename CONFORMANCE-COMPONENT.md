@@ -15,32 +15,32 @@ Baseline measurement, not a release gate (PLAN.md §12.8).
 
 | Outcome | Count |
 | --- | --- |
-| pass | 94 |
-| fail | 0 |
+| pass | 305 |
+| fail | 280 |
 | skip | 0 |
-| unsupported | 545 |
+| unsupported | 38 |
 | timeout | 0 |
-| harness-error | 0 |
+| harness-error | 16 |
 | **total** | **639** |
 
-Executed: 639 commands; pass rate 14.7%.
+Executed: 639 commands; pass rate 47.7%.
 
 ## Per-file counts
 
 | File | pass | fail | unsupported | other |
 | --- | --- | --- | --- | --- |
 | component/binary.wast | 94 | 0 | 38 | 0 |
-| component/abi.wast | 0 | 0 | 23 | 0 |
-| component/annotated-names.wast | 0 | 0 | 36 | 0 |
-| component/attributes.wast | 0 | 0 | 29 | 0 |
-| component/core-modules.wast | 0 | 0 | 11 | 0 |
-| component/defined-types.wast | 0 | 0 | 47 | 0 |
-| component/extern-names.wast | 0 | 0 | 12 | 0 |
-| component/external-visibility.wast | 0 | 0 | 62 | 0 |
-| component/indicies.wast | 0 | 0 | 17 | 0 |
-| component/instantiation.wast | 0 | 0 | 82 | 0 |
-| component/kebab.wast | 0 | 0 | 36 | 0 |
-| component/max-value-size.wast | 0 | 0 | 8 | 0 |
-| component/outer-alias.wast | 0 | 0 | 31 | 0 |
-| component/resources.wast | 0 | 0 | 72 | 0 |
-| component/version-suffix.wast | 0 | 0 | 41 | 0 |
+| component/abi.wast | 8 | 15 | 0 | 0 |
+| component/annotated-names.wast | 19 | 17 | 0 | 0 |
+| component/attributes.wast | 15 | 14 | 0 | 0 |
+| component/core-modules.wast | 0 | 11 | 0 | 0 |
+| component/defined-types.wast | 41 | 6 | 0 | 0 |
+| component/extern-names.wast | 4 | 8 | 0 | 0 |
+| component/external-visibility.wast | 16 | 42 | 0 | 4 |
+| component/indicies.wast | 2 | 13 | 0 | 2 |
+| component/instantiation.wast | 19 | 53 | 0 | 10 |
+| component/kebab.wast | 34 | 2 | 0 | 0 |
+| component/max-value-size.wast | 7 | 1 | 0 | 0 |
+| component/outer-alias.wast | 19 | 12 | 0 | 0 |
+| component/resources.wast | 20 | 52 | 0 | 0 |
+| component/version-suffix.wast | 7 | 34 | 0 | 0 |

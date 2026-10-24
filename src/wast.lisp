@@ -23,7 +23,16 @@
            #:wast-result-command-name #:wast-result-phase
            #:wast-result-detail #:wast-result-elapsed
            #:wast-result-message
-           #:summarize-results #:write-jsonl #:result-outcome-counts))
+           #:summarize-results #:write-jsonl #:result-outcome-counts
+           ;; M7 slice 2: the token-tree contract the component TEXT
+           ;; parser walks (stoken kinds/text + the (:list start end
+           ;; . children) node shape). The CORE text parser keeps its
+           ;; own token layer (src/text.lisp); this is the SCRIPT
+           ;; layer's tree, shared with the component parser.
+           #:stoken #:stoken-p #:stoken-kind #:stoken-text
+           #:stoken-start #:stoken-end
+           ;; M7 slice 2: the component text-parser hook (installed by
+           #:*component-text-parser* #:component-text-parser))
 
 (in-package #:wasmdown.wast)
 
@@ -1422,6 +1431,16 @@ instantiate/execute. Returns (values outcome phase detail instance)."
 ;;; classifies :unsupported 'component instantiation not implemented' —
 ;;; honest, never a silent pass.
 
+
+(defvar *component-text-parser* nil
+  "The component TEXT parser entry point (installed at load time by
+src/component-text.lisp, which loads after this file). A designator of
+the function parse-component-text, or NIL when the parser file was not
+loaded. M7 slice 2.")
+
+(defun component-text-parser ()
+  "The installed component text parser (a function) or NIL."
+  *component-text-parser*)
 (defun %component-outcome (cmd state)
   "Run a (component ...) command through decode + validate. Returns
 (values outcome phase detail)."
@@ -1440,10 +1459,24 @@ instantiate/execute. Returns (values outcome phase detail instance)."
         (values :fail :decode (wasmdown:wasmdown-error-message c)))
       (wasmdown:validation-error (c)
         (values :fail :validate (wasmdown:wasmdown-error-message c)))))
-   ;; text/quote/definition-text: no component TEXT parser yet
+   ;; text/quote/definition-text: the component TEXT parser (M7 slice
+   ;; 2, src/component-text.lisp — loaded AFTER this file defines the
+   ;; hook, so the entry point is installed at load time).
    (t
-    (values :unsupported nil
-            "component text format not implemented in this slice"))))
+    (let ((parse (component-text-parser)))
+      (if parse
+          (handler-case
+              (let ((comp (funcall parse (wast-cmd-text cmd))))
+                (wasmdown.component:validate-component comp)
+                (values :pass nil
+                        "component parses and validates (no instantiation in this slice)"))
+            (wasmdown:decode-error (c)
+              (values :fail :decode (wasmdown:wasmdown-error-message c)))
+            (wasmdown:validation-error (c)
+              (values :fail :validate
+                      (wasmdown:wasmdown-error-message c))))
+          (values :unsupported nil
+                  "component text format not implemented in this slice"))))))
 
 (defun %component-cmd-from-node (node)
   "Rebuild a component wast-cmd from an assertion's (component ...)
