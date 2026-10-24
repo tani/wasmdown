@@ -402,8 +402,9 @@ end the closing ) char, so (source start end) slices the whole form."
   args                                   ; parsed literal args (invoke)
   results                                ; parsed result values
   message                               ; expected-failure message
-  named-form)                           ; :definition / :instance for the
+  named-form                            ; :definition / :instance for the
                                         ; Core 3.0 named module forms
+  component-p)                          ; M7: a (component ...) command —
 
 (defun %parse-int-token (tk)
   "An integer token's value (sign-aware, dec or hex, _ separators)."
@@ -610,6 +611,46 @@ definition's $id), or signals decode-error on bad shape."
         (multiple-value-bind (start end) (%node-span node)
           (values :text id (subseq source start (1+ end)))))))))
 
+(defun %parse-component-form (node source)
+  "Parse a (component ...) node. Returns (values kind id payload):
+KIND :binary (payload = octet vector), :quote (payload = string),
+:definition (payload = the raw source span), or :text (payload = the
+raw source span). The optional leading keyword after $id is one of
+binary / quote / definition; (component $id definition binary ...)
+combines both. Text-form components have NO component text parser in
+this slice — they classify :unsupported, never a silent pass."
+  (let ((items (rest (%node-children node))))   ; skip 'component'
+    (multiple-value-bind (id rest) (%opt-id items)
+      (flet ((first-keyword ()
+               (and rest (stoken-p (first rest))
+                    (eq (stoken-kind (first rest)) :keyword)
+                    (string-downcase (stoken-text (first rest)))))
+             (splice ()
+               (multiple-value-bind (start end) (%node-span node)
+                 (subseq source start (1+ end)))))
+        (let ((k1 (first-keyword)))
+          (cond
+           ((and k1 (string= k1 "definition"))
+            ;; (component definition ...): the payload keeps the full
+            ;; span (minus the definition keyword at consume time);
+            ;; a following binary/quote keyword selects the encoding
+            (let* ((after (rest rest))
+                   (k2 (and after (stoken-p (first after))
+                            (eq (stoken-kind (first after)) :keyword)
+                            (string-downcase (stoken-text (first after))))))
+              (cond
+               ((and k2 (string= k2 "binary"))
+                (values :definition-binary id (%concat-bytes (rest (rest rest)))))
+               ((and k2 (string= k2 "quote"))
+                (values :definition-quote id
+                        (%concat-strings (rest (rest rest)))))
+               (t (values :definition id (splice))))))
+           ((and k1 (string= k1 "binary"))
+            (values :binary id (%concat-bytes (rest rest))))
+           ((and k1 (string= k1 "quote"))
+            (values :quote id (%concat-strings (rest rest))))
+           (t (values :text id (splice)))))))))
+
 (defun %opt-id (items)
   "Split an optional leading $id token off ITEMS."
   (if (and items (stoken-p (first items)) (eq (stoken-kind (first items)) :id))
@@ -798,6 +839,27 @@ command shape."
               (:definition (mk :id id :text payload :named-form :definition))
               (:instance (mk :id id :module-arg payload
                              :named-form :instance)))))
+         ((string= head "component")
+          ;; M7 (component model): the (component ...) command family.
+          ;; A NEW command kind — never conflated with module. The
+          ;; payload forms: binary (decode+validate), quote (component
+          ;; text — no parser yet), definition [+ binary|quote], plain
+          ;; text. TEXT/QUOTE classify :unsupported in the executor
+          ;; (honest: no component text parser in this slice).
+          (multiple-value-bind (kind id payload)
+              (%parse-component-form node source)
+            (ecase kind
+              (:binary (mk :id id :bytes payload :component-p t))
+              (:quote (mk :id id :text payload :component-p t))
+              (:text (mk :id id :text payload :component-p t))
+              (:definition (mk :id id :text payload
+                               :component-p t :named-form :definition))
+              (:definition-binary (mk :id id :bytes payload
+                                      :component-p t
+                                      :named-form :definition))
+              (:definition-quote (mk :id id :text payload
+                                    :component-p t
+                                    :named-form :definition)))))
          ((string= head "register")
           (let* ((items (rest (%node-children node)))
                  (name (first items)))
@@ -1352,6 +1414,55 @@ instantiate/execute. Returns (values outcome phase detail instance)."
     (wasmdown:wasm-trap (c)
       (values :fail :execute (wasmdown:wasmdown-error-message c) nil))))
 
+;;; ---------------------------------------------------------------
+;;; M7: the (component ...) command family. Phase classification is
+;;; the same oracle as modules (assert_malformed -> DECODE,
+;;; assert_invalid -> VALIDATE); instantiation of components needs the
+;;; canonical ABI machinery (a future slice) so a VALID component
+;;; classifies :unsupported 'component instantiation not implemented' —
+;;; honest, never a silent pass.
+
+(defun %component-outcome (cmd state)
+  "Run a (component ...) command through decode + validate. Returns
+(values outcome phase detail)."
+  (declare (ignore state))
+  (cond
+   ;; binary payload: decode-component + validate-component
+   ((wast-cmd-bytes cmd)
+    (handler-case
+        (let ((comp (wasmdown.component:decode-component
+                     (wast-cmd-bytes cmd))))
+          (wasmdown.component:validate-component comp)
+          ;; Valid: instantiation is a FUTURE slice (canonical ABI).
+          (values :unsupported nil
+                  "component decodes and validates; instantiation is a future slice"))
+      (wasmdown:decode-error (c)
+        (values :fail :decode (wasmdown:wasmdown-error-message c)))
+      (wasmdown:validation-error (c)
+        (values :fail :validate (wasmdown:wasmdown-error-message c)))))
+   ;; text/quote/definition-text: no component TEXT parser yet
+   (t
+    (values :unsupported nil
+            "component text format not implemented in this slice"))))
+
+(defun %component-cmd-from-node (node)
+  "Rebuild a component wast-cmd from an assertion's (component ...)
+node, slicing from *script-source*."
+  (multiple-value-bind (kind id payload)
+      (%parse-component-form node *script-source*)
+    (make-wast-cmd
+     :name :component :index 0 :start (second node)
+     :id id
+     :bytes (if (or (eq kind :binary) (eq kind :definition-binary))
+                payload nil)
+     :text (if (or (eq kind :quote) (eq kind :definition-quote)
+                   (eq kind :text) (eq kind :definition))
+               payload nil)
+     :component-p t
+     :named-form (when (or (eq kind :definition) (eq kind :definition-binary)
+                           (eq kind :definition-quote))
+                   :definition))))
+
 (defun %state-imports-for (module)
   "The imports alist for MODULE: spectest + registry. Lazily built via
 the state's import entries; called from %module-outcome with the global
@@ -1671,6 +1782,12 @@ given, receives a JSONL line per result (PLAN.md 12.8)."
   "Execute one command, calling (record cmd outcome phase detail msg)."
   (let ((name (wast-cmd-name cmd)))
     (cond
+     ((and (eq name :component) (wast-cmd-component-p cmd))
+      (multiple-value-bind (outcome phase detail)
+          (%component-outcome cmd state)
+        (if (eq outcome :unsupported)
+            (funcall record cmd :unsupported nil detail nil)
+            (funcall record cmd outcome phase detail nil))))
      ((eq name :module)
       (multiple-value-bind (outcome phase detail inst)
           (%module-outcome cmd state)
@@ -1751,13 +1868,18 @@ given, receives a JSONL line per result (PLAN.md 12.8)."
                  (format nil "unhandled command ~a" name) nil)))))
 
 (defun %action-of (payload)
-  "Interpret an assert payload node: (invoke/get ...) action or a
-module form. Returns (values kind cmd) — kind :action or :module."
-  (if (and (%node-p payload)
-           (member (%head-keyword payload) '("invoke" "get")
-                   :test #'string=))
-      (values :action (parse-action-cmd payload))
-      (values :module (module-cmd-of payload))))
+  "Interpret an assert payload node: (invoke/get ...) action, a module
+form, or — M7 — a (component ...) form. Returns (values kind cmd);
+kind :action | :module | :component."
+  (cond
+   ((and (%node-p payload)
+         (member (%head-keyword payload) '("invoke" "get")
+                 :test #'string=))
+    (values :action (parse-action-cmd payload)))
+   ((and (%node-p payload)
+         (string= (%head-keyword payload) "component"))
+    (values :component (%component-cmd-from-node payload)))
+   (t (values :module (module-cmd-of payload)))))
 
 (defun parse-action-cmd (node)
   "Build a wast-cmd for an (invoke/get) action node."
@@ -1815,8 +1937,34 @@ exhausted."
         (name (wast-cmd-name cmd))
         (msg (wast-cmd-message cmd)))
     (multiple-value-bind (kind inner) (%action-of payload)
-      (declare (ignore inner))
-      (if (eq kind :action)
+      (cond
+       ((eq kind :component)
+        ;; M7: (assert_malformed (component binary ...)) /
+        ;; (assert_invalid (component ...)). Phase oracle identical to
+        ;; modules: malformed -> DECODE, invalid -> VALIDATE; text-form
+        ;; payloads classify :unsupported (no component text parser).
+        (multiple-value-bind (outcome phase detail)
+            (%component-outcome inner state)
+          (let ((want-phase (ecase name
+                              (:assert_malformed :decode)
+                              (:assert_invalid :validate)
+                              (:assert_unlinkable :link)
+                              (:assert_trap :execute)
+                              (:assert_exhaustion :execute))))
+            (cond
+             ((eq outcome :unsupported)
+              (funcall record cmd :unsupported nil detail msg))
+             ((eq outcome :pass)
+              (funcall record cmd :fail nil
+                       "component unexpectedly succeeded" msg))
+             ((eq phase want-phase)
+              (funcall record cmd :pass nil detail msg))
+             (t
+              (funcall record cmd :fail phase
+                       (format nil "phase ~a, want ~a: ~a"
+                               phase want-phase detail)
+                       msg))))))
+       ((eq kind :action)
           ;; action payload (assert_trap / assert_exhaustion)
           (multiple-value-bind (kind2 action-cmd)
               (%action-of payload)
@@ -1850,37 +1998,38 @@ exhausted."
                          "action targets an out-of-scope module" msg))
               (error (c)
                 (funcall record cmd :fail nil
-                         (format nil "~a" c) msg))))
-          ;; module payload: decode the embedded module and check the
-          ;; phase. The module node's source slice is recovered from
-          ;; the runner's bound source via *script-source*.
-          (let ((mod-cmd (%module-cmd-from-node payload)))
-            (multiple-value-bind (outcome phase detail)
-                (%module-outcome mod-cmd state)
-              (let ((want-phase (ecase name
-                                  (:assert_malformed :decode)
-                                  (:assert_invalid :validate)
-                                  (:assert_unlinkable :link)
-                                  (:assert_trap :execute)
-                                  (:assert_exhaustion :execute))))
-                (cond
-                 ((eq outcome :unsupported)
-                  (funcall record cmd :unsupported nil detail msg))
-                 ((eq outcome :pass)
-                  (funcall record cmd :fail nil
-                           "module unexpectedly succeeded" msg))
-                 ((eq phase want-phase)
-                  (funcall record cmd :pass nil detail msg))
-                 ((and (eq name :assert_trap) (eq phase :instantiate))
-                  ;; data/elem segment out-of-bounds traps during
-                  ;; instantiation per the spec (assert_trap (module
-                  ;; (data ...)) cases in data.wast/elem.wast)
-                  (funcall record cmd :pass nil detail msg))
-                 (t
-                  (funcall record cmd :fail phase
-                           (format nil "phase ~a, want ~a: ~a"
-                                   phase want-phase detail)
-                           msg))))))))))
+                         (format nil "~a" c) msg)))))
+       (t
+        ;; module payload: decode the embedded module and check the
+        ;; phase. The module node's source slice is recovered from
+        ;; the runner's bound source via *script-source*.
+        (let ((mod-cmd (%module-cmd-from-node payload)))
+          (multiple-value-bind (outcome phase detail)
+              (%module-outcome mod-cmd state)
+            (let ((want-phase (ecase name
+                                (:assert_malformed :decode)
+                                (:assert_invalid :validate)
+                                (:assert_unlinkable :link)
+                                (:assert_trap :execute)
+                                (:assert_exhaustion :execute))))
+              (cond
+               ((eq outcome :unsupported)
+                (funcall record cmd :unsupported nil detail msg))
+               ((eq outcome :pass)
+                (funcall record cmd :fail nil
+                         "module unexpectedly succeeded" msg))
+               ((eq phase want-phase)
+                (funcall record cmd :pass nil detail msg))
+               ((and (eq name :assert_trap) (eq phase :instantiate))
+                ;; data/elem segment out-of-bounds traps during
+                ;; instantiation per the spec (assert_trap (module
+                ;; (data ...)) cases in data.wast/elem.wast)
+                (funcall record cmd :pass nil detail msg))
+               (t
+                (funcall record cmd :fail phase
+                         (format nil "phase ~a, want ~a: ~a"
+                                 phase want-phase detail)
+                         msg)))))))))))
 
 
 (defun %module-cmd-from-node (node)

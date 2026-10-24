@@ -14,6 +14,7 @@
    (:file "src/numops")
    (:file "src/simd")
    (:file "src/binary")
+   (:file "src/component")
    (:file "src/binary-encode")
    (:file "src/validate")
    (:file "src/runtime")

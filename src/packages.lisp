@@ -159,6 +159,15 @@
            #:reader-offset #:make-reader
            #:read-u32 #:read-u64 #:read-s32 #:read-s33 #:read-s64
            #:read-name #:read-byte-at #:read-bytes
+           ;; M7 (component layer): the shared reader primitives the
+           ;; component decoder builds on — bounds-checked windowed
+           ;; reads, the hostile-count-checked vector reader and the
+           ;; peek used by the head-byte dispatches. OFF-LIMIT /
+           ;; PEEK-BYTE-AT / READ-VEC / READ-BYTE-VEC are part of the
+           ;; wasmdown.binary contract per PLAN.md §4 (the component
+           ;; reader shares the core's decoder discipline; these were
+           ;; unexported internal helpers before the component slice).
+           #:reader-bytes #:reader-limit #:peek-byte-at #:read-vec #:read-byte-vec
            ;; loop 24 (SIMD): the 0xFD decoder routes memarg/lane
            ;; immediates through the host reader; %read-memarg gets an
            ;; exported alias for the same grammar. The ENCODER side
