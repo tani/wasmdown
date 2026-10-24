@@ -159,6 +159,8 @@ plus the heap type."
        ;; packed storage types (loop 22, binary/types.html
        ;; storagetype): i8 0x78, i16 0x77 — field positions only.
        (:i8 #x78) (:i16 #x77)
+       ;; SIMD (loop 24, binary/types.html valtype): v128 0x7B.
+       (:v128 #x7b)
        (:funcref #x70) (:externref #x6F)
        ;; EH (Core 3.0): exnref 0x69.
        (:exnref #x69)))
@@ -523,10 +525,23 @@ low word first, then high word."
        (enc-heaptype e (getf imms :src))
        (enc-heaptype e (getf imms :dst)))
       (t
-       (let ((byte (simple-op-byte op)))
-         (if byte
-             (enc-byte e byte)
-             (error "encode: unknown opcode ~a" op)))))))
+       (cond
+        ;; SIMD (loop 24, the 0xFD prefix family): simd-op-p is a
+        ;; hash lookup, never a case key (case is EQL) — the guard
+        ;; lives in the fallback arm. Emit the sub-opcode (u32 LEB;
+        ;; the relaxed 0x100+ values are multi-byte) then the
+        ;; immediates per the entry's shape, mirroring
+        ;; decode-simd-imms exactly.
+        ((wasmdown.simd:simd-op-p op)
+         (let ((entry (wasmdown.simd:entry-of op)))
+           (enc-byte e #xFD)
+           (enc-u32 e (wasmdown.simd:simd-entry-sub entry))
+           (wasmdown.simd:encode-simd-imms e entry imms)))
+        (t
+         (let ((byte (simple-op-byte op)))
+           (if byte
+               (enc-byte e byte)
+               (error "encode: unknown opcode ~a" op)))))))))
 
 (defun enc-instrs (e instrs)
   "Emit a vector of instructions."

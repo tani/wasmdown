@@ -212,6 +212,8 @@ degrade to a simple-vector (data-seg-state's slot type)."
     (case b
       (#x7f :i32) (#x7e :i64) (#x7d :f32) (#x7c :f64)
       (#x70 :funcref) (#x6f :externref)
+      ;; SIMD (loop 24, binary/types.html valtype): v128 0x7B.
+      (#x7b :v128)
       ;; EH (Core 3.0): exnref 0x69 in valtype position
       ;; (ref_null.wast's binary mirror of (ref.null exn)).
       ;; packed storage types (loop 22, binary/types.html
@@ -418,6 +420,11 @@ word, but little-endian accumulation is unsigned."
 ;;; representation contract); interp/codegen reconstruct via
 ;;; f32-from-bits / f64-from-bits equivalents. SBCL-only helpers; the
 ;;; rest of the decoder is portable CL.
+
+(defun read-memarg (r)
+  "Exported alias of %READ-MEMARG (loop 24: the SIMD 0xFD decoder
+decodes memarg immediates through the exact same grammar)."
+  (%read-memarg r))
 
 (defun %read-memarg (r)
   "memarg per the reference decoder (decode.ml memop): flags is a u32
@@ -672,6 +679,21 @@ markers (keywords) for the block terminators."
              (29 (mk :i31.get-s nil))
              (30 (mk :i31.get-u nil))
              (t (%decode-error r "unknown 0xFB opcode ~d" sub)))))
+        ;; SIMD (loop 24, the 0xFD prefix family — the Core 3.0
+        ;; SIMD binary encoding, proposals/simd/BinarySIMD.md, plus
+        ;; the relaxed-SIMD opcodes 0x100..0x113,
+        ;; relaxed-simd/proposals/relaxed-simd/Overview.md). All
+        ;; immediates decode through wasmdown.simd's entry table;
+        ;; sub-opcodes are read as u32 LEB (per the simdop:varuint32
+        ;; grammar; the 0x100+ relaxed values NEED the multi-byte
+        ;; form).
+        (#xFD
+         (let ((sub (read-u32 r)))
+           (let ((e (wasmdown.simd:entry-by-sub sub)))
+             (if (null e)
+                 (%decode-error r "unknown 0xFD opcode ~d" sub)
+                 (mk (wasmdown.simd:simd-entry-op e)
+                     (wasmdown.simd:decode-simd-imms r e))))))
         (t
          (let ((simple (%simple-op b)))
            (if simple

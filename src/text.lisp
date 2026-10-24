@@ -923,6 +923,9 @@ keyword or (:TYPE N) typeuse)."
    (t
     (let ((k (%tok-keyword x)))
       (cond
+       ((string= k "v128")
+        ;; SIMD (loop 24, text/types.html valtype): v128.
+        :v128)
        ((string= k "i32") :i32)
        ((string= k "i64") :i64)
        ;; packed field types (loop 22, text/types.html storagetype):
@@ -2106,7 +2109,123 @@ rest of the plain sequence."
                                  dst-rt))
                           #() 0)
                          (cddr items)))))))))
+     ;; ---- SIMD (loop 24): v128.const / lane immediates / the
+     ;; memarg(+lane) shapes / all immediate-free spellings ----
+     ((wasmdown.simd:text-op-p k)
+      (%simd-imms k op-key rest pos penv bad))
      (t (funcall bad)))))
+
+(defun %simd-imms (k op-key rest pos penv bad)
+  "Parse the immediates of the SIMD op text K (loop 24): v128.const
+shape literals, laneidx immediates, memarg(+lane) shapes, the
+shuffle's 16 indices, or nothing. Returns (VALUES INSTR REMAINING)."
+  (let* ((entry (wasmdown.simd:entry-by-name k))
+         (imm (wasmdown.simd:simd-entry-imm entry)))
+    (labels
+        ((lane-tok (tok max)
+           (unless (and tok (tok-p tok) (eq (tok-kind tok) :nat))
+             (funcall bad))
+           (let ((n (%parse-nat (tok-text tok) (tok-pos tok))))
+             (unless (<= n max)
+               (%text-error (tok-pos tok)
+                             "invalid lane index ~a (max ~a)" n max))
+             n)))
+      (cond
+       ;; ---- v128.const <shape> <literals> ----
+       ((and (consp imm) (eq (first imm) :const))
+        (let* ((shape-tok (and rest (tok-p (car rest))))
+               (shape (and shape-tok (%tok-keyword (car rest)))))
+          (unless shape (funcall bad))
+          (let* ((per (cond ((string= shape "i32x4") (list 4 4 24 127))
+                            ((string= shape "i64x2") (list 2 8 53 1023))
+                            ((string= shape "f32x4") (list 4 4 24 127))
+                            ((string= shape "f64x2") (list 2 8 53 1023))
+                            (t (funcall bad))))
+                 (n (first per))
+                 (width (second per))
+                 (float-p (or (string= shape "f32x4")
+                              (string= shape "f64x2")))
+                 (lits (nthcdr 1 rest)))
+            (declare (ignorable width))
+            (unless (>= (length lits) n) (funcall bad))
+            (let ((v (make-array 16 :element-type '(unsigned-byte 8)))
+                  (lw (if (or (string= shape "i32x4")
+                              (string= shape "f32x4"))
+                          4 8)))
+              (loop for i below n
+                    for tok in lits
+                    do (unless (and (tok-p tok)
+                                    (member (tok-kind tok)
+                                            '(:nat :int :float)))
+                         (funcall bad))
+                       (let ((x (if float-p
+                                    (%float-bits (tok-text tok)
+                                                 (if (= lw 4) 24 53)
+                                                 (if (= lw 4) 127 1023))
+                                    (%parse-int (tok-text tok)
+                                                (tok-pos tok)))))
+                         (loop for j below lw
+                               do (setf (aref v (+ (* i lw) j))
+                                        (logand #xff (ash x (- (* 8 j))))))))
+              (values (make-wasm-instr op-key (list :bytes v) #() 0)
+                      (nthcdr n lits))))))
+       ;; ---- one laneidx ----
+       ((and (consp imm) (eq (first imm) :lane))
+        (values (make-wasm-instr op-key
+                                 (list :lane (lane-tok (car rest)
+                                                       (second imm)))
+                                 #() 0)
+                (cdr rest)))
+       ;; ---- memarg (+ lane) ----
+       ((and (consp imm)
+             (member (first imm) '(:memarg :memarg-lane)))
+        (let ((offset 0) (align-hint nil) (items rest) (memidx 0))
+          (when (and items (tok-p (car items))
+                     (member (tok-kind (car items)) '(:id :nat)))
+            (setf memidx (%id-or-num (car items) (penv-mems penv) "memory")
+                  items (cdr items)))
+          (loop while (and items (tok-p (car items))
+                           (eq (tok-kind (car items)) :keyword))
+                for tok = (car items)
+                for txt = (tok-text tok)
+                when (and (> (length txt) 7)
+                          (string= txt "offset=" :end1 7))
+                  do (setf offset (%parse-nat (subseq txt 7) (tok-pos tok))
+                         items (cdr items))
+                else when (and (> (length txt) 6)
+                               (string= txt "align=" :end1 6))
+                  do (let ((a (%parse-nat (subseq txt 6) (tok-pos tok))))
+                       (unless (and (plusp a) (= 1 (logcount a)))
+                         (%text-error (tok-pos tok)
+                                      "alignment ~a is not a power of 2" a))
+                       (setf align-hint a items (cdr items)))
+                else do (return))
+          (let* ((nbytes (or (second imm) 16))
+                 (align (or align-hint nbytes))
+                 (imms (list :align (1- (integer-length align))
+                             :offset offset :memidx memidx)))
+            (if (eq (first imm) :memarg-lane)
+                (values (make-wasm-instr
+                         op-key (append imms
+                                         (list :lane (lane-tok (car items)
+                                                               (third imm))))
+                         #() 0)
+                        (cdr items))
+                (values (make-wasm-instr op-key imms #() 0)
+                        items)))))
+       ;; ---- shuffle: 16 laneidx tokens ----
+       ((and (consp imm) (eq (first imm) :lanes))
+        (unless (>= (length rest) 16) (funcall bad))
+        (values (make-wasm-instr
+                 op-key
+                 (list :lanes (coerce (loop for tok in rest
+                                            for i below 16
+                                            collect (lane-tok tok 31))
+                                      'vector))
+                 #() 0)
+                (nthcdr 16 rest)))
+       ;; ---- immediate-free ----
+       (t (values (make-wasm-instr op-key nil #() 0) rest))))))
 
 (defun %block-label-and-type (node penv)
   "Common prefix parsing for a folded (block|loop|if [$id]? typeuse ...)

@@ -228,7 +228,9 @@ exprs may only use IMPORTED globals (global.wast ::120 expects
 (defun valtype-width (t_)
   (declare (ignore t_))
   (ecase t_
-    (:i32 32) (:i64 64) (:f32 32) (:f64 64)))
+    (:i32 32) (:i64 64) (:f32 32) (:f64 64)
+    ;; SIMD (loop 24): the v128 fixed-width type.
+    (:v128 128)))
 
 (defun typed-ref-p (t_)
   "A typed reference value type: (:REF HEAP) non-null or

@@ -1033,17 +1033,20 @@ ref.test, any.convert_extern/extern.convert_any, annotations."
      ;; (annotations.wast ::47's quote "( @a)" — two reserved tokens,
      ;; malformed in any engine) keep their real DECODE outcome.
      ((has "(@") :annotations)
-     ((or (tok "v128") (tok "i8x16") (tok "i16x8") (tok "i32x4")
-          (tok "i64x2") (tok "f32x4") (tok "f64x2")) :simd)
+     ;; SIMD (loop 24): IMPLEMENTED — the full v128 + relaxed family:
+     ;; valtype v128 (0x7B), the 0xFD opcode family (236 v128 ops +
+     ;; the relaxed 0x100..0x113 set) decoded/encoded/validated/
+     ;; executed, the text spellings, lane immediates, memory ops.
+     ;; The v128/i8x16/.../f64x2 shape tokens no longer classify
+     ;; :unsupported — the honest pipeline runs.
      ;; GC VALUE families (loop 22): IMPLEMENTED — struct/array/i31
      ;; heaps in the L2 lattice, the 0xFB opcode family decoded/
      ;; encoded/validated/executed, ref.eq, casts, the any<->extern
      ;; bridges. The opcode spellings, the eqref/structref/arrayref/
      ;; i31ref shorthands and the (ref eq|struct|array|i31) forms no
      ;; longer classify :unsupported — the honest pipeline runs.
-     ;; (Annotations and SIMD stay out of scope;
-     ;; "nonmatching (ref" is obsolete-keywords.wast's malformed-text
-     ;; probe, kept.)
+     ;; (Annotations stay out of scope; "nonmatching (ref" is
+     ;; obsolete-keywords.wast's malformed-text probe, kept.)
      ((has "nonmatching (ref") :gc)
      (t nil))))
 

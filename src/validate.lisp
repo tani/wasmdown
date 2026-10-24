@@ -45,7 +45,10 @@ the types contract exports wasm-limits-has-max-p)."
   t)
 
 (defun numtype-p (t_)
-  (member t_ '(:i32 :i64 :f32 :f64)))
+  (member t_ '(:i32 :i64 :f32 :f64
+               ;; SIMD (loop 24): v128 is a numtype-shaped valtype
+               ;; (binary valtype 0x7B; no subtyping).
+               :v128)))
 
 (defun reftype-p (t_)
   "A reference type: the legacy keywords or the typed-ref lattice
@@ -1611,6 +1614,9 @@ bodies of their :end terminator; bodies of :if carry no :else/:end)."
         ((eq op :i64.const) (%push-val fv :i64))
         ((eq op :f32.const) (%push-val fv :f32))
         ((eq op :f64.const) (%push-val fv :f64))
+        ;; --- SIMD (loop 24): the full v128/relaxed family ---
+        ((wasmdown.simd:simd-op-p op)
+         (validate-simd-instr fv op imms module))
         ;; --- loads/stores via width table ---
         ((assoc op *mem-op-widths*)
          (let* ((info (assoc op *mem-op-widths*))
@@ -2107,14 +2113,65 @@ REJECTED — funcref (nullable) is not <: (ref func))."
                                                    funcidx)))))
 
 (defun describe-module-features (module)
-  "Return an alist of feature keywords to booleans for CLI inspect."
+  "Return an alist of feature keywords to booleans for CLI inspect.
+SIMD (loop 24): detected from the module's instruction ops (any
+wasmdown.simd opcode)."
+  (let ((simd-p (loop for f across (wasmdown.types:wasm-module-funcs module)
+                      thereis (loop for i across
+                                     (wasmdown.types:wasm-func-body f)
+                                   thereis (wasmdown.simd:simd-op-p
+                                            (wasmdown.types:wasm-instr-op i))))))
+    `((:sign-extension-ops . t)
+      (:saturating-float-to-int . t)
+      (:multi-value . t)
+      (:bulk-memory . t)
+      (:reference-types . t)
+      (:simd . ,simd-p)
+      (:threads . nil)
+      (:tail-call . t)
+      (:exceptions . t))))
+
+;;; ---------------------------------------------------------------
+;;; SIMD (loop 24): the v128 + relaxed family's typing rules. The
+;;; signature table (wasmdown.simd's entries) carries each op's
+;;; params/results; the memory ops additionally check their memarg
+;;; against the entry's natural width and address in the memory's
+;;; ADDRTYPE (memory64-aware, loop 23's rules), and every laneidx
+;;; immediate is range-checked per ImmLaneIdxN.
+
+(defun validate-simd-instr (fv op imms module)
+  "Validate one SIMD instruction. Params pop right-to-left (:addr
+  resolves to the target memory's addrtype); results push in order.
+  Lane immediates and memarg bounds are enforced."
   (declare (ignore module))
-  '((:sign-extension-ops . t)
-    (:saturating-float-to-int . t)
-    (:multi-value . t)
-    (:bulk-memory . t)
-    (:reference-types . t)
-    (:simd . nil)
-    (:threads . nil)
-    (:tail-call . nil)
-    (:exceptions . nil)))
+  (let* ((entry (wasmdown.simd:entry-of op))
+         (params (wasmdown.simd:simd-entry-params entry))
+         (results (wasmdown.simd:simd-entry-results entry))
+         (imm (wasmdown.simd:simd-entry-imm entry)))
+    ;; lane immediate ranges (validation-side mirror of the decode
+    ;; bounds; the text parser's lane immediates land here too).
+    (wasmdown.simd:validate-lane-imms
+     imm imms
+     (lambda (control &rest args)
+       (declare (ignore control))
+       (apply #'verr (first args) (rest args))))
+    ;; memory ops: memidx must exist, alignment <= natural width,
+    ;; offset within the addrtype domain — the same %CHECK-MEMARG
+    ;; contract as the scalar loads.
+    (when (and (consp imm)
+               (member (first imm) '(:memarg :memarg-lane)))
+      (let ((width-bits (* 8 (second imm))))
+        (%check-memarg fv imms width-bits)))
+    ;; operand stack: pop params (last param is the stack top).
+    (loop for p in (reverse params)
+          do (%pop-val-expect
+              fv (if (eq p :addr)
+                     ;; the memory op's address parameter takes the
+                     ;; TARGET MEMORY's addrtype (i32 default, i64 for
+                     ;; memory64) — resolved from the memarg's memidx.
+                     (%mem-addrtype-of (fv-ctx fv)
+                                       (or (getf imms :memidx) 0)
+                                       (string op))
+                     p)))
+    (dolist (r results)
+      (%push-val fv r))))

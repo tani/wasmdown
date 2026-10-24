@@ -149,6 +149,7 @@
            #:i64-trunc-sat-f64-s #:i64-trunc-sat-f64-u
            #:f32-bits #:f32-from-bits #:f64-bits #:f64-from-bits
            #:nan-p #:canonical-nan-p #:arithmetic-nan-p
+           #:quiet-nan #:ftrunc #:fnearest #:fmin #:fmax
            #:float-eq-nan-lax
            #:mem-load-le #:mem-store-le))
 
@@ -157,7 +158,13 @@
   (:export #:decode-module #:encode-module #:decode-error-at
            #:reader-offset #:make-reader
            #:read-u32 #:read-u64 #:read-s32 #:read-s33 #:read-s64
-           #:read-name #:read-byte-at))
+           #:read-name #:read-byte-at #:read-bytes
+           ;; loop 24 (SIMD): the 0xFD decoder routes memarg/lane
+           ;; immediates through the host reader; %read-memarg gets an
+           ;; exported alias for the same grammar. The ENCODER side
+           ;; mirrors it (wasmdown.simd:encode-simd-imms).
+           #:read-memarg
+           #:enc-byte #:enc-u32 #:enc-memarg))
 
 (defpackage #:wasmdown.validate
   (:use #:cl #:wasmdown.types)

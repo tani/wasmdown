@@ -10,8 +10,9 @@ baseline SBCL code generation, a public Lisp API and CLI for the **core
 Wasm subset** below, plus the stateful `.wast` spec-script runner and a
 measured baseline against the vendored official test suite. It is
 **not** a conformant Core 3.0 implementation and makes no conformance
-claim. No Component Model, WIT, WASI, SIMD, GC or
-threads support yet — those are PLAN.md milestones M5, M7–M12.
+claim. No Component Model, WIT, WASI or
+threads support yet — those are PLAN.md milestones M5, M7–M12. SIMD
+(v128 + relaxed) IS implemented end to end as of loop 24.
 
 ## Conformance baseline (honest, per PLAN.md §12.8)
 
@@ -26,10 +27,11 @@ pass rate 99.7% (denominator = all executed, incl. unsupported)
 
 Zero fails. Every command in the vendored official core suite is
 either a genuine pass or an honestly-attributed `unsupported` for
-a named out-of-scope family. The 74 unsupported are the TERMINAL
+a named out-of-scope family. The 73 unsupported are the TERMINAL
 honest set: annotations 73 (an unadopted proposal — permanently
-out of scope per PLAN.md §3.3) and obsolete-keywords::10 (a SIMD
-fixture). The struct/array type declarations (loop 21), rec
+out of scope per PLAN.md §3.3); the formerly-unsupported
+obsolete-keywords::10 SIMD row now PASSES at decode (loop 24).
+The struct/array type declarations (loop 21), rec
 groups + canonicalization (loop 20), typed function references
 (loop 19), exception handling + named modules (loop 18) and tail
 calls all pass.
@@ -81,10 +83,11 @@ harness-errors.
 | Codegen | `src/codegen.lisp` | Baseline backend: SBCL `COMPILE` of emitted `LET`/`TAGBODY`/`GO` forms; interp-vs-compiled parity tests. |
 | API / CLI | `src/api.lisp`, `src/cli.lisp` | `read-module`, `validate-module`, `instantiate`, `invoke`, …; CLI `validate`/`inspect`/`compile`/`run`. |
 
-Not implemented (see `PLAN.md` for the full contract): SIMD (v128),
-Component Model, Canonical ABI, WASI (all versions),
+Not implemented (see `PLAN.md` for the full contract): Component
+Model, Canonical ABI, WASI (all versions),
 threads/atomics, FASL cache, annotations (an unadopted proposal —
-permanently out of scope per PLAN.md §3.3). Tail calls
+permanently out of scope per PLAN.md §3.3). SIMD (v128 + relaxed,
+loop 24), tail calls
 `return_call`/`return_call_indirect`, exception handling (tags,
 `try_table`, `throw`, cross-call propagation, uncaught boundary
 at the outermost guest frame), typed function references (the
@@ -151,14 +154,19 @@ SBCL-specific numeric internals where documented.
 ## Roadmap (residual Core 3.0 gaps, in loop order)
 
 The vendored core suite (97 files, pinned) is FULLY attributed —
-no fails, and the 74 unsupported are named out-of-scope families
-(annotations 73 + 1 SIMD fixture). The remaining Core 3.0 feature
+no fails, and the 73 unsupported are named out-of-scope families
+(annotations 73). The remaining Core 3.0 feature
 work (PLAN.md §3.1) has NO vendored fixture coverage; each lands
 with self-authored tests per the §12 gap-test discipline:
 
-1. **SIMD (v128 + relaxed)** — full opcode surface, scalarized
-   reference semantics first per PLAN.md §7.3.
-2. **Component Model / WASI** — PLAN.md §8-9; M7-M12 territory.
+1. **Component Model / WASI** — PLAN.md §8-9; M7-M12 territory.
+
+DONE (loop 24): **SIMD (v128 + relaxed)** — the full 0xFD opcode
+surface per the Core 3.0 SIMD binary encoding (236 v128 ops) plus
+the relaxed 0x100..0x113 set, scalarized reference semantics per
+PLAN.md §7.3 (one 16-byte-vector value per v128; lane loops over
+the backing bytes), text/binary/validate/interp/encode end to end;
+the vendored obsolete-keywords::10 row now passes at decode.
 
 DONE: loop 18 (tail calls, EH, named modules), loop 19 (typed
 function references), loop 20 (rec groups + canonicalization +

@@ -11,7 +11,7 @@ change file-internal details, never these interfaces.
 | i64 | non-negative integer `0 .. 2^64-1` (unsigned interpretation) |
 | f32 | `single-float` (NaN payload loss acceptable only via `f32-bits`) |
 | f64 | `double-float` |
-| v128 | **excluded from this slice** |
+| v128 | one `(simple-array (unsigned-byte 8) (16))` object (loop 24; scalarized lane ops — never per-lane boxes) |
 | funcref/externref | runtime func-instance or opaque host object; `nil` = null ref |
 
 Signed views: `wasmdown.numops:i32-s`, `i64-s` (and `_u` identity helpers).

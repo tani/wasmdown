@@ -1436,6 +1436,9 @@ caller)."
                       "table.copy across distinct tables unsupported"))
              (wasmdown.runtime:table-copy (%table-at dst-idx) dst src len))
            s3))))
+    ;; ---- SIMD (loop 24): the full v128/relaxed family ----
+    ((wasmdown.simd:simd-op-p op)
+     (exec-simd op instr imms s))
     ;; ---- numeric ----
     ((gethash op *numops*)
      (let* ((entry (gethash op *numops*))
@@ -1445,6 +1448,214 @@ caller)."
          (push (apply fn args) s1))))
     (t
      (%trap :unreachable "unimplemented opcode ~a" op))))
+
+;;; ---------------------------------------------------------------
+;;; SIMD (loop 24): the interp-side executor. Pure lane compute
+;;; delegates to wasmdown.simd:exec; memory ops, immediate-bearing
+;;; ops and the scalar reductions live here (they need the
+;;; instance's memories or the raw immediates).
+
+(defun %simd-ea (imms s)
+  "Pop the address (in the target memory's addrtype domain), add
+the memarg's static offset. Returns (values ea memidx new-stack)."
+  (multiple-value-bind (addr s1) (pop-val s)
+    (values (+ addr (getf imms :offset 0))
+            (getf imms :memidx 0)
+            s1)))
+
+(defun exec-simd (op instr imms s)
+  "Execute one SIMD op. Returns the new operand stack."
+  (let* ((entry (wasmdown.simd:entry-of op))
+         (class (wasmdown.simd:simd-entry-class entry))
+         (imm (wasmdown.simd:simd-entry-imm entry))
+         (width (or (wasmdown.simd:simd-entry-lane-width entry) 128))
+         (lanes (or (wasmdown.simd:simd-entry-lanes entry) 1)))
+    (macrolet ((pop-v128 (stack)
+                 `(multiple-value-bind (v s1) (pop-val ,stack)
+                    (if (wasmdown.simd:v128-p v)
+                        (values (wasmdown.simd:v128-bytes v) s1)
+                        (%trap :unreachable
+                               "SIMD operand is not a v128")))))
+      (cond
+       ;; ---- const ----
+       ((eq op :v128.const)
+        (push (wasmdown.simd:make-v128-from-bytes (getf imms :bytes)) s))
+       ;; ---- pure memarg loads/stores ----
+       ((and (consp imm) (eq (first imm) :memarg))
+        (ecase op
+          (:v128.load
+           (multiple-value-bind (ea memidx s1) (%simd-ea imms s)
+             (let ((mem (%mem-at memidx)))
+               ;; bounds-check the full 16-byte span (traps OOB)
+               (wasmdown.runtime:memory-load mem ea 16)
+               (push (wasmdown.simd:make-v128-from-bytes
+                      (wasmdown.runtime:memory-instance-bytes mem) ea)
+                     s1))))
+          (:v128.store
+           (multiple-value-bind (v s1) (pop-v128 s)
+             (multiple-value-bind (ea memidx s2) (%simd-ea imms s1)
+               (let ((mem (%mem-at memidx)))
+                 ;; bounds-check the full 16-byte span then copy
+                 (wasmdown.runtime:memory-load mem ea 16)
+                 (let ((bytes (wasmdown.runtime:memory-instance-bytes mem)))
+                   (loop for i below 16
+                         do (setf (aref bytes (+ ea i)) (aref v i))))
+                 s2))))
+          ;; load-and-extend: 8 source bytes -> 8 lanes of 2x width
+          ((:v128.load8x8_s :v128.load8x8_u
+            :v128.load16x4_s :v128.load16x4_u
+            :v128.load32x2_s :v128.load32x2_u)
+           (multiple-value-bind (ea memidx s1) (%simd-ea imms s)
+             (let* ((mem (%mem-at memidx))
+                    (name (string-downcase (string op)))
+                    (sw (cond ((search "load8x8" name) 8)
+                              ((search "load16x4" name) 16)
+                              (t 32)))
+                    (signed (search "_s" name))
+                    (r (wasmdown.simd:make-v128)))
+               (loop for i below 8
+                     do (let ((x (wasmdown.runtime:memory-load
+                                  mem (+ ea (* i (/ sw 8)))
+                                  (/ sw 8))))
+                          (wasmdown.simd:set-lane-u
+                           r i (* sw 2)
+                           (if signed
+                               (mod (if (>= x (ash 1 (1- sw)))
+                                        (- x (ash 1 sw))
+                                        x)
+                                    (ash 1 (* 2 sw)))
+                               x))))
+               (push r s1))))
+          ;; splat loads
+          ((:v128.load8_splat :v128.load16_splat
+            :v128.load32_splat :v128.load64_splat)
+           (multiple-value-bind (ea memidx s1) (%simd-ea imms s)
+             (let* ((mem (%mem-at memidx))
+                    (name (string op))
+                    (w (cond ((search "load8" name) 8)
+                             ((search "load16" name) 16)
+                             ((search "load32" name) 32)
+                             (t 64)))
+                    (x (wasmdown.runtime:memory-load mem ea (/ w 8)))
+                    (r (wasmdown.simd:make-v128)))
+               (loop for i below (/ 128 w)
+                     do (wasmdown.simd:set-lane-u r i w x))
+               (push r s1))))
+          ;; zero-padded loads
+          ((:v128.load32_zero :v128.load64_zero)
+           (multiple-value-bind (ea memidx s1) (%simd-ea imms s)
+             (let* ((mem (%mem-at memidx))
+                    (w (if (eq op :v128.load32_zero) 4 8))
+                    (x (wasmdown.runtime:memory-load mem ea w))
+                    (r (wasmdown.simd:make-v128)))
+               (wasmdown.simd:set-lane-u r 0 (* 8 w) x)
+               (push r s1))))))
+       ;; ---- load/store lane pairs (memarg + laneidx) ----
+       ((and (consp imm) (eq (first imm) :memarg-lane))
+        (let ((lane (getf imms :lane))
+              (lw (ecase (second imm) (1 8) (2 16) (4 32) (8 64))))
+          (ecase op
+            ((:v128.load8_lane :v128.load16_lane
+              :v128.load32_lane :v128.load64_lane)
+             (multiple-value-bind (v s1) (pop-v128 s)
+               (multiple-value-bind (ea memidx s2) (%simd-ea imms s1)
+                 (let ((x (wasmdown.runtime:memory-load (%mem-at memidx) ea (/ lw 8))))
+                   (wasmdown.simd:set-lane-u v lane lw x)
+                   (push v s2)))))
+            ((:v128.store8_lane :v128.store16_lane
+              :v128.store32_lane :v128.store64_lane)
+             (multiple-value-bind (v s1) (pop-v128 s)
+               (multiple-value-bind (ea memidx s2) (%simd-ea imms s1)
+                 (let ((x (wasmdown.simd:lane-u v lane lw)))
+                   (wasmdown.runtime:memory-store (%mem-at memidx) ea (/ lw 8) x))
+                 s2))))))
+       ;; ---- shuffle / swizzle ----
+       ((eq op :i8x16.shuffle)
+        (multiple-value-bind (b s1) (pop-v128 s)
+          (multiple-value-bind (a s2) (pop-v128 s1)
+            (let ((r (wasmdown.simd:make-v128))
+                  (sel (getf imms :lanes)))
+              (loop for i below 16
+                    do (setf (aref r i)
+                             (if (< (svref sel i) 16)
+                                 (aref a (svref sel i))
+                                 (aref b (- (svref sel i) 16)))))
+              (push r s2)))))
+       ((or (eq op :i8x16.swizzle) (eq op :i8x16.relaxed_swizzle))
+        (multiple-value-bind (sel s1) (pop-v128 s)
+          (multiple-value-bind (a s2) (pop-v128 s1)
+            ;; canonical relaxed choice: OOB indices (16..255) give 0
+            ;; (the non-relaxed swizzle admits only 0; the relaxed
+            ;; variant additionally admits a[s%16] for 16..127).
+            (let ((r (wasmdown.simd:make-v128)))
+              (loop for i below 16
+                    do (let ((idx (aref sel i)))
+                         (setf (aref r i)
+                               (if (< idx 16) (aref a idx) 0))))
+              (push r s2)))))
+       ;; ---- splats ----
+       ((eq class :splat)
+        (multiple-value-bind (x s1) (pop-val s)
+          (let ((r (wasmdown.simd:make-v128)))
+            (loop for i below lanes
+                  do (wasmdown.simd:set-lane-u r i width x))
+            (push r s1))))
+       ;; ---- extract/replace lanes ----
+       ((member class '(:extract :extract-s :extract-u))
+        (multiple-value-bind (v s1) (pop-v128 s)
+          (let* ((lane (getf imms :lane))
+                 (x (wasmdown.simd:lane-u v lane width)))
+            (push (ecase class
+                    (:extract x)
+                    (:extract-s (mod (if (>= x (ash 1 (1- width)))
+                                         (- x (ash 1 width))
+                                         x)
+                                     #x100000000))
+                    (:extract-u x))
+                  s1))))
+       ((eq class :replace)
+        (multiple-value-bind (x s1) (pop-val s)
+          (multiple-value-bind (v s2) (pop-v128 s1)
+            (let ((r (wasmdown.simd:make-v128-from-bytes v)))
+              (wasmdown.simd:set-lane-u r (getf imms :lane) width x)
+              (push r s2)))))
+       ;; ---- shifts (the second operand is a scalar i32) ----
+       ((member class '(:i-shl :i-shr-s :i-shr-u))
+        (multiple-value-bind (k s1) (pop-val s)
+          (multiple-value-bind (a s2) (pop-v128 s1)
+            (push (wasmdown.simd:exec entry a k) s2))))
+       ;; ---- scalar reductions ----
+       ((eq class :any-true)
+        (multiple-value-bind (v s1) (pop-v128 s)
+          (push (if (loop for i below 16 thereis (/= (aref v i) 0))
+                     1 0)
+                s1)))
+       ((eq class :all-true)
+        (multiple-value-bind (v s1) (pop-v128 s)
+          (push (if (loop for i below lanes
+                          always (/= (wasmdown.simd:lane-u v i width) 0))
+                     1 0)
+                s1)))
+       ((eq class :bitmask)
+        (multiple-value-bind (v s1) (pop-v128 s)
+          (push (loop for i below lanes
+                      for x = (wasmdown.simd:lane-u v i width)
+                      when (>= x (ash 1 (1- width)))
+                        sum (ash 1 i))
+                s1)))
+       ;; ---- everything else: pure lane compute via exec ----
+       (t
+        (let ((nparams (length (wasmdown.simd:simd-entry-params entry))))
+          (ecase nparams
+            (1 (multiple-value-bind (a s1) (pop-v128 s)
+                 (push (wasmdown.simd:exec entry a) s1)))
+            (2 (multiple-value-bind (b s1) (pop-v128 s)
+                 (multiple-value-bind (a s2) (pop-v128 s1)
+                   (push (wasmdown.simd:exec entry a b) s2))))
+            (3 (multiple-value-bind (c s1) (pop-v128 s)
+                 (multiple-value-bind (b s2) (pop-v128 s1)
+                   (multiple-value-bind (a s3) (pop-v128 s2)
+                     (push (wasmdown.simd:exec entry a b c) s3))))))))))))
 
 ;;; ---------------------------------------------------------------
 ;;; Function invocation. *RETURN-TAG* / *FRAME-NRESULTS* are defined

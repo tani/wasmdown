@@ -13,10 +13,10 @@ now classify as :unsupported instead of crashing as harness-errors.
 
 | Outcome | Count |
 | --- | --- |
-| pass | 21186 |
+| pass | 21187 |
 | fail | 0 |
 | skip | 0 |
-| unsupported | 74 |
+| unsupported | 73 |
 | timeout | 0 |
 | harness-error | 0 |
 | **total** | **21260** |
@@ -90,7 +90,7 @@ including unsupported — honest per PLAN.md §12.9).
 | memory_trap | 182 | 0 | 0 | 0 |
 | names | 486 | 0 | 0 | 0 |
 | nop | 88 | 0 | 0 | 0 |
-| obsolete-keywords | 10 | 0 | 1 | 0 |
+| obsolete-keywords | 11 | 0 | 0 | 0 |
 | ref | 13 | 0 | 0 | 0 |
 | ref_as_non_null | 7 | 0 | 0 | 0 |
 | ref_func | 17 | 0 | 0 | 0 |

@@ -12,6 +12,7 @@
    (:file "src/conditions")
    (:file "src/types")
    (:file "src/numops")
+   (:file "src/simd")
    (:file "src/binary")
    (:file "src/binary-encode")
    (:file "src/validate")
@@ -37,4 +38,5 @@
    (:file "tests/codegen")
    (:file "tests/api")
    (:file "tests/text")
+   (:file "tests/simd")
    (:file "tests/wast")))
