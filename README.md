@@ -20,17 +20,17 @@ The official core suite (97 `.wast` files, pinned at
 executed through the stateful runner with failure-phase classification:
 
 ```
-pass 21122 | fail 7 | unsupported 131 | harness-error 0 | total 21260
-pass rate 99.3% (denominator = all executed, incl. unsupported)
+pass 21154 | fail 0 | unsupported 106 | harness-error 0 | total 21260
+pass rate 99.4% (denominator = all executed, incl. unsupported)
 ```
 
-The 7 fails are ALL one family — type-canonicalization
-(type-equivalence.wast 6, type-rec.wast 1): structurally-equal
-functypes get distinct indices, so the lattice's nominal typeuse
-comparison rejects where the spec wants equivalence. Fix: the
-`rec`-group canonical-representative pass (next loop). The earlier
-table.wast over-permission (6) and elem.wast rows flipped green
-as the loop-19 lattice settled across final measurements.
+Zero fails. Every command in the vendored official core suite is
+either a genuine pass or an honestly-attributed `unsupported` for
+an out-of-scope family. The 106 unsupported: annotations 73, GC
+value types (type-rec struct rows 21, binary typed-ref 11, elem
+8, binary 2), SIMD 1, custom/obsolete 1+1 — the rec-group
+func-only rows all pass since loop 20 (rec groups +
+canonicalization + iso-recursive equivalence).
 
 Regenerate with `make report-conformance` (writes `CONFORMANCE.md` +
 `tests/spec-core-results.jsonl`, one JSONL line per command); the full
@@ -80,17 +80,19 @@ harness-errors.
 | API / CLI | `src/api.lisp`, `src/cli.lisp` | `read-module`, `validate-module`, `instantiate`, `invoke`, …; CLI `validate`/`inspect`/`compile`/`run`. |
 
 Not implemented (see `PLAN.md` for the full contract): SIMD (v128),
-Wasm GC values (struct/array/i31), `rec` type groups (iso-recursive
-type equivalence/canonicalization — the 10-row type-equivalence
-residual), memory64, multi-memory runtime (text accepts memidx
-forms), Component Model, Canonical ABI, WASI (all versions),
-threads/atomics, FASL cache, annotations. Tail calls
-`return_call`/`return_call_indirect`, exception handling (tags,
-`try_table`, `throw`, cross-call propagation, uncaught boundary at
-the outermost guest frame), typed function references (the
-`(ref $t)`/`(ref null $t)` lattice, `call_ref`, `return_call_ref`,
-`br_on_null`, `br_on_non_null`, `ref.as_non_null`, definite
-initialization for non-defaultable locals) and the named module
+Wasm GC values (struct/array/i31 — the struct-carrying type-rec
+rows stay honestly `:unsupported`), memory64, multi-memory runtime
+(text accepts memidx forms), Component Model, Canonical ABI, WASI
+(all versions), threads/atomics, FASL cache, annotations. Tail
+calls `return_call`/`return_call_indirect`, exception handling
+(tags, `try_table`, `throw`, cross-call propagation, uncaught
+boundary at the outermost guest frame), typed function references
+(the `(ref $t)`/`(ref null $t)` lattice, `call_ref`,
+`return_call_ref`, `br_on_null`, `br_on_non_null`,
+`ref.as_non_null`, definite initialization for non-defaultable
+locals), `rec` type groups with canonicalization and
+iso-recursive equivalence (the wasm-comptype/rectype-group engine,
+cross-module `func-type-match-p`), and the named module
 definition/instance script forms **are** implemented. The `.wat`
 text format and `.wast` spec runner **are** implemented
 (`src/text.lisp`, `src/wast.lisp`), as is conformance reporting.
@@ -136,23 +138,21 @@ SBCL-specific numeric internals where documented.
 
 ## Roadmap (residual families, in loop order)
 
-1. **`rec` type groups + canonicalization (7 fail rows + ~54
-   unsupported carriers)** — iso-recursive type equivalence:
-   structurally-equal functypes share one canonical representative
-   (a `build-vctx` pass mapping each typeidx → the min index of
-   its equal functype; `%heap-sub-p`/`reftype-sub-p` and the
-   link-time functype compare route through canonical reps), so
-   the nominal typeuse comparison matches across
-   differently-declared equal types. This is the ENTIRE remaining
-   fail set (type-equivalence.wast 6, type-rec.wast 1).
-2. **GC values (struct/array/i31)** — the largest remaining
+1. **GC values (struct/array/i31)** — the largest remaining
    `unsupported` family; struct/array/i31 heap types, `struct.new`
-   and friends, `ref.cast`/`br_on_cast`.
-3. **memory64 / multi-memory runtime / SIMD** — the remaining
+   and friends, `ref.cast`/`br_on_cast`, packed fields. The loop-20
+   equivalence engine (wasm-comptype/rectype-group, the iso
+   comparator, struct/array grammar in %comptype-body) is the
+   foundation this builds on.
+2. **memory64 / multi-memory runtime / SIMD** — the remaining
    Core 3.0 feature gaps after GC.
 
-The 131 `unsupported` rows: annotations 73, `rec`-group/carrier
-fixtures (type-rec 26, type-equivalence 18, elem 8, binary 2,
-type-canon 2, custom 1, obsolete-keywords 1, plus GC-value opcode
-fixtures); every non-pass is attributed per file in
-`CONFORMANCE.md`.
+DONE in loop 20 (`fa623ec`): `rec` type groups + canonicalization
++ iso-recursive equivalence — the former 7-fail family and the
+rec-carrier unsupported rows all pass; type-equivalence.wast is
+32/32 and type-canon.wast 2/2.
+
+The 106 `unsupported` rows: annotations 73 (an unadopted
+proposal), GC value types (type-rec struct rows 21, binary
+typed-ref 11, elem 8, binary 2), SIMD 1, custom/obsolete 1+1 —
+every non-pass is attributed per file in `CONFORMANCE.md`.
