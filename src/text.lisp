@@ -1948,16 +1948,48 @@ rest of the plain sequence."
                                  (list :types (and types (coerce types 'vector)))
                                  #() 0)
                 items)))
-     ;; memory ops (single-memory slice: memidx 0)
+     ;; memory ops (multi-memory, Core 3.0): optional memidx per the
+     ;; idx_opt grammar — size/grow/fill take ONE optional index
+     ;; ($id or number, default 0, resolved in the memory namespace
+     ;; exactly like the load/store memarg arm); copy takes
+     ;; both-or-neither (idx_idx_opt: empty | idx idx); init takes
+     ;; dataidx then an optional memidx (binary order).
      ((member k '("memory.size" "memory.grow" "memory.fill") :test #'string=)
-      (values (make-wasm-instr op-key (list :memidx 0) #() 0) rest))
+      (let ((memidx 0) (items rest))
+        (when (and items (tok-p (car items))
+                   (member (tok-kind (car items)) '(:id :nat)))
+          (setf memidx (%id-or-num (car items) (penv-mems penv) "memory")
+                items (cdr items)))
+        (values (make-wasm-instr op-key (list :memidx memidx) #() 0)
+                items)))
      ((string= k "memory.copy")
-      (values (make-wasm-instr op-key (list :dst 0 :src 0) #() 0) rest))
+      (let ((dst 0) (src 0) (items rest))
+        (cond
+         ;; empty -> (0,0)
+         ((not (and items (tok-p (car items))
+                    (member (tok-kind (car items)) '(:id :nat))))
+          (values (make-wasm-instr op-key (list :dst 0 :src 0) #() 0)
+                  items))
+         ;; idx idx (both required when present — idx_idx_opt)
+         ((and (cdr items) (tok-p (second items))
+               (member (tok-kind (second items)) '(:id :nat)))
+          (setf dst (%id-or-num (car items) (penv-mems penv) "memory")
+                src (%id-or-num (second items) (penv-mems penv) "memory")
+                items (cddr items))
+          (values (make-wasm-instr op-key (list :dst dst :src src) #() 0)
+                  items))
+         ;; a single index: malformed per the grammar
+         (t (%text-error 0 "memory.copy needs both or neither index")))))
      ((string= k "memory.init")
       (multiple-value-bind (x items)
           (%take-index rest (penv-datas penv) "data")
-        (values (make-wasm-instr op-key (list :data x :memidx 0) #() 0)
-                items)))
+        (let ((memidx 0))
+          (when (and items (tok-p (car items))
+                     (member (tok-kind (car items)) '(:id :nat)))
+            (setf memidx (%id-or-num (car items) (penv-mems penv) "memory")
+                  items (cdr items)))
+          (values (make-wasm-instr op-key (list :data x :memidx memidx) #() 0)
+                  items))))
      ((string= k "data.drop")
       (multiple-value-bind (x items)
           (%take-index rest (penv-datas penv) "data")
@@ -2243,17 +2275,33 @@ an $id token."
       (values nil items)))
 
 (defun %limits-tail (items pos what)
-  "Parse n | n n limits from ITEMS: the min is a nat token; a SECOND
-nat token is the max (a reftype/id after the min is NOT a max)."
-  (unless (and (>= (length items) 1) (tok-p (car items)))
-    (%text-error pos "~a needs limits" what))
-  (let ((min (%parse-nat (tok-text (car items)) (tok-pos (car items)))))
-    (if (and (cdr items) (tok-p (second items))
-             (eq (tok-kind (second items)) :nat))
-        (let ((max (%parse-nat (tok-text (second items))
-                               (tok-pos (second items)))))
-          (values (make-wasm-limits min max) (cddr items)))
-        (values (make-wasm-limits min) (cdr items)))))
+  "Parse [i32|i64]? n | n n limits from ITEMS (Core 3.0 memorytype:
+addrtype then limits — the i64 marker sets the memory64 flag; i32
+is the default and accepted explicitly). The min is a nat token; a
+SECOND nat token is the max (a reftype/id after the min is NOT a
+max). Returns (values limits rest-items)."
+  ;; optional addrtype marker (memory positions only; TABLE callers
+  ;; never pass an i64 token here — the table grammar has no
+  ;; addrtype, and a 64-bit table would be table64, out of scope)
+  (let ((i64-p nil) (rest items))
+    (when (and rest (tok-p (car rest))
+               (member (tok-kind (car rest)) '(:keyword :id))
+               (member (%tok-keyword (car rest)) '("i32" "i64")
+                       :test #'string=))
+      (setf i64-p (string= (%tok-keyword (car rest)) "i64")
+            rest (cdr rest)))
+    (unless (and (>= (length rest) 1) (tok-p (car rest)))
+      (%text-error pos "~a needs limits" what))
+    (let ((min (%parse-nat (tok-text (car rest)) (tok-pos (car rest)))))
+      (if (and (cdr rest) (tok-p (second rest))
+               (eq (tok-kind (second rest)) :nat))
+          (let ((max (%parse-nat (tok-text (second rest))
+                                 (tok-pos (second rest)))))
+            (values (make-wasm-limits min max i64-p) (cddr rest)))
+          ;; no max: the &aux has-max in the positional constructor
+          ;; keys off SUPPLIED-P, so use the explicit constructor
+          (values (wasmdown.types::%make-wasm-limits* min nil nil i64-p)
+                  (cdr rest))))))
 
 (defun %comptype-body (node penv what)
   "Parse the comptype BODY of one (type $id? (func|struct|array ...))

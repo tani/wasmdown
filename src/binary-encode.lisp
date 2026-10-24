@@ -72,11 +72,14 @@
           (progn (enc-byte e b) (return))
           (enc-byte e (logior b #x80))))))
 
-(declaim (inline enc-u32 enc-s32 enc-s33 enc-s64))
+(declaim (inline enc-u32 enc-s32 enc-s33 enc-s64 enc-u64))
 (defun enc-u32 (e n) (enc-uleb e n))
 (defun enc-s32 (e n) (enc-sleb e n))
 (defun enc-s33 (e n) (enc-sleb e n))
 (defun enc-s64 (e n) (enc-sleb e n))
+;; u64 (Core 3.0 limits/memarg): enc-uleb is value-driven — the
+;; minimal encoding is correct for any non-negative integer width
+(defun enc-u64 (e n) (enc-uleb e n))
 
 ;;; ---------------------------------------------------------------
 ;;; Names (UTF-8).
@@ -181,12 +184,15 @@ ENC-REFTYPE (0x63/0x64 + heap type)."
         (t (enc-valtype e bt))))
 
 (defun enc-limits (e limits)
-  (if (wasm-limits-has-max-p limits)
-      (progn (enc-byte e 1)
-             (enc-u32 e (wasm-limits-min limits))
-             (enc-u32 e (wasm-limits-max limits)))
-      (progn (enc-byte e 0)
-             (enc-u32 e (wasm-limits-min limits)))))
+  "Limits flags (Core 3.0, mirror of %read-limits): bit 0 = has-max,
+bit 2 = 64-bit address type (memory64). min/max emit as u64
+(value-driven minimal LEB — byte-stable round-trips)."
+  (let ((flags (logior (if (wasm-limits-has-max-p limits) 1 0)
+                       (if (wasm-limits-i64-p limits) 4 0))))
+    (enc-byte e flags)
+    (enc-u64 e (wasm-limits-min limits))
+    (when (wasm-limits-has-max-p limits)
+      (enc-u64 e (wasm-limits-max limits)))))
 
 ;;; ---------------------------------------------------------------
 ;;; Reverse lookup of the decoder's simple-op table.

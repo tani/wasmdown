@@ -723,24 +723,39 @@ typeuse-equivalence cases, loop 20)."
 ;;; ---------------------------------------------------------------
 ;;; Immediate validation for memory and reference instructions.
 
+(defun %mem-addrtype (mem)
+  "The memory's address type (Core 3.0 memory64): :i64 when the
+limits carry the 64-bit flag, :i32 otherwise (the default)."
+  (if (wasmdown.types:wasm-limits-i64-p
+       (wasm-memory-limits mem))
+      :i64 :i32))
+(defun %mem-addrtype-of (ctx memidx what)
+  "Resolve MEMIDX in CTX's memory index space (range-checked, WHAT
+names the op in the error) and return its address type."
+  (%mem-addrtype (vctx-mem-at ctx memidx what)))
+
 (defun %check-memarg (fv imms width-bits)
   "Validate a memarg: memidx must exist, alignment must not exceed the
-natural width (spec: 2^align <= N/8), and the offset must fit the u32
-range the spec's memarg grammar allows (suite: address.wast/
-align.wast 'offset out of range' with offset=2^32 and above)."
+natural width (spec: 2^align <= N/8), and the offset must fit the
+memory's ADDRESS domain — u32 for i32-addressed memories (suite:
+address.wast/align.wast 'offset out of range' at 2^32+), u64 for
+memory64 (any u64 offset is valid per spec valid.ml check_memop)."
   (let* ((memidx (or (getf imms :memidx) 0))
          (align (getf imms :align))
          (offset (getf imms :offset))
-         (what (format nil "memory access (width ~a bits)" width-bits)))
-    (vctx-mem-at (fv-ctx fv) memidx what)
+         (what (format nil "memory access (width ~a bits)" width-bits))
+         (mem (vctx-mem-at (fv-ctx fv) memidx what))
+         (offset-max (if (eq (%mem-addrtype mem) :i64)
+                         #xffffffffffffffff
+                         #xffffffff)))
     (unless (and (integerp align) (>= align 0)
                  (<= (ash 1 align) (/ width-bits 8)))
       (verr "alignment must not be larger than natural (offset ~a: align ~a > ~a)"
             (fv-offset fv) align (/ width-bits 8)))
     (unless (integerp offset)
       (verr "memory offset immediate must be an integer"))
-    (unless (and (>= offset 0) (<= offset #xffffffff))
-      (verr "offset out of range (offset ~a): ~a is not within u32"
+    (unless (and (>= offset 0) (<= offset offset-max))
+      (verr "offset out of range (offset ~a): ~a is not within the memory's address range"
             (fv-offset fv) offset))))
 
 (defun %local-type (fv localidx)
@@ -1432,31 +1447,43 @@ bodies of their :end terminator; bodies of :if carry no :else/:end)."
            (%pop-val-expect fv :i32)))
         ((eq op :elem.drop)
          (vctx-elem-type-at (fv-ctx fv) (imm :elem) "elem.drop"))
-        ;; --- memory ---
+        ;; --- memory (Core 3.0 addrtype-aware: per spec valid.ml,
+        ;; size/grow/fill address in the memory's addrtype AT;
+        ;; copy's len type is min(at_dst, at_src) — i32 < i64;
+        ;; init's data src/len stay i32) ---
         ((member op '(:memory.size :memory.grow))
-         (vctx-mem-at (fv-ctx fv) (imm :memidx) (string op))
-         (when (eq op :memory.grow)
-           (%pop-val-expect fv :i32))
-         (%push-val fv :i32))
+         (let* ((mem (vctx-mem-at (fv-ctx fv) (imm :memidx) (string op)))
+                (at (%mem-addrtype mem)))
+           (when (eq op :memory.grow)
+             (%pop-val-expect fv at))
+           (%push-val fv at)))
         ((eq op :memory.fill)
-         (vctx-mem-at (fv-ctx fv) (imm :memidx) "memory.fill")
-         (%pop-val-expect fv :i32)
-         (%pop-val-expect fv :i32)
-         (%pop-val-expect fv :i32))
+         (let* ((mem (vctx-mem-at (fv-ctx fv) (imm :memidx) "memory.fill"))
+                (at (%mem-addrtype mem)))
+           ;; [at i32 at] -> []
+           (%pop-val-expect fv at)
+           (%pop-val-expect fv :i32)
+           (%pop-val-expect fv at)))
         ((eq op :memory.copy)
-         (vctx-mem-at (fv-ctx fv) (imm :dst) "memory.copy dst")
-         (vctx-mem-at (fv-ctx fv) (imm :src) "memory.copy src")
-         (%pop-val-expect fv :i32)
-         (%pop-val-expect fv :i32)
-         (%pop-val-expect fv :i32))
+         (let* ((dst (vctx-mem-at (fv-ctx fv) (imm :dst) "memory.copy dst"))
+                (src (vctx-mem-at (fv-ctx fv) (imm :src) "memory.copy src"))
+                (at-dst (%mem-addrtype dst))
+                (at-src (%mem-addrtype src))
+                ;; len pops in the MIN addrtype (i32 < i64)
+                 (at-len (if (and (eq at-dst :i64) (eq at-src :i64))
+                            :i64 :i32)))
+           (%pop-val-expect fv at-len)
+           (%pop-val-expect fv at-src)
+           (%pop-val-expect fv at-dst)))
         ((eq op :memory.init)
-         (vctx-mem-at (fv-ctx fv) (imm :memidx) "memory.init")
-         (unless (vctx-data-in-range-p (fv-ctx fv) (imm :data))
-           (verr "memory.init: data segment index ~a out of range (module has ~a)"
-                 (imm :data) (vctx-data-count (fv-ctx fv))))
-         (%pop-val-expect fv :i32)
-         (%pop-val-expect fv :i32)
-         (%pop-val-expect fv :i32))
+         (let ((mem (vctx-mem-at (fv-ctx fv) (imm :memidx) "memory.init")))
+           (unless (vctx-data-in-range-p (fv-ctx fv) (imm :data))
+             (verr "memory.init: data segment index ~a out of range (module has ~a)"
+                   (imm :data) (vctx-data-count (fv-ctx fv))))
+           ;; [at i32 i32] -> []
+           (%pop-val-expect fv :i32)
+           (%pop-val-expect fv :i32)
+           (%pop-val-expect fv (%mem-addrtype mem))))
         ((eq op :data.drop)
          (unless (vctx-data-in-range-p (fv-ctx fv) (imm :data))
            (verr "data.drop: data segment index ~a out of range (module has ~a)"
@@ -1590,14 +1617,17 @@ bodies of their :end terminator; bodies of :if carry no :else/:end)."
                 (value-bits (third info))  ; natural (N/8) alignment bound
                 (out-type (fourth info))
                 (store-p (search "STORE" (symbol-name op))))
-           (%check-memarg fv imms value-bits)
-           (if store-p
-               (progn
-                 (%pop-val-expect fv out-type)
-                 (%pop-val-expect fv :i32))
-               (progn
-                 (%pop-val-expect fv :i32)
-                 (%push-val fv out-type)))))
+           (let ((at (%mem-addrtype-of (fv-ctx fv)
+                                       (or (getf imms :memidx) 0)
+                                       (string op))))
+             (%check-memarg fv imms value-bits)
+             (if store-p
+                 (progn
+                   (%pop-val-expect fv out-type)
+                   (%pop-val-expect fv at))
+                 (progn
+                   (%pop-val-expect fv at)
+                   (%push-val fv out-type))))))
         (t
          ;; simple fixed-signature numeric ops
          (let ((sig (%instr-op-sig fv op)))
@@ -1763,8 +1793,16 @@ types helper): params+results for a func, field types for struct."
                               (format nil "import ~a (table)" i)
                               *max-table-size*))
                (:memory
+                ;; memory64 (Core 3.0): the page bound is the
+                ;; addrtype's — 2^16 pages (i32) vs 2^48 pages
+                ;; (i64, the spec's 2^64-byte ceiling); the runtime
+                ;; keeps its own allocation ceiling per §3.4.
                 (check-limits (wasm-memory-limits ty)
-                              (format nil "import ~a (memory)" i)))
+                              (format nil "import ~a (memory)" i)
+                              (if (wasmdown.types:wasm-limits-i64-p
+                                   (wasm-memory-limits ty))
+                                  (ash 1 48)
+                                  *max-memory-pages*)))
                (:global
                 (unless (valtype-p (car ty))
                   (verr "import ~a: invalid global type ~a" i (car ty))))
@@ -1836,7 +1874,15 @@ surface here as 'unknown type' (the vctx slot holds NIL for them)."
     (loop for mem across (wasm-module-mems module)
           for i from 0
           do (check-limits (wasm-memory-limits mem)
-                            (format nil "memory ~a" i)))))
+                            (format nil "memory ~a" i)
+                            ;; memory64: the addrtype's page bound
+                            ;; (2^16 vs 2^48 per spec valid.ml
+                            ;; check_limits; the runtime's own
+                            ;; allocation ceiling is separate, §3.4)
+                            (if (wasmdown.types:wasm-limits-i64-p
+                                 (wasm-memory-limits mem))
+                                (ash 1 48)
+                                *max-memory-pages*)))))
 
 (defun check-globals (ctx)
   "Globals are validated sequentially: each init may reference only

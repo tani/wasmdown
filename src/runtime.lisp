@@ -71,12 +71,16 @@ individual arguments returning a results list."
   type)
 
 (defstruct (memory-instance (:constructor %make-memory-instance))
-  "Linear memory: BYTES is a (vector (unsigned-byte 8)) of PAGES pages."
+  "Linear memory: BYTES is a (vector (unsigned-byte 8)) of PAGES
+pages. I64-P marks the memory64 address type (Core 3.0): loads/
+stores address with i64 operands and grow's failure value is the
+i64 -1."
   (bytes (make-array 0 :element-type '(unsigned-byte 8))
          :type (vector (unsigned-byte 8)))
   (pages 0 :type (integer 0))
   (max-pages *max-pages* :type (integer 0))
-  (has-max-p nil :type boolean))
+  (has-max-p nil :type boolean)
+  (i64-p nil :type boolean))
 
 (defstruct (table-instance (:constructor %make-table-instance))
   "A table of references; ELEMS is a simple vector of func-instances /
@@ -262,7 +266,9 @@ arguments and returns a results LIST."
                         :element-type '(unsigned-byte 8) :initial-element 0)
      :pages min
      :max-pages (or max *max-pages*)
-     :has-max-p (wasm-limits-has-max-p limits))))
+     :has-max-p (wasm-limits-has-max-p limits)
+     ;; memory64 (Core 3.0): the address type from the limits flag
+     :i64-p (wasm-limits-i64-p limits))))
 
 (defun make-table-instance (type limits)
   "Allocate a table of TYPE (:funcref/:externref) from wasm-limits.
@@ -334,13 +340,20 @@ Elements initialize to the null reference (NIL)."
   (memory-instance-pages mem))
 
 (defun memory-grow (mem delta)
-  "Grow by DELTA pages. Returns the old page count on success, 4294967295
- (i32 -1) when the limit is exceeded. On success the byte vector is
- replaced by a larger one that preserves contents and zero-fills."
+  "Grow by DELTA pages. Returns the old page count on success, -1 in
+the memory's ADDRESS TYPE on failure (4294967295 for i32 memories;
+18446744073709551615 for memory64 — spec exec/intabort.ml's grow
+failure is the index-type -1). On success the byte vector is
+replaced by a larger one that preserves contents and zero-fills.
+The *max-pages* ceiling is the runtime's own allocation bound
+(PLAN.md §3.4) — the validator's spec-side bound is separate."
   (let* ((old (memory-instance-pages mem))
-         (new (+ old delta)))
+         (new (+ old delta))
+         (fail (if (memory-instance-i64-p mem)
+                   18446744073709551615
+                   4294967295)))
     (if (or (> new *max-pages*) (> new (memory-instance-max-pages mem)))
-        4294967295
+        fail
         (let* ((old-bytes (memory-instance-bytes mem))
                (new-bytes (make-array (* new *page-size*)
                                       :element-type '(unsigned-byte 8)
@@ -378,6 +391,17 @@ Elements initialize to the null reference (NIL)."
         (let ((tmp (make-array len :element-type '(unsigned-byte 8))))
           (replace tmp bytes :start2 src)
           (replace bytes tmp :start1 dst)))))
+
+(defun memory-copy2 (dst-mem dst src-mem src len)
+  "Cross-memory memory.copy (Core 3.0 multi-memory): LEN bytes from
+SRC-MEM [SRC, SRC+LEN) to DST-MEM [DST, DST+LEN). Bounds-check BOTH
+spans in the exact-integer domain before any access; no overlap is
+possible (distinct backings)."
+  (%check-mem-span dst-mem dst (+ dst len))
+  (%check-mem-span src-mem src (+ src len))
+  (let ((dbytes (memory-instance-bytes dst-mem))
+        (sbytes (memory-instance-bytes src-mem)))
+    (replace dbytes sbytes :start1 dst :end1 (+ dst len) :start2 src)))
 
 (defun memory-init (mem data-state dst src len)
   "memory.init: copy LEN bytes of data segment DATA-STATE [SRC, SRC+LEN)

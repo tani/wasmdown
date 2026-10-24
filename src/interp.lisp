@@ -1376,19 +1376,17 @@ caller)."
                                          dst val len)
            s3))))
     ((eq op :memory.copy)
-     ;; (memory-copy mem dst src len): this slice implements the
-     ;; same-memory form; distinct memidx operands share one instance
-     ;; only when both indices address the same memory, which the
-     ;; spec restricts to equal indices anyway.
+     ;; Core 3.0 multi-memory: same indices -> memmove on one backing;
+     ;; distinct indices -> the cross-memory copy (bounds on both).
      (multiple-value-bind (len s1) (pop-val s)
        (multiple-value-bind (src s2) (pop-val s1)
          (multiple-value-bind (dst s3) (pop-val s2)
            (let ((dst-idx (getf imms :dst 0))
                  (src-idx (getf imms :src 0)))
-             (unless (= dst-idx src-idx)
-               (%trap :out-of-bounds-memory
-                      "memory.copy across distinct memories unsupported"))
-             (wasmdown.runtime:memory-copy (%mem-at dst-idx) dst src len))
+             (if (= dst-idx src-idx)
+                 (wasmdown.runtime:memory-copy (%mem-at dst-idx) dst src len)
+                 (wasmdown.runtime:memory-copy2 (%mem-at dst-idx) dst
+                                                 (%mem-at src-idx) src len)))
            s3))))
     ((eq op :memory.init)
      (multiple-value-bind (len s1) (pop-val s)

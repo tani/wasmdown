@@ -42,6 +42,7 @@
    ;; limits
    #:make-wasm-limits #:wasm-limits #:wasm-limits-p
    #:wasm-limits-min #:wasm-limits-max #:wasm-limits-has-max-p
+   #:wasm-limits-i64-p
    #:copy-wasm-limits
    ;; table / memory types
    #:make-wasm-table #:wasm-table #:wasm-table-p
@@ -185,7 +186,7 @@
    #:memory-instance-max-pages #:memory-instance-has-max-p
    #:make-memory-instance
    #:memory-load #:memory-store #:memory-size #:memory-grow #:memory-fill
-   #:memory-copy #:memory-init
+   #:memory-copy #:memory-copy2 #:memory-init
    #:table-instance #:table-instance-p
    #:table-instance-elems #:table-instance-type #:table-instance-max
    #:table-instance-has-max-p

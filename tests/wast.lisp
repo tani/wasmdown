@@ -1797,3 +1797,87 @@
            (d (wasmdown.binary:decode-module b1))
            (b2 (wasmdown.binary:encode-module d)))
       (wasmdown.test:is (equalp b1 b2)))))
+
+(wasmdown.test:test wast/multi-memory-ops
+  ;; Loop 23: multi-memory (Core 3.0). Two defined memories; every
+  ;; memory op addresses memory 1 through its memidx immediate —
+  ;; load/store via the memarg's leading index, size/grow/fill via
+  ;; the optional index, copy via both-or-neither (idx_idx_opt),
+  ;; init via dataidx-then-memidx. The memories hold DISTINCT state.
+  (let ((os (%outcomes
+             "(module (memory 1) (memory 2)
+                (func (export \"a\") (result i32)
+                  (i32.store 1 (i32.const 0) (i32.const 42))
+                  (i32.load 1 (i32.const 0)))
+                (func (export \"b\") (result i32)
+                  (i32.store (i32.const 0) (i32.const 7))
+                  (i32.load 1 (i32.const 0)))
+                (func (export \"sz\") (result i32) (memory.size 1))
+                (func (export \"fill1\") (result i32)
+                  (memory.fill 1 (i32.const 0) (i32.const 9) (i32.const 2))
+                  (i32.load 1 (i32.const 1))))
+              (assert_return (invoke \"a\") (i32.const 42))
+              (assert_return (invoke \"b\") (i32.const 42))
+              (assert_return (invoke \"sz\") (i32.const 2))
+              (assert_return (invoke \"fill1\") (i32.const 9))")))
+    (wasmdown.test:is (equal '(:pass :pass :pass :pass :pass)
+                             os))))
+
+(wasmdown.test:test wast/multi-memory-cross-copy
+  ;; memory.copy with DISTINCT memidx operands: bounds checked on
+  ;; BOTH backings; the copy crosses memories (the at_min rule in
+  ;; spec valid.ml; the runtime's memory-copy2). Negative: an OOB
+  ;; dst span on the destination memory traps at EXECUTE.
+  (let ((os (%outcomes
+             "(module (memory 1) (memory 1)
+                (func (export \"x\") (result i32)
+                  (i32.store 0 (i32.const 0) (i32.const 99))
+                  (memory.copy 1 0 (i32.const 0) (i32.const 0) (i32.const 4))
+                  (i32.load 1 (i32.const 0)))
+                (func (export \"oob\")
+                  (memory.copy 1 0 (i32.const 65530) (i32.const 0) (i32.const 8))))
+              (assert_return (invoke \"x\") (i32.const 99))
+              (assert_trap (invoke \"oob\") \"out of bounds memory access\")")))
+    (wasmdown.test:is (equal '(:pass :pass :pass) os))))
+
+(wasmdown.test:test wast/memory64-addressing
+  ;; memory64 (Core 3.0): the (memory i64 ...) text marker, limits
+  ;; flags bit 2 in binary, i64-typed load/store addresses, i64
+  ;; size/grow results, and grow's i64 -1 failure value. Round-trip
+  ;; pin included (the flags-0x04 encoding is byte-stable).
+  (let ((os (%outcomes
+             "(module (memory i64 1)
+                (func (export \"a\") (result i64)
+                  (i64.store (i64.const 8) (i64.const 77))
+                  (i64.load (i64.const 8)))
+                (func (export \"sz\") (result i64) (memory.size))
+                (func (export \"growmax\") (result i64)
+                  (memory.grow (i64.const 1125899906842624))))
+              (assert_return (invoke \"a\") (i64.const 77))
+              (assert_return (invoke \"sz\") (i64.const 1))
+              (assert_return (invoke \"growmax\") (i64.const 18446744073709551615))")))
+    (wasmdown.test:is (equal '(:pass :pass :pass :pass) os)))
+  ;; binary round-trip: the i64 limits flag survives encode/decode
+  (let* ((m (wasmdown.text:parse-wat "(module (memory i64 1 10))"))
+         (b1 (wasmdown.binary:encode-module m))
+         (m2 (wasmdown.binary:decode-module b1))
+         (b2 (wasmdown.binary:encode-module m2)))
+    (wasmdown.test:is (equalp b1 b2))
+    (wasmdown.test:is
+     (wasmdown.types:wasm-limits-i64-p
+      (wasmdown.types:wasm-memory-limits
+       (aref (wasmdown.types:wasm-module-mems m2) 0))))))
+
+(wasmdown.test:test wast/multi-memory-data-segment
+  ;; Active data segments target their DECLARED memidx (the
+  ;; wasm-data-mode's memory index); memory.init addresses a
+  ;; non-zero memory. Negative: memidx range check at VALIDATE.
+  (let ((os (%outcomes
+             "(module (memory 1) (memory 1) (data (memory 1) (i32.const 0) \"hi\")
+                (func (export \"a\") (result i32) (i32.load 1 (i32.const 0))))
+              (assert_return (invoke \"a\") (i32.const 26984))
+              (assert_invalid
+                (module (memory 1) (data (i32.const 0) \"x\")
+                        (func (memory.init 1 (i32.const 0) (i32.const 0) (i32.const 0))))
+                \"unknown memory\")")))
+    (wasmdown.test:is (equal '(:pass :pass :pass) os))))

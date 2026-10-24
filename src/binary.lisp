@@ -312,15 +312,23 @@ complement), so the byte case catches them before the s33 read."
 
 
 (defun %read-limits (r)
-  "Flags 0x00 (min) and 0x01 (min+max) only: shared and 64-bit flag
-forms are rejected as decode-error."
+  "Limits flags (Core 3.0, spec binary/decode.ml `limits`): bit 0 =
+has-max, bit 2 = 64-bit address type (memory64; table64 decodes
+but the validator keeps rejecting tables — out of scope). Legal
+flag sets exactly {0x00,0x01,0x04,0x05}; min/max read as u64
+UNCONDITIONALLY (the spec reads the width-agnostic domain; the
+VALIDATOR imposes the per-addrtype page bounds).
+(logtest flags #xfa) covers all illegal bits (shared + reserved)."
   (let ((flags (read-byte-at r)))
-    (case flags
-      (#x00 (make-wasm-limits (read-u32 r)))
-      (#x01 (let ((min (read-u32 r))
-                  (max (read-u32 r)))
-              (make-wasm-limits min max)))
-      (t (%decode-error r "malformed limits flags 0x~x" flags)))))
+    (unless (zerop (logand flags #xfa))
+      (%decode-error r "malformed limits flags 0x~x" flags))
+    (let ((min (read-u64 r))
+          (i64-p (logtest flags #x04)))
+      (if (logtest flags #x01)
+          (make-wasm-limits min (read-u64 r) i64-p)
+          ;; no max: the positional constructor's &aux has-max keys
+          ;; off SUPPLIED-P — use the explicit constructor
+          (wasmdown.types::%make-wasm-limits* min nil nil i64-p)))))
 
 ;;; ---------------------------------------------------------------
 ;;; Simple (immediate-free) opcodes: opcode byte -> op keyword.
@@ -416,16 +424,20 @@ word, but little-endian accumulation is unsigned."
 that must be < 0x80 (else 'malformed memop flags' at DECODE — align
 exponents beyond 2^63 and multi-byte flag encodings are malformed);
 bit 6 -> memidx follows (stored as :memidx); align = flags & 0x3F;
-offset is u32 in this 32-bit-only slice (the grammar writes u64)."
+offset is u64 ALWAYS (memory64's address domain; every pinned
+'integer too large' fixture's value is >= 2^64 and stays
+malformed — the u64 domain only admits what the spec admits).
+The VALIDATOR imposes the per-addrtype offset bound (< 2^32 for
+i32-addressed memories) at %check-memarg."
   (let ((start (reader-offset r))
         (flags (read-u32 r)))
     (unless (< flags #x80)
       (decode-error-at start "malformed memop flags: ~a" flags))
     (if (logtest flags #x40)
         (let ((memidx (read-u32 r))
-              (offset (read-u32 r)))
+              (offset (read-u64 r)))
           (list :align (logand flags #x3F) :offset offset :memidx memidx))
-        (list :align flags :offset (read-u32 r)))))
+        (list :align flags :offset (read-u64 r)))))
 
 (defun %read-instr (r depth)
   "Decode one instruction at R. Returns the wasm-instr, or :end / :else

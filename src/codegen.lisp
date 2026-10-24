@@ -593,11 +593,13 @@ its :end)."
       (:memory.copy
        (destructuring-bind (dst src len) (funcall three)
          (let ((dst-idx (getf imms :dst 0)) (src-idx (getf imms :src 0)))
-           (unless (= dst-idx src-idx)
-             (error 'wasmdown:validation-error
-                    :message "memory.copy across distinct memories"))
-           (%emit cctx `(wasmdown.runtime:memory-copy
-                         ,(%mem cctx dst-idx) ,dst ,src ,len)))))
+           (if (= dst-idx src-idx)
+               (%emit cctx `(wasmdown.runtime:memory-copy
+                             ,(%mem cctx dst-idx) ,dst ,src ,len))
+               ;; Core 3.0 multi-memory: bounds on both backings
+               (%emit cctx `(wasmdown.runtime:memory-copy2
+                             ,(%mem cctx dst-idx) ,dst
+                             ,(%mem cctx src-idx) ,src ,len))))))
       (:memory.init
        (destructuring-bind (dst src len) (funcall three)
          (%emit cctx `(wasmdown.runtime:memory-init

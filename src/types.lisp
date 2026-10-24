@@ -110,10 +110,17 @@ forward-reference bound)."
                 (wasm-func-type-params ty)
                 (wasm-func-type-results ty)))))))
 
-(defstruct (wasm-limits (:constructor make-wasm-limits (min &optional (max nil max-p) &aux (has-max max-p))))
+(defstruct (wasm-limits
+            (:constructor make-wasm-limits (min &optional (max nil max-p) (i64-p nil) &aux (has-max max-p)))
+            (:constructor %make-wasm-limits* (min max has-max &optional (i64-p nil))))
   (min 0 :type (integer 0))
   (max nil :type (or null (integer 0)))
-  (has-max nil :type boolean))
+  (has-max nil :type boolean)
+  ;; memory64 (Core 3.0): the address type is i64 (limits flags bit
+  ;; 2 in binary; the i64 marker in text). Memory-only semantics:
+  ;; a 64-bit TABLE limits flag decodes but the validator keeps
+  ;; rejecting tables (table64 out of scope — honest slice).
+  (i64-p nil :type boolean))
 
 (defun wasm-limits-has-max-p (limits)
   "Exported alias for the HAS-MAX slot reader."
