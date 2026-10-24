@@ -21,7 +21,7 @@ The official core suite (97 `.wast` files, pinned at
 executed through the stateful runner with failure-phase classification:
 
 ```
-pass 21186 | fail 0 | unsupported 74 | harness-error 0 | total 21260
+pass 21187 | fail 0 | unsupported 73 | harness-error 0 | total 21260
 pass rate 99.7% (denominator = all executed, incl. unsupported)
 ```
 
@@ -87,7 +87,10 @@ Not implemented (see `PLAN.md` for the full contract): Component
 Model, Canonical ABI, WASI (all versions),
 threads/atomics, FASL cache, annotations (an unadopted proposal —
 permanently out of scope per PLAN.md §3.3). SIMD (v128 + relaxed,
-loop 24), tail calls
+loop 24: the full 236-op v128 family + the 20 relaxed ops with
+documented canonical choices, scalarized per PLAN.md §7.3 — the
+one vendored SIMD fixture, obsolete-keywords::10, passes at
+DECODE with the honest malformed message), tail calls
 `return_call`/`return_call_indirect`, exception handling (tags,
 `try_table`, `throw`, cross-call propagation, uncaught boundary
 at the outermost guest frame), typed function references (the
@@ -151,28 +154,33 @@ SBCL (developed against 2.6.4, Linux ARM64). Zero third-party Lisp
 libraries; no ASDF ecosystem dependencies. ANSI-portable core logic with
 SBCL-specific numeric internals where documented.
 
-## Roadmap (residual Core 3.0 gaps, in loop order)
+## Roadmap (residual Core 3.0 gaps)
 
 The vendored core suite (97 files, pinned) is FULLY attributed —
-no fails, and the 73 unsupported are named out-of-scope families
-(annotations 73). The remaining Core 3.0 feature
-work (PLAN.md §3.1) has NO vendored fixture coverage; each lands
-with self-authored tests per the §12 gap-test discipline:
+no fails, and the 73 unsupported are the unadopted-annotations
+proposal (permanently out of scope per PLAN.md §3.3). PLAN.md
+§3.1's Core 3.0 opcode/type inventory is COMPLETE in the engine
+slice (every row; SIMD was the last family). What remains is
+§3.2's Component/WASI layer, M7-M12 territory per PLAN.md §14:
 
-1. **Component Model / WASI** — PLAN.md §8-9; M7-M12 territory.
-
-DONE (loop 24): **SIMD (v128 + relaxed)** — the full 0xFD opcode
-surface per the Core 3.0 SIMD binary encoding (236 v128 ops) plus
-the relaxed 0x100..0x113 set, scalarized reference semantics per
-PLAN.md §7.3 (one 16-byte-vector value per v128; lane loops over
-the backing bytes), text/binary/validate/interp/encode end to end;
-the vendored obsolete-keywords::10 row now passes at decode.
+1. **Component Model** (§8.1: layer discrimination, nested core
+   modules/components, aliases, WIT types incl. map<K,V>/
+   implements/external-id) — requires vendoring the
+   component-model spec + suite per §12.1's pin discipline.
+2. **Canonical ABI** (§8.2: lift/lower, flattening, resources,
+   post-return) + **async runtime** (§8.3: the task state
+   machine, may-suspend propagation).
+3. **WASI 0.3.2 providers** (§9: cli/clocks/random/filesystem/
+   sockets/http over the pinned WIT) + the 0.1/0.2 facades.
+4. **The §12 remaining gates** for the conformant claim:
+   compiler-backend parity matrix (§12.3 — the :baseline mode
+   covers a slice; :optimized/:aot and the differential oracle
+   remain), the property/fuzz lanes (§12.6), and the §12.7 CI
+   lanes (test-component/test-wasi-*/test-differential).
 
 DONE: loop 18 (tail calls, EH, named modules), loop 19 (typed
 function references), loop 20 (rec groups + canonicalization +
 iso-recursive equivalence), loop 21 (struct/array declarations),
-loop 22 (GC value opcodes end to end — the full 0xFB family,
-i31, casts, ref.eq, conversions; 8 self-authored test families),
-loop 23 (multi-memory runtime + memory64 — memidx immediates,
-cross-memory copy, i64 addressing; 4 self-authored test
-families).
+loop 22 (GC value opcodes end to end), loop 23 (multi-memory
+runtime + memory64), loop 24 (SIMD — v128 + relaxed, the last
+opcode family; 32 self-authored pins).

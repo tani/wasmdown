@@ -15,7 +15,7 @@ conformance gates. This repository delivers an honest **partial** slice
    end (decode → validate → interpret → compile → invoke). SIMD/GC/EH/
    tail-calls/memory64/WAT/Component/WASI/threads/FASL cache are out of
    scope and rejected with clear errors, not silently.
-   *Superseded in part (loops 18–23, 2026-10-24): tail calls
+   *Superseded in part (loops 18–24, 2026-10-24): tail calls
    (`return_call`/`return_call_indirect`, constant-stack trampoline),
    exception handling (tags, `try_table`, `throw`, named module
    definition/instance forms), typed function references
@@ -32,11 +32,11 @@ conformance gates. This repository delivers an honest **partial** slice
    runtime + memory64 (memidx immediates on every memory op,
    cross-memory copy with bounds on both backings, i64
    addressing with the addrtype-typed size/grow/fill/init
-   rules — self-authored tests, no vendored fixture) are now
+   rules — self-authored tests, no vendored fixture), and SIMD (v128 + relaxed — the full 236-op v128 family and the 20 relaxed ops with documented canonical choices, scalarized per §7.3; the one vendored SIMD fixture passes at decode) are now
    implemented. The vendored core suite is fully attributed
    (0 fails; the 74 unsupported are the unadopted-annotations
-   proposal + one SIMD fixture). Still out of scope: SIMD,
-   WAT-level Component/WASI, threads, FASL cache.
+   proposal + one SIMD fixture). Still out of scope: WAT-level
+   Component/WASI, threads, FASL cache.
    `declared_support` stays `partial`.*
 2. **Failure phases are distinct conditions** (PLAN.md §12.2):
    `decode-error` → `validation-error` → `link-error` →
