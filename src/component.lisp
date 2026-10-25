@@ -2351,6 +2351,21 @@ type's own declarators stay against STATE, the inner space)."
               (vector-push-extend ty (cval-types inner))))
            (:alias
             (let ((a (typedecl-payload d)))
+              ;; slice 5 (outer-alias C, Binary.md 267-270): an alias
+              ;; DECLARATOR inside a component/instance type only
+              ;; aliases a SUBSET of the sorts — export aliases:
+              ;; instance/type (outer-alias.wast ::14's (func $a));
+              ;; outer aliases: core type/type (::15/::16/::17's
+              ;; component/core module)
+              (ecase (aliasrec-kind a)
+                (:export
+                 (unless (member (aliasrec-sort a) '(:instance :type))
+                   (%verr "may only refer to types or instances")))
+                (:outer
+                 (unless (member (aliasrec-sort a) '(:core-type :type))
+                   (%verr "may only refer to types or instances")))
+                ((:core-export)
+                 (%verr "may only refer to types or instances")))
               (when (eq (aliasrec-kind a) :outer)
                 ;; outer aliases inside types may cross TYPE-DEPTH
                 ;; scopes (each nested component/instance TYPE
@@ -2358,8 +2373,20 @@ type's own declarators stay against STATE, the inner space)."
                 ;; ::12's count of 2 inside doubly-nested types)
                 (when (> (aliasrec-count a) type-depth)
                   (%verr "invalid outer alias count of ~d" (aliasrec-count a)))
-                ;; the aliased type index is bounds-checked against the
-                ;; OUTER state below (via %check-outer-alias)
+                ;; slice 5 (outer-alias A): the de Bruijn count
+                ;; resolves through the state stack — one boundary
+                ;; per enclosing TYPE + COMPONENT scope. The chain
+                ;; from THIS type's space: 0 = inner, 1 = the
+                ;; enclosing component's state, 2+ = its outers.
+                (let* ((*outer-states*
+                        (if (boundp '*outer-states*)
+                            (cons outer *outer-states*)
+                            (list outer)))
+                       (tgt (%outer-state-at inner (aliasrec-count a))))
+                  (when (and tgt (eq (aliasrec-sort a) :type))
+                    (when (>= (aliasrec-target a)
+                              (length (cval-types tgt)))
+                      (%verr "type index out of bounds"))))
                 (vector-push-extend
                  (make-ct :kind :prim :payload :outer-aliased)
                  (cval-types inner)))))
@@ -2458,31 +2485,137 @@ parser's interner lands inline externtypes in."
              (elem-size c state))
       (%check-defvaltype c state type-depth outer)))
 
+(defun %outer-state-at (state count)
+  "The validator state COUNT de Bruijn scopes out from STATE (slice 5,
+outer-alias A): count 0 = STATE itself; count N = the (N-1)th entry of
+*OUTER-STATES* (innermost first). NIL when the count exceeds the
+stack (the caller rejects with 'invalid outer alias count')."
+  (if (zerop count)
+      state
+      (nth (1- count) *outer-states*)))
+
+(defun %ct-transitively-resources-p (ct state seen)
+  "Slice 5 (outer-alias B, Binary.md 133-135): does CT transitively
+refer to a resource type? Walks the structural kinds; an :idx valtype
+resolves through STATE's type space (the alias's target scope). A
+resource kind IS the terminal; own/borrow/records/etc. recurse into
+their payloads; component/instance types walk their declarators'
+externtypes (::7/::8's (eq $R) through an import/export)."
+  (labels ((walk-ct (c)
+             (when (and (ct-p c) (not (gethash (ct-kind c) seen)))
+               (setf (gethash (ct-kind c) seen) t)
+               (case (ct-kind c)
+                   (:resource t)
+                   ((:record)
+                    (loop for (nil . vt) across (ct-payload c)
+                          thereis (walk-vt vt)))
+                   ((:variant)
+                    (loop for (nil . vt) across (ct-payload c)
+                          thereis (and vt (walk-vt vt))))
+                   (:list (walk-vt (car (ct-payload c))))
+                   (:tuple
+                    (loop for vt across (ct-payload c)
+                          thereis (walk-vt vt)))
+                   (:option (walk-vt (ct-payload c)))
+                   (:result
+                    (or (and (car (ct-payload c))
+                             (walk-vt (car (ct-payload c))))
+                        (and (cdr (ct-payload c))
+                             (walk-vt (cdr (ct-payload c))))))
+                   ((:own :borrow) t)
+                   ((:stream :future)
+                    (and (ct-payload c) (walk-vt (ct-payload c))))
+                   (:map (walk-vt (cdr (ct-payload c))))
+                   (:func
+                    (or (loop for (nil . vt) across (first (ct-payload c))
+                              thereis (walk-vt vt))
+                        (and (second (ct-payload c))
+                             (walk-vt (second (ct-payload c))))))
+                   ((:component :instance)
+                    (loop for d across (ct-payload c)
+                          thereis
+                          (and (member (typedecl-kind d) '(:import :export))
+                               (let ((et (third (typedecl-payload d))))
+                                 (walk-et et)))))
+                   (t nil))))
+           (walk-et (et)
+             (case (car et)
+               (:type
+                (cond
+                 ((eq (cdr et) :sub-resource) t)
+                 ((and (listp (cdr et)) (eq (car (cdr et)) :eq))
+                  (walk-idx (second (cdr et))))
+                 (t nil)))
+               (:func
+                (and (integerp (cdr et))
+                     (< (cdr et) (length (cval-types state)))
+                     (walk-idx (cdr et))))
+               (t nil)))
+           (walk-idx (i)
+             (and (>= i 0) (< i (length (cval-types state)))
+                  (walk-ct (aref (cval-types state) i))))
+           (walk-vt (vt)
+             (cond ((and (consp vt) (eq (car vt) :idx))
+                    (walk-idx (cdr vt)))
+                   ((ct-p vt) (walk-ct vt))
+                   (t nil))))
+    (walk-ct ct)))
+
 (defun %check-outer-alias (a state outer-depth)
-  "Outer alias validation (outer-alias.wast): the count must be <=
-the number of enclosing scopes ('invalid outer alias count of N');
-when count==outer-depth the target index must be in bounds of the
-ALIASING scope's own index space ('index out of bounds' — an alias
-outer 0 0 sees the current component's types)."
+  "Outer alias validation (outer-alias.wast). De Bruijn convention
+(Explainer 408-412, slice 5): count 0 = the CURRENT component/type's
+index space; count N = N boundaries out, resolved through
+*OUTER-STATES*. The count must not exceed the number of enclosing
+scopes; the target index must be in bounds of the RESOLVED scope's
+space; and when the alias crosses at least one COMPONENT boundary
+with sort TYPE, the target must not transitively refer to a resource
+(Binary.md 133-135) — components may only be aliased substitutable
+definitions (core modules, core types, components, resource-free
+types). OUTER-DEPTH still counts COMPONENT boundaries only (the
+transitivity check fires when COUNT > 0 for an alias inside a nested
+component; type-declarator aliases keep their own boundary counting
+in %check-defvaltype)."
   (let ((ct (aliasrec-count a)))
     (unless (<= ct outer-depth)
-      (%verr "invalid outer alias count of ~d" ct)))
-  ;; count == outer-depth targets THIS scope's index spaces
-  (when (= (aliasrec-count a) outer-depth)
-    (let ((target (aliasrec-target a))
-          (sort (aliasrec-sort a)))
-      (case sort
-        (:type (when (>= target (length (cval-types state)))
-                 (%verr "type index out of bounds")))
-        (:core-type (when (>= target (length (cval-core-types state)))
-                      (%verr "core type index out of bounds")))
-        (:core-module (when (>= target (cval-core-modules state))
-                        (%verr "module index out of bounds")))
-        (:component (when (>= target (cval-components state))
-                      (%verr "component index out of bounds")))
-        (:func (when (>= target (cval-funcs state))
-                 (%verr "function index out of bounds")))
-        (t nil)))))
+      (%verr "invalid outer alias count of ~d" ct))
+    (let ((target-state (%outer-state-at state ct)))
+      (unless target-state
+        ;; count within outer-depth but the STATE stack is shorter:
+        ;; the alias sits inside a component at the validation root
+        ;; whose enclosing scopes are outside this validation run
+        ;; (the suite's named-form fixtures never hit this)
+        (return-from %check-outer-alias))
+      (let ((target (aliasrec-target a))
+            (sort (aliasrec-sort a)))
+        (case sort
+          (:type
+           (when (>= target (length (cval-types target-state)))
+             (%verr "type index out of bounds"))
+           ;; slice 5 (outer-alias B): crossing a COMPONENT boundary
+           ;; with a TYPE alias requires the target to be
+           ;; resource-free (outer-alias.wast ::2/::3/::4/::7/::8)
+           (when (and (plusp ct)
+                      (plusp outer-depth)
+                      (< target (length (cval-types target-state)))
+                      (ct-p (aref (cval-types target-state) target)))
+             (when (%ct-transitively-resources-p
+                    (aref (cval-types target-state) target)
+                    target-state
+                    (make-hash-table))
+               (%verr "transitively refers to resources"))))
+          (:core-type
+           (when (>= target (length (cval-core-types target-state)))
+             (%verr "core type index out of bounds")))
+          (:core-module
+           (when (>= target (cval-core-modules target-state))
+             (%verr "module index out of bounds")))
+          (:component
+           (when (>= target (cval-components target-state))
+             (%verr "component index out of bounds")))
+          (:func
+           (when (>= target (cval-funcs target-state))
+             (%verr "function index out of bounds")))
+          (t nil))))))
 
 (defun %check-externtype (et state inner)
   "The sort checks of an externtype against the type spaces: a func
@@ -2607,6 +2740,13 @@ space."
 ;;; instantiated instance came from) — the alias-type shape
 ;;; resolution resolves the child's typeidx against the CHILD state.
 (defvar *inst-source-comp* (make-hash-table :test #'eql))
+
+(defvar *outer-states* nil
+  "Slice 5 (outer-alias A): the stack of ENCLOSING validator states
+\(innermost first) threaded through validate-component's :component
+recursion and %check-defvaltype's :component/:instance arm. An outer
+alias with de Bruijn count N resolves against the Nth entry; count 0
+is the CURRENT state (Explainer 408-412).")
 ;;; the validate-component nesting depth — the per-validation tables
 ;;; reset only at the OUTERMOST call (a nested child's entries must
 ;;; survive for the parent's resolution; rows in the same suite run
@@ -4415,7 +4555,14 @@ the number of enclosing component/type scopes (outer aliases)."
         ;; validate-component binds its own, so a child's core
         ;; indices never collide with the parent's
         (*core-alias-source* (make-hash-table :test #'equal))
-        (*core-inst-provider* (make-hash-table :test #'eql)))
+        (*core-inst-provider* (make-hash-table :test #'eql))
+        ;; slice 5 (outer-alias A): the ENCLOSING validator states,
+        ;; innermost first — %check-outer-alias resolves a de Bruijn
+        ;; count of N against the Nth entry (count 0 = THIS scope,
+        ;; per Explainer 408-412). The :component arm below pushes
+        ;; THIS state around each nested validate-component; the
+        ;; type-declarator arms push in %check-defvaltype.
+        (*outer-states* *outer-states*))
     (declare (ignorable core-funcs memories tables globals))
     (loop for d across (comp-defs comp)
           do (let ((payload (compdef-payload d)))
@@ -4475,9 +4622,12 @@ the number of enclosing component/type scopes (outer aliases)."
                  (:component
                   ;; a nested component is a full component: validate
                   ;; its defs with one more enclosing scope (an alias
-                  ;; outer 1 ... inside it sees THIS scope).
-                  (validate-component payload
-                                      :outer-depth (1+ outer-depth))
+                  ;; outer 1 ... inside it sees THIS scope). Slice 5
+                  ;; (outer-alias A): push THIS state for the child's
+                  ;; de Bruijn resolution.
+                  (let ((*outer-states* (cons state *outer-states*)))
+                    (validate-component payload
+                                        :outer-depth (1+ outer-depth)))
                   (incf (cval-components state)))
                  (:instance
                   (vector-push-extend nil (cval-instance-types state))

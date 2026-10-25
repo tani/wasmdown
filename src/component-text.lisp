@@ -97,19 +97,39 @@ externnames must be real strings)."
 
 (defun %bind (scope id sort idx)
   (when id
-    (let ((prior (gethash id (ct-scope-ids scope))))
-      (when prior
-        ;; each SORT has its own identifier namespace: reusing $id
-        ;; across sorts is legal (instantiation.wast ::51's $libc
-        ;; is both a core module and a core instance); only a SAME-
-        ;; sort collision is a duplicate.
-        (when (eq (car prior) sort)
-          (%text-err 0 "duplicate identifier ~a" id))))
-    (setf (gethash id (ct-scope-ids scope)) (cons sort idx)))
+    ;; each SORT has its own identifier namespace: reusing $id across
+    ;; sorts is legal (instantiation.wast ::51's $libc is both a core
+    ;; module and a core instance; resources.wast ::44's $c2 is both
+    ;; an instance and a component); only a SAME-sort collision is a
+    ;; duplicate. Slice 5 (family D): the table stores EVERY binding
+    ;; as a list of (sort . idx) — the old single-entry hash let the
+    ;; second sort's bind SHADOW the first, so a later reference
+    ;; needing the first sort failed 'unknown'.
+    (let* ((table (ct-scope-ids scope))
+           (old (gethash id table))
+           (bindings (cond
+                      ((null old) nil)
+                      ((consp (car old)) old)
+                      (t (list old)))))
+      (when (member sort bindings :key #'car)
+        (%text-err 0 "duplicate identifier ~a" id))
+      (setf (gethash id table)
+            (cons (cons sort idx) bindings))))
   idx)
 
-(defun %lookup (scope id)
-  (gethash id (ct-scope-ids scope)))
+(defun %lookup (scope id &optional sort)
+  "ID's binding in SCOPE, optionally the SORT-matching one. The table
+stores a list of (sort . idx) bindings per id (cross-sort reuse is
+legal); SORT NIL returns the FIRST binding (innermost = most recent)."
+  (let ((hit (gethash id (ct-scope-ids scope))))
+    (cond
+     ((null hit) nil)
+     ((consp (car hit))
+      (if sort (find sort hit :key #'car) (car hit)))
+     ;; a legacy single (sort . idx) entry
+     ((or (not sort) (eq (car hit) sort)) hit)
+     (t nil))))
+
 
 (defun %scope-count (scope sort)
   "The current size of SORT's index space in SCOPE."
@@ -235,14 +255,15 @@ markers are :core-type defs."
 (defparameter *outer-aliasable*
   '(:core-module :core-type :component :type))
 
-(defun %find-outer (scope id)
+(defun %find-outer (scope id &optional sort)
   "Search this scope then the enclosing ones, innermost-first, for ID.
 Returns (values sort idx ct); CT is the de Bruijn count (1 = the
-nearest ENCLOSING scope)."
+nearest ENCLOSING scope). SORT (family D) selects the sort-matching
+binding of a multi-sort $id; NIL takes the first."
   (loop for rest on (cons scope (ct-scope-outer scope))
         for depth from 0
         for s = (first rest)
-        for hit = (and s (gethash id (ct-scope-ids s)))
+        for hit = (and s (%lookup s id sort))
         when hit
           do (return (values (car hit) (cdr hit) depth))
         finally (return (values nil nil nil))))
@@ -273,14 +294,14 @@ implicit outer alias). Returns (sort . idx)."
     (cons sort (%nat-token item)))
    ((and (%tokp item) (eq (%tok-kind item) :id))
     (let* ((id (%tok-text item))
-           (hit (%lookup scope id)))
+           (hit (%lookup scope id sort)))
       (cond
        ((and hit (eq (car hit) sort)) hit)
        (hit
         (%text-err (%tok-start item) "unknown ~a ~a"
                    (string-downcase (string sort)) id))
        (t
-        (multiple-value-bind (fsort fidx ct) (%find-outer scope id)
+        (multiple-value-bind (fsort fidx ct) (%find-outer scope id sort)
           (cond
            ((and fsort (eq fsort sort))
             (cons sort (%emit-implicit-outer-alias
@@ -1127,16 +1148,20 @@ sort idx)."
        ((string= h "outer")
         (let* ((ct-item (third items))
                (idx-item (fourth items))
-               (sort-node (fifth items)))
+               (sort-node (fifth items))
+               ;; slice 5 (family D): the sort parses FIRST so the
+               ;; target resolution can pick the SORT-matching
+               ;; binding when $id names both an instance and a
+               ;; component (resources.wast ::44's $c2)
+               (sort+id (%parse-alias-sortdecl sort-node))
+               (sort (car sort+id))
+               (id (cdr sort+id)))
           (multiple-value-bind (ct target)
-              (%parse-outer-alias-targets ct-item idx-item scope)
-            (let* ((sort+id (%parse-alias-sortdecl sort-node))
-                   (sort (car sort+id))
-                   (id (cdr sort+id)))
-              (values
-               (make-aliasrec :kind :outer :sort sort :count ct
-                              :target target :name "" :offset 0)
-               id)))))
+              (%parse-outer-alias-targets ct-item idx-item scope sort)
+            (values
+             (make-aliasrec :kind :outer :sort sort :count ct
+                            :target target :name "" :offset 0)
+             id))))
        ((and (string= h "core") (third items) (%tokp (third items))
              (string= (%tok-text (third items)) "export"))
         (let* ((idx-item (fourth items))
@@ -1188,10 +1213,11 @@ sort idx)."
                 (%sort-of-name sname))
             id))))
 
-(defun %parse-outer-alias-targets (ct-item idx-item scope)
+(defun %parse-outer-alias-targets (ct-item idx-item scope &optional sort)
   "(alias outer ct idx): CT is a u32 or an outer $id (sugar naming the
 enclosing scope); IDX a u32 or a $id resolving in THAT scope. Returns
-(values ct target)."
+(values ct target). SORT (family D) selects the SORT-matching binding
+when IDX's $id names multiple sorts."
   (cond
    ((and (%tokp ct-item) (member (%tok-kind ct-item) '(:nat :int)))
     (let ((ct (%nat-token ct-item)))
@@ -1205,7 +1231,7 @@ enclosing scope); IDX a u32 or a $id resolving in THAT scope. Returns
                   (unless s
                     (%text-err (%tok-start ct-item)
                                "unknown outer scope"))
-                  (let ((hit (%lookup s (%tok-text idx-item))))
+                  (let ((hit (%lookup s (%tok-text idx-item) sort)))
                     (unless hit
                       (%text-err (%tok-start idx-item)
                                  "unknown outer identifier"))
@@ -1213,19 +1239,27 @@ enclosing scope); IDX a u32 or a $id resolving in THAT scope. Returns
                (t (%text-err 0 "expected an index"))))))
    ((and (%tokp ct-item) (eq (%tok-kind ct-item) :id))
     (let* ((cid (%tok-text ct-item))
-           (depth (position cid (ct-scope-outer scope)
+           (chain (cons scope (ct-scope-outer scope)))
+           (depth (position cid chain
                             :key #'ct-scope-name :test #'string=)))
       (unless depth
         (%text-err (%tok-start ct-item)
                    "unknown outer scope ~a" cid))
-      (let ((s (nth depth (ct-scope-outer scope))))
+      ;; de Bruijn convention (Explainer 408-412): count 0 = the
+      ;; CURRENT component/type; count N = N boundaries out. The
+      ;; named-scope sugar $S therefore resolves to the scope's
+      ;; POSITION in the (current . outers) chain — $S naming the
+      ;; current scope yields ct 0 (outer-alias.wast ::0's root-level
+      ;; named aliases), the first enclosing scope yields 1 (::2's
+      ;; cross-boundary alias).
+      (let ((s (nth depth chain)))
         (values depth
                 (cond
                  ((and (%tokp idx-item)
                        (member (%tok-kind idx-item) '(:nat :int)))
                   (%nat-token idx-item))
                  ((%tokp idx-item)
-                  (let ((hit (%lookup s (%tok-text idx-item))))
+                  (let ((hit (%lookup s (%tok-text idx-item) sort)))
                     (unless hit
                       (%text-err (%tok-start idx-item)
                                  "unknown outer identifier"))
@@ -1279,9 +1313,10 @@ functype. Returns the core-type payload."
 
 (defun %parse-moduletype (items scope)
   "A (module <moduledecl>*) moduletype. Returns (:moduletype .
-vector-of-typedecls)."
-  (declare (ignore scope))
-  (let ((decls '()))
+vector-of-typedecls). SCOPE resolves a named (alias outer $C $FT
+(type $a)) declarator's outer reference (slice 5, family E)."
+  (let ((decls '())
+        (ntypes 0))
     (dolist (it items)
       (unless (and (%nodep it) (%children it))
         (%text-err 0 "expected a module declarator"))
@@ -1306,7 +1341,8 @@ vector-of-typedecls)."
               (push (make-typedecl :kind :core-import
                      :payload (list (%string-token mod-tok)
                                     (%string-token field-tok)
-                                    (%parse-core-importdesc desc)))
+                                    (%parse-core-importdesc desc
+                                                            scope)))
                     decls)))
            ((string= h "export")
             (let* ((name-tok (second mi)) (desc (third mi)))
@@ -1319,14 +1355,18 @@ vector-of-typedecls)."
                                    :payload (list
                                              (%string-token name-tok)
                                              (%parse-core-importdesc
-                                              desc)))
+                                              desc scope)))
                     decls)))
            ((string= h "type")
             (let* ((id (when (and (second mi) (%tokp (second mi))
                                   (eq (%tok-kind (second mi)) :id))
                          (%tok-text (second mi))))
                    (ty (if id (third mi) (second mi))))
-              (declare (ignore id))
+              ;; slice 5 (core-modules ::0): the moduletype's OWN
+              ;; type space — a named (type $ft (func)) binds $ft
+              ;; for the following (func (type $ft)) type-uses
+              (when id (%bind scope id :type ntypes))
+              (incf ntypes)
               (unless (and ty (%nodep ty))
                 (%text-err (%node-start it) "bad type declarator"))
               (push (make-typedecl :kind :core-type
@@ -1337,23 +1377,41 @@ vector-of-typedecls)."
                                      (%children ty) "result")))
                     decls)))
            ((string= h "alias")
-            (let* ((ct (third mi)) (idx (fourth mi)))
-              (unless (and (%tokp ct) (member (%tok-kind ct)
-                                               '(:nat :int))
-                           (%tokp idx) (member (%tok-kind idx)
-                                               '(:nat :int)))
+            ;; (alias outer ct idx (type id?)) — slice 5 (family E,
+            ;; outer-alias.wast ::29): CT/IDX accept the NAMED form
+            ;; too ((alias outer $C $FT (type $a))) via the same
+            ;; de Bruijn resolution as top-level outer aliases; the
+            ;; moduletype's OWN type space binds the trailing id so
+            ;; later (func (type $a)) type-uses resolve.
+            (let* ((ct-item (third mi))
+                   (idx-item (fourth mi))
+                   (sort-node (fifth mi))
+                   (sort+id (%parse-alias-sortdecl sort-node))
+                   (sort (car sort+id))
+                   (id (cdr sort+id)))
+              (unless (eq sort :type)
                 (%text-err (%node-start it) "bad alias declarator"))
-              (push (make-typedecl :kind :core-alias
-                     :payload (list (%nat-token ct)
-                                    (%nat-token idx)))
-                    decls)))
+              (multiple-value-bind (ct target)
+                  ;; NIL sort: the TARGET may be a core type bound
+                  ;; under :core-type (the alias's OWN sort is :type —
+                  ;; the moduletype alias aliases the type space)
+                  (%parse-outer-alias-targets ct-item idx-item scope
+                                              nil)
+                (when id
+                  (%bind scope id :type ntypes))
+                (incf ntypes)
+                (push (make-typedecl :kind :core-alias
+                       :payload (list ct target))
+                      decls))))
            (t (%text-err (%tok-start mh)
                          "unexpected module declarator ~a" h))))))
     (cons :moduletype (coerce (nreverse decls) 'vector))))
 
-(defun %parse-core-importdesc (node)
+(defun %parse-core-importdesc (node &optional scope)
   "A core importdesc: (func (type n)?) | (memory n ...) |
-(table n reftype) | (global i32 | (mut t)) | (tag (type n)?)."
+(table n reftype) | (global i32 | (mut t)) | (tag (type n)?).
+SCOPE resolves a NAMED (type $a) type-use against the moduletype's
+own type space (slice 5, family E)."
   (let* ((items (%children node))
          (head (first items)))
     (unless (and (%tokp head) (eq (%tok-kind head) :keyword))
@@ -1364,7 +1422,22 @@ vector-of-typedecls)."
        ((string= h "func")
         (let ((tu (second items)))
           (if (and (%nodep tu) (string= (%head-text tu) "type"))
-              (list :func (%nat-token (second (%children tu))))
+              (let ((tk (second (%children tu))))
+                (list :func
+                      (if (and (%tokp tk) (member (%tok-kind tk)
+                                                   '(:nat :int)))
+                          (%nat-token tk)
+                          ;; a NAMED (type $a): resolve in the
+                          ;; moduletype's own space (core-modules ::0)
+                          (let ((hit (and scope
+                                         (%lookup scope
+                                                  (%tok-text tk)
+                                                  :type))))
+                            (unless hit
+                              (%text-err (%tok-start tk)
+                                         "unknown type ~a"
+                                         (%tok-text tk)))
+                            (cdr hit)))))
               (list :func 0))))
        ((string= h "memory")
         (list :memory (%parse-core-limits (rest items))))

@@ -971,6 +971,105 @@ wast runner's string-to-bytes decoder (same grammar as the suite)."
     (wasmdown.component.text::parse-component-text
      "(component (import \"f\" (func $f)) (core func $f' (canon lower (func $f) string-encoding=utf8)))")))
 
+(test component/outer-alias-debruijn-pins
+  ;; slice 5 (outer-alias A+B, outer-alias.wast ::0/::2-::4/::7/::8/::12):
+  ;; the de Bruijn count is 0 = the CURRENT component/type, N = N
+  ;; boundaries out — the NAMED-scope sugar resolves the (current .
+  ;; outers) chain by POSITION (the old parser used the outers-only
+  ;; list, so $C at the root was 'unknown outer scope' and one-level
+  ;; aliases carried count 0, resolved vacuously); and a TYPE alias
+  ;; crossing a component boundary may not transitively refer to a
+  ;; resource (Binary.md 133-135).
+  (flet ((expect-invalid (src)
+           (block nil
+             (handler-case
+                 (wasmdown.component:validate-component
+                  (wasmdown.component.text::parse-component-text src))
+               (wasmdown:validation-error (c) (return c)))
+             (error "expected wasmdown:validation-error"))))
+    ;; ::0's named form at the ROOT: $C names the CURRENT scope
+    ;; (count 0) — the root-level named aliases resolve and validate
+    (wasmdown.component:validate-component
+     (wasmdown.component.text::parse-component-text
+      "(component definition $C (core module $M (func (export \"f\"))) (type $T (record (field \"x\" u32))) (alias outer $C $M (core module $cm)) (alias outer $C $T (type $ty)))"))
+    ;; ::2 — a resource crossing a component boundary
+    (let ((c (expect-invalid
+              "(component $C (type $R (resource (rep i32))) (component (alias outer $C $R (type $a))))")))
+      (is (search "transitively refers to resources"
+                  (wasmdown:wasmdown-error-message c))))
+    ;; ::3 — a borrow of the resource, transitively
+    (let ((c (expect-invalid
+              "(component $C (type $R (resource (rep i32))) (type $B (borrow $R)) (component (alias outer $C $B (type $a))))")))
+      (is (search "transitively refers to resources"
+                  (wasmdown:wasmdown-error-message c))))
+    ;; ::4 — an own inside a record, transitively
+    (let ((c (expect-invalid
+              "(component $C (type $R (resource (rep i32))) (type $Rec (record (field \"h\" (own $R)))) (component (alias outer $C $Rec (type $a))))")))
+      (is (search "transitively refers to resources"
+                  (wasmdown:wasmdown-error-message c))))
+    ;; ::7 — a component TYPE whose exportdecl mentions (eq $R)
+    (let ((c (expect-invalid
+              "(component $C (type $R (resource (rep i32))) (type $U (component (export \"a\" (type (eq $R))))) (component (alias outer $C $U (type $a))))")))
+      (is (search "transitively refers to resources"
+                  (wasmdown:wasmdown-error-message c))))
+    ;; ::12 — explicit counts through TYPE boundaries resolve to the
+    ;; root scope (count 1 = the enclosing component, count 2 = root)
+    (wasmdown.component:validate-component
+     (wasmdown.component.text::parse-component-text
+      "(component definition $C (type $T (record (field \"x\" u32))) (type (component (alias outer 1 0 (type $parent)) (type (component (alias outer 2 0 (type $grandparent)))))) (component (alias outer 1 0 (type $parent))) (component $D (alias outer $C $T (type $aD)) (component (alias outer $D $aD (type $aE)) (type $use (tuple $aE $aE)))))"))
+    ;; ::11 — a resource-free type crosses fine; count 0 targets the
+    ;; CURRENT scope (the inner component's own $R)
+    (wasmdown.component:validate-component
+     (wasmdown.component.text::parse-component-text
+      "(component definition $C (type $Pure (record (field \"x\" u32))) (component (alias outer $C $Pure (type $pure)) (type $R (resource (rep i32))) (alias outer 0 1 (type $localR))))"))
+    ;; slice 5 (outer-alias C, Binary.md 267-270): alias DECLARATORS
+    ;; inside a component/instance type only alias a SORT SUBSET —
+    ;; export aliases: instance/type (::14's (func $a)); outer
+    ;; aliases: core type/type (::15/::16/::17's component and core
+    ;; module)
+    (let ((c (expect-invalid
+              "(component (type (component (import \"i\" (instance $i (export \"f\" (func)))) (alias export $i \"f\" (func $a)))))")))
+      (is (search "may only refer to types or instances"
+                  (wasmdown:wasmdown-error-message c))))
+    (let ((c (expect-invalid
+              "(component $C (component $D) (type (component (alias outer $C $D (component $a)))))")))
+      (is (search "may only refer to types or instances"
+                  (wasmdown:wasmdown-error-message c))))
+    (let ((c (expect-invalid
+              "(component $C (core module $M) (type (component (alias outer $C $M (core module $a)))))")))
+      (is (search "may only refer to types or instances"
+                  (wasmdown:wasmdown-error-message c))))
+    ;; the positives: export aliases of instance/type and outer
+    ;; aliases of core type/type inside types stay valid (::13)
+    (wasmdown.component:validate-component
+     (wasmdown.component.text::parse-component-text
+      "(component definition $C (type (component (import \"i\" (instance $i (export \"t\" (type (sub resource))) (export \"j\" (instance)))) (alias export $i \"t\" (type $t)) (alias export $i \"j\" (instance $j)))) (core type $FT (func (param i32) (result i32))) (type $T (record (field \"x\" u32))) (type (component (alias outer $C $FT (core type $ct)) (alias outer $C $T (type $t)))))")))
+    ;; slice 5 (family D): a $id reused across sorts keeps EVERY
+    ;; binding — resources.wast ::44's $c2 is an instance AND a
+    ;; component; the (type $c2 \"y\") projection must resolve the
+    ;; INSTANCE binding (the old single-entry table let the later
+    ;; component bind shadow it -> 'unknown instance \$c2')
+    (let ((c (wasmdown.component.text::parse-component-text
+              "(component (type $t (resource (rep i32))) (component $c (import \"x\" (type $t (sub resource))) (export \"y\" (type $t))) (instance $c1 (instantiate $c (with \"x\" (type $t)))) (instance $c2 (instantiate $c (with \"x\" (type $t)))) (component $c2 (import \"x1\" (type $t (sub resource))) (import \"x2\" (type (eq $t))) (import \"x3\" (type (eq $t)))) (instance (instantiate $c2 (with \"x1\" (type $t)) (with \"x2\" (type $c1 \"y\")) (with \"x3\" (type $c2 \"y\")))))")))
+      ;; the PARSE succeeds — the projection resolved $c2's instance
+      ;; binding; the row's remaining failure is the validator's
+      ;; resource-identity check (a separate family)
+      (is (find :instance
+                (map 'list #'wasmdown.component::compdef-kind
+                     (wasmdown.component::comp-defs c))))))
+
+(test component/moduletype-outer-alias-pins
+  ;; slice 5 (family E, outer-alias.wast ::29 + core-modules ::0):
+  ;; a moduletype's (alias outer $C $FT (type $a)) declarator accepts
+  ;; the NAMED form (the old parser demanded bare nat ct/idx ->
+  ;; 'bad alias declarator'), resolves $FT through the enclosing
+  ;; scope, binds $a in the moduletype's OWN type space, and the
+  ;; later (export "f" (func (type $a))) type-use resolves there too;
+  ;; a named (type $ft (func)) similarly binds for later uses.
+  (wasmdown.component:validate-component
+   (wasmdown.component.text::parse-component-text
+    "(component definition $C (core type $FT (func (param i32) (result i32))) (core type $MT (module (alias outer $C $FT (type $a)) (export \"f\" (func (type $a))))) (core type $MT2 (module (alias outer $C $FT (type)) (import \"a\" \"b\" (func (type 0))) (export \"c\" (func (type 0))))))")))
+
 (defun run-component-pins ()
   "Run the component pins (registered via TEST; returns T)."
   (let ((wasmdown.test::*tests*
@@ -992,6 +1091,8 @@ wast runner's string-to-bytes decoder (same grammar as the suite)."
                       component/annotated-name-shape-pins
                       component/instantiate-matching-pins
                       component/core-module-empty-body-pin
+                      component/moduletype-outer-alias-pins
+                      component/outer-alias-debruijn-pins
                       component/externtype-type-use-pins
                       component/abi-string-encoding-pins
                       component/declarator-bind-id-pins
