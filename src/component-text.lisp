@@ -158,15 +158,41 @@ externnames must be real strings)."
 (defvar *component-source* ""
   "The component's raw source (for slicing (core module ...) spans).")
 
+(defvar *type-decl-sink* nil
+  "When non-NIL, an implicit outer alias fired while parsing a
+component/instance TYPE's declarators lands HERE (as a typedecl
+:alias entry of that type) instead of a top-level :alias def — the
+de Bruijn count of an alias inside a TYPE declarator skips the TYPE
+boundary itself (Explainer: 'the number of enclosing components or
+types'), so it must resolve within the type's own declarator
+sequence (defined-types ::42/::43's (instance (type $t)) uses inside
+(type (component ...))).")
+
+(defvar *intern-scope* nil
+  "The FLUSHING scope: inline externtype expressions inside
+component/instance TYPE declarators desugar into out-of-line types
+of the CONCRETE component (Explainer 'Declarators'), so they intern
+HERE (the scope parse-component-text flushes at the end), never in
+an intermediate type scope (which nobody flushes — the index would
+dangle; annotated-names ::30's (func) inside a doubly-nested type).")
+
 (defun %push-def (kind payload)
   (push (make-compdef :kind kind :payload payload :offset 0) *defs*))
 
 (defun %intern-valtype (scope ct)
   "Intern an inline compound type in SCOPE; the caller flushes the
-interned defs when its own definition is complete. Returns the index."
+interned defs when its own definition is complete — UNLESS SCOPE is a
+component/instance TYPE's own space (never flushed): then the ct
+emits as a :type typedecl of that type via *TYPE-DECL-SINK*, keeping
+the returned index valid inside the type's declarator sequence
+(the Explainer's desugaring: inline externtype expressions inside
+declarators become out-of-line types OF THE TYPE)."
   (let ((idx (ct-scope-n-type scope)))
     (incf (ct-scope-n-type scope))
-    (push (cons idx ct) (ct-scope-interned scope))
+    (if (and (boundp '*type-decl-sink*)
+             (not (eq scope *intern-scope*)))
+        (push (make-typedecl :kind :type :payload ct) *type-decl-sink*)
+        (push (cons idx ct) (ct-scope-interned scope)))
     idx))
 
 (defun %intern-core-type (scope payload)
@@ -222,11 +248,21 @@ nearest ENCLOSING scope)."
         finally (return (values nil nil nil))))
 
 (defun %emit-implicit-outer-alias (scope id sort ct idx)
-  "The text format's implicit (alias outer ct idx (sort id))."
-  (%flush-interned scope)
-  (%push-def :alias (make-aliasrec :kind :outer :sort sort
-                                  :count ct :target idx :name ""
-                                  :offset 0))
+  "The text format's implicit (alias outer ct idx (sort id)). Inside
+a component/instance TYPE's declarators (*TYPE-DECL-SINK* BOUND, even
+when its collected value is still empty) the alias lands as a typedecl
+of THAT TYPE (its de Bruijn count skips the type boundary), never as
+a top-level def."
+  (if (boundp '*type-decl-sink*)
+      (push (make-typedecl :kind :alias
+                           :payload (make-aliasrec
+                                     :kind :outer :sort sort :count ct
+                                     :target idx :name "" :offset 0))
+            *type-decl-sink*)
+      (progn (%flush-interned scope)
+             (%push-def :alias (make-aliasrec :kind :outer :sort sort
+                                             :count ct :target idx
+                                             :name "" :offset 0))))
   (%alloc scope sort id))
 
 (defun %parse-sortidx-atom (item sort scope)
@@ -285,12 +321,20 @@ sort idx)."
     (let ((cur-idx (cdr inst)))
       (dolist (name-tok names)
         (%flush-interned scope)
-        (%push-def :alias (make-aliasrec
-                           :kind (if (eq inst-sort :core-instance)
-                                     :core-export :export)
-                           :sort sort :index cur-idx
-                           :name (%string-token name-tok) :offset 0))
-        (setf cur-idx (%alloc scope sort nil)))
+        ;; each INTERMEDIATE name projects from the (instance) result
+        ;; of the preceding alias (Explainer 386-388): the alias's
+        ;; sort is INSTANCE and its index the preceding alias's
+        ;; instance slot; only the LAST name aliases the final SORT
+        ;; (external-visibility ::57's (type $i "i1" "i2") chain)
+        (let ((last-p (null (rest (member name-tok names)))))
+          (%push-def :alias (make-aliasrec
+                             :kind (if (eq inst-sort :core-instance)
+                                       :core-export :export)
+                             :sort (if last-p sort inst-sort)
+                             :index cur-idx
+                             :name (%string-token name-tok) :offset 0))
+          (setf cur-idx (%alloc scope (if last-p sort inst-sort)
+                                nil))))
       (values sort cur-idx))))
 
 (defun %sort-of-name (sname)
@@ -639,38 +683,104 @@ format has no per-declarator type space, only the component's)."
                                    (%parse-functype node scope)))
                       id))))
        ((string= h "instance")
-        (let ((inner (make-ct-scope
-                      :outer (cons scope (ct-scope-outer scope)))))
-          (let ((decls (mapcar (lambda (d)
-                                 ;; SCOPE interns the decls' inline
-                                 ;; expressions (the flushing chain);
-                                 ;; INNER resolves their (type $t)
-                                 ;; references (the declarator's own
-                                 ;; index space)
-                                 (%parse-instancedecl d scope inner))
-                               body)))
-            (values (cons :instance
-                          (%intern-valtype
-                           intern-scope (make-ct :kind :instance
-                                                 :payload (coerce decls
-                                                                 'vector)
-                                                 :offset 0)))
-                    id))))
+        (let ((type-use (find-if
+                         (lambda (b)
+                           (and (%nodep b) (string= (%head-text b)
+                                                    "type")))
+                         body)))
+          (if (and type-use (= (length body) 1))
+              ;; (instance (type $t)): an out-of-line type-USE
+              ;; (Explainer line 650: externtype ::= (<sort> (type
+              ;; <idx>)) for EVERY sort) — resolve $t in SCOPE, never
+              ;; a declarator list (defined-types ::41-43/
+              ;; ::44-46, external-visibility ::41, annotated-
+              ;; names ::30's 'type needs a type body' family)
+              (let ((ti (rest (%children type-use))))
+                (unless (= (length ti) 1)
+                  (%text-err (%node-start type-use)
+                             "type needs exactly one index"))
+                (values (cons :instance
+                             (%parse-typeidx (first ti) scope))
+                        id))
+              (let ((inner (make-ct-scope
+                            :outer (cons scope (ct-scope-outer scope)))))
+                (multiple-value-bind (caller-sink-bound caller-sink)
+                    (if (boundp '*type-decl-sink*)
+                        (values t *type-decl-sink*)
+                        (values nil nil))
+                  ;; a scratch sink during the DECLS' parse keeps each
+                  ;; decl's interning/aliasing local to its own drain;
+                  ;; in a CONCRETE (non-type) context there is no
+                  ;; caller sink to shadow — the decls intern/alias
+                  ;; normally (a nested component's import with an
+                  ;; outer reference must emit its alias as a def)
+                  (let ((decls
+                          (if caller-sink-bound
+                              (let* ((*type-decl-sink* nil)
+                                     (ds (mapcan
+                                          (lambda (d)
+                                            ;; SCOPE interns the decls'
+                                            ;; inline expressions; INNER
+                                            ;; resolves their (type $t)
+                                            ;; references (the declarator's
+                                            ;; own index space)
+                                            (%parse-instancedecl d scope
+                                                                 inner))
+                                          body)))
+                                (nconc ds (nreverse
+                                           (shiftf *type-decl-sink* nil))))
+                              (mapcan (lambda (d)
+                                        (%parse-instancedecl d scope inner))
+                                      body))))
+                    ;; the arm's OWN interning runs with the CALLER's
+                    ;; binding re-established (the enclosing declarator
+                    ;; arm drains it in sequence order); the scratch
+                    ;; binding above has already popped to the caller
+                    ;; state, so no rebind is needed at all
+                    (values (cons :instance
+                                  (%intern-valtype
+                                   intern-scope
+                                   (make-ct :kind :instance
+                                           :payload (coerce decls
+                                                           'vector)
+                                           :offset 0)))
+                            id)))))))
        ((string= h "component")
-        (let ((inner (make-ct-scope
-                      :outer (cons scope (ct-scope-outer scope)))))
-          (let ((decls (mapcar (lambda (d)
-                                 ;; SCOPE interns (flushing chain);
-                                 ;; INNER resolves (type $t)
-                                 (%parse-componentdecl d scope inner))
-                               body)))
-            (values (cons :component
-                          (%intern-valtype
-                           intern-scope (make-ct :kind :component
-                                                 :payload (coerce decls
-                                                                 'vector)
-                                                 :offset 0)))
-                    id))))
+        (let ((type-use (find-if
+                         (lambda (b)
+                           (and (%nodep b) (string= (%head-text b)
+                                                    "type")))
+                         body)))
+          (if (and type-use (= (length body) 1))
+              ;; (component (type $t)): an out-of-line type-USE —
+              ;; same rule as the instance arm (Explainer line 650)
+              (let ((ti (rest (%children type-use))))
+                (unless (= (length ti) 1)
+                  (%text-err (%node-start type-use)
+                             "type needs exactly one index"))
+                (values (cons :component
+                             (%parse-typeidx (first ti) scope))
+                        id))
+              (let ((inner (make-ct-scope
+                            :outer (cons scope (ct-scope-outer scope)))))
+                (let* ((*type-decl-sink* nil)
+                       (decls (mapcan (lambda (d)
+                                        ;; SCOPE interns (flushing chain);
+                                        ;; INNER resolves (type $t)
+                                        (%parse-componentdecl d scope
+                                                              inner))
+                                      body)))
+                  ;; trailing sink entries (see the instance arm)
+                  (setf decls (nconc decls (nreverse
+                                            (shiftf *type-decl-sink*
+                                                    nil))))
+                  (values (cons :component
+                                (%intern-valtype
+                                 intern-scope (make-ct :kind :component
+                                                     :payload (coerce decls
+                                                                     'vector)
+                                                     :offset 0)))
+                          id))))))
        ((string= h "type")
         (let ((bound (first body)))
           (unless (and (%nodep bound) (%children bound))
@@ -722,7 +832,12 @@ format has no per-declarator type space, only the component's)."
                        (unless (= (length ti) 1)
                          (%text-err (%node-start type-use)
                                     "type needs exactly one index"))
-                       (%parse-typeidx (first ti) scope)))
+                       ;; a core module's type-use resolves in the
+                       ;; CORE type space, not the component one
+                       ;; (defined-types ::44-46: (core type $t ...)
+                       ;; then (core module (type $t)))
+                       (cdr (%parse-sortidx-atom (first ti)
+                                                 :core-type scope))))
                     (t
                      ;; intern the inline moduletype as a core type
                      (%intern-core-type
@@ -735,9 +850,12 @@ format has no per-declarator type space, only the component's)."
 
 (defun %parse-instancedecl (node scope type-scope)
   "One instancedecl: (core type ...) | (type ...) | (alias ...) |
-(export ...). Returns a typedecl. References inside the decl resolve
-against TYPE-SCOPE (the declarator's own index space) — see
-%parse-deftype-node."
+(export ...). Returns a LIST of typedecls (usually one; an export
+with INLINE type expressions or outer-name references prepends its
+desugared :type / :alias entries in parse order — the indices the
+parser allocated line up with the returned sequence positions).
+References inside the decl resolve against TYPE-SCOPE (the
+declarator's own index space) — see %parse-deftype-node."
   (let* ((items (%children node))
          (head (first items)))
     (unless (and (%tokp head) (eq (%tok-kind head) :keyword))
@@ -748,9 +866,9 @@ against TYPE-SCOPE (the declarator's own index space) — see
         (let ((sh (second items)))
           (unless (and (%tokp sh) (string= (%tok-text sh) "type"))
             (%text-err (%tok-start sh) "expected (core type ...)"))
-          (make-typedecl :kind :core-type
-                         :payload (%parse-core-type-node
-                                   (cddr items) scope))))
+          (list (make-typedecl :kind :core-type
+                               :payload (%parse-core-type-node
+                                         (cddr items) scope)))))
        ((string= h "type")
         (multiple-value-bind (id rest) (%split-id (rest items))
           (unless (and rest (= (length rest) 1))
@@ -760,47 +878,66 @@ against TYPE-SCOPE (the declarator's own index space) — see
             (incf (ct-scope-n-type type-scope))
             (%bind type-scope id :type
                    (1- (ct-scope-n-type type-scope)))
-            (make-typedecl :kind :type :payload ct))))
+            (list (make-typedecl :kind :type :payload ct)))))
        ((string= h "alias")
         (multiple-value-bind (alias id)
             (%parse-alias-node node type-scope)
           (incf (ct-scope-n-type type-scope))
           (%bind type-scope id :type
                  (1- (ct-scope-n-type type-scope)))
-          (make-typedecl :kind :alias :payload alias)))
+          (list (make-typedecl :kind :alias :payload alias))))
        ((string= h "export")
-        (multiple-value-bind (name attrs et)
+        (multiple-value-bind (name attrs et id)
             ;; TYPE-SCOPE resolves `(type $t)' references against the
-            ;; declarator's own index space (binary.wast ::81); SCOPE
-            ;; (the enclosing chain) interns INLINE externtype
-            ;; expressions — they desugar into out-of-line types of
-            ;; the enclosing component, whose %flush-interned emits
-            ;; them (the type-scope is never flushed, so interning
-            ;; there would leave the externtype index dangling)
-            (%parse-importdecl-parts node type-scope scope)
-          (make-typedecl :kind :export
-                         :payload (list name attrs et))))
+            ;; declarator's own index space (binary.wast ::81) and
+            ;; INTERNs INLINE externtype expressions into that SAME
+            ;; space: the Explainer's desugaring puts the out-of-line
+            ;; type in the TYPE's own declarator sequence (interning
+            ;; elsewhere would leave the externtype index dangling)
+            (%parse-importdecl-parts node type-scope type-scope)
+          ;; the desugared :type/:alias entries collected by the sink
+          ;; during the parse above (parse order)
+          (let ((pre (nreverse (shiftf *type-decl-sink* nil))))
+            ;; an exportdecl introduces a new type index (Binary.md
+            ;; line 274) AND binds its bind-id at the SORT-MATCHING
+            ;; space: an (export "r" (type $r (sub resource))) inside
+            ;; an instance type binds $r for the following declarators
+            ;; (resources.wast ::28/::29/::30, annotated-names ::30)
+            (incf (ct-scope-n-type type-scope))
+            (%bind type-scope id (car et)
+                   (1- (ct-scope-n-type type-scope)))
+            (nconc pre
+                   (list (make-typedecl :kind :export
+                                        :payload (list name attrs
+                                                       et)))))))
        (t (%text-err (%tok-start head)
                      "unexpected declaration ~a" h))))))
 
 (defun %parse-componentdecl (node scope type-scope)
-  "One componentdecl: an instancedecl or an (import ...)."
+  "One componentdecl: an instancedecl or an (import ...). Returns a
+LIST of typedecls (see %parse-instancedecl)."
   (let* ((items (%children node))
          (head (first items)))
     (if (and (%tokp head) (string= (%tok-text head) "import"))
         (multiple-value-bind (name attrs et id)
             ;; TYPE-SCOPE resolves `(type $t)' references (the
-            ;; declarator's own space); SCOPE interns inline
-            ;; expressions (the enclosing, flushing component)
-            (%parse-importdecl-parts node type-scope scope)
-          ;; an import's bind-id introduces a type index inside the
-          ;; enclosing component/instance TYPE (Binary.md line 274;
-          ;; outer-alias.wast ::13 aliases the imported $i)
-          (incf (ct-scope-n-type type-scope))
-          (%bind type-scope id :type
-                 (1- (ct-scope-n-type type-scope)))
-          (make-typedecl :kind :import
-                         :payload (list name attrs et)))
+            ;; declarator's own space) and INTERNs inline expressions
+            ;; into that same space (see the export arm)
+            (%parse-importdecl-parts node type-scope type-scope)
+          (let ((pre (nreverse (shiftf *type-decl-sink* nil))))
+            ;; an import's bind-id introduces a type index inside the
+            ;; enclosing component/instance TYPE (Binary.md line 274)
+            ;; AND binds at the SORT-MATCHING space: an (instance $i)
+            ;; import's $i is an INSTANCE reference for the following
+            ;; (alias export $i ...) declarators (outer-alias.wast
+            ;; ::13/::14's $i; the Explainer's $fs example)
+            (incf (ct-scope-n-type type-scope))
+            (%bind type-scope id (car et)
+                   (1- (ct-scope-n-type type-scope)))
+            (nconc pre
+                   (list (make-typedecl :kind :import
+                                        :payload (list name attrs
+                                                       et))))))
         (%parse-instancedecl node scope type-scope))))
 
 (defun %parse-deftype-node (ty scope &optional type-scope)
@@ -823,26 +960,32 @@ boundary (outer-alias.wast ::0/::10)."
           (let ((inner (make-ct-scope
                         :outer (cons parse-scope
                                      (ct-scope-outer parse-scope)))))
-            (make-ct :kind :component
-                     :payload (coerce
-                               (mapcar (lambda (d)
-                                         (%parse-componentdecl
-                                          d parse-scope inner))
-                                       (rest (%children ty)))
-                               'vector)
-                     :offset 0)))
+            (let* ((*type-decl-sink* nil)
+                   (decls (mapcan (lambda (d)
+                                    (%parse-componentdecl
+                                     d parse-scope inner))
+                                  (rest (%children ty)))))
+              ;; trailing sink entries join in parse order
+              (setf decls (nconc decls (nreverse
+                                        (shiftf *type-decl-sink* nil))))
+              (make-ct :kind :component
+                       :payload (coerce decls 'vector)
+                       :offset 0))))
          ((string= h "instance")
           (let ((inner (make-ct-scope
                         :outer (cons parse-scope
                                      (ct-scope-outer parse-scope)))))
-            (make-ct :kind :instance
-                     :payload (coerce
-                               (mapcar (lambda (d)
-                                         (%parse-instancedecl
-                                          d parse-scope inner))
-                                       (rest (%children ty)))
-                               'vector)
-                     :offset 0)))
+            (let* ((*type-decl-sink* nil)
+                   (decls (mapcan (lambda (d)
+                                    (%parse-instancedecl
+                                     d parse-scope inner))
+                                  (rest (%children ty)))))
+              ;; trailing sink entries join in parse order
+              (setf decls (nconc decls (nreverse
+                                        (shiftf *type-decl-sink* nil))))
+              (make-ct :kind :instance
+                       :payload (coerce decls 'vector)
+                       :offset 0))))
          ((and (%tokp (first (%children ty)))
                (%prim (%tok-text (first (%children ty)))))
           (make-ct :kind :prim
@@ -1226,8 +1369,12 @@ vector-of-typedecls)."
        ((string= h "memory")
         (list :memory (%parse-core-limits (rest items))))
        ((string= h "table")
-        (list :table (%core-valtype-of (third items))
-              (%parse-core-limits (list (second items)))))
+        ;; (table min max? reftype): the reftype is the LAST item, the
+        ;; limits the leading nat items — mirrors %read-core-importdesc
+        ;; (a max limits form previously fed the reftype slot →
+        ;; 'expected a core value type'; instantiation ::44-::46)
+        (list :table (%core-valtype-of (first (last items)))
+              (%parse-core-limits (butlast (rest items)))))
        ((string= h "global")
         (let* ((g (second items))
                (mut (and (%nodep g) (string= (%head-text g) "mut"))))
@@ -1242,19 +1389,24 @@ vector-of-typedecls)."
                      "unknown core import descriptor ~a" h))))))
 
 (defun %parse-core-limits (items)
-  "Core limits: min | min max | min shared."
+  "Core limits: min | min max | min shared | min max shared — the
+shared flag RIDES ALONG (the third list slot) so the validator can
+compare it (instantiation ::47's 'mismatch in the shared flag')."
   (let ((min (first items))
         (max (second items))
-        (shared (third items)))
+        (shared (third items))
+        (shared2 (third (rest items))))
     (unless (and (%tokp min) (member (%tok-kind min) '(:nat :int)))
       (%text-err 0 "expected a limit"))
-    (let ((lo (%nat-token min)))
-      (cond
-       ((and (%tokp max) (member (%tok-kind max) '(:nat :int)))
-        (list lo (%nat-token max)))
-       ((and (%tokp shared) (string= (%tok-text shared) "shared"))
-        (list lo nil))
-       (t (list lo nil))))))
+    (let ((lo (%nat-token min))
+          (hi (when (and (%tokp max) (member (%tok-kind max)
+                                             '(:nat :int)))
+                (%nat-token max)))
+          (shared-p (or (and (%tokp shared)
+                             (string= (%tok-text shared) "shared"))
+                        (and (%tokp shared2)
+                             (string= (%tok-text shared2) "shared")))))
+      (list lo hi shared-p))))
 
 ;;; ---- canon ----
 
@@ -1497,7 +1649,9 @@ introduced func (resources.wast ::62, abi.wast ::3)."
           (let ((inner (make-ct-scope
                         :outer (cons scope (ct-scope-outer scope))
                         :name (or id ""))))
-            (let ((saved *defs*))
+            (let* ((saved *defs*)
+                   (saved-intern *intern-scope*)
+                   (*intern-scope* inner))
               (setf *defs* nil)
               (%parse-defs rest inner)
               (%flush-interned inner)
@@ -1505,6 +1659,7 @@ introduced func (resources.wast ::62, abi.wast ::3)."
                            :defs (coerce (nreverse *defs*)
                                          'vector))))
                 (setf *defs* saved)
+                (setf *intern-scope* saved-intern)
                 (%flush-interned scope)
                 (%push-def :component comp)
                 (%alloc scope :component id))))))
@@ -1588,7 +1743,14 @@ substituted for 'core module $id'."
                          (if (%nodep (first rest-items))
                              (second (first rest-items))
                              (stoken-start (first rest-items)))
-                         (1- (third node))))
+                         ;; EMPTY body: the span from the closing
+                         ;; paren to itself is EMPTY — the old (1-
+                         ;; (third node)) grabbed the char before
+                         ;; ')' so an empty (core module $m) built
+                         ;; "(module m)" -> 'unknown module field'
+                         ;; (instantiation ::35/::56/::78, outer-
+                         ;; alias ::16, indicies ::15)
+                         (third node)))
          (text (format nil "(module ~a)"
                        (subseq *component-source*
                                body-start (third node))))
@@ -1944,7 +2106,11 @@ wasmdown:decode-error on malformed text."
                             "component"))
         (%text-err 0 "expected a (component ...) form"))
       (let ((*component-source* source)
-            (*defs* nil))
+            (*defs* nil)
+            ;; the root scope is the FLUSHING scope for every inline
+            ;; externtype expression, however deeply nested inside
+            ;; component/instance TYPE declarators it parses
+            (*intern-scope* nil))
         (let ((rest (rest (%children node))))
           ;; a named (component definition ...) form: the definition
           ;; keyword is the runner's named-form marker, not a def
@@ -1955,6 +2121,7 @@ wasmdown:decode-error on malformed text."
           (multiple-value-bind (id rest)
               (%split-id rest)
             (let ((scope (make-ct-scope :name (or id ""))))
+              (setf *intern-scope* scope)
               (%parse-defs rest scope)
               (%flush-interned scope)
               (make-comp

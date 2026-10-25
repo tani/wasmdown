@@ -521,8 +521,11 @@ wast runner's string-to-bytes decoder (same grammar as the suite)."
     (is (valid "(component (import \"a\" (instance)) (instance $a) (export \"a\" (instance $a)) (instance (export \"a\" (instance $a))))"))
     ;; binary.wast ::80: a componenttype's exportdecl ascription
     ;; (func (type 2)) resolves against the TYPE's OWN declarator
-    ;; sequence [type, import, type] — inner-first, outer-fallback
-    (is (valid "(component (type (component (type (instance)) (import \"a\" (type (eq 0))) (type (func)) (export \"b\" (func (type 2))))))"))))
+    ;; sequence [type, import, type] — inner-first, outer-fallback.
+    ;; The binary fixture's first decl is the PRIM type `string` (an
+    ;; (eq 0) bound may target any defvaltype; `(instance)` was the
+    ;; old error-swallowing shape that the honest re-signal rejects)
+    (is (valid "(component (type (component (type string) (import \"a\" (type (eq 0))) (type (func)) (export \"b\" (func (type 2))))))"))))
 
 (test component/fixed-list-alignment-pins
   ;; CanonicalABI.md alignment_list: a FIXED list aligns as its
@@ -760,6 +763,187 @@ wast runner's string-to-bytes decoder (same grammar as the suite)."
                   (wasmdown:wasmdown-error-message c))))))
 
 
+(test component/core-module-empty-body-pin
+  ;; An EMPTY (core module $id?) body slices to an EMPTY core module:
+  ;; the old span math grabbed the char before ')' so "(module m)"
+  ;; hit 'unknown module field' at DECODE (instantiation.wast
+  ;; ::35/::56/::78, outer-alias.wast ::16, indicies.wast ::15).
+  (flet ((valid (src)
+           (wasmdown.component:validate-component
+            (wasmdown.component.text::parse-component-text src))))
+    (valid "(component (core module $m))")
+    (valid "(component (core module))")
+    ;; a named module used as a with-arg: the module must SUPPLY the
+    ;; declared moduletype's exports (the ::35 shape with the export
+    ;; PRESENT — the empty module fails 'missing expected export `x`'
+    ;; now that family 1b's covariant check is implemented)
+    (valid (concatenate 'string "(component"
+                " (core module $m (func (export \"x\")))"
+                " (component $c (import \"m\" (core module (export \"x\" (func)))))"
+                " (instance (instantiate $c (with \"m\" (core module $m)))))"))
+    ;; regression guard: a NON-empty body still slices right
+    (valid "(component (core module $m (func (export \"f\"))))")))
+
+(test component/externtype-type-use-pins
+  ;; (Explainer line 650) externtype ::= (<sort> (type <idx>)) for
+  ;; EVERY sort: an (instance (type $I)) / (component (type $C))
+  ;; declarator is an out-of-line type-USE, never a declarator list
+  ;; (defined-types ::41-::46, external-visibility ::41,
+  ;; annotated-names ::30); a (core module (type $t)) use resolves in
+  ;; the CORE type space; and an implicit outer alias fired inside a
+  ;; component/instance TYPE's declarators belongs to THAT type's
+  ;; own declarator sequence (its de Bruijn count skips the type
+  ;; boundary).
+  (flet ((invalid (src)
+           (block nil
+             (handler-case
+                 (wasmdown.component:validate-component
+                  (wasmdown.component.text::parse-component-text src))
+               (wasmdown:validation-error (c) (return c)))
+             (error "expected wasmdown:validation-error")))
+         (valid (src)
+           (wasmdown.component:validate-component
+            (wasmdown.component.text::parse-component-text src))))
+    ;; a FUNC type used via (instance (type $t)) (defined-types ::41)
+    (let ((c (invalid "(component (type $t (func)) (import \"a\" (instance (type $t))))")))
+      (is (search "type index 0 is not an instance type"
+                  (wasmdown:wasmdown-error-message c))))
+    ;; nested in a component type (::42): the implicit outer alias
+    ;; lands inside the type's own declarator sequence
+    (let ((c (invalid "(component (type $t (func)) (type (component (import \"a\" (instance (type $t))))))")))
+      (is (search "type index 0 is not an instance type"
+                  (wasmdown:wasmdown-error-message c))))
+    ;; a CORE functype used via (core module (type $t)) (::44)
+    (let ((c (invalid "(component (core type $t (func)) (import \"a\" (core module (type $t))))")))
+      (is (search "core type index 0 is not a module type"
+                  (wasmdown:wasmdown-error-message c))))
+    ;; positives: an instance type via a type-use; an inline
+    ;; declarator list; a doubly-nested type whose inline (func)
+    ;; interns in the FLUSHING scope (annotated-names ::30)
+    (valid "(component (type $I (instance (export \"f\" (func)))) (import \"a\" (instance (type $I))))")
+    (valid "(component (import \"a\" (instance (export \"f\" (func)))))")
+    (valid "(component (type (component (type $it (instance (export \"bar\" (type (sub resource))) (export \"[static]bar.a\" (func)))) (export \"x\" (instance (type $it))))))")))
+
+(test component/declarator-bind-id-pins
+  ;; A component/instance TYPE's import/export declarators introduce
+  ;; a type index (Binary.md line 274) AND bind their bind-id at the
+  ;; SORT-MATCHING space: an (export "r" (type $r (sub resource)))
+  ;; inside an instance type binds $r for the following declarators
+  ;; (resources.wast ::27/::28); an (import "i" (instance $i ...))
+  ;; binds $i as an INSTANCE for the following (alias export $i ...)
+  ;; (outer-alias.wast ::13/::14, the Explainer's $fs example). A
+  ;; NESTED component is its own interning scope (its inline
+  ;; externtypes intern into ITS type space — instantiation ::29's
+  ;; (component $c (import "i" (instance (export "a" (func)))))).
+  (flet ((valid (src)
+           (wasmdown.component:validate-component
+            (wasmdown.component.text::parse-component-text src))))
+    ;; an export's $r binds and the own/borrow use resolves (the
+    ;; declarator's (sub resource) index IS a resource type)
+    (valid "(component (type $I (instance (export \"r\" (type $r (sub resource))) (export \"f\" (func (result (own $r)))))))")
+    ;; an instance import's $i resolves as an instance by a following
+    ;; alias-export declarator
+    (valid (concatenate 'string "(component"
+                " (type (component"
+                "   (import \"i\" (instance $i (export \"t\" (type (sub resource)))))"
+                "   (alias export $i \"t\" (type $t)))))"))
+    ;; a nested component interns its inline externtypes in ITS OWN
+    ;; space — the (func) resolves inside $c, never the root scope
+    (valid (concatenate 'string "(component"
+                " (import \"i\" (instance $i (export \"a\" (func))))"
+                " (component $c (import \"i\" (instance (export \"a\" (func)))))"
+                " (instance (instantiate $c (with \"i\" (instance $i)))))"))))
+
+
+(test component/core-subtype-matching-pins
+  ;; M7 slice 4 (family 1): the core-instance with-arg matcher
+  ;; (instantiation.wast ::39-::51) — limits subtyping, the kind
+  ;; mismatch and the missing-export messages.
+  (flet ((expect-invalid (thunk)
+           (block nil
+             (handler-case (funcall thunk)
+               (wasmdown:validation-error (c) (return c)))
+             (error "expected wasmdown:validation-error")))
+         (valid (src)
+           (wasmdown.component:validate-component
+            (wasmdown.component.text::parse-component-text src))))
+    ;; ::44 'mismatch in table limits' — the provider's min is below
+    ;; the declared import's min
+    (let ((c (expect-invalid
+              (lambda ()
+                (valid (concatenate 'string "(component"
+                  " (core module $m1 (import \"\" \"t\" (table 2 2 funcref)))"
+                  " (core module $m2 (table (export \"t\") 1 funcref))"
+                  " (core instance $i (instantiate $m2))"
+                  " (core instance (instantiate $m1"
+                  " (with \"\" (instance $i)))))"))))))
+      (is (search "mismatch in table limits"
+                  (wasmdown:wasmdown-error-message c))))
+    ;; ::49 'expected global, found func'
+    (let ((c (expect-invalid
+              (lambda ()
+                (valid (concatenate 'string "(component"
+                  " (core module $m1 (import \"a\" \"b\" (global i32)))"
+                  " (core module $m2 (func (export \"b\")))"
+                  " (core instance $i (instantiate $m2))"
+                  " (core instance (instantiate $m1"
+                  " (with \"a\" (instance $i)))))"))))))
+      (is (search "expected global, found func"
+                  (wasmdown:wasmdown-error-message c))))
+    ;; a MATCHING instantiation validates (the positive)
+    (valid (concatenate 'string "(component"
+      " (core module $m1 (import \"\" \"g\" (global i32)))"
+      " (core module $m2 (global (export \"g\") i32 (i32.const 0)))"
+      " (core instance $i (instantiate $m2))"
+      " (core instance (instantiate $m1 (with \"\" (instance $i)))))"))
+    ;; ::33-family positive: a core module with-arg whose moduletype
+    ;; matches contravariantly/covariantly
+    (valid (concatenate 'string "(component"
+      " (core module $m (func (export \"x\")))"
+      " (component $c (import \"m\" (core module (export \"x\" (func)))))"
+      " (instance (instantiate $c (with \"m\" (core module $m)))))"))))
+
+(test component/canon-signature-pins
+  ;; M7 slice 4 (family 2): the canon core-signature checks
+  ;; (abi.wast ::17/::18/::20/::21).
+  (flet ((expect-invalid (thunk)
+           (block nil
+             (handler-case (funcall thunk)
+               (wasmdown:validation-error (c) (return c)))
+             (error "expected wasmdown:validation-error")))
+         (valid (src)
+           (wasmdown.component:validate-component
+            (wasmdown.component.text::parse-component-text src))))
+    ;; ::17 — realloc with the WRONG core signature
+    (let ((c (expect-invalid
+              (lambda ()
+                (valid (concatenate 'string "(component"
+                  " (core module $M (memory (export \"mem\") 1)"
+                  " (func (export \"f\") (param i32 i32))"
+                  " (func (export \"realloc\")))"
+                  " (core instance $i (instantiate $M))"
+                  " (func $f (param \"p\" (list u8))"
+                  " (canon lift (core func $i \"f\")"
+                  " (memory (core memory $i \"mem\"))"
+                  " (realloc (core func $i \"realloc\")))))"))))))
+      (is (search "realloc` uses a core function with an incorrect signature"
+                  (wasmdown:wasmdown-error-message c))))
+    ;; ::20 — the flatten compatibility check
+    (let ((c (expect-invalid
+              (lambda ()
+                (valid (concatenate 'string "(component"
+                  " (core module $M (func (export \"f\") (param i32)))"
+                  " (core instance $i (instantiate $M))"
+                  " (func $f (canon lift (core func $i \"f\"))))"))))))
+      (is (search "lowered parameter types `[]` do not match parameter types `[I32]`"
+                  (wasmdown:wasmdown-error-message c))))
+    ;; the positive: a MATCHING flatten validates (ev ::16's shape)
+    (valid (concatenate 'string "(component"
+      " (core module $m (func (export \"f\") (param i32 i32 i32 i32)))"
+      " (core instance $i (instantiate $m))"
+      " (func $f (param \"a\" (tuple u32 u32)) (param \"b\" (option u32))"
+      " (canon lift (core func $i \"f\"))))"))))
+
 (defun run-component-pins ()
   "Run the component pins (registered via TEST; returns T)."
   (let ((wasmdown.test::*tests*
@@ -779,7 +963,12 @@ wast runner's string-to-bytes decoder (same grammar as the suite)."
                       component/canonopt-unicity-pins
                       component/core-module-rule-pins
                       component/annotated-name-shape-pins
-                      component/instantiate-matching-pins)))
+                      component/instantiate-matching-pins
+                      component/core-module-empty-body-pin
+                      component/externtype-type-use-pins
+                      component/declarator-bind-id-pins
+                      component/core-subtype-matching-pins
+                      component/canon-signature-pins)))
           wasmdown.test::*tests*)))
     (multiple-value-bind (passed failed)
         (wasmdown.test:run-all-tests)
