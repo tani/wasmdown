@@ -1203,7 +1203,35 @@ wast runner's string-to-bytes decoder (same grammar as the suite)."
     (let ((c (expect-invalid
               "(component (import \"f\" (instance $i)) (export \"f2\" (instance $i) (instance (export \"f\" (func)))))")))
       (is (search "ascribed type of export is not compatible"
-                  (wasmdown:wasmdown-error-message c))))))
+                  (wasmdown:wasmdown-error-message c))))
+    ;; slice 5i (external-visibility ::57): the DEEP (type $i "i1"
+    ;; "i2") chain — an (alias export ct-inst "i1" (instance))
+    ;; projects the export's ascribed SUB-INSTANCE ct (its
+    ;; (instance . k) ascription indexes the ct's OWN declarator
+    ;; space, not the parent's type vector); the sub-ct's exports
+    ;; become the projected table. The fixture source is read from
+    ;; the suite file itself (the full shape is long).
+    (with-open-file
+        (s (merge-pathnames
+            "tests/component/validation/external-visibility.wast"
+            (make-pathname :directory
+                           '(:absolute "home" "tani" "ghq"
+                                      "github.com" "tani" "wasmdown"))))
+      (let ((txt (let ((acc (make-string-output-stream)))
+                   (loop for line = (read-line s nil nil) while line
+                         do (write-line line acc))
+                   (get-output-stream-string acc))))
+        ;; the ::57 command is the 58th COLUMN-0 form; slice it
+        (let* ((cmds (loop for pos = 0 then (position #\newline txt :start (1+ pos))
+                           while pos
+                           when (and (< (1+ pos) (length txt))
+                                     (char= (char txt (1+ pos)) #\())
+                             collect (1+ pos)))
+               (st (nth 57 cmds))
+               (en (or (nth 58 cmds) (length txt)))
+               (src2 (subseq txt st en)))
+          (wasmdown.component:validate-component
+           (wasmdown.component.text::parse-component-text src2)))))))
 
 (defun run-component-pins ()
   "Run the component pins (registered via TEST; returns T)."

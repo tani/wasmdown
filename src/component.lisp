@@ -4099,7 +4099,52 @@ unknown (NIL)."
              ;; aliased instance's table is unknown (ev ::61's
              ;; 'missing expected export `f`')
              (t nil))))))
-     ;; same for a ct-typed SOURCE (an imported instance)
+     ;; slice 5i (external-visibility ::57): a ct-typed SOURCE (an
+     ;; IMPORTED instance) — the projection reads the named export's
+     ;; ascribed externtype from the ct. An (instance . k) ascription
+     ;; indexes the CT'S OWN type space (its declarator sequence's
+     ;; type-introducing positions), NOT the parent's type vector:
+     ;; the k'th type-introducing declarator's payload is the
+     ;; sub-instance ct, whose own export declarators become the
+     ;; projected table.
+     ((and (ct-p ent) (eq (ct-kind ent) :instance))
+      (let* ((d (find name (coerce (ct-payload ent) 'list)
+                     :key (lambda (x)
+                            (and (eq (typedecl-kind x) :export)
+                                 (first (typedecl-payload x))))
+                     :test #'equal))
+             (et (and d (third (typedecl-payload d))))
+             (k (and et (eq (car et) :instance) (integerp (cdr et))
+                     (cdr et))))
+        (when (integerp k)
+          (loop with n = -1
+                for x across (ct-payload ent)
+                do (case (typedecl-kind x)
+                     ((:type :alias :import :export)
+                      (incf n)
+                      (when (and (= n k)
+                                 (eq (typedecl-kind x) :type)
+                                 (ct-p (typedecl-payload x))
+                                 (eq (ct-kind (typedecl-payload x))
+                                     :instance))
+                        (let ((tab (make-hash-table :test #'equal)))
+                          (dolist (td (coerce (ct-payload
+                                               (typedecl-payload x))
+                                             'list))
+                            (when (eq (typedecl-kind td) :export)
+                              (let* ((pl (typedecl-payload td))
+                                     (et2 (third pl)))
+                                (setf (gethash (first pl) tab)
+                                      (cons (car et2)
+                                            (if (and (consp et2)
+                                                     (eq (car et2)
+                                                         :type))
+                                                (first pl)
+                                                (cdr et2)))))))
+                          (return tab)))
+                      (when (= n k) (return nil)))
+                     (t nil))
+                finally (return nil)))))
      (t nil))))
 
 (defun %match-instantiation-arg (name sort et arg-si import-idx
