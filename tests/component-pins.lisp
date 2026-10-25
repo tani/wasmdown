@@ -1070,6 +1070,56 @@ wast runner's string-to-bytes decoder (same grammar as the suite)."
    (wasmdown.component.text::parse-component-text
     "(component definition $C (core type $FT (func (param i32) (result i32))) (core type $MT (module (alias outer $C $FT (type $a)) (export \"f\" (func (type $a))))) (core type $MT2 (module (alias outer $C $FT (type)) (import \"a\" \"b\" (func (type 0))) (export \"c\" (func (type 0))))))")))
 
+
+(test component/resource-identity-pins
+  ;; slice 5c (resources ::30/::44/::45/::53-::56/::60-::64):
+  ;; the alias-declarator type push (every (alias export ... (type))
+  ;; inside a component/instance TYPE introduces a type index), the
+  ;; per-instance identity stash (two instantiations of one component
+  ;; with the same resource argument share the exported resource),
+  ;; the borrow-in-result transitivity, the [i32]->[] destructor
+  ;; signature and the resource-target canon rule.
+  (flet ((expect-invalid (src)
+           (block nil
+             (handler-case
+                 (wasmdown.component:validate-component
+                  (wasmdown.component.text::parse-component-text src))
+               (wasmdown:validation-error (c) (return c)))
+             (error "expected wasmdown:validation-error"))))
+    ;; ::30 — the alias-introduced $r is referenceable by $T2's (eq $r)
+    (wasmdown.component:validate-component
+     (wasmdown.component.text::parse-component-text
+      "(component (type $X (component (type $T (instance (export \"r\" (type (sub resource))))) (export \"t\" (instance $t (type $T))) (alias export $t \"r\" (type $r)) (type $T2 (instance (export \"r2\" (type (eq $r))) (export \"r\" (type (sub resource))))) (export \"t2\" (instance (type $T2))))))"))
+    ;; ::44 — two instantiations of $c with the same $t: the eq-imports
+    ;; x2/x3 both resolve to the SAME resource (no 'not the same')
+    (wasmdown.component:validate-component
+     (wasmdown.component.text::parse-component-text
+      "(component (type $t (resource (rep i32))) (component $c (import \"x\" (type $t (sub resource))) (export \"y\" (type $t))) (instance $c1 (instantiate $c (with \"x\" (type $t)))) (instance $c2 (instantiate $c (with \"x\" (type $t)))) (component $c2 (import \"x1\" (type $t (sub resource))) (import \"x2\" (type (eq $t))) (import \"x3\" (type (eq $t)))) (instance (instantiate $c2 (with \"x1\" (type $t)) (with \"x2\" (type $c1 \"y\")) (with \"x3\" (type $c2 \"y\")))))"))
+    ;; ::53 — borrow in a result
+    (let ((c (expect-invalid
+              "(component (type $R (resource (rep i32))) (type $F (func (result (borrow $R)))))")))
+      (is (search "function result cannot contain a `borrow` type"
+                  (wasmdown:wasmdown-error-message c))))
+    ;; ::56 — borrow transitively through record+list+option
+    (let ((c (expect-invalid
+              "(component (type $R (resource (rep i32))) (type $Rec (record (field \"f\" (borrow $R)))) (type $F (func (result (option (list $Rec))))))")))
+      (is (search "function result cannot contain a `borrow` type"
+                  (wasmdown:wasmdown-error-message c))))
+    ;; ::60 — wrong dtor signature
+    (let ((c (expect-invalid
+              "(component (core module $M (func (export \"dtor\"))) (core instance $m (instantiate $M)) (type $R (resource (rep i32) (dtor (core func $m \"dtor\")))))")))
+      (is (search "wrong signature for a destructor"
+                  (wasmdown:wasmdown-error-message c))))
+    ;; ::61 — dtor index out of bounds
+    (let ((c (expect-invalid
+              "(component (type $R (resource (rep i32) (dtor (core func 100)))))")))
+      (is (search "function index out of bounds"
+                  (wasmdown:wasmdown-error-message c))))
+    ;; ::62 — canon resource.drop of a non-resource
+    (let ((c (expect-invalid
+              "(component (type $T (tuple u32)) (core func (canon resource.drop $T)))")))
+      (is (search "not a resource type"
+                  (wasmdown:wasmdown-error-message c))))))
 (defun run-component-pins ()
   "Run the component pins (registered via TEST; returns T)."
   (let ((wasmdown.test::*tests*
@@ -1091,6 +1141,7 @@ wast runner's string-to-bytes decoder (same grammar as the suite)."
                       component/annotated-name-shape-pins
                       component/instantiate-matching-pins
                       component/core-module-empty-body-pin
+                      component/resource-identity-pins
                       component/moduletype-outer-alias-pins
                       component/outer-alias-debruijn-pins
                       component/externtype-type-use-pins

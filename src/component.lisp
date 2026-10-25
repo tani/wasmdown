@@ -2212,6 +2212,52 @@ type')."
       (unless (ct-defvaltype-p c)
         (%verr "type index ~d is not a defined type" (cdr vt))))))
 
+(defun %vt-transitively-borrow-p (vt state seen)
+  "Slice 5c (Binary.md 258-262): does VALTYPE transitively contain a
+borrow? An :idx reference resolves through STATE's type space; every
+structural kind recurses; a borrow IS the terminal. SEEN guards the
+:idx cycle space."
+  (labels ((walk-idx (i)
+             (and (>= i 0) (< i (length (cval-types state)))
+                  (not (gethash i seen))
+                  (progn (setf (gethash i seen) t)
+                         (walk-ct (aref (cval-types state) i)))))
+           (walk-vt (v)
+             (cond ((and (consp v) (eq (car v) :idx)) (walk-idx (cdr v)))
+                   ((ct-p v) (walk-ct v))
+                   (t nil)))
+           (walk-ct (c)
+             (and (ct-p c)
+                  (not (gethash (ct-kind c) seen))
+                  (case (ct-kind c)
+                    (:borrow t)
+                    (:record
+                     (loop for (nil . f) across (ct-payload c)
+                           thereis (walk-vt f)))
+                    (:variant
+                     (loop for (nil . f) across (ct-payload c)
+                           thereis (and f (walk-vt f))))
+                    (:list (walk-vt (car (ct-payload c))))
+                    (:tuple
+                     (loop for e across (ct-payload c)
+                           thereis (walk-vt e)))
+                    (:option (walk-vt (ct-payload c)))
+                    (:result
+                     (or (and (car (ct-payload c))
+                              (walk-vt (car (ct-payload c))))
+                         (and (cdr (ct-payload c))
+                              (walk-vt (cdr (ct-payload c))))))
+                    ((:stream :future)
+                     (and (ct-payload c) (walk-vt (ct-payload c))))
+                    (:map (walk-vt (cdr (ct-payload c))))
+                    (:func
+                     (or (loop for (nil . p) across (first (ct-payload c))
+                               thereis (walk-vt p))
+                         (and (second (ct-payload c))
+                              (walk-vt (second (ct-payload c))))))
+                    (t nil)))))
+    (walk-vt vt)))
+
 (defun %check-defvaltype (c state &optional (type-depth 1) (outer state))
   "Validate one defined (value) type: label rules, non-emptiness, the
 32-flag limit, type-index bounds + defined-ness, own/borrow resource
@@ -2276,6 +2322,11 @@ type's own declarators stay against STATE, the inner space)."
     ((:stream :future)
      (when (ct-payload c)
        (%check-valtype (ct-payload c) state "stream element")
+       ;; slice 5c (Binary.md 261-262): stream/future element types
+       ;; may not transitively contain a borrow
+       (when (%vt-transitively-borrow-p (ct-payload c) state
+                                        (make-hash-table))
+         (%verr "stream and future types may not contain `borrow`"))
        ;; (stream char) is rejected "at this time" (Binary.md line 263)
        (when (and (eq (ct-kind c) :stream)
                   (or (eq (ct-payload c) :char)
@@ -2301,8 +2352,9 @@ type's own declarators stay against STATE, the inner space)."
      (%check-valtype (cdr (ct-payload c)) state "map value"))
     (:resource
      ;; resource types in a concrete component: rep must be a core
-     ;; numeric; the dtor index is checked against the core func space
-     ;; by the caller (which owns it))
+     ;; numeric; the dtor index is checked against the core func
+     ;; space by the CALLER (validate-component's :type arm, which
+     ;; owns comp for the static core resolver — resources ::60/::61)
      nil)
     (:func
      (let ((params (first (ct-payload c)))
@@ -2312,7 +2364,13 @@ type's own declarators stay against STATE, the inner space)."
          (%check-valtype (cdr p) state "parameter"))
        (%check-label-unique (map 'list #'car params)
                             "function parameter")
-       (when results (%check-valtype results state "result"))))
+       (when results
+         (%check-valtype results state "result")
+         ;; slice 5c (resources ::53-::56, Binary.md 258-260): a
+         ;; functype's result may not transitively contain a borrow
+         (when (%vt-transitively-borrow-p results state
+                                         (make-hash-table))
+           (%verr "function result cannot contain a `borrow` type")))))
     ;; component/instance types: their decls are validated in a fresh
     ;; scope with the type index space extended (Explainer: each
     ;; component/instance type is validated with an initially-empty
@@ -2386,10 +2444,14 @@ type's own declarators stay against STATE, the inner space)."
                   (when (and tgt (eq (aliasrec-sort a) :type))
                     (when (>= (aliasrec-target a)
                               (length (cval-types tgt)))
-                      (%verr "type index out of bounds"))))
-                (vector-push-extend
-                 (make-ct :kind :prim :payload :outer-aliased)
-                 (cval-types inner)))))
+                      (%verr "type index out of bounds")))))
+              ;; EVERY alias declarator introduces a new type index
+              ;; in the type's own space (Binary.md line 274 — an
+              ;; (alias export ...) of the type sort too; resources.wast
+              ;; ::30's $T2 referencing the alias-introduced $r)
+              (vector-push-extend
+               (make-ct :kind :prim :payload :outer-aliased)
+               (cval-types inner))))
            ((:import :export)
             (let* ((payload (typedecl-payload d))
                    (name (first payload))
@@ -2740,6 +2802,15 @@ space."
 ;;; instantiated instance came from) — the alias-type shape
 ;;; resolution resolves the child's typeidx against the CHILD state.
 (defvar *inst-source-comp* (make-hash-table :test #'eql))
+
+(defvar *inst-ids-stash* (make-hash-table :test #'eql)
+  "Slice 5c: per-INSTANCE the rebuilt child identity vector from
+%check-instantiate-args — keyed by the instance's index (pre-incf).
+An (alias export $i \"n\" (type)) whose SOURCE instance was
+INSTANTIATED resolves its :inst-export identity through the child's
+substitution (the with-args' parent identities), so two instantiations
+of one component with the same resource argument share the identity
+(resources.wast ::44/::45).")
 
 (defvar *outer-states* nil
   "Slice 5 (outer-alias A): the stack of ENCLOSING validator states
@@ -3786,7 +3857,12 @@ inst-idx . source-idx) — equal exactly when two aliases project the
 SAME source type of the SAME instance (resources.wast ::41's r1/r2
 re-exports of one typeidx share it); a ct-typed entry (an imported
 instance) has no locally-known source — NIL (the caller falls back
-to a fresh resource id)."
+to a fresh resource id). Slice 5c: when the source instance was
+INSTANTIATED, the stashed child identity vector resolves the source
+idx through the instantiation's substitution — the identity becomes
+whatever the with-args supplied (a parent-space :fresh resource, an
+:inst-export, ...), so two instantiations of one component with the
+same argument SHARE the resource (resources.wast ::44/::45)."
   (let ((ent (and (< inst-idx (length (cval-instance-types state)))
                   (aref (cval-instance-types state) inst-idx))))
     (when (hash-table-p ent)
@@ -3794,8 +3870,15 @@ to a fresh resource id)."
         (when (and (consp hit)
                    (eq (car hit) :type))
           (if (integerp (cdr hit))
-              ;; a source-idx: identity = (instance, source)
-              (list :inst-export inst-idx (cdr hit))
+              (let* ((child-ids (gethash inst-idx *inst-ids-stash*))
+                     (resolved (and child-ids
+                                    (< (cdr hit) (length child-ids))
+                                    (%ty-resolve (aref child-ids (cdr hit))
+                                                 child-ids))))
+                (or resolved
+                    ;; not an instantiated source (a bag): the
+                    ;; (instance, source) pair identity
+                    (list :inst-export inst-idx (cdr hit))))
               ;; an ascribed (sub resource) export: fresh per NAME
               (list :inst-export inst-idx name)))))))
 
@@ -4071,7 +4154,12 @@ rejected (instantiation.wast ::57)."
           (unless arg-si
             (%verr "missing import named `~a`" nm))
           (%match-instantiation-arg nm sort et arg-si import-idx
-                                    ids state)))))))
+                                    ids state)))
+      ;; slice 5c: the rebuilt child identity vector — the caller
+      ;; stashes it per instance so %instance-export-identity can
+      ;; resolve an aliased export through the child's substitution
+      ;; (resources.wast ::44/::45's (type $c1 "out") chains)
+      ids))))
 
 ;;; ---------------------------------------------------------------
 ;;; External visibility of types (Explainer.md
@@ -4532,6 +4620,22 @@ own interfaceversion check."
           ;; into (version, suffix)
           (validate-interface-version version suffix))))))
 
+
+(defun %check-resource-dtor (payload state comp)
+  "Slice 5c (resources ::60/::61, Binary.md 265): a resource type's
+dtor must be a valid core func index with signature [i32] -> [] (the
+handle's representation dropped on entry)."
+  (let ((dtor (and (ct-resourcetype-p payload)
+                   (cdr (ct-payload payload)))))
+    (when dtor
+      (unless (< dtor (cval-core-funcs state))
+        (%verr "function index out of bounds"))
+      (let ((sig (%canon-core-func-sig comp dtor)))
+        (when (and sig
+                   (not (and (equal (car sig) '(:i32))
+                             (null (cdr sig)))))
+          (%verr "wrong signature for a destructor"))))))
+
 (defun validate-component (comp &key (outer-depth 0))
   "Validate a decoded component. Signals wasmdown:validation-error on
 any static rule violation; returns the component. OUTER-DEPTH is
@@ -4539,7 +4643,8 @@ the number of enclosing component/type scopes (outer aliases)."
   (let ((*validate-depth* (1+ *validate-depth*)))
     (when (= *validate-depth* 1)
       (clrhash *comp-state-stash*)
-      (clrhash *inst-source-comp*))
+      (clrhash *inst-source-comp*)
+      (clrhash *inst-ids-stash*))
   (let ((state (make-cval
                 :types (make-array 16 :fill-pointer 0 :adjustable t)
                 :core-types (make-array 16 :fill-pointer 0 :adjustable t)
@@ -4640,7 +4745,11 @@ the number of enclosing component/type scopes (outer aliases)."
                            do (%check-sortidx si state))
                      ;; M7 slice 3b: structural matching of every
                      ;; with-argument against the target's imports
-                     (%check-instantiate-args payload comp state)
+                     ;; slice 5c: the rebuilt child ids stashed per
+                     ;; instance for the export-identity resolution
+                     (setf (gethash (cval-instances state)
+                                    *inst-ids-stash*)
+                           (%check-instantiate-args payload comp state))
                      ;; slice 4 (family 3): the instance's source
                      ;; component (the alias-type shape resolution
                      ;; reads the child's type space through the
@@ -4870,6 +4979,12 @@ the number of enclosing component/type scopes (outer aliases)."
                     (:core-global (incf (cval-core-globals state)))
                     (:core-tag (incf (cval-core-tags state)))))
                  (:type
+                  ;; slice 5c (resources ::60/::61, Binary.md 265):
+                  ;; a resource's dtor must be [i32] -> [] — see
+                  ;; %check-resource-dtor (a separate defun: the
+                  ;; inline version tripped the compiler's
+                  ;; cross-arm type derivation)
+                  (%check-resource-dtor payload state comp)
                   (%check-deftype payload state)
                   (vector-push-extend payload (cval-types state))
                   ;; identity (slice 3b): resource definitions are
@@ -4909,11 +5024,26 @@ the number of enclosing component/type scopes (outer aliases)."
                                 (canonrec-typeidx payload)))))
                     (:builtin
                      ;; built-in canons reference type indices where
-                     ;; applicable; validated structurally
-                     (dolist (imm (canonrec-imms payload))
-                       (when (and (integerp imm)
-                                  (>= imm (length (cval-types state))))
-                         (%verr "type index out of bounds")))))
+                     ;; applicable; validated structurally. Slice 5c
+                     ;; (resources ::62-::64): the resource.* built-ins
+                     ;; require a RESOURCE type target — the parser
+                     ;; routes them here with the typeidx as the SECOND
+                     ;; immediate ('not a resource type'). The local
+                     ;; CR keeps the compiler's payload derivation
+                     ;; local to this clause.
+                     (let ((imms (canonrec-imms payload)))
+                       (dolist (imm imms)
+                         (when (and (integerp imm)
+                                    (>= imm (length (cval-types state))))
+                           (%verr "type index out of bounds")))
+                       (when (and (member (first imms)
+                                          '(:resource-new :resource-drop
+                                            :resource-rep))
+                                  (second imms)
+                                  (integerp (second imms)))
+                         (let ((c (%ct-at state (second imms))))
+                           (unless (ct-resourcetype-p c)
+                             (%verr "not a resource type")))))))
                   ;; slice 4: the canon's INTRODUCED index space —
                   ;; :lift adds a COMPONENT func; :lower and the
                   ;; resource-*/builtin canons add CORE funcs (the
