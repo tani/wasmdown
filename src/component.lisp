@@ -80,6 +80,12 @@
            #:ct-functype-p
            #:component-validate
            #:validate-component
+           ;; M8: the instantiation EXECUTOR's contract (pure
+           ;; export additions; the validator stays static-only)
+           #:sortidx-sort
+           #:sortidx-idx
+           #:ct-resourcetype-p
+           #:canon-opt
            ;; labels + externnames
            #:label-p
            #:words-p
@@ -2796,6 +2802,11 @@ indicies.wast)."
   "A canonopt lookup: OPTS is an assoc-list of (KEY value) lists
 \(both the text parser and the binary reader build it this way)."
   (assoc key opts :test #'eq))
+
+(defun canon-opt (opts key)
+  "The exported canonopt lookup (M8: the instantiation executor's
+  contract — pure addition, the same assoc semantics)."
+  (%opt opts key))
 
 (defun %flat-count (vt state)
   "The flattened core-value count of a component valtype per

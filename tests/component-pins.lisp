@@ -1624,6 +1624,116 @@ wast runner's string-to-bytes decoder (same grammar as the suite)."
       (is (search "type index out of bounds"
                   (wasmdown:wasmdown-error-message c))))))
 
+;;; ---- M8: instantiation EXECUTION pins (src/component-runtime.lisp) ----
+
+(defun %exec-comp (src)
+  "Parse + validate + EXECUTE a component text fixture; returns the
+runtime comp-instance. The suite's end-to-end lane is the oracle;
+these pins guard the executor's mechanisms directly."
+  (let ((comp (wasmdown.component.text::parse-component-text src)))
+    (wasmdown.component:validate-component comp)
+    (wasmdown.component.runtime:instantiate-component comp)))
+
+(test component/instantiation-core-link-pins
+  ;; M8 mechanism 1 — TWO-LEVEL core-instance linking (Explainer
+  ;; 'Instance Definitions'): $B imports ("a" "one"); the with-arg
+  ;; names the FIRST level ("a" -> core instance $a); the second
+  ;; level resolves through that instance's exports. The linked call
+  ;; path must produce $A's constant.
+  (let ((ci (%exec-comp
+             "(component
+                (core module $A (func (export \"one\") (result i32) (i32.const 1)))
+                (core module $B
+                  (import \"a\" \"one\" (func (result i32)))
+                  (func (export \"two\") (result i32) (call 0)))
+                (core instance $a (instantiate $A))
+                (core instance $b (instantiate $B (with \"a\" (instance $a)))))")))
+    (is (wasmdown.component.runtime:comp-instance-p ci))
+    ;; the second core instance is the linked module-instance; its
+    ;; "two" export is $B's func 1, which CALLS the imported "one"
+    (let* ((mb (aref (wasmdown.component.runtime::comp-instance-core-instances
+                      ci) 1))
+           (two (wasmdown.runtime:export-value mb "two")))
+      (is (wasmdown.runtime:func-instance-p two))
+      ;; wasm-call returns the RESULTS LIST
+      (is (equal '(1) (wasmdown.runtime:wasm-call two))))))
+
+(test component/instantiation-with-arg-pins
+  ;; M8 mechanism 2 — COMPONENT-instance with-args: the child's
+  ;; import binds the parent's runtime value (here a canon-lifted
+  ;; func), and the child's re-export projects the SAME value.
+  (let ((ci (%exec-comp
+             "(component
+                (core module $M (func (export \"f\") (result i32) (i32.const 7)))
+                (core instance $m (instantiate $M))
+                (alias core export $m \"f\" (core func $cf))
+                (func $f (result u32) (canon lift (core func $cf)))
+                (component $c
+                  (import \"x\" (func (result u32)))
+                  (export \"y\" (func 0)))
+                (instance $i (instantiate $c (with \"x\" (func $f)))))")))
+    ;; the instantiated child instance is instances[0]
+    (let* ((child (aref (wasmdown.component.runtime::comp-instance-instances
+                         ci) 0))
+           (y (wasmdown.component.runtime:runtime-export-value child "y")))
+      (is (wasmdown.component.runtime:lifted-func-p y))
+      ;; the bound import is the parent's lifted func (identity)
+      (is (eq (gethash "x" (wasmdown.component.runtime:comp-instance-imports
+                            child))
+              y))
+      ;; the FLAT canonical call path: calling the lifted func runs
+      ;; the wrapped core func (i32.const 7)
+      (is (= 7 (wasmdown.component.runtime:lifted-func-call y))))))
+
+(test component/instantiation-start-pins
+  ;; M8 mechanism 3 — START functions run last: a lifted func that
+  ;; bumps a core global; (start $f) executes it during
+  ;; instantiation, and the aliased global OBSERVES the mutation.
+  ;; (The text parser has no start form — the comp IR is built by
+  ;; APPENDING a start def to a parsed fixture.)
+  (let* ((base (wasmdown.component.text::parse-component-text
+                "(component
+                   (core module $M
+                     (global (export \"g\") (mut i32) (i32.const 0))
+                     (func (export \"bump\") (global.set 0 (i32.add (global.get 0) (i32.const 1)))))
+                   (core instance $m (instantiate $M))
+                   (alias core export $m \"g\" (core global $g))
+                   (alias core export $m \"bump\" (core func $bump))
+                   (func $f (canon lift (core func $bump))))"))
+         (comp (wasmdown.component:make-comp
+                :defs (concatenate 'vector
+                                   (wasmdown.component:comp-defs base)
+                                   (vector
+                                    (wasmdown.component:make-compdef
+                                     :kind :start
+                                     :payload (wasmdown.component:make-startrec
+                                               :func 0
+                                               :args (make-array 0)
+                                               :results 0)))))))
+    (wasmdown.component:validate-component comp)
+    (let ((ci (wasmdown.component.runtime:instantiate-component comp)))
+      ;; the start ran: the aliased core global (core-globals[0])
+      ;; went 0 -> 1
+      (let ((g (aref (wasmdown.component.runtime::comp-instance-core-globals
+                      ci) 0)))
+        (is (= 1 (wasmdown.runtime:global-value g)))))))
+
+(test component/instantiation-trap-pins
+  ;; M8 mechanism 4 — TRAP AT INSTANTIATION: a core module whose
+  ;; start function traps; the trap propagates out of the component's
+  ;; core-instance def (assert_trap (component ...) taxonomy: the
+  ;; runner classifies it :execute).
+  (let ((err (wasmdown.test::check-trap
+              (lambda ()
+                (%exec-comp
+                 "(component
+                    (core module $M
+                      (func $start unreachable)
+                      (start $start))
+                    (core instance $m (instantiate $M)))"))
+              :unreachable)))
+    (is err)))
+
 (defun run-component-pins ()
   "Run the component pins (registered via TEST; returns T)."
   (let ((wasmdown.test::*tests*
@@ -1663,7 +1773,11 @@ wast runner's string-to-bytes decoder (same grammar as the suite)."
                       component/abi-string-encoding-pins
                       component/declarator-bind-id-pins
                       component/core-subtype-matching-pins
-                      component/canon-signature-pins)))
+                      component/canon-signature-pins
+                      component/instantiation-core-link-pins
+                      component/instantiation-with-arg-pins
+                      component/instantiation-start-pins
+                      component/instantiation-trap-pins)))
           wasmdown.test::*tests*)))
     (multiple-value-bind (passed failed)
         (wasmdown.test:run-all-tests)

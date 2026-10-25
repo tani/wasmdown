@@ -32,7 +32,10 @@
            #:stoken #:stoken-p #:stoken-kind #:stoken-text
            #:stoken-start #:stoken-end
            ;; M7 slice 2: the component text-parser hook (installed by
-           #:*component-text-parser* #:component-text-parser))
+           ;; src/component-text.lisp) + the M8 instantiator hook
+           ;; (installed by src/component-runtime.lisp).
+           #:*component-text-parser* #:component-text-parser
+           #:*component-instantiator* #:component-instantiator))
 
 (in-package #:wasmdown.wast)
 
@@ -1441,42 +1444,85 @@ loaded. M7 slice 2.")
 (defun component-text-parser ()
   "The installed component text parser (a function) or NIL."
   *component-text-parser*)
+
+(defvar *component-instantiator* nil
+  "The component INSTANTIATOR entry point (installed at load time by
+src/component-runtime.lisp, which loads after this file — the M8
+runtime half). A designator of instantiate-component: called with
+the validated comp, returns the runtime comp-instance. NIL when the
+runtime file was not loaded — the command then classifies
+:unsupported (no silent passes).")
+
+(defun component-instantiator ()
+  "The installed component instantiator (a function) or NIL."
+  *component-instantiator*)
 (defun %component-outcome (cmd state)
-  "Run a (component ...) command through decode + validate. Returns
-(values outcome phase detail)."
+  "Run a (component ...) command through decode + validate +
+  INSTANTIATE (M8: src/component-runtime.lisp). Returns (values
+outcome phase detail instance): :pass when the component validates
+AND instantiates (the instance for the runner's records); :fail with
+the phase (:decode/:validate/:link/:execute) otherwise. A
+\(component definition ...) command is CODE — validate only, no
+execution (no instance is produced)."
   (declare (ignore state))
-  (cond
-   ;; binary payload: decode-component + validate-component
-   ((wast-cmd-bytes cmd)
-    (handler-case
-        (let ((comp (wasmdown.component:decode-component
-                     (wast-cmd-bytes cmd))))
-          (wasmdown.component:validate-component comp)
-          ;; Valid: instantiation is a FUTURE slice (canonical ABI).
-          (values :unsupported nil
-                  "component decodes and validates; instantiation is a future slice"))
-      (wasmdown:decode-error (c)
-        (values :fail :decode (wasmdown:wasmdown-error-message c)))
-      (wasmdown:validation-error (c)
-        (values :fail :validate (wasmdown:wasmdown-error-message c)))))
-   ;; text/quote/definition-text: the component TEXT parser (M7 slice
-   ;; 2, src/component-text.lisp — loaded AFTER this file defines the
-   ;; hook, so the entry point is installed at load time).
-   (t
-    (let ((parse (component-text-parser)))
-      (if parse
-          (handler-case
-              (let ((comp (funcall parse (wast-cmd-text cmd))))
-                (wasmdown.component:validate-component comp)
-                (values :pass nil
-                        "component parses and validates (no instantiation in this slice)"))
-            (wasmdown:decode-error (c)
-              (values :fail :decode (wasmdown:wasmdown-error-message c)))
-            (wasmdown:validation-error (c)
-              (values :fail :validate
-                      (wasmdown:wasmdown-error-message c))))
-          (values :unsupported nil
-                  "component text format not implemented in this slice"))))))
+  (flet ((execute (comp)
+           ;; M8: EXECUTE the validated component through the
+           ;; installed instantiator (src/component-runtime.lisp;
+           ;; loads after this file, so the hook is the contract).
+           ;; The walk may signal link-error (import/index
+           ;; resolution) or a wasm-trap (a start func) — the
+           ;; taxonomy the harness already classifies: :link for
+           ;; assert_unlinkable, :execute for assert_trap.
+           (let ((instantiate (component-instantiator)))
+             (if instantiate
+                 (values :pass nil "ok" (funcall instantiate comp))
+                 (values :unsupported nil
+                         "component instantiation not implemented"
+                         nil)))))
+    (cond
+     ;; binary payload: decode + validate (+ execute unless a
+     ;; DEFINITION command)
+     ((wast-cmd-bytes cmd)
+      (handler-case
+          (let ((comp (wasmdown.component:decode-component
+                       (wast-cmd-bytes cmd))))
+            (wasmdown.component:validate-component comp)
+            (if (eq (wast-cmd-named-form cmd) :definition)
+                (values :pass nil "ok (definition stored)" nil)
+                (execute comp)))
+        (wasmdown:decode-error (c)
+          (values :fail :decode (wasmdown:wasmdown-error-message c) nil))
+        (wasmdown:validation-error (c)
+          (values :fail :validate (wasmdown:wasmdown-error-message c) nil))
+        (wasmdown:link-error (c)
+          (values :fail :link (wasmdown:wasmdown-error-message c) nil))
+        (wasmdown:wasm-trap (c)
+          (values :fail :execute (wasmdown:wasmdown-error-message c) nil))))
+     ;; text/quote/definition-text: the component TEXT parser
+     (t
+      (let ((parse (component-text-parser)))
+        (if parse
+            (handler-case
+                (let ((comp (funcall parse (wast-cmd-text cmd))))
+                  (wasmdown.component:validate-component comp)
+                  (if (eq (wast-cmd-named-form cmd) :definition)
+                      (values :pass nil "ok (definition stored)" nil)
+                      (execute comp)))
+              (wasmdown:decode-error (c)
+                (values :fail :decode (wasmdown:wasmdown-error-message c)
+                        nil))
+              (wasmdown:validation-error (c)
+                (values :fail :validate (wasmdown:wasmdown-error-message c)
+                        nil))
+              (wasmdown:link-error (c)
+                (values :fail :link (wasmdown:wasmdown-error-message c)
+                        nil))
+              (wasmdown:wasm-trap (c)
+                (values :fail :execute (wasmdown:wasmdown-error-message c)
+                        nil)))
+            (values :unsupported nil
+                    "component text format not implemented in this slice"
+                    nil)))))))
 
 (defun %component-cmd-from-node (node)
   "Rebuild a component wast-cmd from an assertion's (component ...)
@@ -1816,8 +1862,9 @@ given, receives a JSONL line per result (PLAN.md 12.8)."
   (let ((name (wast-cmd-name cmd)))
     (cond
      ((and (eq name :component) (wast-cmd-component-p cmd))
-      (multiple-value-bind (outcome phase detail)
+      (multiple-value-bind (outcome phase detail inst)
           (%component-outcome cmd state)
+        (declare (ignore inst))    ; M8: no component actions yet
         (if (eq outcome :unsupported)
             (funcall record cmd :unsupported nil detail nil)
             (funcall record cmd outcome phase detail nil))))
@@ -1976,8 +2023,9 @@ exhausted."
         ;; (assert_invalid (component ...)). Phase oracle identical to
         ;; modules: malformed -> DECODE, invalid -> VALIDATE; text-form
         ;; payloads classify :unsupported (no component text parser).
-        (multiple-value-bind (outcome phase detail)
+        (multiple-value-bind (outcome phase detail inst)
             (%component-outcome inner state)
+          (declare (ignore inst))
           (let ((want-phase (ecase name
                               (:assert_malformed :decode)
                               (:assert_invalid :validate)

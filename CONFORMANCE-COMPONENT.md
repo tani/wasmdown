@@ -15,21 +15,21 @@ Baseline measurement, not a release gate (PLAN.md §12.8).
 
 | Outcome | Count |
 | --- | --- |
-| pass | 603 |
+| pass | 639 |
 | fail | 0 |
 | skip | 0 |
-| unsupported | 36 |
+| unsupported | 0 |
 | timeout | 0 |
 | harness-error | 0 |
 | **total** | **639** |
 
-Executed: 639 commands; pass rate 94.4%.
+Executed: 639 commands; pass rate 100.0%.
 
 ## Per-file counts
 
 | File | pass | fail | unsupported | other |
 | --- | --- | --- | --- | --- |
-| component/binary.wast | 96 | 0 | 36 | 0 |
+| component/binary.wast | 132 | 0 | 0 | 0 |
 | component/abi.wast | 23 | 0 | 0 | 0 |
 | component/annotated-names.wast | 36 | 0 | 0 | 0 |
 | component/attributes.wast | 29 | 0 | 0 | 0 |

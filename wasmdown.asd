@@ -24,6 +24,7 @@
    (:file "src/cli")
    (:file "src/text")
    (:file "src/wast")
+   (:file "src/component-runtime")
    (:file "src/component-text")))
 
 (asdf:defsystem #:wasmdown/test
