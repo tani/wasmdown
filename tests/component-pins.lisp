@@ -944,6 +944,33 @@ wast runner's string-to-bytes decoder (same grammar as the suite)."
       " (func $f (param \"a\" (tuple u32 u32)) (param \"b\" (option u32))"
       " (canon lift (core func $i \"f\"))))"))))
 
+(test component/abi-string-encoding-pins
+  ;; slice 5 (abi ::11-::13): the text parser ACCEPTS repeated
+  ;; string-encoding opts (the 'string-encoding=' prefix match was
+  ;; off by one: 16 chars, not 17 — a single option used to fall to
+  ;; the error arm); the validator then rejects DIFFERENT encodings
+  ;; with the fixture's conflict message, latin1+utf16 in kebab form.
+  (flet ((expect-invalid (src)
+           (block nil
+             (handler-case
+                 (wasmdown.component:validate-component
+                  (wasmdown.component.text::parse-component-text src))
+               (wasmdown:validation-error (c) (return c)))
+             (error "expected wasmdown:validation-error"))))
+    ;; utf8 vs utf16 (abi ::11)
+    (let ((c (expect-invalid
+              "(component (import \"f\" (func $f)) (core func $f' (canon lower (func $f) string-encoding=utf8 string-encoding=utf16)))")))
+      (is (search "canonical encoding option `utf8` conflicts with option `utf16`"
+                  (wasmdown:wasmdown-error-message c))))
+    ;; utf8 vs latin1+utf16 — the kebab spelling (abi ::12)
+    (let ((c (expect-invalid
+              "(component (import \"f\" (func $f)) (core func $f' (canon lower (func $f) string-encoding=utf8 string-encoding=latin1+utf16)))")))
+      (is (search "canonical encoding option `utf8` conflicts with option `latin1-utf16`"
+                  (wasmdown:wasmdown-error-message c))))
+    ;; a SINGLE encoding still parses (the prefix fix's positive)
+    (wasmdown.component.text::parse-component-text
+     "(component (import \"f\" (func $f)) (core func $f' (canon lower (func $f) string-encoding=utf8)))")))
+
 (defun run-component-pins ()
   "Run the component pins (registered via TEST; returns T)."
   (let ((wasmdown.test::*tests*
@@ -966,6 +993,7 @@ wast runner's string-to-bytes decoder (same grammar as the suite)."
                       component/instantiate-matching-pins
                       component/core-module-empty-body-pin
                       component/externtype-type-use-pins
+                      component/abi-string-encoding-pins
                       component/declarator-bind-id-pins
                       component/core-subtype-matching-pins
                       component/canon-signature-pins)))

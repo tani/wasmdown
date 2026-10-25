@@ -1419,9 +1419,9 @@ compare it (instantiation ::47's 'mismatch in the shared flag')."
        ((and (%tokp it) (string= (%tok-text it) "async"))
         (push (list :async t) opts))
        ((and (%tokp it) (eq (%tok-kind it) :keyword)
-             (>= (length (%tok-text it)) 17)
-             (string= (%tok-text it) "string-encoding=" :end1 17))
-        (let ((enc (subseq (%tok-text it) 17)))
+             (>= (length (%tok-text it)) 16)
+             (string= (%tok-text it) "string-encoding=" :end1 16))
+        (let ((enc (subseq (%tok-text it) 16)))
           (cond
            ((string= enc "utf8")
             (push (list :string-encoding 'utf8) opts))

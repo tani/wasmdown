@@ -3074,7 +3074,24 @@ task-return shapes are a later slice."
      (when (> realloc-n 1)
        (%verr "canonical option `realloc` is specified more than once"))
      (when (> post-n 1)
-       (%verr "canonical option `post-return` is specified more than once")))
+       (%verr "canonical option `post-return` is specified more than once"))
+     ;; slice 5 (abi ::11-::13): at most one string-encoding, and
+     ;; different encodings CONFLICT — the fixture message names the
+     ;; FIRST-SEEN encoding then the conflicting one, latin1+utf16 in
+     ;; its kebab form 'latin1-utf16'. Duplicate identical encodings
+     ;; never reach here today (one is enough for the fixtures), but
+     ;; the distinct pair rule is the observable one.
+     (let ((encs (remove-if-not (lambda (o)
+                                  (eq (car o) :string-encoding))
+                                opts)))
+       (when (> (length encs) 1)
+         (let* ((first-enc (second (first encs)))
+                (later (rest encs)))
+           (dolist (e later)
+             (unless (string-equal (string (second e))
+                                   (string first-enc))
+               (%verr "canonical encoding option `~a` conflicts with option `~a`"
+                       (%enc-str first-enc) (%enc-str (second e)))))))))
    ;; the option INDEX immediates are bounds-checked against the
    ;; core spaces (abi.wast ::3 'memory index out of bounds'; the
    ;; realloc/post-return indices reuse the core-func space)
@@ -3205,6 +3222,17 @@ ascription flattens to [] -> [])."
   "The fixture's `[I32]` rendering of a flat core type list."
   (format nil "[~{~a~^ ~}]"
           (mapcar (lambda (t_) (string-upcase (string t_))) types)))
+
+(defun %enc-str (enc)
+  "The fixture spelling of a string-encoding option value: utf8/utf16
+stay as-is; latin1+utf16 takes its kebab form 'latin1-utf16' (abi.wast
+::12/::13's conflict messages). Compares by NAME: the text parser
+interns the encoding symbols in ITS package, the binary reader in
+the keyword package."
+  (let ((name (string enc)))
+    (cond
+     ((string-equal name "LATIN1+UTF16") "latin1-utf16")
+     (t (string-downcase name)))))
 
 (defun %flat-join (a b)
   "CanonicalABI.md join: the tightest approximation of two flat
