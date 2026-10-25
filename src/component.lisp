@@ -5529,7 +5529,56 @@ the number of enclosing component/type scopes (outer aliases)."
                                      (sortidx-sort
                                       (exportrec-sortidx payload)))
                   (when (exportrec-type payload)
-                    (%check-externtype (exportrec-type payload) state nil))
+                    (%check-externtype (exportrec-type payload) state nil)
+                    ;; slice 5h (external-visibility ::60): the
+                    ;; ascription must be COMPATIBLE with the
+                    ;; source — an instance ascription requires the
+                    ;; source's KNOWN exports to provide every
+                    ;; required name+sort; an imported instance with
+                    ;; no known exports cannot satisfy a non-empty
+                    ;; ascription ('ascribed type of export is not
+                    ;; compatible')
+                    (when (eq (car (exportrec-type payload)) :instance)
+                      (let* ((asc (exportrec-type payload))
+                             (src-idx (sortidx-idx
+                                       (exportrec-sortidx payload)))
+                             (src (and (< src-idx
+                                           (length (cval-instance-types
+                                                    state)))
+                                       (aref (cval-instance-types
+                                              state)
+                                             src-idx))))
+                        (when (and (integerp (cdr asc))
+                                   (< (cdr asc)
+                                      (length (cval-types state)))
+                                   (ct-p (aref (cval-types state)
+                                               (cdr asc))))
+                          (let ((act (aref (cval-types state)
+                                           (cdr asc))))
+                            (when (and (ct-p act)
+                                       (eq (ct-kind act) :instance))
+                              (dolist (td (coerce (ct-payload act)
+                                                  'list))
+                                (when (eq (typedecl-kind td) :export)
+                                  (let* ((pl (typedecl-payload td))
+                                         (nm (first pl))
+                                         (eet (third pl)))
+                                    (multiple-value-bind (got known)
+                                        (%instance-export-sort
+                                         src-idx nm state)
+                                      (declare (ignore got))
+                                      (unless (and known
+                                                   (or (null src)
+                                                       (hash-table-p src)))
+                                        (%verr "ascribed type of export is not compatible"))
+                                      (when (and known
+                                                 (hash-table-p src))
+                                        (let ((hit (gethash nm src
+                                                             :missing)))
+                                          (unless (eq hit :missing)
+                                            (unless (eq (car hit)
+                                                        (car eet))
+                                              (%verr "ascribed type of export is not compatible")))))))))))))))
                  ;; external visibility: every nameable type transi-
                  ;; tively used by the exported func/instance/type
                  ;; must be named on either side (imports count:

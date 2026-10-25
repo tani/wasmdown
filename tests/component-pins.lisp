@@ -1196,7 +1196,14 @@ wast runner's string-to-bytes decoder (same grammar as the suite)."
     ;; ::35/::40 — unused INSTANCE types define freely
     (wasmdown.component:validate-component
      (wasmdown.component.text::parse-component-text
-      "(component definition (type (instance (type $Rec (record (field \"x\" u32))) (export \"f\" (func (param \"x\" $Rec))))))"))))
+      "(component definition (type (instance (type $Rec (record (field \"x\" u32))) (export \"f\" (func (param \"x\" $Rec))))))"))
+    ;; slice 5h (external-visibility ::60): an export ascription must
+    ;; be COMPATIBLE with the source — an imported instance (unknown
+    ;; exports) cannot satisfy a non-empty instance ascription
+    (let ((c (expect-invalid
+              "(component (import \"f\" (instance $i)) (export \"f2\" (instance $i) (instance (export \"f\" (func)))))")))
+      (is (search "ascribed type of export is not compatible"
+                  (wasmdown:wasmdown-error-message c))))))
 
 (defun run-component-pins ()
   "Run the component pins (registered via TEST; returns T)."
