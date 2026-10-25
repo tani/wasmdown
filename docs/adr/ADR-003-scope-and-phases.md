@@ -19,7 +19,7 @@ conformance gates. This repository delivers an honest **partial** slice
    tracked by loop number; the Component Model work is tracked by
    PLAN.md §14 milestone id (M7 slices) — the two counters never
    renumber each other.*
-   *Superseded in part (loops 18–24 + M7 slices 1–5, 2026-10-25): tail calls
+   *Superseded in part (loops 18–24 + M7 slices 1–5 + M8, 2026-10-25): tail calls
    (`return_call`/`return_call_indirect`, constant-stack trampoline),
    exception handling (tags, `try_table`, `throw`, named module
    definition/instance forms), typed function references
@@ -86,9 +86,20 @@ conformance gates. This repository delivers an honest **partial** slice
    binding + nested-type outer threading) is implemented; the
    component lane measures 603 pass / 0 fail / 36 unsupported /
    0 harness-error of 639 — ZERO FAILS; the 36 unsupported are
-   valid binaries awaiting instantiation execution. Still out of
-   scope: instantiation execution + linking, the canonical ABI,
-   resources, async, WIT-level Component/WASI, threads,
+   valid binaries awaiting instantiation execution. M8 (2026-10-25:
+   component instantiation execution — src/component-runtime.lisp,
+   the comp-instance runtime: two-level core-instance linking
+   per Explainer 277-300, component-instance with-args, alias
+   projection, canon lift with the flat canonical call path,
+   start funcs last; wired into the runner through the
+   *component-instantiator* hook with link-error -> :link and
+   wasm-trap -> :execute classification) is implemented; the
+   component lane measures 639 pass / 0 fail / 0 unsupported /
+   0 harness-error of 639 — FULLY GREEN, every row passes.
+   Still out of scope: the non-flat canonical ABI at runtime
+   (strings/lists/records via memory + realloc — the values
+   suite), resource handle runtimes, the linking suite's
+   remaining files, async, WIT-level Component/WASI, threads,
    FASL cache.
    `declared_support` stays `partial`.*
 2. **Failure phases are distinct conditions** (PLAN.md §12.2):

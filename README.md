@@ -37,19 +37,21 @@ calls all pass.
 
 The component lane (`make test-component`, the vendored
 component-model suite at commit `d095e2f60dd...` per
-`specs/lock.toml`) measures M7: **603 pass / 0 fail / 36
-unsupported / 0 harness-error of 639** in {binary,validation} minus
-nyi.txt — ZERO fails: the component TEXT parser (slice 2), the
-crash/shape + version-grammar families (3a), structural
-instantiation type matching (3b), the validator-extension
-families (3c), the parser type-use/bind gaps + core-subtype
-moduletype matching + canon signature checks (slice 4), and the
-outer-alias de Bruijn/transitivity/sort rules, resource
-identity/generativity/canon rules, visibility walks + projection
-chains, annotated resource names, moduletype inner rules, core
-instantiation rules and builtin immediates (slice 5a-5m) are
-implemented; the 36 unsupported are valid binaries awaiting
-instantiation execution (the next milestone frontier).
+`specs/lock.toml`) measures M7-M8: **639 pass / 0 fail / 0
+unsupported / 0 harness-error of 639** in {binary,validation}
+minus nyi.txt — FULLY GREEN: every row passes. The component
+TEXT parser (slice 2), the crash/shape + version-grammar families
+(3a), structural instantiation type matching (3b), the
+validator-extension families (3c), the parser type-use/bind gaps
++ core-subtype moduletype matching + canon signature checks
+(slice 4), the outer-alias de Bruijn/transitivity/sort rules,
+resource identity/generativity/canon rules, visibility walks +
+projection chains, annotated resource names, moduletype inner
+rules, core instantiation rules and builtin immediates (slice
+5a-5m), and component instantiation EXECUTION (M8: the
+comp-instance runtime — two-level core linking, with-args,
+aliases, canon lift with the flat call path, start funcs) are
+implemented.
 See `CONFORMANCE-COMPONENT.md`.
 
 Regenerate with `make report-conformance` (writes `CONFORMANCE.md` +
@@ -100,11 +102,12 @@ harness-errors.
 | API / CLI | `src/api.lisp`, `src/cli.lisp` | `read-module`, `validate-module`, `instantiate`, `invoke`, …; CLI `validate`/`inspect`/`compile`/`run`. |
 | Component | `src/component.lisp` | M7 slices 1–5: layer discrimination (magic + version 0x0D + layer byte), the full component binary reader (all 12 sections, WIT value types incl. map 0x63, aliases, canon incl. all 47 async built-ins, value sections), the validator (labels/index/max-size, canonopt lift/lower + unicity + signature checks, semver/canonical-version grammar, externname visibility + type-use walks, annotated resource names, moduletype internals, structural instantiation type matching with per-component type identities + generativity, core-subtype moduletype matching, the de Bruijn outer-alias stack, resource identity/local/canon rules, projection chains), the `(component ...)` script-command family, `make test-component`. |
 | Component text | `src/component-text.lisp` | M7 slices 2–5: the full component TEXT grammar into the same IR (valtypes, functypes, imports/exports + attributes, canon lift/lower + built-ins upright/inverted, core module via `parse-wat`, core instance, aliases incl. outer-alias sugar + projections + declarator bind-ids + type-use externtypes + the sort-aware binding table + moduletype desc shapes, the named-form `(component definition ...)` marker). |
+| Component runtime | `src/component-runtime.lisp` | M8: component instantiation execution — the comp-instance record (per-sort index vectors in validator order + import/export tables), two-level core-instance linking, component-instance with-args, alias projection (:export/:core-export/:outer), canon lift with the flat canonical call path (numeric prims; non-flat values are the next slice), start funcs last with trap propagation. |
 
-Not implemented (see `PLAN.md` for the full contract): component
-instantiation execution + linking (the 36
-honestly-unsupported binary rows), the
-Canonical ABI, resources, async, WASI (all versions),
+Not implemented (see `PLAN.md` for the full contract): the
+non-flat canonical ABI at runtime (strings/lists/records via
+memory + realloc — the values suite), resource handle runtimes,
+async, the linking suite's remaining files, WASI (all versions),
 threads/atomics, FASL cache, annotations (an unadopted proposal —
 permanently out of scope per PLAN.md §3.3). SIMD (v128 + relaxed,
 loop 24: the full 236-op v128 family + the 20 relaxed ops with
