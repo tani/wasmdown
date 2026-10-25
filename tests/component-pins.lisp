@@ -1156,6 +1156,48 @@ wast runner's string-to-bytes decoder (same grammar as the suite)."
      (wasmdown.component.text::parse-component-text
       "(component (component $P (import \"C1\" (component $C1 (import \"T\" (type $T (sub resource))) (export \"foo\" (func (param \"t\" (own $T)))))) (import \"C2\" (component $C2 (import \"T\" (type $T (sub resource))) (import \"foo\" (func (param \"t\" (own $T)))))) (type $R (resource (rep i32))) (instance $c1 (instantiate $C1 (with \"T\" (type $R)))) (alias export $c1 \"foo\" (func $foo)) (instance $c2 (instantiate $C2 (with \"T\" (type $R)) (with \"foo\" (func $foo))))))"))))
 
+
+(test component/external-visibility-type-pins
+  ;; slice 5g (external-visibility ::37/::41-::44): an instance type's
+  ;; declarators are visibility-checked at the USE site (an unused
+  ;; instance type defines freely — ::35/::40); a COMPONENT type's own
+  ;; import/export declarators are checked EAGERLY at the type's
+  ;; definition. The interned inner space is rebuilt declarator-by-
+  ;; declarator (the new index named on its own side, the index being
+  ;; the pre-push length).
+  (flet ((expect-invalid (src)
+           (block nil
+             (handler-case
+                 (wasmdown.component:validate-component
+                  (wasmdown.component.text::parse-component-text src))
+               (wasmdown:validation-error (c) (return c)))
+             (error "expected wasmdown:validation-error"))))
+    ;; ::37 — an instance type exported with an unnamed record inside
+    (let ((c (expect-invalid
+              "(component (type $I (instance (type $Rec (record (field \"x\" u32))) (type $Rec2 (record (field \"r\" $Rec))) (export \"t\" (type (eq $Rec2))))) (export \"i\" (type $I)))")))
+      (is (search "type not valid to be used as export"
+                  (wasmdown:wasmdown-error-message c))))
+    ;; ::41 — the same shape as an import
+    (let ((c (expect-invalid
+              "(component (type $I (instance (type $Rec (record (field \"x\" u32))) (type $Rec2 (record (field \"r\" $Rec))) (export \"t\" (type (eq $Rec2))))) (import \"i\" (instance (type $I))))")))
+      (is (search "instance not valid to be used as import"
+                  (wasmdown:wasmdown-error-message c))))
+    ;; ::42 — a component type's export references an unnamed record
+    (let ((c (expect-invalid
+              "(component (type (component (type $Rec (record (field \"x\" u32))) (export \"f\" (func (param \"x\" $Rec))))))")))
+      (is (search "func not valid to be used as export"
+                  (wasmdown:wasmdown-error-message c))))
+    ;; ::44 — a component type's import may not see a preceding
+    ;; export's resource
+    (let ((c (expect-invalid
+              "(component (type (component (export \"r\" (type $R (sub resource))) (import \"f\" (func (result (own $R)))))))")))
+      (is (search "func not valid to be used as import"
+                  (wasmdown:wasmdown-error-message c))))
+    ;; ::35/::40 — unused INSTANCE types define freely
+    (wasmdown.component:validate-component
+     (wasmdown.component.text::parse-component-text
+      "(component definition (type (instance (type $Rec (record (field \"x\" u32))) (export \"f\" (func (param \"x\" $Rec))))))"))))
+
 (defun run-component-pins ()
   "Run the component pins (registered via TEST; returns T)."
   (let ((wasmdown.test::*tests*
@@ -1178,6 +1220,7 @@ wast runner's string-to-bytes decoder (same grammar as the suite)."
                       component/instantiate-matching-pins
                       component/core-module-empty-body-pin
                       component/resource-identity-pins
+                      component/external-visibility-type-pins
                       component/moduletype-outer-alias-pins
                       component/outer-alias-debruijn-pins
                       component/externtype-type-use-pins

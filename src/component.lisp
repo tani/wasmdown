@@ -2498,23 +2498,18 @@ type's own declarators stay against STATE, the inner space)."
                 (let ((err (resolve-et inner)))
                   (when err
                     (let ((err2 (resolve-et outer)))
-                      (when err2 (error err2))))))
-               ;; external visibility (slice 3c): an import/export
-               ;; declarator's type references must be named INSIDE
-               ;; THE TYPE's own space — eagerly, whatever the
-               ;; enclosing component does with the type later
-               ;; (external-visibility ::37/::42/::43/::44)
-               (handler-case
-                   (%vis-check-decl inner payload
-                                    (eq (typedecl-kind d) :import)
-                                    (case (car et)
-                                      ((:func :instance) "func")
-                                      ((:type :core-module) "type")
-                                      (t "type")))
-                 (wasmdown:validation-error ()
-                   ;; indices may still resolve in the ENCLOSING space
-                   ;; (the outer fallback above); skip then
-                   nil))
+                      (when err2 (error err2))))
+                  ;; external visibility (slice 3c): an import/export
+                  ;; declarator's type references must be named INSIDE
+                  ;; THE TYPE's own space — but ONLY when the type is
+                  ;; USED as an import/export by the ENCLOSING component
+                  ;; (the walk lives at the outer use site, see the
+                  ;; :import/:export arms; ::35/::40's unused types
+                  ;; define freely). The eager slice-3c check is
+                  ;; swallowed here: the OLD unconditional version
+                  ;; either ate the fixture errors (inner resolve ok)
+                  ;; or fired on unused types (::35/::40).
+                  nil))
                ;; the declarator's NEW type index is named in the
                ;; type's own visibility scope, on its own side
                (setf (gethash (1- (length (cval-types inner)))
@@ -2538,7 +2533,17 @@ type's own declarators stay against STATE, the inner space)."
                              :offset 0)
                     (make-ct :kind :prim
                              :payload :imported-or-exported-type))
-                (cval-types inner))))))))))
+                (cval-types inner)))))))))
+       ;; slice 5g (external-visibility ::42/::43/::44): a COMPONENT
+       ;; TYPE's own export/import declarators must satisfy visibility
+       ;; EAGERLY at the type's definition (instance types check at
+       ;; the USE site — the :import/:export arms; ::35/::40's unused
+       ;; instance types define freely)
+       (when (eq (ct-kind c) :component)
+         (%vis-check-type-use
+          (make-cval :types (vector c))
+          0 :auto nil)))
+
 
 (defun %check-deftype (c state &optional (type-depth 1) (outer state))
   "Dispatch: defined value types get the full check; func/resource
@@ -4510,6 +4515,93 @@ An instance-type's EXPORT declarators pass IMPORT-P NIL."
       (:instance (%vis-check state (cdr et) import-p what))
       (t nil))))
 
+(defun %vis-check-type-use (state typeidx import-p what)
+  "Slice 5g (external-visibility ::37/::41-::44): an instance/component
+TYPE used as an import/export by a concrete component — the type's OWN
+import/export declarators must satisfy visibility INSIDE the type's
+space, checked on the OUTER use's side. The walk rebuilds the type's
+inner space declarator-by-declarator (each declarator's new index named
+on its own side, the index being the pre-push length) and runs each
+declarator's vis check. A COMPONENT type's check also fires EAGERLY at
+the type's own definition (%check-defvaltype); an INSTANCE type checks
+only at the use site (::35/::40's unused instance types define
+freely)."
+  (let ((ct (and (>= typeidx 0)
+                 (< typeidx (length (cval-types state)))
+                 (aref (cval-types state) typeidx))))
+    (when (and (ct-p ct)
+               (member (ct-kind ct) '(:instance :component)))
+      (let ((inner (make-cval
+                    :types (make-array 16 :fill-pointer 0 :adjustable t)
+                    :func-types (make-array 16 :fill-pointer 0
+                                            :adjustable t)
+                    :imports (make-hash-table :test #'equal)
+                    :exports (make-hash-table :test #'equal))))
+        (dolist (d (coerce (ct-payload ct) 'list))
+          (case (typedecl-kind d)
+            ((:type :alias)
+             (vector-push-extend
+              (if (eq (typedecl-kind d) :alias)
+                  (make-ct :kind :prim :payload :outer-aliased
+                           :offset 0)
+                  (typedecl-payload d))
+              (cval-types inner)))
+            ((:import :export)
+             (let* ((pl (typedecl-payload d))
+                    (et (third pl)))
+               ;; the declarator's references must be named in the
+               ;; type's own space, checked on the OUTER use's side
+               ;; (::41's 'instance not valid to be used as import')
+               (let ((*vis-seen* nil))
+                 (declare (special *vis-seen*))
+                 ;; slice 5g: the checked side is the OUTER use's
+                 ;; side (the message: ::41's 'instance not valid to
+                 ;; be used as import'); an INSTANCE type's inner
+                 ;; references accept EITHER side (its own exports
+                 ;; are visible to its own imports — resources
+                 ;; ::27/::28) — the export names are mirrored into
+                 ;; the import table below; a COMPONENT type keeps
+                 ;; the sides strict (::44)
+                 (%vis-check-decl inner pl
+                                  ;; the checked side: the OUTER
+                                  ;; use's; the EAGER component-type
+                                  ;; check (:auto) uses each decl's
+                                  ;; own side
+                                  (if (eq import-p :auto)
+                                      (eq (typedecl-kind d) :import)
+                                      import-p)
+                                  ;; the message's kind: the OUTER
+                                  ;; use's (what) when given — the
+                                  ;; eager component-type check passes
+                                  ;; NIL and names its own inner decls
+                                  (or what
+                                      (case (car et)
+                                        ((:func :instance) "func")
+                                        ((:type :core-module) "type")
+                                        (t "type")))))
+               ;; the NEW index the declarator introduces is named
+               ;; on its own side (the index = the pre-push length)
+               (let ((idx (length (cval-types inner))))
+                 (setf (gethash idx
+                                (if (eq (typedecl-kind d) :import)
+                                    (cval-vis-imports inner)
+                                    (cval-vis-exports inner)))
+                       t)
+                 ;; an INSTANCE type's exports are ALSO visible to
+                 ;; its own imports (::27/::28) — mirror the name
+                 (when (and (eq (typedecl-kind d) :export)
+                            (eq (ct-kind ct) :instance))
+                   (setf (gethash idx (cval-vis-imports inner)) t)))
+               (vector-push-extend
+                (if (and (eq (car et) :type)
+                         (eq (cdr et) :sub-resource))
+                    (make-ct :kind :resource :payload '(0 . nil)
+                             :offset 0)
+                    (make-ct :kind :prim
+                             :payload :imported-or-exported-type))
+                (cval-types inner))))
+            (t nil)))))))
+
 (defun %check-annotated-name (name ft state)
   "The [constructor]/[method]/[static] annotated-name shape rules
 \(annotated-names.wast, Explainer 'Annotated names'): the name must
@@ -5334,10 +5426,22 @@ the number of enclosing component/type scopes (outer aliases)."
                     state)
                    (case (car et)
                      (:func (%vis-check state (cdr et) t "func"))
-                     (:instance (%vis-check state (cdr et) t "instance"))
+                     (:instance
+                      ;; slice 5g (external-visibility ::41/::44):
+                      ;; an instance TYPE used as an import — its
+                      ;; own declarators' references must be named
+                      ;; inside the type
+                      (%vis-check state (cdr et) t "instance")
+                      (%vis-check-type-use state (cdr et) t "instance"))
                      (:type
                       (unless (eq (cdr et) :sub-resource)
-                        (%vis-check state (second (cdr et)) t "type")))
+                        (%vis-check state (second (cdr et)) t "type"))
+                      ;; slice 5g (external-visibility ::43): a
+                      ;; component TYPE used as an import
+                      (when (and (listp (cdr et))
+                                 (eq (car (cdr et)) :eq))
+                        (%vis-check-type-use state (second (cdr et))
+                                             t "type")))
                      (t nil)))
                   ;; imports extend the imported sort's space
                   (case (car (importrec-type payload))
@@ -5468,7 +5572,12 @@ the number of enclosing component/type scopes (outer aliases)."
                                          (aref (cval-instance-types state)
                                                fi)))))
                         (when (integerp it)
-                          (%vis-check state it nil "instance"))
+                          (%vis-check state it nil "instance")
+                          ;; slice 5g (external-visibility ::37):
+                          ;; an instance TYPE used as an export — its
+                          ;; own declarators' references must be named
+                          ;; inside the type
+                          (%vis-check-type-use state it nil "instance"))
                         ;; a synthesized BAG instance: walk its inline
                         ;; exports directly (its instance-type entry
                         ;; carries only (sort . nil) externtypes) —
@@ -5513,7 +5622,12 @@ the number of enclosing component/type scopes (outer aliases)."
                           ;; no ascription: the SORTIDX'd type itself
                           ;; is the export target (::23-::32)
                           (when (< fi (length (cval-types state)))
-                            (%vis-check state fi nil "type"))))))
+                            (%vis-check state fi nil "type")
+                            ;; slice 5g (external-visibility ::37):
+                            ;; an instance/component TYPE exported —
+                            ;; its own declarators' references must
+                            ;; be named inside the type
+                            (%vis-check-type-use state fi nil "type"))))))
                      (t nil)))
                   ;; every export introduces a new index of its sort
                   (case (sortidx-sort (exportrec-sortidx payload))
