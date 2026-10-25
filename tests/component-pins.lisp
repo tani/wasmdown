@@ -1315,6 +1315,39 @@ wast runner's string-to-bytes decoder (same grammar as the suite)."
       (is (search "resource used in function does not have a name in this context"
                   (wasmdown:wasmdown-error-message c))))))
 
+
+(test component/inline-func-shape-pins
+  ;; slice 5l (resources ::39/::40): the parser's inline-functype
+  ;; shape for INVERTED lift forms — the synthesized functype node
+  ;; needs the "func" head (the old form fed %parse-functype the
+  ;; canon keyword) and must EXCLUDE the (export ...)/type/canon
+  ;; nodes; the inline (export "n") marker on a lifted FUNC also
+  ;; emits an :export def (the child's export table must see the
+  ;; func); and an export/alias-introduced type index joins the
+  ;; instantiation-rebuilt child space ((:ref ti) for exports).
+  (flet ((expect-invalid (src)
+           (block nil
+             (handler-case
+                 (wasmdown.component:validate-component
+                  (wasmdown.component.text::parse-component-text src))
+               (wasmdown:validation-error (c) (return c)))
+             (error "expected wasmdown:validation-error"))))
+    ;; ::39's positive: the func-projection chain validates
+    (wasmdown.component:validate-component
+     (wasmdown.component.text::parse-component-text
+      "(component (component $C (type $R (resource (rep i32))) (export $Rp \"r\" (type $R)) (core func $drop (canon resource.drop $R)) (func (export \"f\") (param \"x\" (own $Rp)) (canon lift (core func $drop)))) (instance $c1 (instantiate $C)) (component $D (import \"r\" (type $R (sub resource))) (import \"f\" (func (param \"x\" (own $R))))) (instance (instantiate $D (with \"r\" (type $c1 \"r\")) (with \"f\" (func $c1 \"f\")))))"))
+    ;; ::40's negative: two instantiations carry DISTINCT resources
+    (let ((c (expect-invalid
+              "(component (component $C (type $R (resource (rep i32))) (export $Rp \"r\" (type $R)) (core func $drop (canon resource.drop $R)) (func (export \"f\") (param \"x\" (own $Rp)) (canon lift (core func $drop)))) (instance $c1 (instantiate $C)) (instance $c2 (instantiate $C)) (component $D (import \"r\" (type $R (sub resource))) (import \"f\" (func (param \"x\" (own $R))))) (instance (instantiate $D (with \"r\" (type $c1 \"r\")) (with \"f\" (func $c2 \"f\")))))")))
+      (is (search "resource types are not the same"
+                  (wasmdown:wasmdown-error-message c))))
+    ;; the plain inverted lift WITHOUT an export marker still interns
+    ;; the functype and the memory rule fires first
+    (let ((c (expect-invalid
+              "(component (core module $M (func (export \"f\") (param i32 i32))) (core instance $i (instantiate $M)) (func $f (param \"p\" (list u8)) (canon lift (core func $i \"f\"))))")))
+      (is (search "canonical option `memory` is required"
+                  (wasmdown:wasmdown-error-message c))))))
+
 (defun run-component-pins ()
   "Run the component pins (registered via TEST; returns T)."
   (let ((wasmdown.test::*tests*
@@ -1339,6 +1372,7 @@ wast runner's string-to-bytes decoder (same grammar as the suite)."
                       component/resource-identity-pins
                       component/external-visibility-type-pins
                       component/annotated-name-resource-pins
+                      component/inline-func-shape-pins
                       component/moduletype-outer-alias-pins
                       component/outer-alias-debruijn-pins
                       component/externtype-type-use-pins

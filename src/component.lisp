@@ -4306,6 +4306,29 @@ rejected (instantiation.wast ::57)."
                   (%fresh-resource-id)
                   (cons :ct pl))
               ids))
+            ((:export :alias)
+             ;; slice 5l (resources ::39): exports and aliases also
+             ;; introduce type indices in the rebuilt child space —
+             ;; an export's new index is an alias of its sortidx'd
+             ;; source ((:ref ti), resolving to the source's rebuilt
+             ;; identity); an ascribed (sub resource) export is fresh;
+             ;; an alias is opaque
+             (let ((si (if (eq (compdef-kind d) :export)
+                           (exportrec-sortidx pl)
+                           nil)))
+               (vector-push-extend
+                (cond
+                 ((and (eq (compdef-kind d) :export)
+                       (exportrec-type pl)
+                       (consp (cdr (exportrec-type pl)))
+                       (eq (car (cdr (exportrec-type pl)))
+                           :sub-resource))
+                  (%fresh-resource-id))
+                 ((and (eq (compdef-kind d) :export)
+                       si (eq (sortidx-sort si) :type))
+                  (cons :ref (sortidx-idx si)))
+                 (t '(:opaque)))
+                ids)))
             (:import
              (let* ((et (importrec-type pl))
                     (nm (importrec-name pl))
@@ -5072,11 +5095,40 @@ version tripped the compiler's cross-arm payload type derivation."
                    (eq (ct-kind ent) :instance)
                    ent)))
     (vector-push-extend
-     (and ict
-          (%instance-ct-export-functype
-           (aliasrec-index payload)
-           (aliasrec-name payload)
-           state))
+     (or (and ict
+              (%instance-ct-export-functype
+               (aliasrec-index payload)
+               (aliasrec-name payload)
+               state))
+         ;; slice 5l (resources ::39): an INSTANTIATED source — the
+         ;; child's export table entry (name -> (func . k)) resolves
+         ;; k through the CHILD's stashed func-types space, and the
+         ;; func-arg matching resolves BOTH sides in their own spaces
+         ;; (the CHILD's ids from the stash, the parent's from state)
+         (let* ((src-comp (gethash (aliasrec-index payload)
+                                    *inst-source-comp*))
+                (child-state (and src-comp
+                                  (gethash src-comp
+                                           *comp-state-stash*)))
+                (hit (and (hash-table-p ent)
+                          (gethash (aliasrec-name payload) ent
+                                   :missing))))
+           (when (and child-state
+                      (consp hit)
+                      (eq (car hit) :func)
+                      (integerp (cdr hit)))
+             ;; register the per-instance identity space for the
+             ;; parent-side resolution — the IDS STASH (the
+             ;; instantiation's substitution), NOT the child-state's
+             ;; own ids (a different generative fresh id space)
+             (setf (gethash (1- (cval-funcs state))
+                            *func-arg-ids*)
+                   (gethash (aliasrec-index payload)
+                            *inst-ids-stash*))
+             (and (< (cdr hit)
+                     (length (cval-func-types child-state)))
+                  (aref (cval-func-types child-state)
+                        (cdr hit))))))
      (cval-func-types state))
     (when ict
       (setf (gethash (1- (cval-funcs state))

@@ -2008,20 +2008,41 @@ sugar."
                              (lambda (b)
                                (or (and (%nodep b)
                                         (member (%head-text b)
-                                                '("type" "canon")
+                                                '("type" "canon" "export")
                                                 :test #'string=))
                                    (%tokp b)))
                              rest)))
                       (when sig-nodes
                         (let ((ft-ct (%parse-functype
                                       (list* :list 0 0
-                                             (cons (first
-                                                    (%children canon-node))
+                                             (cons (wasmdown.wast::make-stoken
+                                                    :kind :keyword
+                                                    :text "func"
+                                                    :start 0 :end 4)
                                                    sig-nodes))
                                       scope)))
                           (%intern-valtype scope ft-ct)))))))
         (%flush-interned scope)
         (%push-def :canon canon)
+        ;; slice 5l (resources ::39): the inline (export "n") marker on
+        ;; the FUNC node also emits an :export def — the child's export
+        ;; table (built from :export defs) must see the lifted func
+        (let ((ex (find-if
+                   (lambda (b)
+                     (and (%nodep b)
+                          (string= (%head-text b) "export")))
+                   rest)))
+          (when ex
+            (let* ((ei (rest (%children ex)))
+                   (nm (%string-token (first ei))))
+              (%push-def :export
+                         (make-exportrec
+                          :name nm :attrs nil
+                          ;; the func index the canon below introduces
+                          ;; (the parser's n-func is pre-alloc here)
+                          :sortidx (cons :func
+                                         (ct-scope-n-func scope))
+                          :offset 0)))))
         (%alloc scope :func id)))))
 
 ;;; ---- (instance ...) definitions ----
