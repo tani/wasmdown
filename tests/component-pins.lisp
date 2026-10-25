@@ -1148,7 +1148,13 @@ wast runner's string-to-bytes decoder (same grammar as the suite)."
     (let ((c (expect-invalid
               "(component definition (type $I (instance (export \"r\" (type $r (sub resource))) (export \"f\" (func (result (own $r)))))) (import \"i1\" (instance $i1 (type $I))) (import \"i2\" (instance $i2 (type $I))) (component $C (import \"r\" (type $r (sub resource))) (import \"f\" (func (result (own $r))))) (instance (instantiate $C (with \"r\" (type $i1 \"r\")) (with \"f\" (func $i2 \"f\")))))")))
       (is (search "resource types are not the same"
-                  (wasmdown:wasmdown-error-message c))))))
+                  (wasmdown:wasmdown-error-message c))))
+    ;; slice 5f (resources ::43): an IMPORTED component target's
+    ;; exports read from the import's ascribed component type — the
+    ;; (alias export $c1 "foo" (func $foo)) projection resolves
+    (wasmdown.component:validate-component
+     (wasmdown.component.text::parse-component-text
+      "(component (component $P (import \"C1\" (component $C1 (import \"T\" (type $T (sub resource))) (export \"foo\" (func (param \"t\" (own $T)))))) (import \"C2\" (component $C2 (import \"T\" (type $T (sub resource))) (import \"foo\" (func (param \"t\" (own $T)))))) (type $R (resource (rep i32))) (instance $c1 (instantiate $C1 (with \"T\" (type $R)))) (alias export $c1 \"foo\" (func $foo)) (instance $c2 (instantiate $C2 (with \"T\" (type $R)) (with \"foo\" (func $foo))))))"))))
 
 (defun run-component-pins ()
   "Run the component pins (registered via TEST; returns T)."

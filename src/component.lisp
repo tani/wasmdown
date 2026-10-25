@@ -4934,8 +4934,49 @@ the number of enclosing component/type scopes (outer aliases)."
                      (let ((tab (make-hash-table :test #'equal))
                            (tc (%component-at comp
                                               (instrec-index payload))))
-                       ;; an IMPORTED component target has no locally
-                       ;; visible defs — its exports stay unknown
+                       ;; slice 5f (resources ::43): an IMPORTED
+                       ;; component target's exports read from the
+                       ;; import's ascribed COMPONENT TYPE (the ct in
+                       ;; THIS scope's type space) — the import occupies
+                       ;; the component index space (Binary.md: imports
+                       ;; extend their sort's space)
+                       (unless tc
+                         (let ((ict (loop with n = -1
+                                          for x across (comp-defs comp)
+                                          do (case (compdef-kind x)
+                                               (:component (incf n))
+                                               (:import
+                                                (when (eq (car (importrec-type
+                                                                (compdef-payload x)))
+                                                          :component)
+                                                  (incf n)
+                                                  (when (= n (instrec-index
+                                                              payload))
+                                                    (let ((k (cdr (importrec-type
+                                                                   (compdef-payload
+                                                                    x)))))
+                                                      (return (and (< k (length
+                                                                          (cval-types
+                                                                           state)))
+                                                                   (aref (cval-types
+                                                                          state)
+                                                                         k)))))))
+                                               (t nil))
+                                          finally (return nil))))
+                           (when (and ict (ct-p ict)
+                                      (eq (ct-kind ict) :component))
+                             (dolist (dc (coerce (ct-payload ict) 'list))
+                               (when (eq (typedecl-kind dc) :export)
+                                 (let* ((pl (typedecl-payload dc))
+                                        (nm (first pl))
+                                        (et (third pl)))
+                                   (setf (gethash nm tab)
+                                         (cons (car et)
+                                               (if (and (consp et)
+                                                        (eq (car et)
+                                                            :type))
+                                                   nm
+                                                   (cdr et))))))))))
                        (when tc
                          (dolist (dc (coerce (comp-defs tc) 'list))
                            (when (eq (compdef-kind dc) :export)
