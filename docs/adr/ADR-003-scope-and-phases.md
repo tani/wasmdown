@@ -19,7 +19,7 @@ conformance gates. This repository delivers an honest **partial** slice
    tracked by loop number; the Component Model work is tracked by
    PLAN.md §14 milestone id (M7 slices) — the two counters never
    renumber each other.*
-   *Superseded in part (loops 18–24 + M7 slices 1–2, 2026-10-25): tail calls
+   *Superseded in part (loops 18–24 + M7 slices 1–3, 2026-10-25): tail calls
    (`return_call`/`return_call_indirect`, constant-stack trampoline),
    exception handling (tags, `try_table`, `throw`, named module
    definition/instance forms), typed function references
@@ -50,11 +50,22 @@ conformance gates. This repository delivers an honest **partial** slice
    grammar, imported/exported type placeholders, outer-alias
    count+target validation, nested-component recursion) is
    implemented; the component lane measures 305 pass / 280 fail /
-   38 unsupported / 16 harness-error of 639. Still out of scope:
-   the validator-extension families (instantiation arg/type
-   matching, version-suffix semver, external-visibility,
-   annotated-name shapes), instantiation/linking, the canonical
-   ABI, resources, async, WIT-level Component/WASI, threads,
+   38 unsupported / 16 harness-error of 639. M7 slice 3
+   (2026-10-25: the crash/shape families — the with-arg projection
+   disambiguation, moduletype externtype interning, inverted-canon
+   targets, elem-size alignment fixes; the semver/canonical-version
+   grammar per Explainer 2787-3001 + upstream wasmparser; the
+   declarator inner-first outer-fallback resolution; structural
+   instantiation type matching with per-component type identities
+   (fresh/ref/ct/opaque + with-arg substitution); and the
+   validator-extension families — externname visibility,
+   annotated-name shapes, canonopt unicity, moduletype internals)
+   is implemented; the component lane measures 492 pass / 110
+   fail / 37 unsupported / 0 harness-error of 639. Still out of
+   scope: the parser-side type-use/bind gaps, core-subtype
+   moduletype matching, canon core-functype signature checks,
+   instantiation execution + linking, the canonical ABI,
+   resources, async, WIT-level Component/WASI, threads,
    FASL cache.
    `declared_support` stays `partial`.*
 2. **Failure phases are distinct conditions** (PLAN.md §12.2):
