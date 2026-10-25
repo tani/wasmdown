@@ -1257,6 +1257,64 @@ wast runner's string-to-bytes decoder (same grammar as the suite)."
       (is (search "instance not valid to be used as export"
                   (wasmdown:wasmdown-error-message c)))))
 
+
+(test component/annotated-name-resource-pins
+  ;; slice 5k (annotated-names ::0/::4/::18/::26/::28/::31/::32): the
+  ;; resource-NAME resolution for [constructor]/[method]/[static] —
+  ;; the annotation's resource prefix must match the NAME of the
+  ;; referenced resource on the CHECKED SIDE (import/export
+  ;; namespaces disjoint); a WRAPPED constructor result
+  ;; (result (own $T) ...) is legal (::0); a local resource def has
+  ;; no name (::32); [static] only needs a KNOWN name (::26).
+  (flet ((expect-invalid (src)
+           (block nil
+             (handler-case
+                 (wasmdown.component:validate-component
+                  (wasmdown.component.text::parse-component-text src))
+               (wasmdown:validation-error (c) (return c)))
+             (error "expected wasmdown:validation-error"))))
+    ;; ::0 — the wrapped constructor results are LEGAL
+    (wasmdown.component:validate-component
+     (wasmdown.component.text::parse-component-text
+      "(component definition (import \"a\" (type $a (sub resource))) (import \"[constructor]a\" (func (result (own $a)))) (import \"b\" (type $b (sub resource))) (import \"[constructor]b\" (func (result (result (own $b) (error string))))) (import \"d\" (type $d (sub resource))) (import \"[constructor]d\" (func (param \"x\" u32) (result (own $d)))))"))
+    ;; ::4 — the imported resource is named `b`, not `a`
+    (let ((c (expect-invalid
+              "(component (import \"b\" (type $a (sub resource))) (import \"[constructor]a\" (func (result (own $a)))))")))
+      (is (search "function does not match expected resource name `b`"
+                  (wasmdown:wasmdown-error-message c))))
+    ;; ::18 — [method]'s self-borrow resource is named `b`, not `a`
+    (let ((c (expect-invalid
+              "(component (import \"b\" (type $T (sub resource))) (import \"[method]a.b\" (func (param \"self\" (borrow $T)))))")))
+      (is (search "method does not match expected resource name `b`"
+                  (wasmdown:wasmdown-error-message c))))
+    ;; ::26 — [static] with no named resource in scope
+    (let ((c (expect-invalid
+              "(component (import \"[static]a.b\" (func)))")))
+      (is (search "static resource name is not known in this context"
+                  (wasmdown:wasmdown-error-message c))))
+    ;; ::28 — an EXPORT-side [method] needs the resource (re-)exported
+    (let ((c (expect-invalid
+              "(component (import \"b\" (type $T (sub resource))) (import \"f\" (func $f (param \"self\" (borrow $T)))) (export \"[method]b.foo\" (func $f)))")))
+      (is (search "resource used in function does not have a name in this context"
+                  (wasmdown:wasmdown-error-message c))))
+    ;; ::31 — the same shape inside a component TYPE's import
+    (let ((c (expect-invalid
+              "(component (type (component (import \"b\" (type $T (sub resource))) (import \"[constructor]a\" (func (result (own $T)))))))")))
+      (is (search "function does not match expected resource name `b`"
+                  (wasmdown:wasmdown-error-message c))))
+    ;; ::32 — a BAG export's [constructor] with a local resource def
+    (let ((c (expect-invalid
+              "(component
+    (type $T (resource (rep i32)))
+    (core module $m (func (export \"a\") (result i32) unreachable))
+    (core instance $i (instantiate $m))
+    (func $f (result (own $T)) (canon lift (core func $i \"a\")))
+    (instance
+      (export \"a\" (type $T))
+      (export \"[constructor]a\" (func $f))))")))
+      (is (search "resource used in function does not have a name in this context"
+                  (wasmdown:wasmdown-error-message c))))))
+
 (defun run-component-pins ()
   "Run the component pins (registered via TEST; returns T)."
   (let ((wasmdown.test::*tests*
@@ -1280,6 +1338,7 @@ wast runner's string-to-bytes decoder (same grammar as the suite)."
                       component/core-module-empty-body-pin
                       component/resource-identity-pins
                       component/external-visibility-type-pins
+                      component/annotated-name-resource-pins
                       component/moduletype-outer-alias-pins
                       component/outer-alias-debruijn-pins
                       component/externtype-type-use-pins

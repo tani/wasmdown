@@ -2511,12 +2511,28 @@ type's own declarators stay against STATE, the inner space)."
                   ;; or fired on unused types (::35/::40).
                   nil))
                ;; the declarator's NEW type index is named in the
-               ;; type's own visibility scope, on its own side
-               (setf (gethash (1- (length (cval-types inner)))
+               ;; type's own visibility scope, on its own side -- the
+               ;; VALUE is the EXTERNNAME (slice 5k: the
+               ;; annotated-name resource rules read it inside types;
+               ;; the pre-push length IS the index the declarator's
+               ;; ct is about to occupy)
+               (setf (gethash (length (cval-types inner))
                               (if (eq (typedecl-kind d) :import)
                                   (cval-vis-imports inner)
                                   (cval-vis-exports inner)))
-                     t)
+                     name)
+               ;; slice 5k (annotated-names ::31): the [constructor]/
+               ;; [method]/[static] resource-NAME rules inside
+               ;; component/instance TYPE declarators -- AFTER the
+               ;; import's own name registration
+               (when (eq (typedecl-kind d) :import)
+                 (%check-annotated-name
+                  name
+                  (and (eq (car et) :func)
+                       (integerp (cdr et))
+                       (handler-case (%ct-at inner (cdr et))
+                         (wasmdown:validation-error () nil)))
+                  inner t))
                ;; BOTH imports and exports introduce a new type index
                ;; (Binary.md line 274: exportdecl introduces a new
                ;; index; importdecls occupy their position in the
@@ -4688,7 +4704,78 @@ freely)."
                 (cval-types inner))))
             (t nil)))))))
 
-(defun %check-annotated-name (name ft state)
+
+(defun %ann-resource-check (name ann body ft state &optional import-p)
+  "Slice 5k (annotated-names ::4/::18/::26/::28/::31/::32): the
+resource-NAME rules for [constructor]/[method]/[static] names. The
+annotation's resource prefix (the label before the first dot) must
+match the NAME of the resource type the function's type references —
+[constructor]: the own-result's resource; [method]: the self-borrow's
+resource. The name comes from the import/export that INTRODUCED the
+resource ON THE CHECKED SIDE (the import/export namespaces are
+disjoint: an export-side annotated name requires the resource itself
+to be (re-)exported — ::28; IMPORT-P defaults to the import side).
+A resource with NO name on the checked side (a local definition:
+::32, or an import-named resource used in an export: ::28) is
+rejected. [static] only requires the prefix to be KNOWN (::26)."
+  (declare (ignore name))
+  (let ((d (position #\. body))
+        (expect-name nil))
+    (setf expect-name (if d (subseq body 0 d) body))
+    (cond
+     ;; [static]: the prefix must be a KNOWN resource name (::26)
+     ((string= ann "static")
+      (let ((known nil))
+        (loop for v being the hash-values of (cval-vis-imports state)
+              do (when (and (stringp v) (string= v expect-name))
+                   (setf known t)))
+        (loop for v being the hash-values of (cval-vis-exports state)
+              do (when (and (stringp v) (string= v expect-name))
+                   (setf known t)))
+        (unless known
+          (%verr "static resource name is not known in this context"))))
+     ;; [constructor]/[method]: resolve the referenced resource's idx
+     ((member ann '("constructor" "method") :test #'string=)
+      (let ((ridx (%ann-referenced-resource ann ft state)))
+        (when ridx
+          (let ((got (if import-p
+                         (gethash ridx (cval-vis-imports state))
+                         (gethash ridx (cval-vis-exports state)))))
+            (cond
+             ((and got (not (string= got expect-name)))
+              (if (string= ann "constructor")
+                  (%verr "function does not match expected resource name `~a`"
+                         got)
+                  (%verr "method does not match expected resource name `~a`"
+                         got)))
+             ((null got)
+              (%verr "resource used in function does not have a name in this context")))))))
+     (t nil))))
+
+(defun %ann-referenced-resource (ann ft state)
+  "The typeidx of the resource the annotated function's type
+references: [constructor] = the own-result's target; [method] = the
+self-borrow's target. NIL when the shape does not reference a
+resource."
+  (when (and ft (ct-functype-p ft))
+    (cond
+     ((string= ann "constructor")
+      (let ((results (second (ct-payload ft))))
+        (when (and (consp results) (eq (car results) :idx))
+          (let ((rt (%ct-at state (cdr results))))
+            (when (eq (ct-kind rt) :own)
+              (ct-payload rt))))))
+     ((string= ann "method")
+      (let ((params (first (ct-payload ft))))
+        (when (plusp (length params))
+          (let ((vt (cdr (aref params 0))))
+            (when (and (consp vt) (eq (car vt) :idx))
+              (let ((bt (%ct-at state (cdr vt))))
+                (when (eq (ct-kind bt) :borrow)
+                  (ct-payload bt))))))))
+     (t nil))))
+
+(defun %check-annotated-name (name ft state &optional import-p)
   "The [constructor]/[method]/[static] annotated-name shape rules
 \(annotated-names.wast, Explainer 'Annotated names'): the name must
 refer to a FUNCTION whose type matches the annotation. FT is the
@@ -4701,6 +4788,9 @@ type is unresolvable). The grammar checks (dot, kebab) live in
     (unless close (return-from %check-annotated-name))
     (let* ((ann (subseq name 1 close))
            (body (subseq name (1+ close))))
+      ;; slice 5k: the resource-NAME rules (separate flat helpers: the
+      ;; inline nested version repeatedly tripped paren-balance)
+      (%ann-resource-check name ann body ft state import-p)
       (case (intern (string-upcase ann) :keyword)
         (:constructor
          (unless (and ft (ct-functype-p ft))
@@ -4710,6 +4800,19 @@ type is unresolvable). The grammar checks (dot, kebab) live in
              (cond
               ((null results)
                (%verr "should return one value"))
+              ;; slice 5k (::0): a WRAPPED result — the functype's
+              ;; single result is a :result ct whose ok arm references
+              ;; an (own $T) — is the legal (result (own $T) ...)
+              ;; shape
+              ((and (consp results) (eq (car results) :idx)
+                    (eq (ct-kind (%ct-at state (cdr results)))
+                        :result)
+                    (let ((ok (car (ct-payload
+                                    (%ct-at state (cdr results))))))
+                      (and (consp ok) (eq (car ok) :idx)
+                           (eq (ct-kind (%ct-at state (cdr ok)))
+                               :own))))
+               nil)
               ((not (and (consp results) (eq (car results) :idx)))
                ;; a single non-index result is a prim — the allowed
                ;; shape is exactly (own $T)
@@ -5223,7 +5326,21 @@ the number of enclosing component/type scopes (outer aliases)."
                                   :core-types (cval-core-types state)
                                   :func-types (cval-func-types state)
                                   :exports table)
-                                 nil)))
+                                 nil)
+                                ;; slice 5k (annotated-names ::32): the
+                                ;; [constructor]/[method]/[static]
+                                ;; rules for BAG exports — the resource
+                                ;; must be named in THIS scope (a bag-
+                                ;; local resource def has no name)
+                                (when (and (eq sort :func)
+                                           (< (sortidx-idx (cdr pair))
+                                              (length (cval-func-types
+                                                       state))))
+                                  (%check-annotated-name
+                                   name
+                                   (aref (cval-func-types state)
+                                         (sortidx-idx (cdr pair)))
+                                   state nil))))
                      ;; slice 3b+4: a synthesized bag instance carries
                      ;; a HASH export table (name -> (sort . idx)) —
                      ;; %instance-export-sort reads either shape; the
@@ -5522,7 +5639,7 @@ the number of enclosing component/type scopes (outer aliases)."
                          (integerp (cdr et))
                         (handler-case (%ct-at state (cdr et))
                           (wasmdown:validation-error () nil)))
-                    state)
+                    state t)
                    (case (car et)
                      (:func (%vis-check state (cdr et) t "func"))
                      (:instance
@@ -5706,7 +5823,7 @@ the number of enclosing component/type scopes (outer aliases)."
                           (integer (handler-case (%ct-at state ft)
                                      (wasmdown:validation-error () nil)))
                           (t (if (ct-p ft) ft nil)))
-                       state)
+                       state nil)
                        ;; FT is a type index (ascription) or the
                        ;; functype ct itself (the func's own type)
                         (when ft (%vis-check state ft nil "func"))))
