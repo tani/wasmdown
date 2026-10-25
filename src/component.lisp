@@ -4094,6 +4094,47 @@ unknown (NIL)."
                                 (cdr hit)))))
             (cond
              ((hash-table-p sub) sub)
+             ;; slice 5j (external-visibility ::50): the projection of
+             ;; an INSTANTIATED source's named export — the entry idx
+             ;; indexes the CHILD's space; resolve the sub-instance's
+             ;; own table through the CHILD's stashed state
+             ((and (gethash src-idx *inst-source-comp*)
+                   (integerp (cdr hit))
+                   (let* ((child-comp (gethash src-idx
+                                               *inst-source-comp*))
+                          (child-state (and child-comp
+                                            (gethash child-comp
+                                                     *comp-state-stash*))))
+                     (and child-state
+                          (< (cdr hit)
+                             (length (cval-instance-types
+                                      child-state)))
+                          (let ((sub-ent (aref (cval-instance-types
+                                                child-state)
+                                               (cdr hit))))
+                            (when (hash-table-p sub-ent)
+                              ;; re-index the sub-table's entries into
+                              ;; THIS scope's projection: keep the
+                              ;; child-side indices (the consumers of
+                              ;; the projected table resolve them
+                              ;; through the child state)
+                              (let ((tab (make-hash-table :test #'equal)))
+                                (loop for k2 being the hash-keys of sub-ent
+                                      using (hash-value v2)
+                                      do (setf (gethash k2 tab) v2))
+                                tab))))))
+              (let* ((child-comp (gethash src-idx
+                                          *inst-source-comp*))
+                     (child-state (and child-comp
+                                       (gethash child-comp
+                                                *comp-state-stash*)))
+                     (sub-ent (aref (cval-instance-types child-state)
+                                    (cdr hit)))
+                     (tab (make-hash-table :test #'equal)))
+                (loop for k2 being the hash-keys of sub-ent
+                      using (hash-value v2)
+                      do (setf (gethash k2 tab) v2))
+                tab))
              ;; an IMPORTED instance's exports do not survive
              ;; projection out of the defining component — the
              ;; aliased instance's table is unknown (ev ::61's
@@ -5309,6 +5350,19 @@ the number of enclosing component/type scopes (outer aliases)."
                                 (%instance-table-projection
                                  payload state)
                                 (cval-instance-types state))
+                              ;; slice 5j (external-visibility ::50):
+                              ;; the projected instance's SOURCE is
+                              ;; the ALIAS's source instance —
+                              ;; propagate the source-comp record so
+                              ;; the parent's vis walk resolves the
+                              ;; projected entries through the child
+                              (let ((src (gethash (aliasrec-index payload)
+                                                  *inst-source-comp*)))
+                                (when src
+                                  (setf (gethash (1- (cval-instances
+                                                      state))
+                                                 *inst-source-comp*)
+                                        src)))
                               ;; visibility chain: an instance aliased
                               ;; out of a VISIBLE instance is visible
                               (when (and (eq (aliasrec-kind payload)
@@ -5672,6 +5726,57 @@ the number of enclosing component/type scopes (outer aliases)."
                           ;; own declarators' references must be named
                           ;; inside the type
                           (%vis-check-type-use state it nil "instance"))
+                        ;; slice 5j (external-visibility ::50): a
+                        ;; PROJECTED instance (an alias-export chain's
+                        ;; hash table) — walk each FUNC entry's shape
+                        ;; with the PARENT's named-sets: the entry's
+                        ;; index resolves through the SOURCE's space
+                        ;; (the CHILD's stashed state for an
+                        ;; instantiated source), the nameability is
+                        ;; judged in THIS scope
+                        (when (hash-table-p it)
+                          (let* ((src-comp (gethash fi
+                                                    *inst-source-comp*))
+                                 (child-state (and src-comp
+                                                   (gethash src-comp
+                                                            *comp-state-stash*))))
+                            (loop for nm being the hash-keys of it
+                                  using (hash-value hit)
+                                  do (when (and (consp hit)
+                                                (eq (car hit) :func)
+                                                (integerp (cdr hit)))
+                                       (let* ((k (cdr hit))
+                                              (ft (if child-state
+                                                      (and (< k (length
+                                                                (cval-func-types
+                                                                 child-state)))
+                                                           (aref (cval-func-types
+                                                                  child-state)
+                                                                 k))
+                                                      (and (< k (length
+                                                                (cval-func-types
+                                                                 state)))
+                                                           (aref (cval-func-types
+                                                                  state)
+                                                                 k)))))
+                                         (when (and ft (ct-p ft))
+                                           ;; a HYBRID state: the CHILD's
+                                           ;; types (shape resolution)
+                                           ;; with the PARENT's vis
+                                           ;; tables (nameability)
+                                           (%vis-check
+                                            (if child-state
+                                                (make-cval
+                                                 :types (cval-types
+                                                         child-state)
+                                                 :func-types (cval-func-types
+                                                              child-state)
+                                                 :vis-imports (cval-vis-imports
+                                                               state)
+                                                 :vis-exports (cval-vis-exports
+                                                               state))
+                                                state)
+                                            ft nil "instance")))))))
                         ;; a synthesized BAG instance: walk its inline
                         ;; exports directly (its instance-type entry
                         ;; carries only (sort . nil) externtypes) —

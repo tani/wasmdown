@@ -1231,7 +1231,31 @@ wast runner's string-to-bytes decoder (same grammar as the suite)."
                (en (or (nth 58 cmds) (length txt)))
                (src2 (subseq txt st en)))
           (wasmdown.component:validate-component
-           (wasmdown.component.text::parse-component-text src2)))))))
+           (wasmdown.component.text::parse-component-text src2))))))
+    ;; slice 5j (external-visibility ::50): a PROJECTED instance's
+    ;; func types walk with the PARENT's named-sets — the child's
+    ;; bag func references a record named only INSIDE the child; the
+    ;; parent's re-export of the projected instance rejects it
+    (let ((c (block nil
+               (handler-case
+                   (wasmdown.component:validate-component
+                    (wasmdown.component.text::parse-component-text
+                     "(component
+    (component $A
+      (core module $m (func (export \"f\") (result i32) unreachable))
+      (core instance $i (instantiate $m))
+      (type $Rec (record (field \"x\" u32)))
+      (export $Rec' \"t\" (type $Rec))
+      (func $f (result $Rec') (canon lift (core func $i \"f\")))
+      (instance $bag (export \"f\" (func $f)))
+      (export \"i\" (instance $bag)))
+    (instance $a (instantiate $A))
+    ;; only \"i\" is re-exported here, not the record type \"t\" behind it
+    (export \"i2\" (instance $a \"i\")))"))
+                 (wasmdown:validation-error (c) (return c)))
+               (error "expected error"))))
+      (is (search "instance not valid to be used as export"
+                  (wasmdown:wasmdown-error-message c)))))
 
 (defun run-component-pins ()
   "Run the component pins (registered via TEST; returns T)."
