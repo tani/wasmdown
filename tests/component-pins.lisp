@@ -313,8 +313,21 @@ wast runner's string-to-bytes decoder (same grammar as the suite)."
                 " (core module $m (func (export \"f\") (result i32) unreachable))"
                 " (core instance $i (instantiate $m))"
                 " (type $V (variant (case \"a\") (case \"b\")))"
-                " (func $f (result $V) (canon lift (core func $i \"f\")))"
-                " (export \"f\" (func $f)))"))
+                " (func $f (result $V) (canon lift (core func $i \"f\"))))"))
+    ;; the same variant EXPORTED is invalid per the external-
+    ;; visibility rule (external-visibility.wast ::13: an unnamed
+    ;; variant used in an exported func) — the pin guards against
+    ;; regressing the rule away
+    (let ((c (expect-invalid
+              (lambda ()
+                (parse-ok (concatenate 'string "(component"
+                            " (core module $m (func (export \"f\") (result i32) unreachable))"
+                            " (core instance $i (instantiate $m))"
+                            " (type $V (variant (case \"a\") (case \"b\")))"
+                            " (func $f (result $V) (canon lift (core func $i \"f\")))"
+                            " (export \"f\" (func $f)))"))))))
+      (is (search "func not valid to be used as export"
+                  (wasmdown:wasmdown-error-message c))))
     ;; a NONEMPTY variant still elem-sizes (ma > 1 path)
     (parse-ok (concatenate 'string "(component"
                 " (core module $m (func (export \"f\") (result i32) unreachable))"
@@ -406,12 +419,14 @@ wast runner's string-to-bytes decoder (same grammar as the suite)."
                    (wasmdown.component.text::parse-component-text src))))))
         (is (search "conflicts with previous name"
                     (wasmdown:wasmdown-error-message c)))))
-    ;; the control: a genuinely distinct second label stays OK
+    ;; the control: a genuinely distinct second label stays OK (the
+    ;; [method] shape needs a first `self` (borrow $T) param —
+    ;; kebab.wast ::35's form)
     (wasmdown.component:validate-component
      (wasmdown.component.text::parse-component-text
       (concatenate 'string "(component"
-        " (import \"foo-bar\" (type (sub resource)))"
-        " (import \"[method]foo-bar.bazbar\" (func)))")))))
+        " (import \"foo-bar\" (type $t (sub resource)))"
+        " (import \"[method]foo-bar.bazbar\" (func (param \"self\" (borrow $t)))))")))))
 
 (test component/version-grammar-pins
   (flet ((expect-invalid (thunk)
@@ -509,6 +524,242 @@ wast runner's string-to-bytes decoder (same grammar as the suite)."
     ;; sequence [type, import, type] — inner-first, outer-fallback
     (is (valid "(component (type (component (type (instance)) (import \"a\" (type (eq 0))) (type (func)) (export \"b\" (func (type 2))))))"))))
 
+(test component/fixed-list-alignment-pins
+  ;; CanonicalABI.md alignment_list: a FIXED list aligns as its
+  ;; element type, only a variable list aligns as a pointer.
+  ;; max-value-size.wast ::0's tuple — 268435454*1 then +1 — must
+  ;; total 268435455 < 2^28 (the ptr alignment computed 2^28+1 and
+  ;; wrongly tripped 'exceeds maximum byte size' before this rule).
+  (flet ((expect-invalid (thunk)
+           (block nil
+             (handler-case (funcall thunk)
+               (wasmdown:validation-error (c) (return c)))
+             (error "expected wasmdown:validation-error")))
+         (valid (src)
+           (wasmdown.component:validate-component
+            (wasmdown.component.text::parse-component-text src))))
+    ;; ::0's over-limit twin rows stay invalid at the same message
+    (let ((c (expect-invalid
+              (lambda ()
+                (valid "(component (type (tuple (list u8 268435455) (list u8 1))))")))))
+      (is (search "exceeds maximum byte size"
+                  (wasmdown:wasmdown-error-message c))))
+    ;; ...and the just-under row is valid (fixed-list align 1)
+    (is (valid "(component (type (tuple (list u8 268435454) (list u8 1))))"))))
+
+(test component/canonopt-unicity-pins
+  (flet ((expect-invalid (thunk)
+           (block nil
+             (handler-case (funcall thunk)
+               (wasmdown:validation-error (c) (return c)))
+             (error "expected wasmdown:validation-error")))
+         (valid (src)
+           (wasmdown.component:validate-component
+            (wasmdown.component.text::parse-component-text src))))
+    ;; memory specified twice (abi.wast ::14)
+    (let ((c (expect-invalid
+              (lambda ()
+                (valid "(component (import \"f\" (func $f)) (core func $f' (canon lower (func $f) (memory 0) (memory 0))))")))))
+      (is (search "`memory` is specified more than once"
+                  (wasmdown:wasmdown-error-message c))))
+    ;; realloc specified twice (abi.wast ::15)
+    (let ((c (expect-invalid
+              (lambda ()
+                (valid (concatenate 'string "(component"
+                            " (core module $M (memory (export \"mem\") 1)"
+                            " (func (export \"f\") (param i32 i32))"
+                            " (func (export \"realloc\") (param i32 i32 i32 i32) (result i32) unreachable))"
+                            " (core instance $i (instantiate $M))"
+                            " (func $f (param \"p\" (list u8))"
+                            " (canon lift (core func $i \"f\")"
+                            " (memory (core memory $i \"mem\"))"
+                            " (realloc (core func $i \"realloc\"))"
+                            " (realloc (core func $i \"realloc\")))))"))))))
+      (is (search "canonical option `realloc` is specified more than once"
+                  (wasmdown:wasmdown-error-message c))))
+    ;; memory index out of bounds (abi.wast ::3)
+    (let ((c (expect-invalid
+              (lambda ()
+                (valid "(component (import \"f\" (func $f)) (core func $f' (canon lower (func $f) (memory 5))))")))))
+      (is (search "memory index out of bounds"
+                  (wasmdown:wasmdown-error-message c))))
+    ;; post-return cannot be specified for lowerings (abi.wast ::19)
+    (let ((c (expect-invalid
+              (lambda ()
+                (valid (concatenate 'string "(component"
+                            " (import \"f\" (func $f (param \"p\" string)))"
+                            " (core module $M (memory (export \"mem\") 1)"
+                            " (func (export \"realloc\") (param i32 i32 i32 i32) (result i32) unreachable)"
+                            " (func (export \"post\") (param i32)))"
+                            " (core instance $i (instantiate $M))"
+                            " (core func $f' (canon lower (func $f)"
+                            " (memory (core memory $i \"mem\"))"
+                            " (realloc (core func $i \"realloc\"))"
+                            " (post-return (core func $i \"post\")))))"))))))
+      (is (search "cannot be specified for lowerings"
+                  (wasmdown:wasmdown-error-message c))))))
+
+(test component/core-module-rule-pins
+  (flet ((expect-invalid (thunk)
+           (block nil
+             (handler-case (funcall thunk)
+               (wasmdown:validation-error (c) (return c)))
+             (error "expected wasmdown:validation-error")))
+         (valid (src)
+           (wasmdown.component:validate-component
+            (wasmdown.component.text::parse-component-text src))))
+    ;; the embedded core module's CODE is core-validated inside a
+    ;; component (core-modules.wast ::1)
+    (let ((c (expect-invalid
+              (lambda ()
+                (valid "(component (core module (func i32.add)))")))))
+      (is (search "operand stack underflow"
+                  (wasmdown:wasmdown-error-message c))))
+    ;; mangled two-level import names are unique (::7/::8)
+    (let ((c (expect-invalid
+              (lambda ()
+                (valid "(component (core module (import \"\" \"a\" (func)) (import \"\" \"a\" (func))))")))))
+      (is (search "duplicate import name `:a`"
+                  (wasmdown:wasmdown-error-message c))))
+    ;; moduletype internals: duplicate export names (::3)
+    (let ((c (expect-invalid
+              (lambda ()
+                (valid "(component (core type (module (export \"a\" (func)) (export \"a\" (func)))))")))))
+      (is (search "export name `a` already defined"
+                  (wasmdown:wasmdown-error-message c))))
+    ;; moduletype memory limits (::4)
+    (let ((c (expect-invalid
+              (lambda ()
+                (valid "(component (core type (module (import \"\" \"\" (memory 70000)))))")))))
+      (is (search "memory size must be at most 65536"
+                  (wasmdown:wasmdown-error-message c))))
+    ;; moduletype duplicate mangled import names (::9/::10)
+    (let ((c (expect-invalid
+              (lambda ()
+                (valid "(component (core type (module (import \"\" \"\" (func)) (import \"\" \"\" (func)))))")))))
+      (is (search "duplicate import name `:`"
+                  (wasmdown:wasmdown-error-message c))))))
+
+(test component/annotated-name-shape-pins
+  (flet ((expect-invalid (thunk)
+           (block nil
+             (handler-case (funcall thunk)
+               (wasmdown:validation-error (c) (return c)))
+             (error "expected wasmdown:validation-error")))
+         (valid (src)
+           (wasmdown.component:validate-component
+            (wasmdown.component.text::parse-component-text src))))
+    ;; [constructor] must return exactly (own $T)
+    (let ((c (expect-invalid
+              (lambda ()
+                (valid "(component (import \"[constructor]a\" (func)))")))))
+      (is (search "should return one value"
+                  (wasmdown:wasmdown-error-message c))))
+    (let ((c (expect-invalid
+              (lambda ()
+                (valid "(component (import \"[constructor]a\" (func (result u32))))")))))
+      (is (search "should return `(own $T)`"
+                  (wasmdown:wasmdown-error-message c))))
+    ;; [method] needs a first `self` (borrow $T) param
+    (let ((c (expect-invalid
+              (lambda ()
+                (valid "(component (import \"[method]a.b\" (func (param \"x\" u32))))")))))
+      (is (search "should have a first argument called `self`"
+                  (wasmdown:wasmdown-error-message c))))
+    (let ((c (expect-invalid
+              (lambda ()
+                (valid "(component (import \"[method]a.b\" (func (param \"self\" u32))))")))))
+      (is (search "should take a first argument of `(borrow $T)`"
+                  (wasmdown:wasmdown-error-message c))))
+    ;; the positives (annotated-names ::0/::8/::19)
+    (is (valid (concatenate 'string "(component"
+                " (import \"a\" (type $a (sub resource)))"
+                " (import \"[constructor]a\" (func (result (own $a)))))")))
+    (is (valid (concatenate 'string "(component"
+                " (import \"a\" (type $T (sub resource)))"
+                " (import \"[method]a.b\" (func (param \"self\" (borrow $T)))))")))
+    (is (valid (concatenate 'string "(component"
+                " (import \"a\" (type (sub resource)))"
+                " (import \"[static]a.b\" (func (param \"x\" u32) (result string))))")))))
+
+(test component/instantiate-matching-pins
+  (flet ((expect-invalid (thunk)
+           (block nil
+             (handler-case (funcall thunk)
+               (wasmdown:validation-error (c) (return c)))
+             (error "expected wasmdown:validation-error")))
+         (valid (src)
+           (wasmdown.component:validate-component
+            (wasmdown.component.text::parse-component-text src))))
+    ;; prim mismatch through an (eq i) import (instantiation.wast ::1)
+    (let ((c (expect-invalid
+              (lambda ()
+                (valid (concatenate 'string "(component"
+                  " (component $c"
+                  "   (type $t (tuple u32 u32))"
+                  "   (import \"x\" (type (eq $t))))"
+                  " (type $x (tuple string string))"
+                  " (instance (instantiate $c (with \"x\" (type $x)))))"))))))
+      (is (search "expected primitive `u32` found primitive `string`"
+                  (wasmdown:wasmdown-error-message c))))
+    ;; record field mismatch (instantiation.wast ::5)
+    (let ((c (expect-invalid
+              (lambda ()
+                (valid (concatenate 'string "(component"
+                  " (component $c"
+                  "   (type $f (option s32))"
+                  "   (type $t (record (field \"x\" $f)))"
+                  "   (import \"x\" (type (eq $t))))"
+                  " (type $x (record (field \"x\" u32)))"
+                  " (instance (instantiate $c (with \"x\" (type $x)))))"))))))
+      (is (search "type mismatch in record field `x`"
+                  (wasmdown:wasmdown-error-message c))))
+    ;; variant case mismatch (instantiation.wast ::12)
+    (let ((c (expect-invalid
+              (lambda ()
+                (valid (concatenate 'string "(component"
+                  " (component $c"
+                  "   (type $t (variant (case \"x\" u32)))"
+                  "   (import \"x\" (type (eq $t))))"
+                  " (type $x (variant (case \"x\" s32)))"
+                  " (instance (instantiate $c (with \"x\" (type $x)))))"))))))
+      (is (search "type mismatch in variant case `x`"
+                  (wasmdown:wasmdown-error-message c))))
+    ;; eq-substitution resource identity (resources.wast ::0): the
+    ;; (eq $a) import's argument must be the SAME resource as $a's
+    (let ((c (expect-invalid
+              (lambda ()
+                (valid (concatenate 'string "(component"
+                  " (import \"T1\" (type $T1 (sub resource)))"
+                  " (import \"T2\" (type $T2 (sub resource)))"
+                  " (component $eq"
+                  "   (import \"a\" (type $a (sub resource)))"
+                  "   (import \"b\" (type (eq $a))))"
+                  " (instance (instantiate $eq"
+                  "   (with \"a\" (type $T1))"
+                  "   (with \"b\" (type $T2)))))"))))))
+      (is (search "resource types are not the same"
+                  (wasmdown:wasmdown-error-message c))))
+    ;; positive: a matching with-arg instantiation validates
+    (is (valid (concatenate 'string "(component"
+                " (import \"T1\" (type $T1 (sub resource)))"
+                " (component $eq"
+                "   (import \"a\" (type $a (sub resource)))"
+                "   (import \"b\" (type (eq $a))))"
+                " (instance (instantiate $eq"
+                "   (with \"a\" (type $T1))"
+                "   (with \"b\" (type $T1)))))")))
+    ;; func parameter-name mismatch (instantiation.wast ::27)
+    (let ((c (expect-invalid
+              (lambda ()
+                (valid (concatenate 'string "(component"
+                  " (import \"f\" (func $f (param \"x\" u32)))"
+                  " (component $c (import \"f\" (func (param \"y\" u32))))"
+                  " (instance (instantiate $c (with \"f\" (func $f)))))"))))))
+      (is (search "expected parameter named `y`, found `x`"
+                  (wasmdown:wasmdown-error-message c))))))
+
+
 (defun run-component-pins ()
   "Run the component pins (registered via TEST; returns T)."
   (let ((wasmdown.test::*tests*
@@ -523,7 +774,12 @@ wast runner's string-to-bytes decoder (same grammar as the suite)."
                       component/externname-grammar-pins
                       component/shape-family-pins
                       component/kebab-fold-pins
-                      component/version-grammar-pins)))
+                      component/version-grammar-pins
+                      component/fixed-list-alignment-pins
+                      component/canonopt-unicity-pins
+                      component/core-module-rule-pins
+                      component/annotated-name-shape-pins
+                      component/instantiate-matching-pins)))
           wasmdown.test::*tests*)))
     (multiple-value-bind (passed failed)
         (wasmdown.test:run-all-tests)

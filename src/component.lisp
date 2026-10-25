@@ -1636,6 +1636,30 @@ declaration order) + the outer scope stack."
   ;; (outer-aliased or forward-referenced) — the canon lower rules
   ;; skip a nil entry.
   (func-types #() :type vector)
+  ;; M7 slice 3b: the TYPE IDENTITY vector parallel to TYPES — one
+  ;; entry per type index: (:fresh . id) a resource identity, (:ref
+  ;; . idx) an eq-reference, (:ct . ct) concrete, (:opaque)
+  ;; unresolvable. Built by validate-component's def loop; the
+  ;; instantiation matcher (%ty-*) reads it.
+  (type-ids #() :type vector)
+  ;; M7 slice 3b: per-instance TYPE entries (an instance ct or NIL)
+  ;; parallel to the instance index space — with-arg matching reads
+  ;; the argument's exports from it.
+  (instance-types #() :type vector)
+  ;; M7 slice 3c: externally-visible type NAMES (Explainer.md
+  ;; 'external-visibility-of-types'): the set of type indices intro-
+  ;; duced by a type import/export. An import's type references must
+  ;; be import-named only ('imported types cannot transitively refer
+  ;; to the external names of exported types'); an export's may use
+  ;; either set. The typeidx PASSED INTO a type export is not retro-
+  ;; actively named — only the NEW index is (external-visibility
+  ;; ::0/::2).
+  (vis-imports (make-hash-table) :type hash-table)
+  (vis-exports (make-hash-table) :type hash-table)
+  ;; ...and the set of EXPORTED instance indices: an alias export of
+  ;; a type confers a name only when its SOURCE instance is itself
+  ;; externally visible (external-visibility ::46/::48/::49)
+  (vis-inst (make-hash-table) :type hash-table)
   (exports '())                           ; (name kind) records seen
   (imports '()))
 
@@ -1703,8 +1727,18 @@ variant arms reuse elem-size's alignment recursion)."
          ((:s32 :u32 :f32 :char :error-context) 4)
          ((:s64 :u64 :f64) 8)
          (:string (%ptr-size-i64))
+         ;; opaque validator markers (imported/exported/outer-aliased
+         ;; types) have no runtime shape in this slice; size them as
+         ;; a word so elem-size never trips 'bad primitive' on them
+         ((:imported :exported :outer-aliased
+           :imported-or-exported-type) 4)
          (t (%verr "bad primitive"))))
-      (:list (%ptr-size-i64))
+      ;; alignment_list (CanonicalABI.md): a FIXED list aligns as its
+      ;; element type; only the variable list aligns as a pointer.
+      (:list
+       (if (cdr (ct-payload c))
+           (%valtype-align (car (ct-payload c)) state)
+           (%ptr-size-i64)))
       (:record
        (or (loop for (nil . fvt) across (ct-payload c)
                  maximize (%valtype-align fvt state))
@@ -1743,6 +1777,9 @@ not < 2^28 (Binary.md lines 295-297; max-value-size.wast)."
                       ((:s32 :u32 :f32 :char :error-context) 4)
                       ((:s64 :u64 :f64) 8)
                       (:string (* 2 (%ptr-size-i64)))
+                     ;; opaque markers: word-sized (see %valtype-align)
+                     ((:imported :exported :outer-aliased
+                       :imported-or-exported-type) 4)
                       (t (%verr "bad primitive"))))
                    (:list
                     (let ((elem (car (ct-payload c)))
@@ -2358,14 +2395,37 @@ type's own declarators stay against STATE, the inner space)."
                          (wasmdown:validation-error () nil))))
                 (unless (resolve-et inner)
                   (resolve-et outer)))
-              ;; BOTH imports and exports introduce a new type index
-              ;; (Binary.md line 274: exportdecl introduces a new
-              ;; index; importdecls occupy their position in the
-              ;; declarator sequence — fixture ::827-840's exportdecl
-              ;; references index 2 = [type, import, type])
-              (vector-push-extend
-               (make-ct :kind :prim :payload :imported-or-exported-type)
-               (cval-types inner))))))))))
+               ;; external visibility (slice 3c): an import/export
+               ;; declarator's type references must be named INSIDE
+               ;; THE TYPE's own space — eagerly, whatever the
+               ;; enclosing component does with the type later
+               ;; (external-visibility ::37/::42/::43/::44)
+               (handler-case
+                   (%vis-check-decl inner payload
+                                    (eq (typedecl-kind d) :import)
+                                    (case (car et)
+                                      ((:func :instance) "func")
+                                      ((:type :core-module) "type")
+                                      (t "type")))
+                 (wasmdown:validation-error ()
+                   ;; indices may still resolve in the ENCLOSING space
+                   ;; (the outer fallback above); skip then
+                   nil))
+               ;; the declarator's NEW type index is named in the
+               ;; type's own visibility scope, on its own side
+               (setf (gethash (1- (length (cval-types inner)))
+                              (if (eq (typedecl-kind d) :import)
+                                  (cval-vis-imports inner)
+                                  (cval-vis-exports inner)))
+                     t)
+               ;; BOTH imports and exports introduce a new type index
+               ;; (Binary.md line 274: exportdecl introduces a new
+               ;; index; importdecls occupy their position in the
+               ;; declarator sequence — fixture ::827-840's exportdecl
+               ;; references index 2 = [type, import, type])
+               (vector-push-extend
+                (make-ct :kind :prim :payload :imported-or-exported-type)
+                (cval-types inner))))))))))
 
 (defun %check-deftype (c state &optional (type-depth 1) (outer state))
   "Dispatch: defined value types get the full check; func/resource
@@ -2524,6 +2584,32 @@ task-return shapes are a later slice."
     ;; canonopt: realloc implies memory (abi.wast pins the message)
     (when (and realloc (not mem))
       (%verr "canonical option `realloc` requires `memory` to also be specified"))
+   ;; UNICITY: memory/realloc/post-return each at most once
+   ;; (abi.wast ::14/::15/::16)
+   (let ((mem-n (count :memory opts :key #'car))
+         (realloc-n (count :realloc opts :key #'car))
+         (post-n (count :post-return opts :key #'car)))
+     (when (> mem-n 1)
+       (%verr "`memory` is specified more than once"))
+     (when (> realloc-n 1)
+       (%verr "canonical option `realloc` is specified more than once"))
+     (when (> post-n 1)
+       (%verr "canonical option `post-return` is specified more than once")))
+   ;; the option INDEX immediates are bounds-checked against the
+   ;; core spaces (abi.wast ::3 'memory index out of bounds'; the
+   ;; realloc/post-return indices reuse the core-func space)
+   (dolist (o opts)
+     (case (car o)
+       (:memory
+        (when (>= (second o) (cval-core-memories state))
+          (%verr "memory index out of bounds")))
+       ((:realloc :post-return)
+        (when (>= (second o) (cval-core-funcs state))
+          (%verr "core function index out of bounds")))
+       (t nil)))
+   ;; post-return is only valid when LIFTING (abi.wast ::19)
+   (when (and (%opt opts :post-return) (eq context :lower))
+     (%verr "canonical option `post-return` cannot be specified for lowerings"))
     (when ft
       (let* ((params (first (ct-payload ft)))
              (results (second (ct-payload ft))))
@@ -2573,6 +2659,770 @@ task-return shapes are a later slice."
               (:lower (unless mem
                         (%verr "canonical option `memory` is required"))))))))))
 
+;;; ---------------------------------------------------------------
+;;; Structural type matching at instantiation (M7 slice 3b).
+;;; Explainer 'Type Checking': each with-argument must structurally
+;;; match the target component's import type, the child's typevar
+;;; imports substituted by the arguments' identities. Resource
+;;; identities (own/borrow) are the only nominal leaf.
+
+(defvar *resource-id-counter* 0
+  "M7 slice 3b: the fresh-resource identity counter. Each generative
+resource (a resource definition, a (sub resource) import/export, an
+exported alias of an instantiated instance's resource) receives a
+unique id; the counter never resets, so identities from earlier
+validate-component walks can never equal later ones.")
+
+(defun %fresh-resource-id ()
+  (cons :fresh (incf *resource-id-counter*)))
+(defun %ty-resolve (ty ids &optional (depth 0))
+  "Follow :ref chains to a canonical identity. Returns the resolved
+identity; a chain longer than 64 hops or an out-of-bounds reference
+resolves to :ty-bad (the callers report 'type mismatch')."
+  (if (>= depth 64)
+      :ty-bad
+      (cond
+       ((eq ty :ty-bad) :ty-bad)
+       ((and (consp ty) (eq (car ty) :ref))
+        (let ((i (cdr ty)))
+          (if (or (null ids) (>= i (length ids)) (< i 0))
+              :ty-bad
+              (%ty-resolve (aref ids i) ids (1+ depth)))))
+       (t ty))))
+(defun %ty-valtype (vt ids sub)
+  "Normalize one VALTYPE (a (:idx . n) cons, a prim keyword or a ct)
+to an identity: index references pull the identity vector entry and
+apply one substitution step (a :fresh typevar becomes SUB's binding);
+prim keywords wrap as concrete ct. SUB is an alist mapping fresh-id
+-> identity (the with-args substitution)."
+  (cond
+   ((and (consp vt) (eq (car vt) :idx))
+    (let ((i (cdr vt)))
+      (if (or (null ids) (>= i (length ids)))
+          :ty-bad
+          (let ((ty (aref ids i)))
+            (if (and (consp ty) (eq (car ty) :fresh) sub)
+                (or (cdr (assoc (cdr ty) sub :test #'eql)) ty)
+                ty)))))
+   ((ct-p vt) (cons :ct vt))
+   ((keywordp vt) (cons :ct (make-ct :kind :prim :payload vt :offset 0)))
+   (t :ty-bad)))
+(defun %ty-kind-of (ty)
+  "The dispatch key of a canonical identity."
+  (cond
+   ((eq ty :ty-bad) :bad)
+   ((and (consp ty) (eq (car ty) :fresh)) :resource)
+   ;; an aliased exported resource (:inst-export instance source)
+   ;; compares by identity — dispatch it to the resource arm
+   ((and (consp ty) (eq (car ty) :inst-export)) :resource)
+   ((and (consp ty) (eq (car ty) :ct)) (ct-kind (cdr ty)))
+   ((and (consp ty) (eq (car ty) :opaque)) :opaque)
+   (t :other)))
+(defun %ty-match (w g ids-w sub-w ids-g sub-g)
+  "Match two NORMALIZED identities structurally, recursing through
+valtype references in each side's own space. SUB-W/SUB-G substitute
+each side's :fresh typevars. Message shapes are the instantiation.wast
+fixtures' contract."
+  (let ((kw (%ty-kind-of w)) (kg (%ty-kind-of g)))
+    (cond
+     ;; resource identity: the nominal leaf (:fresh ids compare by eql;
+     ;; :inst-export (instance source) pairs by equal — slice 3b)
+     ((and (eq kw :resource) (eq kg :resource))
+      (unless (if (or (eq (car w) :inst-export)
+                      (eq (car g) :inst-export))
+                  (equal w g)
+                  (eql (cdr w) (cdr g)))
+        (%verr "resource types are not the same")))
+     ;; prim vs prim: name equality
+     ((and (eq kw :prim) (eq kg :prim))
+      (unless (eq (ct-payload (cdr w)) (ct-payload (cdr g)))
+        (%verr "expected primitive `~a` found primitive `~a`"
+               (string-downcase (string (ct-payload (cdr w))))
+               (string-downcase (string (ct-payload (cdr g)))))))
+     ;; compound-vs-prim / prim-vs-compound
+     ((and (eq kw :prim)
+           (member kg '(:record :variant :list :tuple :flags :enum
+                        :option :result :own :borrow)))
+      (%verr "expected primitive, found ~a"
+             (string-downcase (string kg))))
+     ((and (member kw '(:record :variant :list :tuple :flags :enum
+                        :option :result :own :borrow))
+           (eq kg :prim))
+      (%verr "expected ~a, found ~a"
+             (string-downcase (string kw))
+             (string-downcase (string (ct-payload (cdr g))))))
+     ;; own-vs-borrow mismatch
+     ((and (member kw '(:own :borrow)) (member kg '(:own :borrow))
+           (not (eq kw kg)))
+      (%verr "expected ~a, found ~a"
+             (string-downcase (string kw))
+             (string-downcase (string kg))))
+     ((not (eq kw kg))
+      (%verr "expected ~a, found ~a"
+             (string-downcase (string kw))
+             (string-downcase (string kg))))
+     (t
+      (case kw
+        (:record
+         (let ((fw (ct-payload (cdr w))) (fg (ct-payload (cdr g))))
+           (unless (= (length fw) (length fg))
+             (%verr "expected ~d fields, found ~d"
+                    (length fw) (length fg)))
+           (loop for a across fw
+                 for b across fg
+                 do (unless (string= (car a) (car b))
+                      (%verr "expected field name `~a`, found `~a`"
+                             (car a) (car b)))
+                    (handler-case
+                        (%ty-match-valtype (cdr a) (cdr b)
+                                           ids-w sub-w ids-g sub-g)
+                      (wasmdown:validation-error ()
+                        (%verr "type mismatch in record field `~a`" (car a)))))))
+        (:variant
+         (let ((cw (ct-payload (cdr w))) (cg (ct-payload (cdr g))))
+           (unless (= (length cw) (length cg))
+             (%verr "expected ~d cases, found ~d"
+                    (length cw) (length cg)))
+           (loop for a across cw
+                 for b across cg
+                 do (unless (string= (car a) (car b))
+                      (%verr "expected case named `~a`, found `~a`"
+                             (car a) (car b)))
+                    (cond
+                     ((and (cdr a) (not (cdr b)))
+                      (%verr "expected case `~a` to have a type, found none"
+                             (car a)))
+                     ((and (not (cdr a)) (cdr b))
+                      (%verr "expected case `~a` to have no type" (car a)))
+                     ((and (cdr a) (cdr b))
+                      (handler-case
+                          (%ty-match-valtype (cdr a) (cdr b)
+                                             ids-w sub-w ids-g sub-g)
+                        (wasmdown:validation-error ()
+                          (%verr "type mismatch in variant case `~a`" (car a)))))))))
+        (:tuple
+         (let ((tw (ct-payload (cdr w))) (tg (ct-payload (cdr g))))
+           (unless (= (length tw) (length tg))
+             (%verr "expected ~d types, found ~d"
+                    (length tw) (length tg)))
+           (loop for a across tw
+                 for b across tg
+                 for i from 0
+                 do (handler-case
+                        (%ty-match-valtype a b ids-w sub-w ids-g sub-g)
+                      ;; a prim-vs-prim element mismatch reports the
+                      ;; primitive message DIRECTLY (instantiation.wast
+                      ;; ::1's 'expected primitive `u32` found primitive
+                      ;; `string`' from inside a tuple); every other
+                      ;; mismatch gets the positional wrapper (::14's
+                      ;; 'type mismatch in tuple field 0')
+                      (wasmdown:validation-error (c)
+                        (let ((msg (wasmdown:wasmdown-error-message c)))
+                        (if (and (search "expected primitive" msg)
+                                  (search "found primitive" msg))
+                            (%verr "~a" msg)
+                            (%verr "type mismatch in tuple field ~d" i))))))))
+        (:flags
+         (let ((lw (ct-payload (cdr w))) (lg (ct-payload (cdr g))))
+           (unless (and (= (length lw) (length lg))
+                        (loop for a across lw
+                              for b across lg
+                              always (string= a b)))
+             (%verr "mismatch in flags elements"))))
+        (:enum
+         (let ((lw (ct-payload (cdr w))) (lg (ct-payload (cdr g))))
+           (unless (and (= (length lw) (length lg))
+                        (loop for a across lw
+                              for b across lg
+                              always (string= a b)))
+             (%verr "mismatch in enum elements"))))
+        (:list
+         (%ty-match-valtype (car (ct-payload (cdr w)))
+                            (car (ct-payload (cdr g)))
+                            ids-w sub-w ids-g sub-g))
+        (:option
+         (%ty-match-valtype (ct-payload (cdr w)) (ct-payload (cdr g))
+                            ids-w sub-w ids-g sub-g))
+        (:result
+         (let ((ow (car (ct-payload (cdr w))))
+               (og (car (ct-payload (cdr g))))
+               (ew (cdr (ct-payload (cdr w))))
+               (eg (cdr (ct-payload (cdr g)))))
+           (cond
+            ((and ow (not og))
+             (%verr "expected ok type, but found none"))
+            ((and (not ow) og)
+             (%verr "expected ok type to not be present"))
+            ((and ow og)
+             (handler-case
+                 (%ty-match-valtype ow og ids-w sub-w ids-g sub-g)
+               (wasmdown:validation-error ()
+                 (%verr "type mismatch in ok variant")))))
+           (cond
+            ((and ew (not eg))
+             (%verr "expected err type, but found none"))
+            ((and (not ew) eg)
+             (%verr "expected err type to not be present"))
+            ((and ew eg)
+             (handler-case
+                 (%ty-match-valtype ew eg ids-w sub-w ids-g sub-g)
+               (wasmdown:validation-error ()
+                 (%verr "type mismatch in err variant")))))))
+        ((:own :borrow)
+         (let ((rw (%ty-resolve-idx (ct-payload (cdr w)) ids-w))
+               (rg (%ty-resolve-idx (ct-payload (cdr g)) ids-g)))
+           (unless (and (consp rw) (consp rg)
+                        (cond
+                         ((or (eq (car rw) :inst-export)
+                              (eq (car rg) :inst-export))
+                          ;; aliased exported resources compare by their
+                          ;; (instance, source) pair (slice 3b ::41)
+                          (and (eq (car rw) :inst-export)
+                               (eq (car rg) :inst-export)
+                               (equal rw rg)))
+                         (t (and (eq (car rw) :fresh)
+                                 (eq (car rg) :fresh)
+                                 (eql (cdr rw) (cdr rg))))))
+             (%verr "resource types are not the same"))))
+        (t nil))))))
+(defun %ty-resolve-idx (i ids)
+  "A type index to a canonical identity (fresh vars pass through)."
+  (if (or (null ids) (>= i (length ids)) (< i 0))
+      :ty-bad
+      (let ((ty (aref ids i)))
+        (if (and (consp ty) (eq (car ty) :fresh))
+            ty
+            (%ty-resolve ty ids)))))
+(defun %ty-match-valtype (vw vg ids-w sub-w ids-g sub-g)
+  "Match two RAW valtypes ((:idx . n) | prim | ct): normalize each in
+its own space, then match."
+  (let ((w (%ty-resolve (%ty-valtype vw ids-w sub-w) ids-w))
+        (g (%ty-resolve (%ty-valtype vg ids-g sub-g) ids-g)))
+    (when (or (eq w :ty-bad) (eq g :ty-bad))
+      (%verr "type mismatch"))
+    (%ty-match w g ids-w sub-w ids-g sub-g)))
+(defun %match-func-arg (arg-si child-ft ids state)
+  "A func import's check: the CHILD's functype (rebuilt in the child
+space, its typevar refs substituted by the with-args) matched against
+the PARENT func's actual functype (cval-func-types). The fixture
+messages (instantiation.wast ::24-::28)."
+  (let* ((pidx (sortidx-idx arg-si))
+         (parent-ft (and (< pidx (length (cval-func-types state)))
+                         (aref (cval-func-types state) pidx))))
+    (unless (and parent-ft (ct-functype-p parent-ft))
+      (return-from %match-func-arg))
+    (unless (and child-ft (ct-functype-p child-ft))
+      (return-from %match-func-arg))
+    (let* ((cw (first (ct-payload child-ft)))
+           (rw (second (ct-payload child-ft)))
+           (cg (first (ct-payload parent-ft)))
+           (rg (second (ct-payload parent-ft))))
+      (unless (= (length cw) (length cg))
+        (%verr "expected ~d parameters, found ~d"
+               (length cw) (length cg)))
+      (loop for a across cw
+            for b across cg
+            do (unless (string= (car a) (car b))
+                 (%verr "expected parameter named `~a`, found `~a`"
+                        (car a) (car b)))
+               (handler-case
+                   (%ty-match-valtype (cdr a) (cdr b)
+                                     ids nil
+                                     (cval-type-ids state) nil)
+                 (wasmdown:validation-error ()
+                   (%verr "type mismatch in function parameter `~a`" (car a)))))
+      (cond
+       ((and rw (not rg))
+        (%verr "expected a result, found none"))
+       ((and (not rw) rg)
+        (%verr "expected no result, but found one"))
+       ((and rw rg)
+        (handler-case
+            (%ty-match-valtype rw rg ids nil (cval-type-ids state) nil)
+          (wasmdown:validation-error ()
+            (%verr "type mismatch with result type"))))))))
+(defun %parent-identity (si state)
+  "The PARENT-space identity of a with-argument sortidx (a :type
+argument; NIL when unresolvable)."
+  (when (and (consp si) (eq (sortidx-sort si) :type))
+    (let ((i (sortidx-idx si)))
+      (when (and (< i (length (cval-type-ids state)))
+                 (consp (aref (cval-type-ids state) i)))
+        (aref (cval-type-ids state) i)))))
+
+(defun %component-at (comp cidx)
+  "The cidx'th :component definition's nested comp (slice 3b)."
+  (let ((seen 0))
+    (loop for d across (comp-defs comp)
+          when (eq (compdef-kind d) :component)
+            do (cond ((= seen cidx)
+                      (return (compdef-payload d)))
+                     (t (incf seen)))
+          finally (return nil))))
+
+(defun %instance-export-sort (inst-idx name state)
+  "The SORT of instance INST-IDX's export NAME (slice 3b): the
+per-instance type table entry is a HASH name -> (sort . source-idx)
+(built by the :instance/:import arms) or an instance ct (an import's
+type) whose export declarators name each export's sort. Returns
+(values sort known-p)."
+  (let ((ent (and (< inst-idx (length (cval-instance-types state)))
+                  (aref (cval-instance-types state) inst-idx))))
+    (typecase ent
+      (hash-table
+       (let ((hit (gethash name ent :missing)))
+         (if (eq hit :missing)
+             (values nil nil)
+             (values (if (consp hit) (car hit) hit) t))))
+      (ct
+       (if (eq (ct-kind ent) :instance)
+           (loop for td across (ct-payload ent)
+                 when (and (eq (typedecl-kind td) :export)
+                           (string= (first (typedecl-payload td)) name))
+                   return (values (car (third (typedecl-payload td))) t)
+                 finally (return (values nil nil)))
+           (values nil nil)))
+      (t (values nil nil)))))
+
+(defun %instance-export-identity (inst-idx name state)
+  "The TYPE IDENTITY of an instance's exported TYPE (slice 3b): for a
+table entry (sort . source-idx) the identity is (:inst-export
+inst-idx . source-idx) — equal exactly when two aliases project the
+SAME source type of the SAME instance (resources.wast ::41's r1/r2
+re-exports of one typeidx share it); a ct-typed entry (an imported
+instance) has no locally-known source — NIL (the caller falls back
+to a fresh resource id)."
+  (let ((ent (and (< inst-idx (length (cval-instance-types state)))
+                  (aref (cval-instance-types state) inst-idx))))
+    (when (hash-table-p ent)
+      (let ((hit (gethash name ent :missing)))
+        (when (and (consp hit)
+                   (eq (car hit) :type))
+          (if (integerp (cdr hit))
+              ;; a source-idx: identity = (instance, source)
+              (list :inst-export inst-idx (cdr hit))
+              ;; an ascribed (sub resource) export: fresh per NAME
+              (list :inst-export inst-idx name)))))))
+
+(defun %match-instantiation-arg (name sort et arg-si import-idx
+                                 ids state)
+  "Match ONE import against its argument (sort + type checks)."
+  (declare (ignore name))
+  (let ((psort (sortidx-sort arg-si)))
+    (unless (eq psort sort)
+      (%verr "expected ~a, found ~a"
+             (string-downcase (string sort))
+             (string-downcase (string psort))))
+    (case sort
+      (:type
+       (cond
+        ((and (listp et) (eq (car et) :eq))
+         (let ((actual (%parent-identity arg-si state)))
+           (%ty-match-import-bound (second et) actual ids
+                                   (cval-type-ids state))))
+        ((eq et :sub-resource)
+         (let ((a (%parent-identity arg-si state)))
+           (unless (or (and (consp a) (eq (car a) :fresh))
+                       (and (consp a) (eq (car a) :ref))
+                       ;; an aliased exported resource carries an
+                       ;; :inst-export identity (slice 3b) — still a
+                       ;; resource (::41's (with "a" (type $r1)))
+                       (and (consp a) (eq (car a) :inst-export)))
+             (%verr "expected resource, found defined type"))))
+        (t nil)))
+      (t nil))))
+
+
+
+(defun %ty-match-import-bound (bound-idx actual ids parent-ids)
+  "The (eq i) import's check: the child's BOUND type (at BOUND-IDX in
+the child's rebuilt space) matched structurally against the argument's
+ACTUAL identity (parent space)."
+  (let ((want (if (and ids (< bound-idx (length ids)))
+                  (aref ids bound-idx)
+                  :ty-bad)))
+    (when (eq want :ty-bad) (return-from %ty-match-import-bound))
+    (let ((w (%ty-resolve want ids))
+          (g (if (and (consp actual) (eq (car actual) :ref))
+                 (%ty-resolve actual parent-ids)
+                 actual)))
+      (unless (or (eq w :ty-bad) (eq g :ty-bad) (null g))
+        (%ty-match w g ids nil parent-ids nil)))))
+(defun %check-instantiate-args (inst comp state)
+  "The instantiation-time type checks (instantiation.wast): every
+import of the target component is checked, in the child's declaration
+order, against the matching (with ...) argument. The child's type space
+is rebuilt by walking its defs: each (sub resource) type import is a
+TYPEVAR bound to its argument's identity (the parent's substitution);
+each (eq i) import follows the child's chain; resource DEFINITIONS are
+fresh (per-instantiation generativity). Duplicate argument names are
+rejected (instantiation.wast ::57)."
+  (let* ((defs (coerce (comp-defs comp) 'list))
+         (cidx (instrec-index inst))
+         (args (instrec-args inst))
+         (target nil)
+         (seen 0))
+    ;; duplicate argument names (instantiation.wast ::57:
+    ;; 'instantiation argument `a` conflicts with previous argument `a`')
+    (let ((names '()))
+      (loop for (nm . nil) across args
+            do (when (member nm names :test #'string=)
+                 (%verr "instantiation argument `~a` conflicts with previous argument `~a`"
+                        nm nm))
+               (push nm names)))
+  (let* ((defs (coerce (comp-defs comp) 'list))
+         (cidx (instrec-index inst))
+         (args (instrec-args inst))
+         (target nil)
+         (seen 0))
+    (dolist (d defs)
+      (when (eq (compdef-kind d) :component)
+        (when (= seen cidx)
+          (setf target (compdef-payload d))
+          (return))
+        (incf seen)))
+    (unless target
+      (return-from %check-instantiate-args))
+    (let ((ctypes (make-array 16 :fill-pointer 0 :adjustable t))
+          (ids (make-array 16 :fill-pointer 0 :adjustable t))
+          (imports '())
+          (func-imports '())
+          (func-types (make-array 16 :fill-pointer 0 :adjustable t)))
+      (dolist (d (coerce (comp-defs target) 'list))
+        (let ((pl (compdef-payload d)))
+          (case (compdef-kind d)
+            (:type
+             (vector-push-extend pl ctypes)
+             (vector-push-extend
+              (if (ct-resourcetype-p pl)
+                  (%fresh-resource-id)
+                  (cons :ct pl))
+              ids))
+            (:import
+             (let* ((et (importrec-type pl))
+                    (nm (importrec-name pl))
+                    (arg-si (cdr (assoc nm (coerce args 'list)
+                                          :test #'string=))))
+               (push (list nm (car et) (cdr et) arg-si
+                           (length ctypes))
+                     imports)
+               (case (car et)
+                 (:type
+                  (vector-push-extend
+                   (if (eq (cdr et) :sub-resource)
+                       (make-ct :kind :resource :payload '(0 . nil)
+                                :offset 0)
+                       (make-ct :kind :prim :payload :imported
+                                :offset 0))
+                   ctypes)
+                  (vector-push-extend
+                   (cond
+                    ((eq (cdr et) :sub-resource)
+                     (or (%parent-identity arg-si state)
+                         (%fresh-resource-id)))
+                    ((and (listp (cdr et))
+                          (eq (car (cdr et)) :eq))
+                     (cons :ref (second (cdr et))))
+                    (t '(:opaque)))
+                   ids))
+                 (:func
+                  (vector-push-extend
+                   (and (< (cdr et) (length ctypes))
+                        (aref ctypes (cdr et)))
+                   func-types)
+                  (push (list nm (cdr et) (length func-types))
+                        func-imports))
+                 (:instance
+                  ;; the child's instance-type import: match the
+                  ;; argument's exports export-by-export by name +
+                  ;; sort (instantiation.wast ::30 'type mismatch in
+                  ;; instance export `a`'; extra exports allowed)
+                  (when arg-si
+                    (let ((want (and (< (cdr et) (length ctypes))
+                                     (aref ctypes (cdr et)))))
+                      (when (and want (ct-p want)
+                                 (eq (ct-kind want) :instance))
+                        (dolist (td (coerce (ct-payload want) 'list))
+                          (when (eq (typedecl-kind td) :export)
+                            (let* ((pl (typedecl-payload td))
+                                   (ename (first pl))
+                                   (eet (third pl)))
+                              (multiple-value-bind (got-sort)
+                                  (%instance-export-sort
+                                   (sortidx-idx arg-si) ename state)
+                                (unless (eq got-sort (car eet))
+                                  (%verr "type mismatch in instance export `~a`"
+                                         ename))))))))
+                  (vector-push-extend
+                   (and (< (cdr et) (length ctypes))
+                        (aref ctypes (cdr et)))
+                   ctypes)
+                  (vector-push-extend '(:opaque) ids))
+                  ))))
+            (t nil))))
+      (dolist (fi (nreverse func-imports))
+        (destructuring-bind (nm typeidx fpos) fi
+          (declare (ignore typeidx))
+          (let ((arg-si (cdr (assoc nm (coerce args 'list)
+                                    :test #'string=))))
+            (when arg-si
+              (%match-func-arg arg-si
+                               (aref func-types (1- fpos))
+                               ids state)))))
+      (dolist (im (nreverse imports))
+        (destructuring-bind (nm sort et arg-si import-idx) im
+          (unless arg-si
+            (%verr "missing import named `~a`" nm))
+          (%match-instantiation-arg nm sort et arg-si import-idx
+                                    ids state)))))))
+
+;;; ---------------------------------------------------------------
+;;; External visibility of types (Explainer.md
+;;; 'external-visibility-of-types'; external-visibility.wast).
+;;; Any resource/record/variant/enum/flags type transitively used in
+;;; the type of an import or export must itself be imported or
+;;; exported: the typeidx INTRODUCED by a type import/export is the
+;;; named one (the typeidx passed into an export is not retroactively
+;;; named — ::0/::2). Imports may only use IMPORT-named types; ex-
+;;; ports may use either. Anonymous structural shells (tuple/list/
+;;; option/result/prim) recurse; named types stop the walk (their
+;;; references were checked when they were named).
+
+(defun %vis-nameable-kind-p (kind)
+  (member kind '(:resource :record :variant :enum :flags)))
+
+(defun %vis-named-p (state idx import-p)
+  "IDX is in the visible set for this context: IMPORT-P selects the
+import table only; exports accept both."
+  (or (gethash idx (cval-vis-imports state))
+      (and (not import-p) (gethash idx (cval-vis-exports state)))))
+
+(defun %vis-check (state root import-p what)
+  "Signal the fixture message when the walk from ROOT (a type index
+or a ct) reaches a nameable type with no external name in this
+context. The ROOT itself is NOT nameability-checked: for a func/
+instance import or export the root is the func/instance type (never
+nameable itself), and for a type import/export of `(eq i)' the bound
+type becomes named through the very declarator being checked — only
+the types it transitively REFERENCES need names (resources.wast
+::26/:41, external-visibility ::23). WHAT names the construct for
+the message: func | type | instance."
+  (let ((seen (make-hash-table)))
+    (labels
+        ((bad (i)
+           (if (%vis-named-p state i (not import-p))
+               ;; named on the OTHER side: imports may not see
+               ;; exports (::3/::44)
+               (when import-p
+                 (%verr "~a not valid to be used as import" what))
+               (%verr "~a not valid to be used as ~a"
+                      what (if import-p "import" "export"))))
+         (walk-idx (i)
+           (when (and (>= i 0) (< i (length (cval-types state)))
+                      (not (gethash i seen)))
+             (setf (gethash i seen) t)
+             (let ((ty (aref (cval-types state) i)))
+               (when (ct-p ty)
+                 ;; a REACHED type must be named if nameable
+                 (when (and (%vis-nameable-kind-p (ct-kind ty))
+                            (not (%vis-named-p state i import-p)))
+                   (bad i))
+                 (walk-ct ty)))))
+         (walk-ct (ty)
+           (case (ct-kind ty)
+             (:prim nil) ; :imported/:exported/:outer-aliased markers
+             (:record
+              (loop for (nil . vt) across (ct-payload ty)
+                    do (walk-vt vt)))
+             (:variant
+              (loop for (nil . vt) across (ct-payload ty)
+                    do (when vt (walk-vt vt))))
+             (:tuple
+              (loop for vt across (ct-payload ty) do (walk-vt vt)))
+             (:list (walk-vt (car (ct-payload ty))))
+             (:option (walk-vt (ct-payload ty)))
+             (:result
+              (when (car (ct-payload ty)) (walk-vt (car (ct-payload ty))))
+              (when (cdr (ct-payload ty))
+                (walk-vt (cdr (ct-payload ty)))))
+             ((:own :borrow) (walk-idx (ct-payload ty)))
+             ((:stream :future)
+              (when (ct-payload ty) (walk-vt (ct-payload ty))))
+             (:map
+              (walk-vt (cdr (ct-payload ty))))
+             (:func
+              (loop for (nil . vt) across (first (ct-payload ty))
+                    do (walk-vt vt))
+              (when (second (ct-payload ty))
+                (walk-vt (second (ct-payload ty)))))
+             (:instance
+              ;; an instance type: every export declarator's
+              ;; externtype is checked in ITS OWN (export) context
+              (loop for d across (ct-payload ty)
+                    when (and (eq (typedecl-kind d) :export))
+                      do (%vis-check-decl state (typedecl-payload d)
+                                         nil what)))
+             (t nil)))
+         (walk-vt (vt)
+           (cond ((and (consp vt) (eq (car vt) :idx))
+                  (walk-idx (cdr vt)))
+                 ((ct-p vt) (walk-ct vt))
+                 (t nil))))
+      ;; the ROOT skips its own nameability check (::26/::41/::23)
+      (cond ((and (integerp root) (>= root 0)
+                  (< root (length (cval-types state))))
+             (let ((ty (aref (cval-types state) root)))
+               (when (ct-p ty) (walk-ct ty))))
+            ((ct-p root) (walk-ct root))
+            (t nil)))))
+
+(defun %nth-instance-def (comp n)
+  "The Nth :instance definition's instrec payload, in file order
+\(the validator's instance index space), or NIL."
+  (let ((seen 0))
+    (loop for d across (comp-defs comp)
+          when (eq (compdef-kind d) :instance)
+            do (if (= seen n)
+                   (return (compdef-payload d))
+                   (incf seen))
+          finally (return nil))))
+
+(defun %check-moduletype (payload)
+  "A (core type (module ...)) moduletype's internal rules
+\(core-modules.wast ::2-::10): the (func (type n)) type-uses are
+bounds-checked against the moduletype's OWN type sequence (in
+declaration order, imports and exports included), export names are
+unique ('export name `a` already defined' / 'name `` already
+defined'), memory limits are within 65536 pages ('memory size must
+be at most 65536'), and the mangled two-level import names are
+unique ('duplicate import name `:`')."
+  (unless (and (consp payload) (eq (car payload) :moduletype))
+    (return-from %check-moduletype))
+  ;; the payload's decl vector comes in two shapes: the binary
+  ;; reader's (:moduletype #(...)) LIST and the text parser's
+  ;; (:moduletype . #(...)) CONS — normalize to the vector
+  (let ((decls (if (and (consp (cdr payload)) (vectorp (second payload)))
+                   (second payload)
+                   (cdr payload))))
+  (let ((ntypes 0)
+         (exports-seen '())
+         (imports-seen '()))
+    (dolist (d (coerce decls 'list))
+      (case (typedecl-kind d)
+        (:core-type (incf ntypes))
+        (:core-export
+         (let* ((pl (typedecl-payload d))
+                (name (first pl))
+                (desc (second pl)))
+           (when (member name exports-seen :test #'string=)
+             (%verr "export name `~a` already defined" name))
+           (push name exports-seen)
+           (when (and (consp desc) (eq (car desc) :func))
+             ;; a bare `(func)' export IMPLICITLY declares a fresh
+             ;; core func type (Explainer 'core:moduletype': 'an
+             ;; implicitly-created func type'). The text parser col-
+             ;; lapses bare and explicit (type 0) uses to the same
+             ;; (:func 0); with ZERO type decls the explicit-0 form
+             ;; is core-modules.wast ::2's OOB fixture — the distinc-
+             ;; tion needs a parser marker (deferred, see report).
+             ;; Here: (type n) beyond the implicit 0 fires OOB.
+             (when (and (integerp (second desc))
+                        (or (plusp (second desc))
+                            (plusp ntypes)))
+               (when (>= (second desc) ntypes)
+                 (%verr "type index out of bounds"))))
+           (when (and (consp desc) (eq (car desc) :memory))
+             ;; limits payload: (min . max?) — check min bound
+             (let ((lim (second desc)))
+               (when (and (consp lim) (integerp (car lim))
+                          (> (car lim) 65536))
+                 (%verr "memory size must be at most 65536"))))))
+        (:core-import
+         (let* ((pl (typedecl-payload d))
+                (mod (first pl))
+                (field (second pl))
+                (desc (third pl))
+                (key (format nil "~a:~a" mod field)))
+           (when (member key imports-seen :test #'string=)
+             (%verr "duplicate import name `~a`" key))
+           (push key imports-seen)
+           (when (and (consp desc) (eq (car desc) :func))
+             ;; same implicit-func-type reading as the export arm
+             (when (and (integerp (second desc))
+                        (or (plusp (second desc))
+                            (plusp ntypes)))
+               (when (>= (second desc) ntypes)
+                 (%verr "type index out of bounds"))))
+           (when (and (consp desc) (eq (car desc) :memory))
+             (let ((lim (second desc)))
+               (when (and (consp lim) (integerp (car lim))
+                          (> (car lim) 65536))
+                 (%verr "memory size must be at most 65536"))))))
+        (t nil))))))
+
+(defun %vis-check-decl (state payload import-p what)
+  "One import/export declarator payload (name attrs et): check the
+externtype's visibility in the declarator's own context (IMPORT-P).
+An instance-type's EXPORT declarators pass IMPORT-P NIL."
+  (let ((et (third payload)))
+    (case (car et)
+      (:func (%vis-check state (cdr et) import-p what))
+      (:type
+       (unless (eq (cdr et) :sub-resource)
+         (%vis-check state (second (cdr et)) import-p what)))
+      (:instance (%vis-check state (cdr et) import-p what))
+      (t nil))))
+
+(defun %check-annotated-name (name ft state)
+  "The [constructor]/[method]/[static] annotated-name shape rules
+\(annotated-names.wast, Explainer 'Annotated names'): the name must
+refer to a FUNCTION whose type matches the annotation. FT is the
+resolved functype ct (NIL when the externtype is not a func or the
+type is unresolvable). The grammar checks (dot, kebab) live in
+%check-externname; the RESOURCE-NAME rules fire separately."
+  (unless (and (> (length name) 0) (char= (char name 0) #\[))
+    (return-from %check-annotated-name))
+  (let ((close (position #\] name)))
+    (unless close (return-from %check-annotated-name))
+    (let* ((ann (subseq name 1 close))
+           (body (subseq name (1+ close))))
+      (case (intern (string-upcase ann) :keyword)
+        (:constructor
+         (unless (and ft (ct-functype-p ft))
+           (%verr "is not a func"))
+         (when (and ft (ct-functype-p ft))
+           (let ((results (second (ct-payload ft))))
+             (cond
+              ((null results)
+               (%verr "should return one value"))
+              ((not (and (consp results) (eq (car results) :idx)))
+               ;; a single non-index result is a prim — the allowed
+               ;; shape is exactly (own $T)
+               (%verr "should return `(own $T)`"))
+              (t
+               (let ((rt (%ct-at state (cdr results))))
+                 (unless (eq (ct-kind rt) :own)
+                   (%verr "function should return `(own $T)` or `(result (own $T))`"))))))))
+        ((:method :static)
+         (unless (and ft (ct-functype-p ft))
+           (%verr "is not a func"))
+         ;; [static] constrains the function type NO FURTHER
+         ;; (annotated-names ::19's positive has (param "x" u32));
+         ;; [method] needs a first `self` param of (borrow $T)
+         (when (and ft (ct-functype-p ft) (string= ann "method"))
+           (let ((params (first (ct-payload ft))))
+             (when (zerop (length params))
+               (%verr "should have at least one argument"))
+             (when (plusp (length params))
+               (unless (string= (car (aref params 0)) "self")
+                 (%verr "should have a first argument called `self`"))
+               (let ((vt (cdr (aref params 0))))
+                 (unless (and (consp vt) (eq (car vt) :idx)
+                              (eq (ct-kind (%ct-at state (cdr vt)))
+                                  :borrow))
+                   (%verr "should take a first argument of `(borrow $T)`")))))))
+        (t nil)))))
+
 (defun %check-sortidx (si state)
   "A sortidx's index must be in bounds for its sort's index space
 (indicies.wast: 'module index out of bounds', 'instance index out of
@@ -2595,9 +3445,18 @@ bounds', ...)."
                     (%verr "core function index out of bounds")))
       (:core-instance (when (>= idx (cval-core-instances state))
                        (%verr "core instance index out of bounds")))
-      (:core-memory nil)     ; core memories live inside core module
-                             ; instances; a component has no memory
-                             ; index space of its own
+      ;; core table/global/memory/tag spaces grow only via ALIASES (a
+      ;; component defines no core tables itself) — a synthesized
+      ;; core-instance export referencing one with no prior alias is
+      ;; out of bounds (instantiation.wast ::68-::70)
+      (:core-table (when (>= idx (cval-core-tables state))
+                     (%verr "index out of bounds")))
+      (:core-global (when (>= idx (cval-core-globals state))
+                      (%verr "index out of bounds")))
+      (:core-memory (when (>= idx (cval-core-memories state))
+                      (%verr "index out of bounds")))
+      (:core-tag (when (>= idx (cval-core-tags state))
+                   (%verr "index out of bounds")))
       (:core-type (when (>= idx (length (cval-core-types state)))
                    (%verr "core type index out of bounds")))
       (t nil))))
@@ -2771,6 +3630,9 @@ number of enclosing component/type scopes (outer aliases)."
                 :types (make-array 16 :fill-pointer 0 :adjustable t)
                 :core-types (make-array 16 :fill-pointer 0 :adjustable t)
                 :func-types (make-array 16 :fill-pointer 0 :adjustable t)
+                :type-ids (make-array 16 :fill-pointer 0 :adjustable t)
+                :instance-types (make-array 16 :fill-pointer 0
+                                            :adjustable t)
                 :imports (make-hash-table :test #'equal)
                 :exports (make-hash-table :test #'equal)))
         (core-funcs 0) (memories 0) (tables 0) (globals 0))
@@ -2778,7 +3640,26 @@ number of enclosing component/type scopes (outer aliases)."
     (loop for d across (comp-defs comp)
           do (let ((payload (compdef-payload d)))
                (case (compdef-kind d)
-                 (:core-module (incf (cval-core-modules state)))
+                 (:core-module
+                 ;; the embedded core module's code is CORE-validated
+                 ;; here (core-modules.wast ::1: 'type mismatch' for an
+                 ;; operand-stack underflow), and the mangled two-
+                 ;; level import names must be unique (::7/::8:
+                 ;; 'duplicate import name `:`'/`:a`' — validate-module
+                 ;; does not check two-level names)
+                 (let ((m payload))
+                   (when (wasmdown.types:wasm-module-p m)
+                     (wasmdown:validate-module m)
+                     (let ((names '()))
+                       (loop for im across (wasmdown.types:wasm-module-imports
+                                           m)
+                             for key = (format nil "~a:~a"
+                                               (wasmdown.types:wasm-import-module im)
+                                               (wasmdown.types:wasm-import-field im))
+                             do (when (member key names :test #'string=)
+                                  (%verr "duplicate import name `~a`" key))
+                                (push key names)))))
+                 (incf (cval-core-modules state)))
                  (:core-instance
                   (ecase (coreinstrec-kind payload)
                     (:instantiate
@@ -2790,7 +3671,10 @@ number of enclosing component/type scopes (outer aliases)."
                            do (%check-sortidx si state))))
                   (incf (cval-core-instances state)))
                  (:core-type
-                  ;; core types: rectypes + the 0x50 moduletype shape
+                  ;; core types: rectypes + the 0x50 moduletype shape;
+                  ;; a moduletype's INTERNALS validate here
+                  ;; (core-modules.wast ::2-::10)
+                  (%check-moduletype payload)
                   (vector-push-extend payload (cval-core-types state)))
                  (:component
                   ;; a nested component is a full component: validate
@@ -2800,13 +3684,62 @@ number of enclosing component/type scopes (outer aliases)."
                                       :outer-depth (1+ outer-depth))
                   (incf (cval-components state)))
                  (:instance
+                  (vector-push-extend nil (cval-instance-types state))
                   (ecase (instrec-kind payload)
                     (:instantiate
                      (when (>= (instrec-index payload)
                                (cval-components state))
                        (%verr "component index out of bounds"))
                      (loop for (nil . si) across (instrec-args payload)
-                           do (%check-sortidx si state)))
+                           do (%check-sortidx si state))
+                     ;; M7 slice 3b: structural matching of every
+                     ;; with-argument against the target's imports
+                     (%check-instantiate-args payload comp state)
+                     ;; slice 3b: record the INSTANTIATED instance's
+                     ;; exports (name -> sort) so later projections
+                     ;; (alias export / (export ... (instance $i "n")))
+                     ;; can resolve them (instantiation.wast
+                     ;; ::75/::77/::79 'no export named `x`')
+                     (let ((tab (make-hash-table :test #'equal))
+                           (tc (%component-at comp
+                                              (instrec-index payload))))
+                       ;; an IMPORTED component target has no locally
+                       ;; visible defs — its exports stay unknown
+                       (when tc
+                         (dolist (dc (coerce (comp-defs tc) 'list))
+                           (when (eq (compdef-kind dc) :export)
+                             (setf (gethash (exportrec-name
+                                             (compdef-payload dc))
+                                            tab)
+                                   ;; the CHILD's exported sortidx:
+                                   ;; (sort . source-type-idx) — the
+                                   ;; source index lets alias-export
+                                   ;; identity thread through (r1/r2
+                                   ;; re-exports share it; resources
+                                   ;; ::41) and the vis walk resolve
+                                   ;; the aliased shape (slice 3c).
+                                   ;; An ASCRIBED (sub resource) export
+                                   ;; breaks the sharing (::42): its
+                                   ;; source is the NAME (fresh per name)
+                                   (let ((asc (exportrec-type
+                                               (compdef-payload dc))))
+                                     (if (and asc
+                                              (consp asc)
+                                              (eq (car asc) :type)
+                                              (eq (cdr asc) :sub-resource))
+                                         (cons :type
+                                               (exportrec-name
+                                                (compdef-payload dc)))
+                                         (cons (sortidx-sort
+                                                (exportrec-sortidx
+                                                 (compdef-payload dc)))
+                                               (sortidx-idx
+                                                (exportrec-sortidx
+                                                 (compdef-payload dc))))))))))
+                       (setf (aref (cval-instance-types state)
+                                   (1- (length
+                                        (cval-instance-types state))))
+                             tab)))
                     (:inline-exports
                      (loop for (nil . si) across (instrec-exports payload)
                            do (%check-sortidx si state))
@@ -2840,14 +3773,49 @@ number of enclosing component/type scopes (outer aliases)."
                                   :core-types (cval-core-types state)
                                   :func-types (cval-func-types state)
                                   :exports table)
-                                 nil)))))
+                                 nil)))
+                     ;; slice 3b: a synthesized bag instance carries an
+                     ;; instance ct built from its exports (name ->
+                     ;; sort) so with-arg export matching can read it
+                     (let ((bag (make-ct
+                                 :kind :instance
+                                 :payload (map 'vector
+                                               (lambda (pair)
+                                                 (let ((nm (if (consp (car pair))
+                                                               (first (car pair))
+                                                               (car pair))))
+                                                   (make-typedecl
+                                                    :kind :export
+                                                    :payload (list nm nil
+                                                                   (cons (sortidx-sort
+                                                                          (cdr pair))
+                                                                         nil)))))
+                                               (instrec-exports payload))
+                                 :offset 0)))
+                       (setf (aref (cval-instance-types state)
+                                   (1- (length
+                                        (cval-instance-types state))))
+                             bag))))
                   (incf (cval-instances state)))
+
                  (:alias
                   (case (aliasrec-kind payload)
                     (:export
                      (when (>= (aliasrec-index payload)
                                (cval-instances state))
-                       (%verr "instance index out of bounds")))
+                       (%verr "instance index out of bounds"))
+                     ;; slice 3b: the aliased export must EXIST and have
+                     ;; the alias's sort (instantiation.wast ::77/::79
+                     ;; 'instance N has no export named `x`')
+                     (multiple-value-bind (sort known)
+                         (%instance-export-sort (aliasrec-index payload)
+                                                (aliasrec-name payload)
+                                                state)
+                       (declare (ignore sort))
+                       (unless known
+                         (%verr "instance ~a has no export named `~a`"
+                                (aliasrec-index payload)
+                                (aliasrec-name payload)))))
                     (:core-export
                      (when (>= (aliasrec-index payload)
                                (cval-core-instances state))
@@ -2863,11 +3831,54 @@ number of enclosing component/type scopes (outer aliases)."
                   (case (aliasrec-sort payload)
                     (:type (vector-push-extend
                             (make-ct :kind :prim :payload :outer-aliased)
-                            (cval-types state)))
+                            (cval-types state))
+                           ;; identity (slice 3b): an outer alias is
+                           ;; opaque; an exported-type alias carries the
+                           ;; SOURCE instance's exported-type identity —
+                           ;; equal iff two aliases project the same
+                           ;; source type of the same instance (::41);
+                           ;; unknown sources stay fresh per alias
+                           (vector-push-extend
+                            (if (eq (aliasrec-kind payload) :outer)
+                                '(:opaque)
+                                (or (and (eq (aliasrec-kind payload)
+                                             :export)
+                                         (%instance-export-identity
+                                          (aliasrec-index payload)
+                                          (aliasrec-name payload)
+                                          state))
+                                    (%fresh-resource-id)))
+                            (cval-type-ids state))
+                           ;; external visibility (slice 3c): an
+                           ;; alias export of a TYPE confers a name
+                           ;; only when its SOURCE instance is itself
+                           ;; externally visible (::46/::48/::49);
+                           ;; an alias export of an INSTANCE from a
+                           ;; visible instance keeps the chain alive
+                           (when (and (eq (aliasrec-kind payload)
+                                          :export)
+                                      (gethash (aliasrec-index payload)
+                                               (cval-vis-inst state)))
+                             (setf (gethash (1- (length
+                                                (cval-types state)))
+                                            (cval-vis-exports state))
+                                   t)))
                     (:func (incf (cval-funcs state))
                            (vector-push-extend nil (cval-func-types state)))
                     (:component (incf (cval-components state)))
-                    (:instance (incf (cval-instances state)))
+                    (:instance (incf (cval-instances state))
+                               (vector-push-extend nil
+                                                   (cval-instance-types state))
+                              ;; visibility chain: an instance aliased
+                              ;; out of a VISIBLE instance is visible
+                              (when (and (eq (aliasrec-kind payload)
+                                             :export)
+                                         (gethash (aliasrec-index payload)
+                                                  (cval-vis-inst state)))
+                                (setf (gethash (1- (cval-instances
+                                                    state))
+                                               (cval-vis-inst state))
+                                      t)))
                     (:value (incf (cval-values state)))
                     (:core-module (incf (cval-core-modules state)))
                     (:core-type (vector-push-extend :aliased
@@ -2880,7 +3891,14 @@ number of enclosing component/type scopes (outer aliases)."
                     (:core-tag (incf (cval-core-tags state)))))
                  (:type
                   (%check-deftype payload state)
-                  (vector-push-extend payload (cval-types state)))
+                  (vector-push-extend payload (cval-types state))
+                  ;; identity (slice 3b): resource definitions are
+                  ;; generative; other types carry their concrete shape
+                  (vector-push-extend
+                   (if (ct-resourcetype-p payload)
+                       (%fresh-resource-id)
+                       (cons :ct payload))
+                   (cval-type-ids state)))
                  (:canon
                   (ecase (canonrec-kind payload)
                     (:lift
@@ -2932,6 +3950,27 @@ number of enclosing component/type scopes (outer aliases)."
                   (%check-name-attrs (importrec-name payload)
                                      (importrec-attrs payload)
                                      (car (importrec-type payload)))
+                 ;; external visibility (external-visibility.wast):
+                 ;; every nameable type transitively used by the
+                 ;; import's type must be IMPORT-named; imports may
+                 ;; not see export names (::3/::44)
+                 (let ((et (importrec-type payload)))
+                   ;; the [constructor]/[method]/[static] shape rules
+                   ;; (annotated-names.wast)
+                   (%check-annotated-name
+                    (importrec-name payload)
+                    (and (eq (car et) :func)
+                         (integerp (cdr et))
+                        (handler-case (%ct-at state (cdr et))
+                          (wasmdown:validation-error () nil)))
+                    state)
+                   (case (car et)
+                     (:func (%vis-check state (cdr et) t "func"))
+                     (:instance (%vis-check state (cdr et) t "instance"))
+                     (:type
+                      (unless (eq (cdr et) :sub-resource)
+                        (%vis-check state (second (cdr et)) t "type")))
+                     (t nil)))
                   ;; imports extend the imported sort's space
                   (case (car (importrec-type payload))
                     (:func (incf (cval-funcs state))
@@ -2943,21 +3982,66 @@ number of enclosing component/type scopes (outer aliases)."
                     ;; a (sub resource) import IS a resource type —
                     ;; own/borrow must accept it (annotated-names
                     ;; pins the positive).
-                    (:type (vector-push-extend
-                            (if (eq (cdr (importrec-type payload))
-                                    :sub-resource)
-                                (make-ct :kind :resource
-                                        :payload '(0 . nil)
-                                        :offset 0)
-                                (make-ct :kind :prim
-                                        :payload :imported
-                                        :offset 0))
-                            (cval-types state)))
+                    (:type
+                     (vector-push-extend
+                      (let ((bound (cdr (importrec-type payload))))
+                        (cond
+                         ((eq bound :sub-resource)
+                          (make-ct :kind :resource :payload '(0 . nil)
+                                   :offset 0))
+                         ((and (listp bound) (eq (car bound) :eq)
+                               (ct-resourcetype-p
+                                (%ct-at state (second bound))))
+                          (make-ct :kind :resource :payload '(0 . nil)
+                                   :offset 0))
+                         (t (make-ct :kind :prim :payload :imported
+                                     :offset 0))))
+                      (cval-types state))
+                    ;; the typeidx introduced by a type import is
+                    ;; externally-visible (import-named) — the VALUE
+                    ;; is the externname (annotated-names needs the
+                    ;; resource's name for [constructor]/[method])
+                    (setf (gethash (1- (length (cval-types state)))
+                                   (cval-vis-imports state))
+                          (importrec-name payload))
+                     ;; identity (slice 3b): a (sub resource) import is a
+                     ;; FRESH typevar; an (eq i) import follows the bound
+                     (vector-push-extend
+                      (let ((bound (cdr (importrec-type payload))))
+                        (cond
+                         ((eq bound :sub-resource) (%fresh-resource-id))
+                         ((and (listp bound) (eq (car bound) :eq)
+                               (< (second bound)
+                                  (length (cval-type-ids state))))
+                          (cons :ref (second bound)))
+                         (t '(:opaque))))
+                      (cval-type-ids state)))
                     (:value (incf (cval-values state)))
                     (:component (incf (cval-components state)))
-                    (:instance (incf (cval-instances state)))
+                    (:instance (incf (cval-instances state))
+                               ;; slice 3b: track the imported
+                               ;; instance's TYPE (its ct) for the
+                               ;; with-arg export matching
+                               (vector-push-extend
+                                (let ((ti (cdr (importrec-type payload))))
+                                  (if (and (< ti
+                                              (length (cval-types state)))
+                                           (ct-p (aref (cval-types state)
+                                                       ti)))
+                                      (aref (cval-types state) ti)
+                                      nil))
+                                (cval-instance-types state)))
                     (:core-module (incf (cval-core-modules state)))))
                  (:export
+                 ;; an exported instance is externally visible: a
+                 ;; later alias export of a type out of it confers
+                 ;; a name (external-visibility ::46/::49)
+                 (when (eq (sortidx-sort (exportrec-sortidx payload))
+                           :instance)
+                   (setf (gethash (sortidx-idx
+                                   (exportrec-sortidx payload))
+                                  (cval-vis-inst state))
+                         t))
                   (%check-externname (exportrec-name payload) state nil)
                   (%check-sortidx (exportrec-sortidx payload) state)
                   (%check-name-attrs (exportrec-name payload)
@@ -2966,6 +4050,95 @@ number of enclosing component/type scopes (outer aliases)."
                                       (exportrec-sortidx payload)))
                   (when (exportrec-type payload)
                     (%check-externtype (exportrec-type payload) state nil))
+                 ;; external visibility: every nameable type transi-
+                 ;; tively used by the exported func/instance/type
+                 ;; must be named on either side (imports count:
+                 ;; ::0's f4 exports own $R2). For a func export the
+                 ;; ASCRIBED type wins when present (::0 positive);
+                 ;; otherwise the func's own functype (::1/::2).
+                 (let* ((sort (sortidx-sort (exportrec-sortidx payload)))
+                        (fi (sortidx-idx (exportrec-sortidx payload))))
+                   (case sort
+                     (:func
+                      (let ((ft (or (and (exportrec-type payload)
+                                          (integerp (cdr (exportrec-type
+                                                          payload)))
+                                          (cdr (exportrec-type payload)))
+                                     (and (< fi (length (cval-func-types
+                                                        state)))
+                                          (aref (cval-func-types state)
+                                                fi)))))
+                       ;; the [constructor]/[method]/[static] shape
+                       ;; rules (annotated-names.wast); FT may be an
+                       ;; ascription INDEX or the functype ct
+                       (%check-annotated-name
+                        (exportrec-name payload)
+                        (typecase ft
+                          (null nil)
+                          (integer (handler-case (%ct-at state ft)
+                                     (wasmdown:validation-error () nil)))
+                          (t (if (ct-p ft) ft nil)))
+                       state)
+                       ;; FT is a type index (ascription) or the
+                       ;; functype ct itself (the func's own type)
+                        (when ft (%vis-check state ft nil "func"))))
+                     (:instance
+                      (let ((it (or (and (exportrec-type payload)
+                                         (integerp (cdr (exportrec-type
+                                                         payload)))
+                                         (cdr (exportrec-type payload)))
+                                    (and (< fi (length (cval-instance-types
+                                                        state)))
+                                         (aref (cval-instance-types state)
+                                               fi)))))
+                        (when (integerp it)
+                          (%vis-check state it nil "instance"))
+                        ;; a synthesized BAG instance: walk its inline
+                        ;; exports directly (its instance-type entry
+                        ;; carries only (sort . nil) externtypes) —
+                        ;; external-visibility ::21
+                        (when (or (null it) (hash-table-p it))
+                          (let ((inst (%nth-instance-def comp fi)))
+                            (when (and inst
+                                       (eq (instrec-kind inst)
+                                           :inline-exports))
+                              (loop for pair across (instrec-exports
+                                                     inst)
+                                    for si = (cdr pair)
+                                    do (case (sortidx-sort si)
+                                        (:func
+                                         (let ((n (sortidx-idx si)))
+                                           (when (and
+                                                  (< n (length
+                                                        (cval-func-types
+                                                         state)))
+                                                  (aref (cval-func-types
+                                                         state) n))
+                                             (%vis-check
+                                              state
+                                              (aref (cval-func-types
+                                                     state) n)
+                                              nil "instance"))))
+                                        (:type
+                                         (when (< (sortidx-idx si)
+                                                  (length (cval-types
+                                                           state)))
+                                           (%vis-check
+                                            state (sortidx-idx si)
+                                            nil "instance")))
+                                        (t nil))))))))
+                     (:type
+                      (let ((bound (cdr (exportrec-type payload))))
+                        (cond
+                         ((eq bound :sub-resource) nil)
+                         ((and (listp bound) (eq (car bound) :eq))
+                          (%vis-check state (second bound) nil "type"))
+                         (t
+                          ;; no ascription: the SORTIDX'd type itself
+                          ;; is the export target (::23-::32)
+                          (when (< fi (length (cval-types state)))
+                            (%vis-check state fi nil "type"))))))
+                     (t nil)))
                   ;; every export introduces a new index of its sort
                   (case (sortidx-sort (exportrec-sortidx payload))
                     (:func (incf (cval-funcs state))
@@ -2994,10 +4167,35 @@ number of enclosing component/type scopes (outer aliases)."
                                       (make-ct :kind :prim
                                                :payload :exported
                                                :offset 0))))
-                            (cval-types state)))
+                            (cval-types state))
+                           ;; the typeidx introduced by a type export
+                           ;; is externally-visible (export-named);
+                           ;; the passed-in idx is NOT (::0/::2) — the
+                           ;; VALUE is the externname (annotated-names)
+                           (setf (gethash (1- (length (cval-types state)))
+                                          (cval-vis-exports state))
+                                 (exportrec-name payload))
+                           ;; identity (slice 3b): re-exporting one typeidx
+                           ;; shares identity; an ascribed (sub resource)
+                           ;; export is a FRESH resource
+                           (let ((ti (sortidx-idx
+                                      (exportrec-sortidx payload))))
+                             (vector-push-extend
+                              (cond
+                               ((and (exportrec-type payload)
+                                     (consp (cdr (exportrec-type payload)))
+                                     (eq (car (cdr (exportrec-type payload)))
+                                         :sub-resource))
+                                (%fresh-resource-id))
+                               ((< ti (length (cval-type-ids state)))
+                                (cons :ref ti))
+                               (t '(:opaque)))
+                              (cval-type-ids state))))
                     (:value (incf (cval-values state)))
                     (:component (incf (cval-components state)))
-                    (:instance (incf (cval-instances state)))
+                    (:instance (incf (cval-instances state))
+                               (vector-push-extend nil
+                                                   (cval-instance-types state)))
                     (:core-module (incf (cval-core-modules state)))))
                  (:start
                   (when (>= (startrec-func payload) (cval-funcs state))
