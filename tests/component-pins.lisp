@@ -1119,7 +1119,26 @@ wast runner's string-to-bytes decoder (same grammar as the suite)."
     (let ((c (expect-invalid
               "(component (type $T (tuple u32)) (core func (canon resource.drop $T)))")))
       (is (search "not a resource type"
-                  (wasmdown:wasmdown-error-message c))))))
+                  (wasmdown:wasmdown-error-message c))))
+    ;; slice 5d (resources ::66-::67/::70): resource.new/rep require
+    ;; a LOCAL resource — an imported (sub resource) type is not
+    ;; local; a re-exported local resource (through an instantiate's
+    ;; with-arg + alias export) IS local; resource.drop accepts any
+    (let ((c (expect-invalid
+              "(component (import \"T\" (type $T (sub resource))) (core func (canon resource.new $T)))")))
+      (is (search "not a local resource"
+                  (wasmdown:wasmdown-error-message c))))
+    (let ((c (expect-invalid
+              "(component (component $C (type $R (resource (rep i32))) (export \"r\" (type $R))) (instance $c (instantiate $C)) (alias export $c \"r\" (type $R)) (core func (canon resource.rep $R)))")))
+      (is (search "not a local resource"
+                  (wasmdown:wasmdown-error-message c))))
+    (wasmdown.component:validate-component
+     (wasmdown.component.text::parse-component-text
+      "(component (type $R (resource (rep i32))) (component $C (import \"x\" (type $x (sub resource))) (export \"y\" (type $x))) (instance $c (instantiate $C (with \"x\" (type $R)))) (alias export $c \"y\" (type $R2)) (core func (canon resource.rep $R2)))"))
+    (wasmdown.component:validate-component
+     (wasmdown.component.text::parse-component-text
+      "(component (component $C (type $R (resource (rep i32))) (export \"r\" (type $R))) (instance $c (instantiate $C)) (alias export $c \"r\" (type $R)) (core func (canon resource.drop $R)))"))))
+
 (defun run-component-pins ()
   "Run the component pins (registered via TEST; returns T)."
   (let ((wasmdown.test::*tests*

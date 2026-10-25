@@ -1660,6 +1660,13 @@ declaration order) + the outer scope stack."
   ;; a type confers a name only when its SOURCE instance is itself
   ;; externally visible (external-visibility ::46/::48/::49)
   (vis-inst (make-hash-table) :type hash-table)
+  ;; slice 5d (resources ::66-::68): the type indices of LOCALLY
+  ;; DEFINED resources — (type $R (resource ...)) defs of THIS
+  ;; concrete component. resource.new/rep require a local resource
+  ;; ('not a local resource'); imported (sub resource) types, aliased
+  ;; exports of other instances' types and outer-aliased resources
+  ;; are not local.
+  (local-resources (make-hash-table) :type hash-table)
   (exports '())                           ; (name kind) records seen
   (imports '()))
 
@@ -4986,14 +4993,25 @@ the number of enclosing component/type scopes (outer aliases)."
                   ;; cross-arm type derivation)
                   (%check-resource-dtor payload state comp)
                   (%check-deftype payload state)
-                  (vector-push-extend payload (cval-types state))
-                  ;; identity (slice 3b): resource definitions are
-                  ;; generative; other types carry their concrete shape
-                  (vector-push-extend
-                   (if (ct-resourcetype-p payload)
-                       (%fresh-resource-id)
-                       (cons :ct payload))
-                   (cval-type-ids state)))
+                  ;; slice 5d (resources ::66-::68/::70): record
+                  ;; LOCALLY-DEFINED resource types — resource.new/rep
+                  ;; may only target these, DIRECTLY or through an
+                  ;; alias whose resolved identity equals the local
+                  ;; resource's fresh id (::70's re-exported $R). The
+                  ;; hash maps typeidx -> fresh-id (the SAME id the
+                  ;; type-ids vector records).
+                  (let ((rid (when (ct-resourcetype-p payload)
+                               (%fresh-resource-id))))
+                    (when rid
+                      (setf (gethash (length (cval-types state))
+                                     (cval-local-resources state))
+                            rid))
+                    (vector-push-extend payload (cval-types state))
+                    ;; identity (slice 3b): resource definitions are
+                    ;; generative; other types carry their concrete shape
+                    (vector-push-extend
+                     (if rid rid (cons :ct payload))
+                     (cval-type-ids state))))
                  (:canon
                   (ecase (canonrec-kind payload)
                     (:lift
@@ -5043,7 +5061,35 @@ the number of enclosing component/type scopes (outer aliases)."
                                   (integerp (second imms)))
                          (let ((c (%ct-at state (second imms))))
                            (unless (ct-resourcetype-p c)
-                             (%verr "not a resource type")))))))
+                             (%verr "not a resource type"))
+                           ;; slice 5d (resources ::66-::67/::70):
+                           ;; resource.new/rep may only target a
+                           ;; LOCALLY-DEFINED resource (resource.drop
+                           ;; accepts any resource — ::68's comment).
+                           ;; Local = the typeidx is a local def OR its
+                           ;; resolved identity equals a local
+                           ;; resource's fresh id (::70's re-export).
+                           (when (member (first imms)
+                                          '(:resource-new :resource-rep))
+                             (let* ((ti (second imms))
+                                    (direct (gethash ti
+                                                     (cval-local-resources
+                                                      state)))
+                                    (tid (and (< ti (length (cval-type-ids
+                                                             state)))
+                                              (aref (cval-type-ids state)
+                                                    ti))))
+                               (unless (or direct
+                                           (and (consp tid)
+                                                (eq (car tid) :fresh)
+                                                (member (cdr tid)
+                                                        (loop for v being
+                                                              the hash-values
+                                                              of (cval-local-resources
+                                                                  state)
+                                                            collect (cdr v))
+                                                        :test #'eql)))
+                                 (%verr "not a local resource")))))))))
                   ;; slice 4: the canon's INTRODUCED index space —
                   ;; :lift adds a COMPONENT func; :lower and the
                   ;; resource-*/builtin canons add CORE funcs (the
