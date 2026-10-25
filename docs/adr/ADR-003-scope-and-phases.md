@@ -19,7 +19,7 @@ conformance gates. This repository delivers an honest **partial** slice
    tracked by loop number; the Component Model work is tracked by
    PLAN.md §14 milestone id (M7 slices) — the two counters never
    renumber each other.*
-   *Superseded in part (loops 18–24 + M7 slices 1–3, 2026-10-25): tail calls
+   *Superseded in part (loops 18–24 + M7 slices 1–4, 2026-10-25): tail calls
    (`return_call`/`return_call_indirect`, constant-stack trampoline),
    exception handling (tags, `try_table`, `throw`, named module
    definition/instance forms), typed function references
@@ -61,9 +61,20 @@ conformance gates. This repository delivers an honest **partial** slice
    validator-extension families — externname visibility,
    annotated-name shapes, canonopt unicity, moduletype internals)
    is implemented; the component lane measures 492 pass / 110
-   fail / 37 unsupported / 0 harness-error of 639. Still out of
-   scope: the parser-side type-use/bind gaps, core-subtype
-   moduletype matching, canon core-functype signature checks,
+   fail / 37 unsupported / 0 harness-error of 639. M7 slice 4
+   (2026-10-25: the parser type-use/bind gaps — type-use
+   externtypes for every sort, declarator bind-ids with
+   sort-correct spaces + type indices, the type-decl-sink/
+   intern-scope machinery, moduletype desc shapes with the
+   shared flag; and the validator's core-subtype moduletype
+   matching over the static core-IR resolver, the canon
+   core-functype signature checks via the flat-types builder,
+   and the visibility table propagation) is implemented; the
+   component lane measures 531 pass / 71 fail / 37
+   unsupported / 0 harness-error of 639. Still out of scope:
+   the outer-alias transitivity/alias-sort rules, the
+   resource-visibility walks, annotated resource-name
+   resolution, the indicies/core-modules residual shapes,
    instantiation execution + linking, the canonical ABI,
    resources, async, WIT-level Component/WASI, threads,
    FASL cache.

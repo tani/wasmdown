@@ -37,15 +37,17 @@ calls all pass.
 
 The component lane (`make test-component`, the vendored
 component-model suite at commit `d095e2f60dd...` per
-`specs/lock.toml`) measures M7: **492 pass / 110 fail / 37
+`specs/lock.toml`) measures M7: **531 pass / 71 fail / 37
 unsupported / 0 harness-error of 639** in {binary,validation} minus
 nyi.txt — the component TEXT parser (slice 2), the crash/shape +
 version-grammar families (slice 3a), structural instantiation type
-matching (slice 3b) and the validator-extension families (slice 3c)
-are implemented; the remaining fails are the parser-side type-use/
-bind gaps, core-subtype moduletype matching, canon core-functype
-signature checks and the resource-visibility consumption rows, and
-the unsupported are valid binaries awaiting instantiation.
+matching (slice 3b), the validator-extension families (slice 3c),
+the parser type-use/bind gaps + core-subtype moduletype matching +
+canon core-functype signature checks (slice 4) are implemented; the
+remaining fails are the outer-alias transitivity/alias-sort rules,
+the resource-visibility walks, annotated resource-name resolution
+and the indicies/core-modules residual shapes, and the unsupported
+are valid binaries awaiting instantiation.
 See `CONFORMANCE-COMPONENT.md`.
 
 Regenerate with `make report-conformance` (writes `CONFORMANCE.md` +
@@ -98,9 +100,10 @@ harness-errors.
 | Component text | `src/component-text.lisp` | M7 slice 2: the full component TEXT grammar into the same IR (valtypes, functypes, imports/exports + attributes, canon lift/lower + built-ins upright/inverted, core module via `parse-wat`, core instance, aliases incl. outer-alias sugar + projections, the named-form `(component definition ...)` marker). |
 
 Not implemented (see `PLAN.md` for the full contract): the
-parser-side type-use/bind gaps + core-subtype moduletype matching +
-canon core-functype signature checks (the residual 110 component
-rows), component instantiation execution + linking, the
+residual 71 component rows (outer-alias transitivity/alias-sort
+rules, resource-visibility walks, annotated resource-name
+resolution, the indicies/core-modules shapes), component
+instantiation execution + linking, the
 Canonical ABI, resources, async, WASI (all versions),
 threads/atomics, FASL cache, annotations (an unadopted proposal —
 permanently out of scope per PLAN.md §3.3). SIMD (v128 + relaxed,
