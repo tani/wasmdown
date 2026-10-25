@@ -2406,7 +2406,12 @@ type's own declarators stay against STATE, the inner space)."
                              :exports (make-hash-table :test #'equal))))
        (dolist (d (coerce (ct-payload c) 'list))
          (case (typedecl-kind d)
-           (:core-type nil)     ; core types keep their own space
+           ;; slice 5m (core-modules ::5/::6): a :core-type decl inside
+           ;; a component/instance type can be a MODULETYPE — its
+           ;; internals (export-name uniqueness, (type n) bounds)
+           ;; validate with the same %check-moduletype as the direct
+           ;; :core-type arm
+           (:core-type (%check-moduletype (typedecl-payload d)))
            (:type
             (let ((ty (typedecl-payload d)))
               (when (ct-resourcetype-p ty)
@@ -2721,20 +2726,37 @@ indicies.wast)."
          (unless (ct-functype-p c)
            (%verr "type index ~d is not a function type" payload))))
       ((:component :instance)
-       (let ((c (%ct-at state payload)))
-         (unless (eq (ct-kind c)
-                     (if (eq sort :component) :component :instance))
-           (%verr "type index ~d is not a~a ~a type" payload
-                  (if (member (char (string-downcase (string sort)) 0)
-                              '(#\a #\e #\i #\o #\u))
-                      "n" "")
-                  (string-downcase (string sort))))))
+       ;; slice 5m (indicies ::10): a DECLARATOR-context ascription
+       ;; ((export "v" (component)) inside an inline instance ct)
+       ;; carries the DUMMY index 0 with no type space to resolve -
+       ;; accept structurally; a REAL index resolves + kind-checks
+       (if (and (zerop payload)
+                (zerop (length (cval-types state))))
+           nil
+           (let ((c (%ct-at state payload)))
+             (unless (eq (ct-kind c)
+                         (if (eq sort :component)
+                             :component :instance))
+               (%verr "type index ~d is not a~a ~a type" payload
+                      (if (member
+                           (char (string-downcase (string sort)) 0)
+                           '(#\a #\e #\i #\o #\u))
+                          "n" "")
+                      (string-downcase (string sort)))))))
       (:core-module
-       (when (>= payload (length (cval-core-types state)))
-         (%verr "core type index out of bounds"))
-       (let ((ty (aref (cval-core-types state) payload)))
-         (unless (and (consp ty) (eq (car ty) :moduletype))
-           (%verr "core type index ~d is not a module type" payload))))
+       ;; slice 5m (indicies ::10): a BARE (core module) declarator
+       ;; ascription carries the :NONE marker (no core-type space
+       ;; to resolve); a REAL index bounds-checks (the (core module
+       ;; (type $t)) use still rejects - defined-types ::45/::46)
+       (if (eq payload :none)
+           nil
+           (progn
+             (when (>= payload (length (cval-core-types state)))
+               (%verr "core type index out of bounds"))
+             (let ((ty (aref (cval-core-types state) payload)))
+               (unless (and (consp ty) (eq (car ty) :moduletype))
+                 (%verr "core type index ~d is not a module type"
+                        payload))))))
       (:type
        (if (eq payload :sub-resource)
            nil
@@ -3057,6 +3079,15 @@ is the CURRENT state (Explainer 408-412).")
   (declare (ignore state))
   (let* ((m (%core-module-at comp (coreinstrec-index payload)))
          (args (coerce (coreinstrec-args payload) 'list)))
+    ;; slice 5m (instantiation ::56): duplicate with-arg names in a
+    ;; CORE instantiation ('duplicate module instantiation argument
+    ;; named `a`')
+    (let ((names '()))
+      (loop for (nm . nil) in args
+            do (when (member nm names :test #'string=)
+                 (%verr "duplicate module instantiation argument named `~a`"
+                        nm))
+               (push nm names)))
     (unless (and m (wasmdown.types:wasm-module-p m))
       (return-from %check-core-instance-args))
     (loop for imp across (wasmdown.types:wasm-module-imports m)
@@ -3887,12 +3918,23 @@ argument; NIL when unresolvable)."
         (aref (cval-type-ids state) i)))))
 
 (defun %component-at (comp cidx)
-  "The cidx'th :component definition's nested comp (slice 3b)."
+  "The cidx'th :component definition's nested comp (slice 3b). The
+COMPONENT index space counts :component defs AND :component IMPORTS
+(slice 5m, resources ::34): an imported component occupies an index
+and has no nested comp — NIL for it, so the callers fall back to the
+import's ascribed ct."
   (let ((seen 0))
     (loop for d across (comp-defs comp)
-          when (eq (compdef-kind d) :component)
-            do (cond ((= seen cidx)
+          when (or (eq (compdef-kind d) :component)
+                   (and (eq (compdef-kind d) :import)
+                        (eq (car (importrec-type
+                                  (compdef-payload d)))
+                            :component)))
+            do (cond ((and (= seen cidx)
+                           (eq (compdef-kind d) :component))
                       (return (compdef-payload d)))
+                     ((= seen cidx)
+                      (return nil))
                      (t (incf seen)))
           finally (return nil))))
 
@@ -3951,7 +3993,10 @@ same argument SHARE the resource (resources.wast ::44/::45)."
                     ;; (instance, source) pair identity
                     (list :inst-export inst-idx (cdr hit))))
               ;; an ascribed (sub resource) export: fresh per NAME
-              (list :inst-export inst-idx name)))))
+              ;; — the entry's string cdr names the identity source
+              ;; (slice 5m, resources ::34: T3 = (eq $T2)'s entry
+              ;; carries "T2", sharing T2's identity)
+              (list :inst-export inst-idx (cdr hit))))))
      ((and (ct-p ent) (eq (ct-kind ent) :instance))
       ;; slice 5e (resources ::27/::28/::43): an IMPORTED instance
       ;; typed by an instance ct — its exported type's identity is
@@ -4083,6 +4128,21 @@ resolved through the stashed child state (ev ::49/::50)."
               (aref (cval-types child-state) ti))
              (t nil))))))))
 
+
+
+(defun %ct-decl-at (decls i)
+  "The i'th TYPE-INTRODUCING declarator's payload (slice 5m,
+indicies ::0): an inline instance ct's (instance . k) ascription
+indexes the DECLARATOR sequence's type-introducing positions."
+  (loop with n = -1
+        for x across decls
+        when (member (typedecl-kind x)
+                     '(:type :alias :import :export))
+          do (incf n)
+             (when (= n i)
+               (return (typedecl-payload x)))
+        finally (return nil)))
+
 (defun %instance-table-projection (a state)
   "Slice 4 (family 3): the export TABLE an (alias export i n
 (instance)) introduces — the projection of the source instance's
@@ -4110,6 +4170,25 @@ unknown (NIL)."
                                 (cdr hit)))))
             (cond
              ((hash-table-p sub) sub)
+             ;; slice 5m (indicies ::0): an entry whose cdr is an
+             ;; INSTANCE ct (carried by the ct-branch build above)
+             ;; projects to that ct's own export table
+             ((and (consp hit)
+                   (eq (car hit) :instance)
+                   (ct-p (cdr hit))
+                   (eq (ct-kind (cdr hit)) :instance))
+              (let ((tab (make-hash-table :test #'equal)))
+                (dolist (td (coerce (ct-payload (cdr hit)) 'list))
+                  (when (eq (typedecl-kind td) :export)
+                    (let* ((pl (typedecl-payload td))
+                           (et2 (third pl)))
+                      (setf (gethash (first pl) tab)
+                            (cons (car et2)
+                                  (if (and (consp et2)
+                                           (eq (car et2) :type))
+                                      (first pl)
+                                      (cdr et2)))))))
+                tab))
              ;; slice 5j (external-visibility ::50): the projection of
              ;; an INSTANTIATED source's named export — the entry idx
              ;; indexes the CHILD's space; resolve the sub-instance's
@@ -4191,13 +4270,28 @@ unknown (NIL)."
                             (when (eq (typedecl-kind td) :export)
                               (let* ((pl (typedecl-payload td))
                                      (et2 (third pl)))
-                                (setf (gethash (first pl) tab)
-                                      (cons (car et2)
-                                            (if (and (consp et2)
-                                                     (eq (car et2)
-                                                         :type))
-                                                (first pl)
-                                                (cdr et2)))))))
+                                (setf
+                                 (gethash (first pl) tab)
+                                 (cons
+                                  (car et2)
+                                  (cond
+                                   ((and (consp et2)
+                                         (eq (car et2) :instance))
+                                    ;; slice 5m (indicies ::0): the
+                                    ;; (instance . k) ascription's k
+                                    ;; indexes the NESTED ct's own
+                                    ;; declarator space - carry the
+                                    ;; double-nested ct ITSELF so a
+                                    ;; projection of THIS table can
+                                    ;; resolve its exports
+                                    (%ct-decl-at
+                                     (ct-payload
+                                      (typedecl-payload x))
+                                     (cdr et2)))
+                                   ((and (consp et2)
+                                         (eq (car et2) :type))
+                                    (first pl))
+                                   (t (cdr et2))))))))
                           (return tab)))
                       (when (= n k) (return nil)))
                      (t nil))
@@ -4276,9 +4370,18 @@ rejected (instantiation.wast ::57)."
          (target nil)
          (seen 0))
     (dolist (d defs)
-      (when (eq (compdef-kind d) :component)
+      ;; slice 5m (resources ::34): the COMPONENT index space counts
+      ;; :component defs AND :component IMPORTS (an imported component
+      ;; occupies an index; the target stays NIL for imports — the
+      ;; with-arg matching skips, the identity/export paths read the
+      ;; ascribed ct)
+      (when (or (eq (compdef-kind d) :component)
+                (and (eq (compdef-kind d) :import)
+                     (eq (car (importrec-type (compdef-payload d)))
+                         :component)))
         (when (= seen cidx)
-          (setf target (compdef-payload d))
+          (when (eq (compdef-kind d) :component)
+            (setf target (compdef-payload d)))
           (return))
         (incf seen)))
     (unless target
@@ -4394,10 +4497,24 @@ rejected (instantiation.wast ::57)."
                   ;; the ARG is a core module (its wasm-module IR);
                   ;; match the declared moduletype contravariantly
                   ;; (the arg may import less) / covariantly (the
-                  ;; arg may export more), instantiation ::33-::36
+                  ;; arg may export more), instantiation ::33-::36.
+                  ;; Slice 5m (indicies ::0): a BARE (core module)
+                  ;; import ascription carries the :NONE marker —
+                  ;; an UNTYPED core module import accepts any arg
                   (when arg-si
-                    (let ((mt (and (< (cdr et) (length core-types))
-                                   (aref core-types (cdr et)))))
+                    (let ((mt (cond
+                               ((eq (cdr et) :none)
+                                ;; slice 5m (instantiation ::34):
+                                ;; a BARE (core module) import
+                                ;; ascription = the EMPTY
+                                ;; moduletype — the arg must have
+                                ;; NO imports
+                                (list :moduletype
+                                      (make-array 0)))
+                               ((integerp (cdr et))
+                                (and (< (cdr et) (length core-types))
+                                     (aref core-types (cdr et))))
+                               (t nil))))
                       (when (and mt (consp mt) (eq (car mt) :moduletype))
                         (let ((m (%core-module-at
                                   comp (sortidx-idx arg-si))))
@@ -4577,6 +4694,12 @@ unique ('duplicate import name `:`')."
     (dolist (d (coerce decls 'list))
       (case (typedecl-kind d)
         (:core-type (incf ntypes))
+        ;; slice 5m (core-modules ::0's named alias): an (alias
+        ;; outer $C $FT (type $a)) declarator introduces a type index
+        ;; in the moduletype's own space — the text parser emits it
+        ;; as a :core-alias typedecl (payload (outer-count .
+        ;; ct-idx)) — count it so a later (func (type $a)) resolves
+        (:core-alias (incf ntypes))
         (:core-export
          (let* ((pl (typedecl-payload d))
                 (name (first pl))
@@ -4584,20 +4707,18 @@ unique ('duplicate import name `:`')."
            (when (member name exports-seen :test #'string=)
              (%verr "export name `~a` already defined" name))
            (push name exports-seen)
-           (when (and (consp desc) (eq (car desc) :func))
-             ;; a bare `(func)' export IMPLICITLY declares a fresh
-             ;; core func type (Explainer 'core:moduletype': 'an
-             ;; implicitly-created func type'). The text parser col-
-             ;; lapses bare and explicit (type 0) uses to the same
-             ;; (:func 0); with ZERO type decls the explicit-0 form
-             ;; is core-modules.wast ::2's OOB fixture — the distinc-
-             ;; tion needs a parser marker (deferred, see report).
-             ;; Here: (type n) beyond the implicit 0 fires OOB.
-             (when (and (integerp (second desc))
-                        (or (plusp (second desc))
-                            (plusp ntypes)))
-               (when (>= (second desc) ntypes)
-                 (%verr "type index out of bounds"))))
+           (when (and (consp desc) (eq (car desc) :func)
+                      (eq (third desc) :implicit))
+             ;; slice 5m (core-modules ::2): a bare (func) export
+             ;; implicitly declares a fresh functype — it counts
+             ;; toward the moduletype's own type space
+             (incf ntypes))
+           (when (and (consp desc) (eq (car desc) :func)
+                      (not (eq (third desc) :implicit)))
+             ;; an EXPLICIT (func (type n)): bounds-checked against
+             ;; the decls so far (::2's (type 0) with no decls)
+             (when (>= (second desc) ntypes)
+               (%verr "type index out of bounds")))
            (when (and (consp desc) (eq (car desc) :memory))
              ;; limits payload: (min . max?) — check min bound
              (let ((lim (second desc)))
@@ -4613,13 +4734,15 @@ unique ('duplicate import name `:`')."
            (when (member key imports-seen :test #'string=)
              (%verr "duplicate import name `~a`" key))
            (push key imports-seen)
-           (when (and (consp desc) (eq (car desc) :func))
-             ;; same implicit-func-type reading as the export arm
-             (when (and (integerp (second desc))
-                        (or (plusp (second desc))
-                            (plusp ntypes)))
-               (when (>= (second desc) ntypes)
-                 (%verr "type index out of bounds"))))
+           (when (and (consp desc) (eq (car desc) :func)
+                      (eq (third desc) :implicit))
+             ;; slice 5m (core-modules ::2): the implicit functype
+             ;; counts toward the moduletype's type space
+             (incf ntypes))
+           (when (and (consp desc) (eq (car desc) :func)
+                      (not (eq (third desc) :implicit)))
+             (when (>= (second desc) ntypes)
+               (%verr "type index out of bounds")))
            (when (and (consp desc) (eq (car desc) :memory))
              (let ((lim (second desc)))
                (when (and (consp lim) (integerp (car lim))
@@ -5214,6 +5337,18 @@ the number of enclosing component/type scopes (outer aliases)."
                     (:inline-exports
                      (loop for (nil . si) across (coreinstrec-exports payload)
                            do (%check-sortidx si state))
+                     ;; slice 5m (instantiation ::59): the inline bag's
+                     ;; export names are strongly-unique WITHIN the
+                     ;; core instance ('export name `a` already
+                     ;; defined')
+                     (let ((seen '()))
+                       (loop for pair across
+                             (coreinstrec-exports payload)
+                             for nm = (car pair)
+                             do (when (member nm seen :test #'string=)
+                                  (%verr "export name `~a` already defined"
+                                         nm))
+                                (push nm seen)))
                      ;; slice 4: a synthesized bag's exports point at
                      ;; alias-introduced core indices
                      (setf (gethash (cval-core-instances state)
@@ -5298,18 +5433,58 @@ the number of enclosing component/type scopes (outer aliases)."
                                           finally (return nil))))
                            (when (and ict (ct-p ict)
                                       (eq (ct-kind ict) :component))
-                             (dolist (dc (coerce (ct-payload ict) 'list))
-                               (when (eq (typedecl-kind dc) :export)
-                                 (let* ((pl (typedecl-payload dc))
-                                        (nm (first pl))
-                                        (et (third pl)))
-                                   (setf (gethash nm tab)
-                                         (cons (car et)
-                                               (if (and (consp et)
-                                                        (eq (car et)
-                                                            :type))
-                                                   nm
-                                                   (cdr et))))))))))
+                             (let ((decls (coerce (ct-payload ict)
+                                                 'list)))
+                               ;; pre-pass: the type-introducing
+                               ;; positions -> the declarator, so an
+                               ;; (eq i) export resolves its target's
+                               ;; NAME (the identity source: all type
+                               ;; exports use the name form)
+                               (let ((by-pos
+                                       (loop with n = -1
+                                             for x in decls
+                                             when (member
+                                                   (typedecl-kind x)
+                                                   '(:type :alias
+                                                     :import :export))
+                                               collect (cons (incf n)
+                                                             x))))
+                                 (dolist (dc decls)
+                                   (when (eq (typedecl-kind dc)
+                                             :export)
+                                     (let* ((pl (typedecl-payload dc))
+                                            (nm (first pl))
+                                            (et (third pl)))
+                                       (setf (gethash nm tab)
+                                             (cons (car et)
+                                                   (if (and (consp et)
+                                                            (eq (car et)
+                                                                :type))
+                                                       (or (and
+                                                            (consp (cdr et))
+                                                            (eq (car
+                                                                 (cdr et))
+                                                                :eq)
+                                                            (let* ((i
+                                                                     (second
+                                                                      (cdr
+                                                                       et)))
+                                                                   (td2
+                                                                     (cdr (assoc
+                                                                           i
+                                                                           by-pos
+                                                                           :test
+                                                                           #'=))))
+                                                              (and td2
+                                                                   (eq
+                                                                    (typedecl-kind
+                                                                     td2)
+                                                                    :export)
+                                                                   (first
+                                                                    (typedecl-payload
+                                                                     td2)))))
+                                                           nm)
+                                                       (cdr et))))))))))))
                        (when tc
                          (dolist (dc (coerce (comp-defs tc) 'list))
                            (when (eq (compdef-kind dc) :export)
@@ -5422,20 +5597,54 @@ the number of enclosing component/type scopes (outer aliases)."
                        (%verr "instance index out of bounds"))
                      ;; slice 3b: the aliased export must EXIST and have
                      ;; the alias's sort (instantiation.wast ::77/::79
-                     ;; 'instance N has no export named `x`')
+                     ;; 'instance N has no export named `x`'); slice 5m
+                     ;; (instantiation ::81): a CORE-sorted alias off a
+                     ;; component instance's export checks the actual
+                     ;; sort ('is not a module')
                      (multiple-value-bind (sort known)
                          (%instance-export-sort (aliasrec-index payload)
                                                 (aliasrec-name payload)
                                                 state)
-                       (declare (ignore sort))
                        (unless known
                          (%verr "instance ~a has no export named `~a`"
                                 (aliasrec-index payload)
-                                (aliasrec-name payload)))))
+                                (aliasrec-name payload)))
+                       (when (and known
+                                  (eq (aliasrec-sort payload)
+                                      :core-module)
+                                  (not (eq sort :core-module)))
+                         (%verr "export `~a` of instance ~a is not a module"
+                                (aliasrec-name payload)
+                                (aliasrec-index payload)))))
                     (:core-export
                      (when (>= (aliasrec-index payload)
                                (cval-core-instances state))
                        (%verr "core instance index out of bounds"))
+                     ;; slice 5m (instantiation ::78): the aliased
+                     ;; core export must EXIST ('core instance 0 has
+                     ;; no export named `a`') — an :instantiate
+                     ;; provider's module exports resolve via
+                     ;; %core-module-at; an inline-export BAG lists
+                     ;; its names directly
+                     (let ((prov (gethash (aliasrec-index payload)
+                                          *core-inst-provider*)))
+                       (when (and (consp prov)
+                                  (not
+                                   (find (aliasrec-name payload)
+                                         (cond
+                                          ((eq (car prov) :bag)
+                                           (map 'list #'car (cdr prov)))
+                                          ((eq (car prov) :module)
+                                           (map 'list
+                                                #'wasmdown.types:wasm-export-name
+                                                (wasmdown.types:wasm-module-exports
+                                                 (%core-module-at
+                                                  comp (cdr prov)))))
+                                          (t nil))
+                                         :test #'string=)))
+                         (%verr "core instance ~a has no export named `~a`"
+                                (aliasrec-index payload)
+                                (aliasrec-name payload))))
                      ;; slice 4: record what this alias-introduced
                      ;; core index resolves to (the canon signature
                      ;; checks and bag providers read it)
@@ -5617,10 +5826,34 @@ the number of enclosing component/type scopes (outer aliases)."
                      ;; CR keeps the compiler's payload derivation
                      ;; local to this clause.
                      (let ((imms (canonrec-imms payload)))
-                       (dolist (imm imms)
-                         (when (and (integerp imm)
-                                    (>= imm (length (cval-types state))))
-                           (%verr "type index out of bounds")))
+                      ;; slice 5m (indicies ::7/::8): only the
+                      ;; TYPE-POSITION immediate bounds-checks
+                      ;; against the component type space — the
+                      ;; resource/stream/future built-ins carry it
+                      ;; at position 1; thread.new-indirect's
+                      ;; second imm is a CORE-TABLE idx and
+                      ;; waitable-set.wait/poll's a CORE-MEMORY idx
+                      ;; (not component typeidxs)
+                      (when (and (second imms)
+                                 (integerp (second imms))
+                                 (member (first imms)
+                                         '(:resource-new :resource-drop
+                                           :resource-rep :stream-new
+                                           :stream-read :stream-write
+                                           :stream-cancel-read
+                                           :stream-cancel-write
+                                           :stream-drop-readable
+                                           :stream-drop-writable
+                                           :stream-forward :future-new
+                                           :future-read :future-write
+                                           :future-cancel-read
+                                           :future-cancel-write
+                                           :future-drop-readable
+                                           :future-drop-writable
+                                           :future-forward))
+                        (when (>= (second imms)
+                                   (length (cval-types state)))
+                          (%verr "type index out of bounds"))))
                        (when (and (member (first imms)
                                           '(:resource-new :resource-drop
                                             :resource-rep))

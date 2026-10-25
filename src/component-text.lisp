@@ -332,7 +332,22 @@ sort idx)."
   (let* ((inst-sort (if (member sort '(:core-func :core-memory :core-table
                                           :core-global :core-tag :core-module))
                         :core-instance :instance))
-         (inst (%parse-sortidx-atom (first items) inst-sort scope))
+         ;; slice 5m (instantiation ::81): a (core <sort> $i "n")
+         ;; projection may source a COMPONENT instance (the
+         ;; validator then checks the projected item's kind — 'is
+         ;; not a module'); when the id is bound ONLY in the
+         ;; component-instance space, fall back and mark the alias
+         ;; chain :export (the component instance table)
+         (comp-fallback (and (eq inst-sort :core-instance)
+                             (%tokp (first items))
+                             (not (%lookup scope
+                                           (%tok-text (first items))
+                                           :core-instance))
+                             (%lookup scope (%tok-text (first items))
+                                      :instance)))
+         (inst (or comp-fallback
+                   (%parse-sortidx-atom (first items) inst-sort
+                                         scope)))
          (names (cdr items)))
     (unless (and names (every (lambda (n)
                                 (and (%tokp n)
@@ -346,15 +361,21 @@ sort idx)."
         ;; of the preceding alias (Explainer 386-388): the alias's
         ;; sort is INSTANCE and its index the preceding alias's
         ;; instance slot; only the LAST name aliases the final SORT
-        ;; (external-visibility ::57's (type $i "i1" "i2") chain)
-        (let ((last-p (null (rest (member name-tok names)))))
+        ;; (external-visibility ::57's (type $i "i1" "i2") chain).
+        ;; Slice 5m (indicies ::0): under comp-fallback the chain
+        ;; runs in the COMPONENT instance space (kind :export,
+        ;; intermediates allocate :instance)
+        (let* ((last-p (null (rest (member name-tok names))))
+               (eff-inst-sort (if comp-fallback :instance inst-sort)))
           (%push-def :alias (make-aliasrec
-                             :kind (if (eq inst-sort :core-instance)
-                                       :core-export :export)
-                             :sort (if last-p sort inst-sort)
+                             :kind (if comp-fallback
+                                       :export
+                                       (if (eq inst-sort :core-instance)
+                                           :core-export :export))
+                             :sort (if last-p sort eff-inst-sort)
                              :index cur-idx
                              :name (%string-token name-tok) :offset 0))
-          (setf cur-idx (%alloc scope (if last-p sort inst-sort)
+          (setf cur-idx (%alloc scope (if last-p sort eff-inst-sort)
                                 nil))))
       (values sort cur-idx))))
 
@@ -389,7 +410,12 @@ idx name+). Returns (values sort idx)."
 
 (defun %parse-coreidx (item sort scope)
   "A core sort's index (already unwrapped from any 'core' head by the
-caller): u32 | $id | (sort idx name+). Returns (values sort idx)."
+caller): u32 | $id | (sort idx name+). Returns (values sort idx).
+Slice 5m (instantiation ::41/::59): the bare (func ...)/(memory ...)
+descriptor heads inside a CORE context name the CORE sorts — (func
+$i \"g\") with $i a CORE instance projects the core-func (the
+component-level reading previously failed with 'unknown instance
+$i')."
   (cond
    ((%tokp item)
     (let ((v (%parse-sortidx-atom item sort scope)))
@@ -399,9 +425,15 @@ caller): u32 | $id | (sort idx name+). Returns (values sort idx)."
            (head (first items)))
       (unless (and (%tokp head) (eq (%tok-kind head) :keyword))
         (%text-err (%node-start item) "expected a core index"))
-      ;; head is the sort name; the items are idx name*
-      (%parse-projection (%sort-of-name (%tok-text head))
-                         (rest items) scope)))
+      ;; head is the sort name; the items are idx name*. In a core
+      ;; context the bare head names the CORE sort: (func ...) =
+      ;; :core-func, (memory ...) = :core-memory, ...
+      (let ((core-sort (cdr (assoc (%tok-text head)
+                                   *core-sort-names*
+                                   :test #'string=))))
+        (%parse-projection (or core-sort
+                               (%sort-of-name (%tok-text head)))
+                           (rest items) scope))))
    (t (%text-err (%node-start item) "expected an index"))))
 
 ;;; ---- primitives and value types ----
@@ -859,10 +891,16 @@ format has no per-declarator type space, only the component's)."
                        ;; then (core module (type $t)))
                        (cdr (%parse-sortidx-atom (first ti)
                                                  :core-type scope))))
-                    (t
+                    ((and mt (consp mt))
                      ;; intern the inline moduletype as a core type
                      (%intern-core-type
-                      intern-scope (%parse-moduletype mt scope)))))
+                      intern-scope (%parse-moduletype mt scope)))
+                    (t
+                     ;; slice 5m (indicies ::10): a BARE (core
+                     ;; module) declarator ascription (no decls, no
+                     ;; type-use) — the dummy marker (no core-type
+                     ;; space resolution)
+                     :none)))
              (or mid id)))))
        (t (%text-err (%tok-start head)
                      "unknown external sort ~a" h))))))
@@ -1438,7 +1476,12 @@ own type space (slice 5, family E)."
                                          "unknown type ~a"
                                          (%tok-text tk)))
                             (cdr hit)))))
-              (list :func 0))))
+              ;; slice 5m (core-modules ::2): a BARE (func) export
+              ;; implicitly declares a fresh functype — marked so
+              ;; the validator counts it toward the moduletype's
+              ;; type space (an explicit (type 0) with no decls is
+              ;; the OOB fixture)
+              (list :func 0 :implicit))))
        ((string= h "memory")
         (list :memory (%parse-core-limits (rest items))))
        ((string= h "table")
@@ -1649,14 +1692,25 @@ introduced func (resources.wast ::62, abi.wast ::3)."
       (list kind)))))
 
 (defun %parse-builtin-typeidx (item scope)
-  "A built-in's type immediate: u32 | $id | (type $t) | (type u32)."
+  "A built-in's type immediate: u32 | $id | (type $t) | (type u32) |
+(type $i \"T\") — slice 5m (indicies ::9): the (type ...) form may
+carry an INSTANCE PROJECTION chain (the alias sugar in immediate
+position)."
   (cond
    ((and (%tokp item) (member (%tok-kind item) '(:nat :int)))
     (%nat-token item))
    ((%tokp item)
     (cdr (%parse-sortidx-atom item :type scope)))
    ((and (%nodep item) (string= (%head-text item) "type"))
-    (%parse-typeidx (second (%children item)) scope))
+    (let ((ti (rest (%children item))))
+      (if (cdr ti)
+          ;; (type $i "T" ...): a projection chain — the aliases
+          ;; emit and the FINAL index is the introduced type
+          (multiple-value-bind (s i)
+              (%parse-projection :type ti scope)
+            (declare (ignore s))
+            i)
+          (%parse-typeidx (first ti) scope))))
    (t (%text-err 0 "expected a type index"))))
 
 (defun %parse-builtin-idx (item sort scope)
@@ -1671,11 +1725,13 @@ introduced func (resources.wast ::62, abi.wast ::3)."
            (head (first items)))
       (cond
        ((and (%tokp head) (string= (%tok-text head) "core"))
-        (let ((idx-item (third items)))
-          (if (and (%tokp idx-item)
-                   (member (%tok-kind idx-item) '(:nat :int)))
-              (%nat-token idx-item)
-              (cdr (%parse-sortidx-atom idx-item sort scope)))))
+        ;; slice 5m (indicies ::7/::8): the (core <sort> ...) form
+        ;; is a full PROJECTION index — (core table $m "tbl") with
+        ;; $m a CORE instance aliases the instance's export
+        (multiple-value-bind (s i)
+            (%parse-projection sort (cddr items) scope)
+          (declare (ignore s))
+          i))
        ((and (%tokp head) (string= (%tok-text head) "type"))
         (%parse-typeidx (second items) scope))
        (t
@@ -1758,7 +1814,23 @@ introduced func (resources.wast ::62, abi.wast ::3)."
           ;; updated by the validator's :canon arm already, so only
           ;; the def itself is pushed here.
           (case (wasmdown.component:canonrec-kind cr)
-            ((:lift :lower) (%alloc scope :func nil))
+            (:lift (%alloc scope :func nil))
+            (:lower
+             ;; slice 5m (abi ::10): a LOWER canon introduces a CORE
+             ;; func (its trailing (core func $id) target names it) —
+             ;; the parser's core-func space must consume the index
+             ;; and BIND the target id so later projections (e.g.
+             ;; the lift's (core func $m "log") alias) allocate
+             ;; BEHIND it
+             (let ((tgt (car (last items))))
+               (%alloc scope :core-func
+                       (and (%nodep tgt)
+                            (%children tgt)
+                            (second (%children tgt))
+                            (%tokp (second (%children tgt)))
+                            (eq (%tok-kind (second (%children tgt)))
+                                :id)
+                            (%tok-text (second (%children tgt)))))))
             (t nil))))
        ((string= h "import")
         (multiple-value-bind (name attrs et id)
@@ -1812,6 +1884,22 @@ substituted for 'core module $id'."
                         (eq (%tok-kind (first items)) :id))
               (first items)))
          (rest-items (if id (rest items) items))
+         ;; slice 5m (indicies ::11): the def-level EXPORT SUGAR -
+         ;; (core module (export "n")) with the single (export
+         ;; <string>) node = define + export the module as "n"
+         ;; (a component-level export, not a wat field); strip it
+         ;; from the wat span and emit the :export def
+         (sugar-export
+          (and (= (length rest-items) 1)
+               (%nodep (first rest-items))
+               (string= (%head-text (first rest-items)) "export")
+               (= (length (%children (first rest-items))) 2)
+               (%tokp (second (%children (first rest-items))))
+               (eq (%tok-kind (second (%children (first rest-items))))
+                   :string)
+               (%string-token
+                (second (%children (first rest-items))))))
+         (rest-items (if sugar-export nil rest-items))
          (body-start (if rest-items
                          (if (%nodep (first rest-items))
                              (second (first rest-items))
@@ -1830,7 +1918,15 @@ substituted for 'core module $id'."
          (module (wasmdown.text:parse-wat text)))
     (%flush-interned scope)
     (%push-def :core-module module)
-    (%alloc scope :core-module (if id (stoken-text id) nil))))
+    (let ((idx (%alloc scope :core-module
+                        (if id (stoken-text id) nil))))
+      (when sugar-export
+        (%push-def :export
+                   (make-exportrec :name sugar-export :attrs nil
+                                   :sortidx (cons :core-module idx)
+                                   :type nil :offset 0))
+        (%alloc scope :core-module nil))
+      idx)))
 
 (defun %parse-core-instance-def (items scope)
   "(core instance $id? (instantiate $m (with ...)*) | exports+)."
@@ -1840,8 +1936,21 @@ substituted for 'core module $id'."
        ((and (%nodep first-item) (string= (%head-text first-item)
                                           "instantiate"))
         (let* ((ii (rest (%children first-item)))
-               (m (cdr (%parse-sortidx-atom (first ii) :core-module
-                                            scope)))
+               ;; slice 5m (indicies ::2): the target may be an
+               ;; inline PROJECTION — (module $i "x") resolves the
+               ;; $i instance's "x" export (the alias-introduced
+               ;; core-module index); the emitted aliases + the
+               ;; final index form the instantiation target
+               (m (if (and (%nodep (first ii))
+                           (cdr (%children (first ii))))
+                      (multiple-value-bind (s i)
+                          (%parse-projection
+                           :core-module
+                           (rest (%children (first ii))) scope)
+                        (declare (ignore s))
+                        i)
+                      (cdr (%parse-sortidx-atom (first ii)
+                                                :core-module scope))))
                (args '()))
           (dolist (w (rest ii))
             (multiple-value-bind (name idx)
@@ -1868,7 +1977,10 @@ substituted for 'core module $id'."
 
 (defun %parse-inline-export (e scope)
   "One (export \"name\" <core-externidx>) of an inline-export list.
-Returns (name sort . idx) — the coreinstrec export shape."
+Returns (name sort . idx) — the coreinstrec export shape. Slice 5m
+(instantiation ::41/::59): inside a CORE instance's inline bag the
+(func ...)/(memory ...) descriptor heads name the CORE sorts — the
+projection resolves the source instance in the CORE-instance space."
   (unless (and (%nodep e) (string= (%head-text e) "export"))
     (%text-err (%node-start e) "expected (export ...)"))
   (let* ((ei (rest (%children e)))
@@ -2093,8 +2205,20 @@ sugar."
          ((and (%nodep first-item)
                (string= (%head-text first-item) "instantiate"))
           (let* ((ii (rest (%children first-item)))
-                 (c (cdr (%parse-sortidx-atom (first ii) :component
-                                              scope)))
+                 ;; slice 5m (indicies ::2): the target may be an
+                 ;; inline PROJECTION — (component $i "x") resolves
+                 ;; the instance's "x" export
+                 (c (if (and (%nodep (first ii))
+                             (cdr (%children (first ii))))
+                        (multiple-value-bind (s i)
+                            (%parse-projection
+                             :component
+                             (rest (%children (first ii))) scope)
+                          (declare (ignore s))
+                          i)
+                        (cdr (%parse-sortidx-atom (first ii)
+                                                  :component
+                                                  scope))))
                  (args '()))
             (dolist (w (rest ii))
               (let* ((wi (rest (%children w)))

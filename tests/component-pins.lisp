@@ -1348,6 +1348,249 @@ wast runner's string-to-bytes decoder (same grammar as the suite)."
       (is (search "canonical option `memory` is required"
                   (wasmdown:wasmdown-error-message c))))))
 
+
+(test component/imported-component-space-pins
+  ;; slice 5m (resources ::34): the COMPONENT index space counts
+  ;; :component defs AND :component imports (%component-at, the
+  ;; instantiate-args target walk); an imported component's export
+  ;; table reads the ascribed ct with (eq i) exports resolved to the
+  ;; eq TARGET's export name; and %instance-export-identity's
+  ;; name-form uses the ENTRY's cdr (the identity source), so
+  ;; T3=(eq $T2) shares T2's identity.
+  (flet ((expect-invalid (src)
+           (block nil
+             (handler-case
+                 (wasmdown.component:validate-component
+                  (wasmdown.component.text::parse-component-text src))
+               (wasmdown:validation-error (c) (return c)))
+             (error "expected wasmdown:validation-error"))))
+    ;; ::34's positive: the imported-$C + $eq chain validates
+    (wasmdown.component:validate-component
+     (wasmdown.component.text::parse-component-text
+      "(component (component $Outer (import \"C\" (component $C (export \"T1\" (type (sub resource))) (export \"T2\" (type $T2 (sub resource))) (export \"T3\" (type (eq $T2))))) (instance $c (instantiate $C)) (alias export $c \"T1\" (type $T1)) (alias export $c \"T2\" (type $T2)) (alias export $c \"T3\" (type $T3)) (component $eq (import \"a\" (type $a (sub resource))) (import \"b\" (type (eq $a)))) (instance (instantiate $eq (with \"a\" (type $T2)) (with \"b\" (type $T3))))))"))
+    ;; the component-index-space shift: an instance of an imported
+    ;; component followed by a nested component def — the instance
+    ;; must NOT resolve to the later component
+    (wasmdown.component:validate-component
+     (wasmdown.component.text::parse-component-text
+      "(component (component $C2 (import \"x\" (type $x (sub resource))) (export \"T\" (type $x))) (component $O (import \"C\" (component $C (export \"T\" (type (sub resource))))) (instance $c (instantiate $C)) (alias export $c \"T\" (type $T)) (component $eq (type $r (resource (rep i32)))) (instance $e (instantiate $eq))) (instance $o (instantiate $O (with \"C\" (component $C2)))))"))
+    ;; two DIFFERENT exported resources stay distinct (the (eq $T2)
+    ;; sharing must not leak to T1)
+    (let ((c (expect-invalid
+              "(component (component $Outer (import \"C\" (component $C (export \"T1\" (type (sub resource))) (export \"T2\" (type $T2 (sub resource))) (export \"T3\" (type (eq $T2))))) (instance $c (instantiate $C)) (alias export $c \"T1\" (type $T1)) (alias export $c \"T2\" (type $T2)) (alias export $c \"T3\" (type $T3)) (component $eq (import \"a\" (type $a (sub resource))) (import \"b\" (type (eq $a)))) (instance (instantiate $eq (with \"a\" (type $T1)) (with \"b\" (type $T3))))))")))
+      (is (search "resource types are not the same"
+                  (wasmdown:wasmdown-error-message c))))))
+
+
+(test component/lower-canon-core-alloc-pins
+  ;; slice 5m (abi ::10): a LOWER canon introduces a CORE func — the
+  ;; parser's canon-def branch allocates + binds it (the trailing
+  ;; (core func $id) target) so later projections allocate BEHIND
+  ;; it; the lift's (core func $m "log") projection previously
+  ;; collided with the lower's target slot ('function index out of
+  ;; bounds' at validate).
+  (flet ((expect-invalid (src)
+           (block nil
+             (handler-case
+                 (wasmdown.component:validate-component
+                  (wasmdown.component.text::parse-component-text src))
+               (wasmdown:validation-error (c) (return c)))
+             (error "expected wasmdown:validation-error"))))
+    ;; the abi ::10 shape: two lowers then three lifts off one
+    ;; core instance — validates cleanly
+    (wasmdown.component:validate-component
+     (wasmdown.component.text::parse-component-text
+      "(component (import \"log\" (func $log (param \"msg\" string))) (core module $Libc (memory (export \"mem\") 1) (func (export \"realloc\") (param i32 i32 i32 i32) (result i32) unreachable)) (core instance $libc (instantiate $Libc)) (alias core export $libc \"mem\" (core memory $mem)) (alias core export $libc \"realloc\" (core func $realloc)) (canon lower (func $log) string-encoding=utf8 (memory $mem) (realloc $realloc) (core func $log1p)) (canon lower (func $log) string-encoding=utf16 (memory $mem) (realloc $realloc) (core func $log2p)) (core module $M (func (export \"log\") (param i32 i32))) (core instance $m (instantiate $M)) (func (export \"log1\") (param \"msg\" string) (canon lift (core func $m \"log\") string-encoding=utf8 (memory $mem) (realloc $realloc))) (func (export \"log2\") (param \"msg\" string) (canon lift (core func $m \"log\") string-encoding=utf16 (memory $mem) (realloc $realloc))))"))
+    ;; the lowered target id is BOUND: a later reference to $log1p
+    ;; resolves (here: reused as a lift source whose type mismatches —
+    ;; the reference must not be 'unknown')
+    (let ((c (expect-invalid
+              "(component (import \"log\" (func $log (param \"msg\" string))) (core module $Libc (memory (export \"mem\") 1) (func (export \"realloc\") (param i32 i32 i32 i32) (result i32) unreachable)) (core instance $libc (instantiate $Libc)) (alias core export $libc \"mem\" (core memory $mem)) (alias core export $libc \"realloc\" (core func $realloc)) (canon lower (func $log) string-encoding=utf8 (memory $mem) (realloc $realloc) (core func $log1p)) (core module $M (func (export \"r\") (param i64 i64))) (core instance $m (instantiate $M)) (func (export \"r\") (param \"msg\" string) (canon lift (core func $m \"r\") string-encoding=utf8 (memory $mem) (realloc $realloc))))")))
+      (is (search "lowered parameter types"
+                  (wasmdown:wasmdown-error-message c))))))
+
+
+(test component/moduletype-inner-rules-pins
+  ;; slice 5m (core-modules ::2/::5/::6): the moduletype rules apply
+  ;; inside component/instance TYPES too (the inner :core-type walk
+  ;; calls %check-moduletype); a bare (func) export is MARKED
+  ;; :implicit by the parser and counts toward the moduletype's own
+  ;; type space; an explicit (func (type n)) bounds-checks against
+  ;; it; a :core-alias declarator also introduces a type index.
+  (flet ((expect-invalid (src)
+           (block nil
+             (handler-case
+                 (wasmdown.component:validate-component
+                  (wasmdown.component.text::parse-component-text src))
+               (wasmdown:validation-error (c) (return c)))
+             (error "expected wasmdown:validation-error"))))
+    ;; ::2 — the explicit (type 0) with NO type decls is OOB
+    (let ((c (expect-invalid
+              "(component (core type (module (export \"a\" (func (type 0))))))")))
+      (is (search "type index out of bounds"
+                  (wasmdown:wasmdown-error-message c))))
+    ;; ::5 — duplicate export names inside a component type
+    (let ((c (expect-invalid
+              "(component (type (component (core type (module (export \"\" (func)) (export \"\" (func)))))))")))
+      (is (search "already defined"
+                  (wasmdown:wasmdown-error-message c))))
+    ;; ::6 — the same rule inside an instance type
+    (let ((c (expect-invalid
+              "(component (type (instance (core type (module (export \"\" (func)) (export \"\" (func)))))))")))
+      (is (search "already defined"
+                  (wasmdown:wasmdown-error-message c))))
+    ;; the positive: a bare (func) + a later explicit (type 0) resolve
+    (wasmdown.component:validate-component
+     (wasmdown.component.text::parse-component-text
+      "(component (core type (module (export \"a\" (func)) (export \"b\" (func (type 0))))))"))))
+
+
+(test component/core-instantiation-rules-pins
+  ;; slice 5m (instantiation ::41/::56/::59/::78/::81): a CORE
+  ;; instance's inline bag descriptor heads name the CORE sorts
+  ;; ((func $i "g") projects the core-func — the component-level
+  ;; reading previously failed 'unknown instance'); a (core <sort>
+  ;; $i "n") projection may source a COMPONENT instance (the alias
+  ;; flips to the component export table; the validator's sort check
+  ;; rejects 'is not a module'); duplicate with-arg names and
+  ;; duplicate inline-bag export names in core instantiations are
+  ;; rejected; a (core export) alias's name must exist in the
+  ;; provider's export list.
+  (flet ((expect-invalid (src)
+           (block nil
+             (handler-case
+                 (wasmdown.component:validate-component
+                  (wasmdown.component.text::parse-component-text src))
+               (wasmdown:validation-error (c) (return c)))
+             (error "expected wasmdown:validation-error"))))
+    ;; ::41 — the inline core-instance bag projecting a core func
+    (let ((c (expect-invalid
+              "(component (core module $m1 (import \"\" \"f\" (func))) (core module $m2 (func (export \"g\") (param i32))) (core instance $i (instantiate $m2)) (core instance (instantiate $m1 (with \"\" (instance (export \"f\" (func $i \"g\")))))))")))
+      (is (search "expected: (func)"
+                  (wasmdown:wasmdown-error-message c))))
+    ;; ::56 — duplicate with-arg names
+    (let ((c (expect-invalid
+              "(component (core module $m) (core instance $i (instantiate $m)) (core instance (instantiate $m (with \"a\" (instance $i)) (with \"a\" (instance $i)))))")))
+      (is (search "duplicate module instantiation argument"
+                  (wasmdown:wasmdown-error-message c))))
+    ;; ::59 — duplicate inline-bag export names
+    (let ((c (expect-invalid
+              "(component (core module $m (func (export \"f\"))) (core instance $i (instantiate $m)) (core instance (export \"a\" (func $i \"f\")) (export \"a\" (func $i \"f\"))))")))
+      (is (search "already defined"
+                  (wasmdown:wasmdown-error-message c))))
+    ;; ::78 — a (core export) alias's name must exist
+    (let ((c (expect-invalid
+              "(component (core module $m) (core instance $i (instantiate $m)) (alias core export $i \"a\" (core func)))")))
+      (is (search "has no export named"
+                  (wasmdown:wasmdown-error-message c))))
+    ;; ::81 — a component instance's non-module export aliased as a
+    ;; core module
+    (let ((c (expect-invalid
+              "(component (component $c (component $inner) (export \"a\" (component $inner))) (instance $i (instantiate $c)) (export \"a\" (core module $i \"a\")))")))
+      (is (search "is not a module"
+                  (wasmdown:wasmdown-error-message c))))
+    ;; the positive: a valid core bag projection (matching signature)
+    (wasmdown.component:validate-component
+     (wasmdown.component.text::parse-component-text
+      "(component (core module $m1 (import \"\" \"f\" (func))) (core module $m2 (func (export \"g\"))) (core instance $i (instantiate $m2)) (core instance (instantiate $m1 (with \"\" (instance (export \"f\" (func $i \"g\")))))))"))))
+
+
+(test component/instance-chain-projection-pins
+  ;; slice 5m (indicies ::0): a multi-level (func $j "a" "b" "f")
+  ;; chain projects through NESTED inline instance cts — the
+  ;; ct-branch table build carries the DOUBLE-NESTED ct in
+  ;; (:instance . ct) entries (%ct-decl-at resolves the declarator
+  ;; position), and the hash-branch projection resolves a ct-carrying
+  ;; entry to that ct's own export table; under comp-fallback the
+  ;; chain's intermediate aliases allocate in the COMPONENT instance
+  ;; space.
+  (flet ((expect-invalid (src)
+           (block nil
+             (handler-case
+                 (wasmdown.component:validate-component
+                  (wasmdown.component.text::parse-component-text src))
+               (wasmdown:validation-error (c) (return c)))
+             (error "expected wasmdown:validation-error"))))
+    ;; the positive: the two-level chain validates
+    (wasmdown.component:validate-component
+     (wasmdown.component.text::parse-component-text
+      "(component (component (component $C (import \"x\" (func))) (import \"f\" (func $f)) (import \"j\" (instance $j (export \"a\" (instance (export \"b\" (instance (export \"f\" (func)))))))) (instance (instantiate $C (with \"x\" (func $j \"a\" \"b\" \"f\"))))))"))
+    ;; a missing intermediate name still rejects
+    (let ((c (expect-invalid
+              "(component (component (component $C (import \"x\" (func))) (import \"f\" (func $f)) (import \"j\" (instance $j (export \"a\" (instance (export \"b\" (instance (export \"f\" (func)))))))) (instance (instantiate $C (with \"x\" (func $j \"a\" \"zz\" \"f\"))))))")))
+      (is (search "has no export named"
+                  (wasmdown:wasmdown-error-message c))))))
+
+
+(test component/builtin-immediate-pins
+  ;; slice 5m (indicies ::7/::8/::10): the canon built-ins'
+  ;; immediates accept PROJECTION forms — (memory (core memory
+  ;; $m "mem")) / (core table $m "tbl") resolve through
+  ;; %parse-projection (the bare (core ...) branch previously read
+  ;; the THIRD item as a plain index); the builtin's type-position
+  ;; immediate alone bounds-checks against the component type space
+  ;; (thread.new-indirect's second imm is a CORE-TABLE idx, the
+  ;; waitable-set's a CORE-MEMORY idx); and a BARE (core module)
+  ;; import ascription carries the :NONE marker = the EMPTY
+  ;; moduletype (the arg must have NO imports - instantiation
+  ;; ::34) while (export "m" (core module)) declarators resolve
+  ;; structurally.
+  (flet ((expect-invalid (src)
+           (block nil
+             (handler-case
+                 (wasmdown.component:validate-component
+                  (wasmdown.component.text::parse-component-text src))
+               (wasmdown:validation-error (c) (return c)))
+             (error "expected wasmdown:validation-error"))))
+    ;; the waitable-set projections validate
+    (wasmdown.component:validate-component
+     (wasmdown.component.text::parse-component-text
+      "(component (component (core module $M (memory (export \"mem\") 1)) (core instance $m (instantiate $M)) (alias core export $m \"mem\" (core memory $mem)) (canon waitable-set.wait (memory $mem) (core func)) (canon waitable-set.wait (memory 0) (core func)) (canon waitable-set.wait (memory (core memory $mem)) (core func)) (canon waitable-set.wait (memory (core memory $m \"mem\")) (core func)) (canon waitable-set.poll (memory (core memory $mem)) (core func)) (canon waitable-set.poll (memory (core memory $m \"mem\")) (core func))))"))
+    ;; the thread.new-indirect projections validate
+    (wasmdown.component:validate-component
+     (wasmdown.component.text::parse-component-text
+      "(component (component (core type $ft (func (param i32))) (core module $M (table (export \"tbl\") 1 funcref)) (core instance $m (instantiate $M)) (alias core export $m \"tbl\" (core table $tbl)) (canon thread.new-indirect 0 0 (core func)) (canon thread.new-indirect $ft $tbl (core func)) (canon thread.new-indirect $ft (core table $tbl) (core func)) (canon thread.new-indirect (core type $ft) $tbl (core func)) (canon thread.new-indirect (core type $ft) (core table $tbl) (core func)) (canon thread.new-indirect (core type $ft) (core table $m \"tbl\") (core func))))"))
+    ;; ::10 - the dummy declarator ascriptions resolve
+    (wasmdown.component:validate-component
+     (wasmdown.component.text::parse-component-text
+      "(component (component (import \"a\" (instance $foo (export \"v\" (component)) (export \"m\" (core module)))) (export \"v\" (component $foo \"v\")) (export \"w\" (core module $foo \"m\"))))"))
+    ;; a BARE (core module) import with an arg that HAS imports
+    ;; rejects (the empty moduletype)
+    (let ((c (expect-invalid
+              "(component (core module $m (import \"\" \"extra\" (global i32))) (component $c (import \"m\" (core module))) (instance (instantiate $c (with \"m\" (core module $m)))))")))
+      (is (search "missing expected import"
+                  (wasmdown:wasmdown-error-message c))))))
+
+
+(test component/inline-target-sugar-pins
+  ;; slice 5m (indicies ::2/::11): the (instantiate (module $i
+  ;; "x")) / (instantiate (component $i "x")) targets accept
+  ;; inline PROJECTION forms (the emitted alias chain + the final
+  ;; index); and a (core module (export "n")) definition's single
+  ;; (export <string>) node is the DEF-LEVEL EXPORT SUGAR - the
+  ;; module is defined and exported as "n" (a component-level
+  ;; export), not a wat field.
+  (flet ((expect-invalid (src)
+           (block nil
+             (handler-case
+                 (wasmdown.component:validate-component
+                  (wasmdown.component.text::parse-component-text src))
+               (wasmdown:validation-error (c) (return c)))
+             (error "expected wasmdown:validation-error"))))
+    ;; the ::2 shapes validate (both sub-components)
+    (wasmdown.component:validate-component
+     (wasmdown.component.text::parse-component-text
+      "(component (component (import \"a\" (instance $i (export \"x\" (core module)))) (core instance (instantiate (module $i \"x\")))) (component (import \"a\" (instance $i (export \"x\" (component)))) (instance (instantiate (component $i \"x\")))))"))
+    ;; the ::11 export sugar validates and the export exists
+    (wasmdown.component:validate-component
+     (wasmdown.component.text::parse-component-text
+      "(component (component (type (export \"foo\") u8) (core module (export \"x\"))))"))
+    ;; a projection target naming a MISSING export still rejects
+    (let ((c (expect-invalid
+              "(component (component (import \"a\" (instance $i (export \"x\" (core module)))) (core instance (instantiate (module $i \"zz\")))))")))
+      (is (search "has no export named"
+                  (wasmdown:wasmdown-error-message c))))))
+
 (defun run-component-pins ()
   "Run the component pins (registered via TEST; returns T)."
   (let ((wasmdown.test::*tests*
@@ -1373,6 +1616,13 @@ wast runner's string-to-bytes decoder (same grammar as the suite)."
                       component/external-visibility-type-pins
                       component/annotated-name-resource-pins
                       component/inline-func-shape-pins
+                      component/imported-component-space-pins
+                      component/lower-canon-core-alloc-pins
+                      component/moduletype-inner-rules-pins
+                      component/core-instantiation-rules-pins
+                      component/instance-chain-projection-pins
+                      component/builtin-immediate-pins
+                      component/inline-target-sugar-pins
                       component/moduletype-outer-alias-pins
                       component/outer-alias-debruijn-pins
                       component/externtype-type-use-pins
