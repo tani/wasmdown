@@ -19,7 +19,7 @@ conformance gates. This repository delivers an honest **partial** slice
    tracked by loop number; the Component Model work is tracked by
    PLAN.md §14 milestone id (M7 slices) — the two counters never
    renumber each other.*
-   *Superseded in part (loops 18–24 + M7 slices 1–4, 2026-10-25): tail calls
+   *Superseded in part (loops 18–24 + M7 slices 1–5, 2026-10-25): tail calls
    (`return_call`/`return_call_indirect`, constant-stack trampoline),
    exception handling (tags, `try_table`, `throw`, named module
    definition/instance forms), typed function references
@@ -71,11 +71,23 @@ conformance gates. This repository delivers an honest **partial** slice
    core-functype signature checks via the flat-types builder,
    and the visibility table propagation) is implemented; the
    component lane measures 531 pass / 71 fail / 37
-   unsupported / 0 harness-error of 639. Still out of scope:
-   the outer-alias transitivity/alias-sort rules, the
-   resource-visibility walks, annotated resource-name
-   resolution, the indicies/core-modules residual shapes,
-   instantiation execution + linking, the canonical ABI,
+   unsupported / 0 harness-error of 639. M7 slice 5 (2026-10-25:
+   the canonopt string-encoding conflicts; the outer-alias de
+   Bruijn scope stack + the resource-transitivity walk + the
+   declarator sort restriction; the sort-aware binding table;
+   moduletype named aliases; the resource identity/generativity/
+   local-resource/dtor/borrow-transitivity canon rules; the
+   type-use visibility walks + projection chains + the
+   export-ascription compatibility; the annotated resource
+   names; the inline-functype shape for inverted lifts; the
+   imported component spaces + canon core-func alloc ordering +
+   moduletype inner rules + core instantiation rules + builtin
+   immediates + inline target sugar; the *outer-states* special
+   binding + nested-type outer threading) is implemented; the
+   component lane measures 603 pass / 0 fail / 36 unsupported /
+   0 harness-error of 639 — ZERO FAILS; the 36 unsupported are
+   valid binaries awaiting instantiation execution. Still out of
+   scope: instantiation execution + linking, the canonical ABI,
    resources, async, WIT-level Component/WASI, threads,
    FASL cache.
    `declared_support` stays `partial`.*
