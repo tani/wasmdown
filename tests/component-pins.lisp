@@ -1137,7 +1137,18 @@ wast runner's string-to-bytes decoder (same grammar as the suite)."
       "(component (type $R (resource (rep i32))) (component $C (import \"x\" (type $x (sub resource))) (export \"y\" (type $x))) (instance $c (instantiate $C (with \"x\" (type $R)))) (alias export $c \"y\" (type $R2)) (core func (canon resource.rep $R2)))"))
     (wasmdown.component:validate-component
      (wasmdown.component.text::parse-component-text
-      "(component (component $C (type $R (resource (rep i32))) (export \"r\" (type $R))) (instance $c (instantiate $C)) (alias export $c \"r\" (type $R)) (core func (canon resource.drop $R)))"))))
+      "(component (component $C (type $R (resource (rep i32))) (export \"r\" (type $R))) (instance $c (instantiate $C)) (alias export $c \"r\" (type $R)) (core func (canon resource.drop $R)))"))
+    ;; slice 5e (resources ::27/::28): the generative-per-imported-
+    ;; instance identity — two imports of ONE instance type carry
+    ;; DISTINCT resources; one import's exported resource is stable
+    ;; across its type-alias and its func-type's (own $r)
+    (wasmdown.component:validate-component
+     (wasmdown.component.text::parse-component-text
+      "(component definition (type $I (instance (export \"r\" (type $r (sub resource))) (export \"f\" (func (result (own $r)))))) (import \"i1\" (instance $i1 (type $I))) (import \"i2\" (instance $i2 (type $I))) (component $C (import \"r\" (type $r (sub resource))) (import \"f\" (func (result (own $r))))) (instance (instantiate $C (with \"r\" (type $i1 \"r\")) (with \"f\" (func $i1 \"f\")))) (instance (instantiate $C (with \"r\" (type $i2 \"r\")) (with \"f\" (func $i2 \"f\")))))"))
+    (let ((c (expect-invalid
+              "(component definition (type $I (instance (export \"r\" (type $r (sub resource))) (export \"f\" (func (result (own $r)))))) (import \"i1\" (instance $i1 (type $I))) (import \"i2\" (instance $i2 (type $I))) (component $C (import \"r\" (type $r (sub resource))) (import \"f\" (func (result (own $r))))) (instance (instantiate $C (with \"r\" (type $i1 \"r\")) (with \"f\" (func $i2 \"f\")))))")))
+      (is (search "resource types are not the same"
+                  (wasmdown:wasmdown-error-message c))))))
 
 (defun run-component-pins ()
   "Run the component pins (registered via TEST; returns T)."

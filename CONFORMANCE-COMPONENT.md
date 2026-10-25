@@ -15,15 +15,15 @@ Baseline measurement, not a release gate (PLAN.md §12.8).
 
 | Outcome | Count |
 | --- | --- |
-| pass | 563 |
-| fail | 39 |
+| pass | 564 |
+| fail | 38 |
 | skip | 0 |
 | unsupported | 37 |
 | timeout | 0 |
 | harness-error | 0 |
 | **total** | **639** |
 
-Executed: 639 commands; pass rate 88.1%.
+Executed: 639 commands; pass rate 88.3%.
 
 ## Per-file counts
 
@@ -42,5 +42,5 @@ Executed: 639 commands; pass rate 88.1%.
 | component/kebab.wast | 36 | 0 | 0 | 0 |
 | component/max-value-size.wast | 8 | 0 | 0 | 0 |
 | component/outer-alias.wast | 31 | 0 | 0 | 0 |
-| component/resources.wast | 67 | 5 | 0 | 0 |
+| component/resources.wast | 68 | 4 | 0 | 0 |
 | component/version-suffix.wast | 41 | 0 | 0 | 0 |

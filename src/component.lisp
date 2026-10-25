@@ -2819,6 +2819,29 @@ substitution (the with-args' parent identities), so two instantiations
 of one component with the same resource argument share the identity
 (resources.wast ::44/::45).")
 
+(defvar *inst-gen-ids* (make-hash-table :test #'equal)
+  "Slice 5e (resources ::27/::28/::43): per-(instance, typeidx)
+GENERATIVE resource ids for IMPORTED instances typed by an instance
+ct — the instance type's (sub resource)/eq exports are abstract per
+instance, so two imports of one type carry distinct resources, and
+one import's exported resource is STABLE across all references.")
+
+(defvar *func-arg-ids* (make-hash-table :test #'eql)
+  "Slice 5e: per-FUNC-INDEX the identity vector of the func's OWN type
+space — populated when an (alias export $i \"f\" (func)) out of an
+IMPORTED instance resolves the source instance ct's functype; the
+func-arg matching resolves the PARENT side through the per-instance
+generative ids. Cleared at validation depth 1.")
+
+(defun %inst-gen-id (inst-idx typeidx)
+  "The generative resource id for imported instance INST-IDX's own
+type slot TYPEIDX (created on first use)."
+  (let ((key (cons inst-idx typeidx)))
+    (or (gethash key *inst-gen-ids*)
+        (let ((id (%fresh-resource-id)))
+          (setf (gethash key *inst-gen-ids*) id)
+          id))))
+
 (defvar *outer-states* nil
   "Slice 5 (outer-alias A): the stack of ENCLOSING validator states
 \(innermost first) threaded through validate-component's :component
@@ -3778,7 +3801,10 @@ its own space, then match."
   "A func import's check: the CHILD's functype (rebuilt in the child
 space, its typevar refs substituted by the with-args) matched against
 the PARENT func's actual functype (cval-func-types). The fixture
-messages (instantiation.wast ::24-::28)."
+messages (instantiation.wast ::24-::28). Slice 5e: the PARENT
+functype's own identity space (an IMPORTED-instance export's ct
+references its own per-instance generative ids — resources
+::27/::28) is looked up from *func-arg-ids* by the ARG's index."
   (let* ((pidx (sortidx-idx arg-si))
          (parent-ft (and (< pidx (length (cval-func-types state)))
                          (aref (cval-func-types state) pidx))))
@@ -3801,9 +3827,18 @@ messages (instantiation.wast ::24-::28)."
                (handler-case
                    (%ty-match-valtype (cdr a) (cdr b)
                                      ids nil
-                                     (cval-type-ids state) nil)
-                 (wasmdown:validation-error ()
-                   (%verr "type mismatch in function parameter `~a`" (car a)))))
+                                     (or (%func-arg-ids-at arg-si)
+                                         (cval-type-ids state))
+                                     nil)
+                 ;; slice 5e (resources ::28): a RESOURCE identity
+                 ;; mismatch carries its own fixture message through
+                 (wasmdown:validation-error (c)
+                   (let ((m (wasmdown:wasmdown-error-message c)))
+                     (if (and (search "resource" m)
+                              (search "not the same" m))
+                         (error c)
+                         (%verr "type mismatch in function parameter `~a`"
+                                (car a)))))))
       (cond
        ((and rw (not rg))
         (%verr "expected a result, found none"))
@@ -3811,9 +3846,16 @@ messages (instantiation.wast ::24-::28)."
         (%verr "expected no result, but found one"))
        ((and rw rg)
         (handler-case
-            (%ty-match-valtype rw rg ids nil (cval-type-ids state) nil)
-          (wasmdown:validation-error ()
-            (%verr "type mismatch with result type"))))))))
+            (%ty-match-valtype rw rg ids nil
+                               (or (%func-arg-ids-at arg-si)
+                                   (cval-type-ids state))
+                               nil)
+          (wasmdown:validation-error (c)
+            (let ((m (wasmdown:wasmdown-error-message c)))
+              (if (and (search "resource" m)
+                       (search "not the same" m))
+                  (error c)
+                  (%verr "type mismatch with result type"))))))))))
 (defun %parent-identity (si state)
   "The PARENT-space identity of a with-argument sortidx (a :type
 argument; NIL when unresolvable)."
@@ -3872,7 +3914,8 @@ whatever the with-args supplied (a parent-space :fresh resource, an
 same argument SHARE the resource (resources.wast ::44/::45)."
   (let ((ent (and (< inst-idx (length (cval-instance-types state)))
                   (aref (cval-instance-types state) inst-idx))))
-    (when (hash-table-p ent)
+    (cond
+     ((hash-table-p ent)
       (let ((hit (gethash name ent :missing)))
         (when (and (consp hit)
                    (eq (car hit) :type))
@@ -3887,7 +3930,96 @@ same argument SHARE the resource (resources.wast ::44/::45)."
                     ;; (instance, source) pair identity
                     (list :inst-export inst-idx (cdr hit))))
               ;; an ascribed (sub resource) export: fresh per NAME
-              (list :inst-export inst-idx name)))))))
+              (list :inst-export inst-idx name)))))
+     ((and (ct-p ent) (eq (ct-kind ent) :instance))
+      ;; slice 5e (resources ::27/::28/::43): an IMPORTED instance
+      ;; typed by an instance ct — its exported type's identity is
+      ;; the GENERATIVE per-(instance, slot) id (the slot counts the
+      ;; type-introducing declarators, the same convention as
+      ;; %instance-ct-ids)
+      (let ((slot (loop with n = -1
+                        for x across (ct-payload ent)
+                        when (member (typedecl-kind x)
+                                     '(:type :alias :import :export))
+                          do (incf n)
+                        when (and (eq (typedecl-kind x) :export)
+                                  (string= (first (typedecl-payload x))
+                                           name))
+                          return n
+                        finally (return nil))))
+        (when slot
+          (%inst-gen-id inst-idx slot))))
+     (t nil))))
+
+(defun %instance-ct-ids (inst-idx ct)
+  "Slice 5e (resources ::27/::28/::43): the identity vector for an
+IMPORTED instance's own type space — the instance ct's declarator
+sequence maps to GENERATIVE per-(instance, slot) resource ids for
+(sub resource) exports/imports, :ref chains for (eq i) bounds, and
+opaque markers otherwise. The SAME ids the type-alias identity uses
+(%inst-gen-id), so a func-type's (own $r) resolves to the same
+resource the (type $i \"r\") alias projects."
+  (let ((ids (make-array 16 :fill-pointer 0 :adjustable t))
+        (n -1))
+    (loop for d across (ct-payload ct)
+          do (let ((slot (incf n)))
+               (vector-push-extend
+                (etypecase d
+                  (null '(:opaque))
+                  (t (case (typedecl-kind d)
+                       (:type (cons :ct (typedecl-payload d)))
+                       (:alias '(:opaque))
+                       ((:import :export)
+                        (let ((et (third (typedecl-payload d))))
+                          (cond
+                           ((and (eq (car et) :type)
+                                 (eq (cdr et) :sub-resource))
+                            (%inst-gen-id inst-idx slot))
+                           ((and (eq (car et) :type)
+                                 (listp (cdr et))
+                                 (eq (car (cdr et)) :eq))
+                            (cons :ref (second (cdr et))))
+                           (t '(:opaque)))))
+                       (t '(:opaque)))))
+                ids)))
+    ids))
+
+(defun %instance-ct-export-functype (inst-idx name state)
+  "Slice 5e (resources ::27/::28/::43): the FUNCTYPE of an IMPORTED
+instance's exported func NAME, read from the instance ct (its (func
+(type i)) ascription indexes the ct's own type space — the
+declarator sequence's introduced indices). NIL when unresolvable."
+  (let ((ent (and (< inst-idx (length (cval-instance-types state)))
+                  (aref (cval-instance-types state) inst-idx))))
+    (when (and (ct-p ent) (eq (ct-kind ent) :instance))
+      (let ((d (find name (coerce (ct-payload ent) 'list)
+                     :key (lambda (x)
+                            (and (eq (typedecl-kind x) :export)
+                                 (first (typedecl-payload x))))
+                     :test #'equal)))
+        (when d
+          (let* ((et (third (typedecl-payload d)))
+                 (fti (and (eq (car et) :func) (integerp (cdr et))
+                           (cdr et))))
+            (when fti
+              (loop with n = -1
+                    for x across (ct-payload ent)
+                    do (case (typedecl-kind x)
+                         (:type (incf n)
+                                (when (= n fti)
+                                  (return (typedecl-payload x))))
+                         (:alias (incf n))
+                         ((:import :export) (incf n))
+                         (t nil))
+                    finally (return nil)))))))))
+
+(defun %func-arg-ids-at (arg-si)
+  "Slice 5e: the identity vector registered for the func ARG's own
+type space (%resolve-aliased-func's *func-arg-ids* entry). A helper:
+the inline gethash tripped the compiler's cross-arm type derivation."
+  (and (consp arg-si) (gethash (sortidx-idx arg-si) *func-arg-ids*)))
+
+(declaim (notinline %func-arg-ids-at))
 
 (defun %alias-exported-type-shape (payload state)
   "Slice 4 (family 3): the SOURCE type SHAPE an (alias export i n
@@ -4643,6 +4775,34 @@ handle's representation dropped on entry)."
                              (null (cdr sig)))))
           (%verr "wrong signature for a destructor"))))))
 
+(defun %resolve-aliased-func (payload state)
+  "Slice 5e (resources ::27/::28/::43): an EXPORT-aliased func out of
+an IMPORTED instance carries the source instance ct's functype (the
+child's with-arg matching reads it) AND its per-instance identity
+space (%instance-ct-ids, so both sides of the func-type match resolve
+in their own spaces); other sources stay nil. A helper: the inline
+version tripped the compiler's cross-arm payload type derivation."
+  (let* ((ent (and (eq (aliasrec-kind payload) :export)
+                   (< (aliasrec-index payload)
+                      (length (cval-instance-types state)))
+                   (aref (cval-instance-types state)
+                         (aliasrec-index payload))))
+         (ict (and (ct-p ent)
+                   (eq (ct-kind ent) :instance)
+                   ent)))
+    (vector-push-extend
+     (and ict
+          (%instance-ct-export-functype
+           (aliasrec-index payload)
+           (aliasrec-name payload)
+           state))
+     (cval-func-types state))
+    (when ict
+      (setf (gethash (1- (cval-funcs state))
+                     *func-arg-ids*)
+            (%instance-ct-ids
+             (aliasrec-index payload) ict)))))
+
 (defun validate-component (comp &key (outer-depth 0))
   "Validate a decoded component. Signals wasmdown:validation-error on
 any static rule violation; returns the component. OUTER-DEPTH is
@@ -4651,7 +4811,9 @@ the number of enclosing component/type scopes (outer aliases)."
     (when (= *validate-depth* 1)
       (clrhash *comp-state-stash*)
       (clrhash *inst-source-comp*)
-      (clrhash *inst-ids-stash*))
+      (clrhash *inst-ids-stash*)
+      (clrhash *inst-gen-ids*)
+      (clrhash *func-arg-ids*))
   (let ((state (make-cval
                 :types (make-array 16 :fill-pointer 0 :adjustable t)
                 :core-types (make-array 16 :fill-pointer 0 :adjustable t)
@@ -4953,7 +5115,11 @@ the number of enclosing component/type scopes (outer aliases)."
                                             (cval-vis-exports state))
                                    t)))
                     (:func (incf (cval-funcs state))
-                           (vector-push-extend nil (cval-func-types state)))
+                           ;; slice 5e (resources ::27/::28/::43): see
+                           ;; %resolve-aliased-func (a helper: the
+                           ;; inline version tripped the compiler's
+                           ;; cross-arm payload type derivation)
+                           (%resolve-aliased-func payload state))
                     (:component (incf (cval-components state)))
                     (:instance (incf (cval-instances state))
                                ;; slice 4 (family 3): the aliased
