@@ -1591,6 +1591,39 @@ wast runner's string-to-bytes decoder (same grammar as the suite)."
       (is (search "has no export named"
                   (wasmdown:wasmdown-error-message c))))))
 
+
+(test component/outer-alias-special-binding-pins
+  ;; slice 5m final (indicies ::9): the walk's (let
+  ;; ((*outer-states* (cons outer ...)))) binds DYNAMICALLY —
+  ;; the defvar must precede the walk (a let of an unproclaimed
+  ;; symbol compiles LEXICAL and %outer-state-at never saw the
+  ;; consed stack); and a nested TYPE declarator's walk threads
+  ;; the ENCLOSING TYPE's INNER space as its outer (an (outer 1)
+  ;; alias inside $T2 crosses into the sibling $r's space).
+  (flet ((expect-invalid (src)
+           (block nil
+             (handler-case
+                 (wasmdown.component:validate-component
+                  (wasmdown.component.text::parse-component-text src))
+               (wasmdown:validation-error (c) (return c)))
+             (error "expected wasmdown:validation-error"))))
+    ;; ::9's shape: the inline instance ct's (type (eq $T))
+    ;; referencing the parent-scope $T validates
+    (wasmdown.component:validate-component
+     (wasmdown.component.text::parse-component-text
+      "(component (component (type $T (future u32)) (import \"i\" (instance $i (export \"T\" (type (eq $T))))) (canon future.new $T (core func)) (canon future.new 0 (core func)) (canon future.new (type $T) (core func)) (canon future.new (type 0) (core func)) (canon future.new (type $i \"T\") (core func))))"))
+    ;; resources ::30's chain still validates (the sibling $r
+    ;; resolution through the nested $T2)
+    (wasmdown.component:validate-component
+     (wasmdown.component.text::parse-component-text
+      "(component (type $X (component (type $T (instance (export \"r\" (type (sub resource))))) (export \"t\" (instance $t (type $T))) (alias export $t \"r\" (type $r)) (type $T2 (instance (export \"r2\" (type (eq $r))) (export \"r\" (type (sub resource))))) (export \"t2\" (instance (type $T2))))))"))
+    ;; an out-of-bounds (eq i) inside an inline instance ct
+    ;; still rejects
+    (let ((c (expect-invalid
+              "(component (component (type $T (future u32)) (import \"i\" (instance $i (export \"T\" (type (eq 5)))))))")))
+      (is (search "type index out of bounds"
+                  (wasmdown:wasmdown-error-message c))))))
+
 (defun run-component-pins ()
   "Run the component pins (registered via TEST; returns T)."
   (let ((wasmdown.test::*tests*
@@ -1623,6 +1656,7 @@ wast runner's string-to-bytes decoder (same grammar as the suite)."
                       component/instance-chain-projection-pins
                       component/builtin-immediate-pins
                       component/inline-target-sugar-pins
+                      component/outer-alias-special-binding-pins
                       component/moduletype-outer-alias-pins
                       component/outer-alias-debruijn-pins
                       component/externtype-type-use-pins

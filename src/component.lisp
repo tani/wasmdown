@@ -2265,6 +2265,18 @@ structural kind recurses; a borrow IS the terminal. SEEN guards the
                     (t nil)))))
     (walk-vt vt)))
 
+(defvar *outer-states* nil
+  "Slice 5 (outer-alias A): the stack of ENCLOSING validator states
+\(innermost first) threaded through validate-component's :component
+recursion and %check-defvaltype's :component/:instance arm. An outer
+alias with de Bruijn count N resolves against the Nth entry; count 0
+is the CURRENT state (Explainer 408-412).")
+;;; the validate-component nesting depth — the per-validation tables
+;;; reset only at the OUTERMOST call (a nested child's entries must
+;;; survive for the parent's resolution; rows in the same suite run
+;;; must not leak into each other)
+(defvar *validate-depth* 0)
+
 (defun %check-defvaltype (c state &optional (type-depth 1) (outer state))
   "Validate one defined (value) type: label rules, non-emptiness, the
 32-flag limit, type-index bounds + defined-ness, own/borrow resource
@@ -2417,7 +2429,13 @@ type's own declarators stay against STATE, the inner space)."
               (when (ct-resourcetype-p ty)
                 ;; Binary.md line 280: no resource defs inside types
                 (%verr "resources can only be defined within a concrete component"))
-              (%check-deftype ty inner (1+ type-depth) outer)
+              ;; slice 5m (indicies ::9): a nested TYPE decl's
+              ;; walk treats the ENCLOSING TYPE's INNER space as
+              ;; its outer scope — an (outer 1) alias inside
+              ;; $T2 crosses the $T2 boundary into the enclosing
+              ;; component type's own space (where the sibling
+              ;; $r was pushed)
+              (%check-deftype ty inner (1+ type-depth) inner)
               (vector-push-extend ty (cval-types inner))))
            (:alias
             (let ((a (typedecl-payload d)))
@@ -2453,6 +2471,7 @@ type's own declarators stay against STATE, the inner space)."
                             (cons outer *outer-states*)
                             (list outer)))
                        (tgt (%outer-state-at inner (aliasrec-count a))))
+
                   (when (and tgt (eq (aliasrec-sort a) :type))
                     (when (>= (aliasrec-target a)
                               (length (cval-types tgt)))
@@ -2884,18 +2903,6 @@ type slot TYPEIDX (created on first use)."
         (let ((id (%fresh-resource-id)))
           (setf (gethash key *inst-gen-ids*) id)
           id))))
-
-(defvar *outer-states* nil
-  "Slice 5 (outer-alias A): the stack of ENCLOSING validator states
-\(innermost first) threaded through validate-component's :component
-recursion and %check-defvaltype's :component/:instance arm. An outer
-alias with de Bruijn count N resolves against the Nth entry; count 0
-is the CURRENT state (Explainer 408-412).")
-;;; the validate-component nesting depth — the per-validation tables
-;;; reset only at the OUTERMOST call (a nested child's entries must
-;;; survive for the parent's resolution; rows in the same suite run
-;;; must not leak into each other)
-(defvar *validate-depth* 0)
 
 (defun %core-module-at (comp n)
   "The Nth :core-module definition's wasm-module payload, or NIL."
