@@ -4461,18 +4461,31 @@ is the valtype."
               (when (and (async-thread-index th)
                          (= (async-thread-index th) (first args)))
                 (setf target th)))
-            ;; §4688/§4714: trap_if(not other_thread.suspended()) —
-            ;; the target must be SUSPENDED (spawn thunk pending or
+            ;; §4688/§4714 (canon_thread_{suspend,yield}_then_resume
+            ;; ONLY): trap_if(not other_thread.suspended()) — the
+            ;; target must be SUSPENDED (spawn thunk pending or
             ;; parked). The CURRENT thread is running: a self-index
             ;; (or a running sibling) traps here, in the arm — the
             ;; fixture's "cannot resume thread which is not
-            ;; suspended". (The promote pair additionally traps on
-            ;; i == thread.index above; a not-found index is
-            ;; out-of-bounds — also a trap.)
-            (unless (and target
-                         (or (functionp (async-thread-spawn-thunk
-                                         target))
-                             (async-thread-yield-parked target)))
+            ;; suspended". A not-found index is out-of-bounds — also
+            ;; a trap. The PROMOTE pair (§4731/§549-565) has NO
+            ;; not-suspended trap: only the i == thread.index trap
+            ;; above; a running/unready target falls back to a plain
+            ;; suspend/yield below. [NYI-NOTE: yield-parked is READY
+            ;; not SUSPENDED in the spec's Thread model — this
+            ;; predicate approximates parked≈suspended pending a
+            ;; real blocked/ready thread state; self-switch-traps
+            ;; was vacuously green at M11b (the component-payload
+            ;; assert_trap matches phase-only, so the old
+            ;; outside-task trap satisfied rows expecting the
+            ;; switch trap) — the fixture now passes for the real
+            ;; reason.]
+            (when (and (not promote-p)
+                       (not (and target
+                                 (or (functionp (async-thread-spawn-thunk
+                                                 target))
+                                     (async-thread-yield-parked
+                                      target)))))
               (error 'wasmdown:wasm-trap :kind :generic
                      :message
                      "cannot resume thread which is not suspended"))
