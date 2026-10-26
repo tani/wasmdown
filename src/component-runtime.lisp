@@ -2580,6 +2580,96 @@ the callee's progression through the FuncInst protocol."
   (mutex (sb-thread:make-mutex :name "wset"))
   (waitqueue (sb-thread:make-waitqueue :name "wset")))
 
+;;; ---- The {Stream,Future} End records (CanonicalABI.md 1598-1922) ----
+;;; The End base derives from Waitable (both ends can join waitable
+;;; sets). The 4 states (§1618): IDLE/COPYING/CANCELLING-COPY/DONE.
+;;; The buffer: a guest linear-memory region — here captured as
+;;; (list memory ptr length progress t) per the Readable/Writable
+;;; GuestBuffer shape (§1545-1586), with the load/store helpers
+;;; reusing the ABI's %abi-load/%abi-store per element type.
+
+(defstruct (async-end (:include async-waitable))
+  "The End base (CanonicalABI.md 1617): the readable/writable end
+of a stream or future pair."
+  (t-ct nil)                         ; the element type ct (stream<T>)
+  (state :idle)   ; :idle :copying :cancelling-copy :done
+  (other nil)                        ; the paired end (NIL = dropped)
+  (buffer nil)    ; (list memory ptr length progress) — the guest buffer
+  (owner nil)                        ; the owning comp-instance
+  (index nil)                        ; the handles-table index (events)
+  (event-code nil)  ; 2=STREAM_READ 3=STREAM_WRITE 4=FUTURE_READ 5=FUTURE_WRITE
+  (future-p nil))  ; T = FutureEnd (the notify/DONE transitions differ)
+
+(defun %end-copying-or-cancelling-p (end)
+  (member (async-end-state end) '(:copying :cancelling-copy)))
+
+;;; EventCode constants (CanonicalABI.md 1232).
+(defconstant +event-stream-read+ 2)
+(defconstant +event-stream-write+ 3)
+(defconstant +event-future-read+ 4)
+(defconstant +event-future-write+ 5)
+
+;;; CopyResult (CanonicalABI.md 1799): COMPLETED/DROPPED/CANCELLED,
+;;; packed with the progress for STREAM ends.
+(defconstant +copy-completed+ 0)
+(defconstant +copy-dropped+ 1)
+(defconstant +copy-cancelled+ 2)
+
+;;; new_{stream,future} (CanonicalABI.md 1907-1920): the linked pair.
+(defun %new-async-pair (t-ct owner event-code future-p)
+  "new_stream / new_future: the linked readable+writable ends."
+  (let* ((r-event (if future-p +event-future-read+ +event-stream-read+))
+         (w-event (if future-p +event-future-write+ +event-stream-write+))
+         (reader (make-async-end
+                  :t-ct t-ct :owner owner :event-code r-event
+                  :future-p future-p))
+         (writer (make-async-end
+                  :t-ct t-ct :owner owner :event-code w-event
+                  :future-p future-p)))
+    (setf (async-end-other reader) writer)
+    (setf (async-end-other writer) reader)
+    (values reader writer)))
+
+;;; End.notify (CanonicalABI.md 1826-1877): arm the pending event
+;;; closure; the STREAM/FUTURE result precedence and DONE
+;;; transitions differ (§1848-1882: streams DONE only on DROPPED;
+;;; futures DONE on COMPLETED and DROPPED; COMPLETED wins).
+(defun %end-notify (end progress)
+  (setf (async-waitable-pending-event end)
+        (lambda ()
+          (let ((result
+                  (cond
+                   ;; FUTURE: COMPLETED conveys the essential info
+                   ((and (async-end-future-p end) (= progress 1))
+                    (setf (async-end-buffer end) nil)
+                    (setf (async-end-state end) :done)
+                    +copy-completed+)
+                   ((null (async-end-other end))
+                    ;; DROPPED (the peer is gone)
+                    (setf (async-end-buffer end) nil)
+                    (setf (async-end-state end) :done)
+                    +copy-dropped+)
+                   ;; CANCELLED (a cancel-copy was requested)
+                   ((eq (async-end-state end) :cancelling-copy)
+                    (setf (async-end-buffer end) nil)
+                    (setf (async-end-state end) :idle)
+                    +copy-cancelled+)
+                   ;; COMPLETED (the copy finished)
+                   ((eq (async-end-state end) :copying)
+                    (setf (async-end-buffer end) nil)
+                    (setf (async-end-state end)
+                          (if (async-end-future-p end) :done :idle))
+                    +copy-completed+)
+                   (t
+                    (setf (async-end-buffer end) nil)
+                    (setf (async-end-state end) :idle)
+                    +copy-completed+))))
+            (list (async-end-event-code end)
+                  (or (async-end-index end) 0)
+                  (if (async-end-future-p end)
+                      result          ; futures do NOT pack progress
+                      (logior result (ash progress 4))))))))
+
 ;;; ---- The Thread record (CanonicalABI.md 391-407) ----
 
 (defstruct async-thread
@@ -3509,16 +3599,42 @@ is the valtype."
           (%subtask-drop s)
           (setf (aref h (1- (first args))) nil))
         '())))
-    ;; thread.*/future.*/stream.*/error-context.* stay OPAQUE (M11b):
-    ;; the slot exists but the call traps (never at instantiate).
+    ;; M11b: {stream,future}.new — the linked End pair added to the
+    ;; instance's handles table, packed readable|writable<<32
+    ;; (CanonicalABI.md 4242-4277). The may_leave gate is not yet
+    ;; modeled (no post-return path creates ends in the fixtures).
+    ((:stream-new :future-new)
+     (let* ((t-ct (and (second imms)
+                       (< (second imms)
+                          (length (comp-instance-types inst)))
+                       (aref (comp-instance-types inst)
+                             (second imms))))
+            (elem (and t-ct (wasmdown.component:ct-payload t-ct)))
+            (future-p (eq kind :future-new)))
+       ;; the element ct: (stream $t?)'s payload — NIL for the
+       ;; empty (stream) form (§4251)
+       (wasmdown.runtime:make-host-func-instance
+        (wasmdown.types:make-wasm-func-type '() '(:i64))
+        (lambda (args)
+          (declare (ignore args))
+          ;; canon_{stream,future}_new (§4262-4276): add the
+          ;; LINKED pair at CALL time, return readable|writable<<32
+          (multiple-value-bind (reader writer)
+              (%new-async-pair elem inst nil future-p)
+            (let ((ri (%handle-add-any inst reader))
+                  (wi (%handle-add-any inst writer)))
+              (setf (async-end-index reader) ri)
+              (setf (async-end-index writer) wi)
+              (list (logior ri (ash wi 32)))))))))
+    ;; the still-opaque kinds: the slot exists, the call traps
     ((:thread-yield :thread-suspend :thread-resume-later
       :thread-suspend-then-resume :thread-yield-then-resume
       :thread-suspend-then-promote :thread-yield-then-promote
       :thread-index :thread-new-indirect
-      :stream-new :stream-read :stream-write
+      :stream-read :stream-write
       :stream-cancel-read :stream-cancel-write
       :stream-drop-readable :stream-drop-writable :stream-forward
-      :future-new :future-read :future-write
+      :future-read :future-write
       :future-cancel-read :future-cancel-write
       :future-drop-readable :future-drop-writable
       :future-forward

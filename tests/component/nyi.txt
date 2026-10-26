@@ -248,3 +248,20 @@
 # first (the packed i64 pair), then read/write (the copy's 5
 # cases + BLOCKED), then cancel/drop/forward, then thread.* —
 # probing cross-task-future (2 rows) as the first fixture. ----
+# ---- M11b session 9 (2026-10-27): {stream,future}.new LANDED +
+# the End record family. The runtime now has: the async-end
+# struct (Waitable-derived; t-ct/state/other/buffer/owner/index/
+# event-code/future-p per §1617-1656), %new-async-pair (the
+# linked reader/writer pair, §1907-1920), %end-notify (the
+# STREAM vs FUTURE result precedence + DONE transitions,
+# §1826-1882), the EventCode/CopyResult constants, and the
+# {stream,new} host funcs in the ecase (the pair added at CALL
+# time, packed readable|writable<<32, §4262-4276). PROBED:
+# cross-task-future's failure MOVED from "import .future.new:
+# expected a function, got NULL" to ".future.write: ...got
+# NULL" — the new family works; the read/write COPY family is
+# the next rung (the 5-case copy + BLOCKED=0xffffffff +
+# End.copy's buffer state, §1491-1597/1660-1717/4280-4375).
+# GATED GREEN: units 407/0, lane 1031/0/0/0. The still-opaque
+# ecase arm now lists exactly the read/write/cancel/drop/
+# forward/thread/error-context kinds. ----
