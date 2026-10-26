@@ -15,6 +15,47 @@
 ./async/drop-cross-task-borrow.wast
 ./async/during-sync-call-may-block-if-other-ready-threads.wast
 ./async/during-sync-call-no-sibling-resume.wast
+# ---- M12 session 3 (2026-10-27): THE NO-SIBLING-RESUME STALL
+# ROOT-CAUSED TO THE ROUND-4 LOST WAKE (no fix landed — the tree
+# stays at the committed 410/1333-0-0-0; every probe below is on
+# the c47446d build). THE EVIDENCE (the serialized %tr trace on
+# the extracted /tmp/ds3.wast = no-sibling-resume test 1 alone;
+# 6/6 deterministic FAIL, not a flake): the exec<->X ping-pong
+# runs its four rounds as [RESUME 2 (the arm's suspend-then-resume
+# wakes X's park) / SUSPEND-ENTER 3 (the exec parks) / SUSPEND-EXIT
+# 2 (X wakes) / RESUME 3 (X's resume-later wakes the exec) /
+# SUSPEND-ENTER 2 (X parks)] x3 + the round-4 prefix [RESUME 2 /
+# SUSPEND-ENTER 3 / SUSPEND-EXIT 2] — and then X VANISHES: no
+# round-4 RESUME 3, no X park, no trap surfaced, the exec parks
+# forever, the oracle fires at 200 idle cycles. THE PROBES: (1) a
+# handler-bind on wasm-trap printed NOTHING on X's thread (the
+# probe was main-thread-scoped — uninformative); (2) the spawn-
+# thunk trap handler patched to print showed [SPAWN-TRAP NIL] on
+# threads 2/3/4/6/7/9 — X DID trap with a NIL message, i.e. X's
+# `unreachable` (its post-loop exit) — X BELIEVES it completed
+# all four rounds; (3) counting the trace's events: X's
+# resume-laters printed only THREE (rounds 1-3), X's parks THREE
+# — X's round-4 iteration-4 resume-later NEVER CALLED
+# async-thread-resume yet X's loop reached the exit. THE REMAINING
+# HYPOTHESES (the next session's probes, in order): (a) X's
+# iteration-4 resume-later's TARGET LOOKUP silently no-ops —
+# resume-later's (when target ...) skips a NOT-FOUND index without
+# a trap; print the lookup's index + the (getf fields :threads)
+# list AT the call (the $implicit-thread-index global vs the
+# registration — is the exec's thread STILL in :threads at
+# round 4? an unregister may have raced); (b) the lost-wakeup at
+# the ARM boundary (the arm resumes X THEN parks the exec — X's
+# resume-later can fire between, the broadcast lost) — TWO fixes
+# measured and REVERTED (one change per gate): the resume-pending
+# flag (resume-later as §458-466's READY mark; broke reentrance
+# 24->22 and scheduling-candidates 31->30 — the stale-mark
+# spurious wake class) and the wake-count guard (the park waits
+# for a COUNT CHANGE; units held 410/0 but ds3 still failed —
+# the stall is NOT the pre-park broadcast alone); (c) the wasm
+# call itself dying silently between the br_if and the call (the
+# interp's trap path on the spawned thread swallows a non-trap
+# error). ALSO: may-block row 4 is the same class (the trace's
+# shape matches). ----
 ./async/idle-drop.wast
 ./async/partial-stream-copies.wast
 ./async/passing-resources.wast
