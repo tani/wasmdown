@@ -109,4 +109,32 @@
 #   registered thread with a smaller gate-seq whose readiness
 #   holds — then re-gate units 407 + the M11a trio + the lane,
 #   then re-census acs under load. ----
+# TOKEN SESSION 3 (2026-10-27): the deprioritized YIELD landed
+# with BOTH prior in-session fixes, compiled green, and was
+# measured against the canary pin. THREE more root causes
+# found+fixed in-session (each verified by the counters):
+#   (a) %token-acquire's spurious-wake retry looped infinitely
+#       (an always-true readiness meant wait-until never parked);
+#       fixed with the :WANT SENTINEL — the tick treats :want as
+#       "grantable", wait-until's fast path maps it to
+#       (eq owner me), and acquire parks on its own condition
+#       loop (units 403/4 -> the recursion crash -> 406/1).
+#   (b) %yield-ready-p must NOT require (eq owner me) — a parked
+#       thread never owns the token; the grant SETS the owner.
+#       The only condition is the priority one (no smaller-seq
+#       ready candidate), and :want peers count as ready.
+#   (c) THE CURRENT FRONTIER: the canary (async-wset-wait-join)
+#       still deadlocks with the exact counter signature
+#       WAIT=2 GRANT=2 ACQ=2 REL=5 TICK=112 PACK=0 — the flow
+#       stalls between the lower's %call-async-funcinst and the
+#       STARTED-wait's pack site; both acquires completed, two
+#       grants happened, five releases, 112 idle ticks — the
+#       outer task never reaches the pack. NEXT PROBE: bracket
+#       %call-async-funcinst's body (the callee-thread spawn to
+#       the pack) with per-line counters — the suspected spot is
+#       the callee's on-start callback chain (the subtask's
+#       state transition vs the caller's readiness closure).
+#       The full patch (token design + fix a + fix b) is
+#       reproducible: /tmp/token-patch.py + /tmp/token-amend.py
+#       + the two tail-close adjustments, all documented above.
 ./async/async-calls-sync.wast
