@@ -659,3 +659,40 @@
 # copies, reentrance, same-component-stream-future, sync-barges-
 # in, sync-streams, trap-if-* (4), + the scheduler-blocked set
 # + the during-sync family (the sync-thread extension). ----
+# ---- M11b session 21 (2026-10-27, REVERTED to the eleventh
+# rung): THE SYNC-LIFT THREAD CONTEXT — implemented + verified
+# in isolation, MYSTERY at the fixture (parked per the time-box;
+# the tree stays green at 408/1201-0-0-0). THE IMPLEMENTATION
+# (re-derivable from /tmp/s21-sync-thread.py): the sync lift's
+# core call wrapped in (let* ((*current-task* sync-task)
+# (*current-thread* sync-th)) (unwind-protect (wasm-call ...)
+# (%task-exit ...))) with a task+thread registered via the gate
+# (needs-exclusive TRUE for a sync func — the exclusive lock
+# held per the spec's sync-call semantics). THE MICROTESTS (all
+# PASS, the mechanism is sound): (1) a bare host func reading a
+# LET-bound special through wasm-call sees the binding; (2) a
+# full wasm module's exported func calling the host func sees
+# it too — BOTH through the interp. THE FIXTURE MYSTERY (the
+# next session's first probe): [SYNC-BIND] prints *current-
+# thread* BOUND on the main thread immediately before the
+# wasm-call; the SUSPEND arm (same OS thread, same invocation)
+# reads *current-thread* NIL — the dynamic binding is NOT
+# visible inside the interp's call chain FOR THE FIXTURE'S PATH
+# (though the microtests' identical shape sees it). The probe
+# to run: print the binding INSIDE the interp's %do-call host
+# path via (symbol-value (find-symbol "*CURRENT-THREAD*"
+# :wasmdown.component.runtime)) — the interp cannot READ the
+# symbol at compile time (the load order: interp before
+# component-runtime — a plain reference is a READ error) but
+# find-symbol at RUNTIME works. Suspects not yet excluded: a
+# second sync-lift path (the [SYNC-BIND] fires 2x for 3
+# components), the interp's tail-call trampoline unwinding past
+# the binding, or the canon's core func being invoked via a
+# cached closure. THE FAMILY'S REMAINING ROWS (with the context
+# bound, once the mystery is solved): exclusive-resume 5/6,
+# no-sibling-resume 4/6, may-block 6/9, scheduling-candidates
+# 19/31 — the sync task's suspend parks the caller's thread and
+# the runtime must resume the instance's READY threads during
+# the sync call (the arm's YIELD-parked callback thread is the
+# fixture's designated resumer — the suspend must run a
+# scheduler pass, not a bare park). ----
