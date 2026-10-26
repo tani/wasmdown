@@ -2228,6 +2228,126 @@ these pins guard the executor's mechanisms directly."
                                                      (:str "y"))))))))
       (is (equal '("xy") results)))))
 
+;;; ---- M11a: the async CORE's VALIDATION pins (slice 1) ----
+
+(test component/async-task-return-borrow-pins
+  ;; task.return's result must not transitively contain a borrow
+  ;; (validate-task-return.wast's two rejections + the positive
+  ;; own-handle case)
+  (flet ((expect-invalid (src)
+           (block nil
+             (handler-case
+                 (wasmdown.component:validate-component
+                  (wasmdown.component.text::parse-component-text src))
+               (wasmdown:validation-error (c) (return c)))
+             (error "expected validation-error"))))
+    ;; the bare borrow
+    (let ((c (expect-invalid
+              "(component (type $r (resource (rep i32)))
+                 (core func (canon task.return (result (borrow $r)))))")))
+      (is (search "task.return` result cannot contain a `borrow` type"
+                  (wasmdown:wasmdown-error-message c))))
+    ;; transitively through a tuple
+    (let ((c (expect-invalid
+              "(component (type $r (resource (rep i32)))
+                 (type $t (tuple u32 (borrow $r)))
+                 (core func (canon task.return (result $t))))")))
+      (is (search "task.return` result cannot contain a `borrow` type"
+                  (wasmdown:wasmdown-error-message c))))
+    ;; the POSITIVE: an own-handle result validates
+    (wasmdown.component:validate-component
+     (wasmdown.component.text::parse-component-text
+      "(component (type $r (resource (rep i32)))
+         (core func (canon task.return (result (own $r)))))"))))
+
+(test component/async-opt-requires-async-type-pins
+  ;; the `async` canonopt requires an ASYNC function type — for
+  ;; lift (the ascribed functype), lift+callback, and lower
+  ;; (validate-no-async-abi-for-sync-type.wast's three cases)
+  (flet ((expect-invalid (src)
+           (block nil
+             (handler-case
+                 (wasmdown.component:validate-component
+                  (wasmdown.component.text::parse-component-text src))
+               (wasmdown:validation-error (c) (return c)))
+             (error "expected validation-error"))))
+    (let ((c (expect-invalid
+              "(component
+                 (core module $M (func (export \"f\")))
+                 (core instance $i (instantiate $M))
+                 (func (export \"f\") (canon lift (core func $i \"f\") async)))")))
+      (is (search "async` canonical option requires an async function type"
+                  (wasmdown:wasmdown-error-message c))))
+    (let ((c (expect-invalid
+              "(component
+                 (core module $M
+                   (func (export \"f\") (param i32) (result i32) unreachable)
+                   (func (export \"f_cb\") (param i32 i32 i32) (result i32) unreachable))
+                 (core instance $i (instantiate $M))
+                 (func (export \"f\") (canon lift (core func $i \"f\") async (callback (core func $i \"f_cb\")))))")))
+      (is (search "async` canonical option requires an async function type"
+                  (wasmdown:wasmdown-error-message c))))
+    (let ((c (expect-invalid
+              "(component
+                 (import \"f\" (func $f))
+                 (core func $f' (canon lower (func $f) async)))")))
+      (is (search "async` canonical option requires an async function type"
+                  (wasmdown:wasmdown-error-message c))))))
+
+(test component/async-builtin-imms-parse-pins
+  ;; the async core builtins' TEXT immediates parse to their full
+  ;; shapes: task.return's (result ...)? + opts, subtask.cancel's
+  ;; async?, context.get/set's valtype + index
+  (let* ((comp (wasmdown.component.text::parse-component-text
+                (concatenate 'string
+                  "(component"
+                  " (core module $M (memory 1)"
+                  "   (func (export \"f\") (result i32) (i32.const 1)))"
+                  " (core instance $m (instantiate $M))"
+                  " (canon task.return (core func $m \"f\"))"
+                  " (canon task.return (result u32) (core func $m \"f\"))"
+                  " (canon context.set i32 0 (core func $m \"f\"))"
+                  " (canon context.get i32 0 (core func $m \"f\"))"
+                  " (canon subtask.cancel async (core func $m \"f\"))"
+                  " (canon subtask.cancel (core func $m \"f\"))"
+                  " (canon waitable-set.new (core func $m \"f\"))"
+                  " (canon waitable.join (core func $m \"f\"))"
+                  " (canon backpressure.inc (core func $m \"f\"))"
+                  " (canon task.cancel (core func $m \"f\"))"
+                  " (canon subtask.drop (core func $m \"f\"))"
+                  " (canon waitable-set.drop (core func $m \"f\")))")))
+         (canons (loop for d across (wasmdown.component::comp-defs comp)
+                      when (eq (wasmdown.component::compdef-kind d) :canon)
+                        collect (wasmdown.component::canonrec-imms
+                                 (wasmdown.component::compdef-payload d)))))
+    ;; task.return with NO result: (:task-return nil opts)
+    (is (equal '(:task-return nil nil) (first canons)))
+    ;; with a result: the valtype collected
+    (is (equal '(:task-return (:u32) nil) (second canons)))
+    ;; context.set/get: the valtype + the 0 index + opts
+    (is (equal '(:context-set :i32 0 nil) (third canons)))
+    (is (equal '(:context-get :i32 0 nil) (fourth canons)))
+    ;; subtask.cancel's async? flag
+    (is (equal '(:subtask-cancel t) (fifth canons)))
+    (is (equal '(:subtask-cancel nil) (sixth canons)))
+    ;; the no-imm builtins
+    (is (equal '(:waitable-set-new) (seventh canons)))
+    (is (equal '(:waitable-join) (eighth canons)))
+    (is (equal '(:backpressure-inc) (ninth canons)))
+    (is (equal '(:task-cancel) (tenth canons)))
+    (is (equal '(:subtask-drop) (nth 10 canons)))
+    (is (equal '(:waitable-set-drop) (nth 11 canons)))))
+
+(test component/async-builtin-sig-marker-pins
+  ;; a with-bag entry pointing at a canon-introduced ASYNC core
+  ;; built-in resolves its flat sig (the marker path that was
+  ;; (:canon-builtin nil) before M11a — async-calls-sync's
+  ;; 'does not export an item named context.set' gap)
+  (let ((comp (wasmdown.component.text::parse-component-text
+              "(component (core module $M (memory 1) (func (export \"f\") (result i32) (i32.const 1))) (canon context.set i32 0 (core func $m \"f\")))")))
+    ;; validates: the bag's entry resolves the canon's sig
+    (wasmdown.component:validate-component comp)))
+
 (defun run-component-pins ()
   "Run the component pins (registered via TEST; returns T)."
   (let ((wasmdown.test::*tests*
@@ -2284,7 +2404,11 @@ these pins guard the executor's mechanisms directly."
                       component/values-variant-discriminant-pins
                       component/values-maxflat-indirection-pins
                       component/values-map-lower-pins
-                      component/values-option-size-pins)))
+                      component/values-option-size-pins
+                      component/async-task-return-borrow-pins
+                      component/async-opt-requires-async-type-pins
+                      component/async-builtin-imms-parse-pins
+                      component/async-builtin-sig-marker-pins)))
           wasmdown.test::*tests*)))
     (multiple-value-bind (passed failed)
         (wasmdown.test:run-all-tests)

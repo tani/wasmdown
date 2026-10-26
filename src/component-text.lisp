@@ -1789,9 +1789,40 @@ introduced func (resources.wast ::62, abi.wast ::3)."
     "future.drop-writable" "future.forward"))
 
 (defun %parse-builtin-imms (h items scope)
-  "The immediates of a dotted canon built-in. Returns the imms list."
+  "The immediates of a dotted canon built-in. Returns the imms list.
+M11a: the async core builtins parse their full immediate shapes —
+task.return's (result ...)? + trailing canonopts, subtask.cancel's
+async?, context.get/set's valtype + u32 index."
   (let ((kind (%canon-kind-kw h)))
     (cond
+     ((string= h "task.return")
+      ;; (result <valtype>)? canonopt* — the results carry ONE
+      ;; valtype (the functype payload's single-result shape)
+      (let ((results '())
+            (tail items))
+        (loop while (and tail (%nodep (first tail))
+                         (string= (%head-text (first tail)) "result"))
+              do (let ((ri (rest (%children (first tail)))))
+                   (unless (= (length ri) 1)
+                     (%text-err (%node-start (first tail))
+                                "result needs exactly one type"))
+                   (push (%parse-valtype (first ri) scope) results))
+                 (setf tail (rest tail)))
+        (list :task-return (nreverse results)
+              (%parse-canonopts tail scope))))
+     ((string= h "subtask.cancel")
+      (list :subtask-cancel
+            (and (some (lambda (it)
+                         (and (%tokp it)
+                              (string= (%tok-text it) "async")))
+                       items)
+                 t)))
+     ((member h '("context.get" "context.set") :test #'string=)
+      ;; $t is a CORE valtype (i32 today), $i a plain u32
+      (list kind
+            (%core-valtype-of (first items))
+            (%nat-token (second items))
+            (%parse-canonopts (cddr items) scope)))
      ((member h *builtin-typeidx-kinds* :test #'string=)
       (list kind
             (%parse-builtin-typeidx (first items) scope)))
@@ -1951,7 +1982,7 @@ position)."
              (let ((tgt (car (last items))))
                (%alloc scope :core-func
                        (and (%nodep tgt)
-                            (>= (length (%children tgt)) 3)
+                            (= (length (%children tgt)) 3)
                             (%tokp (third (%children tgt)))
                             (eq (%tok-kind (third (%children tgt)))
                                 :id)
@@ -1965,7 +1996,7 @@ position)."
              (let ((tgt (car (last items))))
                (%alloc scope :core-func
                        (and (%nodep tgt)
-                            (>= (length (%children tgt)) 3)
+                            (= (length (%children tgt)) 3)
                             (%tokp (third (%children tgt)))
                             (eq (%tok-kind (third (%children tgt)))
                                 :id)

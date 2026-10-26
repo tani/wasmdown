@@ -103,6 +103,7 @@
            ;; the validator's flatten machinery — the same
            ;; flatten_functype table drives both sides.
            #:flatten-functype
+           #:builtin-canon-sig
            #:ct-at))
 
 (in-package #:wasmdown.component)
@@ -3401,6 +3402,81 @@ at canon time where the STATE resolves (:idx . n) references. Returns
   (let ((p (and ft (%flat-functype ft state :lower))))
     (cons (and p (car p)) (and p (cdr p)))))
 
+(defun builtin-canon-sig (kind &optional (imms nil))
+  "The FLAT core signature (params . results) of a canon BUILT-IN
+(M11a: the async core builtins' fixed shapes — CanonicalABI.md's
+builtin validation rules). IMMS is the canonrec's immediate list:
+task.return's result list and context.get/set's valtype decide the
+slots. Only reached with a NIL/absent task.return result (the
+flat-sig helper handles the result-bearing case)."
+  (declare (ignore imms))
+  (case kind
+    ((:backpressure-inc :backpressure-dec :task-cancel
+      :task-return
+      :waitable-set-drop :waitable-join :subtask-drop
+      :thread-yield :thread-suspend :thread-resume-later
+      :thread-suspend-then-resume :thread-yield-then-resume
+      :thread-suspend-then-promote :thread-yield-then-promote
+      :error-context-new :error-context-debug-message
+      :error-context-drop :resource-drop)
+     (cons '() '()))
+    ((:context-get :waitable-set-new :thread-index
+      :resource-new :resource-rep :subtask-cancel
+      :stream-cancel-read :stream-cancel-write
+      :future-cancel-read :future-cancel-write
+      :thread-new-indirect :stream-forward :future-forward)
+     (cons '() '(:i32)))
+    ((:context-set :stream-drop-readable :stream-drop-writable
+      :future-drop-readable :future-drop-writable)
+     (cons '(:i32) '()))
+    ((:stream-new :future-new)
+     (cons '() '(:i64)))
+    ((:stream-read :stream-write)
+     (cons '(:i32 :i32 :i32) '(:i32)))
+    ((:future-read :future-write)
+     (cons '(:i32 :i32) '(:i32)))
+    ((:waitable-set-wait :waitable-set-poll)
+     (cons '(:i32 :i32) '(:i32)))
+    (t (cons '(:i32) '(:i32)))))
+
+
+(defun canon-builtin-flat-sig (imms state)
+  "The flat core sig of a canon BUILT-IN canonrec's immediate list
+IMMS, with STATE resolving task.return's result type references.
+task.return's (result $t)? flattens the single result's types into
+the core PARAMS (CanonicalABI.md 3929: flatten_functype of
+(func (param $t)?) in the LOWER context — the params ARE the flat
+result slots and the results stay EMPTY, so no out-param is
+appended; cross-abi-calls' task.return16 takes exactly its 16
+flat params)."
+  (let* ((kind (first imms))
+         (rs (and (eq kind :task-return) (second imms))))
+    (if (and (eq kind :task-return) rs)
+        (let* (;; the two parser shapes: the BINARY reader's is a
+               ;; LIST holding the one resultlist (NIL when the
+               ;; canon has no result); the TEXT parser's is the
+               ;; collected valtypes themselves. A valtype is a
+               ;; cons (an (:idx . n) ref or a compound shape) or a
+               ;; keyword; a list whose FIRST element is a cons
+               ;; wrapping ANOTHER cons is the BINARY shape; a
+               ;; bare valtype keyword is either parser's single
+               ;; result.
+               (results
+                 (if (and (consp rs) (consp (first rs))
+                          (consp (first (first rs))))
+                     ;; ( ( valtype... ) ) — binary: one resultlist
+                     (first rs)
+                     ;; the collected valtypes (or the binary's
+                     ;; single valtype keyword)
+                     (if (and (consp rs) (listp rs)) rs (list rs))))
+               (flat (mapcan (lambda (x)
+                               (or (ignore-errors
+                                    (%flat-type-list x state))
+                                   '()))
+                             results)))
+          (cons (or flat '()) '()))
+        (builtin-canon-sig kind imms))))
+
 (defun %canon-core-func-sig (comp core-idx)
   "The canon target core func's ACTUAL signature (params . results),
   resolved through the alias that introduced it; NIL when unknown."
@@ -3823,6 +3899,17 @@ task-return shapes are a later slice."
                             (aref (cval-func-types state) f)
                             (car origin) (cdr origin)))
                            (aref (cval-func-types state) f))))))))
+    ;; M11a (validate-no-async-abi-for-sync-type): the `async`
+    ;; canonopt requires an ASYNC function type (CanonicalABI.md
+    ;; 3334) — both for lift (the ascribed functype) and lower
+    ;; (the target func's type)
+    (when (%opt opts :async)
+      (unless (and ft (third (ct-payload ft)))
+        (%verr "the `async` canonical option requires an async function type")))
+    ;; M11a: `callback` requires `async` on the LIFT (3337) and
+    ;; requires the ASYNC type likewise
+    (when (and (%opt opts :callback) (eq context :lower))
+      (%verr "canonical option `callback` cannot be specified for lowerings"))
     ;; canonopt: realloc implies memory (abi.wast pins the message)
     (when (and realloc (not mem))
       (%verr "canonical option `realloc` requires `memory` to also be specified"))
@@ -7556,12 +7643,27 @@ the number of enclosing component/type scopes (outer aliases)."
                      ;; built-in canons reference type indices where
                      ;; applicable; validated structurally. Slice 5c
                      ;; (resources ::62-::64): the resource.* built-ins
-                     ;; require a RESOURCE type target — the parser
-                     ;; routes them here with the typeidx as the SECOND
-                     ;; immediate ('not a resource type'). The local
-                     ;; CR keeps the compiler's payload derivation
-                     ;; local to this clause.
+                     ;; require a RESOURCE type target. M11a
+                     ;; (validate-task-return): task.return's result
+                     ;; must not transitively contain a `borrow`
+                     ;; (CanonicalABI.md 3930).
                      (let ((imms (canonrec-imms payload)))
+                       (when (and (eq (first imms) :task-return)
+                                  (second imms))
+                         (let ((rs (second imms)))
+                           ;; the BINARY reader's shape: one
+                           ;; resultlist; the TEXT parser's: the
+                           ;; collected valtypes
+                           (when (and (consp rs)
+                                      (consp (first rs))
+                                      (consp (first (first rs))))
+                             (setf rs (first rs)))
+                           (dolist (r (if (and (consp rs) (listp rs))
+                                          rs (list rs)))
+                             (when (%vt-transitively-borrow-p
+                                    r state (make-hash-table))
+                               (%verr
+                                "`task.return` result cannot contain a `borrow` type")))))
                       ;; slice 5m (indicies ::7/::8): only the
                       ;; TYPE-POSITION immediate bounds-checks
                       ;; against the component type space — the
@@ -7698,7 +7800,10 @@ the number of enclosing component/type scopes (outer aliases)."
                                     ((eq k :resource-drop)
                                      (cons :canon-sig
                                            (cons '(:i32) '())))
-                                    (t (cons :canon-builtin nil)))))))
+                                    (t (cons :canon-sig
+                                             (canon-builtin-flat-sig
+                                              (canonrec-imms payload)
+                                              state))))))))
                         (incf (cval-core-funcs state)))))
                  (:import
                   (%check-externname (importrec-name payload) state t)

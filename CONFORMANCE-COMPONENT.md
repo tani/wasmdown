@@ -15,20 +15,23 @@ Baseline measurement, not a release gate (PLAN.md §12.8).
 
 | Outcome | Count |
 | --- | --- |
-| pass | 1015 |
+| pass | 1022 |
 | fail | 0 |
 | skip | 0 |
 | unsupported | 0 |
 | timeout | 0 |
 | harness-error | 0 |
-| **total** | **1015** |
+| **total** | **1022** |
 
-Executed: 1015 commands; pass rate 100.0%.
+Executed: 1022 commands; pass rate 100.0%.
 
 ## Per-file counts
 
 | File | pass | fail | unsupported | other |
 | --- | --- | --- | --- | --- |
+| component/validate-no-async-abi-for-sync-type.wast | 3 | 0 | 0 | 0 |
+| component/validate-no-stream-char.wast | 1 | 0 | 0 | 0 |
+| component/validate-task-return.wast | 3 | 0 | 0 | 0 |
 | component/binary.wast | 132 | 0 | 0 | 0 |
 | component/link-time-virtualization.wast | 8 | 0 | 0 | 0 |
 | component/shared-everything-dynamic-linking.wast | 14 | 0 | 0 | 0 |
