@@ -76,4 +76,37 @@
 # token; blocking RELEASES it), one un-parked thread at a time,
 # with the stamp machinery as the grant priority. OUT of the
 # lane until that lands (no-fail rule). ----
+# TOKEN SCHEDULER, MEASURED AND REVERTED (2026-10-27 session):
+# the full three-state design landed and compiled green —
+# *token-owner* + %token-release at every blocking entry +
+# %tick as the ONLY grant (smallest gate-seq among ready
+# candidates, readiness closures published on the record) +
+# guest threads register/acquire at start and release/unregister
+# at exit; the STARTED-wait and request-cancellation's INITIAL
+# wait converted from busy loops to wait-until parks. TWO
+# measured defects, both now root-caused:
+# (1) %token-acquire's readiness was CIRCULAR ((eq owner me) is
+#   only true AFTER the grant, so the tick never granted a
+#   starting thread) — FIXED in-session: wanting-is-ready
+#   (always-true readiness + owner set by the grant before the
+#   wake; idle-token fast path; re-acquire on a spurious wake).
+#   Units went 403/4 -> 406/1.
+# (2) THE REMAINING DEFECT: the YIELD park's ALWAYS-TRUE
+#   readiness makes a yielded thread runnable at EVERY tick —
+#   the tick grants it (smallest ready seq) possibly BEFORE the
+#   caller's STARTED-wait packs, the callback then runs to
+#   task.return, and the lower packs EAGER RETURNED (2) instead
+#   of STARTED|subtaski — the caller's (shr_u ret 4) = 0 ->
+#   "invalid waitable index 0" (async-wset-wait-join pin) or a
+#   grant-order deadlock. The SPEC's answer (§3475/§507): the
+#   YIELDed thread's readiness is NOT always-true — it must
+#   yield priority; the deterministic shape is "grant me only
+#   when NO OTHER ready candidate exists" (or the
+#   exclusive-lock-free condition of the event loop, per the
+#   M11a save/restore semantics). NEXT STEP: give
+#   async-thread-yield a DEPRIORITIZED readiness — e.g. a
+#   ready-p closure that requires (a) owner=me and (b) no other
+#   registered thread with a smaller gate-seq whose readiness
+#   holds — then re-gate units 407 + the M11a trio + the lane,
+#   then re-census acs under load. ----
 ./async/async-calls-sync.wast
