@@ -19,7 +19,7 @@ conformance gates. This repository delivers an honest **partial** slice
    tracked by loop number; the Component Model work is tracked by
    PLAN.md §14 milestone id (M7 slices) — the two counters never
    renumber each other.*
-   *Superseded in part (loops 18–24 + M7 slices 1–5 + M8, 2026-10-25): tail calls
+   *Superseded in part (loops 18–24 + M7 slices 1–5 + M8 + M9, 2026-10-25): tail calls
    (`return_call`/`return_call_indirect`, constant-stack trampoline),
    exception handling (tags, `try_table`, `throw`, named module
    definition/instance forms), typed function references
@@ -100,7 +100,21 @@ conformance gates. This repository delivers an honest **partial** slice
    (strings/lists/records via memory + realloc — the values
    suite), resource handle runtimes, the linking suite's
    remaining files, async, WIT-level Component/WASI, threads,
-   FASL cache.
+   FASL cache. M9 (2026-10-25: the LINKING suite — canon
+   lower as real host core funcs; resource built-ins with
+   per-instance handle tables + own/borrow transfer
+   (lift_own/lower_own/borrow-rep + dtor resolution); the
+   imported-instance identity machinery (declarator-space
+   remaps + per-slot skip vectors + the with-args
+   substitution); the outer-aliased core module resolution +
+   the export-alias chains + the ascribed-type projections;
+   EH tag identity resolved at try_table entry; component
+   invoke/get in the runner) is implemented; the component
+   lane now runs {binary,validation,linking} and measures
+   911 pass / 0 fail / 0 unsupported / 0 harness-error of
+   911 — FULLY GREEN, every row passes. Still out of scope:
+   the non-flat canonical ABI (values suite), async,
+   WIT-level Component/WASI, threads, FASL cache.
    `declared_support` stays `partial`.*
 2. **Failure phases are distinct conditions** (PLAN.md §12.2):
    `decode-error` → `validation-error` → `link-error` →
