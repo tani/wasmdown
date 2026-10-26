@@ -13,8 +13,6 @@
 ./async/cancel-targeted-resume.wast
 ./async/cross-abi-calls.wast
 ./async/drop-cross-task-borrow.wast
-./async/during-sync-call-may-block-if-other-ready-threads.wast
-./async/during-sync-call-no-sibling-resume.wast
 # ---- M12 session 3 (2026-10-27): THE NO-SIBLING-RESUME STALL
 # ROOT-CAUSED TO THE ROUND-4 LOST WAKE (no fix landed — the tree
 # stays at the committed 410/1333-0-0-0; every probe below is on
@@ -60,6 +58,32 @@
 ./async/partial-stream-copies.wast
 ./async/passing-resources.wast
 ./async/reentrance.wast
+# ---- M12 session 4 (2026-10-27): THE SPAWN-NUDGE BUG — THE
+# DURING-SYNC FAMILY COMPLETE (no-sibling-resume 6/6 + may-block
+# 9/9 IN THE LANE; 1333 -> 1348; units 410/0; core 21187/0/73
+# unchanged; the lane x3 STABLE at 1348/0/0/0). ROOT CAUSE (probe
+# (a) CONFIRMED Main's hypothesis exactly): the resume-later
+# LOOKUP PROBE printed [RL-PROBE idx=57005 found=NIL threads=(2)]
+# as X's FIRST call — X's iteration-1 resume-later read the STALE
+# 0xdead $implicit-thread-index (inner-block hadn't set it yet)
+# and the silent (when target ...) skip DROPPED THE WAKE (the
+# exec's round-1 park then starved; the 3 later rounds worked,
+# hiding the loss in the trace). X ran EARLY because
+# async-thread-nudge FIRED THE PENDING SPAWN — a bare Store.tick
+# started the suspended new-indirect thread during setup, before
+# its resumer existed. THE FIX (one change): the spawn-thunk
+# firing moved OUT of async-thread-nudge into
+# async-thread-resume ONLY (§4590: a new-indirect thread is
+# created SUSPENDED — only an EXPLICIT resume may start it; a
+# scheduler tick never may). THE PINS UPDATED to the corrected
+# semantics (f spawns X then suspend-then-resume(X) — the
+# explicit switch; X's resumer's resume-later wakes f; both
+# pins PASS, 410/0). NOTE: the out-of-bounds trap on a
+# not-found resume-later index (the spec's own OOB trap — the
+# silent-skip path's second half) remains UNLANDED: the fixtures
+# that hit it (0xdead) are now unreachable-by-design, but a
+# future fixture may rely on the trap; recorded as the candidate
+# for the next session's one-change gate. ----
 # ---- M12 session 2 (2026-10-27): THE NESTED-SYNC-CALL HANDSHAKE
 # LANDED + TWO DURING-SYNC FIXTURES IN THE LANE (1296 -> 1333;
 # units 408 -> 410 with the two new pins; core 21187/0/73

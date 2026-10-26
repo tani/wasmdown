@@ -3225,23 +3225,29 @@ must not un-suspend a thread that only an explicit switch may."
   "Store.tick's per-thread nudge: wake the WAITCONDITION parkers
 (wait-until loops re-test their readiness; yield-parks return).
 A SUSPENDED thread (§494 — parked by async-thread-suspend with NO
-readiness) is NOT touched: only an explicit switch may resume it."
+readiness) is NOT touched: only an explicit switch may resume it.
+Likewise a PENDING SPAWN (§4590: a thread.new-indirect thread is
+created SUSPENDED — its spawn thunk has not started the SBCL
+thread yet) is NOT started by a bare tick: only the EXPLICIT
+async-thread-resume may. (The observed no-sibling-resume stall: a
+nudge fired X's spawn during setup, BEFORE inner-block set
+$implicit-thread-index — X's first resume-later read 0xdead and
+silently no-oped; the exec's round-1 park then starved.)"
   (sb-thread:with-recursive-lock ((async-thread-mutex thread))
-    (let ((th (async-thread-spawn-thunk thread)))
-      (when (functionp th)
-        (setf (async-thread-spawn-thunk thread) nil)
-        (funcall th)))
     (sb-thread:condition-broadcast (async-thread-waitqueue thread))))
 
 (defun async-thread-resume (thread)
   "Thread.resume (CanonicalABI.md 474) — the EXPLICIT switch
 (the -then-{resume,promote} builtins' target, the cancellation
-resume, resume-later): like the nudge but ALSO wakes a SUSPENDED
-park (§494's only waker). A thread.new-indirect thread starts
-SUSPENDED (§4590): its spawn thunk hasn't started the SBCL thread
-yet — the FIRST resume starts it."
-  (async-thread-nudge thread)
+resume, resume-later): starts a PENDING SPAWN (§4590's first
+resume), nudges the waitqueue parkers, and wakes a SUSPENDED park
+(§494's only waker)."
   (sb-thread:with-recursive-lock ((async-thread-mutex thread))
+    (let ((th (async-thread-spawn-thunk thread)))
+      (when (functionp th)
+        (setf (async-thread-spawn-thunk thread) nil)
+        (funcall th)))
+    (sb-thread:condition-broadcast (async-thread-waitqueue thread))
     (sb-thread:condition-broadcast (async-thread-suspend-waitqueue
                                     thread))))
 

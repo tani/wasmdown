@@ -92,6 +92,8 @@ parent dir), not the first (the grandparent 'component' — the old
 "forward.wast"
 "during-sync-call-exclusive-resume.wast"
 "during-sync-scheduling-candidates.wast"
+"during-sync-call-no-sibling-resume.wast"
+"during-sync-call-may-block-if-other-ready-threads.wast"
 "self-switch-traps.wast"
                                  "empty-wait.wast"
 "same-component-stream-future.wast"
