@@ -7,7 +7,6 @@
 # expected a function, got NULL" / "expected: (func)" for the
 # stream/thread canon sigs, run-script probes 2026-10-26) ----
 ./async/big-interleaving-test.wast
-./async/forward.wast
 ./async/cancel-delivery.wast
 ./async/cancel-resumed-callback-switch.wast
 ./async/cancel-subtask.wast
@@ -26,7 +25,6 @@
 ./async/passing-resources.wast
 ./async/reentrance.wast
 ./async/same-component-stream-future.wast
-./async/self-switch-traps.wast
 ./async/switch-to-ready-callback.wast
 ./async/sync-barges-in.wast
 ./async/sync-streams.wast
@@ -617,3 +615,47 @@
 # code (EXIT 0) + resolve via task.return; the invoke's result
 # for a no-result task.return is (NIL). GATED GREEN: units
 # 408/0, lane 1097/0/0/0 stable x2. ----
+# ---- M11b session 20 (2026-10-27): FORWARD 95/95 IN THE LANE
+# (1097 -> 1192, its 95 rows). THE LAST ROW'S ROOT CAUSE (row 52
+# = empty-element-type, NOT the future chain — the row-to-fixture
+# mapping via the command INDEX, not the line number): the
+# EMPTY-ELEMENT stream (§1567): a (stream) with no t has
+# 0-byte elements — the take MUST still produce n LOGICAL values
+# (the COUNT drives the buffer progress; the old take produced
+# NO values for a NIL t-ct -> the put's (length vals) = 0 -> the
+# progress stayed 0 -> the read's payload COMPLETED|0<<4 = 0
+# where the fixture requires COMPLETED|4<<4). FIX: %buffer-take
+# pushes a NIL placeholder per element when t-ct is NIL (the
+# put then advances the progress by n). THE DEBUGGING LESSON
+# (recorded): the probe's row indexes are COMMAND indexes (all
+# component+assert commands) — the 26th assert_return at line
+# 987 mapped to row 52 ONLY IF the interleaved component
+# commands are counted; use the command-count mapping, not the
+# assert-count. GATED GREEN: units 408/0, lane 1192/0/0/0 (x5
+# after one transient 1191/1 — the load-flake class). ----
+# ---- M11b session 20b (2026-10-27): THE -THEN-* VARIANTS +
+# self-switch-traps IN THE LANE (1192 -> 1201, its 9 rows).
+# thread.{suspend,yield}-then-{resume,promote} (§4668-4770):
+# (i32)->(i32); the promote pair traps on i == thread.index;
+# the switch = the current thread parks (suspend: a bare
+# async-thread-yield) or takes one scheduler pass (yield:
+# resume-all), then the target is nudged (async-thread-resume);
+# an unready/absent target leaves the current parked/ready per
+# the variant. self-switch-traps 9/9 stable x3. THE NEXT GAP
+# (the during-sync-* family, 4 fixtures: exclusive-resume 5/6,
+# no-sibling-resume 4/6, may-block 6/9, scheduling-candidates
+# 19/31): THE SYNC LIFT HAS NO TASK/THREAD — a sync-typed
+# export whose body calls thread.suspend traps "called an async
+# builtin outside a task" (during-sync-call-exclusive-resume's
+# sync-block row). THE FIX (next session's design): the SYNC
+# canon lift wraps its core call in a task+implicit-thread (the
+# thread parks at suspend; the invoke's caller loop waits for
+# the resolution — the M11a stackful machinery reused for the
+# sync shape). This also covers thread.index/yield/resume-later
+# in sync bodies. THE REMAINING nyi AFTER THIS SESSION:
+# big-interleaving-test, cross-abi-calls, dont-block-start,
+# drop-cross-task-borrow, empty-wait, futures-must-write?? (no —
+# in the lane), idle-drop, passing-resources, partial-stream-
+# copies, reentrance, same-component-stream-future, sync-barges-
+# in, sync-streams, trap-if-* (4), + the scheduler-blocked set
+# + the during-sync family (the sync-thread extension). ----

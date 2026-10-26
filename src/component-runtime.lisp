@@ -2809,11 +2809,17 @@ and advances the buffer's progress."
                            (error () 1))))
          (ptr (+ (second buf) (* (fourth buf) (or elem-size 1))))
          (vals nil))
-    (when (and t-ct (plusp n))
-      (let ((cx (make-abi-cx :memory memory :inst inst)))
+    (if t-ct
+        (when (plusp n)
+          (let ((cx (make-abi-cx :memory memory :inst inst)))
+            (dotimes (i n)
+              (push (%abi-load cx t-ct ptr) vals)
+              (incf ptr (or elem-size 1)))))
+        ;; an EMPTY element type (§1567): n logical values, each
+        ;; zero bytes — the COUNT drives the progress (forward's
+        ;; empty-element-type expects COMPLETED|n<<4)
         (dotimes (i n)
-          (push (%abi-load cx t-ct ptr) vals)
-          (incf ptr (or elem-size 1)))))
+          (push nil vals)))
     (incf (fourth buf) n)
     (nreverse vals)))
 
@@ -4338,10 +4344,59 @@ is the valtype."
                                 (%end-copy smaller buffer
                                            t)))))))))
             '())))))
-    ;; the still-opaque kinds: the slot exists, the call traps
+    ;; M11b: thread.{suspend,yield}-then-{resume,promote}
+    ;; (§4668-4770): all four take the target index + return 0.
+    ;; The -then-resume pair: SWITCH to the target — the current
+    ;; thread parks (suspend) or stays ready (yield: one
+    ;; scheduler pass); the target is nudged. The -then-promote
+    ;; pair: the same but traps on i == thread.index and only
+    ;; nudges a READY target.
     ((:thread-suspend-then-resume :thread-yield-then-resume
-      :thread-suspend-then-promote :thread-yield-then-promote
-      :thread-new-indirect
+      :thread-suspend-then-promote :thread-yield-then-promote)
+     (let ((promote-p (member kind '(:thread-suspend-then-promote
+                                     :thread-yield-then-promote)))
+           (yield-p (member kind '(:thread-yield-then-resume
+                                   :thread-yield-then-promote))))
+       (wasmdown.runtime:make-host-func-instance
+        (wasmdown.types:make-wasm-func-type '(:i32) '(:i32))
+        (lambda (args)
+          (let* ((task *current-task*)
+                 (fields (%inst-async-fields inst))
+                 (target nil))
+            (unless (and task *current-thread*)
+              (error 'wasmdown:wasm-trap :kind :generic
+                     :message
+                     "called an async builtin outside a task"))
+            ;; §4728/§4749: the promote variants trap on the
+            ;; CURRENT thread's index
+            (when (and promote-p
+                       (= (or (async-thread-index *current-thread*)
+                              -1)
+                          (first args)))
+              (error 'wasmdown:wasm-trap :kind :generic
+                     :message "cannot switch to the current thread"))
+            (dolist (th (getf fields :threads))
+              (when (and (async-thread-index th)
+                         (= (async-thread-index th) (first args)))
+                (setf target th)))
+            (cond
+             (target
+              ;; the SWITCH: park the current (suspend) or leave
+              ;; it ready (yield — one scheduler pass first so
+              ;; the target runs), then nudge the target
+              (if yield-p
+                  (async-thread-resume-all)
+                  (async-thread-yield *current-thread*))
+              (async-thread-resume target))
+             (promote-p
+              ;; an out-of-bounds/unready target: the promote
+              ;; variants still leave the current suspended/ready
+              (if yield-p
+                  (async-thread-resume-all)
+                  (async-thread-yield *current-thread*))))
+            (list 0))))))
+    ;; the still-opaque kinds: the slot exists, the call traps
+    ((:thread-new-indirect
       :error-context-new :error-context-debug-message
       :error-context-drop)
      nil)))

@@ -88,7 +88,9 @@ parent dir), not the first (the grandparent 'component' — the old
                                  "cancel-not-delivered.wast"
                                  "zero-length.wast"
                                  "wait-during-callback.wast"
-                                 "builtin-trap-poisons-instance.wast")
+                                 "builtin-trap-poisons-instance.wast"
+"forward.wast"
+                                 "self-switch-traps.wast")
                                :test #'string=)))
                 (or (directory (merge-pathnames
                                 "tests/component/async/*.wast" *root*))
