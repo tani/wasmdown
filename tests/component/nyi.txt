@@ -291,3 +291,27 @@
 # ends first-class component values. NEXT: implement those arms,
 # re-probe cross-task-future (the write->read rendezvous should
 # then complete end-to-end), then closed-stream/drop-stream. ----
+# ---- M11b session 11 (2026-10-27): lift_stream/lower_stream
+# LANDED + gated green. The four transfer arms installed:
+# %lift-async-end (the READABLE-end guards + the removal from
+# the owner's table, §2438-2448), %lower-async-end (the re-add
+# to the receiving instance, §2857-2864), and the arms in
+# %abi-lift / %abi-load (the flat + spilled paths) and
+# %abi-store / %abi-lower (the flat + spilled paths) — the END
+# is now a first-class component VALUE that moves between
+# handles tables. Fixed in-session: the %abi-lower t-arm's
+# (mod v #x100000000) crashed on an async-end record ("is not
+# of type REAL") — the flat lowering needed the arm too. GATED
+# GREEN: units 407/0, lane 1031/0/0/0. THE PROBE'S NEXT GAP:
+# cross-task-future now fails "invalid stream end index 3" —
+# the end TRANSFERS but lands at the WRONG index (3 adds for
+# one transfer). SUSPECTED: the result crosses the $C->D
+# boundary through MULTIPLE lower sites (the sync lower's
+# lower_flat_values AND the %abi-store site — the async lower's
+# on-resolve out-param path — each calling %lower-async-end and
+# RE-ADDING the same end). NEXT PROBE: count %lower-async-end
+# calls per fixture run + print (inst, resulting index) at each
+# call; then make %lower-async-end IDEMPOTENT per (end, inst) —
+# a small per-end transferred-instance marker — or route the
+# result through ONE lower site. After that: the write->read
+# rendezvous completes and cross-task-future enters the lane. ----

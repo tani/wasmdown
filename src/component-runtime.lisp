@@ -1347,6 +1347,10 @@ with the TAGGED code-unit count under CX's encoding. Traps on OOB
           (make-ct* :variant
                     (vector (cons "ok" ok) (cons "error" err)))
           ptr)))
+      ((:stream :future)
+       ;; lower_async_value (§2857): the END (the domain value)
+       ;; enters THIS instance's table; store the new index
+       (%abi-store-int cx (%lower-async-end v cx) ptr 4))
       (t (%abi-store-int cx v ptr 4)))))
 
 (defun %abi-store-list (cx v elem-type)
@@ -1415,7 +1419,11 @@ payload at the join-aligned offset."
           (let ((sp (%abi-load-int cx ptr 4))
                 (sl (%abi-load-int cx (+ ptr 4) 4)))
             (%abi-load-string cx sp sl)))
-         (t (%abi-load-int cx ptr 4))))
+         ((:stream :future)
+        ;; lift_async_value's load side: the i32 indexes this
+        ;; table; the END itself is the loaded value
+        (%lift-async-end cx (%abi-load-int cx ptr 4)))
+       (t (%abi-load-int cx ptr 4))))
       (:list
        (let ((elem (car (wasmdown.component:ct-payload c)))
              (fixed (cdr (wasmdown.component:ct-payload c))))
@@ -1636,6 +1644,10 @@ CoerceValueIter pairs) — NIL outside variants."
                      (make-ct* :variant
                                (vector (cons "ok" ok)
                                        (cons "error" err))))))
+      ((:stream :future)
+       ;; lower_async_value (§2851): the END enters THIS instance's
+       ;; table; the flat i32 is the new index
+       (list (%lower-async-end v cx)))
       (t (list (mod v #x100000000))))))
 
 
@@ -1826,6 +1838,11 @@ pairs consumed in order)."
                 (if (string= (car r) "ok")
                     (cons :ok (cdr r))
                     (cons :err (cdr r)))))
+             ((:stream :future)
+              ;; lift_async_value (§2438): the i32 indexes THIS
+              ;; instance's handles table; the READABLE end moves
+              ;; out to the caller (the cx's instance is the owner)
+              (%lift-async-end cx (next :i32)))
              (t (next :i32))))))
     (lift vt)))
 
@@ -2820,6 +2837,37 @@ the (memory ptr length progress) list. The 5 cases in order:
      ;; notify myself with progress 0
      (t
       (%end-notify end 0)))))
+
+;;; ---- lift_async_value / lower_async_value (CanonicalABI.md 2432-2460
+;;; ---- / 2851-2865): the READABLE end crossing a component boundary.
+
+(defun %lift-async-end (cx i)
+  "lift_stream / lift_future (§2432-2460): the i32 index I in CX's
+instance resolves the READABLE end; the guards; the end transfers
+OUT of this table (the caller re-adds it at its boundary)."
+  (let* ((inst (abi-cx-inst cx))
+         (end (%handle-at inst i #'async-end-p "stream end")))
+    (unless (member (async-end-event-code end)
+                    (list +event-stream-read+ +event-future-read+))
+      (error 'wasmdown:wasm-trap :kind :generic
+             :message "handle index used with the wrong type"))
+    (unless (eq (async-end-state end) :idle)
+      (error 'wasmdown:wasm-trap :kind :generic
+             :message "cannot lift a stream or future in a non-idle state"))
+    (when (%waitable-in-wset end)
+      (error 'wasmdown:wasm-trap :kind :generic
+             :message "cannot lift stream while it's in a waitable set"))
+    (setf (aref (%inst-handles inst) (1- i)) nil)
+    end))
+
+(defun %lower-async-end (end cx)
+  "lower_stream / lower_future (§2851-2865): the END enters the
+callee's table; returns the new index."
+  (let* ((inst (abi-cx-inst cx))
+         (i (%handle-add-any inst end)))
+    (setf (async-end-index end) i)
+    (setf (async-end-owner end) inst)
+    i))
 
 ;;; ---- The Thread record (CanonicalABI.md 391-407) ----
 
