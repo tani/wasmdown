@@ -202,13 +202,31 @@
 #     the token the SECOND spawn's :want readiness (seq 1,
 #     SMALLER than the callee's 2) makes it the tick's preferred
 #     grant — but the outer never releases, so nothing moves and
-#     the oracle fires. NEXT: instrument %canon-lower-async-host-
-#     func's call path vs %lower-host-func's to name which lower
-#     the pin's fixture actually takes (the fixture uses `(canon
-#     lower ... async)` — the ASYNC lower — so WHY does the
-#     invoke lambda fire? suspected: the callee's own
-#     callback-loop lift or a nested lifted-func-call), then
-#     unify: ONE task per logical callee (the async lower's),
-#     with %canon-lift-async's caller-loop reused rather than a
-#     second task spawned.
+#     the oracle fires. SESSION 7 (2026-10-27) RESOLVED THE
+#     DOUBLE-SPAWN QUESTION — ON THE RESUME-ALL BASE:
+#     (1) The routing probe (traces at lifted-func-call's async
+#         branch, %canon-lift-async's entry, and
+#         %call-async-funcinst's async arm) on the CLEAN base:
+#         exactly ONE invoke-lambda fire (cur-task=NO-TASK — the
+#         invoker's own entry) and ONE async-arm fire per run —
+#         NO DOUBLE-SPAWN. Main's M11a-latent-defect hypothesis
+#         is DISPROVEN: the "second task" was a TOKEN-SESSION
+#         MEASUREMENT ARTIFACT (the s4/s5 probe scripts'
+#         instrumentation on the token state — the resume-all
+#         base's routing is sound: 6 runs, 1+1 fires each).
+#     (2) The canary (wset-wait-join) on the clean base is
+#         LOAD-FLAKY: 2/10 fails under concurrent load, 12/12
+#         passes quiet — the same load-dependent scheduler-order
+#         class as acs. WITH the routing traces (a timing
+#         perturbation) it passed 9/9. The M11a base is sound;
+#         the flake is the concurrency window.
+#     CONSEQUENCE FOR THE PLAN: the token scheduler remains the
+#     identified deterministic fix, but its sessions' probe
+#         SCRIPTS need rebuilding against clean patterns (their
+#         instrumentation produced the phantom second task); and
+#     the unification step is NOT NEEDED (no double-spawn
+#     exists). The ladder (parser arm -> canon ladder -> instance
+#     poisoning) can proceed on the base as-is; the
+#     scheduler-order flakes (acs + this pin, both load-bound)
+#     remain open items with the token as the candidate fix.
 ./async/async-calls-sync.wast
