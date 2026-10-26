@@ -17,8 +17,6 @@
 ./async/during-sync-call-may-block-if-other-ready-threads.wast
 ./async/during-sync-call-no-sibling-resume.wast
 ./async/during-sync-scheduling-candidates.wast
-./async/future-completion-order.wast
-./async/futures-must-write.wast
 ./async/idle-drop.wast
 ./async/partial-stream-copies.wast
 ./async/passing-resources.wast
@@ -759,3 +757,38 @@
 # exclusive-lock (1), trap-if-block-and-sync (12), the during-
 # sync family (the binding mystery — one print from the hook
 # check), the scheduler-blocked set (M12). ----
+# ---- M11b session 23 (2026-10-27): THE BINDING MYSTERY
+# SOLVED — a COMPILE-ORDER bug, not a runtime one. ROOT CAUSE:
+# the sync-lift context (line ~2030) binds *current-thread*
+# BEFORE the file's DEFPARAMETER (~3046) — SBCL compiles the
+# file top-down and the unproclaimed LET binding compiled
+# LEXICAL: the binding site's own reads saw the value (T) but
+# NO dynamic binding ever reached the guest arms (NIL). The
+# chain of eliminations that pinned it: the probe is honest
+# (symbol-value+find-symbol sees dynamic bindings), the symbols
+# are EQ, the hook IS #'interp-invoke, the core IS :wasm, the
+# OS thread is the same — and finally two reads IN THE SAME LET
+# BODY disagreed (the direct read T, the function read NIL) —
+# the lexical-binding signature. THE FIX LANDED: (declaim
+# (special *current-task* *current-thread* *handle-caller-
+# inst*)) at the file's head (after in-package) — every binding
+# site now compiles as dynamic. Units 408/0 + lane 1277/0/0/0
+# x2 verified with the declaim alone.
+# THE SYNC-LIFT CONTEXT (the during-sync family's unblock):
+# proven SOUND in isolation (units 408/0 with the declaim!)
+# but NOT LANDABLE yet: the lane HANGS (300s+, no output) —
+# the hanger bisected to **reentrance.wast (0 rows in 30s)**;
+# the reentrancy-aware variant (an outer async context reuses
+# it, a top-level sync lift creates task+thread+gate) ALSO
+# hangs the lane. THE RECORDED NEXT PROBE: the reentrance
+# fixture + the gate trace (the enter's exclusive-lock
+# acquisition vs a second sequential sync call; the unwind-
+# protect's exit ordering vs the (first lifted) tail; the
+# :threads registration). ALSO: the s21 script NEVER called
+# %task-enter (the thread was unregistered — the resume-later
+# couldn't find it!); the fixed variant ADDS the enter — keep
+# that in the re-derivation. THE SUSPEND'S SCHEDULER PASS (the
+# family's second requirement) also prototyped: the bare
+# (async-thread-resume-all) before the park hung the MINI repro
+# — the pass's shape needs the arm's callback-thread park state
+# traced first. ----

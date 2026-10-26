@@ -154,8 +154,50 @@ conformance gates. This repository delivers an honest **partial** slice
    remaining 38 async files stay in nyi.txt with per-file
    probe evidence (37 need the M11b canons — future/stream/
    thread/error-context; async-calls-sync has one open
-   interleave bug). Still out of scope: M11b, WIT-level
-   Component/WASI, threads, FASL cache.
+   interleave bug). M11b (2026-10-27: THE CANON FAMILIES —
+   the End record family per CanonicalABI.md 1491-1922 +
+   4242-4534: {stream,future}.new/read/write with the five-
+   case End.copy (1687-1711) + the bounded-buffer
+   backpressure + the BLOCKED sentinel, cancel-{read,write}
+   (4376), drop-{readable,writable} (4448), forward (4495:
+   the outer-link + the both-pending corner 1760 + the
+   empty-element take where a 0-byte element still advances
+   the progress by the count); the Table free list (1142-
+   1148: remove appends, add pops first); the THREAD core
+   (4535-4769: index/yield/suspend/resume-later + new-
+   indirect's suspended spawn-thunk threads with the 4587
+   trap handler + the four -then-{resume,promote} variants
+   4668-4770); the three-shape STARTED semantics (3651:
+   sync-typed inline, callback at the initial return or the
+   wset.wait park, stackful at on_start — derived from four
+   fixtures' expectations, state-check-verified); the sync-
+   lower's two-sided type/handle split (the result type
+   resolves against the callee, the handle indices against
+   the caller — the positional walk, zero-length's fix); the
+   trap propagation (3584: a trapped callee re-signals at
+   the boundary — the sync caller loop + the async delivery
+   closure, cancel-not-delivered's fix); the {stream,future}.
+   forward kind validation; the async dynamic context
+   proclaimed at the file head — a binding site preceding
+   the defparameters compiled LEXICAL and never reached the
+   guest arms, the sessions-21-23 binding-visibility
+   mystery) is implemented; the component lane whitelists
+   25 async files and measures 1296 pass / 0 fail / 0
+   unsupported / 0 harness-error — FULLY GREEN. The
+   remaining 20 async files stay in nyi.txt with per-file
+   probe evidence: the sequential-schedule family (cancel-
+   targeted-resume, cancel-delivery row 3, cancel-subtask
+   rows 1/3, async-calls-sync, cancel-and-exclusive-lock,
+   sync-streams, partial-stream-copies — the callee thread
+   races the lower's bounded wait; the token scheduler is
+   M12's opening problem with the full evidence chain), the
+   sync-lift thread context's reentrance hang (proven sound
+   in isolation; the lane's reentrance.wast hangs — the
+   next probe is the gate trace), the during-sync family
+   (unblocked once reentrance resolves), trap-if-block-and-
+   sync, and the error-context residuals. Still out of
+   scope: M12, WIT-level Component/WASI, threads beyond the
+   canon core, FASL cache.
    `declared_support` stays `partial`.*
 2. **Failure phases are distinct conditions** (PLAN.md §12.2):
    `decode-error` → `validation-error` → `link-error` →

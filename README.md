@@ -37,8 +37,8 @@ calls all pass.
 
 The component lane (`make test-component`, the vendored
 component-model suite at commit `d095e2f60dd...` per
-`specs/lock.toml`) measures M7-M11a: **1031 pass / 0 fail / 0
-unsupported / 0 harness-error of 1031** in {binary,validation,
+`specs/lock.toml`) measures M7-M11b: **1296 pass / 0 fail / 0
+unsupported / 0 harness-error** in {binary,validation,
 linking,values,async-core} minus nyi.txt — FULLY GREEN: every
 row passes. The component TEXT parser + the full validation
 rule set (M7), component instantiation EXECUTION (M8: the
@@ -52,18 +52,43 @@ identity across instances, component invoke/get in the runner),
 the VALUES suite (M10: the canonical ABI at runtime —
 string/list/record/variant/map lowering through realloc +
 memory, the MAX_FLAT pointer indirection, the lowered-host-
-func's OWN canonopt memory), and the ASYNC CORE (M11a: the
+func's OWN canonopt memory), the ASYNC CORE (M11a: the
 task/thread state machine — the callback event loop with the
 real-park YIELD + the exclusive-lock-released WAIT, the
 backpressure gate, the deadlock oracle, the async built-ins as
 real host funcs with the exact trap messages, the packed async
-lower with the STARTED-wait; 7 files in the lane, the remaining
-38 in nyi.txt with per-file probe evidence — 37 need the M11b
-canons (future/stream/thread/error-context), async-calls-sync
-has one open interleave bug) are implemented. nyi.txt also
-carries values/post-return.wast + values/variants.wast (the
-same async machinery) and validation/kebab.wast (the vendored
-exclusion).
+lower with the STARTED-wait), and THE M11b CANON FAMILIES
+(the End record family: {stream,future}.new/read/write with
+the five-case End.copy + the bounded-buffer backpressure +
+the BLOCKED sentinel, cancel-{read,write}, drop-{readable,
+writable}, forward with the outer-link + the both-pending
+corner + the empty-element take (a 0-byte element still
+advances the progress by the COUNT); the Table free list
+(remove appends, add pops first — the fixtures assert exact
+reused indices); the THREAD core (index/yield/suspend/
+resume-later + new-indirect's suspended spawn-thunk threads
+with the §4587 trap handler + the four -then-{resume,promote}
+variants); the three-shape STARTED semantics (sync-typed
+inline, callback at the initial return or the wset.wait park,
+stackful at on_start); the sync-lower's two-sided type/handle
+split (the result type resolves against the callee, the handle
+indices against the caller — the positional walk); the trap
+propagation (a trapped callee re-signals at the boundary: the
+sync caller loop, the async delivery closure); the {stream,
+future}.forward kind validation; and the async dynamic context
+proclaimed at the file head (a binding site preceding the
+defparameters compiled LEXICAL — the sessions-21-23 mystery).
+25 files in the lane, 20 in nyi.txt with per-file probe
+evidence — the residuals: the sequential-schedule family
+(cancel-targeted-resume, cancel-delivery row 3, cancel-subtask
+rows 1/3, async-calls-sync, cancel-and-exclusive-lock,
+sync-streams, partial-stream-copies — M12's token-scheduler
+work), the sync-lift thread context's reentrance hang, the
+during-sync family (unblocked by the context once reentrance
+resolves), trap-if-block-and-sync, and the rest of the
+error-context canon family. nyi.txt also carries values/
+post-return.wast + values/variants.wast (the same async
+machinery) and validation/kebab.wast (the vendored exclusion).
 See `CONFORMANCE-COMPONENT.md`.
 
 Regenerate with `make report-conformance` (writes `CONFORMANCE.md` +

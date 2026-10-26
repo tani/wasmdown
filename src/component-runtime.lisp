@@ -53,6 +53,15 @@
            #:runtime-export-value))
 (in-package #:wasmdown.component.runtime)
 
+;;; THE ASYNC DYNAMIC CONTEXT: proclaimed SPECIAL at the file's
+;;; head so EVERY binding site compiles as a dynamic binding
+;;; (a binding site that precedes the defparameters — an
+;;; unproclaimed LET binding compiles LEXICAL and never reaches
+;;; the guest arms; this was the root cause of the sessions
+;;; 21-23 "binding-visibility mystery").
+(declaim (special *current-task* *current-thread*
+                 *handle-caller-inst*))
+
 (declaim (notinline bag-p bag-ref make-lifted-func lifted-func-call
                     runtime-export-value instantiate-component))
 
