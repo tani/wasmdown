@@ -453,3 +453,51 @@
 # the same fixture checks as before, now with the correct transfer
 # machinery under them; next session's probes start from there).
 # GATED GREEN: units 407/0, lane 1087/0/0/0 stable x2. ----
+# ---- M11b session 17 (2026-10-27, REVERTED to the ninth rung):
+# THE STARTED/STARTING THREE-SHAPE RULE — fully derived, verified
+# at the state checks, NOT landed (the downstream flows regressed;
+# the tree stays at the green 1087). THE RULE (from four
+# fixtures' state expectations):
+#   (1) SYNC-TYPED callee (inline on the lower's thread): the
+#       on_start (the args read) runs inline -> STARTED at the
+#       pack (acs 0x21/0x31 ✓ current behavior, keep).
+#   (2) CALLBACK callee parked INSIDE its initial core call in a
+#       RAW sync builtin (stream/future read-write's sync wait):
+#       STARTING (sync-streams' $C.set — the args are still live).
+#   (3) CALLBACK callee parked at an EVENT-PROTOCOL point (the
+#       wset.wait's park) OR its initial call RETURNED (the
+#       WAIT/YIELD/EXIT code): STARTED (cancel-and-exclusive-
+#       lock's hold-lock parks in wset.wait and still expects
+#       STARTED; the park task returns WAIT and expects STARTED).
+#   The stackful shape: on_start precedes the single core call
+#       (§3395) -> STARTED while blocked (keep the on-start flip).
+# IMPLEMENTATION SHAPE (verified by probe, then reverted): the
+# lower passes :on-start-sync; the SYNC branch flips inline; the
+# CALLBACK callee's flip moves to the initial call's RETURN (the
+# guest body's callback-loop entry) + %wset-wait's park funcalls
+# the current task's on-started hook (the event-protocol handoff)
+# + the STARTED-wait bound 20 (the oracle's 50-cycle patience
+# bounds it). THE REGRESSIONS (both fixtures' first checks PASSED
+# with the rule): cancel-and-exclusive-lock deadlocks in the
+# cancel/write interplay; sync-streams deadlocks at its LAST
+# wset.wait (the $set subtask's event delivery). THE RENDEZVOUS-
+# TURN design (sync-streams' 0x41-vs-0x40): the sync read/write's
+# EAGER completion must observe the PEER's post-rendezvous act
+# (the drop -> DROPPED): the writer parks on the peer's
+# turn-done flag (a new async-end slot), the mark at ANY event
+# delivery (%waitable-get-pending-event sets the peer end's flag
+# + resume-all), the payload then computes DROPPED at delivery.
+# The park is a proper wait-until (the oracle stays quiet); the
+# two deadlocks left are: (a) the future.write's eager park when
+# the peer parks in wset.wait (the mark must reach it via the
+# wset delivery — verified wired, still deadlocked: suspect the
+# wset.wait's readiness/lock interplay), (b) sync-streams' final
+# subtask wset.wait (the join found the subtask, pend=T,
+# resolved=NIL at the wait while a resolve printed state=2 — the
+# OBJECT IDENTITY question: two subtask objects or a stale table
+# slot; the identity trace attempt errored inside the format —
+# re-derive with a serial-number trace next session). NEXT
+# SESSION: re-apply the rule from this note (the probe evidence:
+# [PACK state=0/1] traces confirm all four fixtures' state
+# checks pass with it), then chase the two deadlocks with
+# serial-number identity traces. ----
