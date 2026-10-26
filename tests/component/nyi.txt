@@ -59,10 +59,21 @@
 # close it: gate FIFO only orders tasks that have ARRIVED — 4's
 # inner callee can still be in flight when 5's passes alone
 # (probe: ENTER seq=5 twice BEFORE ENTER seq=4 at the endgame).
-# Deterministic in isolation (6/6+ probe runs green), flaky ~1/4 in
-# the full lane (CPU contention widens the window). IDENTIFIED FIX:
-# a serial Store.tick (§932's random.choice pinned to ONE ready
-# thread per tick, run-to-block) — wasmtime's shape; resume-all
-# schedules every admitted thread CONCURRENTLY, which is the
-# divergence. OUT of the lane until that lands (no-fail rule). ----
+# The flake rate is LOAD-DEPENDENT, not fixed: measured 6/6 green
+# and 4/6 fails across sessions on the same committed tree (CPU
+# contention widens the window). IDENTIFIED FIX: a TRULY serial
+# Store.tick (§932's random.choice pinned to ONE ready thread per
+# tick, run-to-block) — wasmtime's shape. MEASURED AND REVERTED
+# (2026-10-26 session 2): the NAIVE tick — per-thread readiness
+# closures stored on the record, %TICK resuming the ONE
+# smallest-gate-seq ready thread, every blocking site handing off
+# via the tick, resume-all becoming the tick — does NOT serialize:
+# every blocking site is itself a tick SOURCE, so many ticks fly
+# concurrently and multiple threads run anyway (acs got WORSE,
+# 8/10 fails vs the base's load-dependent rate; the M11a async
+# trio stayed green). A REAL serial scheduler needs the TOKEN
+# design: exactly one grant source (the tick alone hands the
+# token; blocking RELEASES it), one un-parked thread at a time,
+# with the stamp machinery as the grant priority. OUT of the
+# lane until that lands (no-fail rule). ----
 ./async/async-calls-sync.wast
