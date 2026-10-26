@@ -60,7 +60,7 @@
 ;;; the guest arms; this was the root cause of the sessions
 ;;; 21-23 "binding-visibility mystery").
 (declaim (special *current-task* *current-thread*
-                 *handle-caller-inst*))
+                 *handle-caller-inst* *sync-lift-owner*))
 
 (declaim (notinline bag-p bag-ref make-lifted-func lifted-func-call
                     runtime-export-value instantiate-component))
@@ -1915,41 +1915,145 @@ of flat arguments)."
 
 ;;; ---- the lifted call (canon_lift, sync; CanonicalABI.md 3389) ----
 
+(defparameter *sync-lift-owner* nil
+  "The sync-lift context's OWNING task (the top-level lift that
+created it): a NESTED sync call borrows the outer context and must
+NOT exit it on return — only the owner's unwind-protect unregisters
+the thread. A binding site that precedes this DEFPARAMETER compiles
+LEXICAL (the compile-order class) — proclaimed at the file's head.")
+
+(declaim (special *sync-lift-owner*))
+
 (defun %sync-lift-context (lf)
-  "The SYNC-LIFT THREAD CONTEXT (sessions 21-23, during-sync family):
-when a SYNC-TYPED export's body calls a thread.*/waitable built-in,
-the built-ins need a task+thread. The outer async context (a nested
-sync call INSIDE a guest turn) reuses *CURRENT-TASK*/*CURRENT-THREAD*;
-a top-level sync lift creates the task+thread pair and registers it
-through the gate (needs-exclusive: the sync func holds the exclusive
-lock for the call's duration, per the sync-call semantics). Returns
-the (values task thread) to bind."
-  (if *current-task*
-      (values *current-task* *current-thread*)
-      (let* ((inst (lifted-func-inst lf))
-             (task (make-async-task
-                    :ft (lifted-func-type lf)
-                    :opts (lifted-func-opts lf)
-                    :inst inst
-                    :on-start (lambda () nil)
-                    :on-resolve (lambda (r) (declare (ignore r)))))
-             (th (make-async-thread :task task)))
-        (setf (async-task-implicit-thread task) th)
-        (setf (async-task-gate-parked task) t) ; inhibit the enter gate's backpressure park
-        (unless (%task-enter-implicit-thread task)
-          (error 'wasmdown:wasm-trap :kind :generic
-                 :message "sync lift cancelled at gate"))
-        (setf (async-task-gate-parked task) nil)
-        (setf (async-task-state task) :started)
-        (values task th))))
+  "The SYNC-LIFT TASK/THREAD (sessions 21-23 + M12): EVERY sync lift
+creates a FRESH task+thread pair and registers it through the gate
+(the per-call Task of §572 — a nested sync call must NOT borrow the
+caller's context: the callee's thread.* built-ins would address the
+CALLER's index — reentrance test 10's promote-the-running-thread
+phase check; the sync func holds the exclusive lock only when
+async-typed, per §652). The OWNER global records the OUTERMOST
+sync-lift task (its unwind-protect is the one that exits; nested
+callers PARK instead — %sync-lift-run). Returns the (values task
+thread) to bind on the executor."
+  (let* ((inst (lifted-func-inst lf))
+         (task (make-async-task
+                :ft (lifted-func-type lf)
+                :opts (lifted-func-opts lf)
+                :inst inst
+                :on-start (lambda () nil)
+                :on-resolve (lambda (r) (declare (ignore r)))))
+         (th (make-async-thread :task task)))
+    (setf (async-task-implicit-thread task) th)
+    (setf (async-task-gate-parked task) t) ; inhibit the enter gate's backpressure park
+    (unless (%task-enter-implicit-thread task)
+      (error 'wasmdown:wasm-trap :kind :generic
+             :message "sync lift cancelled at gate"))
+    (setf (async-task-gate-parked task) nil)
+    (setf (async-task-state task) :started)
+    (unless *sync-lift-owner*
+      (setf *sync-lift-owner* task))
+    (values task th)))
 
 (defun %sync-lift-exit (task th)
-  "The sync-lift context's EXIT: unregister the thread (idempotent —
-the caller's unwind-protect may run twice on the same task)."
+  "The sync-lift context's EXIT: unregister the thread — called by
+%SYNC-LIFT-RUN for the task IT created (idempotent: a double exit's
+remove is a no-op; a trap mid-call still unwinds through here)."
   (when (and task th (async-thread-index th))
     (ignore-errors
       (setf (async-task-gate-parked task) t)
-      (%task-exit-implicit-thread task))))
+      (%task-exit-implicit-thread task))
+    (when (eq *sync-lift-owner* task)
+      (setf *sync-lift-owner* nil))))
+
+(defun %sync-lift-run (lf core flat-args)
+  "The SYNC-LIFT MINI-SCHEDULER (§3538-3543): a sync lift runs its
+core call on a FRESH executor SBCL thread — the implicit thread of
+the per-call Task (§572: EVERY component-export call creates one) —
+so the guest body's thread.* built-ins address THEIR OWN index (a
+nested sync call must NOT run inline on the caller's thread: the
+caller's index collides with the callee's promote target, the
+reentrance phase checks). The CALLER then waits:
+  - TOP-LEVEL (the main OS thread): the main thread runs the drain
+    loop itself (§3538-3543 — Store.tick every live thread until the
+    executor completes), with the DEADLOCK ORACLE (§3539: enough
+    quiescent cycles with the executor unfinished = no ready
+    candidate can ever make progress).
+  - NESTED (the caller is a guest OS thread): the caller parks on
+    DONE-P (a condition-wait with a short timeout — the enclosing
+    drain loop's resume-all nudges the CALLER too, so it re-tests);
+    the executor is registered in the scheduler and gets its slices
+    from the same resume-all."
+  (multiple-value-bind (task th) (%sync-lift-context lf)
+    (let* ((cell (cons nil nil))
+           (dmu (sb-thread:make-mutex :name "sync-lift"))
+           (done (sb-thread:make-waitqueue :name "sync-lift"))
+           (done-p nil)
+           (oracled nil)
+           (executor
+             (sb-thread:make-thread
+              (lambda ()
+                (let ((*current-task* task)
+                      (*current-thread* th))
+                  (unwind-protect
+                       (multiple-value-bind (r e)
+                           (ignore-errors
+                            (apply #'wasmdown.runtime:wasm-call
+                                   core flat-args))
+                         (setf (car cell) r)
+                         (when e (setf (cdr cell) e)))
+                    (sb-thread:with-recursive-lock (dmu)
+                      (setf done-p t)
+                      (sb-thread:condition-broadcast done)))))
+              :name "sync-lift-executor")))
+      (declare (ignore executor))
+      (unwind-protect
+           (cond
+            ((sb-thread:main-thread-p)
+             ;; THE DRAIN LOOP (§3538-3543): Store.tick every live
+             ;; thread, then poll DONE-P. A condition-wait WITH A
+             ;; TIMEOUT on the recursive DMU misfires under load
+             ;; ("not holding mutex" — the M11b park-lock class):
+             ;; poll + sleep instead.
+             (loop
+               with idle-cycles = 0
+               for before = *async-progress*
+               do (async-thread-resume-all)
+                  (sb-thread:with-recursive-lock (dmu)
+                    (when done-p (return)))
+                  (unless done-p (sleep 0.001))
+                  (if (> *async-progress* before)
+                      (setf idle-cycles 0)
+                      (incf idle-cycles))
+               when (>= idle-cycles 200)
+                 do (setf oracled t)
+                    (error 'wasmdown:wasm-trap :kind :generic
+                           :message
+                           "deadlock detected: event loop cannot make further progress")))
+            (t
+             (loop
+               until (progn
+                       (sb-thread:with-recursive-lock (dmu) done-p)
+                       (prog1 done-p (unless done-p (sleep 0.001)))))))
+        ;; THE ORACLE-TRAP TEARDOWN (§3552: "trap and tear down the
+        ;; whole store"): a deadlocked executor stays parked in the
+        ;; scheduler — the NEXT test's resume-all would nudge a
+        ;; ZOMBIE (the observed inter-test interference: test 8's
+        ;; deadlock left the executor registered; test 9's flow
+        ;; then interleaved with it and trapped "unreachable").
+        ;; Unregister it and unblock its park so the SBCL thread
+        ;; can finish (the cell stays empty; the caller traps).
+        (when oracled
+          (setf (async-thread-suspended-p th) nil)
+          (setf (async-thread-yield-parked th) nil)
+          (%sync-lift-exit task th)
+          (sb-thread:with-recursive-lock ((async-thread-mutex th))
+            (sb-thread:condition-broadcast
+             (async-thread-suspend-waitqueue th))
+            (sb-thread:condition-broadcast (async-thread-waitqueue th))))
+        (unless oracled
+          (%sync-lift-exit task th)))
+      (when (cdr cell) (error (cdr cell)))
+      (car cell))))
 
 (defun lifted-func-call (lf &rest args)
   "canon_lift (CanonicalABI.md 3389): the ASYNC-TYPED functype lifts
@@ -2059,21 +2163,17 @@ the caller's unwind-protect may run twice on the same task)."
                               ft (comp-instance-types (lifted-func-inst lf))
                               :lift))))
           (declare (ignore core-sig))
-          ;; THE SYNC-LIFT THREAD CONTEXT (sessions 21-23): the
-          ;; core call runs with a task+thread bound so the
-          ;; thread.*/waitable built-ins in a SYNC body find their
-          ;; context; the unwind-protect ALWAYS exits the implicit
-          ;; thread (the exclusive lock + the registration).
-          (multiple-value-bind (sync-task sync-th)
-              (%sync-lift-context lf)
-            (declare (ignorable sync-task sync-th))
-          (let ((res
-                  (let ((*current-task* sync-task)
-                        (*current-thread* sync-th))
-                    (unwind-protect
-                         (apply #'wasmdown.runtime:wasm-call core
-                                flat-args)
-                      (%sync-lift-exit sync-task sync-th)))))
+          ;; THE SYNC-LIFT TASK/THREAD (sessions 21-23 + M12): every
+          ;; sync lift runs its core call through %SYNC-LIFT-RUN —
+          ;; the fresh implicit thread (a real per-call Task, §572)
+          ;; with the caller draining (top level) or parking
+          ;; (nested). The earlier INLINE nested shape had TWO
+          ;; measured defects: the index collision (the callee's
+          ;; promote targeting the caller's own thread — reentrance
+          ;; test 10's phase checks) and the borrowed-context exit
+          ;; unregistering the caller mid-turn (the empty-scheduler
+          ;; starvation).
+          (let ((res (%sync-lift-run lf core flat-args)))
             (let ((vi (make-array 16 :fill-pointer 0 :adjustable t)))
               (loop for r in (coerce res 'list)
                     for rt in (result-core-types lf result)
@@ -2130,7 +2230,7 @@ the caller's unwind-protect may run twice on the same task)."
                                           (second pr)))))
                       (when prf
                         (apply #'wasmdown.runtime:wasm-call prf res)))))
-                (first lifted))))))))))
+                (first lifted)))))))))
 
 (defun result-core-types (lf result)
   "The core result types the LIFT produces for RESULT (flatten of
@@ -3056,8 +3156,10 @@ wrong-index probe: one transfer produced index 3)."
   (storage (make-array 2 :initial-element 0))
   (cancellable nil)
   (yield-parked nil)                 ; parked by async-thread-yield (READY)
+  (suspended-p nil)                  ; SUSPENDED (§494): only an explicit resume wakes
   (mutex (sb-thread:make-mutex :name "thread"))
-  (waitqueue (sb-thread:make-waitqueue :name "thread")))
+  (waitqueue (sb-thread:make-waitqueue :name "thread"))
+  (suspend-waitqueue (sb-thread:make-waitqueue :name "thread-suspend")))
 
 ;;; ---- Thread-local context: bound per SBCL thread by the task
 ;;; body, so the built-ins find their task/instance. SBCL
@@ -3091,7 +3193,8 @@ no candidate thread can ever make progress — the deadlock trap.")
 ;;; The thread primitives (CanonicalABI.md 447-566).
 
 (declaim (notinline async-thread-wait-until async-thread-resume
-                    async-thread-resume-all async-thread-yield))
+                    async-thread-resume-all async-thread-yield
+                    async-thread-suspend async-thread-nudge))
 
 (defun async-thread-wait-until (thread ready-fn)
   "Thread.wait_until (CanonicalABI.md 505): block until READY-FN
@@ -3104,19 +3207,43 @@ holds, re-testing on each wakeup."
       (sb-thread:condition-wait (async-thread-waitqueue thread)
                                 (async-thread-mutex thread)))))
 
-(defun async-thread-resume (thread)
-  "Thread.resume (CanonicalABI.md 474): nudge the blocked thread; it
-re-tests its own readiness condition. A thread.new-indirect thread
-starts SUSPENDED (§4590): its spawn thunk hasn't started the SBCL
-thread yet — the FIRST resume starts it (the thunk re-parks itself
-on the waitqueue if its body immediately blocks)."
+(defun async-thread-suspend (thread)
+  "Thread.suspend (CanonicalABI.md 494): block with NO readiness
+condition — a SUSPENDED thread is only woken by an EXPLICIT
+async-thread-resume (the switch builtins' target). Store.tick's
+resume-all does NOT touch the suspend waitqueue: a scheduler nudge
+must not un-suspend a thread that only an explicit switch may."
+  (setf (async-thread-suspended-p thread) t)
+  (unwind-protect
+       (sb-thread:with-recursive-lock ((async-thread-mutex thread))
+         (sb-thread:condition-wait (async-thread-suspend-waitqueue
+                                    thread)
+                                   (async-thread-mutex thread)))
+    (setf (async-thread-suspended-p thread) nil)))
+
+(defun async-thread-nudge (thread)
+  "Store.tick's per-thread nudge: wake the WAITCONDITION parkers
+(wait-until loops re-test their readiness; yield-parks return).
+A SUSPENDED thread (§494 — parked by async-thread-suspend with NO
+readiness) is NOT touched: only an explicit switch may resume it."
   (sb-thread:with-recursive-lock ((async-thread-mutex thread))
     (let ((th (async-thread-spawn-thunk thread)))
       (when (functionp th)
         (setf (async-thread-spawn-thunk thread) nil)
         (funcall th)))
-    (sb-thread:condition-broadcast (async-thread-waitqueue thread)
-                               )))
+    (sb-thread:condition-broadcast (async-thread-waitqueue thread))))
+
+(defun async-thread-resume (thread)
+  "Thread.resume (CanonicalABI.md 474) — the EXPLICIT switch
+(the -then-{resume,promote} builtins' target, the cancellation
+resume, resume-later): like the nudge but ALSO wakes a SUSPENDED
+park (§494's only waker). A thread.new-indirect thread starts
+SUSPENDED (§4590): its spawn thunk hasn't started the SBCL thread
+yet — the FIRST resume starts it."
+  (async-thread-nudge thread)
+  (sb-thread:with-recursive-lock ((async-thread-mutex thread))
+    (sb-thread:condition-broadcast (async-thread-suspend-waitqueue
+                                    thread))))
 
 (defun async-thread-resume-all ()
   "Store.tick (CanonicalABI.md 932): nudge every live thread (the
@@ -3124,7 +3251,7 @@ walk is mutex-guarded — the register/unregister sites mutate the
 list concurrently from guest threads)."
   (sb-thread:with-recursive-lock (*scheduler-mutex*)
     (dolist (th *scheduler-threads*)
-      (async-thread-resume th))))
+      (async-thread-nudge th))))
 
 (defun async-thread-yield (thread)
   "Thread.yield_ (CanonicalABI.md 523): cooperatively give up the
@@ -4230,7 +4357,14 @@ is the valtype."
         (list (or (and *current-thread*
                        (async-thread-index *current-thread*))
                   0)))))
-    ((:thread-yield :thread-suspend)
+    ;; thread.yield (§4641: Thread.yield_ — READY while parked, a
+    ;; scheduler nudge re-runs it) vs thread.suspend (§4625:
+    ;; Thread.suspend — NO readiness: only an EXPLICIT resume (the
+    ;; switch builtins / resume-later) may wake it; Store.tick's
+    ;; resume-all does NOT). The M11b shape parked BOTH on the
+    ;; yield queue — exclusive-resume's sync thread then woke on a
+    ;; bare nudge BEFORE the callback set $pinged.
+    ((:thread-yield)
      (wasmdown.runtime:make-host-func-instance
       (wasmdown.types:make-wasm-func-type '() '(:i32))
       (lambda (args)
@@ -4239,6 +4373,16 @@ is the valtype."
           (error 'wasmdown:wasm-trap :kind :generic
                  :message "called an async builtin outside a task"))
         (async-thread-yield *current-thread*)
+        (list 0))))
+    ((:thread-suspend)
+     (wasmdown.runtime:make-host-func-instance
+      (wasmdown.types:make-wasm-func-type '() '(:i32))
+      (lambda (args)
+        (declare (ignore args))
+        (unless *current-thread*
+          (error 'wasmdown:wasm-trap :kind :generic
+                 :message "called an async builtin outside a task"))
+        (async-thread-suspend *current-thread*)
         (list 0))))
     ((:thread-resume-later)
      (wasmdown.runtime:make-host-func-instance
@@ -4484,6 +4628,7 @@ is the valtype."
                        (not (and target
                                  (or (functionp (async-thread-spawn-thunk
                                                  target))
+                                     (async-thread-suspended-p target)
                                      (async-thread-yield-parked
                                       target)))))
               (error 'wasmdown:wasm-trap :kind :generic
@@ -4497,32 +4642,33 @@ is the valtype."
             ;; fallback leaves it alone. The -then-resume pair
             ;; resumes any found target.
             (let ((resumable-target
-                    (if promote-p
-                        (and target
+                    (if (and promote-p target
                              (or (functionp (async-thread-spawn-thunk
                                              target))
+                                 (async-thread-suspended-p target)
                                  (async-thread-yield-parked target)))
-                        target)))
-              ;; park the current thread: SUSPEND leaves it blocked
-              ;; (a -then-resume's switch needs the target to make
-              ;; progress first); YIELD parks it ready (re-runnable
-              ;; at the next scheduler pass). One scheduler pass
-              ;; first so the target gets its CPU slice.
+                        target
+                        (if promote-p nil target))))
+              ;; park the current thread: the SUSPEND pair parks on
+              ;; the SUSPEND waitqueue (§494 — NO readiness: a bare
+              ;; scheduler nudge does NOT wake it, only the target's
+              ;; explicit async-thread-resume); the YIELD pair parks
+              ;; READY (re-runnable at the next scheduler pass). One
+              ;; scheduler pass first so the target gets its slice.
               (if resumable-target
                   (progn
                     (async-thread-resume-all)
                     (async-thread-resume resumable-target)
                     (if yield-p
                         (async-thread-yield *current-thread*)
-                        ;; the SUSPEND: parked with NO readiness —
-                        ;; only the target's explicit resume (or a
-                        ;; scheduler nudge) returns here
-                        (async-thread-yield *current-thread*)))
+                        (async-thread-suspend *current-thread*)))
                   ;; no switch: the plain suspend/yield fallback
                   (progn
                     (async-thread-resume-all)
-                    (async-thread-yield *current-thread*))))
-            (list 0))))))
+                    (if yield-p
+                        (async-thread-yield *current-thread*)
+                        (async-thread-suspend *current-thread*))))
+            (list 0)))))))
     ;; the still-opaque kinds: the slot exists, the call traps
     ((:thread-new-indirect
       :error-context-new :error-context-debug-message

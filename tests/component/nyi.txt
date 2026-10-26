@@ -13,14 +13,66 @@
 ./async/cancel-targeted-resume.wast
 ./async/cross-abi-calls.wast
 ./async/drop-cross-task-borrow.wast
-./async/during-sync-call-exclusive-resume.wast
 ./async/during-sync-call-may-block-if-other-ready-threads.wast
 ./async/during-sync-call-no-sibling-resume.wast
-./async/during-sync-scheduling-candidates.wast
 ./async/idle-drop.wast
 ./async/partial-stream-copies.wast
 ./async/passing-resources.wast
 ./async/reentrance.wast
+# ---- M12 session 2 (2026-10-27): THE NESTED-SYNC-CALL HANDSHAKE
+# LANDED + TWO DURING-SYNC FIXTURES IN THE LANE (1296 -> 1333;
+# units 408 -> 410 with the two new pins; core 21187/0/73
+# unchanged; the lane x3 STABLE at 1333/0/0/0). THE DESIGN (as
+# recorded in session 1's note, now measured): every SYNC-typed
+# lift runs its core call through %SYNC-LIFT-RUN — a FRESH executor
+# SBCL thread bound to the per-call Task+implicit-Thread (SS572) —
+# with the caller DRAINING at the top level (the main thread's
+# SS3538-3543 loop: resume-all + poll DONE-P + the DEADLOCK ORACLE
+# at 200 idle cycles) or PARKING when nested (a guest caller
+# condition-waits on DONE-P; the enclosing drain's resume-all
+# nudges it). THE MEASURED DEFECTS FIXED IN-SESSION (each one
+# gate, the serialized %tr trace): (1) the borrowed-context exit —
+# the nested inline shape exited the CALLER's registration (the
+# empty-scheduler starvation; fixed by the fresh-task design);
+# (2) the and/or PROMOTE PREDICATE BUG — (and target (or ...))
+# returned the yield-parked FLAG (T), so the arm resumed T and
+# crashed async-thread-nudge; the predicate now returns the TARGET;
+# (3) thread.suspend used the YIELD park (a bare nudge woke it —
+# exclusive-resume's $pinged check trapped); SPLIT into
+# async-thread-suspend (SS494: the SUSPEND waitqueue, ONLY an
+# explicit resume wakes it — Store.tick's resume-all now nudges
+# via async-thread-nudge which does NOT touch the suspend queue)
+# vs async-thread-yield (SS523: the READY park, nudged);
+# (4) the -then- pair's not-suspended trap now covers suspended-p
+# too, and resume-later/switches resume the suspend queue;
+# (5) the condition-wait :timeout on the recursive drain mutex
+# misfired under load ("not holding mutex" — the M11b park-lock
+# class); the drain POLL+sleeps instead; (6) the oracle bound 50
+# -> 200 (the load-starved ltv sync lifts tripped 50 in the full
+# lane; 200 holds x3). LANDED ROWS: during-sync-call-exclusive-
+# resume 6/6 (was 5/6) + during-sync-scheduling-candidates 31/31
+# (was 19/31) -> BOTH IN THE LANE (+37). THE FAMILY'S RESIDUAL
+# (2 rows, evidence): no-sibling-resume test 1's run stalls the
+# oracle (the serialized trace: 8 armed sibling threads +
+# inner-block's executor registered; the resume-all spin with no
+# progress — the SUSPEND-parked executor waits for X's
+# suspend-then-resume which never fires: the trace's last ENTER
+# never reaches a SUSPEND-ENTER; the next probe: whether
+# thread.new-indirect's spawn-thunk threads are nudge-resumable
+# at all — they park on the SPAWN path, not a waitqueue) and
+# may-block 8/9 row 4 same class. THE REENTRANCE MAP: 24/25 —
+# tests 9/10/11 ALL GREEN now (the handshake fixed the
+# promote-while-running + the nested index collision), test 12's
+# join trap landed in session 1; the residual cmd 18 (test 9
+# after test 8's deadlock oracle) is the LOAD-FLAKE class (the
+# STARTED-wait race under the zombie executor's load; 6/6 stable
+# alone, 1/4 with T7+T9). THE PINS: component/sync-lift-thread-
+# context-pins (the sync body's OWN thread index + a spawned
+# resumer's resume-later completing a suspended invoke) +
+# component/suspend-vs-yield-determinism-pins (the two-park
+# distinction end-to-end). THE TOKEN SCHEDULER remains the next
+# frontier for the flake class (acs, reentrance-18, the two
+# during-sync residual rows). ----
 # ---- M12 session 1 (2026-10-27): THE REENTRANCE BISECT + THREE
 # LANDED FIXES + THE MINI-SCHEDULER ROOT-CAUSE MAP (the tree stays
 # green: units 408/0, the lane's spot fixtures unchanged — forward

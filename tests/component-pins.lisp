@@ -2588,6 +2588,103 @@ these pins guard the executor's mechanisms directly."
       ;; single NIL result (the resolved no-value)
       (is (equal '(nil) results)))))
 
+(test component/sync-lift-thread-context-pins
+  ;; M12 - THE SYNC-LIFT TASK/THREAD (CanonicalABI.md 572: every
+  ;; component-export call creates a Task; 3538-3543: the non-async
+  ;; drain loop): a SYNC-typed export whose body calls thread.*
+  ;; built-ins runs on its own implicit thread (the executor), the
+  ;; main thread drains, and the guest's thread.index addresses ITS
+  ;; OWN index (not the caller's). Pinned end-to-end: the sync body
+  ;; spawns a new-indirect thread, suspends; the spawned thread's
+  ;; resume-later completes the invoke.
+  (let* ((ci (%exec-comp
+              (concatenate 'string
+                "(component"
+                " (core module $Table (table (export \"tbl\") 1 funcref))"
+                " (core instance $table (instantiate $Table))"
+                " (core module $M"
+                "  (import \"\" \"thread.index\" (func $thread.index (result i32)))"
+                "  (import \"\" \"thread.suspend\" (func $thread.suspend (result i32)))"
+                "  (import \"\" \"thread.resume-later\" (func $thread.resume-later (param i32)))"
+                "  (import \"\" \"thread.new-indirect\" (func $new-indirect (param i32 i32) (result i32)))"
+                "  (import \"\" \"tbl\" (table $tbl 1 funcref))"
+                "  (global $idx (mut i32) (i32.const 0))"
+                "  (func $resumer (param i32)"
+                "    (call $thread.resume-later (global.get $idx)))"
+                "  (elem $tbl (i32.const 0) func $resumer)"
+                "  (func (export \"f\") (result i32)"
+                "    (global.set $idx (call $thread.index))"
+                "    (drop (call $new-indirect (i32.const 0) (i32.const 0)))"
+                "    (drop (call $thread.suspend))"
+                "    (i32.const 42)))"
+                "  (canon thread.index (core func $thread.index))"
+                "  (canon thread.suspend (core func $thread.suspend))"
+                "  (canon thread.resume-later (core func $thread.resume-later))"
+                "  (core type $start-func-ty (func (param i32)))"
+                "  (alias core export $table \"tbl\" (core table $tbl2))"
+                "  (core func $new-indirect-canon"
+                "    (canon thread.new-indirect $start-func-ty (core table $tbl2)))"
+                "  (core instance $m (instantiate $M (with \"\" (instance"
+                "    (export \"thread.index\" (func $thread.index))"
+                "    (export \"thread.suspend\" (func $thread.suspend))"
+                "    (export \"thread.resume-later\" (func $thread.resume-later))"
+                "    (export \"tbl\" (table $table \"tbl\"))"
+                "    (export \"thread.new-indirect\" (func $new-indirect-canon)))))) "
+                " (func (export \"f\") (result u32) (canon lift (core func $m \"f\"))))"))))
+    (let ((f-res (funcall (wasmdown.wast:component-invoker) ci "f" '())))
+      (is (equal '(42) f-res)))))
+
+(test component/suspend-vs-yield-determinism-pins
+  ;; M12 - THE TWO-PARK DISTINCTION (CanonicalABI.md 494 vs 523):
+  ;; thread.suspend parks with NO readiness (only an EXPLICIT resume
+  ;; wakes it - Store.tick's resume-all does NOT); thread.yield parks
+  ;; READY (any scheduler nudge re-runs it). Pinned: the suspended
+  ;; thread STAYS parked across the drain loop's repeated ticks until
+  ;; the spawned resumer's explicit resume-later; a bare nudge can
+  ;; never finish it (the oracle would trap if it could).
+  (let* ((ci (%exec-comp
+              (concatenate 'string
+                "(component"
+                " (core module $Table (table (export \"tbl\") 1 funcref))"
+                " (core instance $table (instantiate $Table))"
+                " (core module $M"
+                "  (import \"\" \"thread.index\" (func $thread.index (result i32)))"
+                "  (import \"\" \"thread.suspend\" (func $thread.suspend (result i32)))"
+                "  (import \"\" \"thread.yield\" (func $thread.yield (result i32)))"
+                "  (import \"\" \"thread.resume-later\" (func $thread.resume-later (param i32)))"
+                "  (import \"\" \"thread.new-indirect\" (func $new-indirect (param i32 i32) (result i32)))"
+                "  (import \"\" \"tbl\" (table $tbl 1 funcref))"
+                "  (global $idx (mut i32) (i32.const 0))"
+                "  (global $r (mut i32) (i32.const 0))"
+                "  (func $resumer (param i32)"
+                "    (drop (call $thread.yield))"
+                "    (call $thread.resume-later (global.get $idx))"
+                "    (global.set $r (i32.const 1)))"
+                "  (elem $tbl (i32.const 0) func $resumer)"
+                "  (func (export \"f\") (result i32)"
+                "    (global.set $idx (call $thread.index))"
+                "    (drop (call $new-indirect (i32.const 0) (i32.const 0)))"
+                "    (drop (call $thread.suspend))"
+                "    (global.get $r)))"
+                "  (canon thread.index (core func $thread.index))"
+                "  (canon thread.suspend (core func $thread.suspend))"
+                "  (canon thread.yield (core func $thread.yield))"
+                "  (canon thread.resume-later (core func $thread.resume-later))"
+                "  (core type $start-func-ty (func (param i32)))"
+                "  (alias core export $table \"tbl\" (core table $tbl2))"
+                "  (core func $new-indirect-canon"
+                "    (canon thread.new-indirect $start-func-ty (core table $tbl2)))"
+                "  (core instance $m (instantiate $M (with \"\" (instance"
+                "    (export \"thread.index\" (func $thread.index))"
+                "    (export \"thread.suspend\" (func $thread.suspend))"
+                "    (export \"thread.yield\" (func $thread.yield))"
+                "    (export \"thread.resume-later\" (func $thread.resume-later))"
+                "    (export \"tbl\" (table $table \"tbl\"))"
+                "    (export \"thread.new-indirect\" (func $new-indirect-canon)))))) "
+                " (func (export \"f\") async (result u32) (canon lift (core func $m \"f\"))))"))))
+    (let ((f-res (funcall (wasmdown.wast:component-invoker) ci "f" '())))
+      (is (equal '(1) f-res)))))
+
 (defun run-component-pins ()
   "Run the component pins (registered via TEST; returns T)."
   (let ((wasmdown.test::*tests*
@@ -2654,7 +2751,9 @@ these pins guard the executor's mechanisms directly."
                       component/async-wset-wait-join-pins
                       component/async-backpressure-block-pins
                       component/async-cancel-delivery-pins
-                      component/async-stream-roundtrip-pins)))
+                      component/async-stream-roundtrip-pins
+                      component/sync-lift-thread-context-pins
+                      component/suspend-vs-yield-determinism-pins)))
           wasmdown.test::*tests*)))
     (multiple-value-bind (passed failed)
         (wasmdown.test:run-all-tests)

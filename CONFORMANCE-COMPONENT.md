@@ -15,15 +15,15 @@ Baseline measurement, not a release gate (PLAN.md §12.8).
 
 | Outcome | Count |
 | --- | --- |
-| pass | 1296 |
+| pass | 1333 |
 | fail | 0 |
 | skip | 0 |
 | unsupported | 0 |
 | timeout | 0 |
 | harness-error | 0 |
-| **total** | **1296** |
+| **total** | **1333** |
 
-Executed: 1296 commands; pass rate 100.0%.
+Executed: 1333 commands; pass rate 100.0%.
 
 ## Per-file counts
 
@@ -40,6 +40,8 @@ Executed: 1296 commands; pass rate 100.0%.
 | component/drop-stream.wast | 5 | 0 | 0 | 0 |
 | component/drop-subtask.wast | 3 | 0 | 0 | 0 |
 | component/drop-waitable-set.wast | 2 | 0 | 0 | 0 |
+| component/during-sync-call-exclusive-resume.wast | 6 | 0 | 0 | 0 |
+| component/during-sync-scheduling-candidates.wast | 31 | 0 | 0 | 0 |
 | component/empty-wait.wast | 2 | 0 | 0 | 0 |
 | component/forward.wast | 95 | 0 | 0 | 0 |
 | component/future-completion-order.wast | 5 | 0 | 0 | 0 |

@@ -90,6 +90,8 @@ parent dir), not the first (the grandparent 'component' — the old
                                  "wait-during-callback.wast"
                                  "builtin-trap-poisons-instance.wast"
 "forward.wast"
+"during-sync-call-exclusive-resume.wast"
+"during-sync-scheduling-candidates.wast"
 "self-switch-traps.wast"
                                  "empty-wait.wast"
 "same-component-stream-future.wast"
