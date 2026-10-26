@@ -3417,12 +3417,18 @@ flat-sig helper handles the result-bearing case)."
   (case kind
     ((:backpressure-inc :backpressure-dec :task-cancel
       :task-return
-      :thread-yield :thread-suspend :thread-resume-later
-      :thread-suspend-then-resume :thread-yield-then-resume
-      :thread-suspend-then-promote :thread-yield-then-promote
       :error-context-new :error-context-debug-message
       :error-context-drop :resource-drop)
      (cons '() '()))
+    ;; M11b (§4652/§4631): thread.yield/suspend return i32 (the
+    ;; literal 0); the -then-resume/-then-promote variants likewise
+    ((:thread-yield :thread-suspend
+      :thread-suspend-then-resume :thread-yield-then-resume
+      :thread-suspend-then-promote :thread-yield-then-promote)
+     (cons '() '(:i32)))
+    ;; §4606: thread.resume-later takes the i32 thread index
+    ((:thread-resume-later)
+     (cons '(:i32) '()))
     ;; M11a (CanonicalABI.md 4226/4089): subtask.drop and
     ;; waitable-set.drop take an i32 handle param — they were
     ;; mis-grouped with the no-params builtins (async-calls-sync's

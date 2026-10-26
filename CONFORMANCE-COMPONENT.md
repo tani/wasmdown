@@ -15,20 +15,22 @@ Baseline measurement, not a release gate (PLAN.md §12.8).
 
 | Outcome | Count |
 | --- | --- |
-| pass | 1041 |
+| pass | 1058 |
 | fail | 0 |
 | skip | 0 |
 | unsupported | 0 |
 | timeout | 0 |
 | harness-error | 0 |
-| **total** | **1041** |
+| **total** | **1058** |
 
-Executed: 1041 commands; pass rate 100.0%.
+Executed: 1058 commands; pass rate 100.0%.
 
 ## Per-file counts
 
 | File | pass | fail | unsupported | other |
 | --- | --- | --- | --- | --- |
+| component/cancel-and-exclusive-lock.wast | 2 | 0 | 0 | 0 |
+| component/cancel-stream.wast | 15 | 0 | 0 | 0 |
 | component/closed-stream.wast | 3 | 0 | 0 | 0 |
 | component/cross-task-future.wast | 2 | 0 | 0 | 0 |
 | component/deadlock.wast | 2 | 0 | 0 | 0 |

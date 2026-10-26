@@ -2216,6 +2216,7 @@ I of THIS instance, type-checked against RT; an empty slot traps."
                :kind :generic
                :message (format nil "handle ~a has the wrong resource type" i)))
       (setf (aref v (1- i)) nil)
+      (%handle-free-slot inst i)
       h)))
 
 (defun %handle-rep (inst rt i)
@@ -2897,6 +2898,7 @@ OUT of this table (the caller re-adds it at its boundary)."
       (error 'wasmdown:wasm-trap :kind :generic
              :message "cannot lift stream while it's in a waitable set"))
     (setf (aref (%inst-handles inst) (1- i)) nil)
+    (%handle-free-slot inst i)
     ;; §2446: lift_async_value clears the owner (lower re-sets it)
     (setf (async-end-owner end) nil)
     end))
@@ -3097,6 +3099,11 @@ does not exist)."
             (return-from %task-enter-implicit-thread nil)))
         (when (%task-needs-exclusive task)
           (setf (getf fields :exclusive-thread) th))))
+    ;; §705: register_thread assigns the instance's next index
+    (unless (async-thread-index th)
+      (setf (async-thread-index th)
+            (1+ (loop for t2 in (getf fields :threads)
+                      maximize (or (async-thread-index t2) 0)))))
     (setf (getf fields :threads)
           (cons th (getf fields :threads)))
     (sb-thread:with-recursive-lock (*scheduler-mutex*)
@@ -3341,10 +3348,25 @@ computes the tuple at delivery time)."
 ;;; ---- Table.add for any handle record (waitables, sets, subtasks
 ;;; share the instance's 1-based handle vector) ----
 
+(defun %handle-free-slot (inst i)
+  "Record the freed slot I on the instance's Table free list
+(CanonicalABI.md 1146: remove appends to free; add pops free FIRST —
+the fixtures assert exact re-used indices: a second stream.new after a
+drop-readable must return index 1 again)."
+  (push i (gethash :handle-free (comp-instance-imports inst))))
+
 (defun %handle-add-any (inst v)
-  (let ((vec (%inst-handles inst)))
-    (vector-push-extend v vec)
-    (length vec)))
+  "Table.add (§1131-1140): pop the free list first, else extend."
+  (let* ((vec (%inst-handles inst))
+         (free (gethash :handle-free (comp-instance-imports inst))))
+    (if free
+        (let ((i (pop (gethash :handle-free
+                                 (comp-instance-imports inst)))))
+          (setf (aref vec (1- i)) v)
+          i)
+        (progn
+          (vector-push-extend v vec)
+          (length vec)))))
 
 (defun %handle-at (inst i &optional (type-p #'identity) (what "handle"))
   "Table.get with a type guard: the 1-based slot at I must hold a
@@ -3774,7 +3796,8 @@ is the valtype."
                                 "waitable set"))
                (h (%inst-handles inst)))
           (%wset-drop wset)
-          (setf (aref h (1- (first args))) nil))
+          (setf (aref h (1- (first args))) nil)
+          (%handle-free-slot inst (first args)))
         '())))
     ((:waitable-set-wait :waitable-set-poll)
      (let ((cx (%wset-event-cx inst kind imms)))
@@ -3847,7 +3870,8 @@ is the valtype."
                              #'async-subtask-p "subtask"))
                (h (%inst-handles inst)))
           (%subtask-drop s)
-          (setf (aref h (1- (first args))) nil))
+          (setf (aref h (1- (first args))) nil)
+          (%handle-free-slot inst (first args)))
         '())))
     ;; M11b: {stream,future}.new — the linked End pair added to the
     ;; instance's handles table, packed readable|writable<<32
@@ -3992,7 +4016,8 @@ is the valtype."
               (error 'wasmdown:wasm-trap :kind :generic
                      :message "cannot drop busy stream"))
             (%end-drop end)
-            (setf (aref (%inst-handles inst) (1- i)) nil))
+            (setf (aref (%inst-handles inst) (1- i)) nil)
+            (%handle-free-slot inst i))
           '()))))
     ;; M11b: {stream,future}.cancel-{read,write} (§4376-4445):
     ;; cancel_copy — the guards (the class, the COPYING state, the
@@ -4050,11 +4075,42 @@ is the valtype."
                       (let* ((event (%waitable-get-pending-event end))
                              (payload (third event)))
                         (list payload))))))))))
+    ;; M11b: thread.{index,yield,suspend,resume-later} (§4535-4665)
+    ((:thread-index)
+     (wasmdown.runtime:make-host-func-instance
+      (wasmdown.types:make-wasm-func-type '() '(:i32))
+      (lambda (args)
+        (declare (ignore args))
+        (list (or (and *current-thread*
+                       (async-thread-index *current-thread*))
+                  0)))))
+    ((:thread-yield :thread-suspend)
+     (wasmdown.runtime:make-host-func-instance
+      (wasmdown.types:make-wasm-func-type '() '(:i32))
+      (lambda (args)
+        (declare (ignore args))
+        (unless *current-thread*
+          (error 'wasmdown:wasm-trap :kind :generic
+                 :message "called an async builtin outside a task"))
+        (async-thread-yield *current-thread*)
+        (list 0))))
+    ((:thread-resume-later)
+     (wasmdown.runtime:make-host-func-instance
+      (wasmdown.types:make-wasm-func-type '(:i32) '())
+      (lambda (args)
+        (let* ((fields (%inst-async-fields inst))
+               (target nil))
+          (dolist (th (getf fields :threads))
+            (when (and (async-thread-index th)
+                       (= (async-thread-index th) (first args)))
+              (setf target th)))
+          (when target
+            (async-thread-resume target)))
+        '())))
     ;; the still-opaque kinds: the slot exists, the call traps
-    ((:thread-yield :thread-suspend :thread-resume-later
-      :thread-suspend-then-resume :thread-yield-then-resume
+    ((:thread-suspend-then-resume :thread-yield-then-resume
       :thread-suspend-then-promote :thread-yield-then-promote
-      :thread-index :thread-new-indirect
+      :thread-new-indirect
       :stream-forward :future-forward
       :error-context-new :error-context-debug-message
       :error-context-drop)
@@ -4115,19 +4171,50 @@ is the valtype."
               (flat-types (loop for vt in ts
                                 append (%flat-type-of vt ft-inst)))
               (component-args
+                ;; M11b: stream/future PARAMS resolve their i32 against
+                ;; the CALLER's table (INST) — the arg-lift cx resolves
+                ;; valtype refs against the TARGET (the values-lane
+                ;; convention) but the END lives in the caller's
+                ;; handles. The flat walk is POSITIONAL: each param
+                ;; consumes its flat slots from ARGS; async-value
+                ;; params take their single i32 directly.
                 (if (> (length flat-types) 4)
-                    ;; the >4 collapse: the single [ptr] loads the
-                    ;; tuple back out of the caller's memory
                     (let* ((ptr (first args))
                            (tuple (make-ct* :tuple (coerce ts 'vector))))
                       (coerce (%abi-load cx tuple ptr) 'list))
-                    (let ((vi (make-array 16 :fill-pointer 0
-                                         :adjustable t)))
-                      (loop for a in args
-                            for ft_ in flat-types
-                            do (vector-push-extend
-                                (cons a ft_) vi))
-                      (%abi-lift-values cx 4 vi ts))))
+                    (let ((vals '())
+                          (ai 0))
+                      (loop for vt in ts
+                            do (let ((c (%abi-ct vt ft-inst)))
+                                 (cond
+                                  ((and (wasmdown.component:ct-p c)
+                                        (member
+                                         (wasmdown.component:ct-kind c)
+                                         '(:stream :future)))
+                                   (push (%lift-async-end
+                                          (make-abi-cx :memory memory
+                                                       :inst inst)
+                                          (nth ai args))
+                                         vals)
+                                   (incf ai))
+                                  (t
+                                   (let* ((pflat (%flat-type-of vt
+                                                                ft-inst))
+                                          (n (length pflat))
+                                          (vi (make-array 16
+                                                          :fill-pointer 0
+                                                          :adjustable t)))
+                                     (loop for k below n
+                                           do (vector-push-extend
+                                               (cons (nth ai args)
+                                                     (nth k pflat))
+                                               vi)
+                                              (incf ai))
+                                     (push (first
+                                            (%abi-lift-values cx 4 vi
+                                                              (list vt)))
+                                           vals))))))
+                      (nreverse vals))))
               (resolved-state nil)
               (resolved-val nil))
          ;; OnStart (§3651): the callee reads its args (the state

@@ -9,11 +9,9 @@
 ./async/big-interleaving-test.wast
 ./async/forward.wast
 ./async/builtin-trap-poisons-instance.wast
-./async/cancel-and-exclusive-lock.wast
 ./async/cancel-delivery.wast
 ./async/cancel-not-delivered.wast
 ./async/cancel-resumed-callback-switch.wast
-./async/cancel-stream.wast
 ./async/cancel-subtask.wast
 ./async/cancel-targeted-resume.wast
 ./async/cross-abi-calls.wast
@@ -360,3 +358,32 @@
 # vs the spec's §3689 (a sync lower of an async-typed callee
 # must park the CALLER thread, not block the whole lift).
 # GATED GREEN: units 407/0, lane 1041/0/0/0. ----
+# ---- M11b session 14 (2026-10-27): TWO MORE FIXTURES IN THE LANE
+# (1041 -> 1058). (1) THE TABLE FREE LIST (CanonicalABI.md 1142-1148)
+# — cancel-stream's run-row root cause: remove appends the hole to a
+# per-instance free list; add pops it FIRST (a second stream.new after
+# a drop-readable returns index 1 again — the fixtures assert exact
+# re-used indices). All five removal sites record the freed slot.
+# cancel-stream 15/15 -> IN THE LANE. (2) thread.{index,yield,suspend,
+# resume-later}: the flat-sig fixes (§4652/§4631: yield/suspend return
+# i32; §4606: resume-later (i32)->()) + the host funcs (yield parks +
+# returns 0; suspend parks; resume-later nudges the target thread via
+# the instance's :threads; index returns the thread's registered
+# index) + register_thread's index assignment (§705). (3) THE
+# POSITIONAL ASYNC-ARG WALK: the async lower's component-args lift is
+# now POSITIONAL — stream/future params take their single i32 directly
+# and transfer with a CALLER-side cx (the END lives in the caller's
+# table; the bulk lift against the target's table trapped
+# invalid-index). cancel-delivery row 1 + cancel-and-exclusive-lock
+# row 1 GREEN -> the latter IN THE LANE. TWO RESIDUALS (recorded):
+# cancel-delivery row 3 (the second $Tester's flow — the same
+# invalid-index class in a different shape) and cancel-not-delivered
+# row 1 (the trap-PROPAGATION piece: a trapped CALLEE under a sync
+# lower must re-signal at the boundary — the design was drafted (the
+# :trap marker through on-resolve + the caller-loop re-signal) but the
+# tail-edit cascade broke the build and was reverted; the shape is in
+# this note for a clean re-land). GATED GREEN: units 407/0, the lane
+# 1058/0/0/0 (stable x2). NEXT: re-land the trap propagation cleanly ->
+# cancel-not-delivered; then cancel-delivery row 3's flow; then the
+# rest of the cancel-* family (cancel-subtask, cancel-targeted-
+# resume, cancel-resumed-callback-switch, drop-cross-task-borrow). ----
