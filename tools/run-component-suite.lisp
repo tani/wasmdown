@@ -3,10 +3,10 @@
 ;;;; WAST runner and emits:
 ;;;;   - tests/component-results.jsonl  (one result per command)
 ;;;;   - CONFORMANCE-COMPONENT.md      (per-file + aggregate report)
-;;;; Scope: tests/component/{binary,validation}/*.wast minus nyi.txt —
-;;;; the M7 slice-1 acceptance surface. The linking/values/async/
-;;;; resources suites need component instantiation + the canonical ABI
-;;;; (future slices) and are NOT run here.
+;;;; Scope: tests/component/{binary,validation,linking,values}/*.wast
+;;;; minus nyi.txt — the M7/M8/M9/M10 acceptance surface. The async/
+;;;; resources suites need the task state machine (future slices) and
+;;;; are NOT run here.
 ;;;; Exit code is ALWAYS 0: a baseline MEASUREMENT, not a gate; the
 ;;;; classification is honest per command (:pass/:fail/:unsupported).
 
@@ -30,9 +30,15 @@
             collect (subseq line 2))))         ; strip leading "./"
 
 (defun nyi-p (file)
-  "True when FILE's path (relative to tests/component/) is excluded."
+  "True when FILE's path (relative to tests/component/) is excluded.
+The REL is the FILESYSTEM shape (values/post-return.wast — the
+nyi.txt entries); the REPORTED case-id path is a DIFFERENT shape
+(component/values/... via the :file format below), so derive the
+rel from the last TWO directory components' SECOND entry (the
+parent dir), not the first (the grandparent 'component' — the old
+(car (last dir 2)) matched nothing once the values glob landed)."
   (let ((rel (format nil "~a/~a"
-                     (car (last (pathname-directory file) 2))
+                     (second (last (pathname-directory file) 2))
                      (file-namestring file))))
     (member rel *nyi* :test #'string=)))
 
@@ -49,7 +55,19 @@
                ;; core-level dynamic linking, tags' EH-tag linking,
                ;; link-time-virtualization's component composition.
                (directory (merge-pathnames
-                           "tests/component/linking/*.wast" *root*))))
+                           "tests/component/linking/*.wast" *root*))
+               ;; M10 (values lane, SHIPPED): the canonical ABI at
+               ;; runtime — strings/lists/records/variants lowered
+               ;; through realloc + memory (CanonicalABI.md's
+               ;; lift/lower_value, load/store per type, the
+               ;; MAX_FLAT pointer indirection). post-return.wast
+               ;; and variants.wast sit in nyi.txt: their bulk /
+               ;; their SECOND fixture need the async built-ins
+               ;; (task.return + may_leave — the next milestone);
+               ;; the rest of the values suite is fully green.
+               (directory (merge-pathnames
+                           "tests/component/values/*.wast" *root*))
+               ))
    #'string< :key #'namestring))
 
 (defparameter *jsonl*

@@ -1,5 +1,6 @@
 # See README.md
 ./validation/kebab.wast
 ./values/post-return.wast
+./values/variants.wast
 ./async/big-interleaving-test.wast
 ./async/forward.wast

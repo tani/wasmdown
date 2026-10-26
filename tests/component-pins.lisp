@@ -1970,6 +1970,264 @@ these pins guard the executor's mechanisms directly."
       (wasmdown.component:validate-component comp))))
 
 
+(test component/values-string-roundtrip-pins
+  ;; values lane — STRING ROUNDTRIP (CanonicalABI.md store_string /
+  ;; lift_flat_string ~2575/3088): a (param string)(result string)
+  ;; canon lift with (memory)(realloc) lowers the argument through
+  ;; the callee's realloc into its memory and lifts the result's
+  ;; [ptr,len] back — the concat.wast "echo" fixture's mechanism.
+  (let* ((ci (%exec-comp
+              (concatenate 'string
+                "(component"
+                " (core module $M"
+                "  (memory (export \"mem\") 1)"
+                "  (global $next (mut i32) (i32.const 1024))"
+                "  (func (export \"realloc\") (param i32 i32 i32 i32) (result i32)"
+                "    (local $r i32)"
+                "    (global.set $next (i32.and (i32.add (global.get $next) (i32.const 7)) (i32.const -8)))"
+                "    (local.set $r (global.get $next))"
+                "    (global.set $next (i32.add (global.get $next) (local.get 3)))"
+                "    (local.get $r))"
+                "  (func (export \"echo\") (param $p i32) (param $l i32) (result i32)"
+                "    (i32.store (i32.const 0) (local.get $p))"
+                "    (i32.store (i32.const 4) (local.get $l))"
+                "    (i32.const 0)))"
+                " (core instance $m (instantiate $M))"
+                " (func (export \"echo\") (param \"a\" string) (result string)"
+                "  (canon lift (core func $m \"echo\")"
+                "   (memory (core memory $m \"mem\"))"
+                "   (realloc (core func $m \"realloc\")))))"))))
+    (let ((results (funcall (wasmdown.wast:component-invoker)
+                            ci "echo"
+                            (list '(:str "hello values")))))
+      (is (equal '("hello values") results)))))
+
+(test component/values-list-lower-lift-pins
+  ;; values lane — LIST LOWER/LIFT (CanonicalABI.md
+  ;; store_list_into_range ~2761 / lift_flat_list ~3093): the
+  ;; (list u32) param reallocs the element vector into the callee's
+  ;; memory; the flat [ptr,len] pair carries it.
+  (let* ((ci (%exec-comp
+              (concatenate 'string
+                "(component"
+                " (core module $M"
+                "  (memory (export \"mem\") 1)"
+                "  (global $next (mut i32) (i32.const 1024))"
+                "  (func (export \"realloc\") (param i32 i32 i32 i32) (result i32)"
+                "    (local $r i32)"
+                "    (global.set $next (i32.and (i32.add (global.get $next) (i32.const 7)) (i32.const -8)))"
+                "    (local.set $r (global.get $next))"
+                "    (global.set $next (i32.add (global.get $next) (local.get 3)))"
+                "    (local.get $r))"
+                "  (func (export \"sum3\") (param $p i32) (param $n i32) (result i32)"
+                "    (i32.add (i32.load (local.get $p))"
+                "      (i32.add (i32.load offset=4 (local.get $p))"
+                "               (i32.load offset=8 (local.get $p)))))) "
+                " (core instance $m (instantiate $M))"
+                " (func (export \"sum3\") (param \"a\" (list u32)) (result u32)"
+                "  (canon lift (core func $m \"sum3\")"
+                "   (memory (core memory $m \"mem\"))"
+                "   (realloc (core func $m \"realloc\")))))"))))
+    (let ((results (funcall (wasmdown.wast:component-invoker)
+                            ci "sum3"
+                            (list '(:list ((:num :u32 1) (:num :u32 2)
+                                           (:num :u32 3)))))))
+      (is (equal '(6) results)))))
+
+(test component/values-record-alignment-pins
+  ;; values lane — RECORD LOWER (CanonicalABI.md lower_flat_record
+  ;; ~3224 + flatten_record ~2971): a 2-field record lowers FLAT as
+  ;; the field sequence (u8 and u32 both ride i32 slots); the SPILLED
+  ;; (aligned-memory) shape is covered by the maxflat pin below.
+  (let* ((ci (%exec-comp
+              (concatenate 'string
+                "(component"
+                " (core module $M"
+                "  (memory (export \"mem\") 1)"
+                "  (global $next (mut i32) (i32.const 1024))"
+                "  (func (export \"realloc\") (param i32 i32 i32 i32) (result i32)"
+                "    (local $r i32)"
+                "    (global.set $next (i32.and (i32.add (global.get $next) (i32.const 7)) (i32.const -8)))"
+                "    (local.set $r (global.get $next))"
+                "    (global.set $next (i32.add (global.get $next) (local.get 3)))"
+                "    (local.get $r))"
+                "  (func (export \"sum\") (param $p i32) (param $q i32) (result i32)"
+                "    (i32.add (local.get $p) (local.get $q))))"
+                " (core instance $m (instantiate $M))"
+                " (type $R (record (field \"a\" u8) (field \"b\" u32)))"
+                " (export $Re \"r\" (type $R))"
+                " (func (export \"sum\") (param \"a\" $Re) (result u32)"
+                "  (canon lift (core func $m \"sum\")"
+                "   (memory (core memory $m \"mem\"))"
+                "   (realloc (core func $m \"realloc\")))))"))))
+    ;; u8 at 0, u32 aligned to 4 -> the callee reads [0]=3, [4]=4
+    (let ((results (funcall (wasmdown.wast:component-invoker)
+                            ci "sum"
+                            (list '(:record (("a" :num :u8 3)
+                                             ("b" :num :u32 4)))))))
+      (is (equal '(7) results)))))
+
+(test component/values-variant-discriminant-pins
+  ;; values lane — VARIANT DISCRIMINANT (CanonicalABI.md
+  ;; lower_flat_variant ~3235 / lift_flat_variant ~3120): the case
+  ;; index rides the discriminant slot and the payload the joined
+  ;; slot (flat).
+  (let* ((ci (%exec-comp
+              (concatenate 'string
+                "(component"
+                " (core module $M"
+                "  (func (export \"tag\") (param $d i32) (param $v i32) (result i32)"
+                "    (i32.add (i32.mul (local.get $d) (i32.const 100))"
+                "             (local.get $v))))"
+                " (core instance $m (instantiate $M))"
+                " (type $V (variant (case \"a\" u32) (case \"b\" u32)))"
+                " (export $Ve \"v\" (type $V))"
+                " (func (export \"tag\") (param \"a\" $Ve) (result u32)"
+                "  (canon lift (core func $m \"tag\"))))"))))
+    ;; case "b" = index 1 -> 1*100 + 7
+    (let ((results (funcall (wasmdown.wast:component-invoker)
+                            ci "tag"
+                            (list '(:variant "b" (:num :u32 7))))))
+      (is (equal '(107) results)))))
+
+(test component/values-maxflat-indirection-pins
+  ;; values lane — the MAX_FLAT fallthrough (CanonicalABI.md
+  ;; lower_flat_values ~3289): >16 flat params spill the TUPLE
+  ;; through realloc into a single [ptr] argument.
+  (let* ((ci (%exec-comp
+              (concatenate 'string
+                "(component"
+                " (core module $M"
+                "  (memory (export \"mem\") 1)"
+                "  (global $next (mut i32) (i32.const 1024))"
+                "  (func (export \"realloc\") (param i32 i32 i32 i32) (result i32)"
+                "    (local $r i32)"
+                "    (global.set $next (i32.and (i32.add (global.get $next) (i32.const 7)) (i32.const -8)))"
+                "    (local.set $r (global.get $next))"
+                "    (global.set $next (i32.add (global.get $next) (local.get 3)))"
+                "    (local.get $r))"
+                "  (func (export \"sum17\") (param $p i32) (result i32)"
+                "    (i32.add (i32.load (local.get $p))"
+                "             (i32.load offset=64 (local.get $p))))"
+                " )"
+                " (core instance $m (instantiate $M))"
+                " (type $Big (tuple u32 u32 u32 u32 u32 u32 u32 u32"
+                "                  u32 u32 u32 u32 u32 u32 u32 u32 u32))"
+                " (export $Be \"big\" (type $Big))"
+                " (func (export \"sum17\") (param \"a\" $Be) (result u32)"
+                "  (canon lift (core func $m \"sum17\")"
+                "   (memory (core memory $m \"mem\"))"
+                "   (realloc (core func $m \"realloc\")))))"))))
+    ;; field 0 at offset 0, field 16 at offset 64 -> 1 + 17 = 18
+    (let ((results (funcall (wasmdown.wast:component-invoker)
+                            ci "sum17"
+                            (list '(:tuple ((:num :u32 1) (:num :u32 2)
+                                            (:num :u32 3) (:num :u32 4)
+                                            (:num :u32 5) (:num :u32 6)
+                                            (:num :u32 7) (:num :u32 8)
+                                            (:num :u32 9) (:num :u32 10)
+                                            (:num :u32 11) (:num :u32 12)
+                                            (:num :u32 13) (:num :u32 14)
+                                            (:num :u32 15) (:num :u32 16)
+                                            (:num :u32 17)))))))
+      (is (equal '(18) results)))))
+
+(test component/values-map-lower-pins
+  ;; values lane — the MAP despecialization (CanonicalABI.md 1938:
+  ;; despecialize(MapType(k, v)) = ListType(TupleType([k, v]))): the
+  ;; map param lowers as a list of (key,value) tuples through
+  ;; realloc into the callee's memory. The core strides 12 bytes per
+  ;; entry (string [ptr,len] + u32, per elem_size_record) and emits
+  ;; the string keys in order.
+  (let* ((ci (%exec-comp
+              (concatenate 'string
+                "(component"
+                " (core module $M"
+                "  (memory (export \"mem\") 1)"
+                "  (global $w (mut i32) (i32.const 1024))"
+                "  (global $next (mut i32) (i32.const 2048))"
+                "  (func (export \"realloc\") (param i32 i32 i32 i32) (result i32)"
+                "   (local $r i32)"
+                "   (global.set $next (i32.and (i32.add (global.get $next) (i32.const 7)) (i32.const -8)))"
+                "   (local.set $r (global.get $next))"
+                "   (global.set $next (i32.add (global.get $next) (local.get 3)))"
+                "   (local.get $r))"
+                "  (func $emit (param $s i32) (param $l i32)"
+                "   (memory.copy (global.get $w) (local.get $s) (local.get $l))"
+                "   (global.set $w (i32.add (global.get $w) (local.get $l))))"
+                "  (func (export \"sum\") (param $p i32) (param $n i32) (result i32)"
+                "   (local $i i32) (local $e i32)"
+                "   (block $d (loop $l"
+                "    (br_if $d (i32.ge_u (local.get $i) (local.get $n)))"
+                "    (local.set $e (i32.add (local.get $p) (i32.mul (local.get $i) (i32.const 12))))"
+                "    (call $emit (i32.load (local.get $e)) (i32.load offset=4 (local.get $e)))"
+                "    (local.set $i (i32.add (local.get $i) (i32.const 1)))"
+                "    (br $l)))"
+                "   (i32.store (i32.const 0) (i32.const 1024))"
+                "   (i32.store (i32.const 4) (i32.sub (global.get $w) (i32.const 1024)))"
+                "   (i32.const 0))"
+                " )"
+                " (core instance $m (instantiate $M))"
+                " (func (export \"m\") (param \"a\" (map string u32)) (result string)"
+                "  (canon lift (core func $m \"sum\")"
+                "   (memory (core memory $m \"mem\"))"
+                "   (realloc (core func $m \"realloc\")))))"))))
+    (let ((results (funcall (wasmdown.wast:component-invoker)
+                            ci "m"
+                            (list '(:list ((:tuple ((:str "a") (:num :u32 7)))
+                                                    (:tuple ((:str "b")
+                                                             (:num :u32 9)))))))))
+      (is (equal '("ab") results)))))
+
+(test component/values-option-size-pins
+  ;; values lane — the OPTION's elem_size is the FULL variant rule
+  ;; (align(disc, max-case-alignment) + max payload, aligned):
+  ;; option(string) strides 12 bytes (1 disc aligned to 4 + the
+  ;; [ptr,len] payload), matching the core's fixed stride; the old
+  ;; payload-only formula dropped the discriminant and
+  ;; desynchronized the entries.
+  (let* ((ci (%exec-comp
+              (concatenate 'string
+                "(component"
+                " (core module $M"
+                "  (memory (export \"mem\") 1)"
+                "  (global $w (mut i32) (i32.const 1024))"
+                "  (global $next (mut i32) (i32.const 2048))"
+                "  (func (export \"realloc\") (param i32 i32 i32 i32) (result i32)"
+                "   (local $r i32)"
+                "   (global.set $next (i32.and (i32.add (global.get $next) (i32.const 7)) (i32.const -8)))"
+                "   (local.set $r (global.get $next))"
+                "   (global.set $next (i32.add (global.get $next) (local.get 3)))"
+                "   (local.get $r))"
+                "  (func $emit (param $s i32) (param $l i32)"
+                "   (memory.copy (global.get $w) (local.get $s) (local.get $l))"
+                "   (global.set $w (i32.add (global.get $w) (local.get $l))))"
+                "  (func (export \"deep\") (param $p i32) (param $n i32) (result i32)"
+                "   (local $i i32) (local $e i32)"
+                "   (block $d (loop $l"
+                "    (br_if $d (i32.ge_u (local.get $i) (local.get $n)))"
+                "    (local.set $e (i32.add (local.get $p) (i32.mul (local.get $i) (i32.const 12))))"
+                "    (if (i32.load (local.get $e))"
+                "     (then (call $emit (i32.load offset=4 (local.get $e)) (i32.load offset=8 (local.get $e)))))"
+                "    (local.set $i (i32.add (local.get $i) (i32.const 1)))"
+                "    (br $l)))"
+                "   (i32.store (i32.const 0) (i32.const 1024))"
+                "   (i32.store (i32.const 4) (i32.sub (global.get $w) (i32.const 1024)))"
+                "   (i32.const 0))"
+                " )"
+                " (core instance $m (instantiate $M))"
+                " (func (export \"d\") (param \"a\" (list (option string))) (result string)"
+                "  (canon lift (core func $m \"deep\")"
+                "   (memory (core memory $m \"mem\"))"
+                "   (realloc (core func $m \"realloc\")))))"))))
+    (let ((results (funcall (wasmdown.wast:component-invoker)
+                            ci "d"
+                            (list '(:list ((:option-some (:str "x"))
+                                                    (:option-none)
+                                                    (:option-some
+                                                     (:str "y"))))))))
+      (is (equal '("xy") results)))))
+
 (defun run-component-pins ()
   "Run the component pins (registered via TEST; returns T)."
   (let ((wasmdown.test::*tests*
@@ -2019,7 +2277,14 @@ these pins guard the executor's mechanisms directly."
                       component/canon-lower-roundtrip-pins
                       component/linking-tag-identity-pins
                       component/linking-tag-sort-mismatch-pins
-                      component/linking-ascribed-projection-pins)))
+                      component/linking-ascribed-projection-pins
+                      component/values-string-roundtrip-pins
+                      component/values-list-lower-lift-pins
+                      component/values-record-alignment-pins
+                      component/values-variant-discriminant-pins
+                      component/values-maxflat-indirection-pins
+                      component/values-map-lower-pins
+                      component/values-option-size-pins)))
           wasmdown.test::*tests*)))
     (multiple-value-bind (passed failed)
         (wasmdown.test:run-all-tests)

@@ -314,19 +314,25 @@ a top-level def."
   ;; pending alias defs, so the vector order matches the counter
   ;; order (the walk sees the functype at its intern slot, the alias
   ;; at ITS slot).
-  (let ((idx (%alloc scope sort id)))
+  ;; NOTE: the LOCAL alloc index gets its own binding — the emitter's
+  ;; IDX parameter (the OUTER type index) is the alias's TARGET, and
+  ;; shadowing it with the local slot wrote the LOCAL index into the
+  ;; aliasrec (an inner component projecting a SECOND outer type then
+  ;; aliased the wrong slot: 'type index out of bounds').
+  (let ((local-idx (%alloc scope sort id))
+        (count ct))
     (if *in-type-decl*
         (push (make-typedecl :kind :alias
                              :payload (make-aliasrec
                                        :kind :outer :sort sort
-                                       :count ct :target idx
+                                       :count count :target idx
                                        :name "" :offset 0))
               *type-decl-sink*)
         (progn (%flush-interned scope)
                (%push-def :alias (make-aliasrec
-                                  :kind :outer :sort sort :count ct
+                                  :kind :outer :sort sort :count count
                                   :target idx :name "" :offset 0))))
-    idx))
+    local-idx))
 
 (defun %parse-sortidx-atom (item sort scope)
   "A bare index in SORT's space: u32 | $id (the latter possibly an
@@ -1936,16 +1942,34 @@ position)."
              ;; and BIND the target id so later projections (e.g.
              ;; the lift's (core func $m "log") alias) allocate
              ;; BEHIND it
+             ;; (values lane) the trailing target is
+             ;; (core func $id) — the id is the node's THIRD child
+             ;; (the head `core`, the sort `func`, then $id); the
+             ;; old SECOND-slot read grabbed the `func` keyword and
+             ;; never bound the id (post-return's $import' stayed
+             ;; unknown at its later projections)
              (let ((tgt (car (last items))))
                (%alloc scope :core-func
                        (and (%nodep tgt)
-                            (%children tgt)
-                            (second (%children tgt))
-                            (%tokp (second (%children tgt)))
-                            (eq (%tok-kind (second (%children tgt)))
+                            (>= (length (%children tgt)) 3)
+                            (%tokp (third (%children tgt)))
+                            (eq (%tok-kind (third (%children tgt)))
                                 :id)
-                            (%tok-text (second (%children tgt)))))))
-            (t nil))))
+                            (%tok-text (third (%children tgt)))))))
+            ;; (values lane) the BUILT-IN canons (resource.new/drop/
+            ;; rep, the concurrency built-ins) each introduce a CORE
+            ;; func too — the trailing (core func $id) target binds
+            ;; the new index exactly like a lower (post-return's
+            ;; (canon resource.new $R (core func $resource.new)))
+            (t
+             (let ((tgt (car (last items))))
+               (%alloc scope :core-func
+                       (and (%nodep tgt)
+                            (>= (length (%children tgt)) 3)
+                            (%tokp (third (%children tgt)))
+                            (eq (%tok-kind (third (%children tgt)))
+                                :id)
+                            (%tok-text (third (%children tgt))))))))))
        ((string= h "import")
         (multiple-value-bind (name attrs et id)
             (%parse-importdecl-parts node scope)

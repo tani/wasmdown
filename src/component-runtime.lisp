@@ -665,7 +665,15 @@ remaining built-ins stay opaque core-func slots (the values slice)."
                     (canonrec-func payload)))
          (%push-core-func
           inst
-          (%lower-host-func inst (canonrec-func payload))))
+          ;; (values lane) pass the CANONREC: the LOWER's OWN canon
+          ;; options (its (memory ...)/(realloc ...)/(string-
+          ;; encoding ...)) belong to THIS component's spaces; the
+          ;; wrapper reading the TARGET lifted func's LIFT opts named
+          ;; the WRONG memory (the arg lift pulled the caller's data
+          ;; out of the target's memory and the result store wrote
+          ;; where the caller's retptr never pointed)
+          (%lower-host-func inst (canonrec-func payload)
+                            payload)))
         ((and (member rkind
                       '(:resource-new :resource-drop :resource-rep))
               rt)
@@ -724,237 +732,1403 @@ arm; the introduced type re-exports the source ct)."
                                       (comp-instance-core-types inst))))))
 
 ;;; ---------------------------------------------------------------
-;;; The flat canonical call path (CanonicalABI.md lift/lower): FLAT
-;;; numeric params/results pass through with the prim->core mapping;
-;;; anything needing memory (string/list/record/variant) is a
-;;; values-suite shape and signals host-error when CALLED (creating
-;;; the wrapper stays legal).
+;;; ---------------------------------------------------------------
+;;; The canonical ABI call path (CanonicalABI.md, the values lane):
+;;; lower_flat_values / lift_flat_values with the MAX_FLAT fallthrough
+;;; and the full store/load machinery per type — strings (realloc +
+;;; the utf8/utf16/latin1+utf16 transcodes), lists (realloc the
+;;; elements then the pair), records (the aligned field sequence),
+;;; variants (the discriminant + payload + the join coercions), and
+;;; the flags/enum/option/result specializations.
 
-(declaim (notinline lifted-func-call %valtype-flat-core))
+(declaim (notinline lifted-func-call %abi-lower-values %abi-lift-values
+                    %abi-lower %abi-lift %abi-store %abi-load
+                    %abi-store-string %abi-load-string
+                    %abi-allocate %abi-reallocate
+                    %abi-align %abi-elem-size %abi-alignment
+                    %abi-utf8-encode %abi-utf8-decode
+                    %abi-utf16-encode %abi-utf16-decode
+                    %abi-latin1-encode
+                    %abi-variant-cases %abi-variant-payload-size))
 
-;;; The flat CORE type of a component valtype: the numeric prims map
-;;; to i32/i64/f32/f64; OWN/BORROW handles ride i32 (CanonicalABI.md
-;;; lower_own/lower_borrow: the handle-table index); a STRING is a
-;;; [ptr,len] pair (NOT flat-callable as a single core value — the
-;;; string path goes through the lift memory). INST is the runtime
-;;; instance whose TYPE space resolves (:idx . n) references; the
-;;; prim keyword passes through directly.
-(defun %valtype-prim-of (vt inst)
-  "Resolve a valtype to its PRIMITIVE keyword when flat: a prim
-keyword as-is; an (:idx . n) reference resolving to an :own/:borrow
-ct's prim (i32); anything else is a values-suite shape."
-  (declare (ignore inst))
-  (typecase vt
-    (keyword vt)
-    (cons
-     (when (eq (car vt) :idx)
-       ;; an own/borrow of a resource type: the FLAT core type is i32
-       ;; (the handle-table index) — the type-shape resolution needs
-       ;; the component's type space, which %exec-canon pre-resolves
-       ;; into the lifted-func's TYPE slot; the prim for a resource
-       ;; handle is :own/:borrow only for identity checks, so treat
-       ;; any resolved reference as i32-shaped here.
-       (let ((n (cdr vt)))
-         (declare (ignore n))
-         :i32-handle)))
-    (t nil)))
+;;; ---- alignment / elem_size (mirror the validator's twins; the two
+;;; ---- MUST stay consistent — CanonicalABI.md #alignment,
+;;; ---- #element-size; ptr_size = 4 for the i32 memories this lane)
 
-(defun %valtype-flat-core (vt &optional (context :params))
-  "The flat CORE type of one component valtype in CONTEXT. The
-numeric prims map to i32/i64/f32/f64; OWN/BORROW handles (an
-(:idx . n) reference) ride i32 — the handle-table index. A STRING
-RESULT flattens to ONE i32 (the pointer to the [ptr,len] tuple —
-MAX_FLAT_RESULTS=1 fallthrough); a string PARAM is [ptr,len] (TWO
-core values) and stays a values-suite shape in this slice."
-  (typecase vt
-    (keyword
-     (case vt
-       ((:bool :u8 :s8 :u16 :s16 :u32 :s32 :char) :i32)
-       ((:u64 :s64) :i64)
-       (:f32 :f32)
-       (:f64 :f64)
-       (:string (when (eq context :results) :i32))
-       (t nil)))
-    ;; an (:idx . n) reference: own/borrow handles flatten to i32
-    (cons (when (eq (car vt) :idx) :i32))
-    (t nil)))
+(defun %abi-align-to (ptr alignment)
+  "align_to (CanonicalABI.md 2112): round PTR up to ALIGNMENT."
+  (* (ceiling ptr alignment) alignment))
 
-(declaim (notinline %valtype-flat-core))
+(defun %abi-alignment (vt inst)
+  "alignment(t, i32) (CanonicalABI.md 1991-2063)."
+  (labels
+      ((al (vt)
+         (let ((c (%abi-ct vt inst)))
+           (case (wasmdown.component:ct-kind c)
+             (:prim
+              (case (wasmdown.component:ct-payload c)
+                ((:bool :s8 :u8) 1)
+                ((:s16 :u16) 2)
+                ((:s32 :u32 :f32 :char :error-context) 4)
+                ((:s64 :u64 :f64) 8)
+                (:string 4)
+                (t 4)))
+             (:list
+              (if (cdr (wasmdown.component:ct-payload c))
+                  (al (car (wasmdown.component:ct-payload c)))
+                  4))
+             (:record
+              (or (loop for (nil . fvt) across
+                           (wasmdown.component:ct-payload c)
+                         maximize (%abi-alignment fvt inst))
+                  1))
+             (:variant
+              (max (%abi-align-discriminant-size c)
+                   (or (loop for (nil . cvt) across
+                                (wasmdown.component:ct-payload c)
+                              when cvt maximize
+                              (%abi-alignment cvt inst))
+                       1)))
+             ((:flags :enum) 1)
+             (:tuple
+              (or (loop for t_ across (wasmdown.component:ct-payload c)
+                        maximize (%abi-alignment t_ inst))
+                  1))
+             (:option (%abi-alignment (wasmdown.component:ct-payload c)
+                                      inst))
+             (:result
+              (let ((ok (car (wasmdown.component:ct-payload c)))
+                    (err (cdr (wasmdown.component:ct-payload c))))
+                (max 4 (if ok (%abi-alignment ok inst) 1)
+                     (if err (%abi-alignment err inst) 1))))
+             (t 4)))))
+    (al vt)))
 
-;;; The PRIMITIVE keyword of a valtype when it is one; NIL otherwise
-;;; (an (:idx . n) cons or a ct — those resolve through the type
-;;; space, which the flat slice defers).
-(defun %valtype-prim (vt)
-  (and (keywordp vt) vt))
+(defun %abi-ct (vt inst)
+  "Resolve a valtype to its ct: an (:idx . n) ref through the
+instance's type space (NIL when unresolvable — the caller's default
+shapes treat it as opaque), a prim keyword as a prim ct, a ct as-is.
+A MAP ct DESPECIALIZES here (CanonicalABI.md 1938:
+despecialize(MapType(k, v)) = ListType(TupleType([k, v]))) so every
+alignment/elem-size/store/lower/lift walker sees the plain
+list-of-tuples shape."
+  (labels
+      ((despecialize (c)
+         (if (and (wasmdown.component:ct-p c)
+                  (eq (wasmdown.component:ct-kind c) :map))
+             (despecialize
+              (make-ct* :list
+                        (cons (make-ct* :tuple
+                                        (vector
+                                         (car (wasmdown.component:ct-payload
+                                               c))
+                                         (cdr (wasmdown.component:ct-payload
+                                               c))))
+                               nil)))
+             c)))
+    (let ((raw
+            (cond
+             ((and (consp vt) (eq (car vt) :idx))
+              (or (wasmdown.component:ct-at (comp-instance-types inst)
+                                            (cdr vt))
+                  (make-ct* :prim vt)))
+             ((keywordp vt) (make-ct* :prim vt))
+             ((wasmdown.component:ct-p vt) vt)
+             (t (make-ct* :prim :bool)))))
+      (despecialize raw))))
 
-(declaim (notinline %valtype-prim))
+(defun make-ct* (kind payload &optional (offset 0))
+  "A fresh ct (the component package's keyword constructor, one arm)."
+  (wasmdown.component:make-ct :kind kind :payload payload :offset offset))
+
+(defun %abi-discriminant-size (cases)
+  "discriminant_type (CanonicalABI.md 2038): the smallest unsigned
+width covering the case count — 1 byte up to 256 cases, 2 to 65536,
+else 4."
+  (let ((n (length cases)))
+    (cond ((<= n 256) 1) ((<= n 65536) 2) (t 4))))
+
+(defun %abi-align-discriminant-size (c)
+  "The ALIGNMENT of the discriminant (alignment(discriminant_type))."
+  (let ((n (length (wasmdown.component:ct-payload c))))
+    (cond ((<= n 256) 1) ((<= n 65536) 2) (t 4))))
+
+(defun %abi-elem-size (vt inst)
+  "elem_size(t, i32) (CanonicalABI.md 2080-2130)."
+  (let ((c (%abi-ct vt inst)))
+    (case (wasmdown.component:ct-kind c)
+      (:prim
+       (case (wasmdown.component:ct-payload c)
+         ((:bool :s8 :u8) 1)
+         ((:s16 :u16) 2)
+         ((:s32 :u32 :f32 :char :error-context) 4)
+         ((:s64 :u64 :f64) 8)
+         (:string 8)
+         (t 4)))
+      (:list
+       (let ((elem (car (wasmdown.component:ct-payload c)))
+             (fixed (cdr (wasmdown.component:ct-payload c))))
+         (if fixed (* fixed (%abi-elem-size elem inst)) 8)))
+      (:record
+       (let ((sz 0))
+         (loop for (nil . fvt) across (wasmdown.component:ct-payload c)
+               do (let ((a (%abi-alignment fvt inst)))
+                    (setf sz (* (ceiling sz a) a))
+                    (incf sz (%abi-elem-size fvt inst))))
+         (let ((a (or (loop for (nil . fvt) across
+                               (wasmdown.component:ct-payload c)
+                             maximize (%abi-alignment fvt inst))
+                     1)))
+           (* (ceiling sz a) a))))
+      (:variant
+       (let* ((cases (wasmdown.component:ct-payload c))
+              (ds (%abi-discriminant-size cases))
+              (ma (max 1 (or (loop for (nil . cvt) across cases
+                                   when cvt maximize
+                                   (%abi-alignment cvt inst))
+                             1)))
+              (payload (or (loop for (nil . cvt) across cases
+                                 when cvt maximize (%abi-elem-size cvt inst))
+                           0)))
+         (let ((sz (+ (* (ceiling ds ma) ma) payload)))
+           (* (ceiling sz ma) ma))))
+      (:flags
+       (let ((n (length (wasmdown.component:ct-payload c))))
+         (cond ((<= n 8) 1) ((<= n 16) 2) (t 4))))
+      (:enum 1)
+      (:tuple
+       (let ((sz 0))
+         (loop for t_ across (wasmdown.component:ct-payload c)
+               do (let ((a (%abi-alignment t_ inst)))
+                    (setf sz (* (ceiling sz a) a))
+                    (incf sz (%abi-elem-size t_ inst))))
+         (let ((a (or (loop for t_ across (wasmdown.component:ct-payload c)
+                            maximize (%abi-alignment t_ inst))
+                     1)))
+           (* (ceiling sz a) a))))
+      (:option
+       ;; despecialized: variant(none, some) — the FULL variant rule:
+       ;; align(disc_size, max_case_alignment) + max payload size,
+       ;; then align to the variant's alignment (CanonicalABI.md
+       ;; elem_size_variant). The old payload-only formula dropped
+       ;; the discriminant (16 for concat.wast ::23's option(tuple
+       ;; string (list u32)) where the core strides 20).
+       (let* ((payload (wasmdown.component:ct-payload c))
+              (ds 1)
+              (ma (max 1 (or (and payload
+                                  (%abi-alignment payload inst))
+                             1)))
+              (ps (or (and payload (%abi-elem-size payload inst)) 0)))
+         (let ((sz (+ (* (ceiling ds ma) ma) ps)))
+           (* (ceiling sz ma) ma))))
+      (:result
+       ;; despecialized: variant(ok, error) — disc 1 + payload
+       (let* ((ok (car (wasmdown.component:ct-payload c)))
+              (err (cdr (wasmdown.component:ct-payload c)))
+              (p (max (if ok (%abi-elem-size ok inst) 0)
+                      (if err (%abi-elem-size err inst) 0)))
+              (a (max 1 (if ok (%abi-alignment ok inst) 1)
+                     (if err (%abi-alignment err inst) 1))))
+         (max 1 (* (ceiling p a) a))))
+      (t 4))))
+
+;;; ---- codecs (utf8 / utf16 / latin1) ----
+
+(defun %abi-utf8-encode (s)
+  "Encode a Lisp string as UTF-8 bytes (SBCL's encoder)."
+  (sb-ext:string-to-octets s :external-format :utf-8))
+
+(defun %abi-utf8-decode (bytes &optional (start 0) (end nil))
+  "Decode UTF-8 BYTES [START, END) as a Lisp string; signals a
+wasm-trap (:invalid-utf8 style) on malformed input — load_string's
+trap taxonomy (invalid utf-8 / incomplete utf-8 byte sequence)."
+  (let ((end (or end (length bytes))))
+    (handler-case
+        (sb-ext:octets-to-string bytes :start start :end end
+                                 :external-format :utf-8)
+      (error (c)
+        (declare (ignore c))
+        (error 'wasmdown:wasm-trap
+               :kind :generic
+               :message "invalid utf-8")))))
+
+(defun %abi-utf16-encode (s)
+  "Encode a Lisp string as little-endian UTF-16 code units."
+  (let* ((units
+           (loop for ch across s
+                 for cp = (char-code ch)
+                 if (< cp #x10000)
+                   collect cp
+                 else
+                   ;; surrogate pair
+                   collect (+ #xD800 (ash (- cp #x10000) -10))
+                   and collect (+ #xDC00 (logand #x3FF
+                                                 (- cp #x10000)))))
+         (bytes (make-array (* 2 (length units))
+                            :element-type '(unsigned-byte 8))))
+    (loop for u in units
+          for i from 0 by 2
+          do (setf (aref bytes i) (logand #xff u)
+                   (aref bytes (+ i 1)) (ash u -8)))
+    bytes))
+
+(defun %abi-utf16-decode (bytes &optional (start 0) (end nil))
+  "Decode little-endian UTF-16 code units [START, END) as a string."
+  (let* ((end (or end (length bytes)))
+         (n (ash (- end start) -1))
+         (s (make-array n :element-type 'character :fill-pointer 0
+                        :adjustable t)))
+    (loop for i below n
+          for u = (logior (aref bytes (+ start (* 2 i)))
+                          (ash (aref bytes (+ start (+ 1 (* 2 i)))) 8))
+          do (cond
+              ((and (>= u #xD800) (<= u #xDBFF))
+               ;; high surrogate — pair with the next unit
+               (let ((lo (if (< (1+ i) n)
+                              (logior
+                               (aref bytes (+ start (* 2 (+ i 1))))
+                               (ash (aref bytes
+                                          (+ start (+ 1 (* 2 (+ i 1)))))
+                                    8))
+                              0)))
+                 (vector-push-extend
+                  (code-char (+ #x10000
+                                (ash (- u #xD800) 10)
+                                (- lo #xDC00)))
+                  s)
+                 (incf i)))
+              ((and (>= u #xDC00) (<= u #xDFFF))
+               ;; lone low surrogate — invalid; treat as replacement
+               (vector-push-extend (code-char u) s))
+              (t (vector-push-extend (code-char u) s))))
+    s))
+
+(defun %abi-latin1-encode (s)
+  "Encode a Lisp string as Latin-1 bytes; traps when a code point
+exceeds U+00FF (store_string_copy's latin-1 target)."
+  (let ((bytes (make-array (length s)
+                           :element-type '(unsigned-byte 8))))
+    (loop for ch across s
+          for i from 0
+          do (let ((cp (char-code ch)))
+               (when (> cp #xFF)
+                 (error 'wasmdown:wasm-trap
+                        :kind :generic
+                        :message "invalid latin-1 code point"))
+               (setf (aref bytes i) cp)))
+    bytes))
+
+;;; ---- the lower context (cx: memory + realloc + encoding + inst) ----
+
+(defun %abi-encoding-of (enc-opt)
+  "The canonopt's string-encoding as the ABI's keyword — the text
+parser interns the symbols in ITS package and the binary reader in
+the keyword package, so compare by NAME (component.lisp's %enc-str
+lesson)."
+  (let ((v (and enc-opt (second enc-opt))))
+    (cond
+     ((null v) :utf8)
+     ((string-equal (string v) "UTF8") :utf8)
+     ((string-equal (string v) "UTF16") :utf16)
+     ((string-equal (string v) "LATIN1+UTF16") :latin1+utf16)
+     (t (error 'wasmdown:host-error
+               :message (format nil "unknown string encoding ~a" v))))))
+
+(defstruct abi-cx
+  "LiftLowerContext (CanonicalABI.md 1038): the lift/lower ambient
+state — the memory, the realloc core func, the string encoding and
+the defining comp-instance (the handle transfers)."
+  (memory nil)
+  (realloc nil)
+  (encoding :utf8)
+  (inst nil))
+
+(defun %abi-reallocate (cx old old-size alignment new-size)
+  "LiftLowerContext.reallocate (CanonicalABI.md 1057): call the
+callee's realloc core func, then trap-check the returned pointer's
+ALIGNMENT and BOUNDS (realloc.wast's exact taxonomy: 'unaligned
+pointer' for the misaligned case, 'list content out-of-bounds' /
+'realloc return: ...' for the OOB family)."
+  (let ((realloc (abi-cx-realloc cx))
+        (memory (abi-cx-memory cx)))
+    (unless (and realloc (wasmdown.runtime:func-instance-p realloc))
+      (error 'wasmdown:host-error
+             :message "realloc option required for non-flat values"))
+    (let ((ptr (first (wasmdown.runtime:wasm-call
+                       realloc old old-size alignment new-size))))
+      (unless (zerop (mod ptr alignment))
+        (error 'wasmdown:wasm-trap
+               :kind :generic
+               :message "unaligned pointer"))
+      (when (> (+ ptr new-size) (length (wasmdown.runtime:memory-instance-bytes
+                                         memory)))
+        (error 'wasmdown:wasm-trap
+               :kind :generic
+               :message "realloc return: beyond end of memory"))
+      ptr)))
+
+(defun %abi-allocate (cx alignment byte-length)
+  "LiftLowerContext.allocate (CanonicalABI.md 1077)."
+  (%abi-reallocate cx 0 0 alignment byte-length))
+
+;;; ---- store (lower into memory) / load (lift out of memory) ----
+
+(defun %abi-memory-bytes (cx)
+  (wasmdown.runtime:memory-instance-bytes (abi-cx-memory cx)))
+
+(defun %abi-load-int (cx ptr nbytes &key (signed nil))
+  "load_int (CanonicalABI.md 2171)."
+  (let ((bytes (%abi-memory-bytes cx))
+        (acc 0))
+    (loop for i from 0 below nbytes
+          do (setf acc (logior acc (ash (aref bytes (+ ptr i))
+                                         (* 8 i)))))
+    (if (and signed (>= acc (ash 1 (1- (* 8 nbytes)))))
+        (- acc (ash 1 (* 8 nbytes)))
+        acc)))
+
+(defun %abi-store-int (cx v ptr nbytes)
+  "store_int (CanonicalABI.md 2491): the low NBYTES of V, little-
+endian."
+  (let ((bytes (%abi-memory-bytes cx)))
+    (loop for i from 0 below nbytes
+          do (setf (aref bytes (+ ptr i)) (logand #xff (ash v (- (* 8 i))))))))
+
+(declaim (notinline %abi-load-int %abi-store-int))
+
+(defun %abi-check-span (cx ptr size kind-name)
+  "The load/store bounds assert (CanonicalABI.md load/store top):
+trap when [PTR, PTR+SIZE) leaves the memory."
+  (let ((len (length (%abi-memory-bytes cx))))
+    (unless (and (>= ptr 0) (<= (+ ptr size) len))
+      (error 'wasmdown:wasm-trap
+             :kind :out-of-bounds-memory
+             :message (format nil "~a content out-of-bounds" kind-name)))))
+
+(defun %abi-check-align (cx ptr alignment what)
+  "The load/store alignment assert: trap when PTR is not aligned
+(alignment.wast's 'unaligned pointer')."
+  (unless (zerop (mod ptr alignment))
+    (error 'wasmdown:wasm-trap
+           :kind :generic
+           :message (format nil "unaligned pointer (~a)" what))))
+
+;;; store_string (CanonicalABI.md 2575-2735): lower the string into
+;;; the callee's memory via realloc with the declared encoding, and
+;;; return (ptr . tagged-code-units). The source is always a Lisp
+;;; string here (the host boundary), which the spec models as the
+;;; (str, encoding, units) tuple with a fresh per-call hint.
+(defun %abi-store-string (cx v)
+  "store_string_into_range: the [ptr, tagged-length] pair for the
+value V under CX's encoding. utf8 stores the encoded bytes; utf16
+the code units; latin1+utf16 picks per content — latin1 when every
+code point fits, utf16 (tagged) otherwise."
+  (case (abi-cx-encoding cx)
+    (:utf8
+     (let* ((encoded (%abi-utf8-encode v))
+            (n (length encoded))
+            (ptr (%abi-allocate cx 1 n)))
+       (replace (%abi-memory-bytes cx) encoded :start1 ptr)
+       (cons ptr n)))
+    (:utf16
+     (let* ((encoded (%abi-utf16-encode v))
+            (n (ash (length encoded) -1))
+            (ptr (%abi-allocate cx 2 (length encoded))))
+       (replace (%abi-memory-bytes cx) encoded :start1 ptr)
+       (cons ptr n)))
+    (:latin1+utf16
+     (let ((latin1-p (every (lambda (ch) (<= (char-code ch) #xFF)) v)))
+       (if latin1-p
+           (let* ((encoded (%abi-latin1-encode v))
+                  (ptr (%abi-allocate cx 2 (length encoded))))
+             (replace (%abi-memory-bytes cx) encoded :start1 ptr)
+             (cons ptr (length encoded)))
+           (let* ((encoded (%abi-utf16-encode v))
+                  (n (ash (length encoded) -1))
+                  (ptr (%abi-allocate cx 2 (length encoded))))
+             (replace (%abi-memory-bytes cx) encoded :start1 ptr)
+             (cons ptr (logior n #x80000000))))))
+    (t (error 'wasmdown:host-error
+              :message "unknown string encoding"))))
+
+(defun %abi-load-string (cx ptr tagged)
+  "load_string_from_range (CanonicalABI.md 2265): the string at PTR
+with the TAGGED code-unit count under CX's encoding. Traps on OOB
+(including a zero length at an OOB ptr), on misalignment for the
+2-aligned encodings, and on invalid utf-8."
+  (let* ((encoding (abi-cx-encoding cx))
+         (tag #x80000000)
+         (bytes (%abi-memory-bytes cx))
+         (len (length bytes)))
+    (multiple-value-bind (byte-length decode-start decode-end)
+        (case encoding
+          (:utf8
+           (unless (and (>= ptr 0) (<= (+ ptr tagged) len))
+             (error 'wasmdown:wasm-trap
+                    :kind :out-of-bounds-memory
+                    :message "string pointer/length out of bounds of memory"))
+           (unless (zerop (mod ptr 1))
+             (error 'wasmdown:wasm-trap
+                    :kind :generic :message "unaligned pointer"))
+           (values tagged ptr (+ ptr tagged)))
+          (:utf16
+           (let ((bl (* 2 tagged)))
+             (unless (and (>= ptr 0) (<= (+ ptr bl) len))
+               (error 'wasmdown:wasm-trap
+                      :kind :out-of-bounds-memory
+                      :message "string pointer/length out of bounds of memory"))
+             (unless (zerop (mod ptr 2))
+               (error 'wasmdown:wasm-trap
+                      :kind :generic :message "unaligned pointer"))
+             (values bl ptr (+ ptr bl))))
+          (:latin1+utf16
+           (let* ((utf16p (logtag-p tagged tag))
+                  (units (logxor (logand tagged (lognot tag))
+                                 (if utf16p tag 0)))
+                  (units (if utf16p (- tagged tag) tagged))
+                  (bl (if utf16p (* 2 units) units)))
+             (declare (ignore units))
+             (unless (and (>= ptr 0) (<= (+ ptr bl) len))
+               (error 'wasmdown:wasm-trap
+                      :kind :out-of-bounds-memory
+                      :message "string pointer/length out of bounds of memory"))
+             (unless (zerop (mod ptr 2))
+               (error 'wasmdown:wasm-trap
+                      :kind :generic :message "unaligned pointer"))
+             (values bl ptr (+ ptr bl))))
+          (t (error 'wasmdown:host-error
+                    :message "unknown string encoding")))
+      (declare (ignore decode-start decode-end))
+      ;; decode per encoding from [ptr, ptr+byte-length)
+      (case encoding
+        (:utf8 (%abi-utf8-decode bytes ptr (+ ptr byte-length)))
+        (:utf16 (%abi-utf16-decode bytes ptr (+ ptr byte-length)))
+        (:latin1+utf16
+         (if (logtag-p tagged tag)
+             (%abi-utf16-decode bytes ptr (+ ptr byte-length))
+             ;; latin1: each byte is a code point
+             (let ((n (logand tagged (lognot tag))))
+               (declare (ignore n))
+               (let ((s (make-array byte-length :element-type 'character)))
+                 (loop for i below byte-length
+                       do (setf (char s i)
+                                (code-char (aref bytes (+ ptr i)))))
+                 s))))
+        (t (error 'wasmdown:host-error
+                  :message "unknown string encoding"))))))
+
+(defun logtag-p (i tag)
+  "utf16_tag (CanonicalABI.md 2258): the high-bit tag test."
+  (not (zerop (logand i tag))))
+
+;;; store/load (CanonicalABI.md 2458 / 2140) — the full per-type table.
+;;; The VALUE domain: numbers (unsigned host ints), single/double
+;;; floats, booleans, strings, lists, alists (records/tuples),
+;;; (:variant label . payload), (:enum label), (:flags labels),
+;;; (:some . payload), :none, (:ok . payload), (:err . payload).
+
+(defun %abi-store (cx v vt ptr)
+  "store (CanonicalABI.md 2458): write V of valtype VT at PTR."
+  (%abi-check-align cx ptr (%abi-alignment vt (abi-cx-inst cx)) "store")
+  (%abi-check-span cx ptr (%abi-elem-size vt (abi-cx-inst cx)) "value")
+  (let ((c (%abi-ct vt (abi-cx-inst cx))))
+    (case (wasmdown.component:ct-kind c)
+      (:prim
+       (case (wasmdown.component:ct-payload c)
+         (:bool (%abi-store-int cx (if v 1 0) ptr 1))
+         (:u8 (%abi-store-int cx v ptr 1))
+         (:u16 (%abi-store-int cx v ptr 2))
+         (:u32 (%abi-store-int cx v ptr 4))
+         (:u64 (%abi-store-int cx v ptr 8))
+         (:s8 (%abi-store-int cx v ptr 1))
+         (:s16 (%abi-store-int cx v ptr 2))
+         (:s32 (%abi-store-int cx v ptr 4))
+         (:s64 (%abi-store-int cx v ptr 8))
+         (:f32 (%abi-store-int
+                cx (wasmdown.numops:f32-bits v) ptr 4))
+         (:f64 (%abi-store-int
+                cx (wasmdown.numops:f64-bits v) ptr 8))
+         (:char (%abi-store-int cx (char-code (character v)) ptr 4))
+         (:string
+          (let ((p (%abi-store-string cx v)))
+            (%abi-store-int cx (car p) ptr 4)
+            (%abi-store-int cx (cdr p) (+ ptr 4) 4)))
+         (t (%abi-store-int cx v ptr 4))))
+      (:list
+       (let ((elem (car (wasmdown.component:ct-payload c)))
+             (fixed (cdr (wasmdown.component:ct-payload c))))
+         (if fixed
+             (let ((es (%abi-elem-size elem (abi-cx-inst cx))))
+               (loop for e in v
+                     for i from 0
+                     do (%abi-store cx e elem (+ ptr (* i es)))))
+             (let ((p (%abi-store-list cx v elem)))
+               (%abi-store-int cx (car p) ptr 4)
+               (%abi-store-int cx (cdr p) (+ ptr 4) 4)))))
+      (:record
+       (let ((off ptr))
+         (loop for (nil . fvt) across (wasmdown.component:ct-payload c)
+               for (nil . fv) in v
+               do (setf off (%abi-align-to off
+                                           (%abi-alignment
+                                            fvt (abi-cx-inst cx))))
+                  (%abi-store cx fv fvt off)
+                  (incf off (%abi-elem-size fvt (abi-cx-inst cx))))))
+      (:tuple
+       (let ((off ptr))
+         (loop for t_ across (wasmdown.component:ct-payload c)
+               for tv in v
+               do (setf off (%abi-align-to off
+                                           (%abi-alignment
+                                            t_ (abi-cx-inst cx))))
+                  (%abi-store cx tv t_ off)
+                  (incf off (%abi-elem-size t_ (abi-cx-inst cx))))))
+      (:variant
+       (%abi-store-variant cx v c ptr))
+      (:flags
+       (let ((labels (coerce (wasmdown.component:ct-payload c) 'list))
+             ;; the TAGGED shape (cons :flags labels): a bare list
+             ;; (a nested record field's pre-converted value) also
+             ;; accepts
+             (set (if (and (consp v) (eq (car v) :flags))
+                      (cdr v)
+                      v)))
+         (let ((bits 0))
+           (loop for l in labels
+                 for i from 0
+                 when (member l set :test #'string=)
+                   do (setf bits (logior bits (ash 1 i))))
+           (%abi-store-int cx bits ptr
+                           (%abi-elem-size vt (abi-cx-inst cx))))))
+      (:enum
+       (let ((labels (coerce (wasmdown.component:ct-payload c) 'list)))
+         (let ((idx (or (position v labels :test #'string=) 0)))
+           (%abi-store-int cx idx ptr 1))))
+      (:option
+       ;; the DOMAIN shape (:some . payload) (or the bare :none) —
+       ;; unwrap the tag into the variant's ("some" . payload) form;
+       ;; the old (cons "some" v) DOUBLE-WRAPPED and the store's
+       ;; case lookup read the :some SYMBOL where the payload belonged
+       (%abi-store-variant
+        cx
+        (if (eq v :none)
+            (cons "none" nil)
+            (cons "some" (if (and (consp v) (eq (car v) :some))
+                             (cdr v)
+                             v)))
+        (make-ct* :variant
+                  (vector (cons "none" nil)
+                          (cons "some" (wasmdown.component:ct-payload c))))
+        ptr))
+      (:result
+       (let ((ok (car (wasmdown.component:ct-payload c)))
+             (err (cdr (wasmdown.component:ct-payload c))))
+         (%abi-store-variant
+          cx
+          (cond ((and (consp v) (eq (car v) :ok))
+                 (cons "ok" (cdr v)))
+                ((and (consp v) (eq (car v) :err))
+                 (cons "error" (cdr v)))
+                (t (cons "ok" v)))
+          (make-ct* :variant
+                    (vector (cons "ok" ok) (cons "error" err)))
+          ptr)))
+      (t (%abi-store-int cx v ptr 4)))))
+
+(defun %abi-store-list (cx v elem-type)
+  "store_list_into_range (CanonicalABI.md 2761): realloc the elements,
+store each, return (ptr . length)."
+  (let* ((n (length v))
+         (es (%abi-elem-size elem-type (abi-cx-inst cx)))
+         (ptr (%abi-allocate cx
+                              (%abi-alignment elem-type (abi-cx-inst cx))
+                              (* n es))))
+    (loop for e in v
+          for i from 0
+          do (%abi-store cx e elem-type (+ ptr (* i es))))
+    (cons ptr n)))
+
+(defun %abi-store-variant (cx v c ptr)
+  "store_variant (CanonicalABI.md 2787): the discriminant + the
+payload at the join-aligned offset."
+  (let* ((cases (coerce (wasmdown.component:ct-payload c) 'list))
+         (idx (or (position (car v) cases
+                            :key #'car :test #'string=)
+                  0))
+         (case (nth idx cases))
+         (payload (cdr case))
+         (ds (%abi-discriminant-size cases))
+         (ma (max 1 (or (loop for (nil . cvt) in cases
+                              when cvt maximize
+                              (%abi-alignment cvt (abi-cx-inst cx)))
+                        1))))
+    (%abi-store-int cx idx ptr ds)
+    (when payload
+      (let ((p (+ ptr (%abi-align-to ds ma))))
+        (%abi-store cx (cdr v) payload p)))))
+
+(defun %abi-load (cx vt ptr)
+  "load (CanonicalABI.md 2140): read a value of valtype VT at PTR."
+  (%abi-check-align cx ptr (%abi-alignment vt (abi-cx-inst cx)) "load")
+  (%abi-check-span cx ptr (%abi-elem-size vt (abi-cx-inst cx)) "value")
+  (let ((c (%abi-ct vt (abi-cx-inst cx))))
+    (case (wasmdown.component:ct-kind c)
+      (:prim
+       (case (wasmdown.component:ct-payload c)
+         (:bool (not (zerop (%abi-load-int cx ptr 1))))
+         (:u8 (%abi-load-int cx ptr 1))
+         (:u16 (%abi-load-int cx ptr 2))
+         (:u32 (%abi-load-int cx ptr 4))
+         (:u64 (%abi-load-int cx ptr 8))
+         (:s8 (%abi-load-int cx ptr 1 :signed t))
+         (:s16 (%abi-load-int cx ptr 2 :signed t))
+         (:s32 (%abi-load-int cx ptr 4 :signed t))
+         (:s64 (%abi-load-int cx ptr 8 :signed t))
+         (:f32 (wasmdown.numops:f32-from-bits
+                (%abi-load-int cx ptr 4)))
+         (:f64 (wasmdown.numops:f64-from-bits
+                (%abi-load-int cx ptr 8)))
+         (:char
+          (let ((i (%abi-load-int cx ptr 4)))
+            (cond
+             ((or (>= i #x110000)
+                  (and (>= i #xD800) (<= i #xDFFF)))
+              (error 'wasmdown:wasm-trap
+                     :kind :generic
+                     :message "invalid `char` bit pattern"))
+              (t (code-char i)))))
+         (:string
+          (let ((sp (%abi-load-int cx ptr 4))
+                (sl (%abi-load-int cx (+ ptr 4) 4)))
+            (%abi-load-string cx sp sl)))
+         (t (%abi-load-int cx ptr 4))))
+      (:list
+       (let ((elem (car (wasmdown.component:ct-payload c)))
+             (fixed (cdr (wasmdown.component:ct-payload c))))
+         (if fixed
+             (loop repeat fixed
+                   for i from 0
+                   collect (%abi-load cx elem
+                                      (+ ptr (* i
+                                                (%abi-elem-size
+                                                 elem (abi-cx-inst cx))))))
+             (let ((lp (%abi-load-int cx ptr 4))
+                   (ln (%abi-load-int cx (+ ptr 4) 4)))
+               (%abi-load-list cx lp ln elem)))))
+      (:record
+       (let ((off ptr)
+             (fields (coerce (wasmdown.component:ct-payload c) 'list))
+             (out '()))
+         (loop for (label . fvt) in fields
+               do (setf off (%abi-align-to
+                             off (%abi-alignment fvt (abi-cx-inst cx))))
+                  (push (cons label (%abi-load cx fvt off)) out)
+                  (incf off (%abi-elem-size fvt (abi-cx-inst cx))))
+         (nreverse out)))
+      (:tuple
+       (let ((off ptr)
+             (out '()))
+         (loop for t_ across (wasmdown.component:ct-payload c)
+               do (setf off (%abi-align-to
+                             off (%abi-alignment t_ (abi-cx-inst cx))))
+                  (push (%abi-load cx t_ off) out)
+                  (incf off (%abi-elem-size t_ (abi-cx-inst cx))))
+         (nreverse out)))
+      (:variant
+       (let* ((cases (coerce (wasmdown.component:ct-payload c) 'list))
+              (ds (%abi-discriminant-size cases))
+              (idx (%abi-load-int cx ptr ds)))
+         (when (>= idx (length cases))
+           (error 'wasmdown:wasm-trap
+                  :kind :generic
+                  :message "invalid variant discriminant"))
+         (let* ((case (nth idx cases))
+                (payload (cdr case))
+                (ma (max 1 (or (loop for (nil . cvt) in cases
+                                     when cvt maximize
+                                     (%abi-alignment cvt (abi-cx-inst cx)))
+                           1))))
+           (if payload
+               (cons (car case)
+                     (%abi-load cx payload
+                                (+ ptr (%abi-align-to ds ma))))
+               (cons (car case) nil)))))
+      (:flags
+       (let ((labels (coerce (wasmdown.component:ct-payload c) 'list)))
+         (let ((bits (%abi-load-int cx ptr
+                                     (%abi-elem-size vt
+                                                     (abi-cx-inst cx)))))
+           (loop for l in labels
+                 for i from 0
+                 when (logbitp i bits)
+                   collect l))))
+      (:enum
+       (let ((labels (coerce (wasmdown.component:ct-payload c) 'list)))
+         (let ((idx (%abi-load-int cx ptr 1)))
+           (if (< idx (length labels))
+               (cons :enum (nth idx labels))
+               (error 'wasmdown:wasm-trap
+                      :kind :generic
+                      :message "invalid variant discriminant")))))
+      (:option
+       (let* ((payload (wasmdown.component:ct-payload c))
+              (r (%abi-load
+                  cx
+                  (make-ct* :variant
+                            (vector (cons "none" nil)
+                                    (cons "some" payload)))
+                  ptr)))
+         (if (string= (car r) "none") :none (cons :some (cdr r)))))
+      (:result
+       (let* ((ok (car (wasmdown.component:ct-payload c)))
+              (err (cdr (wasmdown.component:ct-payload c)))
+              (r (%abi-load
+                  cx
+                  (make-ct* :variant
+                            (vector (cons "ok" ok)
+                                    (cons "error" err)))
+                  ptr)))
+         (if (string= (car r) "ok")
+             (cons :ok (cdr r))
+             (cons :err (cdr r)))))
+      (t (%abi-load-int cx ptr 4)))))
+
+(defun %abi-load-list (cx ptr length elem-type)
+  "load_list_from_range (CanonicalABI.md 2323): bounds-check the
+span then load each element."
+  (let ((es (%abi-elem-size elem-type (abi-cx-inst cx))))
+    (%abi-check-align cx ptr (%abi-alignment elem-type (abi-cx-inst cx))
+                      "list")
+    (%abi-check-span cx ptr (* length es) "list")
+    (loop for i below length
+          collect (%abi-load cx elem-type (+ ptr (* i es))))))
+
+;;; ---- lower_flat / lift_flat (the register domain) ----
+
+(defun %abi-lower (cx v vt &optional (joined-types nil))
+  "lower_flat (CanonicalABI.md 3164): one component value as the flat
+core value list. JOINED-TYPES is the variant join's flat types (the
+CoerceValueIter pairs) — NIL outside variants."
+  (declare (ignore joined-types))
+  (let ((c (%abi-ct vt (abi-cx-inst cx))))
+    (case (wasmdown.component:ct-kind c)
+      (:prim
+       (case (wasmdown.component:ct-payload c)
+         (:bool (list (if v 1 0)))
+         ((:u8 :u16 :u32) (list (mod v #x100000000)))
+         ((:s8 :s16 :s32)
+          (list (mod (mod v #x100000000) #x100000000)))
+         ((:u64 :s64) (list (mod v #x10000000000000000)))
+         (:f32 (list v))
+         (:f64 (list v))
+         (:char (list (char-code (character v))))
+         (:string
+          (let ((p (%abi-store-string cx v)))
+            (list (car p) (cdr p))))
+         (t (list (mod v #x100000000)))))
+      (:list
+       (let ((elem (car (wasmdown.component:ct-payload c)))
+             (fixed (cdr (wasmdown.component:ct-payload c))))
+         (if fixed
+             (loop for e in v append (%abi-lower cx e elem))
+             (let ((p (%abi-store-list cx v elem)))
+               (list (car p) (cdr p))))))
+      (:record
+       (let ((fields (coerce (wasmdown.component:ct-payload c) 'list)))
+         (loop for (nil . fvt) in fields
+               for (nil . fv) in v
+               append (%abi-lower cx fv fvt))))
+      (:tuple
+       (loop for t_ across (wasmdown.component:ct-payload c)
+             for tv in v
+             append (%abi-lower cx tv t_)))
+      (:option
+       ;; (values lane, concat.wast ::23 'deep') lower_flat of an
+       ;; option: the variant(none, some) special case — the flat
+       ;; path had no :option arm and the (t ...) default lowered the
+       ;; domain cons as a single i32 (disc 0 = 'none' for every
+       ;; some). The DOMAIN (:some . payload) unwraps to ("some" .
+       ;; payload).
+       (%abi-lower
+        cx
+        (if (eq v :none)
+            (cons "none" nil)
+            (cons "some"
+                  (if (and (consp v) (eq (car v) :some)) (cdr v) v)))
+        (make-ct* :variant
+                  (vector (cons "none" nil)
+                          (cons "some"
+                                (wasmdown.component:ct-payload c))))))
+      (:variant
+       ;; lower_flat_variant (CanonicalABI.md 3235): the discriminant
+       ;; + the case payload COERCED to the joined slot types + 0 pad
+       (let* ((cases (coerce (wasmdown.component:ct-payload c) 'list))
+              (idx (or (position (car v) cases :key #'car :test #'string=)
+                       0))
+              (case (nth idx cases))
+              (payload (cdr case))
+              ;; the JOINED flat slot types (flatten_variant minus the
+              ;; discriminant) and the payload's own flat types
+              (want (cdr (%flat-type-of c (abi-cx-inst cx))))
+              (have (and payload
+                         (%flat-type-of payload (abi-cx-inst cx))))
+              (raw (if payload (%abi-lower cx (cdr v) payload) '()))
+              (coerced
+                (loop for rv in raw
+                      for i from 0
+                      collect (%abi-coerce-lower
+                               rv (and have (nth i have))
+                               (nth i want)))))
+         (append (list idx)
+                 (append coerced
+                         (make-list (max 0 (- (length want)
+                                               (length coerced)))
+                                    :initial-element 0)))))
+      (:flags
+       ;; the TAGGED domain (cons :flags labels); a bare label list
+       ;; (a nested field's pre-converted value) also accepts
+       (let ((labels (coerce (wasmdown.component:ct-payload c) 'list))
+             (set (if (and (consp v) (eq (car v) :flags)) (cdr v) v))
+             (bits 0))
+         (loop for l in labels
+               for i from 0
+               when (member l set :test #'string=)
+                 do (setf bits (logior bits (ash 1 i))))
+         (list bits)))
+      (:enum
+       ;; the TAGGED domain (cons :enum label); a bare label accepts
+       (let ((labels (coerce (wasmdown.component:ct-payload c) 'list))
+             (e (if (and (consp v) (eq (car v) :enum)) (cdr v) v)))
+         (list (or (position e labels :test #'string=) 0))))
+      (:option
+       (%abi-lower cx
+                   (if (eq v :none)
+                       (cons "none" nil)
+                       (cons "some" (cdr v)))
+                   (make-ct* :variant
+                             (vector (cons "none" nil)
+                                     (cons "some"
+                                           (wasmdown.component:ct-payload
+                                            c))))))
+      (:result
+       (let ((ok (car (wasmdown.component:ct-payload c)))
+             (err (cdr (wasmdown.component:ct-payload c))))
+         (%abi-lower cx
+                     (cond ((and (consp v) (eq (car v) :ok))
+                            (cons "ok" (cdr v)))
+                           ((and (consp v) (eq (car v) :err))
+                            (cons "error" (cdr v)))
+                           (t (cons "ok" v)))
+                     (make-ct* :variant
+                               (vector (cons "ok" ok)
+                                       (cons "error" err))))))
+      (t (list (mod v #x100000000))))))
+
+
+;;; %abi-coerce-lower (lower_flat_variant's match table,
+;;; CanonicalABI.md 3247): the payload's RAW flat value coerced to the
+;;; JOINED slot's core type. (f32,i32) re-encodes the bits; (i32,i64)
+;;; zero-extends; (f32,i64) re-encodes then zero-extends; (f64,i64)
+;;; re-encodes; equal pairs pass through.
+(defun %abi-coerce-lower (rv have want)
+  (cond
+   ((or (null want) (null have) (eq have want)) rv)
+   ((and (eq have :f32) (eq want :i32))
+    (wasmdown.numops:f32-bits rv))
+   ((and (eq have :f32) (eq want :i64))
+    (wasmdown.numops:f32-bits rv))
+   ((and (eq have :f64) (eq want :i64))
+    (wasmdown.numops:f64-bits rv))
+   ((and (eq have :i32) (eq want :i64)) rv)
+   (t rv)))
+
+;;; %abi-coerce-lift (lift_flat_variant's CoerceValueIter,
+;;; CanonicalABI.md 3125): the JOINED slot's raw core value coerced
+;;; to the case payload's own flat type. (i32,f32) re-decodes;
+;;; (i64,i32) wraps; (i64,f32) wraps then re-decodes; (i64,f64)
+;;; re-decodes; equal pairs pass through.
+(defun %abi-coerce-lift (rv have want)
+  (cond
+   ((or (null want) (null have) (eq have want)) rv)
+   ((and (eq have :i32) (eq want :f32))
+    (wasmdown.numops:f32-from-bits rv))
+   ((and (eq have :i64) (eq want :i32)) (mod rv #x100000000))
+   ((and (eq have :i64) (eq want :f32))
+    (wasmdown.numops:f32-from-bits (mod rv #x100000000)))
+   ((and (eq have :i64) (eq want :f64))
+    (wasmdown.numops:f64-from-bits rv))
+   (t rv)))
+
+;;; ---- lift_flat (CanonicalABI.md 3035) ----
+
+(defun %abi-lift (cx vi vt)
+  "lift_flat (CanonicalABI.md 3035): one component value from the
+flat core value iterator VI (a fill-pointer vector of (value . type)
+pairs consumed in order)."
+  (labels
+      ((next (&optional (want nil))
+         (let ((pair (vector-pop vi)))
+           (if (and want (not (eq (cdr pair) want)))
+               (error 'wasmdown:host-error
+                      :message (format nil
+                                      "flat value type mismatch: ~
+                                       have ~a want ~a"
+                                      (cdr pair) want))
+               (car pair))))
+       (lift (vt)
+         (let ((c (%abi-ct vt (abi-cx-inst cx))))
+           (case (wasmdown.component:ct-kind c)
+             (:prim
+              (case (wasmdown.component:ct-payload c)
+                (:bool (not (zerop (next :i32))))
+                (:u8 (mod (next :i32) #x100))
+                (:u16 (mod (next :i32) #x10000))
+                (:u32 (next :i32))
+                (:u64 (next :i64))
+                (:s8 (let ((i (mod (next :i32) #x100)))
+                       (if (>= i #x80) (- i #x100) i)))
+                (:s16 (let ((i (mod (next :i32) #x10000)))
+                       (if (>= i #x8000) (- i #x10000) i)))
+                (:s32 (let ((i (next :i32)))
+                       (if (>= i #x80000000) (- i #x100000000) i)))
+                (:s64 (let ((i (next :i64)))
+                       (if (>= i #x8000000000000000)
+                           (- i #x10000000000000000)
+                           i)))
+                (:f32 (next :f32))
+                (:f64 (next :f64))
+                (:char
+                 (let ((i (next :i32)))
+                   (cond
+                    ((or (>= i #x110000)
+                         (and (>= i #xD800) (<= i #xDFFF)))
+                     (error 'wasmdown:wasm-trap
+                            :kind :generic
+                            :message "invalid `char` bit pattern"))
+                    (t (code-char i)))))
+                (:string
+                 (let ((ptr (next :i32))
+                       (len (next :i32)))
+                   (%abi-load-string cx ptr len)))
+                (t (next :i32))))
+             (:list
+              (let ((elem (car (wasmdown.component:ct-payload c)))
+                    (fixed (cdr (wasmdown.component:ct-payload c))))
+                (if fixed
+                    (loop repeat fixed collect (lift elem))
+                    (let ((ptr (next :i32))
+                          (len (next :i32)))
+                      (%abi-load-list cx ptr len elem)))))
+             (:record
+              (let ((fields (coerce (wasmdown.component:ct-payload c)
+                                    'list))
+                    (out '()))
+                (loop for (label . fvt) in fields
+                      do (push (cons label (lift fvt)) out))
+                (nreverse out)))
+             (:tuple
+              (let ((out '()))
+                (loop for t_ across (wasmdown.component:ct-payload c)
+                      do (push (lift t_) out))
+                (nreverse out)))
+             (:variant
+              (let* ((cases (coerce (wasmdown.component:ct-payload c)
+                                    'list))
+                     (idx (next :i32)))
+                (when (>= idx (length cases))
+                  (error 'wasmdown:wasm-trap
+                         :kind :generic
+                         :message "invalid variant discriminant"))
+                (let* ((case (nth idx cases))
+                       (payload (cdr case))
+                       ;; the JOINED flat types minus the discriminant
+                       (want (cdr (%flat-type-of c (abi-cx-inst cx))))
+                       ;; consume EXACTLY the joined slots
+                       (slots
+                         (loop repeat (length want)
+                               collect (vector-pop vi)))
+                       (have (and payload
+                                  (%flat-type-of payload
+                                                 (abi-cx-inst cx)))))
+                  (when payload
+                    ;; coerce each slot to the payload's own type and
+                    ;; re-push for the recursive lift
+                    (loop for (rv . rt) in slots
+                          for i from 0
+                          do (vector-push-extend
+                              (cons (%abi-coerce-lift
+                                     rv (nth i want) (nth i have))
+                                    (nth i have))
+                              vi)
+                          finally
+                            ;; push back in REVERSE (vector-pop LIFO)
+                            (loop for i from 0 below (length have)
+                                  do (vector-push-extend
+                                      (vector-pop vi) vi))))
+                  (let ((v (if payload (lift payload) nil)))
+                    ;; drop the unconsumed pad slots
+                    (loop repeat (- (length want)
+                                    (if payload (length have) 0))
+                          do (vector-pop vi))
+                    (cons (car case) v)))))
+             (:flags
+              (let ((labels (coerce (wasmdown.component:ct-payload c)
+                                    'list)))
+                (let ((bits (next :i32)))
+                  ;; the TAGGED shape (cons :flags labels) — the
+                  ;; domain convention shared with :enum
+                  ;; ((cons :enum label)); the flags.const spec's
+                  ;; (list :flags labels) WRAPS one level deeper and
+                  ;; %abi-arg-domain unwraps to this shape
+                  (cons :flags
+                        (loop for l in labels
+                              for i from 0
+                              when (logbitp i bits)
+                                collect l)))))
+             (:enum
+              (let ((labels (coerce (wasmdown.component:ct-payload c)
+                                    'list)))
+                (let ((idx (next :i32)))
+                  (if (< idx (length labels))
+                      (cons :enum (nth idx labels))
+                      (error 'wasmdown:wasm-trap
+                             :kind :generic
+                             :message "invalid variant discriminant")))))
+             (:option
+              (let* ((payload (wasmdown.component:ct-payload c))
+                     (r (lift (make-ct*
+                               :variant
+                               (vector (cons "none" nil)
+                                       (cons "some" payload))))))
+                (if (string= (car r) "none") :none
+                    (cons :some (cdr r)))))
+             (:result
+              (let* ((ok (car (wasmdown.component:ct-payload c)))
+                     (err (cdr (wasmdown.component:ct-payload c)))
+                     (r (lift (make-ct*
+                               :variant
+                               (vector (cons "ok" ok)
+                                       (cons "error" err))))))
+                (if (string= (car r) "ok")
+                    (cons :ok (cdr r))
+                    (cons :err (cdr r)))))
+             (t (next :i32))))))
+    (lift vt)))
+
+;;; ---- lift_flat_values / lower_flat_values (CanonicalABI.md 3270 /
+;;; ---- 3289) ----
+
+(defun %abi-lower-values (cx max-flat vs ts)
+  "lower_flat_values: lower the component values VS of types TS to
+the flat core arg list, with the MAX_FLAT fallthrough: >MAX-FLAT
+spills the TUPLE through realloc into a single [ptr]."
+  (let* ((flat-types (loop for vt in ts
+                           append (%flat-type-of vt (abi-cx-inst cx)))))
+    (if (> (length flat-types) max-flat)
+        ;; the tuple in memory via realloc: (type i, ...) — the
+        ;; runtime's tuple is a TUPLE ct of TS
+        (let* ((tuple (make-ct* :tuple (coerce ts 'vector)))
+               (size (%abi-elem-size tuple (abi-cx-inst cx)))
+               (align (%abi-alignment tuple (abi-cx-inst cx)))
+               (ptr (%abi-allocate cx align size))
+               ;; the record-style store: field i at its aligned slot
+               (off ptr))
+          (loop for vt in ts
+                for v in vs
+                do (setf off (%abi-align-to
+                              off (%abi-alignment vt (abi-cx-inst cx))))
+                   (%abi-store cx v vt off)
+                   (incf off (%abi-elem-size vt (abi-cx-inst cx))))
+          (list ptr))
+        (loop for v in vs
+              for vt in ts
+              append (%abi-lower cx v vt)))))
+
+(defun %abi-lift-values (cx max-flat vi ts)
+  "lift_flat_values: lift the core results VI into the component
+values of types TS, with the MAX_FLAT fallthrough: a single [ptr]
+result reads the TUPLE back out of memory. VI's (value . type) pairs
+are consumed IN ORDER — %abi-lift pops LIFO, so the vector is
+reversed up front (an un-reversed pop would swap every adjacent pair
+of flat arguments)."
+  ;; reverse into a fresh scratch so the caller's vector is intact
+  (let* ((n (length vi))
+         (scratch (make-array (max 1 n) :fill-pointer 0 :adjustable t)))
+    (loop for i from (1- n) downto 0
+          do (vector-push-extend (aref vi i) scratch))
+    (setf vi scratch))
+  (let* ((flat-types (loop for vt in ts
+                           append (%flat-type-of vt (abi-cx-inst cx)))))
+    (if (> (length flat-types) max-flat)
+        ;; the spilled results read the TUPLE back out of memory —
+        ;; for the SINGLE-result case (lift_flat_values with one type
+        ;; whose flattening exceeds MAX_FLAT_RESULTS) the tuple IS the
+        ;; bare value: load it as the result's own type
+        (let* ((pair (vector-pop vi))
+               (ptr (car pair)))
+          (if (= (length ts) 1)
+              (list (%abi-load cx (first ts) ptr))
+              (let ((tuple (make-ct* :tuple (coerce ts 'vector))))
+                (coerce (%abi-load cx tuple ptr) 'list))))
+        (loop for vt in ts
+              collect (%abi-lift cx vi vt)))))
+
+;;; ---- the lifted call (canon_lift, sync; CanonicalABI.md 3389) ----
 
 (defun lifted-func-call (lf &rest args)
-  "Call a lifted func with FLAT component values: lower the args
-(identity for the numeric prims — bool/ints/char ride i32/i64,
-floats ride f32/f64), call the wrapped core func, lift the single
-result back. M9: OWN/BORROW params/results ride i32 handle indexes
-(the values the core side produced); a STRING result lifts through
-the canon (memory ...) option's memory — [ptr,len] at the returned
-pointer. Non-flat shapes signal host-error (values slice).
-M9 (linking ::126): an OWN/BORROW PARAM index arrives in the CALLER
-instance's table space (the lower added it there) — lift_own
-consumes it from the CALLER's table (the dynamic *handle-caller-inst*,
-falling back to the defining instance) and re-enters the DEFINING
-instance's table so the core side's drop/removal finds it."
+  "canon_lift (CanonicalABI.md 3389, sync): lower the component ARGS
+per the canonical ABI (the flat register domain, the MAX_FLAT_PARAMS
+fallthrough spilling through realloc), call the wrapped core func,
+lift the results (the MAX_FLAT_RESULTS fallthrough reading the tuple
+back out of the lift memory), and run the optional post-return with
+the SAME flat core results. M9 (linking ::126): an OWN/BORROW param
+index arrives in the CALLER instance's table — lift_own consumes it
+there and re-enters the defining instance's table."
   (let* ((ft (lifted-func-type lf))
          (core (lifted-func-core lf)))
     (unless (and core (wasmdown.runtime:func-instance-p core))
       (error 'wasmdown:host-error
-             :message "lifted func wraps no core func (values slice)"))
-    (let ((flat-params
-            (and ft (eq (wasmdown.component:ct-kind ft) :func)
-                 (coerce (first (wasmdown.component:ct-payload ft))
-                         'list)))
-          (flat-result
-            (and ft (eq (wasmdown.component:ct-kind ft) :func)
-                 (second (wasmdown.component:ct-payload ft)))))
-      (let ((core-params
-              (mapcar (lambda (p) (%valtype-flat-core (cdr p) :params))
-                      (or flat-params '())))
-            (core-result
-              (and flat-result
-                   (%valtype-flat-core flat-result :results))))
-        (when (or (member nil core-params)
-                  (and flat-result (null core-result)))
-          (error 'wasmdown:host-error
-                 :message "canonical ABI for non-flat values is a future slice"))
-        (unless (= (length args) (length core-params))
-          (error 'wasmdown:host-error
-                 :message (format nil
-                                  "lifted func expects ~d argument~:p, got ~d"
-                                  (length core-params) (length args))))
-        ;; M9 (linking ::126): an own/borrow PARAM's i32 is a handle
-        ;; index in the CALLER instance's table — consume it there and
-        ;; re-enter THIS (defining) instance's table
-        (let ((self (lifted-func-inst lf))
-              (caller (or *handle-caller-inst* (lifted-func-inst lf))))
-          (setf args
-                (mapcar
-                 (lambda (p a)
-                   (let ((ty (and (consp (cdr p))
-                                  (eq (car (cdr p)) :idx)
-                                  self
-                                  (integerp (cdr (cdr p)))
-                                  (< (cdr (cdr p))
-                                     (length (comp-instance-types self)))
-                                  (aref (comp-instance-types self)
-                                        (cdr (cdr p))))))
-                    (if (and ty
-                             (eq (wasmdown.component:ct-kind ty) :own)
-                             (integerp a)
-                              (integerp
-                               (wasmdown.component:ct-payload ty))
-                              (< (wasmdown.component:ct-payload ty)
-                                 (length (comp-instance-types self))))
-                         (let* ((rt (aref (comp-instance-types self)
-                                          (wasmdown.component:ct-payload
-                                           ty)))
-                                (h (and (wasmdown.component:ct-resourcetype-p
-                                         rt)
-                                        (%handle-remove caller rt a))))
-                           (if h
-                               (%handle-add self rt (cdar h) t)
-                               a))
-                         ;; M9 (linking ::110): a BORROW param's i32
-                         ;; is a handle index in the CALLER's table —
-                         ;; deref to the REP for the core side (no
-                         ;; table transfer: a borrow holds no
-                         ;; ownership); unknown handles pass through
-                         (if (and ty
-                                  (eq (wasmdown.component:ct-kind ty)
-                                      :borrow)
-                                  (integerp a)
-                                  (integerp
-                                   (wasmdown.component:ct-payload ty))
-                                  (< (wasmdown.component:ct-payload ty)
-                                     (length (comp-instance-types self))))
-                             (let* ((rt (aref (comp-instance-types self)
-                                              (wasmdown.component:ct-payload
-                                               ty))))
-                               (if (wasmdown.component:ct-resourcetype-p rt)
-                                   (let ((rep (%handle-rep caller rt a)))
-                                     (or rep a))
-                                   a))
-                             a))))
-                 (or flat-params '())
-                 args)))
-        (let ((res (apply #'wasmdown.runtime:wasm-call core args)))
-          (if core-result
-              (cond
-               ((and (eq core-result :i32)
-                     (consp flat-result)
-                     (eq (car flat-result) :idx))
-                (let* ((tidx (cdr flat-result))
-                       (inst (lifted-func-inst lf))
-                       (res-ct (and inst
-                                    (< tidx
-                                       (length (comp-instance-types inst)))
-                                    (aref (comp-instance-types inst)
-                                          tidx))))
-                  (let* ((rt (cond
-                              ((and res-ct
-                                    (eq (wasmdown.component:ct-kind res-ct)
-                                        :resource))
-                               res-ct)
-                              ((and res-ct
-                                    (member (wasmdown.component:ct-kind
-                                             res-ct)
-                                            '(:own :borrow))
-                                    (integerp
-                                     (wasmdown.component:ct-payload res-ct))
-                                    inst
-                                    (< (wasmdown.component:ct-payload res-ct)
-                                       (length (comp-instance-types inst))))
-                               (aref (comp-instance-types inst)
-                                     (wasmdown.component:ct-payload
-                                      res-ct)))
-                              (t nil)))
-                         (h (and rt (%handle-remove inst rt (first res)))))
-                    (unless h
-                      (error 'wasmdown:host-error
-                             :message
-                             "own result references an unknown type"))
-                    (list :own-handle rt (cdar h)))))
-               ((and (eq core-result :i32)
-                     (eq flat-result :string))
-                (lift-flat-string (lifted-func-memory lf) (first res)))
-               (t (first res)))
-              (values)))))))
-(defun lift-flat-string (memory ptr)
-  "lift_flat_string (CanonicalABI.md 3088): read the [ptr,len] tuple
-at PTR in the lift MEMORY and return the Lisp string. Traps on a
-bad range (the spec's trap taxonomy)."
-  (unless memory
-    (error 'wasmdown:host-error
-           :message "string lift requires the canon (memory ...) option"))
-  (let ((bytes (wasmdown.runtime:memory-instance-bytes memory)))
-    (unless (and (>= ptr 0) (<= (+ ptr 8) (length bytes)))
-      (error 'wasmdown:wasm-trap
-             :kind :out-of-bounds-memory
-             :message (format nil "string pointer out of bounds: ~d" ptr)))
-    (let ((sp (logior (aref bytes ptr)
-                      (ash (aref bytes (+ ptr 1)) 8)
-                      (ash (aref bytes (+ ptr 2)) 16)
-                      (ash (aref bytes (+ ptr 3)) 24)))
-          (sl (logior (aref bytes (+ ptr 4))
-                      (ash (aref bytes (+ ptr 5)) 8)
-                      (ash (aref bytes (+ ptr 6)) 16)
-                      (ash (aref bytes (+ ptr 7)) 24))))
-      (unless (and (>= sp 0) (<= (+ sp sl) (length bytes)))
-        (error 'wasmdown:wasm-trap
-               :kind :out-of-bounds-memory
-               :message (format nil "string range out of bounds: ~d" sp)))
-      (let ((v (make-array sl :element-type 'character)))
-        (loop for i below sl
-              do (setf (aref v i) (code-char (aref bytes (+ sp i)))))
-        v))))
+             :message "lifted func wraps no core func"))
+    (let* ((params (and ft (eq (wasmdown.component:ct-kind ft) :func)
+                        (coerce (first (wasmdown.component:ct-payload ft))
+                                'list)))
+           (result (and ft (eq (wasmdown.component:ct-kind ft) :func)
+                         (second (wasmdown.component:ct-payload ft))))
+           (opts (lifted-func-opts lf))
+           (enc-opt (wasmdown.component:canon-opt opts
+                                                  :string-encoding))
+           (cx (make-abi-cx
+                :memory (lifted-func-memory lf)
+                :realloc (lifted-func-realloc lf)
+                :encoding (%abi-encoding-of enc-opt)
+                :inst (lifted-func-inst lf))))
+      ;; M9 (linking ::126): an OWN/BORROW param's i32 is a handle
+      ;; index in the CALLER instance's table — lift_own consumes it
+      ;; there and re-enters THIS (defining) instance's table; a
+      ;; BORROW derefs the REP for the core side (no transfer)
+      (let ((self (lifted-func-inst lf))
+            (caller (or *handle-caller-inst* (lifted-func-inst lf))))
+        (setf args
+              (mapcar
+               (lambda (p a)
+                 (let ((ty (and (consp (cdr p))
+                                (eq (car (cdr p)) :idx)
+                                self
+                                (integerp (cdr (cdr p)))
+                                (< (cdr (cdr p))
+                                   (length (comp-instance-types self)))
+                                (aref (comp-instance-types self)
+                                      (cdr (cdr p))))))
+                   (if (and ty
+                            (eq (wasmdown.component:ct-kind ty) :own)
+                            (integerp a)
+                            (integerp
+                             (wasmdown.component:ct-payload ty))
+                            (< (wasmdown.component:ct-payload ty)
+                               (length (comp-instance-types self))))
+                       (let* ((rt (aref (comp-instance-types self)
+                                        (wasmdown.component:ct-payload ty)))
+                              (h (and
+                                  (wasmdown.component:ct-resourcetype-p rt)
+                                  (%handle-remove caller rt a))))
+                         (if h
+                             (%handle-add self rt (cdar h) t)
+                             a))
+                       (if (and ty
+                                (eq (wasmdown.component:ct-kind ty)
+                                     :borrow)
+                                (integerp a)
+                                (integerp
+                                 (wasmdown.component:ct-payload ty))
+                                (< (wasmdown.component:ct-payload ty)
+                                   (length (comp-instance-types self))))
+                           (let* ((rt (aref
+                                       (comp-instance-types self)
+                                       (wasmdown.component:ct-payload
+                                        ty))))
+                             (if (wasmdown.component:ct-resourcetype-p
+                                 rt)
+                                 (let ((rep (%handle-rep caller rt a)))
+                                   (or rep a))
+                                 a))
+                           a))))
+               (or params '())
+               args)))
+      ;; the runtime LOWER domain: the parsed specs (the runner
+      ;; passes the component-value AST) become the domain values
+      (let ((vals
+              (loop for p in (or params '())
+                    for a in args
+                    collect (%abi-arg-domain a (cdr p) cx))))
+        (let ((flat-args
+                (if (or (abi-cx-memory cx) params)
+                    (%abi-lower-values
+                     cx 16
+                     vals (loop for p in (or params '())
+                                collect (cdr p)))
+                    ;; no params at all
+                    '()))
+              ;; the core signature per the LIFT context
+              (core-sig (and ft
+                             (wasmdown.component:flatten-functype
+                              ft (comp-instance-types (lifted-func-inst lf))
+                              :lift))))
+          (declare (ignore core-sig))
+          (let ((res (apply #'wasmdown.runtime:wasm-call core
+                            flat-args)))
+            (let ((vi (make-array 16 :fill-pointer 0 :adjustable t)))
+              (loop for r in (coerce res 'list)
+                    for rt in (result-core-types lf result)
+                    do (vector-push-extend (cons r rt) vi))
+              (let ((lifted
+                      (if result
+                          (%abi-lift-values cx 1 vi (list result))
+                          '())))
+                ;; M9: an OWN-typed result lifts via lift_own — the
+                ;; handle at the raw index is REMOVED from the defining
+                ;; instance's table and the REP rides the abstract
+                ;; (:own-handle rt rep) record; lower_own (the caller
+                ;; side) adds it to ITS table.
+                (when (and result (consp result)
+                           (eq (car result) :idx))
+                  (let* ((tidx (cdr result))
+                         (inst (lifted-func-inst lf))
+                         (res-ct (and inst
+                                      (< tidx (length
+                                               (comp-instance-types
+                                                inst)))
+                                      (aref (comp-instance-types inst)
+                                            tidx))))
+                    (when (and res-ct
+                               (eq (wasmdown.component:ct-kind res-ct)
+                                   :own)
+                               (integerp
+                                (wasmdown.component:ct-payload res-ct))
+                               (< (wasmdown.component:ct-payload res-ct)
+                                  (length (comp-instance-types inst))))
+                      (let* ((rt (aref (comp-instance-types inst)
+                                       (wasmdown.component:ct-payload
+                                        res-ct)))
+                             (h (and
+                                 (wasmdown.component:ct-resourcetype-p rt)
+                                 (%handle-remove
+                                  inst rt (first lifted)))))
+                        (unless h
+                          (error 'wasmdown:host-error
+                                 :message
+                                 "own result references an unknown type"))
+                        (setf lifted
+                              (list (list :own-handle rt (cdar h))))))))
+                ;; post-return runs with the SAME flat results
+                (let ((pr (wasmdown.component:canon-opt
+                           opts :post-return)))
+                  (when pr
+                    (let ((prf (and (second pr)
+                                    (< (second pr)
+                                       (length (comp-instance-core-funcs
+                                                (lifted-func-inst lf))))
+                                    (aref (comp-instance-core-funcs
+                                           (lifted-func-inst lf))
+                                          (second pr)))))
+                      (when prf
+                        (apply #'wasmdown.runtime:wasm-call prf res)))))
+                (first lifted)))))))))
 
+(defun result-core-types (lf result)
+  "The core result types the LIFT produces for RESULT (flatten of
+the single result; NIL when none). The LIFTED FUNC's defining
+instance resolves (:idx . n) refs."
+  (if result
+      (coerce (%flat-type-of result (lifted-func-inst lf)) 'list)
+      '()))
+
+(defun %abi-arg-domain (a vt cx)
+  "Convert a runner ARG (the component-value AST from the parser, or
+an already-domain value from another call) to the runtime domain
+value for valtype VT."
+  (labels
+      ((prim-of (c) (wasmdown.component:ct-payload c))
+       (cnv (a vt)
+         (let ((c (%abi-ct vt (abi-cx-inst cx))))
+           (case (first a)
+             ((:num :float :bool :char :str)
+              (case (prim-of c)
+                (:bool (second a))
+                (:char (if (stringp (second a))
+                           (char (second a) 0)
+                           (second a)))
+                ((:f32 :f64)
+                 (if (eq (first a) :float)
+                     (if (eq (second a) :f32)
+                         (wasmdown.numops:f32-from-bits (third a))
+                         (wasmdown.numops:f64-from-bits (third a)))
+                     ;; a non-float spec against a float type: the
+                     ;; numeric path below (the FLAT domain delivered
+                     ;; ints for f32/f64 in M9) — keep the raw value
+                     (cond
+                      ((eq (first a) :num) (third a))
+                      (t (error 'wasmdown:host-error
+                                :message "float type mismatch")))))
+                (t (cond
+                    ((eq (first a) :num) (third a))
+                    ((eq (first a) :str) (second a))
+                    (t (error 'wasmdown:host-error
+                              :message "bad prim value"))))))
+             (:list
+              (let ((elem (car (wasmdown.component:ct-payload c))))
+                (mapcar (lambda (e) (cnv e elem)) (second a))))
+             (:tuple
+              (mapcar (lambda (e t_) (cnv e t_))
+                      (second a)
+                      (coerce (wasmdown.component:ct-payload c) 'list)))
+             (:record
+              (mapcar (lambda (spec-pair field)
+                        (cons (car field) (cnv (cdr spec-pair) (cdr field))))
+                      (second a)
+                      (coerce (wasmdown.component:ct-payload c) 'list)))
+             (:variant
+              (let ((hit (find (second a)
+                               (coerce (wasmdown.component:ct-payload c)
+                                       'list)
+                               :key #'car :test #'string=)))
+                (cons (second a)
+                      (and hit (cdr hit) (third a)
+                           (cnv (third a) (cdr hit))))))
+             (:enum (second a))
+             ;; the TAGGED domain shape (cons :flags labels) — the
+             ;; same form %abi-lift's :flags arm produces and
+             ;; %abi-lower's flags arm consumes. BOTH input shapes:
+             ;; a flags.const spec WRAPS the labels ((:flags labels)
+             ;; — (second a) reads them), a LIFTED value SPREADS
+             ;; them ((:flags . labels) — the (cdr a) tail); the
+             ;; lowered-host-func chain passes lifted values.
+             (:flags (cons :flags
+                           (if (and (consp (second a))
+                                    (not (stringp (second a))))
+                               (second a)
+                               (cdr a))))
+             (:option-some
+              (cons :some (cnv (second a)
+                               (wasmdown.component:ct-payload c))))
+             (:option-none :none)
+             (:result-ok
+              (cons :ok (and (second a)
+                             (cnv (second a)
+                                  (car (wasmdown.component:ct-payload c))))))
+             (:result-err
+              (cons :err (and (second a)
+                              (cnv (second a)
+                                   (cdr (wasmdown.component:ct-payload
+                                         c))))))
+             (t a)))))
+    (if (and (consp a) (keywordp (first a))
+             (member (first a)
+                     '(:num :float :bool :char :str :list :tuple
+                       :record :variant :enum :flags :option-some
+                       :option-none :result-ok :result-err)))
+        (cnv a vt)
+        ;; already a domain value (a nested call or a start func)
+        a)))
 
 ;;; ---------------------------------------------------------------
 ;;; M9 (linking lane): canon LOWER + the resource built-ins.
@@ -1041,41 +2215,250 @@ flat domain). Returns the single result or NIL."
       (t (error 'wasmdown:link-error
                 :message "lowered func target has no runtime value")))))
 
-(defun %lower-host-func (inst fidx)
-  "canon lower's CORE wrapper (CanonicalABI.md 3618, sync case): a
-host func-instance whose type is the FLATTENED core functype of the
-target component func — [flat params] -> [flat results] — calling
-through %call-component-func. M9 lower_own (CanonicalABI.md 2829):
-an ABSTRACT own-handle result (the lift's :own-handle record) is
-ADDED to THIS instance's handle table and the new index handed to
-the core side. M9 (linking ::126): the CALLER instance is bound
-dynamically so the target lifted func's own-PARAM lift can consume
-the handle from the CALLER's table and re-enter its own."
+(defun %flat-type-of (vt inst)
+  "The FLAT core types of one component valtype (CanonicalABI.md
+flatten_type) on the RUNTIME side: prims map directly; an (:idx . n)
+ref resolves through THIS instance's type space when it holds a ct,
+and otherwise flattens as ONE i32 (the flat shape of every opaque
+handle-ish slot: own/borrow/stream/future/func/instance/resource
+all ride the single i32 of the table's catch-all rows — the ref may
+name a DECLARATOR-space slot whose ct is not resident here, which is
+exactly the case the uniform i32 covers). Compound cts recurse; a
+tuple is a record; a variable-length list is a [ptr,len] pair; a
+variant joins its cases (the i32 discriminant + the joined payload
+slots)."
+  (labels
+      ((fl (vt)
+         (cond
+          ((and (consp vt) (eq (car vt) :idx))
+           (let ((c (wasmdown.component:ct-at
+                     (comp-instance-types inst) (cdr vt))))
+             (if c (fl-ct c) (list :i32))))
+          ((keywordp vt) (fl-prim vt))
+          ((wasmdown.component:ct-p vt) (fl-ct vt))
+          (t (list :i32))))
+       (fl-prim (p)
+         ;; FRESH lists every time: MAPCAN NCONCs its results, and a
+         ;; shared literal would be destructively appended — the
+         ;; second use of the same literal builds a CYCLE (the lane's
+         ;; link-time-virtualization hang)
+         (case p
+           ((:bool :u8 :u16 :u32 :s8 :s16 :s32 :char) (list :i32))
+           ((:u64 :s64) (list :i64))
+           (:f32 (list :f32))
+           (:f64 (list :f64))
+           (:string (list :i32 :i32))
+           (t (list :i32))))
+       (fl-ct (c)
+         (case (wasmdown.component:ct-kind c)
+           (:prim (fl-prim (wasmdown.component:ct-payload c)))
+           (:record
+            (mapcan (lambda (f) (fl (cdr f)))
+                    (coerce (wasmdown.component:ct-payload c) 'list)))
+           (:tuple
+            (mapcan #'fl (coerce (wasmdown.component:ct-payload c)
+                                 'list)))
+           (:list
+            (let ((elem (car (wasmdown.component:ct-payload c)))
+                  (len (cdr (wasmdown.component:ct-payload c))))
+              (if len
+                  (loop repeat len append (fl elem))
+                  (list :i32 :i32))))
+           (:option
+            (fl-variant (list (cons "none" nil)
+                              (cons "some"
+                                    (wasmdown.component:ct-payload
+                                     c)))))
+           (:result
+            (fl-variant
+             (list (cons "ok" (car (wasmdown.component:ct-payload c)))
+                   (cons "err" (cdr (wasmdown.component:ct-payload
+                                     c))))))
+           (:variant
+            (fl-variant (coerce (wasmdown.component:ct-payload c)
+                                'list)))
+           (:map (list :i32 :i32))
+           ;; flags/enum/own/borrow/stream/future/resource/func/
+           ;; instance/component: all one i32
+           (t (list :i32))))
+       (fl-variant (cases)
+         ;; ACC stays in ORDER (a join REPLACES a slot by INDEX; a
+         ;; prepend-ordered acc would write the joined slot at the
+         ;; wrong position — same lesson as the validator's fix)
+         (let ((acc '()))
+           (dolist (c cases)
+             (when (cdr c)
+               (loop for ft in (fl (cdr c))
+                     for i from 0
+                     do (if (< i (length acc))
+                            (setf (nth i acc)
+                                  (%join-flat (nth i acc) ft))
+                            (setf acc (append acc (list ft)))))))
+           (cons :i32 acc))))
+    (fl vt)))
+
+(defun %join-flat (a b)
+  "CanonicalABI.md join: the tightest approximation of two flat core
+types (bitcast-compatible pairs)."
+  (cond ((eq a b) a)
+        ((or (and (eq a :i32) (eq b :f32))
+             (and (eq a :f32) (eq b :i32)))
+         :i32)
+        (t :i64)))
+
+(defun %flat-sig-of (ft inst)
+  "flatten_functype of the target component functype on the RUNTIME
+side, with the LOWER context: >16 flat params collapse to one [ptr];
+>1 flat result appends the [ptr] out-param to the params and returns
+NO results (CanonicalABI.md 2906-2912). Returns (params . results)."
+  (let* ((params (and ft (coerce (first (wasmdown.component:ct-payload
+                                         ft)) 'list)))
+         (result (and ft (second (wasmdown.component:ct-payload ft))))
+         (flat-params (mapcan (lambda (p) (%flat-type-of (cdr p) inst))
+                             (or params '())))
+         (flat-results (and result (%flat-type-of result inst))))
+    (when (> (length flat-params) 16) (setf flat-params '(:i32)))
+    (when (and flat-results (> (length flat-results) 1))
+      (setf flat-params (append flat-params '(:i32)))
+      (setf flat-results '()))
+    (cons flat-params flat-results)))
+
+(defun %lower-host-func (inst fidx &optional canon)
+  "canon lower's CORE wrapper (CanonicalABI.md 3618, the sync case):
+a host func-instance whose type is the FLATTENED core functype (the
+LOWER context). The call lifts the core args per the component
+functype (lift_flat_values, MAX_FLAT_PARAMS — a spilled tuple reads
+the fields back out of the CALLER's memory), calls the target
+component func, then lowers the result back (lower_flat_values,
+MAX_FLAT_RESULTS — a spilled tuple STORES the fields at the caller's
+[ptr] out-param). M9 lower_own: an abstract own-handle result enters
+THIS instance's table and the core side gets the INDEX. M9 (linking
+::126): the CALLER instance is bound dynamically so the target
+lifted func's own-PARAM lift consumes the handle from the CALLER's
+table and re-enters its own.
+
+(values lane) the functype's (:idx . n) refs belong to the TARGET
+LIFTED FUNC's own instance (an alias projecting $C's func into $D
+carries $C's functype; $D's type space cannot resolve the refs) —
+the flat sig and the arg/result type walks resolve against the
+TARGET's space."
   (let* ((f (aref (comp-instance-funcs inst) fidx))
          (ft (and (lifted-func-p f) (lifted-func-type f)))
+         (opts (and (lifted-func-p f) (lifted-func-opts f)))
          (params (and ft (eq (wasmdown.component:ct-kind ft) :func)
                       (coerce (first (wasmdown.component:ct-payload ft))
                               'list)))
          (result (and ft (eq (wasmdown.component:ct-kind ft) :func)
                       (second (wasmdown.component:ct-payload ft))))
-         (core-params (mapcar (lambda (p) (%valtype-flat-core (cdr p)))
-                              (or params '())))
-         (core-result (and result (%valtype-flat-core result :results))))
+         (ft-inst (if (lifted-func-p f) (lifted-func-inst f) inst))
+         (flat (and ft (eq (wasmdown.component:ct-kind ft) :func)
+                    (%flat-sig-of ft ft-inst)))
+         (core-params (and flat (coerce (car flat) 'list)))
+         (core-results (and flat (coerce (cdr flat) 'list)))
+         (core-result (first core-results))
+         ;; (values lane, concat.wast's map fixtures): the ABI's
+         ;; memory/realloc/encoding are the LOWER's OWN canonopts
+         ;; (CANON — resolved against THIS component's spaces: the
+         ;; caller's data lives in the LOWER's memory). The TARGET's
+         ;; lift opts are a DIFFERENT memory — reading those made the
+         ;; arg lift pull the caller's (ptr,len) out of the wrong
+         ;; memory (empty tuples) and the result store write where
+         ;; the caller's retptr never pointed.
+         (lopts (or (and canon (wasmdown.component:canonrec-opts
+                                 canon))
+                    ;; the pre-values shape (no canonrec): keep the
+                    ;; legacy TARGET-opts read
+                    opts))
+         (enc-opt (and lopts (wasmdown.component:canon-opt
+                              lopts :string-encoding)))
+         (mem-opt (and lopts (wasmdown.component:canon-opt
+                              lopts :memory)))
+         (realloc-opt (and lopts (wasmdown.component:canon-opt
+                                  lopts :realloc)))
+         (memory (and mem-opt
+                      (< (second mem-opt)
+                         (length (comp-instance-core-memories inst)))
+                      (aref (comp-instance-core-memories inst)
+                            (second mem-opt))))
+         (realloc (and realloc-opt
+                       (< (second realloc-opt)
+                          (length (comp-instance-core-funcs inst)))
+                       (aref (comp-instance-core-funcs inst)
+                             (second realloc-opt)))))
     (wasmdown.runtime:make-host-func-instance
-     (wasmdown.types:make-wasm-func-type core-params
-                                         (if core-result
-                                             (list core-result) '()))
+     (wasmdown.types:make-wasm-func-type core-params core-results)
      (lambda (args)
        (let* ((*handle-caller-inst* inst)
-              (res (%call-component-func inst fidx args)))
-         (if core-result
+              ;; (values lane) the ARG LIFT resolves the functype's
+              ;; (:idx . n) refs against the TARGET LIFTED FUNC's own
+              ;; instance (the declarator-space indices are meaningless
+              ;; in THIS component's space; resolving them here
+              ;; produced an own-wrapper's integer payload where a
+              ;; variant ct was expected — variants.wast's
+              ;; take-variant param)
+              (cx (make-abi-cx
+                   :memory memory
+                   :realloc realloc
+                   :encoding (%abi-encoding-of enc-opt)
+                   :inst ft-inst))
+              (ts (loop for p in (or params '()) collect (cdr p)))
+              (flat-types (loop for vt in ts
+                                append (%flat-type-of vt ft-inst)))
+              (component-args
+                (if (> (length flat-types) 16)
+                    (let* ((ptr (first args))
+                           (tuple (make-ct* :tuple (coerce ts 'vector)))
+                           (vals (%abi-load cx tuple ptr)))
+                      (coerce vals 'list))
+                    (let ((vi (make-array 16 :fill-pointer 0
+                                         :adjustable t)))
+                      (loop for a in args
+                            for ft_ in flat-types
+                            do (vector-push-extend
+                                (cons a ft_) vi))
+                      (%abi-lift-values cx 16 vi ts))))
+              ;; NOTE: no APPLY — %call-component-func-list takes the
+              ;; args LIST as its third parameter (an EMPTY list
+              ;; would be swallowed by apply's spread)
+              (res (%call-component-func-list inst fidx
+                                              component-args)))
+         (if (or core-result result)
              (list
               (if (and (consp res) (eq (first res) :own-handle))
                   ;; lower_own: the abstract handle enters THIS
                   ;; instance's table; the core side gets the INDEX
                   (%handle-add inst (second res) (third res) t)
-                  res))
+                  (if result
+                      ;; lower_flat_values: FLAT when <= 1 flat slot,
+                      ;; else the result STORED at the [ptr] out-param
+                      ;; (the last core arg)
+                      (let ((rflat (%flat-type-of result ft-inst)))
+                        (if (> (length rflat) 1)
+                            ;; the SPILLED result: store at the [ptr]
+                            ;; out-param (the LAST core param; the sig
+                            ;; carries NO core results — the old
+                            ;; (if core-result ...) gate skipped the
+                            ;; store entirely and the caller read an
+                            ;; empty retptr)
+                            (let ((ptr (first (last args))))
+                              (%abi-store cx res result ptr)
+                              nil)
+                            (first (%abi-lower cx res result))))
+                      res)))
              '()))))))
+
+(defun %call-component-func-list (inst fidx args)
+  "Like %call-component-func but takes the args as a LIST (the lower
+path's apply shape) and returns the single result or NIL."
+  (let ((f (and (>= fidx 0) (< fidx (length (comp-instance-funcs inst)))
+                (aref (comp-instance-funcs inst) fidx))))
+    (typecase f
+      (lifted-func (apply #'lifted-func-call f args))
+      (wasmdown.runtime:func-instance
+       (let ((res (apply #'wasmdown.runtime:wasm-call f args)))
+         (first res)))
+      (t (error 'wasmdown:link-error
+                :message "lowered func target has no runtime value")))))
 
 (defun %resource-builtin-host-func (inst kind rt &optional dtor)
   "The canon resource built-in's core wrapper: [i32] -> [i32] for

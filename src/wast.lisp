@@ -553,8 +553,22 @@ typed value record, or NIL when NODE is not a value form."
               (let ((tk (%one-tok rest k)))
                 (list :num prim (%parse-int-token tk))))))
        ((string= k "bool.const")
+        ;; (bool.const true|false) — the values suite spells the
+        ;; literals as keywords (the reference grammar's boolean
+        ;; terminals); a bare 0/1 integer is accepted too.
         (let ((tk (%one-tok rest "bool.const")))
-          (list :bool (not (zerop (%parse-int-token tk))))))
+          (list :bool
+                (cond
+                 ((and (stoken-p tk) (eq (stoken-kind tk) :keyword)
+                       (string= (stoken-text tk) "true"))
+                  t)
+                 ((and (stoken-p tk) (eq (stoken-kind tk) :keyword)
+                       (string= (stoken-text tk) "false"))
+                  nil)
+                 ((and (stoken-p tk)
+                       (member (stoken-kind tk) '(:nat :int)))
+                  (not (zerop (%parse-int-token tk))))
+                 (t (%werr 0 "bad bool.const form"))))))
        ((string= k "char.const")
         ;; (char.const "Z"): a one-character string; code point
         (let ((tk (%one-tok rest "char.const")))
@@ -567,6 +581,79 @@ typed value record, or NIL when NODE is not a value form."
           (unless (and (stoken-p tk) (eq (stoken-kind tk) :string))
             (%werr 0 "bad str.const form"))
           (list :str (%byte-string-to-string (stoken-text tk)))))
+       ;; ---- (values lane) the compound component value forms ----
+       ;; The component-value AST: one cons whose car tags the shape
+       ;; and whose cdr carries the parsed subvalues. The lower/lift
+       ;; machinery in src/component-runtime.lisp consumes these.
+       ((string= k "list.const")
+        ;; (list.const v*): the element values
+        (list :list (mapcar #'%const-value rest)))
+       ((string= k "tuple.const")
+        ;; (tuple.const v*): the field values in order
+        (list :tuple (mapcar #'%const-value rest)))
+       ((string= k "record.const")
+        ;; (record.const (field "l" <flat value form>)*): the
+        ;; label/value pairs in field order. The field's value is a
+        ;; FLAT continuation inside the field parens —
+        ;; (field "n" u32.const 7) — so the value node is SYNTHESIZED
+        ;; from the tokens after the label.
+        (list :record
+              (loop for f in rest
+                    for node = f
+                    unless (and (%node-p node)
+                                (string= (%head-keyword node) "field"))
+                      do (%werr 0 "bad record.const form")
+                    collect
+                    (let* ((items (rest (%node-children node)))
+                           (lt (first items)))
+                      (unless (and lt (stoken-p lt)
+                                   (eq (stoken-kind lt) :string))
+                        (%werr 0 "bad record.const field"))
+                      (cons (%byte-string-to-string (stoken-text lt))
+                            (%const-value
+                             (list* :list 0 0 (rest items))))))))
+       ((string= k "variant.const")
+        ;; (variant.const "l" v): the case label + the payload
+        (let ((lt (first rest)))
+          (unless (and lt (stoken-p lt) (eq (stoken-kind lt) :string))
+            (%werr 0 "bad variant.const form"))
+          (list :variant
+                (%byte-string-to-string (stoken-text lt))
+                (and (second rest) (%const-value (second rest))))))
+       ((string= k "enum.const")
+        ;; (enum.const "l"): the case label (a payload-less variant)
+        (let ((lt (%one-tok rest "enum.const")))
+          (unless (and (stoken-p lt) (eq (stoken-kind lt) :string))
+            (%werr 0 "bad enum.const form"))
+          (list :enum (%byte-string-to-string (stoken-text lt)))))
+       ((string= k "flags.const")
+        ;; (flags.const "l"*): the set labels, in type order at
+        ;; lower time (pack_flags_into_int maps labels to bits).
+        ;; The shape is (list :flags labels) — a TWO-element form;
+        ;; %abi-lift's :flags arm conses the labels onto :flags and
+        ;; %comp-value-matches reads (second ...) on both sides, so
+        ;; the LIFT is the side that changed (was: a spread tail)
+        (list :flags
+              (loop for tk in rest
+                    unless (and (stoken-p tk)
+                                (eq (stoken-kind tk) :string))
+                      do (%werr 0 "bad flags.const form")
+                    collect (%byte-string-to-string
+                             (stoken-text tk)))))
+       ((string= k "option.some")
+        ;; (option.some v): the some payload — a nested value form
+        (unless (= (length rest) 1)
+          (%werr 0 "bad option.some form"))
+        (list :option-some (%const-value (first rest))))
+       ((string= k "option.none")
+        ;; (option.none): the empty case
+        (list :option-none))
+       ((string= k "result.ok")
+        ;; (result.ok v): the ok payload (NIL when absent)
+        (list :result-ok (and rest (%const-value (first rest)))))
+       ((string= k "result.err")
+        ;; (result.err v): the error payload (NIL when absent)
+        (list :result-err (and rest (%const-value (first rest)))))
        ((string= k "ref.func")
         ;; (ref.func) = any non-null funcref; (ref.func $id) = identity
         (if (null rest)
@@ -688,21 +775,46 @@ this slice — they classify :unsupported, never a silent pass."
                  (subseq source start (1+ end)))))
         (let ((k1 (first-keyword)))
           (cond
+           ((and k1 (string= k1 "instance"))
+            ;; (values lane) the named INSTANCE form:
+            ;; (component instance $I $X) — the first id names the
+            ;; NEW instance and the second the stored DEFINITION's
+            ;; $id. Deferred instantiation, mirroring (module
+            ;; instance $I $M).
+            (let* ((after (rest rest))
+                   (ids (remove-if-not
+                         (lambda (x)
+                           (and (stoken-p x) (eq (stoken-kind x) :id)))
+                         after))
+                   (iid (or (and ids (stoken-text (first ids)))
+                            id))
+                   (def-id (and (second ids)
+                                (stoken-text (second ids)))))
+              (values :named-instance iid def-id)))
            ((and k1 (string= k1 "definition"))
             ;; (component definition ...): the payload keeps the full
             ;; span (minus the definition keyword at consume time);
-            ;; a following binary/quote keyword selects the encoding
+            ;; a following binary/quote keyword selects the encoding.
+            ;; (values lane) the DEFINITION's $id may follow the
+            ;; keyword — (component definition $C defs...) — and
+            ;; names the stored definition for the later
+            ;; (component instance $I $C).
             (let* ((after (rest rest))
-                   (k2 (and after (stoken-p (first after))
-                            (eq (stoken-kind (first after)) :keyword)
-                            (string-downcase (stoken-text (first after))))))
+                   (did (and after (stoken-p (first after))
+                             (eq (stoken-kind (first after)) :id)
+                             (stoken-text (first after))))
+                   (body (if did (rest after) after))
+                   (k2 (and body (stoken-p (first body))
+                            (eq (stoken-kind (first body)) :keyword)
+                            (string-downcase (stoken-text (first body))))))
               (cond
                ((and k2 (string= k2 "binary"))
-                (values :definition-binary id (%concat-bytes (rest (rest rest)))))
+                (values :definition-binary (or id did)
+                        (%concat-bytes (rest body))))
                ((and k2 (string= k2 "quote"))
-                (values :definition-quote id
-                        (%concat-strings (rest (rest rest)))))
-               (t (values :definition id (splice))))))
+                (values :definition-quote (or id did)
+                        (%concat-strings (rest body))))
+               (t (values :definition (or id did) (splice))))))
            ((and k1 (string= k1 "binary"))
             (values :binary id (%concat-bytes (rest rest))))
            ((and k1 (string= k1 "quote"))
@@ -910,6 +1022,11 @@ command shape."
               (:binary (mk :id id :bytes payload :component-p t))
               (:quote (mk :id id :text payload :component-p t))
               (:text (mk :id id :text payload :component-p t))
+              ;; (values lane): the named instance — the definition's
+              ;; $id rides MODULE-ARG like (module instance $I $M)
+              (:named-instance
+               (mk :id id :module-arg payload
+                   :component-p t :named-form :instance))
               (:definition (mk :id id :text payload
                                :component-p t :named-form :definition))
               (:definition-binary (mk :id id :bytes payload
@@ -1049,7 +1166,13 @@ behavior."
   ;; EH/named-forms (Core 3.0): (module definition $M ...) stores the
   ;; parsed module here keyed by $id — instantiation is deferred to
   ;; (module instance $I $M).
-  (module-definitions (make-hash-table :test #'equal) :type hash-table))
+  (module-definitions (make-hash-table :test #'equal) :type hash-table)
+  ;; (values lane): (component definition $C ...) stores the
+  ;; component's SOURCE here keyed by $id — instantiation is deferred
+  ;; to (component instance $I $C); each instance command
+  ;; re-parse+validate+instantiate a FRESH instance (instantiation is
+  ;; generative, like the module analog).
+  (comp-definitions (make-hash-table :test #'equal) :type hash-table))
 
 (defun %register-unsupported (state name)
   "Record that registered name NAME holds an out-of-scope-unsupported
@@ -1358,6 +1481,31 @@ standard pipeline runs."
            (error () nil)))))
 
 
+(defun %strip-component-definition-keyword (src)
+  "The component-definition source span SRC ((component definition
+$C defs...) or ((component $C definition defs...)) rewritten for
+parse-component-text: drop the definition keyword, keeping the
+component form and any $id. The keyword sits directly after
+(component (with an optional $id between)."
+  (flet ((drop-at (pos)
+           (concatenate 'string
+                        (subseq src 0 pos)
+                        (subseq src (+ pos (length "definition"))))))
+    (let* ((head "(component ")
+           (hlen (length head)))
+      (cond
+       ((and (>= (length src) (+ hlen (length "definition")))
+             (string-equal src head :end1 hlen)
+             (string-equal src "definition" :start1 hlen
+                           :end1 (+ hlen (length "definition"))))
+        (drop-at hlen))
+       (t
+        ;; (component $id definition ...): find the keyword after the id
+        (let ((pos (search " definition " src)))
+          (if (and pos (< pos hlen))
+              (drop-at (1+ pos))
+              src)))))))
+
 (defun %strip-definition-keyword (src)
   "The module-definition source span SRC (\"(module definition $M
   fields...)\") rewritten for parse-wat: drop the leading `definition`
@@ -1509,8 +1657,9 @@ outcome phase detail instance): :pass when the component validates
 AND instantiates (the instance for the runner's records); :fail with
 the phase (:decode/:validate/:link/:execute) otherwise. A
 \(component definition ...) command is CODE — validate only, no
-execution (no instance is produced)."
-  (declare (ignore state))
+execution (no instance is produced); its SOURCE is stored under the
+$id for the later (component instance $I $C), which re-validates and
+instantiates a FRESH instance (instantiation is generative)."
   (flet ((execute (comp)
            ;; M8: EXECUTE the validated component through the
            ;; installed instantiator (src/component-runtime.lisp;
@@ -1526,6 +1675,59 @@ execution (no instance is produced)."
                          "component instantiation not implemented"
                          nil)))))
     (cond
+     ;; (values lane) the named INSTANCE command: re-parse the stored
+     ;; definition source, validate + instantiate a FRESH instance
+     ((eq (wast-cmd-named-form cmd) :instance)
+      (let* ((def-id (wast-cmd-module-arg cmd))
+             (src (and def-id
+                       (gethash def-id
+                                (wast-state-comp-definitions state)))))
+        (cond
+         ((null src)
+          (values :fail :link
+                  (format nil "unknown component definition ~a" def-id)
+                  nil))
+         ;; a binary definition: the stored (cons :bytes vector)
+         ((and (consp src) (eq (car src) :bytes))
+          (handler-case
+              (let ((comp (wasmdown.component:decode-component
+                           (cdr src))))
+                (wasmdown.component:validate-component comp)
+                (execute comp))
+            (wasmdown:decode-error (c)
+              (values :fail :decode
+                      (wasmdown:wasmdown-error-message c) nil))
+            (wasmdown:validation-error (c)
+              (values :fail :validate
+                      (wasmdown:wasmdown-error-message c) nil))
+            (wasmdown:link-error (c)
+              (values :fail :link
+                      (wasmdown:wasmdown-error-message c) nil))
+            (wasmdown:wasm-trap (c)
+              (values :fail :execute
+                      (wasmdown:wasmdown-error-message c) nil))))
+         (t
+          (let ((parse (component-text-parser)))
+            (if parse
+                (handler-case
+                    (let ((comp (funcall parse src)))
+                      (wasmdown.component:validate-component comp)
+                      (execute comp))
+                  (wasmdown:decode-error (c)
+                    (values :fail :decode
+                            (wasmdown:wasmdown-error-message c) nil))
+                  (wasmdown:validation-error (c)
+                    (values :fail :validate
+                            (wasmdown:wasmdown-error-message c) nil))
+                  (wasmdown:link-error (c)
+                    (values :fail :link
+                            (wasmdown:wasmdown-error-message c) nil))
+                  (wasmdown:wasm-trap (c)
+                    (values :fail :execute
+                            (wasmdown:wasmdown-error-message c) nil)))
+                (values :unsupported nil
+                        "component text format not implemented in this slice"
+                        nil)))))))
      ;; binary payload: decode + validate (+ execute unless a
      ;; DEFINITION command)
      ((wast-cmd-bytes cmd)
@@ -1534,7 +1736,12 @@ execution (no instance is produced)."
                        (wast-cmd-bytes cmd))))
             (wasmdown.component:validate-component comp)
             (if (eq (wast-cmd-named-form cmd) :definition)
-                (values :pass nil "ok (definition stored)" nil)
+                (progn
+                  (when (wast-cmd-id cmd)
+                    (setf (gethash (wast-cmd-id cmd)
+                                   (wast-state-comp-definitions state))
+                          (cons :bytes (wast-cmd-bytes cmd))))
+                  (values :pass nil "ok (definition stored)" nil))
                 (execute comp)))
         (wasmdown:decode-error (c)
           (values :fail :decode (wasmdown:wasmdown-error-message c) nil))
@@ -1552,7 +1759,14 @@ execution (no instance is produced)."
                 (let ((comp (funcall parse (wast-cmd-text cmd))))
                   (wasmdown.component:validate-component comp)
                   (if (eq (wast-cmd-named-form cmd) :definition)
-                      (values :pass nil "ok (definition stored)" nil)
+                      (progn
+                        (when (wast-cmd-id cmd)
+                          (setf (gethash (wast-cmd-id cmd)
+                                         (wast-state-comp-definitions
+                                          state))
+                                (%strip-component-definition-keyword
+                                 (wast-cmd-text cmd))))
+                        (values :pass nil "ok (definition stored)" nil))
                       (execute comp)))
               (wasmdown:decode-error (c)
                 (values :fail :decode (wasmdown:wasmdown-error-message c)
@@ -1583,10 +1797,14 @@ node, slicing from *script-source*."
      :text (if (or (eq kind :quote) (eq kind :definition-quote)
                    (eq kind :text) (eq kind :definition))
                payload nil)
+     :module-arg (when (eq kind :named-instance) payload)
      :component-p t
-     :named-form (when (or (eq kind :definition) (eq kind :definition-binary)
-                           (eq kind :definition-quote))
-                   :definition))))
+     :named-form (cond
+                  ((or (eq kind :definition)
+                       (eq kind :definition-binary)
+                       (eq kind :definition-quote))
+                   :definition)
+                  ((eq kind :named-instance) :instance)))))
 
 (defun %state-imports-for (module)
   "The imports alist for MODULE: spectest + registry. Lazily built via
@@ -1635,16 +1853,20 @@ stable order."
 comparison directive list."
   (case (first spec)
     (:num
-     ;; M9: component prims (u32/s32/...) ride the same :num spec; the
-     ;; 32-bit prims compare in the i32 domain (mod 2^32) and the
-     ;; 64-bit prims in the i64 domain — the FLAT core path delivers
-     ;; exactly those unsigned Lisp integers.
+     ;; M9: component prims (u32/s32/...) ride the same :num spec.
+     ;; (values lane) the LIFTED signed prims deliver the SIGNED
+     ;; component domain (lift_flat_signed's two's-complement
+     ;; narrowing), so s8/s16/s32/s64 compare signed; the unsigned
+     ;; prims and the CORE i32/i64 stay in the mod'd flat domain the
+     ;; flat path delivers.
      (let ((v (third spec)))
        (case (second spec)
-         ((:u32 :s32 :u16 :s16 :u8 :s8 :i32)
+         ((:u32 :u16 :u8 :i32)
           (list :exact (mod v #x100000000)))
-         ((:u64 :s64 :i64)
+         ((:u64 :i64)
           (list :exact (mod v #x10000000000000000)))
+         ((:s8 :s16 :s32) (list :exact v))
+         ((:s64) (list :exact v))
          (t (list :exact v)))))
     (:float (case (fourth spec)
               (:exact
@@ -1663,11 +1885,20 @@ comparison directive list."
                                 #x7fffff
                                 #xfffffffffffff))))))
     (:bool (list :bool (second spec)))
-    (:char (list :exact (char-code (character (second spec)))))
+    ;; (values lane) the lifted CHAR is a Lisp character (the
+    ;; component domain); the old flat code-point comparison stays for
+    ;; a numeric actual (M9's flat path)
+    (:char (list :char (char (second spec) 0)))
     ;; a lifted STRING result: the actual arrives as a Lisp string
     ;; (the runner's component-invoke path reads it out of the lift
     ;; memory); compare by string=
     (:str (list :str (second spec)))
+    ;; (values lane) the compound component shapes: the actual is the
+    ;; LIFTED component value (a structured Lisp value); compare
+    ;; structurally against the parsed spec.
+    ((:list :tuple :record :variant :enum :flags
+      :option-some :option-none :result-ok :result-err)
+     (list :comp-value spec))
     (:ref-func (if (second spec)
                    (list :ref-func-id (second spec))
                    (list :ref-non-null)))
@@ -1693,10 +1924,20 @@ per docs/CONTRACTS.md (i32/i64 unsigned, f32/f64 floats, refs)."
                 (wasmdown.numops:f64-from-bits (third spec)))
       ;; NOTE: NaN-CLASS specs are never legal as arguments; exact only.
       )
-    ;; M9: bool lowers to i32 0/1; char to its code point
+    ;; M9: bool lowers to i32 0/1; char and string pass the spec
+    ;; through (the component invoker's lower consumes the AST — the
+    ;; runner's flat domain is only the CORE path, which never sees
+    ;; component value forms)
     (:bool (if (second spec) 1 0))
-    (:char (char-code (character (second spec))))
-    (:str (error "string arguments are the values slice"))
+    (:char spec)
+    (:str spec)
+    ;; (values lane) the compound component shapes pass the parsed AST
+    ;; through — the component invoker's canonical-ABI lower consumes
+    ;; the tagged spec (never the core path, which %component-target-p
+    ;; already diverts).
+    ((:list :tuple :record :variant :enum :flags
+      :option-some :option-none :result-ok :result-err)
+     spec)
     (:ref-func (error "ref.func as invoke argument unsupported"))
     (:ref-null nil)
     (:ref-extern (list 'externref (second spec)))))
@@ -1748,8 +1989,24 @@ per docs/CONTRACTS.md (i32/i64 unsigned, f32/f64 floats, refs)."
              (= (logand (wasmdown.numops:f64-bits actual)
                         #xfffffffffffff)
                 (third expected))))))
-    (:bool (and (integerp actual)
-                (if (second expected) (not (zerop actual)) (zerop actual))))
+    (:char (cond
+           ((characterp actual)
+            (char= actual (second expected)))
+           ;; the FLAT domain delivered the code point
+           ((integerp actual)
+            (= actual (char-code (second expected))))
+           (t nil)))
+    (:bool (cond
+            ((integerp actual)
+             (if (second expected) (not (zerop actual)) (zerop actual)))
+            ;; (values lane) the lifted BOOL is a Lisp boolean
+            ((typep actual 'boolean)
+             (eq actual (and (second expected) t)))
+            (t nil)))
+    ;; (values lane) a lifted compound component value: compare the
+    ;; LIFTED structure (the runtime's component-value domain) against
+    ;; the parsed spec, prim by prim.
+    (:comp-value (%comp-value-matches actual (second expected)))
     ;; M9: a lifted component STRING — the actual is a Lisp string
     ;; (the component-invoke path lifts it out of the lift memory)
     (:str (and (stringp actual) (string= actual (second expected))))
@@ -1759,6 +2016,80 @@ per docs/CONTRACTS.md (i32/i64 unsigned, f32/f64 floats, refs)."
     (:ref-extern
      (and (consp actual) (eq (first actual) 'externref)
           (eql (second actual) (second expected))))))
+
+(defun %comp-value-matches (actual spec)
+  "Compare a LIFTED component value (the runtime's structured domain:
+  numbers, strings, booleans, lists, alists, (:variant label . value)
+  records) against a parsed spec AST, prim by prim. NaN payloads and
+  bit-exact float classes ride the scalar directives' rules."
+  (labels
+      ((m (a s)
+         (case (first s)
+           (:num
+            (let ((v (third s)))
+              (case (second s)
+                ((:u32 :s32 :u16 :s16 :u8 :s8 :i32)
+                 (and (integerp a) (= (mod a #x100000000) (mod v #x100000000))))
+                ((:u64 :s64 :i64)
+                 (and (integerp a) (= (mod a #x10000000000000000)
+                                      (mod v #x10000000000000000))))
+                (t (equalp a v)))))
+           (:float
+            ;; bit-exact comparison in the expected width; an expected
+            ;; :f32 never matches a double actual (the lift delivers
+            ;; the declared width)
+            (etypecase a
+              (single-float
+               (and (eq (second s) :f32)
+                    (= (wasmdown.numops:f32-bits a) (third s))))
+              (double-float
+               (and (eq (second s) :f64)
+                    (= (wasmdown.numops:f64-bits a) (third s))))))
+           (:bool (eq a (second s)))
+           (:char (and (characterp a) (char= a (char (second s) 0))))
+           (:str (and (stringp a) (string= a (second s))))
+           (:list
+            (and (listp a) (= (length a) (length (second s)))
+                 (loop for x in a
+                       for ys in (second s)
+                       always (m x ys))))
+           (:tuple
+            (and (listp a) (= (length a) (length (second s)))
+                 (loop for x in a
+                       for ys in (second s)
+                       always (m x ys))))
+           (:record
+            (and (listp a) (= (length a) (length (second s)))
+                 (loop for (label . ys) in (second s)
+                       for (al . av) in a
+                       always (and (string= label al)
+                                   (m av ys)))))
+           (:option-none (eq a :none))
+           (:result-ok
+            (and (consp a) (eq (car a) :ok)
+                 (or (null (second s))
+                     (m (cdr a) (second s)))))
+           (:result-err
+            (and (consp a) (eq (car a) :err)
+                 (or (null (second s))
+                     (m (cdr a) (second s)))))
+           (:option-some
+            (and (consp a) (eq (car a) :some)
+                 (m (cdr a) (second s))))
+           (:enum (and (consp a) (eq (car a) :enum)
+                       (string= (cdr a) (second s))))
+           (:flags
+            (and (consp a) (eq (car a) :flags)
+                 (null (set-difference (cdr a) (second s)
+                                       :test #'string=))
+                 (= (length (cdr a)) (length (second s)))))
+           (:variant
+            (and (consp a) (eq (car a) :variant)
+                 (string= (second a) (second s))
+                 (or (null (third s))
+                     (m (third a) (third s)))))
+           (t nil))))
+    (m actual spec)))
 
 (defun %results-match (actuals expected)
   "Compare full result tuples. Returns (values ok detail)."

@@ -15,15 +15,15 @@ Baseline measurement, not a release gate (PLAN.md §12.8).
 
 | Outcome | Count |
 | --- | --- |
-| pass | 911 |
+| pass | 1015 |
 | fail | 0 |
 | skip | 0 |
 | unsupported | 0 |
 | timeout | 0 |
 | harness-error | 0 |
-| **total** | **911** |
+| **total** | **1015** |
 
-Executed: 911 commands; pass rate 100.0%.
+Executed: 1015 commands; pass rate 100.0%.
 
 ## Per-file counts
 
@@ -43,8 +43,13 @@ Executed: 911 commands; pass rate 100.0%.
 | component/external-visibility.wast | 62 | 0 | 0 | 0 |
 | component/indicies.wast | 17 | 0 | 0 | 0 |
 | component/instantiation.wast | 82 | 0 | 0 | 0 |
-| component/kebab.wast | 36 | 0 | 0 | 0 |
 | component/max-value-size.wast | 8 | 0 | 0 | 0 |
 | component/outer-alias.wast | 31 | 0 | 0 | 0 |
 | component/resources.wast | 72 | 0 | 0 | 0 |
 | component/version-suffix.wast | 41 | 0 | 0 | 0 |
+| component/alignment.wast | 25 | 0 | 0 | 0 |
+| component/concat.wast | 46 | 0 | 0 | 0 |
+| component/numerics.wast | 26 | 0 | 0 | 0 |
+| component/realloc.wast | 16 | 0 | 0 | 0 |
+| component/strings.wast | 17 | 0 | 0 | 0 |
+| component/transcode.wast | 10 | 0 | 0 | 0 |

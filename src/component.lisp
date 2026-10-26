@@ -48,6 +48,7 @@
            ;; component type AST accessors (shared with the validator)
            #:ct-kind
            #:ct-payload
+           #:ct-p
            #:ct-offset
            #:component-type-p
            #:make-ct
@@ -97,7 +98,12 @@
            ;; extern-names lanes; the pins exercise both directly)
            #:canonversion-p
            #:split-canonical-version
-           #:elem-size))
+           #:elem-size
+           ;; values lane (M10): the RUNTIME canonical ABI consumes
+           ;; the validator's flatten machinery — the same
+           ;; flatten_functype table drives both sides.
+           #:flatten-functype
+           #:ct-at))
 
 (in-package #:wasmdown.component)
 
@@ -1678,12 +1684,27 @@ declaration order) + the outer scope stack."
 
 (defun %ct-at (state idx)
   "The ct at component type index IDX; out-of-bounds is a validation
-error ('type index out of bounds', the fixtures' message)."
-  (when (>= idx (length (cval-types state)))
-    (%verr "type index out of bounds"))
-  (let ((ty (aref (cval-types state) idx)))
-    (unless (ct-p ty) (%verr "type index out of bounds"))
-    ty))
+error ('type index out of bounds', the fixtures' message). STATE may
+also be a plain TYPES VECTOR (the values lane's runtime resolution):
+a vector position out of bounds or holding a non-ct reads as NIL
+(the runtime treats a bad index as an opaque shape, never a crash)
+rather than signaling."
+  (cond
+   ((vectorp state)
+    (and (>= idx 0) (< idx (length state))
+         (let ((ty (aref state idx)))
+           (and (ct-p ty) ty))))
+   (t
+    (when (>= idx (length (cval-types state)))
+      (%verr "type index out of bounds"))
+    (let ((ty (aref (cval-types state) idx)))
+      (unless (ct-p ty) (%verr "type index out of bounds"))
+      ty))))
+
+(defun ct-at (state idx)
+  "Public wrapper (values lane): %ct-at — the runtime passes the
+comp-instance's TYPES VECTOR as the STATE."
+  (%ct-at state idx))
 
 
 ;;; --- label validation (defined-types.wast) ---
@@ -2471,8 +2492,22 @@ type's own declarators stay against STATE, the inner space)."
                 ;; scopes (each nested component/instance TYPE
                 ;; declarator adds one boundary; outer-alias.wast
                 ;; ::12's count of 2 inside doubly-nested types)
-                (when (> (aliasrec-count a) type-depth)
-                  (%verr "invalid outer alias count of ~d" (aliasrec-count a)))
+                ;; (values lane, numerics.wast ::22): the TRUE bound
+                ;; counts the enclosing TYPE boundaries (TYPE-DEPTH) AND
+                ;; the enclosing COMPONENT boundaries beyond this one
+                ;; (the ambient *OUTER-STATES* stack — one entry per
+                ;; nested-component arm above this validation). The
+                ;; Explainer counts "the number of enclosing components
+                ;; OR types"; the old (> count type-depth) rejected the
+                ;; COMPONENT-boundary case ($D's declarators referencing
+                ;; the ENCLOSING component's flags type at count 2 with
+                ;; type-depth 1), and a bare chain-length bound broke
+                ;; outer-alias.wast ::12 (the doubly-nested TYPE at the
+                ;; validation root: type-depth 2, no ambient states).
+                (unless (<= (aliasrec-count a)
+                            (+ type-depth (length *outer-states*)))
+                  (%verr "invalid outer alias count of ~d"
+                         (aliasrec-count a)))
                 ;; slice 5 (outer-alias A): the de Bruijn count
                 ;; resolves through the state stack — one boundary
                 ;; per enclosing TYPE + COMPONENT scope. The chain
@@ -2487,7 +2522,33 @@ type's own declarators stay against STATE, the inner space)."
                   (when (and tgt (eq (aliasrec-sort a) :type))
                     (when (>= (aliasrec-target a)
                               (length (cval-types tgt)))
-                      (%verr "type index out of bounds")))))
+                      (%verr "type index out of bounds"))
+                    ;; (values lane) outer-alias.wast ::6: a TYPE
+                    ;; alias crossing a COMPONENT boundary may not
+                    ;; target a type that transitively refers to
+                    ;; resources — the same substitution rule as
+                    ;; %check-outer-alias (Binary.md 133-135), gated
+                    ;; the same way: only when the resolution crossed
+                    ;; OUT of this component (the target state is an
+                    ;; ambient *OUTER-STATES* entry — the walk's own
+                    ;; INNER/OUTER pair does not count; the M9
+                    ;; resource flow reaches resources through IMPORT
+                    ;; declarators legally, resolving to INNER/OUTER).
+                    (let ((raw (and (< (aliasrec-target a)
+                                       (length (cval-types tgt)))
+                                    (aref (cval-types tgt)
+                                          (aliasrec-target a)))))
+                      (when (and raw (ct-p raw)
+                                 ;; only when the alias crosses PAST
+                                 ;; the enclosing component (count 1
+                                 ;; = the ENCLOSING component's own
+                                 ;; space — the legal M9 import flow
+                                 ;; that reaches a resource through an
+                                 ;; instance type's declarators)
+                                 (> (aliasrec-count a) 1)
+                                 (%ct-transitively-resources-p
+                                  raw tgt (make-hash-table)))
+                        (%verr "transitively refers to resources"))))))
               ;; EVERY alias declarator introduces a new type index
               ;; in the type's own space (Binary.md line 274 — an
               ;; (alias export ...) of the type sort too; resources.wast
@@ -2914,7 +2975,7 @@ space."
                                (setf best (max best
                                                (%flat-count v state)))))
                     best))
-      ((:result) (let ((v (second (ct-payload c))))
+      ((:result) (let ((v (cdr (ct-payload c))))
                    (if v (%flat-count v state) 0)))
       ((:map) 2))))
 
@@ -3011,10 +3072,6 @@ can remap its (:idx . k) payloads into the component's type space
 (the declarator's k-th type-introducing entry belongs to the export
 named n; the alias for n holds the component-space position).")
 
-(defvar *func-arg-inst* (make-hash-table :test #'eql)
-  "M9 (linking ::128): per-FUNC-INDEX the source INSTANCE index whose
-ids stash feeds the func-arg identity match — the raw→rebuilt shift
-resolves the child comp through *inst-source-comp* at THIS key.")
 (defvar *func-alias-origin* (make-hash-table :test #'eql)
   "M9 (linking ::90): per-FUNC-INDEX the (INSTANCE-IDX . instance-ct)
 of the imported instance whose declarator-space functype was pushed —
@@ -3757,9 +3814,14 @@ task-return shapes are a later slice."
                      ;; type space before the checks read them
                      (let ((origin (gethash f *func-alias-origin*)))
                        (if origin
+                           (if (and (consp origin)
+                                    (eq (car origin) :state))
+                               (%deindex-functype
+                                (aref (cval-func-types state) f)
+                                (cdr origin))
                            (%remap-decl-functype
                             (aref (cval-func-types state) f)
-                            (car origin) (cdr origin))
+                            (car origin) (cdr origin)))
                            (aref (cval-func-types state) f))))))))
     ;; canonopt: realloc implies memory (abi.wast pins the message)
     (when (and realloc (not mem))
@@ -4005,6 +4067,12 @@ as a pointer pair."
        (fl-variant (cases)
          ;; discriminant_type: the case count's log2 byte width maps
          ;; u8/u16/u32 — ALL flatten to one :i32
+         ;; ACC stays in ORDER: extend with APPEND, never PUSH — a
+         ;; join REPLACES an existing slot by INDEX, and a prepend-
+         ;; ordered acc writes the joined slot at the wrong position
+         ;; (flat-pad's tuple<f32,f2>/u32 join landed at slot 0 of the
+         ;; REVERSED acc, producing [i32 f32 i32] instead of
+         ;; [i32 i32 f32]).
          (let ((acc '()))
            (dolist (c cases)
              (when (cdr c)
@@ -4012,21 +4080,35 @@ as a pointer pair."
                      for i from 0
                      do (if (< i (length acc))
                             (setf (nth i acc) (%flat-join (nth i acc) ft))
-                            (push ft acc)))))
-           (cons :i32 (nreverse acc)))))
+                            (setf acc (append acc (list ft)))))))
+           (cons :i32 acc))))
     (fl vt)))
+
+(defun flatten-functype (ft-ct state context)
+  "Public wrapper (values lane): %flat-functype as the RUNTIME's
+entry into the validator's flatten table. STATE may be NIL when the
+functype's valtypes are all prims/ct shapes (no (:idx . n) refs)."
+  (%flat-functype ft-ct state context))
 
 (defun %flat-functype (ft-ct state context)
   "flatten_functype (CanonicalABI.md 2894-2930): the component
 functype's FULL flattened (params . results) with the MAX_FLAT
-fallthrough. FT-CT may be NIL (an empty ascription)."
-  (declare (ignore context))
+fallthrough. FT-CT may be NIL (an empty ascription). The >1 flat
+RESULTS fallthrough differs by CONTEXT (the values lane): a LIFT
+returns one [ptr] core result (the caller reads the tuple back out
+of memory); a LOWER appends the [ptr] out-param to the core PARAMS
+and returns NO results (the caller-allocated buffer receives the
+tuple). Params > 16 collapse to a single [ptr] in both contexts."
   (let* ((pl (and ft-ct (coerce (first (ct-payload ft-ct)) 'list)))
          (res (and ft-ct (second (ct-payload ft-ct))))
          (params (mapcan (lambda (p) (%flat-type-list (cdr p) state)) pl))
          (results (and res (%flat-type-list res state))))
     (when (> (length params) 16) (setf params '(:i32)))
-    (when (> (length results) 1) (setf results '(:i32)))
+    (when (> (length results) 1)
+      (ecase context
+        (:lift (setf results '(:i32)))
+        (:lower (setf params (append params '(:i32)))
+                (setf results '()))))
     (cons params results)))
 ;;; Structural type matching at instantiation (M7 slice 3b).
 ;;; Explainer 'Type Checking': each with-argument must structurally
@@ -4330,65 +4412,7 @@ the resources canaries broke; the kind-first order keeps both."
     (when (or (eq w :ty-bad) (eq g :ty-bad))
       (%verr "type mismatch"))
     (%ty-match w g ids-w sub-w ids-g sub-g)))
-(defun %shift-raw-functype (ft arg-si state)
-  "M9 (linking ::128): the identity path's functype with an
-INSTANTIATED source — its (:idx . k) valtype refs are RAW child-space
-type indices, but the ids vector it resolves through is the REBUILT
-child space (the alias-skip in %check-instantiate-args's walk). Shift
-each ref down by the number of non-:type-sorted ALIAS defs before its
-slot in the child's def order. The child comp comes from the ARG's
-instance source record; no record leaves the functype untouched."
-  (labels
-      ((skip-count (comp k)
-         (loop with n = -1
-               with skips = 0
-               for d across (comp-defs comp)
-               do (case (compdef-kind d)
-                    (:type (incf n))
-                    (:export (incf n))
-                    (:alias (if (eq (aliasrec-sort
-                                     (compdef-payload d))
-                                    :type)
-                                (incf n)
-                                ;; a non-type alias: RAW occupies a
-                                ;; slot the rebuild skips
-                                (progn (incf n)
-                                       (when (<= n k)
-                                         (incf skips)))))
-                    (:import
-                     (when (member (car (importrec-type
-                                         (compdef-payload d)))
-                                   '(:type :instance :component))
-                       (incf n))))
-               when (> n k)
-                 return skips
-               finally (return skips)))
-       (shift-valtype (vt comp)
-         (if (and (consp vt) (eq (car vt) :idx)
-                  (integerp (cdr vt)))
-             (cons :idx (- (cdr vt) (skip-count comp (cdr vt))))
-             vt)))
-    (let* ((fidx (sortidx-idx arg-si))
-           (iidx (gethash fidx *func-arg-inst*))
-           (child (and iidx
-                       (gethash iidx *inst-source-comp*))))
-      (if (not (and ft child (ct-p ft) (eq (ct-kind ft) :func)))
-          ft
-          (let* ((pl (ct-payload ft))
-                 (params (first pl))
-                 (results (second pl)))
-            (make-ct :kind :func
-                     :payload (list (if (vectorp params)
-                                        (map 'vector
-                                             (lambda (p)
-                                               (cons (car p)
-                                                     (shift-valtype
-                                                      (cdr p) child)))
-                                             params)
-                                        params)
-                                    (shift-valtype results child)
-                                    (third pl))
-                     :offset (ct-offset ft)))))))
+
 (defun %match-func-arg (arg-si child-ft ids state)
   "A func import's check: the CHILD's functype (rebuilt in the child
 space, its typevar refs substituted by the with-args) matched against
@@ -4417,14 +4441,17 @@ instead of reading the declarator index against this state."
                         (%remap-decl-functype parent-ft
                                              (car origin)
                                              (cdr origin)))
-                       ;; M9 (linking ::128): the identity path with
-                       ;; an INSTANTIATED source — the ids vector is
-                       ;; the REBUILT child space (non-type aliases
-                       ;; skipped) while the functype's refs are RAW
-                       ;; child-space indices; shift each ref down by
-                       ;; the count of skipped alias slots before it
+                       ;; M9 (linking ::128, values lane): the
+                       ;; identity path with an INSTANTIATED source —
+                       ;; the ids vector is the REBUILT child space,
+                       ;; INDEX-ALIGNED with the child validator's
+                       ;; own type space (the ids-rebuild fix). The
+                       ;; stashed functype's refs are the child's RAW
+                       ;; VALIDATOR-space indices, so they resolve
+                       ;; through the stash UNCHANGED (the old
+                       ;; %shift-raw-functype patch is retired).
                        ((gethash pidx *func-arg-ids*)
-                        (%shift-raw-functype parent-ft arg-si state))
+                        parent-ft)
                        (t parent-ft)))))
     (unless (and parent-ft (ct-functype-p parent-ft))
       (return-from %match-func-arg))
@@ -5341,9 +5368,20 @@ rejected (instantiation.wast ::57)."
                ;; M9 (linking ::130): a non-type alias the rebuild
                ;; skips — later wrapper payloads shift past it
                (incf alias-skips))
-             (when (or (eq (compdef-kind d) :export)
+             (when (or (and (eq (compdef-kind d) :export)
+                            (eq (sortidx-sort (exportrec-sortidx pl))
+                                :type))
                        (and (eq (compdef-kind d) :alias)
                             (eq (aliasrec-sort pl) :type)))
+               ;; The rebuild stays INDEX-ALIGNED with the child's
+               ;; VALIDATOR type space: an export introduces an index
+               ;; of ITS OWN SORT (a :func export grows the FUNC space,
+               ;; not the type space), so ONLY :type-sorted exports may
+               ;; push here. Pushing for every :export def (the old
+               ;; rule) misaligned every slot after a func export —
+               ;; the raw functype refs the parent resolves through
+               ;; the stash are VALIDATOR-space indices and need NO
+               ;; shift.
                (let ((si (if (eq (compdef-kind d) :export)
                              (exportrec-sortidx pl)
                              nil)))
@@ -5527,6 +5565,59 @@ ct when found there, NIL when FTI is not a declarator-space index
 import table only; exports accept both."
   (or (gethash idx (cval-vis-imports state))
       (and (not import-p) (gethash idx (cval-vis-exports state)))))
+
+(defun %resolve-aliased-shape (tgt ct)
+  "The outer-alias slot's SHAPE (values lane): when the outer type
+slot holds the opaque :imported marker, follow the eq-BOUND import's
+underlying type (found by walking the outer comp's defs and counting
+:type-introducing slots up to the marker's typeidx); every other
+shape passes through."
+  (if (and (ct-p ct)
+           (eq (ct-kind ct) :prim)
+           (eq (ct-payload ct) :imported))
+      (let* ((types (cval-types tgt))
+             (idx (position ct (coerce types 'list))))
+        (if (null idx)
+            ct
+            (let ((comp (gethash tgt *state-comp*))
+                  (seen -1)
+                  (hit nil))
+              (when comp
+                (loop for d across (comp-defs comp)
+                      do (case (compdef-kind d)
+                           (:type (incf seen)
+                                  (when (= seen idx)
+                                    (loop-finish)))
+                           (:import
+                            (when (eq (car (importrec-type
+                                            (compdef-payload d)))
+                                      :type)
+                              (incf seen)
+                              (when (= seen idx)
+                                (setf hit (cdr (importrec-type
+                                                (compdef-payload d))))
+                                (loop-finish))))
+                           (:export
+                            (when (eq (sortidx-sort
+                                       (exportrec-sortidx
+                                        (compdef-payload d)))
+                                      :type)
+                              (incf seen)
+                              (when (= seen idx)
+                                (loop-finish))))
+                         (:alias
+                          (when (eq (aliasrec-sort (compdef-payload d))
+                                    :type)
+                            (incf seen)
+                            (when (= seen idx)
+                              (loop-finish)))))))
+              (or (and hit
+                       (listp hit)
+                       (eq (car hit) :eq)
+                       (< (second hit) (length types))
+                       (aref types (second hit)))
+                  ct))))
+      ct))
 
 (defvar *vis-seen* nil
   "The seen-set shared across one %VIS-CHECK walk INCLUDING the
@@ -6310,6 +6401,87 @@ handle's representation dropped on entry)."
                              (null (cdr sig)))))
           (%verr "wrong signature for a destructor"))))))
 
+(defun %deindex-functype (ft state)
+  "Values lane (concat's map fixtures): a functype whose
+(:idx . k) valtype refs resolve against a CHILD component's state
+(an alias-projected func out of an INSTANTIATED instance reads the
+child's stashed functype with RAW child-space indices). Rewrite each
+ref to the RESOLVED ct so any reader sees the full shape without
+needing the child's space. NIL when unresolvable."
+  (when (and ft (ct-p ft) (eq (ct-kind ft) :func))
+    (labels
+        ((deindex (vt)
+           (if (and (consp vt) (eq (car vt) :idx))
+               (let ((c (and (>= (cdr vt) 0)
+                             (< (cdr vt) (length (cval-types state)))
+                             (aref (cval-types state) (cdr vt)))))
+                 (or c vt))
+               (if (ct-p vt)
+                   (deindex-ct vt)
+                   vt)))
+         (deindex-ct (c)
+           (case (ct-kind c)
+             (:prim c)
+             (:list
+              (make-ct :kind :list
+                       :payload (cons (deindex (car (ct-payload c)))
+                                      (cdr (ct-payload c)))
+                       :offset (ct-offset c)))
+             (:record
+              (make-ct :kind :record
+                       :payload (coerce
+                                 (loop for (l . fvt) across (ct-payload c)
+                                       collect (cons l (deindex fvt)))
+                                 'vector)
+                       :offset (ct-offset c)))
+             (:tuple
+              (make-ct :kind :tuple
+                       :payload (coerce
+                                 (loop for t_ across (ct-payload c)
+                                       collect (deindex t_))
+                                 'vector)
+                       :offset (ct-offset c)))
+             (:variant
+              (make-ct :kind :variant
+                       :payload (coerce
+                                 (loop for (l . cvt) across (ct-payload c)
+                                       collect (cons l
+                                                     (and cvt
+                                                          (deindex cvt))))
+                                 'vector)
+                       :offset (ct-offset c)))
+             (:option
+              (make-ct :kind :option
+                       :payload (deindex (ct-payload c))
+                       :offset (ct-offset c)))
+             (:result
+              (make-ct :kind :result
+                       :payload (cons (and (car (ct-payload c))
+                                          (deindex (car (ct-payload c))))
+                                     (and (cdr (ct-payload c))
+                                          (deindex (cdr (ct-payload c)))))
+                       :offset (ct-offset c)))
+             (:map
+              (make-ct :kind :map
+                       :payload (cons (deindex (car (ct-payload c)))
+                                      (deindex (cdr (ct-payload c))))
+                       :offset (ct-offset c)))
+             (t c))))
+      (let* ((pl (ct-payload ft))
+             (params (first pl))
+             (results (second pl)))
+        (make-ct :kind :func
+                 :payload (list (if (vectorp params)
+                                    (map 'vector
+                                         (lambda (p)
+                                           (cons (car p)
+                                                 (deindex (cdr p))))
+                                         params)
+                                    params)
+                               (and results (deindex results))
+                               (third pl))
+                 :offset (ct-offset ft))))))
+
 (defun %remap-decl-functype (ft inst-idx ict)
   "M9 (linking ::90): a functype read out of an IMPORTED instance's
 declarator space — its (:idx . k) valtype payloads reference the
@@ -6321,18 +6493,154 @@ COMPONENT-space typeidx of the (alias export $inst \"name\" (type))
 that projects that export. Unresolvable references stay untouched."
   (labels
       ((entry-at (k)
-         "The declarator's k-th type-introducing entry's payload."
+         "The declarator's k-th type-introducing entry's payload. A
+:TYPE declarator yields its ct; an ALIAS/IMPORT yields NIL; and
+(values lane, variants.wast) an eq-BOUND :TYPE EXPORT declarator —
+(export \"v32\" (type $v32 (eq $v32'))) — yields the eq's UNDERLYING
+entry: the old NIL left the raw (:idx . k) in the remap and the
+component-space checks read a declarator index ('type index out of
+bounds')."
+         ;; (values lane, concat.wast ::36): the DECLARATOR type space
+         ;; counts EVERY declarator (Binary.md: each declarator
+         ;; introduces a type index — :type, :alias, :import, AND
+         ;; :export alike; the old :type/-alias-only counting maxed
+         ;; at the 15 :TYPE entries while the interned inline maps
+         ;; sat at index 18, past the last TYPE, and the raw
+         ;; (:idx . 18) leaked through to the component space).
          (loop with n = -1
                for td across (ct-payload ict)
+               for i from 0
                do (case (typedecl-kind td)
-                    ((:type :alias :import :export)
+                    (:type
                      (incf n)
                      (when (= n k)
-                       (return-from entry-at
-                         (if (eq (typedecl-kind td) :type)
-                             (typedecl-payload td)
-                             nil)))))
+                       (return-from entry-at (typedecl-payload td))))
+                    ((:alias :import)
+                     (incf n)
+                     (when (= n k)
+                       ;; (values lane, numerics.wast ::22): an ALIAS
+                       ;; declarator (the sunk implicit outer alias of
+                       ;; an eq-ref'd outer type) resolves THROUGH the
+                       ;; outer chain to the target ct — the old NIL
+                       ;; left the raw (:idx . k) and %needs-memory-p
+                       ;; read a declarator index against the
+                       ;; component space ('type index out of bounds').
+                       ;; The declarator's count N maps to the ambient
+                       ;; chain as N-1 (the declarator's own INNER
+                       ;; scope is skipped): %outer-state-at count
+                       ;; 1 = the first ambient entry (the ENCLOSING
+                       ;; component, pushed by the nested :component
+                       ;; arm).
+                       (let* ((a (typedecl-payload td))
+                              (tgt (and (eq (aliasrec-kind a) :outer)
+                                        (%outer-state-at
+                                         nil (1- (aliasrec-count a)))))
+                             (raw (and tgt
+                                       (< (aliasrec-target a)
+                                          (length (cval-types tgt)))
+                                       (aref (cval-types tgt)
+                                             (aliasrec-target a)))))
+                         ;; (values lane) the SAME resource-substitution
+                         ;; rule as %check-outer-alias: a TYPE alias
+                         ;; crossing a boundary may not target a type
+                         ;; that transitively refers to resources
+                         ;; (outer-alias.wast ::6: the resource $R
+                         ;; sunk through a doubly-nested component
+                         ;; type's declarators)
+                         (when (and raw (ct-p raw)
+                                    (%ct-transitively-resources-p
+                                     raw tgt (make-hash-table)))
+                           (%verr "transitively refers to resources"))
+                         (return-from entry-at raw))))
+                    (:export
+                     ;; every EXPORT introduces an index too (the
+                     ;; ORIGINAL counted all four kinds — the
+                     ;; k-battery rewrite narrowed the counting and
+                     ;; the interned inline types past the last
+                     ;; :TYPE entry went unreachable). An eq-BOUND
+                     ;; :TYPE export yields the eq's UNDERLYING entry
+                     ;; (variants.wast); any other export (a
+                     ;; FUNC-sorted one — concat's inline (export
+                     ;; "map-str-u32" (func ...))) yields NIL: its
+                     ;; inline types live at their OWN interned TYPE
+                     ;; entries, never at the export's index.
+                     (incf n)
+                     (when (= n k)
+                       (let* ((et (third (typedecl-payload td))))
+                         (return-from entry-at
+                           (and (consp et) (eq (car et) :type)
+                                (let* ((bound (cdr et))
+                                       (m (and (listp bound)
+                                               (eq (car bound) :eq)
+                                               (second bound))))
+                                  (and m
+                                       (deindex-ct (entry-at m)))))))))
+                    (t nil))
                finally (return-from entry-at nil)))
+       (deindex-ct (c)
+         "Values lane (variants.wast): a declarator entry's ct may
+itself carry (:idx . m) refs — inline expressions interned into the
+DECLARATOR's own type space. Resolve them through remap-valtype so
+the component-space checks never read a declarator index."
+         (if (not (ct-p c))
+             c
+             (case (ct-kind c)
+               (:prim c)
+               (:list
+                (make-ct :kind :list
+                         :payload (cons (remap-valtype
+                                         (car (ct-payload c)))
+                                        (cdr (ct-payload c)))
+                         :offset (ct-offset c)))
+               (:record
+                (make-ct :kind :record
+                         :payload (coerce
+                                   (loop for (l . fvt)
+                                         across (ct-payload c)
+                                         collect (cons l
+                                                       (remap-valtype fvt)))
+                                   'vector)
+                         :offset (ct-offset c)))
+               (:tuple
+                (make-ct :kind :tuple
+                         :payload (coerce
+                                   (loop for t_ across (ct-payload c)
+                                         collect (remap-valtype t_))
+                                   'vector)
+                         :offset (ct-offset c)))
+               (:variant
+                (make-ct :kind :variant
+                         :payload (coerce
+                                   (loop for (l . cvt)
+                                         across (ct-payload c)
+                                         collect (cons l
+                                                       (and cvt
+                                                            (remap-valtype
+                                                             cvt))))
+                                   'vector)
+                         :offset (ct-offset c)))
+               (:option
+                (make-ct :kind :option
+                         :payload (remap-valtype (ct-payload c))
+                         :offset (ct-offset c)))
+               (:result
+                (make-ct :kind :result
+                         :payload (cons
+                                   (and (car (ct-payload c))
+                                        (remap-valtype
+                                         (car (ct-payload c))))
+                                   (and (cdr (ct-payload c))
+                                        (remap-valtype
+                                         (cdr (ct-payload c)))))
+                         :offset (ct-offset c)))
+               (:map
+                (make-ct :kind :map
+                         :payload (cons (remap-valtype
+                                         (car (ct-payload c)))
+                                        (remap-valtype
+                                         (cdr (ct-payload c))))
+                         :offset (ct-offset c)))
+               (t c))))
        (export-name-for (m)
          "The name of the m-th TYPE-INTRODUCING exportdecl (in
 declarator order): a (sub resource) export's et carries the
@@ -6354,7 +6662,7 @@ exportdecls."
                        (integerp (cdr vt))))
              vt
              (let* ((k (cdr vt))
-                    (e (entry-at k))
+                    (e (deindex-ct (entry-at k)))
                     ;; the interned own/borrow entry's payload is the
                     ;; OWNED type's declarator-space index
                     (m (and (ct-p e)
@@ -6379,9 +6687,13 @@ exportdecls."
                                      (make-ct :kind :resource
                                               :payload '(0 . nil)
                                               :offset 0)))))
-               (if target
-                   (if (integerp target) (cons :idx target) target)
-                   vt)))))
+               (cond
+                ((and (null target) (ct-p e)
+                      (not (member (ct-kind e) '(:own :borrow))))
+                 e)
+                (target
+                 (if (integerp target) (cons :idx target) target))
+                (t vt))))))
     (if (not (and ft (ct-p ft) (eq (ct-kind ft) :func)))
         ft
         (let* ((pl (ct-payload ft))
@@ -6446,11 +6758,14 @@ version tripped the compiler's cross-arm payload type derivation."
                             *func-arg-ids*)
                    (gethash (aliasrec-index payload)
                             *inst-ids-stash*))
-             ;; M9 (linking ::128): the source INSTANCE index for the
-             ;; shift's child-comp lookup
+             ;; (values lane) the stashed functype's refs are CHILD-
+             ;; space indices — record the child's VALIDATOR STATE as
+             ;; the func's origin so the canon checks can DEINDEX the
+             ;; refs to full ct shapes (concat's map fixtures: the
+             ;; lowered import's (map string u32) params)
              (setf (gethash (1- (cval-funcs state))
-                            *func-arg-inst*)
-                   (aliasrec-index payload))
+                            *func-alias-origin*)
+                   (cons :state child-state))
              (and (< (cdr hit)
                      (length (cval-func-types child-state)))
                   (aref (cval-func-types child-state)
@@ -6932,9 +7247,20 @@ the number of enclosing component/type scopes (outer aliases)."
                                        (and tgt
                                             (< (aliasrec-target payload)
                                                (length (cval-types tgt)))
-                                            (aref (cval-types tgt)
-                                                  (aliasrec-target
-                                                   payload)))))
+                                            ;; (values lane) an eq-
+                                            ;; BOUND type import's slot
+                                            ;; holds the opaque
+                                            ;; :imported marker — the
+                                            ;; alias's SHAPE follows
+                                            ;; the eq to the under-
+                                            ;; lying ct so the vis
+                                            ;; walk sees the real
+                                            ;; record/variant
+                                            (%resolve-aliased-shape
+                                             tgt
+                                             (aref (cval-types tgt)
+                                                   (aliasrec-target
+                                                    payload))))))
                                 (make-ct :kind :prim
                                          :payload :outer-aliased))
                             (cval-types state))
@@ -7344,9 +7670,14 @@ the number of enclosing component/type scopes (outer aliases)."
                                                     (gethash
                                                      f *func-alias-origin*)))
                                               (if origin
-                                                  (%remap-decl-functype
-                                                   ft (car origin)
-                                                   (cdr origin))
+                                                  (if (and (consp origin)
+                                                           (eq (car origin)
+                                                               :state))
+                                                      (%deindex-functype
+                                                       ft (cdr origin))
+                                                      (%remap-decl-functype
+                                                       ft (car origin)
+                                                       (cdr origin)))
                                                   ft))))
                                    (cons :canon-lower
                                          (%canon-lower-flat-sig state ft))))
