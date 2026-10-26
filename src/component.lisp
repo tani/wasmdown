@@ -3394,12 +3394,16 @@ declarators in declaration order (imports and exports included)."
            (cons :table (cons (second desc) (third desc))))
           (t nil))))))
 
-(defun %canon-lower-flat-sig (state ft)
+(defun %canon-lower-flat-sig (state ft &optional (async-p nil))
   "The FLATTENED core signature of a canon LOWER of functype FT —
 flatten_functype's lower side (CanonicalABI.md 2894-2930), computed
 at canon time where the STATE resolves (:idx . n) references. Returns
-(params . results) as core type lists."
-  (let ((p (and ft (%flat-functype ft state :lower))))
+(params . results) as core type lists. M11a: ASYNC-P selects the
+async lower shape (MAX_FLAT_ASYNC_PARAMS=4 param collapse, the
+appended [ptr] out-param for ANY results, the packed-state :i32
+core result)."
+  (let ((p (and ft (%flat-functype ft state :lower
+                                   :async-p async-p))))
     (cons (and p (car p)) (and p (cdr p)))))
 
 (defun builtin-canon-sig (kind &optional (imms nil))
@@ -3413,22 +3417,33 @@ flat-sig helper handles the result-bearing case)."
   (case kind
     ((:backpressure-inc :backpressure-dec :task-cancel
       :task-return
-      :waitable-set-drop :waitable-join :subtask-drop
       :thread-yield :thread-suspend :thread-resume-later
       :thread-suspend-then-resume :thread-yield-then-resume
       :thread-suspend-then-promote :thread-yield-then-promote
       :error-context-new :error-context-debug-message
       :error-context-drop :resource-drop)
      (cons '() '()))
+    ;; M11a (CanonicalABI.md 4226/4089): subtask.drop and
+    ;; waitable-set.drop take an i32 handle param — they were
+    ;; mis-grouped with the no-params builtins (async-calls-sync's
+    ;; $AsyncOuter with-bag: 'expected: (func)' on subtask.drop).
+    ((:subtask-drop :waitable-set-drop :context-set
+      :stream-drop-readable :stream-drop-writable
+      :future-drop-readable :future-drop-writable)
+     (cons '(:i32) '()))
     ((:context-get :waitable-set-new :thread-index
-      :resource-new :resource-rep :subtask-cancel
+      :resource-new :resource-rep
       :stream-cancel-read :stream-cancel-write
       :future-cancel-read :future-cancel-write
       :thread-new-indirect :stream-forward :future-forward)
      (cons '() '(:i32)))
-    ((:context-set :stream-drop-readable :stream-drop-writable
-      :future-drop-readable :future-drop-writable)
-     (cons '(:i32) '()))
+    ;; M11a (CanonicalABI.md 4115): waitable.join is
+    ;; (func (param $wi i32) (param $si i32)) — TWO i32 params, no
+    ;; results (it was mis-grouped with the no-params builtins, so
+    ;; every fixture importing waitable.join failed the with-bag
+    ;; signature check: deadlock.wast's 'expected: (func)').
+    ((:waitable-join)
+     (cons '(:i32 :i32) '()))
     ((:stream-new :future-new)
      (cons '() '(:i64)))
     ((:stream-read :stream-write)
@@ -4171,13 +4186,17 @@ as a pointer pair."
            (cons :i32 acc))))
     (fl vt)))
 
-(defun flatten-functype (ft-ct state context)
+(defun flatten-functype (ft-ct state context &key (async-p nil)
+                                                 (callback-p nil))
   "Public wrapper (values lane): %flat-functype as the RUNTIME's
 entry into the validator's flatten table. STATE may be NIL when the
-functype's valtypes are all prims/ct shapes (no (:idx . n) refs)."
-  (%flat-functype ft-ct state context))
+functype's valtypes are all prims/ct shapes (no (:idx . n) refs).
+M11a: the ASYNC-P/CALLBACK-P keys forward to the async flatten
+arms (CanonicalABI.md 2914-2929)."
+  (%flat-functype ft-ct state context
+                  :async-p async-p :callback-p callback-p))
 
-(defun %flat-functype (ft-ct state context)
+(defun %flat-functype (ft-ct state context &key (async-p nil) (callback-p nil))
   "flatten_functype (CanonicalABI.md 2894-2930): the component
 functype's FULL flattened (params . results) with the MAX_FLAT
 fallthrough. FT-CT may be NIL (an empty ascription). The >1 flat
@@ -4185,18 +4204,36 @@ RESULTS fallthrough differs by CONTEXT (the values lane): a LIFT
 returns one [ptr] core result (the caller reads the tuple back out
 of memory); a LOWER appends the [ptr] out-param to the core PARAMS
 and returns NO results (the caller-allocated buffer receives the
-tuple). Params > 16 collapse to a single [ptr] in both contexts."
+tuple). Params > 16 collapse to a single [ptr] in both contexts.
+M11a (ASYNC, CanonicalABI.md 2914-2929): with ASYNC-P the limits
+change — LIFT: params still >16 collapse, results are ['i32] when
+CALLBACK-P (the packed CallbackCode) else [] (the stackful async
+case: the callee returns NO core results; task.return delivers the
+value); LOWER: params >4 (MAX_FLAT_ASYNC_PARAMS) collapse to [ptr],
+ANY results ride the appended [ptr] out-param, and the core result
+is the ['i32] packed state|(subtaski<<4)."
   (let* ((pl (and ft-ct (coerce (first (ct-payload ft-ct)) 'list)))
          (res (and ft-ct (second (ct-payload ft-ct))))
          (params (mapcan (lambda (p) (%flat-type-list (cdr p) state)) pl))
          (results (and res (%flat-type-list res state))))
-    (when (> (length params) 16) (setf params '(:i32)))
-    (when (> (length results) 1)
-      (ecase context
-        (:lift (setf results '(:i32)))
-        (:lower (setf params (append params '(:i32)))
-                (setf results '()))))
+    (if async-p
+        (ecase context
+          (:lift
+           (when (> (length params) 16) (setf params '(:i32)))
+           (setf results (if callback-p '(:i32) '())))
+          (:lower
+           (when (> (length params) 4) (setf params '(:i32)))
+           (when results (setf params (append params '(:i32))))
+           (setf results '(:i32))))
+        (progn
+          (when (> (length params) 16) (setf params '(:i32)))
+          (when (> (length results) 1)
+            (ecase context
+              (:lift (setf results '(:i32)))
+              (:lower (setf params (append params '(:i32)))
+                      (setf results '()))))))
     (cons params results)))
+
 ;;; Structural type matching at instantiation (M7 slice 3b).
 ;;; Explainer 'Type Checking': each with-argument must structurally
 ;;; match the target component's import type, the child's typevar
@@ -7782,7 +7819,11 @@ the number of enclosing component/type scopes (outer aliases)."
                                                        (cdr origin)))
                                                   ft))))
                                    (cons :canon-lower
-                                         (%canon-lower-flat-sig state ft))))
+                                         (%canon-lower-flat-sig
+                                          state ft
+                                          (and (%opt (canonrec-opts payload)
+                                                     :async)
+                                               t)))))
                                 ((:resource-new :resource-rep)
                                  (cons :canon-sig (cons '(:i32) '(:i32))))
                                 (:resource-drop

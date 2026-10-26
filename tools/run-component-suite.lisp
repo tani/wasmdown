@@ -56,20 +56,30 @@ parent dir), not the first (the grandparent 'component' — the old
                ;; link-time-virtualization's component composition.
                (directory (merge-pathnames
                            "tests/component/linking/*.wast" *root*))
-               ;; M11a (async lane, slice 1): the VALIDATION-only
-               ;; async fixtures — task.return's no-borrow rule,
-               ;; stream<char> rejection, the async-canonopt
-               ;; requires-async-type rule. The runtime async core
-               ;; (the task state machine, context.get/set,
-               ;; backpressure, waitable-sets) is the NEXT slice;
-               ;; the execution-bearing async files stay in
-               ;; nyi.txt with per-file probe evidence.
+               ;; M11a (async lane, slices 1+2): the async-core-green
+               ;; fixtures. Slice 1: the VALIDATION-only files
+               ;; (task.return's no-borrow rule, stream<char>
+               ;; rejection, the async-canonopt
+               ;; requires-async-type rule). Slice 2: the
+               ;; EXECUTION files whose machinery is the landed
+               ;; async core — the task/thread state machine, the
+               ;; callback event loop, waitable-sets/join/subtask,
+               ;; the backpressure gate + the deadlock oracle and
+               ;; the sync-task cannot-block trap. The remaining
+               ;; async files stay in nyi.txt with per-file probe
+               ;; evidence (future/stream/thread/error-context
+               ;; canons = M11b; async-calls-sync = the acs
+               ;; interleave, one open runtime bug).
                (remove-if
                 (lambda (f)
                   (not (member (file-namestring f)
                                '("validate-task-return.wast"
                                  "validate-no-stream-char.wast"
-                                 "validate-no-async-abi-for-sync-type.wast")
+                                 "validate-no-async-abi-for-sync-type.wast"
+                                 "deadlock.wast"
+                                 "dont-block-start.wast"
+                                 "drop-subtask.wast"
+                                 "drop-waitable-set.wast")
                                :test #'string=)))
                 (or (directory (merge-pathnames
                                 "tests/component/async/*.wast" *root*))

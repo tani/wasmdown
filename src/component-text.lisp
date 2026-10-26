@@ -2344,28 +2344,46 @@ re-export rows)."
         ;; an inline (param ...)/(result ...) ascription on the FUNC
         ;; node IS the lifted functype: intern it so the canonrec's
         ;; typeidx points at it (the validator's lift rules read it).
+        ;; M11a: the FUNCTYPE's effect lives on the FUNC node's bare
+        ;; `async` token too — the fixture shape
+        ;; (func (export "unblock") async (canon lift ...)) has NO
+        ;; param/result nodes at all, and even when it has them the
+        ;; token is a %TOKP that the sig-nodes filter below EXCLUDES,
+        ;; so %parse-functype would never see it and the interned
+        ;; functype would lose the async flag (the `async` canonopt
+        ;; then requires an async type and rejects the lift).
+        ;; Collect the token HERE and pass it into the synthetic
+        ;; (func ...) node so the payload's third slot carries it.
         (when (eq (canonrec-kind canon) :lift)
-          (setf (canonrec-typeidx canon)
-                (or ft (canonrec-typeidx canon)
-                    (let ((sig-nodes
-                            (remove-if
-                             (lambda (b)
-                               (or (and (%nodep b)
-                                        (member (%head-text b)
-                                                '("type" "canon" "export")
-                                                :test #'string=))
-                                   (%tokp b)))
-                             rest)))
-                      (when sig-nodes
-                        (let ((ft-ct (%parse-functype
-                                      (list* :list 0 0
-                                             (cons (wasmdown.wast::make-stoken
-                                                    :kind :keyword
-                                                    :text "func"
-                                                    :start 0 :end 4)
-                                                   sig-nodes))
-                                      scope)))
-                          (%intern-valtype scope ft-ct)))))))
+          (let* ((async-tok
+                   (find-if
+                    (lambda (b)
+                      (and (%tokp b)
+                           (string= (%tok-text b) "async")))
+                    rest))
+                 (sig-nodes
+                   (remove-if
+                    (lambda (b)
+                      (or (and (%nodep b)
+                               (member (%head-text b)
+                                       '("type" "canon" "export")
+                                       :test #'string=))
+                         (%tokp b)))
+                    rest))
+                 (ft-inline
+                   (when (or async-tok sig-nodes)
+                     (%parse-functype
+                      (list* :list 0 0
+                             (cons (wasmdown.wast::make-stoken
+                                    :kind :keyword
+                                    :text "func"
+                                    :start 0 :end 4)
+                                   (append (and async-tok (list async-tok))
+                                           sig-nodes)))
+                      scope))))
+            (setf (canonrec-typeidx canon)
+                  (or ft (canonrec-typeidx canon)
+                      (and ft-inline (%intern-valtype scope ft-inline))))))
         (%flush-interned scope)
         (%push-def :canon canon)
         ;; slice 5l (resources ::39): the inline (export "n") marker

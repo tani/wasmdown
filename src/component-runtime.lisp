@@ -259,8 +259,38 @@ first; a count of N resolves the Nth entry).")
 per instantiation; the counter never resets, mirroring the
 validator's).")
 
+(defvar *resource-dtor-table* (make-hash-table :test #'equal)
+  "M9: (resource-ct . defining-comp-instance) -> the dtor
+func-instance, resolved at the TYPE def walk in the DEFINING
+instance's core-func space. A consumer's resource.drop canon reads
+the ORIGIN's dtor — the ct's payload dtor index is meaningful only
+there.")
 (defun %fresh-resource-id ()
   (cons :fresh (incf *resource-id-counter*)))
+
+(defvar *comp-closure* (make-hash-table :test #'equal)
+  "M9 (linking ::233): (exporting-inst . projected-comp) -> the
+SOURCE comp-instance an alias-projected component was exported from.
+The instantiate arm consults it: a child instantiated via an alias
+resolves its depth-1 outer refs through the EXPORTING instance (the
+closure), prepended to the outer chain. No value-shape change — the
+components vector holds the RAW comp (the ::169 export chains see
+exactly what they always did).")
+
+(defvar *ct-defining-inst* (make-hash-table :test #'equal)
+  "M9 (linking ::93): resource-ct -> the comp-instance whose exports
+PROJECTED it (an (alias export $i \"r\" (type)) at the consumer).
+The drop canon's dtor lookup keys the dtor table by the DEFINING
+instance — with two instantiations of the defining component the ct
+object is shared but each instance has its OWN dtor func, so the
+first table hit leaks the wrong instance's counter.")
+
+(defvar *handle-caller-inst* nil
+  "M9 (linking ::126): the comp-instance whose handle table an
+incoming own/borrow PARAM index refers to — bound dynamically at the
+lower's %call-component-func so the target lifted func's lift_own
+consumes the handle from the CALLER's table and re-enters its own.")
+
 
 (declaim (notinline instantiate-component %exec-core-instance
                     %exec-instance %exec-alias %exec-canon
@@ -506,13 +536,6 @@ runtime value this slice (the index grows, the value is opaque)."
 
 ;;; ---- canon ----
 
-(defvar *resource-dtor-table* (make-hash-table :test #'equal)
-  "M9: (resource-ct . defining-comp-instance) -> the dtor
-func-instance, resolved at the TYPE def walk in the DEFINING
-instance's core-func space. A consumer's resource.drop canon reads
-the ORIGIN's dtor — the ct's payload dtor index is meaningful only
-there.")
-
 (defstruct closed-comp
   "M9 (linking ::233): an alias-projected COMPONENT value captured at
 the export site — the comp plus the SOURCE comp-instance (the closure
@@ -521,30 +544,6 @@ over the instance that exported it, so instantiating it later resolves
 its outer refs through THAT instance, not the instantiating site's)."
   (comp nil)
   (instance nil))
-
-(defvar *comp-closure* (make-hash-table :test #'equal)
-  "M9 (linking ::233): (exporting-inst . projected-comp) -> the
-SOURCE comp-instance an alias-projected component was exported from.
-The instantiate arm consults it: a child instantiated via an alias
-resolves its depth-1 outer refs through the EXPORTING instance (the
-closure), prepended to the outer chain. No value-shape change — the
-components vector holds the RAW comp (the ::169 export chains see
-exactly what they always did).")
-
-(defvar *ct-defining-inst* (make-hash-table :test #'equal)
-  "M9 (linking ::93): resource-ct -> the comp-instance whose exports
-PROJECTED it (an (alias export $i \"r\" (type)) at the consumer).
-The drop canon's dtor lookup keys the dtor table by the DEFINING
-instance — with two instantiations of the defining component the ct
-object is shared but each instance has its OWN dtor func, so the
-first table hit leaks the wrong instance's counter.")
-
-(defvar *handle-caller-inst* nil
-  "M9 (linking ::126): the comp-instance whose handle table an
-incoming own/borrow PARAM index refers to — bound dynamically at the
-lower's %call-component-func so the target lifted func's lift_own
-consumes the handle from the CALLER's table and re-enters its own.")
-
 
 (defun %exec-canon (payload inst)
   "One canonrec. A LIFT wraps the target core func (allocating the
@@ -659,27 +658,42 @@ remaining built-ins stay opaque core-func slots (the values slice)."
                                       ct)))))))
        (cond
         ((and (eq kind :lower)
+              (canonrec-func payload)
               (< (canonrec-func payload)
                  (length (comp-instance-funcs inst)))
               (aref (comp-instance-funcs inst)
                     (canonrec-func payload)))
          (%push-core-func
           inst
-          ;; (values lane) pass the CANONREC: the LOWER's OWN canon
-          ;; options (its (memory ...)/(realloc ...)/(string-
-          ;; encoding ...)) belong to THIS component's spaces; the
-          ;; wrapper reading the TARGET lifted func's LIFT opts named
-          ;; the WRONG memory (the arg lift pulled the caller's data
-          ;; out of the target's memory and the result store wrote
-          ;; where the caller's retptr never pointed)
-          (%lower-host-func inst (canonrec-func payload)
-                            payload)))
+          ;; M11a: an ASYNC lower (the `async` canonopt) routes
+          ;; through the Subtask wrapper (the packed state return,
+          ;; the eager RETURNED, the [ptr] out-param); the sync
+          ;; lowers keep the M9 flat path. The (values lane)
+          ;; CANONREC passes the LOWER's OWN canon options (the
+          ;; caller's memory/realloc) to both.
+          (if (wasmdown.component:canon-opt (canonrec-opts payload)
+                                            :async)
+              (%canon-lower-async-host-func
+               inst (canonrec-func payload) payload)
+              (%lower-host-func inst (canonrec-func payload)
+                                payload))))
         ((and (member rkind
                       '(:resource-new :resource-drop :resource-rep))
               rt)
          (%push-core-func
           inst
           (%resource-builtin-host-func inst rkind rt dtor)))
+        ((eq kind :builtin)
+         ;; M11a: the ASYNC builtins become REAL host funcs
+         ;; (task.return/cancel, context.get/set, backpressure,
+         ;; waitable-set.*, waitable.join, subtask.*); the M11b
+         ;; kinds (thread.*/future.*/stream.*/error-context.*)
+         ;; return NIL — an opaque slot that traps when called,
+         ;; never at instantiate time.
+         (%push-core-func
+          inst
+          (%builtin-async-host-func inst rkind
+                                    (canonrec-imms payload))))
         (t (%push-core-func inst nil)))))))
 
 ;;; ---- import ----
@@ -1876,19 +1890,28 @@ of flat arguments)."
 ;;; ---- the lifted call (canon_lift, sync; CanonicalABI.md 3389) ----
 
 (defun lifted-func-call (lf &rest args)
-  "canon_lift (CanonicalABI.md 3389, sync): lower the component ARGS
-per the canonical ABI (the flat register domain, the MAX_FLAT_PARAMS
-fallthrough spilling through realloc), call the wrapped core func,
-lift the results (the MAX_FLAT_RESULTS fallthrough reading the tuple
-back out of the lift memory), and run the optional post-return with
-the SAME flat core results. M9 (linking ::126): an OWN/BORROW param
-index arrives in the CALLER instance's table — lift_own consumes it
-there and re-enters the defining instance's table."
+  "canon_lift (CanonicalABI.md 3389): the ASYNC-TYPED functype lifts
+  route through the task state machine (%canon-lift-async — the
+  guest body runs on its own SBCL thread and resolves via
+  task.return); everything else keeps the SYNC flat path (lower the
+  component ARGS per the canonical ABI, call the wrapped core func,
+  lift the results, run the optional post-return with the SAME flat
+  core results). M9 (linking ::126): an OWN/BORROW param index
+  arrives in the CALLER instance's table — lift_own consumes it there
+  and re-enters the defining instance's table."
   (let* ((ft (lifted-func-type lf))
          (core (lifted-func-core lf)))
     (unless (and core (wasmdown.runtime:func-instance-p core))
       (error 'wasmdown:host-error
              :message "lifted func wraps no core func"))
+    ;; M11a: an ASYNC-TYPED functype (the payload's third slot) goes
+    ;; through the task state machine — the SYNC flat path below
+    ;; would run the guest body on the CALLER's thread where the
+    ;; built-ins could not find their task and the YIELD/WAIT
+    ;; protocol could not suspend.
+    (when (and ft (third (wasmdown.component:ct-payload ft)))
+      (return-from lifted-func-call
+        (%canon-lift-async lf args)))
     (let* ((params (and ft (eq (wasmdown.component:ct-kind ft) :func)
                         (coerce (first (wasmdown.component:ct-payload ft))
                                 'list)))
@@ -2488,8 +2511,1214 @@ resource.drop (param handle), [i32] -> [i32] for resource.rep."
         (let ((v (%inst-handles inst)))
           (list (cdar (aref v (1- (first args)))))))))))
 
+;;; ---------------------------------------------------------------
+;;; ---------------------------------------------------------------
+;;; M11a: THE RUNTIME ASYNC CORE (the component-model task state
+;;; machine — CanonicalABI.md Tasks §569-825, Threads §360-568,
+;;; Concurrency §162-358, Store.tick §922-941, Waitable State
+;;; §1218-1396, Subtask State §1397-1490, canon_lift §3389-3544,
+;;; canon_lower §3618-3741 and the async built-ins §3835-4239).
+;;;
+;;; THREADING MODEL: the spec's cooperative Thread objects (suspend /
+;;; resume / wait_until, §447-566) map onto SBCL OS threads: each
+;;; guest Task runs on its own sb-thread:thread and coordinates
+;;; through a (mutex, waitqueue) pair. `wait_until(ready)` = loop
+;;; testing READY under the lock, condition-waiting when false;
+;;; `resume` = a broadcast nudge (the woken thread re-tests its own
+;;; condition — Store.tick's random.choice is the host's freedom, a
+;;; nudge-all is a valid scheduling). The fixtures observe only the
+;;; PROTOCOL VALUES (packed states, event codes, trap messages), not
+;;; the interleaving.
+
+;;; ---- Task (CanonicalABI.md 609-637) ----
+
+(defstruct async-task
+  "The Task record (CanonicalABI.md 609): the per-CALL state tracking
+the callee's progression through the FuncInst protocol."
+  (ft nil)                           ; the component functype ct
+  (opts nil)                         ; the canon's opts
+  (inst nil)                         ; the DEFINING comp-instance
+  (on-start nil)                     ; thunk -> component-level args
+  (on-resolve nil)                   ; (result | :cancelled) -> done
+  (state :initial)   ; :initial :started :pending-cancel
+                     ; :cancel-delivered :resolved
+  (num-borrows 0)
+  (implicit-thread nil)              ; the async-thread record
+  (mutex (sb-thread:make-mutex :name "task"))
+  (waitqueue (sb-thread:make-waitqueue :name "task"))
+  (resolved-p nil)
+  (gate-parked nil)                 ; parked at the backpressure gate
+  (result nil))
+
+;;; ---- Waitable / Subtask / WaitableSet (CanonicalABI.md 1272-1489) ----
+
+(defstruct async-waitable
+  "The Waitable base (CanonicalABI.md 1272): a pending-event closure,
+  its waitable set, and the sync-waiter guard."
+  (pending-event nil)                ; closure -> (code p1 p2)
+  (wset nil)
+  (has-sync-waiter nil))
+
+(defstruct (async-subtask (:include async-waitable))
+  "The Subtask (CanonicalABI.md 1406): the caller-side record."
+  (state 0)  ; 0=STARTING 1=STARTED 2=RETURNED
+             ; 3=CANCELLED-BEFORE-STARTED 4=CANCELLED-BEFORE-RETURNED
+  (on-cancel nil)                    ; the callee's OnCancel
+  (lenders nil)
+  (cancellation-requested nil)
+  (flat-results nil)
+  (resolve-delivered-p nil)
+  (result-memory nil)                ; the async lower's out-param
+  (result-ptr nil)                   ; memory + [ptr]
+  (task nil))                        ; the callee's async-task
+
+(defstruct async-waitable-set
+  "The WaitableSet (CanonicalABI.md 1327): elems + the num_waiting
+  guard for WaitableSet.drop."
+  (elems nil)
+  (num-waiting 0)
+  (mutex (sb-thread:make-mutex :name "wset"))
+  (waitqueue (sb-thread:make-waitqueue :name "wset")))
+
+;;; ---- The Thread record (CanonicalABI.md 391-407) ----
+
+(defstruct async-thread
+  "The Thread record (CanonicalABI.md 391): the guest thread's
+  blocking state + the per-thread STORAGE (context.get/set TLS)."
+  (task nil)
+  (index nil)
+  (storage (make-array 2 :initial-element 0))
+  (cancellable nil)
+  (mutex (sb-thread:make-mutex :name "thread"))
+  (waitqueue (sb-thread:make-waitqueue :name "thread")))
+
+;;; ---- Thread-local context: bound per SBCL thread by the task
+;;; body, so the built-ins find their task/instance. SBCL
+;;; defparameter bindings made inside sb-thread:make-thread bodies
+;;; are per-thread, so a guest thread sees ITS task.
+
+(defparameter *current-task* nil
+  "The current Thread's Task (CanonicalABI.md current_task).")
+
+(defparameter *current-thread* nil
+  "The current Thread record (CanonicalABI.md current_thread).")
+
+(defparameter *scheduler-threads* nil
+  "The live async-thread records — Store.tick's nudge-all walks it.
+MUTATED FROM MULTIPLE GUEST THREADS (enter/exit implicit thread):
+every access goes through *SCHEDULER-MUTEX* — a bare pushnew/remove
+races (a lost registration leaves a thread permanently un-nudgable,
+the observed acs deadlock).")
+
+(defparameter *scheduler-mutex* (sb-thread:make-mutex
+                                 :name "scheduler"))
+
+(defparameter *async-progress* 0
+  "M11a liveness counter: bumped on every observable state change
+(a thread waking, a task state transition). The canon_lift caller
+loop uses it as the deadlock oracle (§3539-3542): if a full
+nudge+wait cycle passes with NO progress and the task unresolved,
+no candidate thread can ever make progress — the deadlock trap.")
+
+;;; ---------------------------------------------------------------
+;;; The thread primitives (CanonicalABI.md 447-566).
+
+(declaim (notinline async-thread-wait-until async-thread-resume
+                    async-thread-resume-all async-thread-yield))
+
+(defun async-thread-wait-until (thread ready-fn)
+  "Thread.wait_until (CanonicalABI.md 505): block until READY-FN
+holds, re-testing on each wakeup."
+  (loop
+    (sb-thread:with-recursive-lock ((async-thread-mutex thread))
+      (when (funcall ready-fn)
+        (incf *async-progress*)
+        (return))
+      (sb-thread:condition-wait (async-thread-waitqueue thread)
+                                (async-thread-mutex thread)))))
+
+(defun async-thread-resume (thread)
+  "Thread.resume (CanonicalABI.md 474): nudge the blocked thread; it
+re-tests its own readiness condition."
+  (sb-thread:with-recursive-lock ((async-thread-mutex thread))
+    (sb-thread:condition-broadcast (async-thread-waitqueue thread)
+                               )))
+
+(defun async-thread-resume-all ()
+  "Store.tick (CanonicalABI.md 932): nudge every live thread (the
+walk is mutex-guarded — the register/unregister sites mutate the
+list concurrently from guest threads)."
+  (sb-thread:with-recursive-lock (*scheduler-mutex*)
+    (dolist (th *scheduler-threads*)
+      (async-thread-resume th))))
+
+(defun async-thread-yield (thread)
+  "Thread.yield_ (CanonicalABI.md 523): cooperatively give up the
+CPU. wait-until with an always-true predicate returns IMMEDIATELY
+(§507's host freedom) which hot-spins a yielding guest and starves
+siblings; instead PARK on the thread's waitqueue for a single
+scheduler nudge (Store.tick / resume-all) so other threads run."
+  (sb-thread:with-recursive-lock ((async-thread-mutex thread))
+    (sb-thread:condition-wait (async-thread-waitqueue thread)
+                              (async-thread-mutex thread))))
+
+;;; ---- the ComponentInstance concurrency fields (§133-150) ----
+
+(defun %inst-async-fields (inst)
+  "backpressure / num_waiting_to_enter / exclusive_thread / threads,
+  lazily initialized under the imports table's reserved :async key."
+  (or (gethash :async (comp-instance-imports inst))
+      (let ((fields (list :backpressure 0
+                          :num-waiting-to-enter 0
+                          :exclusive-thread nil
+                          :threads nil)))
+        (setf (gethash :async (comp-instance-imports inst))
+              fields)
+        fields)))
+
+(defun %inst-backpressure (inst)
+  (getf (%inst-async-fields inst) :backpressure))
+
+(defun (setf %inst-backpressure) (v inst)
+  (let ((fields (%inst-async-fields inst)))
+    (setf (getf fields :backpressure) v)))
+
+(defun %inst-exclusive-thread (inst)
+  (getf (%inst-async-fields inst) :exclusive-thread))
+
+(defun (setf %inst-exclusive-thread) (v inst)
+  (let ((fields (%inst-async-fields inst)))
+    (setf (getf fields :exclusive-thread) v)))
+
+;;; ---------------------------------------------------------------
+;;; Task lifecycle (CanonicalABI.md 657-823).
+
+(declaim (notinline %task-needs-exclusive %task-enter-implicit-thread
+                    %task-exit-implicit-thread %task-return
+                    %task-cancel %task-request-cancellation
+                    %task-deliver-pending-cancel))
+
+(defun %task-ft-async-p (task)
+  "The functype's async flag (the payload's third slot)."
+  (and (async-task-ft task)
+       (third (wasmdown.component:ct-payload (async-task-ft task)))))
+
+(defun %task-opts-async-p (task)
+  (and (wasmdown.component:canon-opt (async-task-opts task) :async) t))
+
+(defun %task-opts-callback-p (task)
+  (and (wasmdown.component:canon-opt (async-task-opts task) :callback)
+       t))
+
+(defun %task-needs-exclusive (task)
+  "Task.needs_exclusive (CanonicalABI.md 652): true unless the lift
+  opted into stackful async (the `async` opt WITHOUT `callback`)."
+  (or (not (%task-opts-async-p task))
+      (%task-opts-callback-p task)))
+
+(defun %task-enter-implicit-thread (task)
+  "Task.enter_implicit_thread (CanonicalABI.md 681): the BACKPRESSURE
+gate — wait until backpressure subsides, then register the thread.
+Returns NIL when a pending cancellation aborted the start. The
+instance's async FIELDS plist is pulled ONCE into a local: the
+getf-setf then mutates the shared plist object through the local
+binding (an incf on (getf (%inst-async-fields inst) ...) would
+expand into a (setf (%inst-async-fields inst)) — a function that
+does not exist)."
+  (let* ((th (async-task-implicit-thread task))
+         (inst (async-task-inst task))
+         (fields (%inst-async-fields inst)))
+    (when (%task-ft-async-p task)
+      (let ((has-backpressure
+              (lambda ()
+                (or (> (getf fields :backpressure) 0)
+                    (and (%task-needs-exclusive task)
+                         (getf fields :exclusive-thread))))))
+        (when (or (funcall has-backpressure)
+                  (> (getf fields :num-waiting-to-enter) 0))
+          ;; the num_waiting_to_enter counter is the RESIDUAL
+          ;; backpressure rule (§669-672): a later waiter sees an
+          ;; earlier one waiting and waits too (no thundering herd)
+          (incf (getf fields :num-waiting-to-enter))
+          ;; the thread must be NUDGABLE while parked: register it
+          ;; in the scheduler BEFORE parking (the gate's readiness
+          ;; flips on another thread's release — resume-all must
+          ;; see this thread to deliver the nudge)
+          (setf (async-task-gate-parked task) t)
+          (sb-thread:with-recursive-lock (*scheduler-mutex*)
+            (pushnew th *scheduler-threads* :test #'eq))
+          (async-thread-wait-until
+           th (lambda () (not (funcall has-backpressure))))
+          (setf (async-task-gate-parked task) nil)
+          (decf (getf fields :num-waiting-to-enter))
+          (when (%task-deliver-pending-cancel task)
+            ;; cancelled while waiting: resolve without running
+            (%task-cancel task)
+            (return-from %task-enter-implicit-thread nil)))
+        (when (%task-needs-exclusive task)
+          (setf (getf fields :exclusive-thread) th))))
+    (setf (getf fields :threads)
+          (cons th (getf fields :threads)))
+    (sb-thread:with-recursive-lock (*scheduler-mutex*)
+      (push th *scheduler-threads*))
+    t))
+
+
+(defun %task-exit-implicit-thread (task)
+  "Task.exit_implicit_thread (CanonicalABI.md 730): release the
+  exclusive lock and unregister the thread (the FIELDS local, like
+  the enter gate: getf-setf through the shared plist)."
+  (let* ((th (async-task-implicit-thread task))
+         (inst (async-task-inst task))
+         (fields (%inst-async-fields inst)))
+    (setf (getf fields :threads)
+          (remove th (getf fields :threads)))
+    (sb-thread:with-recursive-lock (*scheduler-mutex*)
+      (setf *scheduler-threads*
+            (remove th *scheduler-threads* :test #'eq)))
+    (when (and (%task-ft-async-p task)
+               (%task-needs-exclusive task))
+      (setf (getf fields :exclusive-thread) nil)
+      ;; releasing the exclusive lock may admit a gate-parked peer
+      ;; of this instance (its gate readiness just became true)
+      (async-thread-resume-all))))
+
+(defun %task-has-pending-cancel (task)
+  (eq (async-task-state task) :pending-cancel))
+
+(defun %task-deliver-pending-cancel (task)
+  "Task.deliver_pending_cancel (CanonicalABI.md 775)."
+  (when (%task-has-pending-cancel task)
+    (setf (async-task-state task) :cancel-delivered)
+    t))
+
+(defun %task-request-cancellation (task)
+  "Task.request_cancellation (CanonicalABI.md 761): the OnCancel the
+  caller's subtask.cancel invokes. INITIAL (still at the backpressure
+  gate): mark PENDING and nudge the gate — the gate's re-test
+  performs Task.cancel, so wait for the resolution (the spec asserts
+  RESOLVED on return). STARTED: mark PENDING and nudge (the callback
+  event loop delivers TASK_CANCELLED on its next turn)."
+  (cond
+   ((eq (async-task-state task) :initial)
+    (setf (async-task-state task) :pending-cancel)
+    (when (async-task-implicit-thread task)
+      (async-thread-resume (async-task-implicit-thread task)))
+    (sb-thread:with-recursive-lock ((async-task-mutex task))
+      (loop until (async-task-resolved-p task)
+            do (sb-thread:condition-wait (async-task-waitqueue task)
+                                         (async-task-mutex task)))))
+   (t
+    (setf (async-task-state task) :pending-cancel)
+    (when (async-task-implicit-thread task)
+      (async-thread-resume (async-task-implicit-thread task))))))
+
+(defun %task-return (task result)
+  "Task.return_ (CanonicalABI.md 802): resolve with a value."
+  (when (eq (async-task-state task) :resolved)
+    (error 'wasmdown:wasm-trap :kind :generic
+           :message "task already returned"))
+  (unless (zerop (async-task-num-borrows task))
+    (error 'wasmdown:wasm-trap :kind :generic
+           :message "cannot return with outstanding borrows"))
+  (funcall (async-task-on-resolve task) result)
+  (setf (async-task-state task) :resolved)
+  (sb-thread:with-recursive-lock ((async-task-mutex task))
+    (setf (async-task-resolved-p task) t)
+    (setf (async-task-result task) result)
+    (sb-thread:condition-broadcast (async-task-waitqueue task)))
+  ;; M11a wake propagation: a resolution may unblock SIBLING tasks
+  ;; (a parked waiter's readiness condition reads this task's
+  ;; state, a subtask's pending-event closure runs at delivery) —
+  ;; nudge every live thread so they re-test (Store.tick, §932)
+  (async-thread-resume-all))
+
+(defun %task-cancel (task)
+  "Task.cancel (CanonicalABI.md 818): resolve with cancellation (only
+  after DELIVERY)."
+  (unless (eq (async-task-state task) :cancel-delivered)
+    (error 'wasmdown:wasm-trap :kind :generic
+           :message "cannot cancel before delivery"))
+  (unless (zerop (async-task-num-borrows task))
+    (error 'wasmdown:wasm-trap :kind :generic
+           :message "cannot cancel with outstanding borrows"))
+  (funcall (async-task-on-resolve task) :cancelled)
+  (setf (async-task-state task) :resolved)
+  (sb-thread:with-recursive-lock ((async-task-mutex task))
+    (setf (async-task-resolved-p task) t)
+    (sb-thread:condition-broadcast (async-task-waitqueue task)))
+  ;; M11a wake propagation (same as %task-return)
+  (async-thread-resume-all))
+
+;;; ---------------------------------------------------------------
+;;; Waitable / WaitableSet operations (CanonicalABI.md 1282-1394).
+
+(declaim (notinline %waitable-join %wset-has-pending-event
+                    %wset-get-pending-event %wset-wait
+                    %wset-poll %wset-drop %wset-wait-from-callback))
+
+(defun %waitable-in-wset (w) (and (async-waitable-wset w) t))
+
+(defun %waitable-join (w wset)
+  "Waitable.join (CanonicalABI.md 1302): move W into WSET (or out,
+  when WSET is NIL)."
+  (when (async-waitable-has-sync-waiter w)
+    (error 'wasmdown:wasm-trap :kind :generic
+           :message "waitable has a sync waiter"))
+  (when (async-waitable-wset w)
+    (setf (async-waitable-set-elems (async-waitable-wset w))
+          (remove w (async-waitable-set-elems
+                     (async-waitable-wset w))
+                  :test #'eq)))
+  (setf (async-waitable-wset w) wset)
+  (when wset
+    (sb-thread:with-recursive-lock ((async-waitable-set-mutex wset))
+      (push w (async-waitable-set-elems wset))
+      ;; an arriving waitable may already hold a pending event: wake
+      ;; the set's waiters
+      (sb-thread:condition-broadcast (async-waitable-set-waitqueue wset)
+                                 ))))
+
+(defun %waitable-get-pending-event (w)
+  "Waitable.get_pending_event (CanonicalABI.md 1297): run and clear."
+  (let ((ev (async-waitable-pending-event w)))
+    (setf (async-waitable-pending-event w) nil)
+    (funcall ev)))
+
+(defun %waitable-event-ready-p (w)
+  "A waitable's event is READY when its closure exists AND — for a
+SUBTASK — the resolve has actually happened (§1282-1294: the event
+exists only in the resolved state; the pack-time closure merely
+computes the tuple at delivery time)."
+  (and (async-waitable-pending-event w)
+       (or (not (async-subtask-p w))
+           (%subtask-resolved-p w))))
+
+(defun %wset-has-pending-event (wset)
+  "WaitableSet.has_pending_event (CanonicalABI.md 1335)."
+  (some #'%waitable-event-ready-p
+        (async-waitable-set-elems wset)))
+
+(defun %wset-get-pending-event (wset)
+  "WaitableSet.get_pending_event (CanonicalABI.md 1338): deliver one
+  element's pending event (arrival order — the spec's shuffle is
+  the host's freedom)."
+  (loop for w in (reverse (async-waitable-set-elems wset))
+        when (%waitable-event-ready-p w)
+          do (return-from %wset-get-pending-event
+               (%waitable-get-pending-event w))))
+
+(defun %wset-wait (wset)
+  "WaitableSet.wait (CanonicalABI.md 1352): block until an element
+  has a pending event, then deliver it. The num_waiting count guards
+  WaitableSet.drop. §3522-3543: a SYNCHRONOUS task (no implicit
+  thread — e.g. a sync-lifted start function) cannot block: no
+  other thread could ever wake it — trap instead of hanging."
+  (unless *current-thread*
+    (error 'wasmdown:wasm-trap :kind :generic
+           :message "cannot block a synchronous task before returning"))
+  (incf (async-waitable-set-num-waiting wset))
+  (unwind-protect
+       (progn
+         (async-thread-wait-until
+          *current-thread*
+          (lambda () (%wset-has-pending-event wset)))
+         (%wset-get-pending-event wset))
+    (decf (async-waitable-set-num-waiting wset))))
+
+(defun %wset-poll (wset)
+  "WaitableSet.poll (CanonicalABI.md 1358)."
+  (if (%wset-has-pending-event wset)
+      (%wset-get-pending-event wset)
+      (list 0 0 0)))
+
+(defun %wset-drop (wset)
+  "WaitableSet.drop (CanonicalABI.md 1391): trap when non-empty or
+  waited upon (the fixture message covers both cases)."
+  (when (or (async-waitable-set-elems wset)
+            (> (async-waitable-set-num-waiting wset) 0))
+    (error 'wasmdown:wasm-trap :kind :generic
+           :message "cannot drop waitable set with waiters")))
+
+(defun %wset-wait-from-callback (wset)
+  "WaitableSet.wait_from_callback (CanonicalABI.md 1373): the
+  readiness condition ALSO requires the exclusive_thread lock free;
+  pending cancellation is delivered as TASK_CANCELLED (code 6)."
+  (let* ((thread *current-thread*)
+         (task *current-task*)
+         (inst (async-task-inst task)))
+    (incf (async-waitable-set-num-waiting wset))
+    (unwind-protect
+         (progn
+           (async-thread-wait-until
+            thread
+            (lambda ()
+              (and (null (%inst-exclusive-thread inst))
+                   (or (%wset-has-pending-event wset)
+                       (%task-has-pending-cancel task)))))
+           (if (%task-deliver-pending-cancel task)
+               (list 6 0 0)             ; EventCode.TASK_CANCELLED
+               (%wset-get-pending-event wset)))
+      (decf (async-waitable-set-num-waiting wset)))))
+
+;;; ---------------------------------------------------------------
+;;; Subtask operations (CanonicalABI.md 1435-1488).
+
+(declaim (notinline %subtask-resolved-p %subtask-resolve
+                    %subtask-deliver-resolve %subtask-drop))
+
+(defun %subtask-resolved-p (s)
+  "Subtask.resolved (CanonicalABI.md 1435)."
+  (>= (async-subtask-state s) 2))
+
+(defun %subtask-resolve (s state flat-results)
+  "Subtask.resolve (CanonicalABI.md 1460)."
+  (setf (async-subtask-state s) state)
+  (setf (async-subtask-flat-results s) flat-results)
+  ;; the resolve arms the subtask's WAITABLE event: a waiter parked
+  ;; on the owning set must re-test (§1282-1294 — the pending-event
+  ;; exists only once resolved)
+  (when (async-waitable-wset s)
+    (sb-thread:with-recursive-lock
+        ((async-waitable-set-mutex (async-waitable-wset s)))
+      (sb-thread:condition-broadcast
+       (async-waitable-set-waitqueue (async-waitable-wset s))))
+    (async-thread-resume-all)))
+
+(defun %subtask-deliver-resolve (s)
+  "Subtask.deliver_resolve (CanonicalABI.md 1467): the delivered mark
+  (the num_lends accounting is M11b's borrow transfer)."
+  (setf (async-subtask-resolve-delivered-p s) t))
+
+(defun %subtask-drop (s)
+  "Subtask.drop (CanonicalABI.md 1485): trap when the resolve has
+  not been delivered."
+  (unless (async-subtask-resolve-delivered-p s)
+    (error 'wasmdown:wasm-trap :kind :generic
+           :message "cannot drop a subtask which has not yet resolved"))
+  (%waitable-join s nil))
+
+;;; ---- Table.add for any handle record (waitables, sets, subtasks
+;;; share the instance's 1-based handle vector) ----
+
+(defun %handle-add-any (inst v)
+  (let ((vec (%inst-handles inst)))
+    (vector-push-extend v vec)
+    (length vec)))
+
+(defun %handle-at (inst i &optional (type-p #'identity) (what "handle"))
+  "Table.get with a type guard: the 1-based slot at I must hold a
+  record satisfying TYPE-P."
+  (let ((v (%inst-handles inst)))
+    (unless (and (integerp i) (> i 0) (<= i (length v))
+                 (funcall type-p (aref v (1- i))))
+      (error 'wasmdown:wasm-trap :kind :generic
+             :message (format nil "invalid ~a index ~a" what i)))
+    (aref v (1- i))))
+
+;;; ---------------------------------------------------------------
+;;; The canon_lift ASYNC entry (CanonicalABI.md 3389-3544): the
+;;; guest body runs on its own SBCL thread; the CALLER waits on the
+;;; task's resolution. The callback event loop runs INSIDE the
+;;; guest thread; the YIELD/WAIT turn boundaries are where the
+;;; guest thread blocks on its readiness condition.
+
+(defun %unpack-callback-result (packed)
+  "unpack_callback_result (CanonicalABI.md 3564)."
+  (let ((code (logand packed 15)))
+    (when (> code 2)
+      (error 'wasmdown:wasm-trap :kind :generic
+             :message "invalid callback result"))
+    (cons code (ash packed -4))))
+
+(defun %async-lift-guest-body (task lf cx)
+  "The thread_func of canon_lift (CanonicalABI.md 3390-3493): runs on
+  the guest's own SBCL thread. The task resolves via task.return /
+  task.cancel (the host built-ins call %task-return on THIS task —
+  *CURRENT-TASK* is thread-bound); the SYNC-lifted shape returns the
+  value directly from the core call and resolves the task itself."
+  (let* ((inst (async-task-inst task))
+         (opts (async-task-opts task))
+         (ft (async-task-ft task))
+         (core (lifted-func-core lf))
+         (callback-opt (wasmdown.component:canon-opt opts :callback))
+         (callback (and callback-opt
+                         (< (second callback-opt)
+                            (length (comp-instance-core-funcs inst)))
+                         (aref (comp-instance-core-funcs inst)
+                               (second callback-opt))))
+         (th (async-task-implicit-thread task)))
+    (unless (%task-enter-implicit-thread task)
+      ;; cancelled at the backpressure gate: already resolved
+      (return-from %async-lift-guest-body :cancelled-at-gate))
+    (setf (async-task-state task) :started)
+    (let* ((args (funcall (async-task-on-start task)))
+           (params (and ft (coerce (first (wasmdown.component:ct-payload
+                                           ft)) 'list)))
+           (vals (loop for p in (or params '())
+                       for a in (or args '())
+                       collect (%abi-arg-domain a (cdr p) cx)))
+           (flat-args
+             (if (or (abi-cx-memory cx) params)
+                 (%abi-lower-values
+                  cx (if (%task-opts-async-p task) 4 16)
+                  vals (loop for p in (or params '())
+                             collect (cdr p)))
+                 '()))
+           (flat-ft
+             (and ft (wasmdown.component:flatten-functype
+                      ft (comp-instance-types inst)
+                      (if callback :lower :lift)))))
+      (cond
+       ((and (%task-opts-async-p task) callback)
+        ;; ---- THE CALLBACK EVENT LOOP (§3464-3493) ----
+        (let ((packed (first (apply #'wasmdown.runtime:wasm-call
+                                     core flat-args))))
+          (loop
+            (let ((code/si (%unpack-callback-result packed)))
+              (when (eq (car code/si) 0) (return)) ; EXIT
+              ;; the turn boundary: deliver pending cancel FIRST
+              (let ((event
+                      (if (%task-deliver-pending-cancel task)
+                          (list 6 0 0)          ; TASK_CANCELLED
+                          (case (car code/si)
+                            (1                     ; YIELD
+                             ;; release the exclusive lock while
+                             ;; waiting (§3470-3471) so siblings run;
+                             ;; the readiness (exclusive lock FREE)
+                             ;; is IMMEDIATELY true here, so a bare
+                             ;; wait-until would hot-spin the guest
+                             ;; (cb -> YIELD -> cb) and starve the
+                             ;; siblings — the §507 host freedom is
+                             ;; used to BLOCK: park this thread on
+                             ;; its waitqueue for a scheduler nudge
+                             ;; (Store.tick), giving other threads
+                             ;; real CPU
+                             (setf (async-thread-cancellable th) t)
+                             (let ((saved (%inst-exclusive-thread inst)))
+                               (setf (%inst-exclusive-thread inst) nil)
+                               (unwind-protect
+                                    (async-thread-yield th)
+                                 (setf (%inst-exclusive-thread inst)
+                                       saved)
+                                 (setf (async-thread-cancellable th)
+                                       nil)))
+                             (if (%task-deliver-pending-cancel task)
+                                 (list 6 0 0)
+                                 (list 0 0 0)))
+                            (2                     ; WAIT
+                             (let ((wset
+                                     (%handle-at
+                                      inst (cdr code/si)
+                                      #'async-waitable-set-p
+                                      "waitable set")))
+                               (setf (async-thread-cancellable th) t)
+                               ;; §3480-3483: the WAIT turn ALSO
+                               ;; releases the exclusive lock for the
+                               ;; duration of the wait (the readiness
+                               ;; condition of wait_from_callback
+                               ;; REQUIRES it free — holding it here
+                               ;; self-deadlocks the callback loop)
+                               (let ((saved (%inst-exclusive-thread inst)))
+                                 (setf (%inst-exclusive-thread inst) nil)
+                                 (unwind-protect
+                                      (%wset-wait-from-callback wset)
+                                   (setf (%inst-exclusive-thread inst)
+                                         saved)
+                                   (setf (async-thread-cancellable th)
+                                         nil)))))
+                            (t
+                             (error 'wasmdown:wasm-trap
+                                    :kind :generic
+                                    :message "invalid callback result"))))))
+                (setf packed
+                      (first (apply #'wasmdown.runtime:wasm-call
+                                    callback
+                                    (list (first event)
+                                          (second event)
+                                          (third event))))))))))
+       (t
+        ;; ---- the STACKFUL async case (§3452-3456) and the SYNC
+        ;; lift of an ASYNC-TYPED functype: a single core call. The
+        ;; callee resolves via task.return (async-typed) — or, when
+        ;; the functype is SYNC-typed (a plain sync lift), the core
+        ;; results ARE the value (lifted here and resolved).
+        (let ((res (apply #'wasmdown.runtime:wasm-call core flat-args)))
+          (unless (%task-opts-async-p task)
+            ;; SYNC-TYPED: the results lift per the functype; the
+            ;; sync-caller drain loop (below) needs the task resolved
+            (let* ((result (second (wasmdown.component:ct-payload
+                                    ft)))
+                   (vi (make-array 16 :fill-pointer 0
+                                   :adjustable t)))
+              (loop for r in (coerce res 'list)
+                    for rt in (result-core-types lf result)
+                    do (vector-push-extend (cons r rt) vi))
+              (let ((lifted
+                      (if result
+                          (%abi-lift-values cx 1 vi (list result))
+                          '())))
+                (%task-return task (first lifted)))))))
+      (%task-exit-implicit-thread task)))))
+
+(defun %canon-lift-async (lf args)
+  "The ASYNC canon_lift entry (CanonicalABI.md 3389, 3535-3543):
+  create the Task + Thread pair, run the guest body on a fresh SBCL
+  thread, wait for the resolution, and return the component-level
+  result (the runner's INVOKE path). A guest TRAP propagates to the
+  caller; a task that never resolves (the guest returned without
+  task.return and no other thread can make progress) is the DEADLOCK
+  trap (§3539-3542: no ready candidates)."
+  (let* ((ft (lifted-func-type lf))
+         (opts (lifted-func-opts lf))
+         (inst (lifted-func-inst lf))
+         (task (make-async-task
+                :ft ft :opts opts :inst inst
+                :on-start (lambda () args)))
+         (th (make-async-thread :task task))
+         (enc-opt (wasmdown.component:canon-opt opts :string-encoding))
+         (cx (make-abi-cx
+              :memory (lifted-func-memory lf)
+              :realloc (lifted-func-realloc lf)
+              :encoding (%abi-encoding-of enc-opt)
+              :inst inst))
+         (cell (cons nil nil)))
+    (setf (async-task-implicit-thread task) th)
+    (setf (async-task-on-resolve task)
+          (lambda (result)
+            (setf (car cell) t (cdr cell) result)))
+    (let ((guest
+            (sb-thread:make-thread
+             (lambda ()
+               (let ((*current-task* task)
+                     (*current-thread* th)
+                     (*handle-caller-inst* inst))
+                 (handler-case
+                     (%async-lift-guest-body task lf cx)
+                 (error (c)
+                   ;; a guest trap/abort records the failure for
+                    ;; the caller (the trap re-signals at the
+                    ;; component boundary)
+                    (setf (car cell) :trap
+                          (cdr cell) c)
+                     (sb-thread:with-recursive-lock
+                         ((async-task-mutex task))
+                       (setf (async-task-resolved-p task) t)
+                       (sb-thread:condition-broadcast
+                        (async-task-waitqueue task)))
+                     ;; M11a wake propagation: a trapped task may
+                     ;; be the waker sibling parked tasks awaited
+                     ;; (Store.tick, §932)
+                     (async-thread-resume-all))))))))
+      (declare (ignore guest))
+      (sb-thread:grab-mutex (async-task-mutex task))
+      (unwind-protect
+           (loop
+             with idle-cycles = 0
+             when (async-task-resolved-p task)
+               do (return)
+             ;; nudge every live thread, then give them a slice of
+             ;; CPU — the deadlock oracle (§3539-3542) must OBSERVE
+             ;; whether any thread made progress, so a bare
+             ;; condition-wait (sleeping until this task's own
+             ;; resolution) would hang exactly when it must trap
+             do (let ((before *async-progress*))
+                  (async-thread-resume-all)
+                  (sb-thread:release-mutex (async-task-mutex task))
+                  (sleep 0.002)
+                  (sb-thread:grab-mutex (async-task-mutex task))
+                  (if (> *async-progress* before)
+                      (setf idle-cycles 0)
+                      (incf idle-cycles)))
+             ;; THE DEADLOCK TRAP (§3539-3542): enough consecutive
+             ;; quiescent cycles with the task unresolved = no ready
+             ;; candidate can ever make progress
+             when (>= idle-cycles 50)
+               do (error 'wasmdown:wasm-trap :kind :generic
+                         :message
+                         "deadlock detected: event loop cannot make further progress"))
+        (sb-thread:release-mutex (async-task-mutex task)))
+      (etypecase (car cell)
+        ((eql t)
+         (let ((r (cdr cell)))
+           (if (eq r :cancelled) nil r)))
+        (null
+         ;; the guest body finished without resolving the task: no
+         ;; thread can make further progress — the deadlock trap
+         (error 'wasmdown:wasm-trap :kind :generic
+                :message
+                "deadlock detected: event loop cannot make further progress"))
+        (keyword (error (cdr cell)))))))
+
+;;; ---------------------------------------------------------------
+;;; The canon <builtin> ASYNC host funcs (CanonicalABI.md 3835-4239).
+;;; Each canon's %exec-canon :builtin arm allocates one; the bodies
+;;; read *CURRENT-TASK* (bound per-thread during guest execution).
+
+(declaim (notinline %builtin-async-host-func))
+
+(defun %current-task-or-trap ()
+  (or *current-task*
+      (error 'wasmdown:wasm-trap :kind :generic
+             :message "called an async builtin outside a task")))
+(declaim (notinline %task-return-result-type))
+
+(defun %task-return-result-type (imms)
+  "The (result $t)? immediate's component valtype, or NIL. The
+BINARY's second immediate is the raw valtype itself (a keyword or
+an (:idx . n) cons) — binary.wast ::94's (:task-return :u32); the
+TEXT parser's is the collected-valtypes list whose first element
+is the valtype."
+  (let ((rs (second imms)))
+    (cond
+     ((null rs) nil)
+     ;; the TEXT parser's collected-valtypes list: the first element
+     ;; is the valtype keyword or the (:idx . n) cons
+     ((and (consp rs) (consp (first rs))
+           (listp (first (first rs))))
+      (first (first rs)))
+     ;; the raw valtype itself (keyword / (:idx . n)) — the binary's
+     ;; second immediate (binary.wast ::94) or the single-collect case
+     ((not (consp rs)) rs)
+     (t (first rs)))))
+
+(defun %task-return-opts (imms)
+  "The canon's trailing canonopts (the third immediate)."
+  (third imms))
+
+(defun %task-return-flat-types (inst imms)
+  "The flat core PARAMS of task.return — the result type's flattened
+  slots (CanonicalABI.md 3929: flatten_functype of (func (param $t)?)
+  in the LOWER context: the params ARE the flat result slots, no
+  out-param is appended)."
+  (let ((rt (%task-return-result-type imms)))
+    (if rt (%flat-type-of rt inst) '())))
+
+(defun %wset-event-cx (inst kind imms)
+  "waitable-set.wait/poll's memory option (the event-payload store
+  memory) as an abi-cx."
+  (declare (ignore kind))
+  (let* ((mem-idx (second imms))
+         (memory (and (integerp mem-idx)
+                      (< mem-idx (length (comp-instance-core-memories
+                                         inst)))
+                      (aref (comp-instance-core-memories inst)
+                            mem-idx))))
+    (make-abi-cx :memory memory :inst inst)))
+
+(defun %unpack-event-store (cx event ptr)
+  "unpack_event (CanonicalABI.md 4043): the two i32 payloads stored
+  at PTR and PTR+4; the event code returns as the i32 result."
+  (%abi-check-span cx ptr 8 "event")
+  (%abi-check-align cx ptr 4 "event")
+  (%abi-store-int cx (second event) ptr 4)
+  (%abi-store-int cx (third event) (+ ptr 4) 4)
+  (first event))
+
+(defun %builtin-async-host-func (inst kind imms)
+  "The canon <builtin> core wrapper: a real host func-instance whose
+  signature is the flat sig the canon marker recorded. IMMS carries
+  the builtin's immediates (task.return's result + opts, the
+  subtask.cancel async flag, wait/poll's memory option). The
+  thread.*/future.*/stream.*/error-context.* kinds stay OPAQUE (M11b):
+  the canon still allocates the core-func slot (instantiate stays
+  green); the CALL traps."
+  (ecase kind
+    ((:task-return)
+     (let ((flat (%task-return-flat-types inst imms))
+           (rt (%task-return-result-type imms))
+           (opts (%task-return-opts imms)))
+       (let* ((mem-opt (and opts
+                            (wasmdown.component:canon-opt
+                             opts :memory)))
+              (enc-opt (and opts
+                            (wasmdown.component:canon-opt
+                             opts :string-encoding)))
+              (memory (and mem-opt
+                           (< (second mem-opt)
+                              (length (comp-instance-core-memories
+                                       inst)))
+                           (aref (comp-instance-core-memories inst)
+                                 (second mem-opt)))))
+         (wasmdown.runtime:make-host-func-instance
+          (wasmdown.types:make-wasm-func-type flat '())
+          (lambda (args)
+            (let* ((task (%current-task-or-trap))
+                   (cx (make-abi-cx
+                        :memory memory
+                        :encoding (%abi-encoding-of enc-opt)
+                        :inst inst)))
+              ;; lift_flat_values of the flat args per the RESULT
+              ;; type (MAX_FLAT_PARAMS — 16 — the task-return
+              ;; direction is a LIFT: core -> component)
+              (let ((vi (make-array 16 :fill-pointer 0
+                                   :adjustable t)))
+                (loop for a in args
+                      for ft_ in flat
+                      do (vector-push-extend (cons a ft_) vi))
+                (let ((lifted
+                       (if rt (%abi-lift-values cx 16 vi (list rt))
+                           '())))
+                  (%task-return task (first lifted))))
+              '()))))))
+    ((:task-cancel)
+     (wasmdown.runtime:make-host-func-instance
+      (wasmdown.types:make-wasm-func-type '() '())
+      (lambda (args)
+        (declare (ignore args))
+        (%task-cancel (%current-task-or-trap))
+        '())))
+    ((:context-get)
+     (wasmdown.runtime:make-host-func-instance
+      (wasmdown.types:make-wasm-func-type '() '(:i32))
+      (lambda (args)
+        (declare (ignore args))
+        (let* ((thread *current-thread*)
+               (i (third imms)))
+          (unless thread
+            (error 'wasmdown:wasm-trap :kind :generic
+                   :message "called an async builtin outside a task"))
+          (list (aref (async-thread-storage thread) i))))))
+    ((:context-set)
+     (wasmdown.runtime:make-host-func-instance
+      (wasmdown.types:make-wasm-func-type '(:i32) '())
+      (lambda (args)
+        (let* ((thread *current-thread*)
+               (i (third imms)))
+          (unless thread
+            (error 'wasmdown:wasm-trap :kind :generic
+                   :message "called an async builtin outside a task"))
+          (setf (aref (async-thread-storage thread) i)
+                (first args)))
+        '())))
+    ((:backpressure-inc)
+     (wasmdown.runtime:make-host-func-instance
+      (wasmdown.types:make-wasm-func-type '() '())
+      (lambda (args)
+        (declare (ignore args))
+        (incf (%inst-backpressure inst))
+        '())))
+    ((:backpressure-dec)
+     (wasmdown.runtime:make-host-func-instance
+      (wasmdown.types:make-wasm-func-type '() '())
+      (lambda (args)
+        (declare (ignore args))
+        (decf (%inst-backpressure inst))
+        ;; a dec may unblock gate-waiting threads
+        (async-thread-resume-all)
+        '())))
+    ((:waitable-set-new)
+     (wasmdown.runtime:make-host-func-instance
+      (wasmdown.types:make-wasm-func-type '() '(:i32))
+      (lambda (args)
+        (declare (ignore args))
+        (list (%handle-add-any inst
+                               (make-async-waitable-set))))))
+    ((:waitable-set-drop)
+     (wasmdown.runtime:make-host-func-instance
+      (wasmdown.types:make-wasm-func-type '(:i32) '())
+      (lambda (args)
+        (let* ((wset (%handle-at inst (first args)
+                                #'async-waitable-set-p
+                                "waitable set"))
+               (h (%inst-handles inst)))
+          (%wset-drop wset)
+          (setf (aref h (1- (first args))) nil))
+        '())))
+    ((:waitable-set-wait :waitable-set-poll)
+     (let ((cx (%wset-event-cx inst kind imms)))
+       (wasmdown.runtime:make-host-func-instance
+        (wasmdown.types:make-wasm-func-type '(:i32 :i32) '(:i32))
+        (lambda (args)
+          (let* ((wset (%handle-at inst (first args)
+                                   #'async-waitable-set-p
+                                   "waitable set"))
+                 (ptr (second args))
+                 (event (if (eq kind :waitable-set-wait)
+                            (%wset-wait wset)
+                            (%wset-poll wset))))
+            (list (%unpack-event-store cx event ptr)))))))
+    ((:waitable-join)
+     (wasmdown.runtime:make-host-func-instance
+      (wasmdown.types:make-wasm-func-type '(:i32 :i32) '())
+      (lambda (args)
+        (let* ((w (%handle-at inst (first args)
+                              #'async-waitable-p "waitable"))
+               (si (second args))
+               (wset (and (/= si 0)
+                          (%handle-at inst si
+                                      #'async-waitable-set-p
+                                      "waitable set"))))
+          (when (async-waitable-has-sync-waiter w)
+            (error 'wasmdown:wasm-trap :kind :generic
+                   :message "waitable has a sync waiter"))
+          (%waitable-join w wset))
+        '())))
+    ((:subtask-cancel)
+     (wasmdown.runtime:make-host-func-instance
+      (wasmdown.types:make-wasm-func-type '(:i32) '(:i32))
+      (lambda (args)
+        (let ((subtask (%handle-at inst (first args)
+                                    #'async-subtask-p "subtask"))
+              (result nil))
+          (when (async-subtask-resolve-delivered-p subtask)
+            (error 'wasmdown:wasm-trap :kind :generic
+                   :message "subtask resolve already delivered"))
+          (when (async-subtask-cancellation-requested subtask)
+            (error 'wasmdown:wasm-trap :kind :generic
+                   :message "subtask cancellation already requested"))
+          (when (%waitable-in-wset subtask)
+            (error 'wasmdown:wasm-trap :kind :generic
+                   :message "subtask is in a waitable set"))
+          (unless (%subtask-resolved-p subtask)
+            (setf (async-subtask-cancellation-requested subtask) t)
+            (setf (async-waitable-has-sync-waiter subtask) t)
+            (unwind-protect
+                 (funcall (async-subtask-on-cancel subtask))
+              (setf (async-waitable-has-sync-waiter subtask) nil))
+            (unless (or (second imms)          ; the `async` opt
+                        (%subtask-resolved-p subtask))
+              ;; SYNC cancel: block until the subtask resolves
+              (async-thread-wait-until
+               *current-thread*
+               (lambda () (%subtask-resolved-p subtask))))
+            (unless (%subtask-resolved-p subtask)
+              (setf result (list #xffffffff))))  ; BLOCKED
+          (unless result
+            (%subtask-deliver-resolve subtask)
+            (setf result (list (async-subtask-state subtask))))
+          result))))
+    ((:subtask-drop)
+     (wasmdown.runtime:make-host-func-instance
+      (wasmdown.types:make-wasm-func-type '(:i32) '())
+      (lambda (args)
+        (let ((s (%handle-at inst (first args)
+                             #'async-subtask-p "subtask"))
+               (h (%inst-handles inst)))
+          (%subtask-drop s)
+          (setf (aref h (1- (first args))) nil))
+        '())))
+    ;; thread.*/future.*/stream.*/error-context.* stay OPAQUE (M11b):
+    ;; the slot exists but the call traps (never at instantiate).
+    ((:thread-yield :thread-suspend :thread-resume-later
+      :thread-suspend-then-resume :thread-yield-then-resume
+      :thread-suspend-then-promote :thread-yield-then-promote
+      :thread-index :thread-new-indirect
+      :stream-new :stream-read :stream-write
+      :stream-cancel-read :stream-cancel-write
+      :stream-drop-readable :stream-drop-writable :stream-forward
+      :future-new :future-read :future-write
+      :future-cancel-read :future-cancel-write
+      :future-drop-readable :future-drop-writable
+      :future-forward
+      :error-context-new :error-context-debug-message
+      :error-context-drop)
+     nil)))
+
+;;; ---------------------------------------------------------------
+;;; The canon_lower ASYNC core wrapper (CanonicalABI.md 3618-3741):
+;;; a host func with the async-lower flat sig. The call starts the
+;;; callee's FuncInst, hands it the OnStart/OnResolve pair, and
+;;; returns the packed state|(subtaski<<4) — or the eager [RETURNED]
+;;; when the callee resolved before returning.
+
+(defun %canon-lower-async-host-func (inst fidx canon)
+  "The async LOWER's core wrapper (CanonicalABI.md 3713-3729): spawn
+  the callee task via the target lifted func's async lift entry,
+  register the Subtask, and return the packed state — RETURNED(2)
+  eager when the callee resolved synchronously."
+  (let* ((f (aref (comp-instance-funcs inst) fidx))
+         (ft (and (lifted-func-p f) (lifted-func-type f)))
+         (opts (and (lifted-func-p f) (lifted-func-opts f)))
+         (params (and ft (eq (wasmdown.component:ct-kind ft) :func)
+                      (coerce (first (wasmdown.component:ct-payload
+                                     ft)) 'list)))
+         (result (and ft (eq (wasmdown.component:ct-kind ft) :func)
+                      (second (wasmdown.component:ct-payload ft))))
+         (ft-inst (if (lifted-func-p f) (lifted-func-inst f) inst))
+         (flat (wasmdown.component:flatten-functype
+                ft (comp-instance-types ft-inst) :lower
+                :async-p t))
+         (core-params (coerce (car flat) 'list))
+         ;; the LOWER's OWN canonopts (the caller's memory/realloc)
+         (lopts (wasmdown.component:canonrec-opts canon))
+         (mem-opt (wasmdown.component:canon-opt lopts :memory))
+         (realloc-opt (wasmdown.component:canon-opt lopts :realloc))
+         (enc-opt (wasmdown.component:canon-opt lopts
+                                          :string-encoding))
+         (memory (and mem-opt
+                      (< (second mem-opt)
+                         (length (comp-instance-core-memories inst)))
+                      (aref (comp-instance-core-memories inst)
+                            (second mem-opt))))
+         (realloc (and realloc-opt
+                       (< (second realloc-opt)
+                          (length (comp-instance-core-funcs inst)))
+                       (aref (comp-instance-core-funcs inst)
+                             (second realloc-opt)))))
+    (wasmdown.runtime:make-host-func-instance
+     (wasmdown.types:make-wasm-func-type core-params '(:i32))
+     (lambda (args)
+       (let* ((subtask (make-async-subtask))
+              (cx (make-abi-cx
+                   :memory memory
+                   :realloc realloc
+                   :encoding (%abi-encoding-of enc-opt)
+                   :inst ft-inst))
+              (ts (loop for p in (or params '())
+                        collect (cdr p)))
+              (flat-types (loop for vt in ts
+                                append (%flat-type-of vt ft-inst)))
+              (component-args
+                (if (> (length flat-types) 4)
+                    ;; the >4 collapse: the single [ptr] loads the
+                    ;; tuple back out of the caller's memory
+                    (let* ((ptr (first args))
+                           (tuple (make-ct* :tuple (coerce ts 'vector))))
+                      (coerce (%abi-load cx tuple ptr) 'list))
+                    (let ((vi (make-array 16 :fill-pointer 0
+                                         :adjustable t)))
+                      (loop for a in args
+                            for ft_ in flat-types
+                            do (vector-push-extend
+                                (cons a ft_) vi))
+                      (%abi-lift-values cx 4 vi ts))))
+              (resolved-state nil)
+              (resolved-val nil))
+         ;; OnStart (§3651): the callee reads its args (the state
+         ;; moves STARTING -> STARTED)
+         ;; OnResolve (§3657): the callee's result lowers back into
+         ;; the CALLER's [ptr] out-param (the LAST core arg)
+         (multiple-value-bind (on-cancel callee-task)
+             (%call-async-funcinst f component-args
+               :on-start (lambda ()
+                           (setf (async-subtask-state subtask) 1))
+               :on-resolve (lambda (val)
+                             (cond
+                              ((eq val :cancelled)
+                               (setf resolved-state
+                                     (if (= (async-subtask-state
+                                             subtask)
+                                             0)
+                                         3 4))
+                               (%subtask-resolve subtask
+                                                 resolved-state nil))
+                              (t
+                               ;; lower the results into the
+                               ;; caller's out-param
+                               (when (and result memory)
+                                 (let ((rflat
+                                         (%flat-type-of result
+                                                        ft-inst)))
+                                   (when rflat
+                                     (%abi-store cx val result
+                                                 (first
+                                                  (last args))))))
+                               (%subtask-resolve subtask 2 nil)))
+                             (setf resolved-val val)
+                             (async-thread-resume-all)))
+           (setf (async-subtask-task subtask) callee-task)
+           (setf (async-subtask-on-cancel subtask) on-cancel))
+         ;; §3707: the packed return reports STARTING(0) or
+         ;; STARTED(1); the fixtures REQUIRE STARTED when the callee
+         ;; actually got started (async-calls-sync's 0x21/0x31
+         ;; checks) — the callee's OnStart fires on its own thread,
+         ;; so WAIT for the STARTING->STARTED transition (or the
+         ;; eager resolve) before packing. A sync-typed inline
+         ;; callee resolves before reaching here (no wait).
+         (unless (%subtask-resolved-p subtask)
+           (loop
+             with cycles = 0
+             until (or (%subtask-resolved-p subtask)
+                       (/= (async-subtask-state subtask) 0)
+                       (async-task-gate-parked
+                        (async-subtask-task subtask)))
+             do (async-thread-resume-all)
+                (sleep 0.001)))
+         (if (%subtask-resolved-p subtask)
+             ;; the EAGER case (§3714-3717): resolved before return
+             (progn
+               (%subtask-deliver-resolve subtask)
+               (list 2))                   ; Subtask.State.RETURNED
+             (let ((subtaski (%handle-add-any inst subtask)))
+               ;; the PENDING-EVENT closure (§3720-3725): delivered
+               ;; on the next wait/poll — computes the event at
+               ;; DELIVERY time
+               (setf (async-waitable-pending-event subtask)
+                     (lambda ()
+                       (when (%subtask-resolved-p subtask)
+                         (%subtask-deliver-resolve subtask))
+                       (list 1 subtaski          ; EventCode.SUBTASK
+                             (async-subtask-state subtask))))
+               (list (logior (async-subtask-state subtask)
+                             (ash subtaski 4))))))))))
+
+(defun %call-async-funcinst (f component-args &key on-start on-resolve)
+  "Start the callee's FuncInst: F is the target lifted func; the
+  async-typed ones go through the task machinery (the task runs on
+  its own thread and resolves asynchronously — %canon-lift-async
+  BLOCKS until resolution, so run it on a FRESH thread); a
+  SYNC-typed callee runs inline and resolves before returning.
+  Returns the OnCancel closure (the subtask's cancel hook)."
+  (let ((ft (and (lifted-func-p f)
+                 (lifted-func-type f))))
+    (if (and ft (third (wasmdown.component:ct-payload ft)))
+        ;; the callee is ASYNC-TYPED: run the lift on its own thread
+        ;; (the task resolves via task.return whenever it's ready)
+        (let* ((task (make-async-task
+                      :ft ft
+                      :opts (lifted-func-opts f)
+                      :inst (lifted-func-inst f)
+                      :on-start (lambda ()
+                                  (when on-start (funcall on-start))
+                                  component-args)))
+               (th (make-async-thread :task task)))
+          (setf (async-task-implicit-thread task) th)
+          (setf (async-task-on-resolve task)
+                (lambda (result)
+                  (funcall on-resolve
+                           (if (eq result :cancelled)
+                               :cancelled result))))
+          (%inst-async-fields (lifted-func-inst f))
+          (sb-thread:make-thread
+           (lambda ()
+             (let ((*current-task* task)
+                   (*current-thread* th)
+                   (*handle-caller-inst* (lifted-func-inst f)))
+               (handler-case
+                   (%async-lift-guest-body
+                    task f
+                    (make-abi-cx
+                     :memory (lifted-func-memory f)
+                     :realloc (lifted-func-realloc f)
+                     :inst (lifted-func-inst f)))
+                 (error (c)
+                   (declare (ignore c))
+                   ;; a trapped callee resolves as cancelled (the
+                   ;; trap semantics propagate at the boundary)
+                   (unless (async-task-resolved-p task)
+                     (funcall on-resolve :cancelled))
+                   (sb-thread:with-recursive-lock
+                       ((async-task-mutex task))
+                     (setf (async-task-resolved-p task) t)
+                     (sb-thread:condition-broadcast
+                      (async-task-waitqueue task)))
+                   ;; M11a wake propagation: the trapped-callee case
+                   (async-thread-resume-all)))))
+           :name "async-lower-callee")
+          ;; the OnCancel: request the task's cancellation (the
+          ;; TASK is the second value — the lower stores it in the
+          ;; subtask for the STARTED-wait's gate-parked check)
+          (values (lambda () (%task-request-cancellation task))
+                  task))
+        ;; the callee is SYNC-TYPED: an inline call resolves at once
+        (let ((res (apply #'lifted-func-call f component-args)))
+          (funcall on-resolve res)
+          (values (lambda () nil) nil)))))
+
 ;;; Install the entry point into the runner's hook (src/wast.lisp
 ;;; loads first and calls through *COMPONENT-INSTANTIATOR*).
+
 (setf wasmdown.wast:*component-instantiator* #'instantiate-component)
 
 ;;; M9: the runner's component-instance ACTION hook (the contract

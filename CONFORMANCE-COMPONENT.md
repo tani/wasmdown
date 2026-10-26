@@ -15,20 +15,24 @@ Baseline measurement, not a release gate (PLAN.md §12.8).
 
 | Outcome | Count |
 | --- | --- |
-| pass | 1022 |
+| pass | 1031 |
 | fail | 0 |
 | skip | 0 |
 | unsupported | 0 |
 | timeout | 0 |
 | harness-error | 0 |
-| **total** | **1022** |
+| **total** | **1031** |
 
-Executed: 1022 commands; pass rate 100.0%.
+Executed: 1031 commands; pass rate 100.0%.
 
 ## Per-file counts
 
 | File | pass | fail | unsupported | other |
 | --- | --- | --- | --- | --- |
+| component/deadlock.wast | 2 | 0 | 0 | 0 |
+| component/dont-block-start.wast | 2 | 0 | 0 | 0 |
+| component/drop-subtask.wast | 3 | 0 | 0 | 0 |
+| component/drop-waitable-set.wast | 2 | 0 | 0 | 0 |
 | component/validate-no-async-abi-for-sync-type.wast | 3 | 0 | 0 | 0 |
 | component/validate-no-stream-char.wast | 1 | 0 | 0 | 0 |
 | component/validate-task-return.wast | 3 | 0 | 0 | 0 |

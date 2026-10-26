@@ -2348,6 +2348,192 @@ these pins guard the executor's mechanisms directly."
     ;; validates: the bag's entry resolves the canon's sig
     (wasmdown.component:validate-component comp)))
 
+(test component/async-task-yield-resume-pins
+  ;; M11a — the YIELD/EXIT protocol (CanonicalABI.md 3390/3464):
+  ;; an async-typed canon lift with (callback ...) runs the core,
+  ;; parks the task's thread on YIELD (the scheduler nudge resumes
+  ;; it) and the callback's EXIT resolves the task via
+  ;; task.return — the invoke returns the resolved value.
+  (let* ((ci (%exec-comp
+              (concatenate 'string
+                "(component"
+                " (core module $M"
+                "  (import \"\" \"task.return\" (func $task.return (param i32)))"
+                "  (memory (export \"mem\") 1)"
+                "  (global $g (mut i32) (i32.const 0))"
+                "  (func $f (export \"f\") (result i32)"
+                "    (global.set $g (i32.const 1))"
+                "    (i32.const 1))"
+                "  (func $f_cb (export \"f-cb\") (param i32 i32 i32) (result i32)"
+                "    (call $task.return (i32.const 42))"
+                "    (i32.const 0)))"
+                "  (canon task.return (result u32) (core func $task.return))"
+                "  (core instance $m (instantiate $M (with \"\" (instance"
+                "    (export \"task.return\" (func $task.return))))))"
+                " (func (export \"f\") async (result u32) (canon lift"
+                "   (core func $m \"f\")"
+                "   async (callback (core func $m \"f-cb\")))))"))))
+    (let ((results (funcall (wasmdown.wast:component-invoker)
+                            ci "f" '())))
+      (is (equal '(42) results)))))
+
+(test component/async-context-roundtrip-pins
+  ;; M11a — context.get/set (CanonicalABI.md 3835/3862): the
+  ;; per-task i32 context slot threads a value between the guest
+  ;; core and its callback turn.
+  (let* ((ci (%exec-comp
+              (concatenate 'string
+                "(component"
+                " (core module $M"
+                "  (import \"\" \"task.return\" (func $task.return (param i32)))"
+                "  (import \"\" \"context.set\" (func $context.set (param i32)))"
+                "  (import \"\" \"context.get\" (func $context.get (result i32)))"
+                "  (memory (export \"mem\") 1)"
+                "  (func $f (export \"f\") (result i32)"
+                "    (call $context.set (i32.const 7))"
+                "    (i32.const 1))"
+                "  (func $f_cb (export \"f-cb\") (param i32 i32 i32) (result i32)"
+                "    (call $task.return (call $context.get))"
+                "    (i32.const 0)))"
+                "  (canon task.return (result u32) (core func $task.return))"
+                "  (canon context.set i32 0 (core func $context.set))"
+                "  (canon context.get i32 0 (core func $context.get))"
+                "  (core instance $m (instantiate $M (with \"\" (instance"
+                "    (export \"task.return\" (func $task.return))"
+                "    (export \"context.set\" (func $context.set))"
+                "    (export \"context.get\" (func $context.get))))))"
+                " (func (export \"f\") async (result u32) (canon lift"
+                "   (core func $m \"f\")"
+                "   async (callback (core func $m \"f-cb\")))))"))))
+    (let ((results (funcall (wasmdown.wast:component-invoker)
+                            ci "f" '())))
+      (is (equal '(7) results)))))
+
+(test component/async-wset-wait-join-pins
+  ;; M11a — waitable-set.new/wait + waitable.join (CanonicalABI.md
+  ;; 4000/4020/4108): the callback's WAIT turn parks on the set
+  ;; until the JOINED subtask's resolution arms its event — the
+  ;; event delivery (SUBTASK, index, RETURNED) resumes the loop.
+  (let* ((ci (%exec-comp
+              (concatenate 'string
+                "(component"
+                " (component $Inner"
+                "  (core module $M"
+                "   (import \"\" \"task.return\" (func $task.return (param i32)))"
+                "   (func $f (export \"f\") (result i32)"
+                "    (i32.const 1))"
+                "   (func $f_cb (export \"f-cb\") (param i32 i32 i32) (result i32)"
+                "    (call $task.return (i32.const 5))"
+                "    (i32.const 0)))"
+                "  (canon task.return (result u32) (core func $task.return))"
+                "  (core instance $inner (instantiate $M (with \"\" (instance"
+                "   (export \"task.return\" (func $task.return))))))"
+                "  (func (export \"f\") async (result u32) (canon lift"
+                "   (core func $inner \"f\")"
+                "   async (callback (core func $inner \"f-cb\")))))"
+                " (core module $Outer"
+                "  (import \"\" \"f\" (func $f (param i32) (result i32)))"
+                "  (import \"\" \"task.return\" (func $task.return (param i32)))"
+                "  (import \"\" \"waitable-set.new\" (func $wsn (result i32)))"
+                "  (import \"\" \"waitable.join\" (func $join (param i32 i32)))"
+                "  (import \"\" \"subtask.drop\" (func $drop (param i32)))"
+                "  (global $ws (mut i32) (i32.const 0))"
+                "  (func $run (export \"run\") (result i32)"
+                "   (local $ret i32)"
+                "   (global.set $ws (call $wsn))"
+                "   (local.set $ret (call $f (i32.const 16)))"
+                "   (call $join (i32.shr_u (local.get $ret) (i32.const 4)) (global.get $ws))"
+                "   (i32.or (i32.const 2) (i32.shl (global.get $ws) (i32.const 4))))"
+                "  (func $run_cb (export \"run-cb\") (param i32 i32 i32) (result i32)"
+                "   (call $drop (local.get 1))"
+                "   (call $task.return (i32.const 99))"
+                "   (i32.const 0)))"
+                " (canon task.return (result u32) (core func $task.return))"
+                " (canon waitable-set.new (core func $wsn))"
+                " (canon waitable.join (core func $join))"
+                " (canon subtask.drop (core func $drop))"
+                " (instance $i (instantiate $Inner))"
+                " (canon lower (func $i \"f\") async (core func $f'))"
+                " (core instance $o (instantiate $Outer (with \"\" (instance"
+                "  (export \"f\" (func $f'))"
+                "  (export \"task.return\" (func $task.return))"
+                "  (export \"waitable-set.new\" (func $wsn))"
+                "  (export \"waitable.join\" (func $join))"
+                "  (export \"subtask.drop\" (func $drop))))))"
+                " (func (export \"run\") async (result u32) (canon lift"
+                "  (core func $o \"run\")"
+                "  async (callback (core func $o \"run-cb\")))))"))))
+    (let ((results (funcall (wasmdown.wast:component-invoker)
+                            ci "run" '())))
+      ;; the callback receives the SUBTASK RETURNED event for the
+      ;; joined subtask, drops it, and resolves the run task with 99
+      (is (equal '(99) results)))))
+
+(test component/async-backpressure-block-pins
+  ;; M11a — backpressure (CanonicalABI.md 655/3889): backpressure.inc
+  ;; raises the instance counter; a NEEDS-EXCLUSIVE task's
+  ;; enter_implicit_thread gate blocks while it is > 0. The pin
+  ;; guards the counter's plumbing (inc/dec builtins + the fields
+  ;; plist) — the GATE's blocking path is drop-subtask's lane row.
+  (let* ((ci (%exec-comp
+              (concatenate 'string
+                "(component"
+                " (core module $M"
+                "  (import \"\" \"backpressure.inc\" (func $bpi))"
+                "  (import \"\" \"backpressure.dec\" (func $bpd))"
+                "  (import \"\" \"task.return0\" (func $task.return0))"
+                "  (memory (export \"mem\") 1)"
+                "  (func $f (export \"f\") (result i32)"
+                "    (call $bpi)"
+                "    (call $bpd)"
+                "    (i32.const 1))"
+                "  (func $f_cb (export \"f-cb\") (param i32 i32 i32) (result i32)"
+                "   (call $task.return0)"
+                "   (i32.const 0)))"
+                "  (canon task.return (core func $task.return0))"
+                "  (canon backpressure.inc (core func $bpi))"
+                "  (canon backpressure.dec (core func $bpd))"
+                "  (core instance $m (instantiate $M (with \"\" (instance"
+                "   (export \"backpressure.inc\" (func $bpi))"
+                "   (export \"backpressure.dec\" (func $bpd))"
+                "   (export \"task.return0\" (func $task.return0))))))"
+                " (func (export \"f\") async (canon lift"
+                "   (core func $m \"f\")"
+                "   async (callback (core func $m \"f-cb\")))))"))))
+    (let ((results (funcall (wasmdown.wast:component-invoker)
+                            ci "f" '())))
+      (is (null results)))))
+
+(test component/async-cancel-delivery-pins
+  ;; M11a — task.cancel + the CANCELLED event (CanonicalABI.md
+  ;; 3971/775): the callback loop delivers TASK_CANCELLED (event
+  ;; code 6) at the turn boundary when the task's cancellation was
+  ;; requested — the guest observes it and exits. drop-subtask's
+  ;; trap row is the lane oracle; this pin guards the DELIVERY arm
+  ;; via the sync-lower's cancel path (a task.cancel on a yielded
+  ;; callee resolves the task CANCELLED — the caller's subtask
+  ;; packs CANCELLED-BEFORE-RETURNED).
+  (let* ((ci (%exec-comp
+              (concatenate 'string
+                "(component"
+                " (core module $M"
+                "  (memory (export \"mem\") 1)"
+                "  (func $f (export \"f\") (result i32) (i32.const 1))"
+                "  (func $f_cb (export \"f-cb\") (param i32 i32 i32) (result i32)"
+                "    (i32.const 0)))"
+                "  (core instance $m (instantiate $M))"
+                " (func (export \"f\") async (result u32) (canon lift"
+                "   (core func $m \"f\")"
+                "   async (callback (core func $m \"f-cb\")))))"))))
+    (let ((lf (wasmdown.component.runtime:runtime-export-value
+               ci "f")))
+      ;; the lifted func's functype carries the async marker (the
+      ;; (payload third slot) — the cancel delivery's precondition
+      (is (wasmdown.component.runtime:lifted-func-p lf))
+      (is (third (wasmdown.component:ct-payload
+                  (wasmdown.component.runtime:lifted-func-type
+                   lf))))
+      )))
 (defun run-component-pins ()
   "Run the component pins (registered via TEST; returns T)."
   (let ((wasmdown.test::*tests*
@@ -2408,7 +2594,12 @@ these pins guard the executor's mechanisms directly."
                       component/async-task-return-borrow-pins
                       component/async-opt-requires-async-type-pins
                       component/async-builtin-imms-parse-pins
-                      component/async-builtin-sig-marker-pins)))
+                      component/async-builtin-sig-marker-pins
+                      component/async-task-yield-resume-pins
+                      component/async-context-roundtrip-pins
+                      component/async-wset-wait-join-pins
+                      component/async-backpressure-block-pins
+                      component/async-cancel-delivery-pins)))
           wasmdown.test::*tests*)))
     (multiple-value-bind (passed failed)
         (wasmdown.test:run-all-tests)

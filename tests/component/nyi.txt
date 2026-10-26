@@ -2,5 +2,48 @@
 ./validation/kebab.wast
 ./values/post-return.wast
 ./values/variants.wast
+# ---- M11b: fixtures needing future/stream/thread/error-context
+# canons (probe evidence: COMPONENT [FAIL] "import .future.read:
+# expected a function, got NULL" / "expected: (func)" for the
+# stream/thread canon sigs, run-script probes 2026-10-26) ----
 ./async/big-interleaving-test.wast
 ./async/forward.wast
+./async/builtin-trap-poisons-instance.wast
+./async/cancel-and-exclusive-lock.wast
+./async/cancel-delivery.wast
+./async/cancel-not-delivered.wast
+./async/cancel-resumed-callback-switch.wast
+./async/cancel-stream.wast
+./async/cancel-subtask.wast
+./async/cancel-targeted-resume.wast
+./async/closed-stream.wast
+./async/cross-abi-calls.wast
+./async/cross-task-future.wast
+./async/drop-cross-task-borrow.wast
+./async/drop-stream.wast
+./async/during-sync-call-exclusive-resume.wast
+./async/during-sync-call-may-block-if-other-ready-threads.wast
+./async/during-sync-call-no-sibling-resume.wast
+./async/during-sync-scheduling-candidates.wast
+./async/empty-wait.wast
+./async/future-completion-order.wast
+./async/futures-must-write.wast
+./async/idle-drop.wast
+./async/partial-stream-copies.wast
+./async/passing-resources.wast
+./async/reentrance.wast
+./async/same-component-stream-future.wast
+./async/self-switch-traps.wast
+./async/switch-to-ready-callback.wast
+./async/sync-barges-in.wast
+./async/sync-streams.wast
+./async/trap-if-block-and-sync.wast
+./async/trap-if-done.wast
+./async/trap-if-sync-and-waitable-set.wast
+./async/trap-if-transfer-in-waitable-set.wast
+./async/wait-during-callback.wast
+./async/zero-length.wast
+# ---- M11a open: async-calls-sync (the acs interleave — the
+# backpressure-gate wake chain; probe: 4 gate parks, 0 passes, the
+# deadlock oracle fires; one open runtime bug) ----
+./async/async-calls-sync.wast
