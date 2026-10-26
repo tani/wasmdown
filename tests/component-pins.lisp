@@ -1734,6 +1734,242 @@ these pins guard the executor's mechanisms directly."
               :unreachable)))
     (is err)))
 
+;;; ---- M9: the LINKING lane's mechanisms ----
+
+(test component/invoke-lifted-func-pins
+  ;; M9 mechanism — COMPONENT INVOKE: a comp-instance's exported
+  ;; lifted func through the runner's action hook. The FLAT path
+  ;; lowers u32 args to i32 and lifts the single result back.
+  (let* ((ci (%exec-comp
+              "(component
+                 (core module $M
+                   (global $g (mut i32) (i32.const 0))
+                   (func (export \"bump\") (param i32) (result i32)
+                     (global.set $g (i32.add (global.get $g)
+                                             (local.get 0)))
+                     (global.get $g)))
+                 (core instance $m (instantiate $M))
+                 (func (export \"bump\") (param \"x\" u32)
+                   (result u32)
+                   (canon lift (core func $m \"bump\"))))")))
+    (let ((lf (wasmdown.component.runtime:runtime-export-value
+               ci "bump")))
+      (is (wasmdown.component.runtime:lifted-func-p lf))
+      ;; the hook's INVOKE: args in the component domain, results in
+      ;; the comparison domain
+      (is (equal '(5) (funcall (wasmdown.wast:component-invoker)
+                                ci "bump" '(5))))
+      (is (equal '(12) (funcall (wasmdown.wast:component-invoker)
+                                ci "bump" '(7)))))))
+
+(test component/instance-isolation-pins
+  ;; M9 mechanism — INSTANCE ISOLATION: two instances of one core
+  ;; module have SEPARATE globals; two lifts off DIFFERENT instances
+  ;; wrap DIFFERENT core funcs (unit.wast's first fixture). The
+  ;; parser now consumes the EXPORT-introduced func slot so the
+  ;; second lift cannot cross-wire to the first instance's func.
+  (let* ((ci (%exec-comp
+              "(component
+                 (core module $M
+                   (global $g (mut i32) (i32.const 0))
+                   (func (export \"bump\") (result i32)
+                     (global.set $g (i32.add (global.get $g)
+                                             (i32.const 1)))
+                     (global.get $g)))
+                 (core instance $a (instantiate $M))
+                 (core instance $b (instantiate $M))
+                 (func (export \"bump-a\") (result u32)
+                   (canon lift (core func $a \"bump\")))
+                 (func (export \"bump-b\") (result u32)
+                   (canon lift (core func $b \"bump\"))))")))
+    (let ((a (wasmdown.component.runtime:runtime-export-value ci "bump-a"))
+          (b (wasmdown.component.runtime:runtime-export-value ci "bump-b")))
+      (is (wasmdown.component.runtime:lifted-func-p a))
+      (is (wasmdown.component.runtime:lifted-func-p b))
+      ;; the two lifts wrap DIFFERENT core funcs
+      (is (not (eq (wasmdown.component.runtime::lifted-func-core a)
+                   (wasmdown.component.runtime::lifted-func-core b))))
+      ;; the state is isolated: a=1, a=2, b=1, a=3
+      (is (= 1 (wasmdown.component.runtime:lifted-func-call a)))
+      (is (= 2 (wasmdown.component.runtime:lifted-func-call a)))
+      (is (= 1 (wasmdown.component.runtime:lifted-func-call b)))
+      (is (= 3 (wasmdown.component.runtime:lifted-func-call a))))))
+
+(test component/canon-lower-roundtrip-pins
+  ;; M9 mechanism — CANON LOWER: the lowered core func is a REAL
+  ;; host core func wrapping the target component func (the flat
+  ;; sync path): a service's lifted bump, lowered into a client
+  ;; module, called — the client observes the SERVICE's state.
+  (let* ((ci (%exec-comp
+              "(component
+                 (component $Svc
+                   (core module $M
+                     (global $g (mut i32) (i32.const 0))
+                     (func (export \"bump\") (result i32)
+                       (global.set $g
+                                   (i32.add (global.get $g)
+                                            (i32.const 1)))
+                       (global.get $g)))
+                   (core instance $m (instantiate $M))
+                   (func (export \"bump\") (result u32)
+                     (canon lift (core func $m \"bump\"))))
+                 (component $User
+                   (import \"svc\" (instance $svc
+                     (export \"bump\" (func (result u32)))))
+                   (core func $bump (canon lower (func $svc \"bump\")))
+                   (core module $M
+                     (import \"svc\" \"bump\" (func (result i32)))
+                     (func (result i32) (call 0)))
+                   (core instance $m (instantiate $M
+                     (with \"svc\" (instance
+                       (export \"bump\" (func $bump)))))))
+                 (instance $svc (instantiate $Svc))
+                 (instance $user (instantiate $User
+                   (with \"svc\" (instance $svc)))))")))
+    ;; the lowered core func is a host func with the flat [i32]→[i32]
+    ;; signature wired to the service's lifted func
+
+
+    (let* ((user (aref (wasmdown.component.runtime::comp-instance-instances
+                        ci) 1))
+           (lf (aref (wasmdown.component.runtime::comp-instance-core-funcs
+                      user) 0)))
+      (is (wasmdown.runtime:func-instance-p lf))
+      (is (eq (wasmdown.runtime:func-instance-kind lf) :host))
+      ;; calling it bumps the SERVICE's counter (shared state)
+      (is (equal '(1) (wasmdown.runtime:wasm-call lf)))
+      (is (equal '(2) (wasmdown.runtime:wasm-call lf))))))
+
+(test component/linking-tag-identity-pins
+  ;; M9 mechanism (linking tags ::9) — EH TAG IDENTITY ACROSS
+  ;; INSTANCES: the Catcher imports $tag-a's tag; $ta throws the
+  ;; $tag-a tag, $tb the $tag-b one. SBCL runs handler-bind handlers
+  ;; BEFORE unwinding, so at handler time the dynamic *frame-module*
+  ;; is the THROWER's — the catch clause's tag must resolve at
+  ;; try_table ENTRY (the guarding module), never late. A late read
+  ;; saw the thrower's tags[0] — the thrown tag itself — and every
+  ;; catch matched; run-b must fall through to catch_all (77).
+  (let* ((ci (%exec-comp
+              "(component
+                 (core module $Tag (tag (export \"t\") (param i32)))
+                 (core module $Thrower
+                   (import \"tag\" \"t\" (tag $t (param i32)))
+                   (func (export \"throw\") (param i32)
+                     (throw $t (local.get 0))))
+                 (core module $Catcher
+                   (import \"tag\" \"t\" (tag $t (param i32)))
+                   (import \"a\" \"throw\" (func $throw-a (param i32)))
+                   (import \"b\" \"throw\" (func $throw-b (param i32)))
+                   (func (export \"run-a\") (param i32) (result i32)
+                     (block $all
+                       (block $h (result i32)
+                         (try_table (catch $t $h) (catch_all $all)
+                           (call $throw-a (local.get 0)))
+                         (return (i32.const 99)))
+                       (return))
+                     (i32.const 77))
+                   (func (export \"run-b\") (param i32) (result i32)
+                     (block $all
+                       (block $h (result i32)
+                         (try_table (catch $t $h) (catch_all $all)
+                           (call $throw-b (local.get 0)))
+                         (return (i32.const 99)))
+                       (return))
+                     (i32.const 77)))
+                 (core instance $tag-a (instantiate $Tag))
+                 (core instance $tag-b (instantiate $Tag))
+                 (core instance $ta
+                   (instantiate $Thrower (with \"tag\" (instance $tag-a))))
+                 (core instance $tb
+                   (instantiate $Thrower (with \"tag\" (instance $tag-b))))
+                 (core instance $c (instantiate $Catcher
+                   (with \"tag\" (instance $tag-a))
+                   (with \"a\" (instance $ta))
+                   (with \"b\" (instance $tb))))
+                 (func (export \"run-a\") (param \"x\" u32) (result u32)
+                   (canon lift (core func $c \"run-a\")))
+                 (func (export \"run-b\") (param \"x\" u32) (result u32)
+                   (canon lift (core func $c \"run-b\"))))"))
+         (ra (wasmdown.component.runtime:runtime-export-value ci "run-a"))
+         (rb (wasmdown.component.runtime:runtime-export-value ci "run-b")))
+    ;; the thrown $tag-a tag IS the Catcher's $t: caught, payload 42
+    (is (= 42 (wasmdown.component.runtime:lifted-func-call ra 42)))
+    ;; $tag-b's tag is a DIFFERENT tag-instance: no match, catch_all
+    (is (= 77 (wasmdown.component.runtime:lifted-func-call rb 42)))))
+
+(test component/linking-tag-sort-mismatch-pins
+  ;; M9 mechanism (linking tags ::10) — the CORE-EXPORT alias's
+  ;; sort check: a func export aliased as (core tag) is a sort
+  ;; mismatch, not merely an existence check.
+  (flet ((expect-invalid (src)
+           (block nil
+             (handler-case
+                 (let ((comp (wasmdown.component.text::parse-component-text
+                              src)))
+                   (wasmdown.component:validate-component comp))
+               (wasmdown:validation-error (c) (return c)))
+             (error "expected validation error"))))
+    ;; aliasing a FUNC export as a core tag
+    (let ((c (expect-invalid
+              "(component
+                 (core module $M (func (export \"f\")))
+                 (core instance $i (instantiate $M))
+                 (alias core export $i \"f\" (core tag $t)))")))
+      (is (search "is not a tag" (wasmdown:wasmdown-error-message c))))
+    ;; a correct tag alias still validates
+    (let ((comp (wasmdown.component.text::parse-component-text
+                 "(component
+                    (core module $M (tag (export \"t\") (param i32)))
+                    (core instance $i (instantiate $M))
+                    (alias core export $i \"t\" (core tag $t)))")))
+      (wasmdown.component:validate-component comp))))
+
+(test component/linking-ascribed-projection-pins
+  ;; M9 mechanism (linking EV ::61) — the EXPORT ASCRIBED instance
+  ;; type REPLACES the visible one in projections: an instance
+  ;; exported with an EMPTY (instance) ascription hides its exports
+  ;; from consumers; a consumer requiring one of them fails with
+  ;; 'missing expected export'.
+  (flet ((expect-invalid (src)
+           (block nil
+             (handler-case
+                 (let ((comp (wasmdown.component.text::parse-component-text
+                              src)))
+                   (wasmdown.component:validate-component comp))
+               (wasmdown:validation-error (c) (return c)))
+             (error "expected validation error"))))
+    ;; the ascribed-empty f2 no longer satisfies a consumer's "f"
+    (let ((c (expect-invalid
+              "(component
+                 (import \"f\" (func $f))
+                 (component $C
+                   (import \"f\" (instance $i (export \"f\" (func))))
+                   (export \"f2\" (instance $i) (instance)))
+                 (instance $c (instantiate $C
+                   (with \"f\" (instance (export \"f\" (func $f))))))
+                 (component $Consume
+                   (import \"arg\" (instance (export \"f\" (func)))))
+                 (instance (instantiate $Consume
+                   (with \"arg\" (instance $c \"f2\")))))")))
+      (is (search "missing expected export"
+                  (wasmdown:wasmdown-error-message c))))
+    ;; WITHOUT the ascription the projection still sees "f" and
+    ;; the consumer validates (the up-cast direction)
+    (let ((comp (wasmdown.component.text::parse-component-text
+                 "(component
+                    (import \"f\" (func $f))
+                    (component $C
+                      (import \"f\" (instance $i (export \"f\" (func))))
+                      (export \"f2\" (instance $i)))
+                    (instance $c (instantiate $C
+                      (with \"f\" (instance (export \"f\" (func $f))))))
+                    (component $Consume
+                      (import \"arg\" (instance (export \"f\" (func)))))
+                    (instance (instantiate $Consume
+                      (with \"arg\" (instance $c \"f2\")))))")))
+      (wasmdown.component:validate-component comp))))
+
+
 (defun run-component-pins ()
   "Run the component pins (registered via TEST; returns T)."
   (let ((wasmdown.test::*tests*
@@ -1777,7 +2013,13 @@ these pins guard the executor's mechanisms directly."
                       component/instantiation-core-link-pins
                       component/instantiation-with-arg-pins
                       component/instantiation-start-pins
-                      component/instantiation-trap-pins)))
+                      component/instantiation-trap-pins
+                      component/invoke-lifted-func-pins
+                      component/instance-isolation-pins
+                      component/canon-lower-roundtrip-pins
+                      component/linking-tag-identity-pins
+                      component/linking-tag-sort-mismatch-pins
+                      component/linking-ascribed-projection-pins)))
           wasmdown.test::*tests*)))
     (multiple-value-bind (passed failed)
         (wasmdown.test:run-all-tests)

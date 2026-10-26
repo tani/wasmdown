@@ -440,6 +440,14 @@ target. Returns the operands plus the truncated remainder via THROW."
         (svref tags tagidx)
         (%trap :unreachable "unknown tag ~d" tagidx))))
 
+(defun %clause-tag (x)
+  "M9 (linking tags ::9): a catch clause's tag — an index resolves in
+the current frame; a tag-instance (the try_table-entry resolution)
+passes through."
+  (if (wasmdown.runtime:tag-instance-p x)
+      x
+      (%tag-at x)))
+
 (defun %match-catch-clause (catches ex)
   "The first clause of CATCHES matching the thrown exception EX:
 tag-identity for catch/catch_ref, anything for catch_all (first clause
@@ -447,8 +455,14 @@ wins, spec order). Returns (values clause exnref-p) or NIL."
   (let ((thrown-tag (wasmdown:wasm-exception-tag ex)))
     (loop for c across catches
           when (case (first c)
-                 (:catch (eq (%tag-at (second c)) thrown-tag))
-                 (:catch-ref (eq (%tag-at (second c)) thrown-tag))
+                 ;; M9 (linking tags ::9): the clause's tag arrives
+                 ;; EITHER as an index (the raw catches — resolved
+                 ;; against the CURRENT frame) or as a tag-instance
+                 ;; (the try_table-entry resolution, where the
+                 ;; guarding module is in scope — the handler runs on
+                 ;; the THROWER's dynamic frame)
+                 (:catch (eq (%clause-tag (second c)) thrown-tag))
+                 (:catch-ref (eq (%clause-tag (second c)) thrown-tag))
                  (:catch-all t)
                  (:catch-all-ref t)
                  (t nil))
@@ -621,6 +635,23 @@ counts one depth on the block stack). Never returns."
                                               :params nparams :results nresults
                                               :height (length below)))
                      (catches (getf imms :catches))
+                     ;; M9 (linking tags ::9): resolve each catch
+                     ;; clause's tag HERE — at try_table entry the
+                     ;; dynamic *frame-module* is the GUARDING module;
+                     ;; at handler time it is the THROWER's (SBCL runs
+                     ;; handlers before unwinding), so a late
+                     ;; %tag-at read the thrower's tags[0] — the
+                     ;; thrown tag itself — and every catch matched
+                     (resolved-catches
+                       (coerce
+                        (loop for c across catches
+                             collect (if (member (first c)
+                                                 '(:catch :catch-ref))
+                                         (list (first c)
+                                               (%tag-at (second c))
+                                               (third c))
+                                         c))
+                        'vector))
                      (try-block-stack (cons frame block-stack)))
                 (multiple-value-bind (vals leftover)
                     (catch frame
@@ -628,7 +659,7 @@ counts one depth on the block stack). Never returns."
                           ((wasmdown:wasm-exception
                              (lambda (ex)
                                (multiple-value-bind (clause exnref-p)
-                                   (%match-catch-clause catches ex)
+                                   (%match-catch-clause resolved-catches ex)
                                  (when clause
                                    (%branch-to-clause ex clause exnref-p
                                                       try-block-stack s))))))

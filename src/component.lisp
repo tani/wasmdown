@@ -2440,7 +2440,13 @@ type's own declarators stay against STATE, the inner space)."
               ;; its outer scope — an (outer 1) alias inside
               ;; $T2 crosses the $T2 boundary into the enclosing
               ;; component type's own space (where the sibling
-              ;; $r was pushed)
+              ;; $r was pushed).
+              ;; M9 (linking ::104): the outer threading for nested
+              ;; component/instance cts was tried here (passing the
+              ;; arm's OUTER) and REVERTED — it broke indicies ::9's
+              ;; (outer 1)-into-$T2 and resources ::30's sibling-$r
+              ;; chains (both pin suites). The de Bruijn chain for a
+              ;; nested type's decls keeps INNER as the first outer.
               (%check-deftype ty inner (1+ type-depth) inner)
               (vector-push-extend ty (cval-types inner))))
            (:alias
@@ -2485,9 +2491,64 @@ type's own declarators stay against STATE, the inner space)."
               ;; EVERY alias declarator introduces a new type index
               ;; in the type's own space (Binary.md line 274 — an
               ;; (alias export ...) of the type sort too; resources.wast
-              ;; ::30's $T2 referencing the alias-introduced $r)
+              ;; ::30's $T2 referencing the alias-introduced $r).
+              ;; M9 (linking ::104): an OUTER type alias whose
+              ;; resolved target is a RESOURCE pushes a RESOURCE ct —
+              ;; the declarators' interned own/borrow cts reference
+              ;; this slot and %check-defvaltype's own/borrow arm
+              ;; demands a resource there (the opaque marker read as
+              ;; 'type index N is not a resource type')
               (vector-push-extend
-               (make-ct :kind :prim :payload :outer-aliased)
+               ;; M9 (linking ::104): the resource check reads the
+               ;; NEWLY-CONSDED chain — the push sits OUTSIDE the
+               ;; count-check's let* above, so a bare read saw the
+               ;; OLD chain (a stale/fresh inner) and never the
+               ;; enclosing component's real type space
+               (let* ((*outer-states*
+                        (if (boundp '*outer-states*)
+                            (cons outer *outer-states*)
+                            (list outer)))
+                      (tgt (and (eq (aliasrec-kind a) :outer)
+                                (eq (aliasrec-sort a) :type)
+                                (%outer-state-at inner
+                                                 (aliasrec-count a)))))
+                 (if (and tgt
+                          (< (aliasrec-target a)
+                             (length (cval-types tgt)))
+                          (ct-resourcetype-p
+                           (aref (cval-types tgt)
+                                 (aliasrec-target a))))
+                     (make-ct :kind :resource :payload '(0 . nil)
+                              :offset 0)
+                     ;; M9 (linking ::104): the de Bruijn target may
+                     ;; land on a FRESH inner space (a walk whose
+                     ;; *outer-states* head is an empty inner) —
+                     ;; walk the chain past too-short states to the
+                     ;; first where the target index resolves to a
+                     ;; resource; no hit keeps the opaque marker
+                     (let ((hit
+                             (and (eq (aliasrec-kind a) :outer)
+                                  (eq (aliasrec-sort a) :type)
+                                  (loop for st in
+                                        (cons inner
+                                              (if (boundp
+                                                   '*outer-states*)
+                                                  *outer-states*
+                                                  nil))
+                                        thereis (and
+                                                 (< (aliasrec-target a)
+                                                    (length
+                                                     (cval-types st)))
+                                                 (ct-resourcetype-p
+                                                  (aref
+                                                   (cval-types st)
+                                                   (aliasrec-target
+                                                    a))))))))
+                       (if hit
+                           (make-ct :kind :resource
+                                    :payload '(0 . nil) :offset 0)
+                           (make-ct :kind :prim
+                                    :payload :outer-aliased)))))
                (cval-types inner))))
            ((:import :export)
             (let* ((payload (typedecl-payload d))
@@ -2577,8 +2638,26 @@ type's own declarators stay against STATE, the inner space)."
                          (eq (cdr et) :sub-resource))
                     (make-ct :kind :resource :payload '(0 . nil)
                              :offset 0)
-                    (make-ct :kind :prim
-                             :payload :imported-or-exported-type))
+                    ;; M9 (linking ::125): an (eq i) type export
+                    ;; aliases i — its own/borrow acceptance follows
+                    ;; the TARGET's kind (the eq of a (sub resource)
+                    ;; export IS a resource for the declarator's
+                    ;; functype refs); other/unknown stay opaque
+                    (if (and (eq (car et) :type)
+                             (consp (cdr et))
+                             (eq (first (cdr et)) :eq)
+                             (integerp (second (cdr et)))
+                             (< (second (cdr et))
+                                (length (cval-types inner)))
+                             (ct-p (aref (cval-types inner)
+                                         (second (cdr et))))
+                             (ct-resourcetype-p
+                              (aref (cval-types inner)
+                                    (second (cdr et)))))
+                        (make-ct :kind :resource :payload '(0 . nil)
+                                 :offset 0)
+                        (make-ct :kind :prim
+                                 :payload :imported-or-exported-type)))
                 (cval-types inner)))))))))
        ;; slice 5g (external-visibility ::42/::43/::44): a COMPONENT
        ;; TYPE's own export/import declarators must satisfy visibility
@@ -2878,10 +2957,28 @@ space."
 ;;; the alias-type shape resolution follows entries through this
 ;;; stash (ev ::49/::50).
 (defvar *comp-state-stash* (make-hash-table :test #'eq))
+(defvar *outer-alias-core-module* (make-hash-table :test #'equal)
+  "M9 (linking ::179): (comp . core-module-idx) -> the RESOLVED
+wasm-module an outer-aliased core module projects (the walk's alias
+arm resolves it through *outer-states*/*state-comp*); %core-module-at
+reads it so a nested (instantiate $outer-module) finds the module.")
+
+(defvar *state-comp* (make-hash-table :test #'eq)
+  "M9 (linking ::179): the REVERSE of *comp-state-stash* — state ->
+its comp, so an outer-alias resolution can walk the ENCLOSING
+component's defs (an outer-aliased core module's payload lives in
+the outer comp's def walk).")
 ;;; ...and the per-instance SOURCE COMPONENT (which nested comp an
 ;;; instantiated instance came from) — the alias-type shape
 ;;; resolution resolves the child's typeidx against the CHILD state.
 (defvar *inst-source-comp* (make-hash-table :test #'eql))
+
+(defvar *alias-component-source* (make-hash-table :test #'eql)
+  "M9 (linking ::169): per-COMPONENT-INDEX the source comp of an
+alias-introduced component (an (alias export $i \"c\" (component $x))
+of an instantiated instance). %check-instantiate-args's target
+search resolves the alias's comp through this record so the aliased
+component's imports (not the nearest :component def's) are matched.")
 
 (defvar *inst-ids-stash* (make-hash-table :test #'eql)
   "Slice 5c: per-INSTANCE the rebuilt child identity vector from
@@ -2906,6 +3003,25 @@ IMPORTED instance resolves the source instance ct's functype; the
 func-arg matching resolves the PARENT side through the per-instance
 generative ids. Cleared at validation depth 1.")
 
+(defvar *inst-alias-typeidx* (make-hash-table :test #'equal)
+  "M9 (linking ::90): per (INSTANCE-IDX . EXPORT-NAME) the COMPONENT
+type index of the (alias export $i \"n\" (type)) that projects it —
+recorded at the alias walk so an import's declarator-space functype
+can remap its (:idx . k) payloads into the component's type space
+(the declarator's k-th type-introducing entry belongs to the export
+named n; the alias for n holds the component-space position).")
+
+(defvar *func-arg-inst* (make-hash-table :test #'eql)
+  "M9 (linking ::128): per-FUNC-INDEX the source INSTANCE index whose
+ids stash feeds the func-arg identity match — the raw→rebuilt shift
+resolves the child comp through *inst-source-comp* at THIS key.")
+(defvar *func-alias-origin* (make-hash-table :test #'eql)
+  "M9 (linking ::90): per-FUNC-INDEX the (INSTANCE-IDX . instance-ct)
+of the imported instance whose declarator-space functype was pushed —
+the canon checks read that functype against the COMPONENT's type
+space and must remap its (:idx . k) payloads first. Cleared at
+validation depth 1.")
+
 (defun %inst-gen-id (inst-idx typeidx)
   "The generative resource id for imported instance INST-IDX's own
 type slot TYPEIDX (created on first use)."
@@ -2915,12 +3031,115 @@ type slot TYPEIDX (created on first use)."
           (setf (gethash key *inst-gen-ids*) id)
           id))))
 
+(defun %sort-err-name (sort)
+  "M9 (linking tags ::10): the sort's name in the 'is not a ~a'
+validation message — the fixture text uses the CORE sort names."
+  (case sort
+    (:core-func "func")
+    (:core-memory "memory")
+    (:core-table "table")
+    (:core-global "global")
+    (:core-tag "tag")
+    (:core-module "module")
+    (:core-instance "instance")
+    (t (string-downcase (subseq (symbol-name sort) 1)))))
+
+(defun %core-provider-export-names (comp inst-idx)
+  "M9 (linking tags ::10): core instance INST-IDX's export NAMES plus
+a KIND-OF function (name -> the export's core sort, or NIL when the
+kind is not statically known — a moduletype-only provider has no
+kind info). Two values: (names-list kind-of)."
+  (let ((prov (and *core-inst-provider*
+                   (gethash inst-idx *core-inst-provider*))))
+    (if (not (consp prov))
+        (values nil nil)
+        (case (car prov)
+          (:bag
+           (values (map 'list #'car (cdr prov))
+                   ;; an inline bag's exports carry sortidxes — the
+                   ;; sort IS the alias's own sort space
+                   (lambda (name)
+                     (let ((pair (find name (cdr prov)
+                                       :key #'car :test #'string=)))
+                       (and pair (sortidx-sort (cdr pair)))))))
+          (:module
+           (let ((pm (%core-module-at comp (cdr prov))))
+             (cond
+              ((wasmdown.types:wasm-module-p pm)
+               (values
+                (map 'list #'wasmdown.types:wasm-export-name
+                     (wasmdown.types:wasm-module-exports pm))
+                (lambda (name)
+                  (let ((ex (find name
+                                  (coerce (wasmdown.types:wasm-module-exports
+                                           pm)
+                                          'list)
+                                  :key #'wasmdown.types:wasm-export-name
+                                  :test #'string=)))
+                    (and ex
+                         (ecase (wasmdown.types:wasm-export-kind ex)
+                           (:func :core-func)
+                           (:memory :core-memory)
+                           (:table :core-table)
+                           (:global :core-global)
+                           (:tag :core-tag)))))))
+              ;; moduletype-only providers (the ::183/:via-moduletype
+              ;; and ::231/:via-import markers, imported instances):
+              ;; the NAMES are known (core-export decls) but the KINDS
+              ;; are not (the payload is a name list) — kind-of NIL
+              (t
+               (let ((mt (cond
+                          ((and (consp pm)
+                                (eq (car pm) :via-moduletype))
+                           (cdr pm))
+                          ((and (consp pm)
+                                (eq (car pm) :via-import))
+                           (%core-module-import-moduletype
+                            (second pm) (cdr (cdr pm))))
+                          (t (%core-module-import-moduletype
+                              comp (cdr prov))))))
+                 (values
+                  (and mt
+                       (map 'list #'first
+                            (map 'list #'(lambda (d) (typedecl-payload d))
+                                 (remove-if-not
+                                  (lambda (d)
+                                    (eq (typedecl-kind d) :core-export))
+                                  (coerce (%moduletype-decls mt)
+                                          'list)))))
+                  nil))))))))))
 (defun %core-module-at (comp n)
-  "The Nth :core-module definition's wasm-module payload, or NIL."
+  "The Nth core module of the INDEX SPACE (which counts :core-module
+defs AND (:core-module) imports, in file order) — a def yields its
+wasm-module payload; an import occupies the slot with no IR (NIL —
+the module's shape arrives only at instantiation, M9's
+with-(core-module) fixtures).
+M9 (linking ::179): a :core-module-sorted ALIAS also occupies a slot
+(the implicit (alias outer ct idx (core module)) of a nested
+component's (instantiate $outer-module)); its payload resolves
+through *outer-states*/*state-comp* — the target state's comp's
+own core-module space. The alias record carries the resolved module
+in *outer-alias-core-module* (the walk's alias arm populates it);
+no record = the hole stays NIL (matching the import case)."
   (let ((seen 0))
     (loop for d across (comp-defs comp)
-          when (eq (compdef-kind d) :core-module)
-            do (cond ((= seen n) (return (compdef-payload d)))
+          when (or (eq (compdef-kind d) :core-module)
+                   (and (eq (compdef-kind d) :import)
+                        (eq (car (importrec-type
+                                  (compdef-payload d)))
+                            :core-module))
+                   (and (eq (compdef-kind d) :alias)
+                        (eq (aliasrec-sort (compdef-payload d))
+                            :core-module)))
+            do (cond ((= seen n)
+                      (return (cond
+                               ((eq (compdef-kind d) :core-module)
+                                (compdef-payload d))
+                               ((eq (compdef-kind d) :alias)
+                                (or (gethash (cons comp seen)
+                                             *outer-alias-core-module*)
+                                    nil))
+                               (t nil))))
                      (t (incf seen)))
           finally (return nil))))
 
@@ -2985,6 +3204,11 @@ type slot TYPEIDX (created on first use)."
              (and g (cons :global
                           (cons (wasmdown.types:wasm-global-type g)
                                 (wasmdown.types:wasm-global-mutable g))))))
+
+          ;; M9 (linking lane): a TAG export — the tag's identity is
+          ;; opaque here; the core-link arm needs only the KIND match
+          ;; (tags.wast's whole-instance arguments)
+          (:tag (cons :tag t))
           (t nil))))))
 
 (defun %core-provider-export (comp inst-idx name)
@@ -2993,22 +3217,132 @@ type slot TYPEIDX (created on first use)."
   (:global . (type . mut)) | NIL. An :instantiate provider reads the
   module's exports; an inline-export BAG follows its (sort . idx)
   entry through *core-alias-source* (each bag entry points at an
-  alias-introduced core index)."
+  alias-introduced core index, or — M9 — a canon-introduced one whose
+  recorded marker carries the lowered/built-in SIGNATURE directly)."
   (let ((prov (and *core-inst-provider*
                    (gethash inst-idx *core-inst-provider*))))
     (cond
      ((and (consp prov) (eq (car prov) :module))
       (let ((m (%core-module-at comp (cdr prov))))
-        (and m (%module-export-item m name))))
+        (cond
+         ((and m (wasmdown.types:wasm-module-p m))
+          (%module-export-item m name))
+         ;; M9: an IMPORTED core module — the IR arrives only at
+         ;; instantiation; the ascribed moduletype's export
+         ;; declarator carries the shape (the moduletype match
+         ;; already ran at the with-arg site)
+         (t (%core-moduletype-export-item comp (cdr prov) name)))))
      ((and (consp prov) (eq (car prov) :bag))
       (let* ((hit (find name (coerce (cdr prov) 'list)
                        :key #'car :test #'string=))
              (src (and hit
                        *core-alias-source*
                        (gethash (cdr hit) *core-alias-source*))))
-        (when src
-          (%core-provider-export comp (car src) (cdr src)))))
+        (cond
+         ;; M9: a canon-introduced core func — the marker carries the
+         ;; lowered (component ct) or built-in signature
+         ((and (consp src) (eq (car src) :canon-lower))
+          (cons :func (cdr src)))
+         ((and (consp src) (eq (car src) :canon-sig))
+          (cons :func (cdr src)))
+         (src
+          (%core-provider-export comp (car src) (cdr src)))
+         (t nil))))
      (t nil))))
+
+(defun %core-module-import-moduletype (comp n)
+  "The moduletype ct ascribed to the Nth core-module slot's IMPORT —
+the importrec's (:core-module . typeidx) pointing into the
+component's core-type space (the ct's OWN payload, a (:moduletype .
+  decls) cons); NIL when the slot holds a real def."
+  (let ((seen 0))
+    (loop for d across (comp-defs comp)
+          when (or (eq (compdef-kind d) :core-module)
+                   (and (eq (compdef-kind d) :import)
+                        (eq (car (importrec-type
+                                  (compdef-payload d)))
+                            :core-module)))
+            do (cond
+                ((and (= seen n)
+                      (eq (compdef-kind d) :import))
+                 (let* ((k (cdr (importrec-type (compdef-payload d))))
+                        (mt (when (integerp k)
+                              (loop with c = -1
+                                    for e across (comp-defs comp)
+                                    when (eq (compdef-kind e)
+                                             :core-type)
+                                      do (incf c)
+                                    when (= c k)
+                                      return (compdef-payload e)
+                                    finally (return nil)))))
+                   (return mt)))
+                ((= seen n) (return nil))
+                (t (incf seen)))
+          finally (return nil))))
+
+(defun %core-moduletype-export-item (comp n name)
+  "The export item of the Nth core module's DECLARED moduletype —
+used when the module is an IMPORT (no IR at validation time; the
+import's ascription is the only shape). Returns (:func params .
+  results) | (:global . (type . mut)) | (:memory . limits) |
+(:table . (reftype . limits)) | NIL. The (func (type i)) desc
+indexes the moduletype's OWN type sequence — the :core-type
+declarators in declaration order (imports and exports included)."
+  (let* ((mt (%core-module-import-moduletype comp n)))
+    (unless (and mt (consp mt) (eq (car mt) :moduletype))
+      (return-from %core-moduletype-export-item nil))
+    (let* ((decls (if (and (consp (cdr mt)) (vectorp (second mt)))
+                      (second mt)
+                      (cdr mt)))
+           (ex (find name (coerce decls 'list)
+                     :key (lambda (d)
+                            (and (eq (typedecl-kind d) :core-export)
+                                 (first (typedecl-payload d))))
+                     :test #'string=)))
+      (unless ex (return-from %core-moduletype-export-item nil))
+      (let ((desc (second (typedecl-payload ex))))
+        (case (car desc)
+          (:func
+           (let* ((ti (second desc))
+                  (ft (loop with c = -1
+                            for d2 across decls
+                            when (member (typedecl-kind d2)
+                                         '(:core-type :core-alias))
+                              do (incf c)
+                            when (= c ti)
+                              return (typedecl-payload d2)
+                            finally (return nil))))
+             (cond
+              ((and ft (wasmdown.types:wasm-comptype-p ft))
+               (cons :func
+                     (cons (wasmdown.types:wasm-comptype-params ft)
+                           (wasmdown.types:wasm-comptype-results ft))))
+              ;; an IMPLICIT (func ...) desc: the inline sig rides
+              ;; in the FOURTH slot (a wasm-func-type, M9)
+              ((and (eq (third desc) :implicit)
+                    (wasmdown.types:wasm-func-type-p
+                     (fourth desc)))
+               (cons :func
+                     (cons (wasmdown.types:wasm-func-type-params
+                            (fourth desc))
+                           (wasmdown.types:wasm-func-type-results
+                            (fourth desc)))))
+              (t (cons :func (cons nil nil))))))
+          (:global
+           (cons :global (cons (second desc) (third desc))))
+          (:memory
+           (cons :memory (second desc)))
+          (:table
+           (cons :table (cons (second desc) (third desc))))
+          (t nil))))))
+
+(defun %canon-lower-flat-sig (state ft)
+  "The FLATTENED core signature of a canon LOWER of functype FT —
+flatten_functype's lower side (CanonicalABI.md 2894-2930), computed
+at canon time where the STATE resolves (:idx . n) references. Returns
+(params . results) as core type lists."
+  (let ((p (and ft (%flat-functype ft state :lower))))
+    (cons (and p (car p)) (and p (cdr p)))))
 
 (defun %canon-core-func-sig (comp core-idx)
   "The canon target core func's ACTUAL signature (params . results),
@@ -3058,8 +3392,14 @@ type slot TYPEIDX (created on first use)."
   nil)
 
 (defun %core-sig-equal-p (a b)
-  "Two core functypes (params . results) equal."
-  (and (equal (car a) (car b)) (equal (cdr a) (cdr b))))
+  "Two core functypes (params . results) equal. The sequences are
+normalized to LISTS first: the text parser's functype slots and the
+runtime's vectors (and M9's fresh moduletype functype objects) mix
+list and vector representations — the comparison is element-wise on
+the CONTENT, never on the representation or object identity."
+  (flet ((norm (x) (if (vectorp x) (coerce x 'list) x)))
+    (and (equal (norm (car a)) (norm (car b)))
+         (equal (norm (cdr a)) (norm (cdr b))))))
 
 (defun %core-importdesc-text (desc)
   "A moduletype import desc rendered as core text — the fixture's
@@ -3106,6 +3446,11 @@ type slot TYPEIDX (created on first use)."
                  (%verr "duplicate module instantiation argument named `~a`"
                         nm))
                (push nm names)))
+    ;; M9: an IMPORTED core module has no IR at validation time —
+    ;; its shape (imports and exports) was declared by the import's
+    ;; moduletype ascription and matched against the with-arg at the
+    ;; component-instantiation site (%match-core-module-arg), so the
+    ;; per-item provider checks below are redundant for it
     (unless (and m (wasmdown.types:wasm-module-p m))
       (return-from %check-core-instance-args))
     (loop for imp across (wasmdown.types:wasm-module-imports m)
@@ -3126,10 +3471,16 @@ type slot TYPEIDX (created on first use)."
                     (%verr "expected func, found ~a"
                            (string-downcase (string (car prov)))))
                   ;; the provider func's signature must equal the
-                  ;; target's imported functype (::39-::41)
+                  ;; target's imported functype (::39-::41). The
+                  ;; import's type is an index into the MODULE's
+                  ;; TYPE VECTOR (not a func-space position — M9:
+                  ;; reading it through %module-comptype's
+                  ;; imports-then-defs numbering cross-wired
+                  ;; multi-import modules).
                   (let* ((ti (wasmdown.types:wasm-import-type imp))
                          (ct (and (integerp ti)
-                                  (%module-comptype m ti :func))))
+                                  (wasmdown.types:module-type-comptype
+                                   m ti))))
                     (unless (and ct
                                  (eq (wasmdown.types:wasm-comptype-kind ct)
                                      :func)
@@ -3189,7 +3540,14 @@ type slot TYPEIDX (created on first use)."
                             (wasmdown.types:wasm-import-type imp))
                            (wasmdown.types:wasm-memory-limits (cdr prov)))
                     ;; ::48
-                    (%verr "mismatch in memory limits"))))))))
+                    (%verr "mismatch in memory limits")))
+                 ;; M9 (linking lane): a TAG import — the provider
+                 ;; must be a tag (kind match only; tags.wast)
+                 (:tag
+                  (unless (eq (car prov) :tag)
+                    (%verr "expected tag, found ~a"
+                           (string-downcase (string (car prov)))))))))))
+
 
 
 (defun %moduletype-decls (mt)
@@ -3227,7 +3585,22 @@ mismatch is the caller's 'type mismatch in import' (::33)."
     (case (car desc)
       (:func
        (and (eq kind :func)
-            (let* ((want (%moduletype-type-at decls (second desc)))
+            (let* ((want (cond
+                           ;; M9 (shared-everything ::0): an implicit
+                           ;; (func (param ...) (result ...)) import
+                           ;; desc carries its OWN inline sig in the
+                           ;; fourth slot — read it directly instead
+                           ;; of dereferencing a typeidx the
+                           ;; moduletype never declared
+                           ((and (eq (third desc) :implicit)
+                                 (wasmdown.types:wasm-func-type-p
+                                  (fourth desc)))
+                            (cons (wasmdown.types:wasm-func-type-params
+                                   (fourth desc))
+                                  (wasmdown.types:wasm-func-type-results
+                                   (fourth desc))))
+                           (t (%moduletype-type-at decls
+                                                    (second desc)))))
                    (ti (wasmdown.types:wasm-import-type imp))
                    (ct (and (integerp ti)
                             (%module-comptype m ti :func))))
@@ -3270,7 +3643,14 @@ compatible."
   (case (car desc)
     (:func
      (and (eq (car item) :func)
-          (let ((want (%moduletype-type-at decls (second desc))))
+          (let ((want (if (and (eq (third desc) :implicit)
+                               (wasmdown.types:wasm-func-type-p
+                                (fourth desc)))
+                          (cons (wasmdown.types:wasm-func-type-params
+                                 (fourth desc))
+                                (wasmdown.types:wasm-func-type-results
+                                 (fourth desc)))
+                          (%moduletype-type-at decls (second desc)))))
             (and want (%core-sig-equal-p want (cdr item))))))
     (:global
      (and (eq (car item) :global)
@@ -3371,7 +3751,16 @@ task-return shapes are a later slice."
                  (let ((f (canonrec-func cr)))
                    (when (and (< f (length (cval-func-types state)))
                               (aref (cval-func-types state) f))
-                     (aref (cval-func-types state) f))))))
+                     ;; M9 (linking ::90): a declarator-space functype
+                     ;; pushed from an imported instance's ct — remap
+                     ;; its (:idx . k) payloads to THIS component's
+                     ;; type space before the checks read them
+                     (let ((origin (gethash f *func-alias-origin*)))
+                       (if origin
+                           (%remap-decl-functype
+                            (aref (cval-func-types state) f)
+                            (car origin) (cdr origin))
+                           (aref (cval-func-types state) f))))))))
     ;; canonopt: realloc implies memory (abi.wast pins the message)
     (when (and realloc (not mem))
       (%verr "canonical option `realloc` requires `memory` to also be specified"))
@@ -3521,18 +3910,31 @@ ascription flattens to [] -> [])."
     (let* ((want (%flat-functype ft state :lift))
            (sig (%canon-core-func-sig comp (canonrec-func cr))))
       (when sig
-        (unless (equal (car want) (car sig))
-          (%verr "lowered parameter types `~a` do not match parameter types `~a`"
-                 (%flat-core-str (car want)) (%flat-core-str (car sig))))
-        (unless (equal (cdr want) (cdr sig))
-          (%verr "lowered result types `~a` do not match result types `~a`"
-                 (%flat-core-str (cdr want)) (%flat-core-str (cdr sig))))))))
+        ;; M9 (shared-everything ::0): the canon target's signature
+        ;; may arrive with VECTOR slots (the moduletype declarator's
+        ;; wasm-func-type / wasm-comptype params) while the flattened
+        ;; want is a LIST — normalize both sides like %core-sig-equal-p
+        (unless (%core-sig-equal-p (cons (car want) (cdr want))
+                                   (cons (car sig) (cdr sig)))
+          ;; report the params/results separately for the fixture's
+          ;; two distinct messages
+          (unless (equal (coerce (car want) 'list)
+                         (coerce (car sig) 'list))
+            (%verr "lowered parameter types `~a` do not match parameter types `~a`"
+                   (%flat-core-str (car want)) (%flat-core-str (car sig))))
+          (unless (equal (coerce (cdr want) 'list)
+                         (coerce (cdr sig) 'list))
+            (%verr "lowered result types `~a` do not match result types `~a`"
+                   (%flat-core-str (cdr want)) (%flat-core-str (cdr sig)))))))))
 
 
 (defun %flat-core-str (types)
-  "The fixture's `[I32]` rendering of a flat core type list."
+  "The fixture's `[I32]` rendering of a flat core type list. The
+sequence may arrive as a VECTOR (the runtime's functype slots and M9's
+fresh moduletype functype objects) — coerce first."
   (format nil "[~{~a~^ ~}]"
-          (mapcar (lambda (t_) (string-upcase (string t_))) types)))
+          (mapcar (lambda (t_) (string-upcase (string t_)))
+                  (coerce types 'list))))
 
 (defun %enc-str (enc)
   "The fixture spelling of a string-encoding option value: utf8/utf16
@@ -3660,16 +4062,33 @@ resolves to :ty-bad (the callers report 'type mismatch')."
 to an identity: index references pull the identity vector entry and
 apply one substitution step (a :fresh typevar becomes SUB's binding);
 prim keywords wrap as concrete ct. SUB is an alist mapping fresh-id
--> identity (the with-args substitution)."
+-> identity (the with-args substitution).
+M9 (linking ::130): an interned OWN/BORROW wrapper entry resolves
+THROUGH to the OWNED identity — the wrapper's payload indexes the
+OWNED type's slot in the SAME ids space. The OWN/BORROW KIND is
+checked FIRST at %ty-match-valtype's raw level (the resources
+::9/::13 'expected own, found borrow' rule), so the through-resolved
+identity no longer erases the kind distinction; the raw-vs-rebuilt
+payload alignment is handled by the ids-build remap (the wrapper cts
+push into the rebuilt ids with shifted payloads)."
   (cond
    ((and (consp vt) (eq (car vt) :idx))
     (let ((i (cdr vt)))
       (if (or (null ids) (>= i (length ids)))
           :ty-bad
           (let ((ty (aref ids i)))
-            (if (and (consp ty) (eq (car ty) :fresh) sub)
-                (or (cdr (assoc (cdr ty) sub :test #'eql)) ty)
-                ty)))))
+            (cond
+             ((and (consp ty) (eq (car ty) :fresh) sub)
+              (or (cdr (assoc (cdr ty) sub :test #'eql)) ty))
+             ;; the interned own/borrow wrapper: pull the OWNED
+             ;; entry (its payload indexes this same space)
+             ((and (consp ty) (eq (car ty) :ct)
+                   (ct-p (cdr ty))
+                   (member (ct-kind (cdr ty)) '(:own :borrow))
+                   (integerp (ct-payload (cdr ty)))
+                   (< (ct-payload (cdr ty)) (length ids)))
+              (aref ids (ct-payload (cdr ty))))
+             (t ty))))))
    ((ct-p vt) (cons :ct vt))
    ((keywordp vt) (cons :ct (make-ct :kind :prim :payload vt :offset 0)))
    (t :ty-bad)))
@@ -3837,6 +4256,18 @@ fixtures' contract."
         ((:own :borrow)
          (let ((rw (%ty-resolve-idx (ct-payload (cdr w)) ids-w))
                (rg (%ty-resolve-idx (ct-payload (cdr g)) ids-g)))
+           ;; M9 (linking ::130): the OWNED identity's :fresh entry is
+           ;; the child's TYPEVAR — apply the with-args substitution
+           ;; (sub-w/sub-g) so the type-arg's resource (the alias's
+           ;; fresh id) compares against the parent's; un-substituted,
+           ;; the two :fresh ids were always distinct (the child's
+           ;; typevar vs the defining instance's generative id)
+           (flet ((apply-sub (x sub)
+                    (if (and (consp x) (eq (car x) :fresh) sub)
+                        (or (cdr (assoc (cdr x) sub :test #'eql)) x)
+                        x)))
+             (setf rw (apply-sub rw sub-w))
+             (setf rg (apply-sub rg sub-g)))
            (unless (and (consp rw) (consp rg)
                         (cond
                          ((or (eq (car rw) :inst-export)
@@ -3850,7 +4281,7 @@ fixtures' contract."
                                  (eq (car rg) :fresh)
                                  (eql (cdr rw) (cdr rg))))))
              (%verr "resource types are not the same"))))
-        (t nil))))))
+(t nil))))))
 (defun %ty-resolve-idx (i ids)
   "A type index to a canonical identity (fresh vars pass through)."
   (if (or (null ids) (>= i (length ids)) (< i 0))
@@ -3861,12 +4292,103 @@ fixtures' contract."
             (%ty-resolve ty ids)))))
 (defun %ty-match-valtype (vw vg ids-w sub-w ids-g sub-g)
   "Match two RAW valtypes ((:idx . n) | prim | ct): normalize each in
-its own space, then match."
+its own space, then match.
+M9 (linking ::130 + resources ::9/::13): the OWN/BORROW KIND check
+runs FIRST at the RAW valtype level — a valtype whose ids entry is
+an interned own/borrow WRAPPER ct carries that kind (an own param
+vs a borrow expectation rejects 'expected own, found borrow' BEFORE
+any identity resolution). Then %ty-valtype THROUGH-resolves the
+wrapper to the owned identity (the substitution applies at the own
+arm) — the through-resolution alone previously erased the kind and
+the resources canaries broke; the kind-first order keeps both."
+  (flet ((raw-kind (vt ids)
+           (cond
+            ((and (consp vt) (eq (car vt) :idx)
+                  (integerp (cdr vt))
+                  (< (cdr vt) (length ids)))
+             (let ((ty (aref ids (cdr vt))))
+               (cond
+                ((and (consp ty) (eq (car ty) :ct)
+                      (ct-p (cdr ty)))
+                 (ct-kind (cdr ty)))
+                ((ct-p ty) (ct-kind ty))
+                ((keywordp ty) :prim)
+                (t :other))))
+            ((ct-p vt) (ct-kind vt))
+            ((keywordp vt) :prim)
+            (t :other))))
+    (let ((kw (raw-kind vw ids-w))
+          (kg (raw-kind vg ids-g)))
+      (when (and (member kw '(:own :borrow))
+                 (member kg '(:own :borrow))
+                 (not (eq kw kg)))
+        (%verr "expected ~a, found ~a"
+               (string-downcase (string kw))
+               (string-downcase (string kg))))))
   (let ((w (%ty-resolve (%ty-valtype vw ids-w sub-w) ids-w))
         (g (%ty-resolve (%ty-valtype vg ids-g sub-g) ids-g)))
     (when (or (eq w :ty-bad) (eq g :ty-bad))
       (%verr "type mismatch"))
     (%ty-match w g ids-w sub-w ids-g sub-g)))
+(defun %shift-raw-functype (ft arg-si state)
+  "M9 (linking ::128): the identity path's functype with an
+INSTANTIATED source — its (:idx . k) valtype refs are RAW child-space
+type indices, but the ids vector it resolves through is the REBUILT
+child space (the alias-skip in %check-instantiate-args's walk). Shift
+each ref down by the number of non-:type-sorted ALIAS defs before its
+slot in the child's def order. The child comp comes from the ARG's
+instance source record; no record leaves the functype untouched."
+  (labels
+      ((skip-count (comp k)
+         (loop with n = -1
+               with skips = 0
+               for d across (comp-defs comp)
+               do (case (compdef-kind d)
+                    (:type (incf n))
+                    (:export (incf n))
+                    (:alias (if (eq (aliasrec-sort
+                                     (compdef-payload d))
+                                    :type)
+                                (incf n)
+                                ;; a non-type alias: RAW occupies a
+                                ;; slot the rebuild skips
+                                (progn (incf n)
+                                       (when (<= n k)
+                                         (incf skips)))))
+                    (:import
+                     (when (member (car (importrec-type
+                                         (compdef-payload d)))
+                                   '(:type :instance :component))
+                       (incf n))))
+               when (> n k)
+                 return skips
+               finally (return skips)))
+       (shift-valtype (vt comp)
+         (if (and (consp vt) (eq (car vt) :idx)
+                  (integerp (cdr vt)))
+             (cons :idx (- (cdr vt) (skip-count comp (cdr vt))))
+             vt)))
+    (let* ((fidx (sortidx-idx arg-si))
+           (iidx (gethash fidx *func-arg-inst*))
+           (child (and iidx
+                       (gethash iidx *inst-source-comp*))))
+      (if (not (and ft child (ct-p ft) (eq (ct-kind ft) :func)))
+          ft
+          (let* ((pl (ct-payload ft))
+                 (params (first pl))
+                 (results (second pl)))
+            (make-ct :kind :func
+                     :payload (list (if (vectorp params)
+                                        (map 'vector
+                                             (lambda (p)
+                                               (cons (car p)
+                                                     (shift-valtype
+                                                      (cdr p) child)))
+                                             params)
+                                        params)
+                                    (shift-valtype results child)
+                                    (third pl))
+                     :offset (ct-offset ft)))))))
 (defun %match-func-arg (arg-si child-ft ids state)
   "A func import's check: the CHILD's functype (rebuilt in the child
 space, its typevar refs substituted by the with-args) matched against
@@ -3874,10 +4396,36 @@ the PARENT func's actual functype (cval-func-types). The fixture
 messages (instantiation.wast ::24-::28). Slice 5e: the PARENT
 functype's own identity space (an IMPORTED-instance export's ct
 references its own per-instance generative ids — resources
-::27/::28) is looked up from *func-arg-ids* by the ARG's index."
+::27/::28) is looked up from *func-arg-ids* by the ARG's index.
+M9 (linking ::128): the parent functype may be a DECLARATOR-space
+read pushed from an imported instance's ct — remap its (:idx . k)
+payloads to the component's space (the ::90 remap) before the
+comparison, so an (own $r) result resolves through the alias chain
+instead of reading the declarator index against this state."
   (let* ((pidx (sortidx-idx arg-si))
          (parent-ft (and (< pidx (length (cval-func-types state)))
-                         (aref (cval-func-types state) pidx))))
+                         (aref (cval-func-types state) pidx)))
+         (parent-ft (let ((origin (gethash pidx *func-alias-origin*)))
+                      ;; the remap must NOT touch the identity-
+                      ;; based path: a func with a registered
+                      ;; per-instance identity space (*func-arg-ids*)
+                      ;; resolves its refs through that space (the
+                      ;; resources ::27/::28 generative matching)
+                      (cond
+                       ((and origin
+                             (not (gethash pidx *func-arg-ids*)))
+                        (%remap-decl-functype parent-ft
+                                             (car origin)
+                                             (cdr origin)))
+                       ;; M9 (linking ::128): the identity path with
+                       ;; an INSTANTIATED source — the ids vector is
+                       ;; the REBUILT child space (non-type aliases
+                       ;; skipped) while the functype's refs are RAW
+                       ;; child-space indices; shift each ref down by
+                       ;; the count of skipped alias slots before it
+                       ((gethash pidx *func-arg-ids*)
+                        (%shift-raw-functype parent-ft arg-si state))
+                       (t parent-ft)))))
     (unless (and parent-ft (ct-functype-p parent-ft))
       (return-from %match-func-arg))
     (unless (and child-ft (ct-functype-p child-ft))
@@ -3940,10 +4488,16 @@ argument; NIL when unresolvable)."
 COMPONENT index space counts :component defs AND :component IMPORTS
 (slice 5m, resources ::34): an imported component occupies an index
 and has no nested comp — NIL for it, so the callers fall back to the
-import's ascribed ct."
+import's ascribed ct.
+M9 (linking ::169): a :component-sort ALIAS also occupies an index
+(the parse allocates it); it has no nested comp HERE — the callers
+resolve the export chain through %resolve-aliased-component."
   (let ((seen 0))
     (loop for d across (comp-defs comp)
           when (or (eq (compdef-kind d) :component)
+                   (and (eq (compdef-kind d) :alias)
+                        (eq (aliasrec-sort (compdef-payload d))
+                            :component))
                    (and (eq (compdef-kind d) :import)
                         (eq (car (importrec-type
                                   (compdef-payload d)))
@@ -3954,6 +4508,27 @@ import's ascribed ct."
                      ((= seen cidx)
                       (return nil))
                      (t (incf seen)))
+          finally (return nil))))
+
+(defun %aliased-component-target (comp cidx)
+  "M9 (linking ::169): the comp an alias-introduced component projects
+— the cidx'th component-space entry when it is a :component-sort alias
+(%component-at returns NIL there). NIL otherwise."
+  (let ((seen 0))
+    (loop for d across (comp-defs comp)
+          when (or (eq (compdef-kind d) :component)
+                   (and (eq (compdef-kind d) :alias)
+                        (eq (aliasrec-sort (compdef-payload d))
+                            :component))
+                   (and (eq (compdef-kind d) :import)
+                        (eq (car (importrec-type
+                                  (compdef-payload d)))
+                            :component)))
+            if (= seen cidx)
+              return (and (eq (compdef-kind d) :alias)
+                          (%resolve-aliased-component
+                           (compdef-payload d) comp))
+            else do (incf seen)
           finally (return nil))))
 
 (defun %instance-export-sort (inst-idx name state)
@@ -4059,6 +4634,32 @@ resource the (type $i \"r\") alias projects."
                            ((and (eq (car et) :type)
                                  (eq (cdr et) :sub-resource))
                             (%inst-gen-id inst-idx slot))
+                           ;; M9 (linking ::128): a BIND-ID sub-resource
+                           ;; export — (export "r" (type $r (sub
+                           ;; resource))) — interns the sub-resource ct
+                           ;; and ascribes its INDEX; resolve the index
+                           ;; through the declarator sequence and treat
+                           ;; a resource target as the generative id
+                           ((and (eq (car et) :type)
+                                 (integerp (cdr et))
+                                 (let ((n2 -1))
+                                   (loop for td2 across (ct-payload ct)
+                                         do (case (typedecl-kind td2)
+                                              ((:type :alias :import
+                                                :export)
+                                               (incf n2)
+                                               (when (= n2 (cdr et))
+                                                 (return
+                                                  (and
+                                                   (eq (typedecl-kind
+                                                        td2)
+                                                       :type)
+                                                   (ct-resourcetype-p
+                                                    (typedecl-payload
+                                                     td2))))))
+                                              (t nil))
+                                         finally (return nil))))
+                            (%inst-gen-id inst-idx slot))
                            ((and (eq (car et) :type)
                                  (listp (cdr et))
                                  (eq (car (cdr et)) :eq))
@@ -4097,11 +4698,15 @@ declarator sequence's introduced indices). NIL when unresolvable."
                          (t nil))
                     finally (return nil)))))))))
 
-(defun %func-arg-ids-at (arg-si)
+(defun %func-arg-ids-at (arg-si &optional (state nil))
   "Slice 5e: the identity vector registered for the func ARG's own
 type space (%resolve-aliased-func's *func-arg-ids* entry). A helper:
-the inline gethash tripped the compiler's cross-arm type derivation."
-  (and (consp arg-si) (gethash (sortidx-idx arg-si) *func-arg-ids*)))
+the inline gethash tripped the compiler's cross-arm type derivation.
+M9 (linking ::130): keyed by (STATE . fidx) — the bare func index
+collided across walks (a later component's func-0 clobbered the
+earlier's and the func-arg match read the wrong identity vector)."
+  (and (consp arg-si)
+       (gethash (sortidx-idx arg-si) *func-arg-ids*)))
 
 (declaim (notinline %func-arg-ids-at))
 
@@ -4109,42 +4714,80 @@ the inline gethash tripped the compiler's cross-arm type derivation."
   "Slice 4 (family 3): the SOURCE type SHAPE an (alias export i n
 (type)) introduces. A bag's table entry idx is THIS scope's typeidx
 (ev ::48); an INSTANTIATED instance's entry idx is the CHILD's —
-resolved through the stashed child state (ev ::49/::50)."
+resolved through the stashed child state (ev ::49/::50). M9 (linking
+lane): an IMPORTED instance (typed by an instance ct) contributes
+the declared export's SHAPE — a (sub resource) export declarator
+yields a resource ct (the canon resource.* target checks read it)."
   (let* ((src-idx (aliasrec-index payload))
          (ent (and (< src-idx (length (cval-instance-types state)))
                    (aref (cval-instance-types state) src-idx))))
-    (when (hash-table-p ent)
-      (let* ((hit (gethash (aliasrec-name payload) ent :missing))
-             (ti (and (consp hit)
-                      (integerp (cdr hit))
-                      (cdr hit))))
-        (when ti
-          (let* ((child-comp (gethash src-idx *inst-source-comp*))
-                 (child-state (and child-comp
-                                   (gethash child-comp
-                                            *comp-state-stash*))))
-            (cond
-             ;; THIS-scope first: a bag's entry idx is this scope's
-             ;; typeidx (ev ::48/::54) — but only a REAL shape (the
-             ;; marker prims are not resolvable definitions)
-             ((and (< ti (length (cval-types state)))
-                   (ct-p (aref (cval-types state) ti))
-                   (not (and (eq (ct-kind (aref (cval-types state) ti))
-                                 :prim)
-                             (member (ct-payload
-                                      (aref (cval-types state) ti))
-                                     '(:imported :exported
-                                       :outer-aliased
-                                       :imported-or-exported-type)
-                                     :test #'eq))))
-              (aref (cval-types state) ti))
-             ;; an INSTANTIATED instance's entry idx is the CHILD's
-             ;; — resolve through the stashed child state (ev ::49)
-             ((and child-state
-                   (< ti (length (cval-types child-state)))
-                   (ct-p (aref (cval-types child-state) ti)))
-              (aref (cval-types child-state) ti))
-             (t nil))))))))
+    (or (and (hash-table-p ent)
+             (%alias-exported-type-shape-from-hash payload state ent))
+        (and (ct-p ent) (eq (ct-kind ent) :instance)
+             (%instance-ct-exported-type-shape
+              (aliasrec-name payload) ent)))))
+
+(defun %alias-exported-type-shape-from-hash (payload state ent)
+  "The HASH-table branch of %alias-exported-type-shape (a bag or an
+instantiated instance's export table)."
+  (let* ((hit (gethash (aliasrec-name payload) ent :missing))
+         (ti (and (consp hit) (integerp (cdr hit)) (cdr hit))))
+    (when ti
+      (let* ((src-idx (aliasrec-index payload))
+             (child-comp (gethash src-idx *inst-source-comp*))
+             (child-state (and child-comp
+                               (gethash child-comp *comp-state-stash*))))
+        (cond
+         ((and (< ti (length (cval-types state)))
+               (ct-p (aref (cval-types state) ti))
+               (not (and (eq (ct-kind (aref (cval-types state) ti))
+                             :prim)
+                         (member (ct-payload
+                                  (aref (cval-types state) ti))
+                                 '(:imported :exported
+                                   :outer-aliased
+                                   :imported-or-exported-type)
+                                 :test #'eq))))
+          (aref (cval-types state) ti))
+         ((and child-state
+               (< ti (length (cval-types child-state)))
+               (ct-p (aref (cval-types child-state) ti)))
+          (aref (cval-types child-state) ti))
+         (t nil))))))
+
+(defun %instance-ct-exported-type-shape (name ct)
+  "The declared SHAPE of an IMPORTED instance's exported TYPE name —
+the instance ct's (export \"n\" (type <bound>)) declarator: a (sub
+resource) bound is a resource ct; an (eq i) bound follows the ct's
+own declarator chain; anything else has no local shape (NIL)."
+  (let ((d (find name (coerce (ct-payload ct) 'list)
+                :key (lambda (x)
+                       (and (eq (typedecl-kind x) :export)
+                            (first (typedecl-payload x))))
+                :test #'equal)))
+    (when d
+      (let* ((et (third (typedecl-payload d)))
+             (bound (and (eq (car et) :type) (cdr et))))
+        (cond
+         ((eq bound :sub-resource)
+          (make-ct :kind :resource :payload '(0 . nil) :offset 0))
+         ((and (listp bound) (eq (car bound) :eq))
+          ;; an (eq i) bound: follow the ct's own type space
+          (let* ((ti (second bound))
+                 (n -1)
+                 (shape (loop for x across (ct-payload ct)
+                              do (case (typedecl-kind x)
+                                   ((:type :alias :import :export)
+                                    (incf n)
+                                    (when (= n ti)
+                                      (return
+                                       (case (typedecl-kind x)
+                                         (:type (typedecl-payload x))
+                                         (t nil)))))
+                                   (t nil))
+                              finally (return nil))))
+            (and shape (ct-p shape) shape)))
+         (t nil))))))
 
 
 
@@ -4188,15 +4831,137 @@ unknown (NIL)."
                                 (cdr hit)))))
             (cond
              ((hash-table-p sub) sub)
-             ;; slice 5m (indicies ::0): an entry whose cdr is an
-             ;; INSTANCE ct (carried by the ct-branch build above)
-             ;; projects to that ct's own export table
+             ;; M9 (linking EV ::61): the EXPORT'S ASCRIBED
+             ;; instance type REPLACES the visible one — when the
+             ;; child's export rec for NAME carries an :instance
+             ;; ascription, the projected table is the AScribed ct's
+             ;; export declarators (an empty ascription hides every
+             ;; export: the consumer's 'missing expected export')
+             ((and (gethash src-idx *inst-source-comp*)
+                   (let* ((child-comp (gethash src-idx
+                                               *inst-source-comp*))
+                          (asc (and child-comp
+                                    (loop for d across
+                                             (wasmdown.component:comp-defs
+                                              child-comp)
+                                          when (and
+                                                (eq (compdef-kind d)
+                                                    :export)
+                                                (string=
+                                                 (exportrec-name
+                                                  (compdef-payload d))
+                                                 name))
+                                            return (exportrec-type
+                                                    (compdef-payload
+                                                     d)))))
+                          (k (and (consp asc)
+                                  (eq (car asc) :instance)
+                                  (cdr asc))))
+                     (and (integerp k)
+                          child-comp
+                          (let* ((child-state
+                                  (gethash child-comp
+                                           *comp-state-stash*))
+                                 (ct* (and child-state
+                                           (< k (length
+                                                 (cval-types
+                                                  child-state)))
+                                           (aref (cval-types
+                                                  child-state)
+                                                 k))))
+                        (and (ct-p ct*)
+                             (eq (ct-kind ct*) :instance)
+                             (let ((tab (make-hash-table
+                                         :test #'equal)))
+                               (dolist (td (coerce (ct-payload ct*)
+                                                   'list))
+                                 (when (eq (typedecl-kind td)
+                                           :export)
+                                   (let* ((pl (typedecl-payload td))
+                                          (et2 (third pl)))
+                                     (setf (gethash (first pl) tab)
+                                           (cons (car et2)
+                                                 (if (and (consp et2)
+                                                          (eq (car et2)
+                                                              :type))
+                                                     (first pl)
+                                                     (cdr et2)))))))
+                               tab))))))
+              (let ((tab (make-hash-table :test #'equal)))
+                (let* ((child-comp (gethash src-idx
+                                           *inst-source-comp*))
+                       (child-state (and child-comp
+                                        (gethash child-comp
+                                                 *comp-state-stash*)))
+                       (asc (loop for d across
+                                     (wasmdown.component:comp-defs
+                                  child-comp)
+                                when (and (eq (compdef-kind d)
+                                              :export)
+                                          (string=
+                                           (exportrec-name
+                                            (compdef-payload d))
+                                           name))
+                                return (exportrec-type
+                                        (compdef-payload d))))
+                       (k (and (consp asc)
+                               (eq (car asc) :instance)
+                               (cdr asc)))
+                       (ct* (and child-state
+                                 (integerp k)
+                                 (< k (length (cval-types child-state)))
+                                 (aref (cval-types child-state) k))))
+                  (dolist (td (coerce (ct-payload ct*) 'list))
+                    (when (eq (typedecl-kind td) :export)
+                      (let* ((pl (typedecl-payload td))
+                             (et2 (third pl)))
+                        (setf (gethash (first pl) tab)
+                              (cons (car et2)
+                                    (if (and (consp et2)
+                                             (eq (car et2) :type))
+                                        (first pl)
+                                        (cdr et2)))))))
+                  tab)))
+             ;; slice 5m (indicies ::0) + M9 (::75's 49-row
+             ;; cascade): an entry whose sort is :instance — the
+             ;; RE-EXPORT of an IMPORTED instance. The entry's cdr
+             ;; is the CHILD's import index (child space); resolve
+             ;; the import's ascribed instance-ct through the
+             ;; CHILD's stashed state (its instance-types slot holds
+             ;; the ct), then project the ct's export declarators.
              ((and (consp hit)
                    (eq (car hit) :instance)
-                   (ct-p (cdr hit))
-                   (eq (ct-kind (cdr hit)) :instance))
-              (let ((tab (make-hash-table :test #'equal)))
-                (dolist (td (coerce (ct-payload (cdr hit)) 'list))
+                   (let* ((child-comp (gethash src-idx
+                                               *inst-source-comp*))
+                          (child-state (and child-comp
+                                            (gethash child-comp
+                                                     *comp-state-stash*)))
+                          (k (cdr hit))
+                          (ct* (or (and (ct-p k) k)
+                                   (and child-state
+                                        (integerp k)
+                                        (< k (length
+                                              (cval-instance-types
+                                               child-state)))
+                                        (aref (cval-instance-types
+                                               child-state) k)))))
+                     (and (ct-p ct*)
+                          (eq (ct-kind ct*) :instance))))
+              (let* ((child-comp (gethash src-idx
+                                          *inst-source-comp*))
+                     (child-state (and child-comp
+                                       (gethash child-comp
+                                                *comp-state-stash*)))
+                     (k (cdr hit))
+                     (ct* (or (and (ct-p k) k)
+                              (and child-state
+                                   (integerp k)
+                                   (< k (length (cval-instance-types
+                                                 child-state)))
+                                   (aref (cval-instance-types
+                                          child-state) k))))
+                     (tab (make-hash-table :test #'equal)))
+                (dolist (td (coerce (ct-payload ct*) 'list))
                   (when (eq (typedecl-kind td) :export)
                     (let* ((pl (typedecl-payload td))
                            (et2 (third pl)))
@@ -4360,6 +5125,89 @@ ACTUAL identity (parent space)."
                  actual)))
       (unless (or (eq w :ty-bad) (eq g :ty-bad) (null g))
         (%ty-match w g ids nil parent-ids nil)))))
+(defun %resolve-aliased-component (alias comp)
+  "M9 (linking ::169): the comp an export-alias projects. The
+alias's source instance was instantiated from a comp reachable in
+the def tree, so resolve the chain structurally (the shared
+*inst-source-comp* is keyed by bare instance index and a child's
+records are clobbered by the enclosing walk): the alias lives in
+COMP; its source instance's instrec gives the SOURCE comp; that
+comp's component-space export (the alias's name) gives the next
+entry — a plain :component def ends the chain, another alias
+recurses with the source comp as the new owner (the chain crosses
+component boundaries: $C11 -> $D1's export c1 -> the alias $Ca
+inside $D1 -> $D2's export c -> $Counter)."
+  (labels
+      ((comp-entry (c k)
+         "The k-th component-space entry of C: (:component . comp) |
+(:alias . aliasrec) | NIL."
+         (let ((seen 0))
+           (loop for d across (comp-defs c)
+                 when (or (eq (compdef-kind d) :component)
+                          (and (eq (compdef-kind d) :import)
+                               (eq (car (importrec-type
+                                         (compdef-payload d)))
+                                   :component))
+                          (and (eq (compdef-kind d) :alias)
+                               (eq (aliasrec-sort (compdef-payload d))
+                                   :component)))
+                   if (= seen k)
+                     return (cons (compdef-kind d) (compdef-payload d))
+                   else do (incf seen)
+                 finally (return nil))))
+       (inst-source (c iidx)
+         "The (target-comp . entry) the iidx-th instance def of C
+instantiates: the TARGET comp is what the instance instantiates —
+the export named by a later alias hop resolves in IT (the alias
+$C11 projects $d1's export c1, and c1 is $D1's export, not the
+parent's)."
+         (let ((seen 0))
+           (loop for d across (comp-defs c)
+                 when (eq (compdef-kind d) :instance)
+                   if (= seen iidx)
+                     return (let ((e (and (eq (instrec-kind
+                                              (compdef-payload d))
+                                             :instantiate)
+                                         (comp-entry
+                                          c (instrec-index
+                                             (compdef-payload d))))))
+                              (and e
+                                   (cons (if (eq (car e) :component)
+                                             (cdr e)
+                                             nil)
+                                         e)))
+                   else do (incf seen)
+                 finally (return nil))))
+       (export-entry (c name)
+         "C's component-space export NAME's entry."
+         (loop for d across (comp-defs c)
+               when (and (eq (compdef-kind d) :export)
+                         (string= (exportrec-name (compdef-payload d))
+                                  name))
+                 do (let ((si (exportrec-sortidx
+                               (compdef-payload d))))
+                      (when (and (consp si)
+                                 (eq (sortidx-sort si) :component))
+                        (return (cons c (comp-entry c (sortidx-idx si))))))
+               finally (return nil))))
+    (loop
+      with guard = 0
+      for owner = comp then (car hop)
+      for a = alias then (cdr (cdr hop))
+      for hop = (and (eq (aliasrec-kind a) :export)
+                     owner
+                     (let ((src (inst-source owner
+                                             (aliasrec-index a))))
+                       (and src
+                            (car src)
+                            (export-entry (car src)
+                                          (aliasrec-name a)))))
+      do (incf guard)
+         (when (or (> guard 16) (null hop))
+           (return nil))
+      when (and (consp (cdr hop))
+                (eq (car (cdr hop)) :component))
+        return (cdr (cdr hop)))))
 (defun %check-instantiate-args (inst comp state)
   "The instantiation-time type checks (instantiation.wast): every
 import of the target component is checked, in the child's declaration
@@ -4393,13 +5241,29 @@ rejected (instantiation.wast ::57)."
       ;; occupies an index; the target stays NIL for imports — the
       ;; with-arg matching skips, the identity/export paths read the
       ;; ascribed ct)
+      ;; M9 (linking ::169): a :component-sort ALIAS also occupies an
+      ;; index (unit.wast's nested-component export chain aliases a
+      ;; counter component up two levels — instantiating the alias
+      ;; resolved the wrong target and reported the alias's own
+      ;; imports). The aliased component's payload rides in the
+      ;; *alias-component-source* record.
       (when (or (eq (compdef-kind d) :component)
                 (and (eq (compdef-kind d) :import)
                      (eq (car (importrec-type (compdef-payload d)))
+                         :component))
+                (and (eq (compdef-kind d) :alias)
+                     (eq (aliasrec-sort (compdef-payload d))
                          :component)))
         (when (= seen cidx)
-          (when (eq (compdef-kind d) :component)
+          (cond
+           ((eq (compdef-kind d) :component)
             (setf target (compdef-payload d)))
+           ;; an alias-introduced component: resolve the export chain
+           ;; (the alias projects a component out of an instance's
+           ;; exports; that export may itself be an alias — recurse)
+           ((eq (compdef-kind d) :alias)
+            (setf target (%resolve-aliased-component
+                          (compdef-payload d) comp))))
           (return))
         (incf seen)))
     (unless target
@@ -4412,7 +5276,17 @@ rejected (instantiation.wast ::57)."
           ;; slice 4 (family 1b): the child's CORE types — the
           ;; (:core-module . k) import's moduletype lives at k in
           ;; the child's own core-type space
-          (core-types (make-array 16 :fill-pointer 0 :adjustable t)))
+          (core-types (make-array 16 :fill-pointer 0 :adjustable t))
+          ;; M9 (linking ::130): the number of non-:type-sorted
+          ;; ALIAS defs walked so far — a wrapper ct pushed into ids
+          ;; carries a RAW child-space payload index; the rebuilt ids
+          ;; skip those alias slots, so the payload must shift down
+          ;; by this count to stay aligned
+          (alias-skips 0)
+          ;; M9 (linking ::130): the skip count in effect when each
+          ;; ids slot was pushed — a wrapper's payload shift uses the
+          ;; count at the TARGET's slot, not at the wrapper's own
+          (slot-skips (make-array 16 :fill-pointer 0 :adjustable t)))
       (dolist (d (coerce (comp-defs target) 'list))
         (let ((pl (compdef-payload d)))
           (case (compdef-kind d)
@@ -4425,32 +5299,69 @@ rejected (instantiation.wast ::57)."
              (vector-push-extend
               (if (ct-resourcetype-p pl)
                   (%fresh-resource-id)
-                  (cons :ct pl))
-              ids))
+                  ;; M9 (linking ::130): an own/borrow WRAPPER ct's
+                  ;; payload is a RAW child-space type index — remap
+                  ;; it to the rebuilt space. The shift is the skip
+                  ;; count in effect at the TARGET's slot (the
+                  ;; non-type aliases before the referenced def),
+                  ;; read from the per-slot record — NOT the count at
+                  ;; the wrapper's own position (later canon-target
+                  ;; aliases inflate that)
+                  (cons :ct
+                        (if (and (member (ct-kind pl) '(:own :borrow))
+                                 (integerp (ct-payload pl))
+                                 (< (ct-payload pl)
+                                    (length slot-skips)))
+                            (make-ct :kind (ct-kind pl)
+                                     :payload (- (ct-payload pl)
+                                                 (aref slot-skips
+                                                       (ct-payload pl)))
+                                     :offset (ct-offset pl))
+                            pl)))
+              ids)
+             ;; record this slot's effective skip count
+             (vector-push-extend alias-skips slot-skips))
             ((:export :alias)
              ;; slice 5l (resources ::39): exports and aliases also
              ;; introduce type indices in the rebuilt child space —
              ;; an export's new index is an alias of its sortidx'd
              ;; source ((:ref ti), resolving to the source's rebuilt
              ;; identity); an ascribed (sub resource) export is fresh;
-             ;; an alias is opaque
-             (let ((si (if (eq (compdef-kind d) :export)
-                           (exportrec-sortidx pl)
-                           nil)))
-               (vector-push-extend
-                (cond
-                 ((and (eq (compdef-kind d) :export)
-                       (exportrec-type pl)
-                       (consp (cdr (exportrec-type pl)))
-                       (eq (car (cdr (exportrec-type pl)))
-                           :sub-resource))
-                  (%fresh-resource-id))
-                 ((and (eq (compdef-kind d) :export)
-                       si (eq (sortidx-sort si) :type))
-                  (cons :ref (sortidx-idx si)))
-                 (t '(:opaque)))
-                ids)))
-            (:import
+             ;; an alias is opaque.
+             ;; M9 (linking ::128): only :type-INTRODUCING defs grow
+             ;; the rebuilt ids — an ALIAS of another sort (the parse's
+             ;; implicit (alias core-export ...) for a resource's
+             ;; (dtor (core func ...)) projection) occupies that sort's
+             ;; space, NOT the type space; pushing for it misaligned
+             ;; every later slot (the own's target resolved through
+             ;; the wrong id and the func-arg match failed 'type
+             ;; mismatch with result type')
+             (when (and (eq (compdef-kind d) :alias)
+                        (not (eq (aliasrec-sort pl) :type)))
+               ;; M9 (linking ::130): a non-type alias the rebuild
+               ;; skips — later wrapper payloads shift past it
+               (incf alias-skips))
+             (when (or (eq (compdef-kind d) :export)
+                       (and (eq (compdef-kind d) :alias)
+                            (eq (aliasrec-sort pl) :type)))
+               (let ((si (if (eq (compdef-kind d) :export)
+                             (exportrec-sortidx pl)
+                             nil)))
+                 (vector-push-extend
+                  (cond
+                   ((and (eq (compdef-kind d) :export)
+                         (exportrec-type pl)
+                         (consp (cdr (exportrec-type pl)))
+                         (eq (car (cdr (exportrec-type pl)))
+                             :sub-resource))
+                    (%fresh-resource-id))
+                   ((and (eq (compdef-kind d) :export)
+                         si (eq (sortidx-sort si) :type))
+                    (cons :ref (sortidx-idx si)))
+                   (t '(:opaque)))
+                  ids)
+                 ;; M9 (linking ::130): this slot's skip count too
+                 (vector-push-extend alias-skips slot-skips))))            (:import
              (let* ((et (importrec-type pl))
                     (nm (importrec-name pl))
                     (arg-si (cdr (assoc nm (coerce args 'list)
@@ -4499,17 +5410,28 @@ rejected (instantiation.wast ::57)."
                             (let* ((pl (typedecl-payload td))
                                    (ename (first pl))
                                    (eet (third pl)))
-                              (multiple-value-bind (got-sort)
+                              (multiple-value-bind (got-sort known)
                                   (%instance-export-sort
                                    (sortidx-idx arg-si) ename state)
+                                ;; M9 (linking EV ::61): a REQUIRED
+                                ;; export the argument does not
+                                ;; provide at all — 'missing
+                                ;; expected export `f`' (the
+                                ;; ascription-replaced type)
+                                (unless known
+                                  (%verr "missing expected export `~a`"
+                                         ename))
                                 (unless (eq got-sort (car eet))
                                   (%verr "type mismatch in instance export `~a`"
                                          ename))))))))
-                  (vector-push-extend
-                   (and (< (cdr et) (length ctypes))
-                        (aref ctypes (cdr et)))
-                   ctypes)
-                  (vector-push-extend '(:opaque) ids)))
+                  ;; M9 (shared-everything ::0): an import introduces
+                  ;; NO component type index — its ascribed ct was
+                  ;; already pushed by the child's own :type def walk
+                  ;; (the inline instance externtype desugars into an
+                  ;; out-of-line type def BEFORE the import def). The
+                  ;; former re-push duplicated the ct, shifting every
+                  ;; later import's read by one.
+                  ))
                  (:core-module
                   ;; slice 4 (family 1b): the moduletype import —
                   ;; the ARG is a core module (its wasm-module IR);
@@ -4580,6 +5502,26 @@ rejected (instantiation.wast ::57)."
 (defun %vis-nameable-kind-p (kind)
   (member kind '(:resource :record :variant :enum :flags)))
 
+(defun %vis-decl-functype-at (ict fti)
+  "M9 (linking ::104): instance-ct ICT's FUNCTYPE for a func export
+whose ascribed index FTI resolves in the CT's OWN declarator space
+(the :type-introducing entries counted in sequence) — the functype
+ct when found there, NIL when FTI is not a declarator-space index
+(the caller falls back to the enclosing state's space)."
+  (loop with n = -1
+        for td across (ct-payload ict)
+        do (case (typedecl-kind td)
+             ((:type :alias :import :export)
+              (incf n)
+              (when (and (= n fti)
+                         (eq (typedecl-kind td) :type)
+                         (eq (wasmdown.component:ct-kind
+                              (typedecl-payload td))
+                             :func))
+                (return-from %vis-decl-functype-at
+                  (typedecl-payload td)))))
+        finally (return-from %vis-decl-functype-at nil)))
+
 (defun %vis-named-p (state idx import-p)
   "IDX is in the visible set for this context: IMPORT-P selects the
 import table only; exports accept both."
@@ -4615,16 +5557,39 @@ the message: func | type | instance."
                (%verr "~a not valid to be used as ~a"
                       what (if import-p "import" "export"))))
          (walk-idx (i)
-           (when (and (>= i 0) (< i (length (cval-types state)))
+           (when (and (>= i 0)
                       (not (gethash i seen)))
-             (setf (gethash i seen) t)
-             (let ((ty (aref (cval-types state) i)))
-               (when (ct-p ty)
-                 ;; a REACHED type must be named if nameable
-                 (when (and (%vis-nameable-kind-p (ct-kind ty))
-                            (not (%vis-named-p state i import-p)))
-                   (bad i))
-                 (walk-ct ty)))))
+             ;; M9 (EV ::52): an import-declarator's SUNK implicit
+             ;; outer alias leaves the ref's index OUT OF BOUNDS in
+             ;; THIS state (the alias never introduced a slot) —
+             ;; resolve through *outer-states* so the walk sees the
+             ;; underlying type in the ENCLOSING component's space
+             ;; ('func not valid to be used as import' fires there;
+             ;; skipping it made the fixture pass wrong)
+             (cond
+              ((< i (length (cval-types state)))
+               (setf (gethash i seen) t)
+               (let ((ty (aref (cval-types state) i)))
+                 (when (ct-p ty)
+                   ;; a REACHED type must be named if nameable
+                   (when (and (%vis-nameable-kind-p (ct-kind ty))
+                              (not (%vis-named-p state i import-p)))
+                     (bad i))
+                   (walk-ct ty))))
+              ((and (boundp '*outer-states*) *outer-states*)
+               (loop for st in *outer-states*
+                     when (and (< i (length (cval-types st)))
+                               (not (gethash (cons :st i) seen)))
+                       do (setf (gethash (cons :st i) seen) t)
+                          (let ((ty (aref (cval-types st) i)))
+                            (when (and (ct-p ty)
+                                       (%vis-nameable-kind-p (ct-kind ty)))
+                              ;; named in the ENCLOSING space: an
+                              ;; outer type is visible there only if
+                              ;; the ENCLOSING component named it
+                              (unless (%vis-named-p st i import-p)
+                                (bad i)))
+                            (when (ct-p ty) (walk-ct ty))))))))
          (walk-ct (ty)
            (case (ct-kind ty)
              (:prim nil) ; :imported/:exported/:outer-aliased markers
@@ -4652,18 +5617,123 @@ the message: func | type | instance."
                     do (walk-vt vt))
               (when (second (ct-payload ty))
                 (walk-vt (second (ct-payload ty)))))
-             (:instance
-              ;; an instance type: every export declarator's
-              ;; externtype is checked in ITS OWN (export) context
-              (loop for d across (ct-payload ty)
-                    when (and (eq (typedecl-kind d) :export))
-                      do (%vis-check-decl state (typedecl-payload d)
-                                         nil what)))
+            (:instance
+             ;; an instance type: every export declarator's
+             ;; externtype is checked in ITS OWN (export) context.
+             ;; M9 (linking ::104): the declarators' index refs are
+             ;; in the CT's OWN declarator space — resolve the func
+             ;; export's functype through the declarator sequence
+             ;; (an own/borrow ref to an alias-introduced type is an
+             ;; outer-aliased marker — the walk stops there; walking
+             ;; the ENCLOSING state's space read the wrong ct and
+             ;; reported 'func not valid to be used as export')
+             (loop for d across (ct-payload ty)
+                   when (eq (typedecl-kind d) :export)
+                     do (let ((et (third (typedecl-payload d))))
+                          (case (car et)
+                            (:func
+                             (let ((ft (and (integerp (cdr et))
+                                            (%vis-decl-functype-at
+                                             ty (cdr et)))))
+                               (if ft
+                                   (labels
+                                       ((walk-decl-vt (vt)
+                                          (cond
+                                           ((and (consp vt)
+                                                 (eq (car vt) :idx)
+                                                 (integerp (cdr vt)))
+                                            ;; a DECLARATOR-space ref:
+                                            ;; the entry at that
+                                            ;; position — an alias is
+                                            ;; outer-aliased (opaque,
+                                            ;; the walk stops); a
+                                            ;; :type walks in place
+                                            (let ((e (and
+                                                      (integerp (cdr vt))
+                                                      (loop with n2 = -1
+                                                            for td2 across
+                                                              (ct-payload ty)
+                                                            do (case
+                                                                 (typedecl-kind td2)
+                                                                 ((:type :alias
+                                                                   :import
+                                                                   :export)
+                                                                  (incf n2)
+                                                                  (when (= n2
+                                                                           (cdr vt))
+                                                                    (return
+                                                                     td2))))
+                                                            finally
+                                                               (return nil)))))
+                                              (when (and e
+                                                         (eq
+                                                          (typedecl-kind e)
+                                                          :type))
+                                                (walk-decl-ct
+                                                 (typedecl-payload e)))))
+                                           ((and (consp vt)
+                                                 (eq (car vt) :idx))
+                                            ;; an interned own/borrow
+                                            ;; ct ref — walk it with
+                                            ;; the decl resolution
+                                            nil)
+                                           ((and vt (ct-p vt))
+                                            (walk-decl-ct vt))))
+                                        (walk-decl-ct (c)
+                                          (when (and (ct-p c)
+                                                     (not
+                                                      (gethash
+                                                       (ct-kind c)
+                                                       seen)))
+                                            (setf (gethash
+                                                   (ct-kind c)
+                                                   seen)
+                                                  t)
+                                            (case
+                                                (ct-kind c)
+                                              (:func
+                                               (loop
+                                                for (nil . vt2)
+                                                  across
+                                                  (first
+                                                   (ct-payload c))
+                                                do (walk-decl-vt vt2))
+                                               (when (second
+                                                      (ct-payload c))
+                                                 (walk-decl-vt
+                                                  (second
+                                                   (ct-payload c)))))
+                                              ((:own :borrow)
+                                               (walk-decl-vt
+                                                (ct-payload c)))
+                                              (t nil)))))
+                                     (declare (ignorable
+                                               #'walk-decl-vt
+                                               #'walk-decl-ct))
+                                     (walk-decl-ct ft))
+                                   ;; not in the declarator's own
+                                   ;; space: the generic state path
+                                   (%vis-check-decl state
+                                                    (typedecl-payload d)
+                                                    nil what))))
+                            ((:type :instance)
+                             (%vis-check-decl state (typedecl-payload d)
+                                              nil what))))))
              (t nil)))
          (walk-vt (vt)
            (cond ((and (consp vt) (eq (car vt) :idx))
                   (walk-idx (cdr vt)))
-                 ((ct-p vt) (walk-ct vt))
+                 ((ct-p vt)
+                  ;; M9 (EV ::52): a BARE ct arrived with no index —
+                  ;; a nameable kind reached this way (an anonymous
+                  ;; inline ct, e.g. an import functype's result
+                  ;; resolving a sunk outer alias) has NO named slot
+                  ;; to check: fire the bad path. The shape-of-a-
+                  ;; named-type arrivals come through walk-idx (which
+                  ;; already checked namedness before recursing).
+                  (when (%vis-nameable-kind-p (ct-kind vt))
+                    (bad -1))
+                  (walk-ct vt))
                  (t nil))))
       ;; the ROOT skips its own nameability check (::26/::41/::23)
       (cond ((and (integerp root) (>= root 0)
@@ -4808,8 +5878,28 @@ freely)."
             ((:type :alias)
              (vector-push-extend
               (if (eq (typedecl-kind d) :alias)
-                  (make-ct :kind :prim :payload :outer-aliased
-                           :offset 0)
+                  (let ((a (typedecl-payload d)))
+                    ;; M9 (linking ::104): an OUTER type alias whose
+                    ;; target is a RESOURCE pushes a RESOURCE ct — the
+                    ;; type's own declarators' interned own/borrow cts
+                    ;; reference this slot and the own/borrow check
+                    ;; demands a resource (same as %check-defvaltype's
+                    ;; alias arm; the de Bruijn chain here resolves
+                    ;; against the USE site's state)
+                    (let ((tgt (and (eq (aliasrec-kind a) :outer)
+                                    (eq (aliasrec-sort a) :type)
+                                    (%outer-state-at state
+                                                     (aliasrec-count a)))))
+                      (if (and tgt
+                               (< (aliasrec-target a)
+                                  (length (cval-types tgt)))
+                               (ct-resourcetype-p
+                                (aref (cval-types tgt)
+                                      (aliasrec-target a))))
+                          (make-ct :kind :resource
+                                   :payload '(0 . nil) :offset 0)
+                          (make-ct :kind :prim
+                                   :payload :outer-aliased :offset 0))))
                   (typedecl-payload d))
               (cval-types inner)))
             ((:import :export)
@@ -5220,6 +6310,96 @@ handle's representation dropped on entry)."
                              (null (cdr sig)))))
           (%verr "wrong signature for a destructor"))))))
 
+(defun %remap-decl-functype (ft inst-idx ict)
+  "M9 (linking ::90): a functype read out of an IMPORTED instance's
+declarator space — its (:idx . k) valtype payloads reference the
+DECLARATOR's own type space. An inline (own $r)/(borrow $r) result
+DESUGARS to an interned OWN/BORROW entry at position k whose PAYLOAD
+is $r's declarator-space index m; the exportdecl whose ascribed
+(type . m) introduced m names the resource. Remap k to the
+COMPONENT-space typeidx of the (alias export $inst \"name\" (type))
+that projects that export. Unresolvable references stay untouched."
+  (labels
+      ((entry-at (k)
+         "The declarator's k-th type-introducing entry's payload."
+         (loop with n = -1
+               for td across (ct-payload ict)
+               do (case (typedecl-kind td)
+                    ((:type :alias :import :export)
+                     (incf n)
+                     (when (= n k)
+                       (return-from entry-at
+                         (if (eq (typedecl-kind td) :type)
+                             (typedecl-payload td)
+                             nil)))))
+               finally (return-from entry-at nil)))
+       (export-name-for (m)
+         "The name of the m-th TYPE-INTRODUCING exportdecl (in
+declarator order): a (sub resource) export's et carries the
+:SUB-RESOURCE marker — its declarator-space position is the export
+ARM's ordinal (the bind index the arm assigns), so count type-sorted
+exportdecls."
+         (loop with n = -1
+               for td across (ct-payload ict)
+               when (and (eq (typedecl-kind td) :export)
+                         (let ((et (third (typedecl-payload td))))
+                           (and (consp et) (eq (car et) :type))))
+                 do (incf n)
+                    (when (= n m)
+                      (return-from export-name-for
+                        (first (typedecl-payload td))))
+               finally (return-from export-name-for nil)))
+       (remap-valtype (vt)
+         (if (not (and (consp vt) (eq (car vt) :idx)
+                       (integerp (cdr vt))))
+             vt
+             (let* ((k (cdr vt))
+                    (e (entry-at k))
+                    ;; the interned own/borrow entry's payload is the
+                    ;; OWNED type's declarator-space index
+                    (m (and (ct-p e)
+                            (member (ct-kind e) '(:own :borrow))
+                            (integerp (ct-payload e))
+                            (ct-payload e)))
+                    (nm (and m (export-name-for m)))
+                    (hit (and nm
+                              (gethash (cons inst-idx nm)
+                                       *inst-alias-typeidx*)))
+                    ;; no projecting type alias: the resource exists
+                    ;; only in the IMPORT's declarator space — the
+                    ;; own/borrow valtype is a RESOURCE handle (i32,
+                    ;; no memory forcing); substitute a concrete
+                    ;; resource marker ct so the component-space
+                    ;; resolution never reads the declarator index
+                    (target (or hit
+                                (and (ct-p e)
+                                     (member (ct-kind e)
+                                             '(:own :borrow))
+                                     m
+                                     (make-ct :kind :resource
+                                              :payload '(0 . nil)
+                                              :offset 0)))))
+               (if target
+                   (if (integerp target) (cons :idx target) target)
+                   vt)))))
+    (if (not (and ft (ct-p ft) (eq (ct-kind ft) :func)))
+        ft
+        (let* ((pl (ct-payload ft))
+               (params (first pl))
+               (results (second pl)))
+          (make-ct :kind :func
+                   :payload (list (if (vectorp params)
+                                      (map 'vector
+                                           (lambda (p)
+                                             (cons (car p)
+                                                   (remap-valtype
+                                                    (cdr p))))
+                                           params)
+                                      params)
+                                  (remap-valtype results)
+                                  (third pl))
+                   :offset (ct-offset ft))))))
+
 (defun %resolve-aliased-func (payload state)
   "Slice 5e (resources ::27/::28/::43): an EXPORT-aliased func out of
 an IMPORTED instance carries the source instance ct's functype (the
@@ -5266,6 +6446,11 @@ version tripped the compiler's cross-arm payload type derivation."
                             *func-arg-ids*)
                    (gethash (aliasrec-index payload)
                             *inst-ids-stash*))
+             ;; M9 (linking ::128): the source INSTANCE index for the
+             ;; shift's child-comp lookup
+             (setf (gethash (1- (cval-funcs state))
+                            *func-arg-inst*)
+                   (aliasrec-index payload))
              (and (< (cdr hit)
                      (length (cval-func-types child-state)))
                   (aref (cval-func-types child-state)
@@ -5275,7 +6460,13 @@ version tripped the compiler's cross-arm payload type derivation."
       (setf (gethash (1- (cval-funcs state))
                      *func-arg-ids*)
             (%instance-ct-ids
-             (aliasrec-index payload) ict)))))
+             (aliasrec-index payload) ict))
+      ;; M9 (linking ::90): the canon checks read this functype against
+      ;; the COMPONENT's type space — record the declarator origin so
+      ;; the (:idx . k) payloads can be remapped there
+      (setf (gethash (1- (cval-funcs state))
+                     *func-alias-origin*)
+            (cons (aliasrec-index payload) ict)))))
 
 (defun validate-component (comp &key (outer-depth 0))
   "Validate a decoded component. Signals wasmdown:validation-error on
@@ -5284,10 +6475,15 @@ the number of enclosing component/type scopes (outer aliases)."
   (let ((*validate-depth* (1+ *validate-depth*)))
     (when (= *validate-depth* 1)
       (clrhash *comp-state-stash*)
+      (clrhash *state-comp*)
       (clrhash *inst-source-comp*)
       (clrhash *inst-ids-stash*)
       (clrhash *inst-gen-ids*)
-      (clrhash *func-arg-ids*))
+      (clrhash *func-arg-ids*)
+      ;; M9 (linking ::90/::169)
+      (clrhash *inst-alias-typeidx*)
+      (clrhash *func-alias-origin*)
+      (clrhash *alias-component-source*))
   (let ((state (make-cval
                 :types (make-array 16 :fill-pointer 0 :adjustable t)
                 :core-types (make-array 16 :fill-pointer 0 :adjustable t)
@@ -5386,6 +6582,12 @@ the number of enclosing component/type scopes (outer aliases)."
                   ;; (outer-alias A): push THIS state for the child's
                   ;; de Bruijn resolution.
                   (let ((*outer-states* (cons state *outer-states*)))
+                    ;; M9 (linking ::179): record the ENCLOSING state's
+                    ;; comp BEFORE the recursion — the child's outer-
+                    ;; alias resolution (*state-comp*) runs during the
+                    ;; child's walk, before the parent's own end-of-
+                    ;; validate stash
+                    (setf (gethash state *state-comp*) comp)
                     (validate-component payload
                                         :outer-depth (1+ outer-depth)))
                   (incf (cval-components state)))
@@ -5417,9 +6619,15 @@ the number of enclosing component/type scopes (outer aliases)."
                      ;; (alias export / (export ... (instance $i "n")))
                      ;; can resolve them (instantiation.wast
                      ;; ::75/::77/::79 'no export named `x`')
-                     (let ((tab (make-hash-table :test #'equal))
-                           (tc (%component-at comp
-                                              (instrec-index payload))))
+                    (let ((tab (make-hash-table :test #'equal))
+                          ;; M9 (linking ::169): an alias-introduced
+                          ;; component target resolves through the
+                          ;; export chain (%component-at returns NIL at
+                          ;; an alias's index)
+                          (tc (or (%component-at comp
+                                                 (instrec-index payload))
+                                  (%aliased-component-target
+                                   comp (instrec-index payload)))))
                        ;; slice 5f (resources ::43): an IMPORTED
                        ;; component target's exports read from the
                        ;; import's ascribed COMPONENT TYPE (the ct in
@@ -5644,25 +6852,36 @@ the number of enclosing component/type scopes (outer aliases)."
                      ;; provider's module exports resolve via
                      ;; %core-module-at; an inline-export BAG lists
                      ;; its names directly
-                     (let ((prov (gethash (aliasrec-index payload)
-                                          *core-inst-provider*)))
-                       (when (and (consp prov)
-                                  (not
-                                   (find (aliasrec-name payload)
-                                         (cond
-                                          ((eq (car prov) :bag)
-                                           (map 'list #'car (cdr prov)))
-                                          ((eq (car prov) :module)
-                                           (map 'list
-                                                #'wasmdown.types:wasm-export-name
-                                                (wasmdown.types:wasm-module-exports
-                                                 (%core-module-at
-                                                  comp (cdr prov)))))
-                                          (t nil))
-                                         :test #'string=)))
+                     ;; slice 5m (instantiation ::78) + M9 (linking tags ::10): the
+                     ;; aliased core export must EXIST and carry the
+                     ;; alias's SORT. An :instantiate provider's
+                     ;; exports resolve via %core-module-at (a real
+                     ;; wasm-module reads its export KINDS — 'is not a
+                     ;; tag' on a sort mismatch); an inline-export
+                     ;; BAG lists its names directly.
+                     (multiple-value-bind (names kind-of)
+                         (%core-provider-export-names
+                          comp (aliasrec-index payload))
+                       (declare (ignorable kind-of))
+                       (unless (find (aliasrec-name payload) names
+                                     :test #'string=)
                          (%verr "core instance ~a has no export named `~a`"
                                 (aliasrec-index payload)
-                                (aliasrec-name payload))))
+                                (aliasrec-name payload)))
+                       ;; M9 (linking tags ::10): the export's actual
+                       ;; kind (when statically known) must equal the
+                       ;; alias's core sort
+                       (let ((got (and kind-of
+                                       (funcall kind-of
+                                                (aliasrec-name payload)))))
+                         (when (and got
+                                    (not (eq got
+                                             (aliasrec-sort payload))))
+                           (%verr
+                            "export `~a` for core instance ~a is not a ~a"
+                            (aliasrec-name payload)
+                            (aliasrec-index payload)
+                            (%sort-err-name (aliasrec-sort payload))))))
                      ;; slice 4: record what this alias-introduced
                      ;; core index resolves to (the canon signature
                      ;; checks and bag providers read it)
@@ -5690,11 +6909,32 @@ the number of enclosing component/type scopes (outer aliases)."
                             ;; type carries the SOURCE type's SHAPE —
                             ;; a bag's table entry idx is THIS scope's
                             ;; typeidx (::48's $Rec' must be the record
-                            ;; so the vis walk sees it); unknown or
-                            ;; outer sources stay the opaque marker
+                            ;; so the vis walk sees it).
+                            ;; M9 (linking ::179 + EV ::52/::53): an
+                            ;; OUTER type alias ALSO carries the
+                            ;; resolved target's SHAPE (through
+                            ;; *outer-states*) — the vis walk must see
+                            ;; the underlying record/resource to fire
+                            ;; 'func not valid to be used as
+                            ;; import/export'; the opaque marker made
+                            ;; the type invisible and the check passed
+                            ;; WRONG once the implicit-alias def began
+                            ;; emitting. The slot itself stays UNNAMED
+                            ;; (only import/export declarators register
+                            ;; vis names) — the two-site semantics.
                             (or (and (eq (aliasrec-kind payload) :export)
                                      (%alias-exported-type-shape
                                       payload state))
+                                (and (eq (aliasrec-kind payload) :outer)
+                                     (let ((tgt (%outer-state-at
+                                                 state
+                                                 (aliasrec-count payload))))
+                                       (and tgt
+                                            (< (aliasrec-target payload)
+                                               (length (cval-types tgt)))
+                                            (aref (cval-types tgt)
+                                                  (aliasrec-target
+                                                   payload)))))
                                 (make-ct :kind :prim
                                          :payload :outer-aliased))
                             (cval-types state))
@@ -5715,27 +6955,69 @@ the number of enclosing component/type scopes (outer aliases)."
                                           state))
                                     (%fresh-resource-id)))
                             (cval-type-ids state))
-                           ;; external visibility (slice 3c): an
-                           ;; alias export of a TYPE confers a name
-                           ;; only when its SOURCE instance is itself
-                           ;; externally visible (::46/::48/::49);
-                           ;; an alias export of an INSTANCE from a
-                           ;; visible instance keeps the chain alive
-                           (when (and (eq (aliasrec-kind payload)
-                                          :export)
-                                      (gethash (aliasrec-index payload)
-                                               (cval-vis-inst state)))
-                             (setf (gethash (1- (length
+                           ;; M9 (linking ::90): record the component
+                           ;; typeidx this export-type alias occupies —
+                           ;; the declarator-space remap's target
+                           (when (eq (aliasrec-kind payload) :export)
+                             (setf (gethash (cons (aliasrec-index payload)
+                                                 (aliasrec-name payload))
+                                            *inst-alias-typeidx*)
+                                   (1- (length (cval-types state)))))
+                          ;; external visibility (slice 3c): an
+                          ;; alias export of a TYPE confers a name
+                          ;; only when its SOURCE instance is itself
+                          ;; externally visible (::46/::48/::49);
+                          ;; an alias export of an INSTANCE from a
+                          ;; visible instance keeps the chain alive.
+                          ;; M9 (linking ::104): an IMPORTED source
+                          ;; instance is externally visible by
+                          ;; definition — its instance ct names its
+                          ;; exports (the (sub resource) "r" the alias
+                          ;; projects was import-named at the declarator)
+                          (when (and (eq (aliasrec-kind payload)
+                                         :export)
+                                     (or (gethash (aliasrec-index payload)
+                                                  (cval-vis-inst state))
+                                         (let ((src (and
+                                                     (< (aliasrec-index
+                                                         payload)
+                                                        (length
+                                                         (cval-instance-types
+                                                          state)))
+                                                     (aref
+                                                      (cval-instance-types
+                                                       state)
+                                                      (aliasrec-index
+                                                       payload)))))
+                                           (and (ct-p src)
+                                                (eq (ct-kind src)
+                                                    :instance)))))
+                            (setf (gethash (1- (length
                                                 (cval-types state)))
-                                            (cval-vis-exports state))
-                                   t)))
+                                           (cval-vis-exports state))
+                                  t)))
                     (:func (incf (cval-funcs state))
                            ;; slice 5e (resources ::27/::28/::43): see
                            ;; %resolve-aliased-func (a helper: the
                            ;; inline version tripped the compiler's
                            ;; cross-arm payload type derivation)
                            (%resolve-aliased-func payload state))
-                    (:component (incf (cval-components state)))
+                    (:component
+                     (incf (cval-components state))
+                     ;; M9 (linking ::169): an alias-introduced
+                     ;; component's SOURCE comp (when resolvable —
+                     ;; an export alias of an instantiated instance)
+                     ;; recorded for %check-instantiate-args: the
+                     ;; alias occupies a component index, and
+                     ;; instantiating it must resolve THIS comp's
+                     ;; imports, not the nearest :component def's
+                     (when (eq (aliasrec-kind payload) :export)
+                       (let ((src (gethash (aliasrec-index payload)
+                                           *inst-source-comp*)))
+                         (when src
+                           (setf (gethash (1- (cval-components state))
+                                          *alias-component-source*)
+                                 src)))))
                     (:instance (incf (cval-instances state))
                                ;; slice 4 (family 3): the aliased
                                ;; instance's export table is the
@@ -5770,7 +7052,117 @@ the number of enclosing component/type scopes (outer aliases)."
                                                (cval-vis-inst state))
                                       t)))
                     (:value (incf (cval-values state)))
-                    (:core-module (incf (cval-core-modules state)))
+                    (:core-module
+                     (incf (cval-core-modules state))
+                     ;; M9 (linking ::179): an outer-aliased core
+                     ;; module RESOLVES to the target's module — the
+                     ;; nested component's (instantiate
+                     ;; $outer-module) reads it through
+                     ;; %core-module-at's table; an EXPORT alias of
+                     ;; an instantiated instance's module export
+                     ;; resolves through the source-comp record
+                     (let ((comp0 comp))
+                       (when comp0
+                         (setf (gethash (cons comp0
+                                              (1- (cval-core-modules
+                                                   state)))
+                                        *outer-alias-core-module*)
+                               (cond
+                                ((and (eq (aliasrec-kind payload) :outer)
+                                      (boundp '*outer-states*))
+                                 (let ((tgt (%outer-state-at
+                                             state
+                                             (aliasrec-count payload))))
+                                   (let ((oc (and tgt
+                                                  (gethash tgt
+                                                           *state-comp*))))
+                                     (or (and oc
+                                              (%core-module-at
+                                               oc (aliasrec-target payload)))
+                                         ;; M9 (linking ::231): the outer
+                                         ;; slot is an IMPORT hole —
+                                         ;; the module's SHAPE (the
+                                         ;; ascribed moduletype) lives
+                                         ;; in the OUTER comp; record
+                                         ;; the (outer-comp . target-idx)
+                                         ;; pair for the exports-find's
+                                         ;; moduletype fallback
+                                         (and oc
+                                              (cons :via-import
+                                                    (cons oc
+                                                          (aliasrec-target
+                                                           payload))))))))
+                                ;; M9 (linking ::166 + ::183): an EXPORT
+                                ;; alias of an instance's core-module
+                                ;; export. An INSTANTIATED source: the
+                                ;; recorded export table (hash: name ->
+                                ;; (sort . idx)) into the source comp's
+                                ;; core-module space. An IMPORTED source:
+                                ;; the entry is an INSTANCE CT — the
+                                ;; declarator's (:core-module . k) payload
+                                ;; indexes THIS comp's core-type space
+                                ;; (the moduletype, interned here by the
+                                ;; ::183 parse fix); record the moduletype
+                                ;; marker for the exports-find.
+                                ((and (eq (aliasrec-kind payload) :export)
+                                      (< (aliasrec-index payload)
+                                         (length (cval-instance-types
+                                                  state))))
+                                 (let* ((itab (aref (cval-instance-types
+                                                     state)
+                                                    (aliasrec-index payload)))
+                                        (hit (and (hash-table-p itab)
+                                                  (gethash (aliasrec-name
+                                                            payload)
+                                                           itab))))
+                                   (or (and (consp hit)
+                                            (eq (car hit) :core-module)
+                                            (let ((src (gethash
+                                                        (aliasrec-index payload)
+                                                        *inst-source-comp*)))
+                                              (and src
+                                                   (%core-module-at
+                                                    src (cdr hit)))))
+                                       (and (ct-p itab)
+                                            (eq (ct-kind itab) :instance)
+                                            (loop for td across
+                                                     (ct-payload itab)
+                                                  when (and
+                                                       (eq (typedecl-kind
+                                                            td)
+                                                           :export)
+                                                       (string=
+                                                        (first
+                                                         (typedecl-payload
+                                                          td))
+                                                        (aliasrec-name
+                                                         payload)))
+                                                    do (let* ((et (third
+                                                                   (typedecl-payload
+                                                                    td))))
+                                                         (return
+                                                          (and (consp et)
+                                                               (eq (car et)
+                                                                   :core-module)
+                                                               (integerp
+                                                                (cdr et))
+                                                               (< (cdr et)
+                                                                  (length
+                                                                   (cval-core-types
+                                                                    state)))
+                                                               (let ((mt
+                                                                       (aref
+                                                                        (cval-core-types
+                                                                         state)
+                                                                        (cdr et))))
+                                                                 (and (consp mt)
+                                                                      (eq (car mt)
+                                                                          :moduletype)
+                                                                      (cons
+                                                                       :via-moduletype
+                                                                       mt))))))
+                                                  finally (return nil))))))
+                                (t nil))))))
                     (:core-type (vector-push-extend :aliased
                                                      (cval-core-types state)))
                     (:core-func (incf (cval-core-funcs state)))
@@ -5922,7 +7314,61 @@ the number of enclosing component/type scopes (outer aliases)."
                                         (canonrec-typeidx payload))
                                   nil)
                               (cval-func-types state)))
-                      (incf (cval-core-funcs state))))
+                      (let ((cidx (cval-core-funcs state)))
+                        ;; M9 (linking lane): record the canon-
+                        ;; introduced core func's STATIC SIGNATURE so
+                        ;; core-instance with-arg matching resolves
+                        ;; bag entries pointing at it (%core-provider-
+                        ;; export follows *core-alias-source*, which
+                        ;; only alias-introduced indexes carry). A
+                        ;; LOWER's signature is flatten_functype of
+                        ;; the target component func's ct; the
+                        ;; resource built-ins are [i32] -> [i32] /
+                        ;; [i32] -> [] / [i32] -> [i32].
+                        (setf (gethash (cons :core-func cidx)
+                                       *core-alias-source*)
+                              (ecase (canonrec-kind payload)
+                                (:lower
+                                 (let* ((f (canonrec-func payload))
+                                        (ft (and (< f (length (cval-func-types
+                                                              state)))
+                                                 (aref (cval-func-types
+                                                        state) f)))
+                                        ;; M9 (linking ::90): the same
+                                        ;; declarator-space remap as
+                                        ;; %check-canon-opts — the
+                                        ;; lowered func's functype may
+                                        ;; come from an imported
+                                        ;; instance's ct
+                                        (ft (let ((origin
+                                                    (gethash
+                                                     f *func-alias-origin*)))
+                                              (if origin
+                                                  (%remap-decl-functype
+                                                   ft (car origin)
+                                                   (cdr origin))
+                                                  ft))))
+                                   (cons :canon-lower
+                                         (%canon-lower-flat-sig state ft))))
+                                ((:resource-new :resource-rep)
+                                 (cons :canon-sig (cons '(:i32) '(:i32))))
+                                (:resource-drop
+                                 (cons :canon-sig (cons '(:i32) '())))
+                                (:builtin
+                                 ;; the INVERTED (core func $d (canon
+                                 ;; resource.new $T)) parses as :BUILTIN
+                                 ;; with the kind in the first immediate
+                                 (let ((k (first (canonrec-imms payload))))
+                                   (cond
+                                    ((member k '(:resource-new
+                                                :resource-rep))
+                                     (cons :canon-sig
+                                           (cons '(:i32) '(:i32))))
+                                    ((eq k :resource-drop)
+                                     (cons :canon-sig
+                                           (cons '(:i32) '())))
+                                    (t (cons :canon-builtin nil)))))))
+                        (incf (cval-core-funcs state)))))
                  (:import
                   (%check-externname (importrec-name payload) state t)
                   (%check-externtype (importrec-type payload) state nil)
@@ -6086,9 +7532,14 @@ the number of enclosing component/type scopes (outer aliases)."
                                         (%instance-export-sort
                                          src-idx nm state)
                                       (declare (ignore got))
-                                      (unless (and known
-                                                   (or (null src)
-                                                       (hash-table-p src)))
+                                      ;; M9 (linking EV ::61): every
+                                      ;; name the ascription REQUIRES
+                                      ;; must be KNOWN on the source
+                                      ;; instance — an imported
+                                      ;; instance with no type info
+                                      ;; (NIL) cannot satisfy a
+                                      ;; non-empty ascription
+                                      (unless known
                                         (%verr "ascribed type of export is not compatible"))
                                       (when (and known
                                                  (hash-table-p src))
@@ -6340,6 +7791,7 @@ the number of enclosing component/type scopes (outer aliases)."
     ;; slice 4 (family 3): record THIS component's validator state
     ;; for the parent's export-table shape resolution
     (setf (gethash comp *comp-state-stash*) state)
+    (setf (gethash state *state-comp*) comp)
     comp))
     )
 

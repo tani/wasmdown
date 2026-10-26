@@ -43,7 +43,13 @@
                (directory (merge-pathnames
                            "tests/component/binary/*.wast" *root*))
                (directory (merge-pathnames
-                           "tests/component/validation/*.wast" *root*))))
+                           "tests/component/validation/*.wast" *root*))
+               ;; M9 (linking lane): the linking suite — unit.wast's
+               ;; instance multiplicity/sharing, shared-everything's
+               ;; core-level dynamic linking, tags' EH-tag linking,
+               ;; link-time-virtualization's component composition.
+               (directory (merge-pathnames
+                           "tests/component/linking/*.wast" *root*))))
    #'string< :key #'namestring))
 
 (defparameter *jsonl*

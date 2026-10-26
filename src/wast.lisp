@@ -35,7 +35,10 @@
            ;; src/component-text.lisp) + the M8 instantiator hook
            ;; (installed by src/component-runtime.lisp).
            #:*component-text-parser* #:component-text-parser
-           #:*component-instantiator* #:component-instantiator))
+           #:*component-instantiator* #:component-instantiator
+           ;; M9: the component-instance ACTION hook (installed by
+           ;; src/component-runtime.lisp alongside the instantiator).
+           #:*component-invoker* #:component-invoker))
 
 (in-package #:wasmdown.wast)
 
@@ -521,6 +524,49 @@ typed value record, or NIL when NODE is not a value form."
           (multiple-value-bind (bits class)
               (%float-class-and-bits text 53 1023 #x7ffffffffffff)
             (list :float :f64 bits class))))
+       ;; M9 (component lane): the component-model value forms the
+       ;; linking suite uses — (u32.const 5) and friends parse with
+       ;; the (:num prim value) shape; the PRIM keyword rides the
+       ;; second slot and %expected-to-lisp/%arg-to-lisp map it to
+       ;; the flat core domain (u32 -> i32 mod 2^32, u64 -> i64, ...).
+       ;; float32/float64 are the component spellings (values suite);
+       ;; they map onto the same :float spec kind as f32/f64.
+       ((member k '("u8.const" "u16.const" "u32.const" "u64.const"
+                    "s8.const" "s16.const" "s32.const" "s64.const"
+                    "float32.const" "float64.const")
+                :test #'string=)
+        (let* ((dot (position #\. k :from-end t))
+               (base (subseq k 0 dot))
+               (prim (cond
+                      ((string= base "float32") :f32)
+                      ((string= base "float64") :f64)
+                      (t (intern (string-upcase base) :keyword)))))
+          (if (member prim '(:f32 :f64))
+              (let* ((tk (%one-tok rest k))
+                     (text (stoken-text tk)))
+                (multiple-value-bind (bits class)
+                    (if (eq prim :f32)
+                        (%float-class-and-bits text 24 127 #x7fffff)
+                        (%float-class-and-bits text 53 1023
+                                               #x7ffffffffffff))
+                  (list :float prim bits class)))
+              (let ((tk (%one-tok rest k)))
+                (list :num prim (%parse-int-token tk))))))
+       ((string= k "bool.const")
+        (let ((tk (%one-tok rest "bool.const")))
+          (list :bool (not (zerop (%parse-int-token tk))))))
+       ((string= k "char.const")
+        ;; (char.const "Z"): a one-character string; code point
+        (let ((tk (%one-tok rest "char.const")))
+          (unless (and (stoken-p tk) (eq (stoken-kind tk) :string))
+            (%werr 0 "bad char.const form"))
+          (list :char (%byte-string-to-string (stoken-text tk)))))
+       ((string= k "str.const")
+        ;; (str.const "hello"): the component STRING value form
+        (let ((tk (%one-tok rest "str.const")))
+          (unless (and (stoken-p tk) (eq (stoken-kind tk) :string))
+            (%werr 0 "bad str.const form"))
+          (list :str (%byte-string-to-string (stoken-text tk)))))
        ((string= k "ref.func")
         ;; (ref.func) = any non-null funcref; (ref.func $id) = identity
         (if (null rest)
@@ -1588,10 +1634,18 @@ stable order."
   "Convert a parsed result spec to a host value for comparison, or a
 comparison directive list."
   (case (first spec)
-    (:num (let ((v (third spec)))
-            (if (eq (second spec) :i32)
-                (list :exact (mod v #x100000000))
-                (list :exact (mod v #x10000000000000000)))))
+    (:num
+     ;; M9: component prims (u32/s32/...) ride the same :num spec; the
+     ;; 32-bit prims compare in the i32 domain (mod 2^32) and the
+     ;; 64-bit prims in the i64 domain — the FLAT core path delivers
+     ;; exactly those unsigned Lisp integers.
+     (let ((v (third spec)))
+       (case (second spec)
+         ((:u32 :s32 :u16 :s16 :u8 :s8 :i32)
+          (list :exact (mod v #x100000000)))
+         ((:u64 :s64 :i64)
+          (list :exact (mod v #x10000000000000000)))
+         (t (list :exact v)))))
     (:float (case (fourth spec)
               (:exact
                (list :exact-bits (second spec)
@@ -1604,10 +1658,16 @@ comparison directive list."
                (list :nan-arithmetic (second spec)))
               (:nan-payload
                (list :nan-payload (second spec)
-                     (logand (third spec)
-                             (if (eq (second spec) :f32)
-                                 #x7fffff
-                                 #xfffffffffffff))))))
+                    (logand (third spec)
+                            (if (eq (second spec) :f32)
+                                #x7fffff
+                                #xfffffffffffff))))))
+    (:bool (list :bool (second spec)))
+    (:char (list :exact (char-code (character (second spec)))))
+    ;; a lifted STRING result: the actual arrives as a Lisp string
+    ;; (the runner's component-invoke path reads it out of the lift
+    ;; memory); compare by string=
+    (:str (list :str (second spec)))
     (:ref-func (if (second spec)
                    (list :ref-func-id (second spec))
                    (list :ref-non-null)))
@@ -1618,15 +1678,25 @@ comparison directive list."
   "Convert a parsed argument spec to the Lisp-domain argument value
 per docs/CONTRACTS.md (i32/i64 unsigned, f32/f64 floats, refs)."
   (case (first spec)
-    (:num (let ((v (third spec)))
-            (if (eq (second spec) :i32)
-                (mod v #x100000000)
-                (mod v #x10000000000000000))))
+    (:num
+     ;; M9: component prims pass through the FLAT core domain — the
+     ;; 32-bit prims as unsigned i32, the 64-bit prims as i64.
+     (let ((v (third spec)))
+       (case (second spec)
+         ((:u32 :s32 :u16 :s16 :u8 :s8 :i32)
+          (mod v #x100000000))
+         ((:u64 :s64 :i64)
+          (mod v #x10000000000000000))
+         (t v))))
     (:float (if (eq (second spec) :f32)
                 (wasmdown.numops:f32-from-bits (third spec))
                 (wasmdown.numops:f64-from-bits (third spec)))
       ;; NOTE: NaN-CLASS specs are never legal as arguments; exact only.
       )
+    ;; M9: bool lowers to i32 0/1; char to its code point
+    (:bool (if (second spec) 1 0))
+    (:char (char-code (character (second spec))))
+    (:str (error "string arguments are the values slice"))
     (:ref-func (error "ref.func as invoke argument unsupported"))
     (:ref-null nil)
     (:ref-extern (list 'externref (second spec)))))
@@ -1678,6 +1748,11 @@ per docs/CONTRACTS.md (i32/i64 unsigned, f32/f64 floats, refs)."
              (= (logand (wasmdown.numops:f64-bits actual)
                         #xfffffffffffff)
                 (third expected))))))
+    (:bool (and (integerp actual)
+                (if (second expected) (not (zerop actual)) (zerop actual))))
+    ;; M9: a lifted component STRING — the actual is a Lisp string
+    ;; (the component-invoke path lifts it out of the lift memory)
+    (:str (and (stringp actual) (string= actual (second expected))))
     (:ref-null (null actual))
     (:ref-non-null (wasmdown.runtime:func-instance-p actual))
     (:ref-func-id (error "ref.func identity results not yet supported"))
@@ -1767,34 +1842,71 @@ no module was ever instantiated."
                      :message (format nil "unknown module ~a"
                                       cmd-or-id)))))))
 
+;;; ---------------------------------------------------------------
+;;; M9 (linking lane): component-instance actions. A comp-instance
+;;; target needs the component RUNTIME's export resolution + lifted
+;;; call — but src/component-runtime.lisp loads AFTER this file, so
+;;; the dispatch runs through an installed hook (the same contract
+;;; as *COMPONENT-INSTANTIATOR*). NIL when the runtime file was not
+;;; loaded: no comp-instances can exist then, so the core path runs.
+
+(defvar *component-invoker* nil
+  "The component-instance ACTION entry point (installed at load time
+by src/component-runtime.lisp). A designator of a function called as
+— (funcall hook inst name args): INVOKE on a comp-instance; returns
+the RESULTS LIST in the comparison domain.
+— (funcall hook :get inst name): GET on a comp-instance; returns the
+global's value.
+— (funcall hook :instance-p v): whether V is a comp-instance.
+NIL when the runtime file was not loaded.")
+
+(defun component-invoker ()
+  "The installed component action hook (a function) or NIL."
+  *component-invoker*)
+
+(defun %component-target-p (inst)
+  "True when the action target INST is a component instance. Without
+the runtime loaded there is nothing to detect (no comp-instances
+exist), so the hook's mere presence is the test."
+  (and (component-invoker)
+       (funcall (component-invoker) :instance-p inst)))
+
 (defun %run-invoke (state cmd)
   "Execute an invoke action. Returns (values results-list). Signals
 traps/errors per the engine. When the current module position is an
 out-of-scope module, a missing export (wasmdown:link-error from
 invoke) is re-signaled as unsupported-action: the action targets the
 out-of-scope module (imports.wast print32/print64 after the EH-tag
-module), never a fresh :fail."
+module), never a fresh :fail. M9: a comp-instance target dispatches
+to the installed component invoker hook."
   (let* ((inst (%resolve-action-instance state (wast-cmd-module-arg cmd)))
          (args (mapcar #'%arg-to-lisp (wast-cmd-args cmd))))
-    (handler-case
-        (apply #'wasmdown:invoke inst (wast-cmd-name-arg cmd) args)
-      (wasmdown:link-error (c)
-        (if (wast-state-current-unsupported state)
-            (error 'unsupported-action
-                   :message (format nil
-                                    "export of an out-of-scope module: ~a"
-                                    (wasmdown:wasmdown-error-message c)))
-            (error c))))))
+    (if (%component-target-p inst)
+        (funcall (component-invoker) inst (wast-cmd-name-arg cmd) args)
+        (handler-case
+            (apply #'wasmdown:invoke inst (wast-cmd-name-arg cmd) args)
+          (wasmdown:link-error (c)
+            (if (wast-state-current-unsupported state)
+                (error 'unsupported-action
+                       :message (format nil
+                                        "export of an out-of-scope module: ~a"
+                                        (wasmdown:wasmdown-error-message c)))
+                (error c)))))))
 
 
 (defun %run-get (state cmd)
-  "Execute a get action: the exported global's value."
-  (let* ((inst (%resolve-action-instance state (wast-cmd-module-arg cmd)))
-         (v (wasmdown.runtime:export-value inst (wast-cmd-name-arg cmd))))
-    (unless (wasmdown.runtime:global-instance-p v)
-      (error 'wasmdown:host-error
-             :message "get: export is not a global"))
-    (wasmdown.runtime:global-value v)))
+  "Execute a get action: the exported global's value. M9: on a
+comp-instance the export must be a core global (the hook resolves
+it); the core path is unchanged."
+  (let* ((inst (%resolve-action-instance state (wast-cmd-module-arg cmd))))
+    (if (%component-target-p inst)
+        (funcall (component-invoker) :get inst (wast-cmd-name-arg cmd))
+        (let ((v (wasmdown.runtime:export-value inst
+                                                (wast-cmd-name-arg cmd))))
+          (unless (wasmdown.runtime:global-instance-p v)
+            (error 'wasmdown:host-error
+                   :message "get: export is not a global"))
+          (wasmdown.runtime:global-value v)))))
 
 ;;; ---------------------------------------------------------------
 ;;; The script driver.
@@ -1862,12 +1974,34 @@ given, receives a JSONL line per result (PLAN.md 12.8)."
   (let ((name (wast-cmd-name cmd)))
     (cond
      ((and (eq name :component) (wast-cmd-component-p cmd))
+      ;; M9 (linking lane): a passing component command's INSTANCE
+      ;; becomes the script's current action target — mirroring the
+      ;; :module arm's pass case (the $id binds by name too). A
+      ;; definition command produces no instance; a failing/unsupported
+      ;; component DROPS the current target (an action now addresses
+      ;; the new — broken — component, never a stale instance).
       (multiple-value-bind (outcome phase detail inst)
           (%component-outcome cmd state)
-        (declare (ignore inst))    ; M8: no component actions yet
-        (if (eq outcome :unsupported)
-            (funcall record cmd :unsupported nil detail nil)
-            (funcall record cmd outcome phase detail nil))))
+        (cond
+         ((and (eq outcome :pass)
+               (not (eq (wast-cmd-named-form cmd) :definition)))
+          (setf (wast-state-current state) inst
+                (wast-state-current-unsupported state) nil)
+          (when (wast-cmd-id cmd)
+            (remhash (wast-cmd-id cmd)
+                     (wast-state-unsupported-named state))
+            (setf (gethash (wast-cmd-id cmd)
+                           (wast-state-named-instances state))
+                  inst))
+          (funcall record cmd :pass phase detail nil))
+         ((eq outcome :unsupported)
+          (setf (wast-state-current state) nil)
+          (setf (wast-state-current-unsupported state) t)
+          (funcall record cmd :unsupported nil detail nil))
+         (t
+          (setf (wast-state-current state) nil)
+          (setf (wast-state-current-unsupported state) nil)
+          (funcall record cmd outcome phase detail nil)))))
      ((eq name :module)
       (multiple-value-bind (outcome phase detail inst)
           (%module-outcome cmd state)

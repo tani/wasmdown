@@ -15,21 +15,25 @@ Baseline measurement, not a release gate (PLAN.md §12.8).
 
 | Outcome | Count |
 | --- | --- |
-| pass | 639 |
+| pass | 911 |
 | fail | 0 |
 | skip | 0 |
 | unsupported | 0 |
 | timeout | 0 |
 | harness-error | 0 |
-| **total** | **639** |
+| **total** | **911** |
 
-Executed: 639 commands; pass rate 100.0%.
+Executed: 911 commands; pass rate 100.0%.
 
 ## Per-file counts
 
 | File | pass | fail | unsupported | other |
 | --- | --- | --- | --- | --- |
 | component/binary.wast | 132 | 0 | 0 | 0 |
+| component/link-time-virtualization.wast | 8 | 0 | 0 | 0 |
+| component/shared-everything-dynamic-linking.wast | 14 | 0 | 0 | 0 |
+| component/tags.wast | 12 | 0 | 0 | 0 |
+| component/unit.wast | 238 | 0 | 0 | 0 |
 | component/abi.wast | 23 | 0 | 0 | 0 |
 | component/annotated-names.wast | 36 | 0 | 0 | 0 |
 | component/attributes.wast | 29 | 0 | 0 | 0 |

@@ -93,6 +93,7 @@ externnames must be real strings)."
   (n-core-type 0) (n-core-module 0) (n-core-instance 0)
   (n-core-func 0) (n-core-memory 0) (n-core-table 0)
   (n-core-global 0)
+  (n-core-tag 0)
   (interned nil :type list))            ; inline types, in intern order
 
 (defun %bind (scope id sort idx)
@@ -146,6 +147,7 @@ legal); SORT NIL returns the FIRST binding (innermost = most recent)."
     (:core-memory (ct-scope-n-core-memory scope))
     (:core-table (ct-scope-n-core-table scope))
     (:core-global (ct-scope-n-core-global scope))
+    (:core-tag (ct-scope-n-core-tag scope))
     (t (%text-err 0 "no index space for sort ~a" sort))))
 
 (defun %scope-incf (scope sort)
@@ -162,6 +164,7 @@ legal); SORT NIL returns the FIRST binding (innermost = most recent)."
     (:core-memory (incf (ct-scope-n-core-memory scope)))
     (:core-table (incf (ct-scope-n-core-table scope)))
     (:core-global (incf (ct-scope-n-core-global scope)))
+    (:core-tag (incf (ct-scope-n-core-tag scope)))
     (t (%text-err 0 "no index space for sort ~a" sort))))
 
 (defun %alloc (scope sort &optional id)
@@ -178,6 +181,15 @@ legal); SORT NIL returns the FIRST binding (innermost = most recent)."
 (defvar *component-source* ""
   "The component's raw source (for slicing (core module ...) spans).")
 
+(defvar *in-type-decl* nil
+  "M9 (linking ::179): T while parsing a component/instance TYPE's
+declarators — distinguishes the type context (an implicit outer alias
+lands in the sink, its de Bruijn count skipping the type boundary)
+from a CONCRETE component's def parse (the alias must emit as a
+top-level :alias def). The sink alone can't tell them apart: it
+starts NIL in both, and the OLD boundp test treated the defvar'd
+symbol as always-bound (every concrete-context alias vanished).")
+
 (defvar *type-decl-sink* nil
   "When non-NIL, an implicit outer alias fired while parsing a
 component/instance TYPE's declarators lands HERE (as a typedecl
@@ -188,6 +200,13 @@ types'), so it must resolve within the type's own declarator
 sequence (defined-types ::42/::43's (instance (type $t)) uses inside
 (type (component ...))).")
 
+(defvar *core-intern-scope* nil
+  "M9 (linking ::183): when non-NIL, an inline CORE-MODULE externtype's
+moduletype interns HERE — the ENCLOSING component's scope — instead of
+the declarator's own (never-flushed) space. Bound by the instance/
+component TYPE declarator parse around the export arm; the func/
+instance/component externtype arms ignore it (binary ::81's inline
+funcs intern in the declarator's space and MUST stay there).")
 (defvar *intern-scope* nil
   "The FLUSHING scope: inline externtype expressions inside
 component/instance TYPE declarators desugar into out-of-line types
@@ -274,17 +293,40 @@ a component/instance TYPE's declarators (*TYPE-DECL-SINK* BOUND, even
 when its collected value is still empty) the alias lands as a typedecl
 of THAT TYPE (its de Bruijn count skips the type boundary), never as
 a top-level def."
-  (if (boundp '*type-decl-sink*)
-      (push (make-typedecl :kind :alias
-                           :payload (make-aliasrec
-                                     :kind :outer :sort sort :count ct
-                                     :target idx :name "" :offset 0))
-            *type-decl-sink*)
-      (progn (%flush-interned scope)
-             (%push-def :alias (make-aliasrec :kind :outer :sort sort
-                                             :count ct :target idx
-                                             :name "" :offset 0))))
-  (%alloc scope sort id))
+  ;; M9 (linking ::179 + EV ::52): the TYPE-CONTEXT test is the
+  ;; dedicated flag — the defvar'd sink is ALWAYS bound, so the OLD
+  ;; boundp form pushed every concrete-component alias into a NIL
+  ;; sink (the def VANISHED and the nested (instantiate
+  ;; $outer-module) kept a bare index; 'module index out of
+  ;; bounds'). The companion VIS rule (a def-introduced outer alias
+  ;; stays UNNAMED for the export/import naming checks) lives at
+  ;; %vis-named-p.
+  ;;
+  ;; M9 (EV ::52) ORDERING: an emit fired MID-INLINE-FUNCTYPE parse
+  ;; (an import's (result $outer)) allocates the alias's type slot
+  ;; BEFORE the functype's intern — but pushing the alias def
+  ;; immediately lands it EARLIER in the final defs vector than the
+  ;; functype's def, swapping the walk's type space against the
+  ;; parse's counter order (the functype hijacked the alias's slot;
+  ;; the result ref self-cycled and the vis check never reached the
+  ;; record). DEFER: record the alias on the scope's interned list —
+  ;; %flush-interned emits the interned types FIRST, then the
+  ;; pending alias defs, so the vector order matches the counter
+  ;; order (the walk sees the functype at its intern slot, the alias
+  ;; at ITS slot).
+  (let ((idx (%alloc scope sort id)))
+    (if *in-type-decl*
+        (push (make-typedecl :kind :alias
+                             :payload (make-aliasrec
+                                       :kind :outer :sort sort
+                                       :count ct :target idx
+                                       :name "" :offset 0))
+              *type-decl-sink*)
+        (progn (%flush-interned scope)
+               (%push-def :alias (make-aliasrec
+                                  :kind :outer :sort sort :count ct
+                                  :target idx :name "" :offset 0))))
+    idx))
 
 (defun %parse-sortidx-atom (item sort scope)
   "A bare index in SORT's space: u32 | $id (the latter possibly an
@@ -761,6 +803,11 @@ format has no per-declarator type space, only the component's)."
                     (if (boundp '*type-decl-sink*)
                         (values t *type-decl-sink*)
                         (values nil nil))
+                  ;; M9 (linking ::183): the declarators' inline CORE
+                  ;; moduletypes intern into the ENCLOSING scope (the
+                  ;; only flushed space); see *core-intern-scope*
+                  (let ((*core-intern-scope*
+                          (or *core-intern-scope* scope)))
                   ;; a scratch sink during the DECLS' parse keeps each
                   ;; decl's interning/aliasing local to its own drain;
                   ;; in a CONCRETE (non-type) context there is no
@@ -770,6 +817,7 @@ format has no per-declarator type space, only the component's)."
                   (let ((decls
                           (if caller-sink-bound
                               (let* ((*type-decl-sink* nil)
+                                     (*in-type-decl* t)
                                      (ds (mapcan
                                           (lambda (d)
                                             ;; SCOPE interns the decls'
@@ -797,7 +845,7 @@ format has no per-declarator type space, only the component's)."
                                            :payload (coerce decls
                                                            'vector)
                                            :offset 0)))
-                            id)))))))
+                            id))))))))
        ((string= h "component")
         (let ((type-use (find-if
                          (lambda (b)
@@ -817,6 +865,12 @@ format has no per-declarator type space, only the component's)."
               (let ((inner (make-ct-scope
                             :outer (cons scope (ct-scope-outer scope)))))
                 (let* ((*type-decl-sink* nil)
+                       (*in-type-decl* t)
+                       ;; M9 (linking ::183): same as the instance arm —
+                       ;; the declarators' inline CORE moduletypes intern
+                       ;; into the ENCLOSING scope
+                       (*core-intern-scope*
+                        (or *core-intern-scope* scope))
                        (decls (mapcan (lambda (d)
                                         ;; SCOPE interns (flushing chain);
                                         ;; INNER resolves (type $t)
@@ -892,9 +946,17 @@ format has no per-declarator type space, only the component's)."
                        (cdr (%parse-sortidx-atom (first ti)
                                                  :core-type scope))))
                     ((and mt (consp mt))
-                     ;; intern the inline moduletype as a core type
+                     ;; intern the inline moduletype as a core type.
+                     ;; M9 (linking ::183): inside a component/instance
+                     ;; TYPE's declarators the ENCLOSING scope owns the
+                     ;; core-type space (the declarator's own space is
+                     ;; never flushed — interning there VANISHED the
+                     ;; def and the (:core-module . 0) payload dangled);
+                     ;; *core-intern-scope* is bound there. Elsewhere it
+                     ;; is NIL and the caller's intern-scope stands.
                      (%intern-core-type
-                      intern-scope (%parse-moduletype mt scope)))
+                      (or *core-intern-scope* intern-scope)
+                      (%parse-moduletype mt scope)))
                     (t
                      ;; slice 5m (indicies ::10): a BARE (core
                      ;; module) declarator ascription (no decls, no
@@ -952,7 +1014,17 @@ declarator's own index space) — see %parse-deftype-node."
             ;; INTERNs INLINE externtype expressions into that SAME
             ;; space: the Explainer's desugaring puts the out-of-line
             ;; type in the TYPE's own declarator sequence (interning
-            ;; elsewhere would leave the externtype index dangling)
+            ;; elsewhere would leave the externtype index dangling).
+            ;; M9 (linking ::183) EXCEPT the CORE-MODULE case: an
+            ;; inline (core module (export ...)) moduletype is a CORE
+            ;; type — it desugars into the ENCLOSING component's
+            ;; core-type space (the declarator's own space holds
+            ;; COMPONENT types only and is never flushed; interning
+            ;; there VANISHED the def and the (core module . 0)
+            ;; payload dangled at validation). Intern into the
+            ;; ENCLOSING scope: the core-type counter is a DIFFERENT
+            ;; space from the declarator's component types, so the
+            ;; ::81 inline-func interning is unaffected.
             (%parse-importdecl-parts node type-scope type-scope)
           ;; the desugared :type/:alias entries collected by the sink
           ;; during the parse above (parse order)
@@ -1020,6 +1092,7 @@ boundary (outer-alias.wast ::0/::10)."
                         :outer (cons parse-scope
                                      (ct-scope-outer parse-scope)))))
             (let* ((*type-decl-sink* nil)
+                   (*in-type-decl* t)
                    (decls (mapcan (lambda (d)
                                     (%parse-componentdecl
                                      d parse-scope inner))
@@ -1035,6 +1108,7 @@ boundary (outer-alias.wast ::0/::10)."
                         :outer (cons parse-scope
                                      (ct-scope-outer parse-scope)))))
             (let* ((*type-decl-sink* nil)
+                   (*in-type-decl* t)
                    (decls (mapcan (lambda (d)
                                     (%parse-instancedecl
                                      d parse-scope inner))
@@ -1156,9 +1230,12 @@ sort idx)."
 
 ;;; ---- aliases ----
 
-(defun %parse-alias-node (node scope)
+(defun %parse-alias-node (node scope &optional default-sort)
   "(alias export idx name (sort id?)) | (alias core export ...) |
-(alias outer ct idx (sort id?)). Returns (values aliasrec id)."
+(alias outer ct idx (sort id?)). Returns (values aliasrec id).
+DEFAULT-SORT (M9, the inverted (core func $id (alias ...)) /
+(func $id (alias ...)) forms): the sort implied by the DEF HEAD when
+the alias body carries no trailing (sort id?) declaration."
   (let* ((items (%children node))
          (head (second items)))
     (unless (and (%tokp head) (eq (%tok-kind head) :keyword))
@@ -1175,7 +1252,9 @@ sort idx)."
                        "alias export needs a name"))
           (let* ((inst (cdr (%parse-sortidx-atom idx-item :instance
                                                 scope)))
-                 (sort+id (%parse-alias-sortdecl sort-node))
+                 (sort+id (if sort-node
+                              (%parse-alias-sortdecl sort-node)
+                              (cons (or default-sort :func) nil)))
                  (sort (car sort+id))
                  (id (cdr sort+id)))
             (values (make-aliasrec :kind :export :sort sort
@@ -1191,7 +1270,9 @@ sort idx)."
                ;; target resolution can pick the SORT-matching
                ;; binding when $id names both an instance and a
                ;; component (resources.wast ::44's $c2)
-               (sort+id (%parse-alias-sortdecl sort-node))
+               (sort+id (if sort-node
+                            (%parse-alias-sortdecl sort-node)
+                            (cons (or default-sort :func) nil)))
                (sort (car sort+id))
                (id (cdr sort+id)))
           (multiple-value-bind (ct target)
@@ -1211,7 +1292,9 @@ sort idx)."
                        "alias core export needs a name"))
           (let* ((inst (cdr (%parse-sortidx-atom idx-item
                                                  :core-instance scope)))
-                 (sort+id (%parse-alias-sortdecl sort-node))
+                 (sort+id (if sort-node
+                              (%parse-alias-sortdecl sort-node)
+                              (cons (or default-sort :core-func) nil)))
                  (sort (car sort+id))
                  (id (cdr sort+id)))
             (values (make-aliasrec :kind :core-export :sort sort
@@ -1349,6 +1432,32 @@ functype. Returns the core-type payload."
       (%text-err (%tok-start tk) "expected a core value type"))
     (cdr m)))
 
+(defun %parse-core-functype-sig (nodes)
+  "The inline (param ...)/(result ...) signature of a moduletype
+import/export declarator's bare (func ...) desc, as a wasm-func-type
+(M9: the imported-module export resolution reads it when the
+moduletype match already ran at the with-arg site)."
+  (let ((params '())
+        (results '()))
+    (dolist (n nodes)
+      (when (and (%nodep n) (%children n))
+        (let* ((items (%children n))
+               (h (and (%tokp (first items))
+                       (%tok-text (first items)))))
+          (cond
+           ((string= h "param")
+            (dolist (tk (rest items))
+              (when (%tokp tk)
+                (push (%core-valtype-of tk) params))))
+           ((string= h "result")
+            (dolist (tk (rest items))
+              (when (%tokp tk)
+                (push (%core-valtype-of tk) results))))
+           (t nil)))))
+    (wasmdown.types:make-wasm-func-type
+     (coerce (nreverse params) 'vector)
+     (coerce (nreverse results) 'vector))))
+
 (defun %parse-moduletype (items scope)
   "A (module <moduledecl>*) moduletype. Returns (:moduletype .
 vector-of-typedecls). SCOPE resolves a named (alias outer $C $FT
@@ -1481,7 +1590,12 @@ own type space (slice 5, family E)."
               ;; the validator counts it toward the moduletype's
               ;; type space (an explicit (type 0) with no decls is
               ;; the OOB fixture)
-              (list :func 0 :implicit))))
+              ;; M9 (linking lane): the inline (param ...)/(result
+              ;; ...) sig rides along as the FOURTH slot so the
+              ;; imported-module export resolution reads the
+              ;; signature without a core-type declarator
+              (list :func 0 :implicit
+                    (%parse-core-functype-sig (rest items))))))
        ((string= h "memory")
         (list :memory (%parse-core-limits (rest items))))
        ((string= h "table")
@@ -1504,6 +1618,7 @@ own type space (slice 5, family E)."
        (t (%text-err (%tok-start head)
                      "unknown core import descriptor ~a" h))))))
 
+
 (defun %parse-core-limits (items)
   "Core limits: min | min max | min shared | min max shared — the
 shared flag RIDES ALONG (the third list slot) so the validator can
@@ -1523,8 +1638,6 @@ compare it (instantiation ::47's 'mismatch in the shared flag')."
                         (and (%tokp shared2)
                              (string= (%tok-text shared2) "shared")))))
       (list lo hi shared-p))))
-
-;;; ---- canon ----
 
 (defun %parse-canonopts (items scope)
   "canonopt*: string-encoding=X | (memory i) | (realloc i) |
@@ -1574,6 +1687,7 @@ compare it (instantiation ::47's 'mismatch in the shared flag')."
                            "unknown canon option ~a" h))))))
        (t (%text-err 0 "unexpected canon option"))))
     (nreverse opts)))
+
 
 (defun %canon-kind-kw (h)
   "The built-in kind keyword for a dotted text name (waitable-set.wait
@@ -1988,9 +2102,16 @@ projection resolves the source instance in the CORE-instance space."
          (idx-node (second ei)))
     (unless (and idx-node (%nodep idx-node))
       (%text-err (%node-start e) "expected a core index"))
-    (multiple-value-bind (s i)
-        (%parse-coreidx idx-node :core-func scope)
-      (cons name (cons s i)))))
+    ;; M9 (linking lane): the descriptor HEAD names the core sort —
+    ;; (tag ...) = :core-tag, (global ...) = :core-global, ... — a
+    ;; tag or global inline export is NOT a func index (tags.wast's
+    ;; synthesized instance exporting an aliased tag)
+    (let* ((dh (%tok-text (first (%children idx-node))))
+           (core-sort (cdr (assoc dh *core-sort-names*
+                                  :test #'string=))))
+      (multiple-value-bind (s i)
+          (%parse-coreidx idx-node (or core-sort :core-func) scope)
+        (cons name (cons s i))))))
 
 (defun %parse-with-arg (w scope sort)
   "One (with \"name\" (instance ...)) argument — core instances supply
@@ -2040,20 +2161,39 @@ instance-idx)."
 (defun %parse-core-func-def (items scope)
   "(core func $id (canon ...)) — the inverted canon form: the target
 core func is the def itself, so the canon node has NO trailing
-(core func ...) node (resources.wast ::69, abi.wast ::3)."
+(core func ...) node (resources.wast ::69, abi.wast ::3). M9
+(linking lane): the inverted ALIAS form — (core func $id (alias core
+export $i \"n\")) — introduces the core index by projecting the core
+instance's export (unit.wast's tupling fixtures)."
   (multiple-value-bind (id rest) (%split-id items)
     (let ((canon-node (first rest)))
-      (unless (and (%nodep canon-node)
-                   (string= (%head-text canon-node) "canon"))
-        (%text-err (%node-start canon-node)
-                   "expected (canon ...)"))
-      (let ((canon (%parse-canon-def (rest (%children canon-node))
-                                     scope t)))
-        (%flush-interned scope)
-        (%push-def :canon canon)
-        (if (eq (canonrec-kind canon) :lift)
-            (%alloc scope :func id)
-            (%alloc scope :core-func id))))))
+      (cond
+       ((and (%nodep canon-node)
+             (string= (%head-text canon-node) "canon"))
+        (let ((canon (%parse-canon-def (rest (%children canon-node))
+                                       scope t)))
+          (%flush-interned scope)
+          (%push-def :canon canon)
+          (if (eq (canonrec-kind canon) :lift)
+              (%alloc scope :func id)
+              (%alloc scope :core-func id))))
+       ((and (%nodep canon-node)
+             (string= (%head-text canon-node) "alias"))
+        ;; M9: the inverted ALIAS — the def head fixes the sort
+        ;; (:core-func here); the def's $id binds at the alias's NEW
+        ;; index, and a trailing (core func $x) sort decl's $x binds
+        ;; the SAME index (the canonical (alias ...) def shape)
+        (multiple-value-bind (alias alias-id)
+            (%parse-alias-node canon-node scope :core-func)
+          (%flush-interned scope)
+          (%push-def :alias alias)
+          (let ((idx (%alloc scope (aliasrec-sort alias) id)))
+            (declare (ignore idx))
+            (when alias-id
+              (%bind scope alias-id (aliasrec-sort alias)
+                     (1- (%scope-count scope (aliasrec-sort alias))))))))
+       (t (%text-err (%node-start canon-node)
+                     "expected (canon ...)"))))))
 
 ;;; ---- (type ...) definitions ----
 
@@ -2091,7 +2231,11 @@ sugar."
 ;;; ---- (func ...) inverted canon-lift definitions ----
 
 (defun %parse-func-def (items scope)
-  "(func $id (type $t)? <inline sig>? (canon lift ...))."
+  "(func $id (type $t)? <inline sig>? (canon lift ...)). M9 (linking
+lane): the inverted ALIAS form — (func $id (alias export $i \"n\"))
+and (func (export \"n\") (alias export $i \"m\")) — projects the
+instance's export into the component FUNC space (unit.wast's 117
+re-export rows)."
   (multiple-value-bind (id rest) (%split-id items)
     (let ((type-use (find-if
                      (lambda (b)
@@ -2101,7 +2245,40 @@ sugar."
                        (lambda (b)
                          (and (%nodep b)
                               (string= (%head-text b) "canon")))
+                       rest))
+          (alias-node (find-if
+                       (lambda (b)
+                         (and (%nodep b)
+                              (string= (%head-text b) "alias")))
                        rest)))
+      ;; ---- the inverted ALIAS form ----
+      (when alias-node
+        (multiple-value-bind (alias alias-id)
+            (%parse-alias-node alias-node scope :func)
+          (%flush-interned scope)
+          (%push-def :alias alias)
+          (let ((idx (%alloc scope (aliasrec-sort alias) id)))
+            (let ((ex (find-if
+                       (lambda (b)
+                         (and (%nodep b)
+                              (string= (%head-text b) "export")))
+                       rest)))
+              (when ex
+                (let* ((ei (rest (%children ex)))
+                       (nm (%string-token (first ei))))
+                  (%push-def :export
+                             (make-exportrec
+                              :name nm :attrs nil
+                              :sortidx (cons :func idx)
+                              :offset 0)))
+                ;; the EXPORT-introduced slot (the validator's :export
+                ;; arm pushes the value again; the parser consumes
+                ;; the index to stay aligned)
+                (%alloc scope (aliasrec-sort alias) nil)))
+            (when alias-id
+              (%bind scope alias-id (aliasrec-sort alias) idx))))
+        (return-from %parse-func-def))
+      ;; ---- the inverted CANON-LIFT form ----
       (unless canon-node
         (%text-err 0 "expected (canon lift ...)"))
       (let* ((canon (%parse-canon-def
@@ -2136,26 +2313,31 @@ sugar."
                           (%intern-valtype scope ft-ct)))))))
         (%flush-interned scope)
         (%push-def :canon canon)
-        ;; slice 5l (resources ::39): the inline (export "n") marker on
-        ;; the FUNC node also emits an :export def — the child's export
-        ;; table (built from :export defs) must see the lifted func
-        (let ((ex (find-if
-                   (lambda (b)
-                     (and (%nodep b)
-                          (string= (%head-text b) "export")))
-                   rest)))
+        ;; slice 5l (resources ::39): the inline (export "n") marker
+        ;; on the FUNC node also emits an :export def. The CANON
+        ;; introduces func index N (the parser's pre-alloc count) and
+        ;; the EXPORT introduces N+1 (the validator's :export arm
+        ;; pushes the value again) — so the parser consumes BOTH
+        ;; slots, the canon's FIRST, to stay aligned with the
+        ;; validator/runtime (the two-lift fixture previously
+        ;; under-counted, cross-wiring the second lift).
+        (let* ((canon-idx (ct-scope-n-func scope))
+               (ex (find-if
+                    (lambda (b)
+                      (and (%nodep b)
+                           (string= (%head-text b) "export")))
+                    rest)))
+          (%alloc scope :func id)
           (when ex
             (let* ((ei (rest (%children ex)))
                    (nm (%string-token (first ei))))
               (%push-def :export
                          (make-exportrec
                           :name nm :attrs nil
-                          ;; the func index the canon below introduces
-                          ;; (the parser's n-func is pre-alloc here)
-                          :sortidx (cons :func
-                                         (ct-scope-n-func scope))
-                          :offset 0)))))
-        (%alloc scope :func id)))))
+                          :sortidx (cons :func canon-idx)
+                          :offset 0)))
+            ;; the export-introduced slot
+            (%alloc scope :func nil)))))))
 
 ;;; ---- (instance ...) definitions ----
 
