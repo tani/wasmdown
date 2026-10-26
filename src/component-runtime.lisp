@@ -3158,8 +3158,8 @@ computes the tuple at delivery time)."
                       (if result
                           (%abi-lift-values cx 1 vi (list result))
                           '())))
-                (%task-return task (first lifted)))))))
-      (%task-exit-implicit-thread task)))))
+                (%task-return task (first lifted))))))))
+      (%task-exit-implicit-thread task))))
 
 (defun %canon-lift-async (lf args)
   "The ASYNC canon_lift entry (CanonicalABI.md 3389, 3535-3543):
@@ -3196,6 +3196,17 @@ computes the tuple at delivery time)."
                  (handler-case
                      (%async-lift-guest-body task lf cx)
                  (error (c)
+                   ;; The trap path MUST run Task.exit_implicit_thread
+                   ;; FIRST: the guest body died mid-turn, so the
+                   ;; exclusive lock + scheduler registration may
+                   ;; still be held — resolving without releasing
+                   ;; LEAKS the lock and starves every
+                   ;; needs-exclusive peer of this instance.
+                   ;; Idempotent guards: an already-exited (or
+                   ;; never-entered) task's remove-setf is a no-op.
+                   (handler-case
+                       (%task-exit-implicit-thread task)
+                     (error () nil))
                    ;; a guest trap/abort records the failure for
                     ;; the caller (the trap re-signals at the
                     ;; component boundary)
@@ -3694,6 +3705,14 @@ is the valtype."
                      :inst (lifted-func-inst f)))
                  (error (c)
                    (declare (ignore c))
+                   ;; Like the invoke-side trap handler: the guest
+                   ;; body died mid-turn holding the exclusive lock
+                   ;; + scheduler registration — release FIRST
+                   ;; (Task.exit_implicit_thread) or the leaked
+                   ;; lock starves every needs-exclusive peer.
+                   (handler-case
+                       (%task-exit-implicit-thread task)
+                     (error () nil))
                    ;; a trapped callee resolves as cancelled (the
                    ;; trap semantics propagate at the boundary)
                    (unless (async-task-resolved-p task)
