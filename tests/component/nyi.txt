@@ -230,3 +230,21 @@
 #     scheduler-order flakes (acs + this pin, both load-bound)
 #     remain open items with the token as the candidate fix.
 ./async/async-calls-sync.wast
+# ---- M11b PROGRESS (2026-10-27 session 8): THE PARSER ARM
+# LANDED — {stream,future}.{read,write}'s canonopts (async /
+# memory / realloc) parse via the new dedicated arm in
+# %parse-builtin-imms (src/component-text.lisp ~1826): the opts
+# embed as the imms' THIRD element, mirroring task.return's
+# (third imms) convention the runtime already reads. Probed:
+# (:STREAM-READ 0 ((:ASYNC T) (:MEMORY 0))) — the typeidx +
+# resolved canonopts. GATED GREEN: units 407/0, the lane
+# 1031/0/0/0. THE REMAINING RUNG (probed immediately after):
+# the canon runtime — cross-task-future still fails "import
+# .future.new: expected a function, got NULL" because the
+# %builtin-async-host-func ecase tail (~3503-3516 of
+# component-runtime) still returns NIL (opaque) for the
+# stream/future/thread kinds. NEXT: implement the real host
+# funcs family by family per the spec map — {stream,future}.new
+# first (the packed i64 pair), then read/write (the copy's 5
+# cases + BLOCKED), then cancel/drop/forward, then thread.* —
+# probing cross-task-future (2 rows) as the first fixture. ----

@@ -1823,6 +1823,16 @@ async?, context.get/set's valtype + u32 index."
             (%core-valtype-of (first items))
             (%nat-token (second items))
             (%parse-canonopts (cddr items) scope)))
+     ((member h '("stream.read" "stream.write"
+                  "future.read" "future.write") :test #'string=)
+      ;; M11b: the COPY builtins carry canonopts (async / memory /
+      ;; realloc — the buffer's lift/lower context, CanonicalABI.md
+      ;; 4293-4299). The opts embed as the imms' THIRD element (the
+      ;; task.return convention — the runtime's %task-return-opts
+      ;; reads (third imms) the same way).
+      (list kind
+            (%parse-builtin-typeidx (first items) scope)
+            (%parse-canonopts (rest items) scope)))
      ((member h *builtin-typeidx-kinds* :test #'string=)
       (list kind
             (%parse-builtin-typeidx (first items) scope)))
