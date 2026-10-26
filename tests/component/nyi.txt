@@ -58,6 +58,24 @@
 ./async/partial-stream-copies.wast
 ./async/passing-resources.wast
 ./async/reentrance.wast
+# ---- M12 session 5 (2026-10-27): THE RESUME-LATER TRAPS LANDED
+# + trap-if-block-and-sync IN THE LANE (1348 -> 1396, its 48
+# rows; units 410/0; core 21187/0/73 unchanged; the lane x3
+# STABLE at 1396/0/0/0). THE CHANGE (the session-4 note's
+# candidate, one gate): thread.resume-later now traps per
+# §4605-4610 — the unknown-index OOB trap (Table.get's OOB/empty
+# class: "unknown thread index N") + §4609's
+# trap_if(not other_thread.suspended()) ("cannot resume thread
+# which is not suspended") — the SILENT SKIP (the (when target
+# ...) no-op that DROPPED X's 0xdead wake in the no-sibling stall)
+# is gone from the resume path. THE MEASURED YIELD: the
+# trap-if-block-and-sync fixture — 12 rows nyi'd since M11b —
+# went 48/48 GREEN EN PASSANT (its resume-later/suspend-then-
+# resume rows required exactly these traps + the two-park
+# semantics from session 2; stable x3). NO REGRESSIONS: the
+# during-sync family 52/52, self-switch-traps 9/9 (the
+# -then-promote fallback unchanged), reentrance 24/25 (cmd 18,
+# the known load-flake). ----
 # ---- M12 session 4 (2026-10-27): THE SPAWN-NUDGE BUG — THE
 # DURING-SYNC FAMILY COMPLETE (no-sibling-resume 6/6 + may-block
 # 9/9 IN THE LANE; 1333 -> 1348; units 410/0; core 21187/0/73
@@ -192,7 +210,6 @@
 ./async/switch-to-ready-callback.wast
 ./async/sync-barges-in.wast
 ./async/sync-streams.wast
-./async/trap-if-block-and-sync.wast
 # ---- M11b step 1 (post-72bfb62): async-calls-sync. The exit-path
 # repair (72bfb62) fixed the deadlock: run2 (the $AsyncMiddle
 # variant) is GREEN and run1 reaches the endgame deterministically

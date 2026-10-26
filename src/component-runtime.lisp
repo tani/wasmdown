@@ -4400,8 +4400,22 @@ is the valtype."
             (when (and (async-thread-index th)
                        (= (async-thread-index th) (first args)))
               (setf target th)))
-          (when target
-            (async-thread-resume target)))
+          ;; §4605-4610: Table.get traps OOB/empty; §4609's
+          ;; trap_if(not other_thread.suspended()) — the SILENT
+          ;; SKIP (the (when target ...) no-op) DROPPED the wake
+          ;; in the no-sibling-resume stall (X's 0xdead read);
+          ;; a resume path must never silently no-op.
+          (unless target
+            (error 'wasmdown:wasm-trap :kind :generic
+                   :message
+                   (format nil "unknown thread index ~a"
+                           (first args))))
+          (unless (or (functionp (async-thread-spawn-thunk target))
+                      (async-thread-suspended-p target)
+                      (async-thread-yield-parked target))
+            (error 'wasmdown:wasm-trap :kind :generic
+                   :message "cannot resume thread which is not suspended"))
+          (async-thread-resume target))
         '())))
     ;; thread.new-indirect (§4555-4596): read the funcref from the
     ;; canon's core TABLE (trap OOB/null), create a SUSPENDED

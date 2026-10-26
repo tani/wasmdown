@@ -15,15 +15,15 @@ Baseline measurement, not a release gate (PLAN.md §12.8).
 
 | Outcome | Count |
 | --- | --- |
-| pass | 1348 |
+| pass | 1396 |
 | fail | 0 |
 | skip | 0 |
 | unsupported | 0 |
 | timeout | 0 |
 | harness-error | 0 |
-| **total** | **1348** |
+| **total** | **1396** |
 
-Executed: 1348 commands; pass rate 100.0%.
+Executed: 1396 commands; pass rate 100.0%.
 
 ## Per-file counts
 
@@ -50,6 +50,7 @@ Executed: 1348 commands; pass rate 100.0%.
 | component/futures-must-write.wast | 14 | 0 | 0 | 0 |
 | component/same-component-stream-future.wast | 9 | 0 | 0 | 0 |
 | component/self-switch-traps.wast | 9 | 0 | 0 | 0 |
+| component/trap-if-block-and-sync.wast | 48 | 0 | 0 | 0 |
 | component/trap-if-done.wast | 31 | 0 | 0 | 0 |
 | component/trap-if-sync-and-waitable-set.wast | 29 | 0 | 0 | 0 |
 | component/trap-if-transfer-in-waitable-set.wast | 5 | 0 | 0 | 0 |
