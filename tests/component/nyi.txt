@@ -144,18 +144,43 @@
 #     make-thread rebinding DEFPARAMETERs per thread (the owner
 #     reads diverge), (ii) a wait-until park path releasing
 #     between a tick's owner-set and the woken thread's return,
-#     letting a second grant slip in, (iii) the 4 threads = 2
-#     stale from the prior oracle fire (the deadlock leaked
-#     them; the pin's single run creates only 2) — meaning the
-#     invariant break may be the LEFTOVER threads' acquire fast
-#     paths racing. NEXT PROBES, in order: print the owner's
-#     IDENTITY (an address, NOT the struct — the struct print
-#     recursed to a 23GB log) per thread in the dump; check
-#     sb-thread:make-thread's binding semantics for
-#     *token-owner*; and gate the acquire fast path + tick grant
-#     on a single *scheduler-mutex* critical section that also
-#     re-reads owner after waking. The full repro remains:
-#     /tmp/token-patch.py + /tmp/token-amend.py +
-#     /tmp/token-s3.py (the session-3 state + counters) and the
-#     five paren adjustments documented in session 3's note.
+#     letting a second grant slip in, (iii) the leftovers' acquire
+#     fast paths racing. THE THREE PROBES RAN (2026-10-27 sess 5):
+#     (1) make-thread binding semantics: VERIFIED SHARED — a
+#         guest thread's (setf *token-owner*) IS visible to the
+#         main thread (probe script /tmp/probe-bindings.lisp).
+#         Suspect (i) ELIMINATED.
+#     (2) The single owner-write path (%set-owner with a write
+#         log + a VIOLATION detector) + the identity dump ran on
+#         a FRESH single canary: the owner log has EXACTLY ONE
+#         entry — (NIL ACQUIRE-FAST NIL EAD9..) — the outer
+#         guest takes the token and NOTHING further is ever
+#         logged (no release, no grant): the outer never reaches
+#         ANY wait-until. The dump: owner=EAD9 (state=STARTED)
+#         listed TWICE in *scheduler-threads* + two DISTINCT
+#         :want threads at state=INITIAL — 3 distinct threads for
+#         a pin that creates 2, with one duplicated. Suspect
+#         (iii) as stated is WRONG (the run was fresh): the
+#         anomalies are (A) the outer guest parks NOTHING after
+#         acquire — the hang is BEFORE the first wait-until
+#         (suspect: the guest lambda's register/acquire/unwind-
+#         protect chain or %async-lift-guest-body's non-blocking
+#         head — the enter gate fast path), and (B) a thread is
+#         DUPLICATE-registered despite pushnew :test #'eq under
+#         the mutex — and a THIRD :want task exists at all.
+#     (3) THE PARK-LOCK BUG (found + fixed in-session, real):
+#         %token-acquire's loop parked via condition-wait while
+#         holding the SCHEDULER mutex — SBCL's condition-wait
+#         releases only the INNERMOST (thread) mutex, leaving the
+#         scheduler locked while parked: EVERY tick froze. That
+#         shape HUNG the whole run (no oracle, no output). The
+#         fix (park holding ONLY the thread's own mutex) got the
+#         run to the oracle again with the data above.
+#     NEXT PROBE (single, decisive): trace the outer guest's
+#     steps between %token-acquire's return and its first
+#     wait-until — counters at: the unwind-protect entry, the
+#     %async-lift-guest-body entry, the gate's no-park path, and
+#     the first core call. The duplicate-registration and the
+#     third task need the same trace (the register sites: the
+#     guest lambda vs the gate's pushnew).
 ./async/async-calls-sync.wast
