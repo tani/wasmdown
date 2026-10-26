@@ -129,12 +129,33 @@
 #       stalls between the lower's %call-async-funcinst and the
 #       STARTED-wait's pack site; both acquires completed, two
 #       grants happened, five releases, 112 idle ticks — the
-#       outer task never reaches the pack. NEXT PROBE: bracket
-#       %call-async-funcinst's body (the callee-thread spawn to
-#       the pack) with per-line counters — the suspected spot is
-#       the callee's on-start callback chain (the subtask's
-#       state transition vs the caller's readiness closure).
-#       The full patch (token design + fix a + fix b) is
-#       reproducible: /tmp/token-patch.py + /tmp/token-amend.py
-#       + the two tail-close adjustments, all documented above.
+#       outer task never reaches the pack.
+# (c) PROBE RESULTS (2026-10-27 session 4): the per-site counters
+#     DISPROVED the on-start-chain hypothesis — ONSTART fires
+#     (the subtask reaches STARTED) and the callee's guest body
+#     runs (CALLEE-ENTER=1, GUEST-ENTER=2); the pack still never
+#     runs. THE REAL FINDING: the deadlock oracle's thread dump
+#     shows FOUR live threads with TWO marked owner=T
+#     simultaneously (both state=STARTED, ready-fn=NIL) and two
+#     :want threads never granted — THE TOKEN INVARIANT IS
+#     VIOLATED (two concurrent owners). All three owner writes
+#     are under *scheduler-mutex* (acquire fast path, tick
+#     grant, release) — the remaining suspects: (i) SBCL's
+#     make-thread rebinding DEFPARAMETERs per thread (the owner
+#     reads diverge), (ii) a wait-until park path releasing
+#     between a tick's owner-set and the woken thread's return,
+#     letting a second grant slip in, (iii) the 4 threads = 2
+#     stale from the prior oracle fire (the deadlock leaked
+#     them; the pin's single run creates only 2) — meaning the
+#     invariant break may be the LEFTOVER threads' acquire fast
+#     paths racing. NEXT PROBES, in order: print the owner's
+#     IDENTITY (an address, NOT the struct — the struct print
+#     recursed to a 23GB log) per thread in the dump; check
+#     sb-thread:make-thread's binding semantics for
+#     *token-owner*; and gate the acquire fast path + tick grant
+#     on a single *scheduler-mutex* critical section that also
+#     re-reads owner after waking. The full repro remains:
+#     /tmp/token-patch.py + /tmp/token-amend.py +
+#     /tmp/token-s3.py (the session-3 state + counters) and the
+#     five paren adjustments documented in session 3's note.
 ./async/async-calls-sync.wast
