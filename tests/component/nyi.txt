@@ -265,3 +265,29 @@
 # GATED GREEN: units 407/0, lane 1031/0/0/0. The still-opaque
 # ecase arm now lists exactly the read/write/cancel/drop/
 # forward/thread/error-context kinds. ----
+# ---- M11b session 10 (2026-10-27): the COPY family LANDED +
+# gated green. The runtime now has: %buffer-make (GuestBuffer's
+# eager alignment+bounds guards, §1552-1556 — fixed to compare
+# against memory-instance-BYTES' length, not memory-size which
+# returns PAGES), %buffer-take/%buffer-put (the load/store pair
+# with the value transfer ACROSS buffers — the first cut staged
+# into one buffer's slot and read the other's, never crossing),
+# %end-copy (the 5 cases of §1687-1711 incl. the same-instance
+# non-numeric trap §1695), and the {stream,future}.{read,write}
+# host funcs (the guards, the buffer, the copy, the eager event
+# delivery, the BLOCKED=0xffffffff async path, the sync
+# wait_for_pending_event). Fixed in-session: the unbound CANON
+# reference (the binary path has no canonrec — the opts now read
+# the imms' third element with an empty default). GATED GREEN:
+# units 407/0, lane 1031/0/0/0. THE PROBE'S NEXT GAP (exactly
+# one mechanism deeper): cross-task-future now fails "invalid
+# stream end index 1" — the future's readable end lives in $C's
+# handles table but $D's future.read looks it up in $D's: THE
+# CROSS-INSTANCE TRANSFER (lift_stream/lower_stream §2432-2460/
+# 2851-2865 — lift removes the end from the owner's table and
+# re-adds it to the receiving instance's, guarding IDLE + not-in-
+# a-waitable-set). That's the %abi-lift/%abi-store arms for the
+# stream/future valtypes — the value-level routing that makes
+# ends first-class component values. NEXT: implement those arms,
+# re-probe cross-task-future (the write->read rendezvous should
+# then complete end-to-end), then closed-stream/drop-stream. ----

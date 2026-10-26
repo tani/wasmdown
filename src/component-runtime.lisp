@@ -2670,6 +2670,157 @@ of a stream or future pair."
                       result          ; futures do NOT pack progress
                       (logior result (ash progress 4))))))))
 
+;;; ---- The GuestBuffer (CanonicalABI.md 1545-1586) ----
+;;; A buffer is (list memory ptr length progress) — the load/store
+;;; helpers below advance ptr and progress per element.
+
+(defconstant +buffer-max-length+ (1- (expt 2 28)))
+
+(defun %buffer-make (end memory ptr length)
+  "GuestBuffer's eager guards (§1552-1556): the alignment + bounds
+trap at construction; zero-length buffers skip them."
+  (let* ((t-ct (async-end-t-ct end))
+         (inst (async-end-owner end))
+         (elem-size (and t-ct
+                         (handler-case
+                             (%abi-elem-size t-ct inst)
+                           (error () 1)))))
+    (when (> length +buffer-max-length+)
+      (error 'wasmdown:wasm-trap :kind :generic
+             :message "buffer length exceeds the maximum"))
+    (when (and t-ct (plusp length))
+      (let ((align (handler-case
+                       (%abi-alignment t-ct inst)
+                     (error () 1))))
+        (unless (zerop (mod ptr align))
+          (error 'wasmdown:wasm-trap :kind :generic
+                 :message (format nil "unaligned pointer (~a)"
+                                  "stream buffer"))))
+      ;; memory-size returns PAGES — compare against the BYTES
+      ;; vector's length (the byte length, §1556)
+      (when (> (+ ptr (* length (or elem-size 1)))
+               (length (wasmdown.runtime:memory-instance-bytes memory)))
+        (error 'wasmdown:wasm-trap :kind :generic
+               :message "out of bounds memory access")))
+    (list memory ptr length 0)))
+
+(defun %buffer-remain (buf)
+  (- (third buf) (fourth buf)))
+
+(defun %buffer-progress (buf) (fourth buf))
+
+(defun %buffer-take (buf n t-ct inst)
+  "ReadableGuestBuffer.read(n) (§1567-1575): load N elements from
+the buffer's memory at its advancing ptr; returns the values list
+and advances the buffer's progress."
+  (let* ((memory (first buf))
+         (elem-size (and t-ct
+                         (handler-case
+                             (%abi-elem-size t-ct inst)
+                           (error () 1))))
+         (ptr (+ (second buf) (* (fourth buf) (or elem-size 1))))
+         (vals nil))
+    (when (and t-ct (plusp n))
+      (let ((cx (make-abi-cx :memory memory :inst inst)))
+        (dotimes (i n)
+          (push (%abi-load cx t-ct ptr) vals)
+          (incf ptr (or elem-size 1)))))
+    (incf (fourth buf) n)
+    (nreverse vals)))
+
+(defun %buffer-put (buf vals t-ct inst)
+  "WritableGuestBuffer.write (§1577-1585): store the VALUES list
+into the buffer's memory at its advancing ptr, advancing the
+progress by the count."
+  (let* ((memory (first buf))
+         (elem-size (and t-ct
+                         (handler-case
+                             (%abi-elem-size t-ct inst)
+                           (error () 1))))
+         (n (length vals))
+         (ptr (+ (second buf) (* (fourth buf) (or elem-size 1)))))
+    (when (and t-ct vals)
+      (let ((cx (make-abi-cx :memory memory :inst inst)))
+        (dolist (v vals)
+          (%abi-store cx v t-ct ptr)
+          (incf ptr (or elem-size 1)))))
+    (incf (fourth buf) n)))
+
+;;; ---- End.copy (CanonicalABI.md 1687-1711): the 5 cases ----
+
+(defun %none-or-number-type-p (t-ct)
+  "The same-instance copy trap's exemption (§1695): number-typed
+elements may copy within one instance."
+  (or (null t-ct)
+      (and (wasmdown.component:ct-p t-ct)
+           (member (wasmdown.component:ct-kind t-ct) '(:prim))
+           (member (wasmdown.component:ct-payload t-ct)
+                   '(:u8 :s8 :u16 :s16 :u32 :s32 :u64 :s64
+                     :f32 :f64 :float16 :float32 :float64 :char :bool)))))
+
+(defun %end-copy (end buffer is-read)
+  "End.copy (§1687): the single parameterized copy. The buffer is
+the (memory ptr length progress) list. The 5 cases in order:
+1. racily-dropped peer (pending event already armed);
+2. no peer buffer — park mine, wait for the peer;
+3. both non-zero — copy the min, notify both, drop the drained one;
+4. mine non-zero or (read + the peer's zero-length) — notify the
+   peer with progress 0, take my buffer as pending;
+5. my zero-length — notify myself with progress 0."
+  (setf (async-end-state end) :copying)
+  (let ((other (async-end-other end)))
+    (cond
+     ;; case 1: the peer was racily dropped (its drop armed my event)
+     ((null other)
+      ;; the drop already notified us (the pending event holds)
+      nil)
+     ;; case 2: the peer has no buffer — park mine, wait for it
+     ((null (async-end-buffer other))
+      (setf (async-end-buffer end) buffer))
+     ;; case 3: both have remain > 0 — copy the min
+     ((and (plusp (%buffer-remain buffer))
+           (plusp (%buffer-remain (async-end-buffer other))))
+      ;; the same-instance non-numeric trap (§1695)
+      (when (and (async-end-owner end)
+                 (eq (async-end-owner end) (async-end-owner other))
+                 (not (%none-or-number-type-p (async-end-t-ct end))))
+        (error 'wasmdown:wasm-trap :kind :generic
+               :message
+               "cannot read from and write to intra-component future/stream"))
+      (let ((n (min (%buffer-remain buffer)
+                    (%buffer-remain (async-end-buffer other))))
+            (inst (async-end-owner end))
+            (t-ct (async-end-t-ct end)))
+        (if is-read
+            ;; the READER's buffer is the DESTINATION: load n from
+            ;; the peer's (writable-side staged) buffer, store into
+            ;; mine — the values move peer -> me
+            (let* ((peer (async-end-buffer other))
+                   (vals (%buffer-take peer n t-ct inst)))
+              (%buffer-put buffer vals t-ct inst))
+            ;; the WRITER's buffer is the SOURCE: load n from mine,
+            ;; store into the peer's writable buffer — me -> peer
+            (let* ((vals (%buffer-take buffer n t-ct inst)))
+              (%buffer-put (async-end-buffer other) vals t-ct inst)))
+        ;; notify BOTH with their progress; the fully-drained
+        ;; peer buffer is dropped
+        (%end-notify end (%buffer-progress buffer))
+        (%end-notify other (%buffer-progress (async-end-buffer other)))
+        (when (zerop (%buffer-remain (async-end-buffer other)))
+          (setf (async-end-buffer other) nil))))
+     ;; case 4: mine non-zero, or a read meeting the peer's
+     ;; zero-length — the peer learns progress 0 and I park
+     ((or (plusp (%buffer-remain buffer))
+          (and is-read (zerop (%buffer-remain
+                               (async-end-buffer other)))))
+      (%end-notify other 0)
+      (setf (async-end-buffer other) nil)
+      (setf (async-end-buffer end) buffer))
+     ;; case 5: my zero-length write meeting a non-zero peer —
+     ;; notify myself with progress 0
+     (t
+      (%end-notify end 0)))))
+
 ;;; ---- The Thread record (CanonicalABI.md 391-407) ----
 
 (defstruct async-thread
@@ -3627,14 +3778,89 @@ is the valtype."
               (setf (async-end-index writer) wi)
               (list (logior ri (ash wi 32)))))))))
     ;; the still-opaque kinds: the slot exists, the call traps
+    ;; M11b: {stream,future}.{read,write} — the COPY family
+    ;; (CanonicalABI.md 4280-4375): the 5-case End.copy over the
+    ;; guest buffer, the BLOCKED sentinel for the async path, the
+    ;; blocking wait for the sync path.
+    ((:stream-read :stream-write :future-read :future-write)
+     (let* ((future-p (member kind '(:future-read :future-write)))
+            (read-p (member kind '(:stream-read :future-read)))
+            ;; the canonopts: the parser arm embeds them as the
+            ;; imms' THIRD element; the BINARY reader puts them
+            ;; on the canonrec's OPTS (both shapes read here)
+            ;; the canonopts: the parser arm embeds them as the imms'
+            ;; THIRD element (the binary path's fixtures reach here
+            ;; via the text parser in this lane; an empty opts list
+            ;; is the safe default otherwise)
+            (opts (or (third imms) '()))
+            (mem-opt (wasmdown.component:canon-opt opts :memory))
+            (memory (and mem-opt
+                        (< (second mem-opt)
+                           (length (comp-instance-core-memories inst)))
+                        (aref (comp-instance-core-memories inst)
+                              (second mem-opt))))
+            (t-idx (second imms))
+            (t-ct (and (integerp t-idx)
+                       (< t-idx (length (comp-instance-types inst)))
+                       (aref (comp-instance-types inst) t-idx)))
+            (elem-ct (and t-ct (wasmdown.component:ct-payload t-ct)))
+            (sig (if future-p '(:i32 :i32) '(:i32 :i32 :i32))))
+       (declare (ignorable future-p))
+       (wasmdown.runtime:make-host-func-instance
+        (wasmdown.types:make-wasm-func-type sig '(:i32))
+        (lambda (args)
+          ;; copy (§4317-4335): the guards, the buffer, the copy,
+          ;; then the event/BLOCKED
+          (let* ((i (first args))
+                 (ptr (second args))
+                 (length (if future-p 1 (third args)))
+                 (end (%handle-at inst i #'async-end-p "stream end"))
+                 (elem-decl (and t-ct
+                                 (wasmdown.component:ct-payload t-ct)))
+                 ;; the type guard: end.t == the canon's $t (§4322)
+                 (declared (and elem-decl
+                               (or (eq (async-end-t-ct end) elem-decl)
+                                   (equal (async-end-t-ct end) elem-decl)))))
+            (declare (ignorable declared elem-decl))
+            (unless (eq (async-end-state end) :idle)
+              (error 'wasmdown:wasm-trap :kind :generic
+                     :message "cannot read or write a stream or future in a non-idle state"))
+            (when (and (%waitable-in-wset end)
+                       (not (wasmdown.component:canon-opt opts :async)))
+              (error 'wasmdown:wasm-trap :kind :generic
+                     :message "cannot read or write while in a waitable set"))
+            ;; the future ends only read/write ONCE (§1666: futures
+            ;; have no length param — always implicitly 1)
+            (let ((buffer (%buffer-make end memory ptr length)))
+              (%end-copy end buffer read-p)
+              (if (async-waitable-pending-event end)
+                  ;; the event is ready: deliver it synchronously
+                  (let* ((event (%waitable-get-pending-event end))
+                         (payload (third event)))
+                    (list payload))
+                  ;; no event yet: BLOCKED (async) or wait (sync)
+                  (if (wasmdown.component:canon-opt opts :async)
+                      (list #xffffffff)  ; BLOCKED (§4158)
+                      (progn
+                        (setf (async-waitable-has-sync-waiter end) t)
+                        (unwind-protect
+                             (async-thread-wait-until
+                              *current-thread*
+                              (lambda ()
+                                (not (null (async-waitable-pending-event
+                                            end)))))
+                          (setf (async-waitable-has-sync-waiter end)
+                                nil))
+                        (let* ((event (%waitable-get-pending-event end))
+                               (payload (third event)))
+                          (list payload)))))))))))
+    ;; the still-opaque kinds: the slot exists, the call traps
     ((:thread-yield :thread-suspend :thread-resume-later
       :thread-suspend-then-resume :thread-yield-then-resume
       :thread-suspend-then-promote :thread-yield-then-promote
       :thread-index :thread-new-indirect
-      :stream-read :stream-write
       :stream-cancel-read :stream-cancel-write
       :stream-drop-readable :stream-drop-writable :stream-forward
-      :future-read :future-write
       :future-cancel-read :future-cancel-write
       :future-drop-readable :future-drop-writable
       :future-forward
