@@ -3440,9 +3440,12 @@ flat-sig helper handles the result-bearing case)."
       :future-drop-readable :future-drop-writable)
      (cons '(:i32) '()))
     ((:context-get :waitable-set-new :thread-index
-      :resource-new :resource-rep
-      :stream-forward :future-forward)
+      :resource-new :resource-rep)
      (cons '() '(:i32)))
+    ;; §4500: {stream,future}.forward takes the readable + writable
+    ;; indices, no results
+    ((:stream-forward :future-forward)
+     (cons '(:i32 :i32) '()))
     ;; §4565: thread.new-indirect takes the table index + the
     ;; closure param and returns the thread index — a FIXED shape
     ((:thread-new-indirect)
@@ -7744,6 +7747,37 @@ the number of enclosing component/type scopes (outer aliases)."
                         (when (>= (second imms)
                                    (length (cval-types state)))
                           (%verr "type index out of bounds"))))
+                       ;; M11b (§4495): {stream,future}.forward's
+                       ;; typeidx must be the matching kind —
+                       ;; forward.wast's assert_invalid rows. The
+                       ;; other builtins' kinds are guarded at
+                       ;; RUNTIME (the handle class checks) — a
+                       ;; validator-side check there broke the
+                       ;; alias-bound type pins (the (eq $T)
+                       ;; substitution resolves through spaces
+                       ;; the %ct-at walk doesn't mirror).
+                       (when (and (member (first imms)
+                                          '(:stream-forward
+                                            :future-forward))
+                                  (second imms)
+                                  (integerp (second imms))
+                                  (>= (second imms) 0)
+                                  (< (second imms)
+                                     (length (cval-types state))))
+                         (let* ((c (%ct-at state (second imms)))
+                                (want (if (eq (first imms)
+                                               :stream-forward)
+                                          :stream :future)))
+                           (when (and c
+                                      (wasmdown.component:ct-p c)
+                                      (not (eq
+                                            (wasmdown.component:ct-kind
+                                             c)
+                                            want)))
+                             (%verr
+                              (if (eq want :stream)
+                                  "stream built-in requires a stream type"
+                                  "future built-in requires a future type")))))
                        (when (and (member (first imms)
                                           '(:resource-new :resource-drop
                                             :resource-rep))

@@ -4241,11 +4241,107 @@ is the valtype."
               (sb-thread:with-recursive-lock (*scheduler-mutex*)
                 (push th *scheduler-threads*))
               (list (async-thread-index th))))))))
+    ;; M11b: {stream,future}.forward (§4495-4534): the guards
+    ;; (the class, the type match, IDLE, not in a wset), both ends
+    ;; REMOVED, then End.forward (§1754): the trivial-loop case
+    ;; drops both; otherwise the OUTER ends link directly and the
+    ;; both-pending corner copies the SMALLER buffer through.
+    ((:stream-forward :future-forward)
+     (let* ((future-p (eq kind :future-forward))
+            (t-idx (second imms))
+            (t-ct (and (integerp t-idx)
+                       (< t-idx
+                          (length (comp-instance-types inst)))
+                       (aref (comp-instance-types inst) t-idx))))
+       (wasmdown.runtime:make-host-func-instance
+        (wasmdown.types:make-wasm-func-type '(:i32 :i32) '())
+        (lambda (args)
+          (let* ((h (%inst-handles inst))
+                 (ri (first args))
+                 (wi (second args))
+                 (r-end (and (<= 1 ri (length h))
+                             (aref h (1- ri))))
+                 (w-end (and (<= 1 wi (length h))
+                             (aref h (1- wi)))))
+            (flet ((bad (msg)
+                     (error 'wasmdown:wasm-trap :kind :generic
+                            :message msg)))
+              (unless (and r-end (async-end-p r-end)
+                           (eq (async-end-future-p r-end)
+                               future-p))
+                (bad "invalid readable end index"))
+              (unless (and w-end (async-end-p w-end)
+                           (eq (async-end-future-p w-end)
+                               future-p))
+                (bad "invalid writable end index"))
+              ;; the type guard: end.t == the canon's $t (§4502):
+              ;; a (stream $t?) ct's payload IS the element type
+              (let ((elem (and t-ct
+                               (wasmdown.component:ct-payload
+                                t-ct))))
+                (when (and elem
+                           (not (equal (async-end-t-ct r-end)
+                                       elem)))
+                  (bad "stream type mismatch"))
+                (when (and elem
+                           (not (equal (async-end-t-ct w-end)
+                                       elem)))
+                  (bad "stream type mismatch")))
+              (unless (eq (async-end-state r-end) :idle)
+                (bad "cannot forward a non-idle readable end"))
+              (unless (eq (async-end-state w-end) :idle)
+                (bad "cannot forward a non-idle writable end"))
+              (when (%waitable-in-wset r-end)
+                (bad "cannot forward an end in a waitable set"))
+              (when (%waitable-in-wset w-end)
+                (bad "cannot forward an end in a waitable set"))
+              ;; both REMOVED (§4519-4524)
+              (setf (aref h (1- ri)) nil)
+              (%handle-free-slot inst ri)
+              (setf (aref h (1- wi)) nil)
+              (%handle-free-slot inst wi)
+              ;; End.forward (§1754-1763)
+              (let ((src r-end) (dst w-end))
+                (if (or (eq (async-end-other src) dst)
+                        (null (async-end-other src))
+                        (null (async-end-other dst)))
+                    (progn (%end-drop src) (%end-drop dst))
+                    (let ((writable-end (async-end-other src))
+                          (readable-end (async-end-other dst)))
+                      (setf (async-end-other writable-end)
+                            readable-end)
+                      (setf (async-end-other readable-end)
+                            writable-end)
+                      ;; the both-pending corner: copy the SMALLER
+                      ;; buffer through (§1760-1763)
+                      (when (and (async-end-buffer writable-end)
+                                 (async-end-buffer readable-end))
+                        (if (> (%buffer-remain
+                                (async-end-buffer readable-end))
+                               (%buffer-remain
+                                (async-end-buffer writable-end)))
+                            (let ((bigger readable-end)
+                                  (smaller writable-end))
+                              (declare (ignore bigger))
+                              (let ((buffer (async-end-buffer
+                                             smaller)))
+                                (setf (async-end-buffer smaller)
+                                      nil)
+                                (%end-copy smaller buffer nil)))
+                            (let ((bigger writable-end)
+                                  (smaller readable-end))
+                              (declare (ignore bigger))
+                              (let ((buffer (async-end-buffer
+                                             smaller)))
+                                (setf (async-end-buffer smaller)
+                                      nil)
+                                (%end-copy smaller buffer
+                                           t)))))))))
+            '())))))
     ;; the still-opaque kinds: the slot exists, the call traps
     ((:thread-suspend-then-resume :thread-yield-then-resume
       :thread-suspend-then-promote :thread-yield-then-promote
       :thread-new-indirect
-      :stream-forward :future-forward
       :error-context-new :error-context-debug-message
       :error-context-drop)
      nil)))

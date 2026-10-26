@@ -2534,6 +2534,60 @@ these pins guard the executor's mechanisms directly."
                   (wasmdown.component.runtime:lifted-func-type
                    lf))))
       )))
+
+(test component/async-stream-roundtrip-pins
+  ;; M11b — the stream read/write RENDEZVOUS with backpressure
+  ;; (CanonicalABI.md 1687-1711: the copy's case 2 park + case 3
+  ;; copy; 4280-4375: the BLOCKED sentinel for the async path +
+  ;; the sync wait). The lane oracle is cross-task-future +
+  ;; zero-length; this pin guards the copy directly: the writer
+  ;; parks (the buffer), the reader's 4-byte read rendezvouses
+  ;; (the COMPLETED|4<<4 payload both sides), the bytes cross.
+  (let* ((ci (%exec-comp
+              (concatenate 'string
+                "(component"
+                " (core module $Memory (memory (export \"mem\") 1))"
+                " (core instance $memory (instantiate $Memory))"
+                " (core module $M"
+                "  (import \"\" \"mem\" (memory 1))"
+                "  (import \"\" \"task.return0\" (func $task.return0))"
+                "  (import \"\" \"stream.new\" (func $snew (result i64)))"
+                "  (import \"\" \"stream.read\" (func $sread (param i32 i32 i32) (result i32)))"
+                "  (import \"\" \"stream.write\" (func $swrite (param i32 i32 i32) (result i32)))"
+                "  (func $f (export \"f\") (result i32)"
+                "    (local $ret64 i64) (local $rx i32) (local $tx i32) (local $ret i32)"
+                "    (local.set $ret64 (call $snew))"
+                "    (local.set $rx (i32.wrap_i64 (local.get $ret64)))"
+                "    (local.set $tx (i32.wrap_i64 (i64.shr_u (local.get $ret64) (i64.const 32))))"
+                "    (i32.store (i32.const 16) (i32.const 267880218))"
+                "    (local.set $ret (call $swrite (local.get $tx) (i32.const 16) (i32.const 4)))"
+                "    (if (i32.ne (i32.const -1 (; BLOCKED ;)) (local.get $ret)) (then unreachable))"
+                "    (local.set $ret (call $sread (local.get $rx) (i32.const 32) (i32.const 4)))"
+                "    (if (i32.ne (i32.const 64) (local.get $ret)) (then unreachable))"
+                "    (if (i32.ne (i32.const 267880218) (i32.load (i32.const 32))) (then unreachable))"
+                "    (call $task.return0)"
+                "    (i32.const 0 (; EXIT ;)))"
+                "  (func $f_cb (export \"f-cb\") (param i32 i32 i32) (result i32) (i32.const 0)))"
+                " (type $ST (stream u8))"
+                " (canon task.return (core func $task.return0))"
+                " (canon stream.new $ST (core func $snew))"
+                " (canon stream.read $ST (memory (core memory $memory \"mem\")) (core func $sread))"
+                " (canon stream.write $ST async (memory (core memory $memory \"mem\")) (core func $swrite))"
+                " (core instance $m (instantiate $M (with \"\" (instance"
+                "   (export \"mem\" (memory $memory \"mem\"))"
+                "   (export \"task.return0\" (func $task.return0))"
+                "   (export \"stream.new\" (func $snew))"
+                "   (export \"stream.read\" (func $sread))"
+                "   (export \"stream.write\" (func $swrite))))))"
+                " (func (export \"f\") async (result u32) (canon lift"
+                "   (core func $m \"f\")"
+                "   async (callback (core func $m \"f-cb\")))))"))))
+    (let ((results (funcall (wasmdown.wast:component-invoker)
+                            ci "f" '())))
+      ;; task.return with no result: the invoke observes the
+      ;; single NIL result (the resolved no-value)
+      (is (equal '(nil) results)))))
+
 (defun run-component-pins ()
   "Run the component pins (registered via TEST; returns T)."
   (let ((wasmdown.test::*tests*
@@ -2599,7 +2653,8 @@ these pins guard the executor's mechanisms directly."
                       component/async-context-roundtrip-pins
                       component/async-wset-wait-join-pins
                       component/async-backpressure-block-pins
-                      component/async-cancel-delivery-pins)))
+                      component/async-cancel-delivery-pins
+                      component/async-stream-roundtrip-pins)))
           wasmdown.test::*tests*)))
     (multiple-value-bind (passed failed)
         (wasmdown.test:run-all-tests)

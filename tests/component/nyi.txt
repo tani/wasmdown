@@ -8,7 +8,6 @@
 # stream/thread canon sigs, run-script probes 2026-10-26) ----
 ./async/big-interleaving-test.wast
 ./async/forward.wast
-./async/builtin-trap-poisons-instance.wast
 ./async/cancel-delivery.wast
 ./async/cancel-resumed-callback-switch.wast
 ./async/cancel-subtask.wast
@@ -35,7 +34,6 @@
 ./async/trap-if-done.wast
 ./async/trap-if-sync-and-waitable-set.wast
 ./async/trap-if-transfer-in-waitable-set.wast
-./async/wait-during-callback.wast
 # ---- M11b step 1 (post-72bfb62): async-calls-sync. The exit-path
 # repair (72bfb62) fixed the deadlock: run2 (the $AsyncMiddle
 # variant) is GREEN and run1 reaches the endgame deterministically
@@ -531,3 +529,91 @@
 # traces + chase the crash from the drop arm's (first args) index
 # + the instance identity. The serialized trace map in this note
 # is the reference for the flow's correct ordering. ----
+# ---- M11b session 19 (2026-10-27, REVERTED to the ninth rung):
+# THE INTERLEAVE PARK — per the note's criterion ("if the scoping
+# bug proves deeper than a session, park it and move to forward").
+# THE SESSION'S FINDINGS (all with serialized traces; the rule
+# re-applied + the %tr scaffolding re-derivable from
+# /tmp/s18-rule.py + the note):
+# (1) THE RULE + THE FLOW VERIFIED AGAIN: [PACK serial=1 state=1
+#     i=1] + [PACK serial=2 state=1 i=2] + [CANCEL BLOCKED] +
+#     [RW-EAGER 0] + [SUB-RESOLVE 2 state=2] (hold-lock returns)
+#     + [SUB-RESOLVE 1 state=4] (park cancelled) + [DELIVER
+#     serial=1] ($D's first wait ✓ THE FIXTURE'S CHECKS PASS:
+#     park + state 4) — the flow runs to the subtask.drop.
+# (2) THE CRASH IS RUN-TIMING-DEPENDENT: three variants observed
+#     across runs of the SAME build: (a) the full flow → the drop-
+#     arm crashes a CALLEE thread with TYPE-ERROR expected
+#     ASYNC-SUBTASK datum ASYNC-END (a subtask cancel/drop arm
+#     resolved an END-holding index; the arms' inst = the canon
+#     owner ($D) — the $D table map: park=1, future r=2 w=3, the
+#     lift frees 2, the hold's subtask pops 2 — CONSISTENT, so
+#     the END vs SUBTASK collision is in the ARM'S resolution or
+#     a STALE FREE-SLOT pop — print the drop/cancel arms' resolved
+#     object type at the %handle-at next time); (b) the hold-
+#     lock's task resolves FULLY during the STARTED-wait (its
+#     body ran to task.return — over-advance) → the eager branch
+#     packs 2 → the STARTED check traps; (c) the hold-lock's
+#     lower hangs: THREE gate-enters ($D-run, park, hold-lock ✓
+#     order verified) but NO PACK(2) — the hold-lock's thread
+#     entered the gate (bp=0 lock=NIL waiting=0 — the gate was
+#     FREE at its enter!) and never reached a flip/resolve within
+#     the 20-pass bound: its body's read/wset.new/join/wset.wait
+#     chain never completed a flip — the suspects: the gate's
+#     inner re-check racing the park's lock acquisition, or the
+#     wset.wait flip's *current-task* on-started lookup.
+# (3) THE CLASS: all three variants are THE SEQUENTIAL-SCHEDULE
+#     over-advance/starvation family — the callee's SBCL thread
+#     races the lower's bounded wait; the correct model is the
+#     TOKEN SCHEDULER (M12's opening problem). cancel-and-
+#     exclusive-lock is SCHEDULER-BLOCKED (add to the list with
+#     acs/cancel-targeted-resume/cancel-delivery-row-3/cancel-
+#     subtask-rows-1,3).
+# NEXT: move to FORWARD (§4495-4534, 48 rows) per the parent's
+# ladder — the fixtures that don't need the interleave. ----
+# ---- M11b session 19b (2026-10-27): FORWARD LANDED (94/95) — the
+# mechanism complete, row 52 residual. {stream,future}.forward
+# (§4495-4534 + End.forward §1754): the host func (the class
+# guards via future-p parity, the TYPE guard — a (stream $t?) ct's
+# payload IS the element type, not a list — the typeidx
+# validation NARROWED to the forward kinds only (a validator-side
+# kind check on the other builtins broke the outer-alias type
+# pins: the (eq $T) substitution resolves through spaces %ct-at
+# doesn't mirror — the runtime handle-class checks cover them),
+# both ends REMOVED + freed in ri-then-wi order (the free list
+# gives the fixture's exact reuse indices), the trivial-loop case
+# (src.other is dst / either None -> both drop), the outer-link
+# case, the both-pending corner (the smaller buffer copied
+# through). PROBED: forward.wast 94/95 stable x2 (was 0/95): the
+# assert_invalid rows (the kind validation) + the trap rows (the
+# guards) + the transfer rows all green. RESIDUAL row 52 =
+# future-forward-chain (line 987): the chain's two forwards
+# (rA,wB)+(rC,wA) then the write to wC must see BLOCKED (the
+# linked rB has no buffer) — the write's check traps; the lead:
+# the SECOND forward's dst.other (wA's other was RELINKED to rB
+# by the first forward — verify the link chain wC<->rB holds and
+# the write's case-2 park arms no event). forward stays in nyi
+# until 95/95; the mechanism (the host func + the validation) is
+# in the tree and gated green: units 407/0, lane 1087/0/0/0. ----
+# ---- M11b session 19c (2026-10-27): TWO MORE FIXTURES IN THE
+# LANE (1087 -> 1097) + THE STREAM-ROUNDTRIP PIN (units 407 ->
+# 408). wait-during-callback (2 rows) + builtin-trap-poisons-
+# instance (8 rows!) BOTH already fully green on the M11a+M11b
+# machinery (the poison fixture's note said 4 rows — it's 8/8;
+# the poisoning behavior fell out of the trap-propagation +
+# instance-scoped runtime state). THE PIN (the parent's standing
+# request — the stream family flipped, so it lands now):
+# component/async-stream-roundtrip-pins — a $Tester-shape single
+# task: stream.new -> an ASYNC 4-byte write (BLOCKED, the case-2
+# park) -> a 4-byte read (case 3: the copy + BOTH sides notified
+# with COMPLETED|4<<4) -> the byte roundtrip (0x12345678) checked
+# both sides -> task.return + EXIT. THE PIN'S DERIVATION LESSONS
+# (for future pins): the core module's IMPORTS must precede any
+# definition (the memory export last); the memory comes from a
+# SEPARATE $Memory module+instance (no self-reference in the
+# with-instance); a single-threaded write must be the ASYNC
+# canon (a sync write parks the only thread -> the deadlock
+# oracle); a callback lift's initial call must return the packed
+# code (EXIT 0) + resolve via task.return; the invoke's result
+# for a no-result task.return is (NIL). GATED GREEN: units
+# 408/0, lane 1097/0/0/0 stable x2. ----

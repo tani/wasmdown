@@ -15,20 +15,21 @@ Baseline measurement, not a release gate (PLAN.md §12.8).
 
 | Outcome | Count |
 | --- | --- |
-| pass | 1087 |
+| pass | 1097 |
 | fail | 0 |
 | skip | 0 |
 | unsupported | 0 |
 | timeout | 0 |
 | harness-error | 0 |
-| **total** | **1087** |
+| **total** | **1097** |
 
-Executed: 1087 commands; pass rate 100.0%.
+Executed: 1097 commands; pass rate 100.0%.
 
 ## Per-file counts
 
 | File | pass | fail | unsupported | other |
 | --- | --- | --- | --- | --- |
+| component/builtin-trap-poisons-instance.wast | 8 | 0 | 0 | 0 |
 | component/cancel-and-exclusive-lock.wast | 2 | 0 | 0 | 0 |
 | component/cancel-not-delivered.wast | 2 | 0 | 0 | 0 |
 | component/cancel-stream.wast | 15 | 0 | 0 | 0 |
@@ -42,6 +43,7 @@ Executed: 1087 commands; pass rate 100.0%.
 | component/validate-no-async-abi-for-sync-type.wast | 3 | 0 | 0 | 0 |
 | component/validate-no-stream-char.wast | 1 | 0 | 0 | 0 |
 | component/validate-task-return.wast | 3 | 0 | 0 | 0 |
+| component/wait-during-callback.wast | 2 | 0 | 0 | 0 |
 | component/zero-length.wast | 27 | 0 | 0 | 0 |
 | component/binary.wast | 132 | 0 | 0 | 0 |
 | component/link-time-virtualization.wast | 8 | 0 | 0 | 0 |
