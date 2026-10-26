@@ -43,7 +43,26 @@
 ./async/trap-if-transfer-in-waitable-set.wast
 ./async/wait-during-callback.wast
 ./async/zero-length.wast
-# ---- M11a open: async-calls-sync (the acs interleave — the
-# backpressure-gate wake chain; probe: 4 gate parks, 0 passes, the
-# deadlock oracle fires; one open runtime bug) ----
+# ---- M11b step 1 (post-72bfb62): async-calls-sync. The exit-path
+# repair (72bfb62) fixed the deadlock: run2 (the $AsyncMiddle
+# variant) is GREEN and run1 reaches the endgame deterministically
+# — the packs are exactly 0x21/0x31/0x40/0x50 and all four
+# blocking-call tasks resolve (TASK-RETURN 2/3/4/5). The residual
+# is a SCHEDULER-ORDER flake, not a mechanism gap: the second pair's
+# two sync-func tasks (different instances, no shared lock before
+# their inner blocking-call callees) can run their cores in either
+# order; when 5's inner callee wins the race to $AsyncInner's
+# $counter, subtask 5's chain stores 4 at [20] and run-cb's
+# [index*4]=index guard traps (probe: CB-EVENT (1 5 2) with
+# [20]=4). FIFO gate admission (arrival- and issue-stamped seqs,
+# incl. inherited stamps for sync-lower callees) narrows but cannot
+# close it: gate FIFO only orders tasks that have ARRIVED — 4's
+# inner callee can still be in flight when 5's passes alone
+# (probe: ENTER seq=5 twice BEFORE ENTER seq=4 at the endgame).
+# Deterministic in isolation (6/6+ probe runs green), flaky ~1/4 in
+# the full lane (CPU contention widens the window). IDENTIFIED FIX:
+# a serial Store.tick (§932's random.choice pinned to ONE ready
+# thread per tick, run-to-block) — wasmtime's shape; resume-all
+# schedules every admitted thread CONCURRENTLY, which is the
+# divergence. OUT of the lane until that lands (no-fail rule). ----
 ./async/async-calls-sync.wast
