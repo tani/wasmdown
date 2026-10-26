@@ -36,7 +36,6 @@
 ./async/trap-if-sync-and-waitable-set.wast
 ./async/trap-if-transfer-in-waitable-set.wast
 ./async/wait-during-callback.wast
-./async/zero-length.wast
 # ---- M11b step 1 (post-72bfb62): async-calls-sync. The exit-path
 # repair (72bfb62) fixed the deadlock: run2 (the $AsyncMiddle
 # variant) is GREEN and run1 reaches the endgame deterministically
@@ -429,3 +428,28 @@
 # The three probes that showed the class: [PACK state=0] (the gate
 # pack), CANCEL-RET (4294967295) (the async cancel's BLOCKED), and
 # $start's locals[0]=2 (the eager resolution before the pack). ----
+# ---- M11b session 16 (2026-10-27): THE SYNC-LOWER's TWO-SIDED
+# TYPE/HANDLE SPLIT — zero-length IN THE LANE (1060 -> 1087, its 27
+# rows). The ROOT CAUSE (found via the FLOOR-on-END type-error
+# backtrace chain): the sync lower (%lower-host-func) used ONE cx
+# for both the TYPE resolution and the HANDLE table ops — but the
+# two live on OPPOSITE sides of the boundary: the RESULT TYPE (an
+# (:idx . n) ref) is in the CALLEE's type space (resolving against
+# the caller's space yields a wrong ct -> the stream result fell to
+# the (mod v #x100000000) prim arm -> SBCL's FLOOR(END) type error,
+# which then rode my new trap-propagation path and surfaced as the
+# harness's "not REAL" assert detail); the HANDLE indices live in
+# the CALLER's table (the async-value params' lift + the result's
+# lower). TWO FIXES: (1) the RESULT path pre-resolves the ct
+# target-side (%abi-ct result ft-inst) and passes the RESOLVED ct
+# (a ct passes through %abi-lower unchanged) with the CALLER-side
+# rcx for the table ops; (2) the ARG path gets the POSITIONAL walk
+# (mirroring the async lower's): stream/future params pre-resolve
+# their ct target-side and lift their single i32 with a CALLER-side
+# acx; ordinary params lift against the target-side cx; the >16
+# spill tuple pre-resolves its element cts. ALSO FIXED EN PASSANT
+# by the walk: sync-streams/same-component-stream-future/partial-
+# stream-copies each hold at ONE failing row (unreachable-class —
+# the same fixture checks as before, now with the correct transfer
+# machinery under them; next session's probes start from there).
+# GATED GREEN: units 407/0, lane 1087/0/0/0 stable x2. ----

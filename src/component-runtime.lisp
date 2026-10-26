@@ -2445,19 +2445,65 @@ TARGET's space."
               (ts (loop for p in (or params '()) collect (cdr p)))
               (flat-types (loop for vt in ts
                                 append (%flat-type-of vt ft-inst)))
+              ;; M11b: stream/future PARAMS consume their handle
+              ;; from the CALLER's table (lift_async_value §2438: the
+              ;; end LEAVES the caller) while the TYPE resolves
+              ;; against the TARGET (the values-lane convention:
+              ;; both sides needed — one cx can't do both). The
+              ;; POSITIONAL walk mirrors the async lower's: each
+              ;; param consumes its flat slots; async-value params
+              ;; pre-resolve their ct (target-side) and lift the
+              ;; single i32 with a CALLER-side transfer cx.
               (component-args
-                (if (> (length flat-types) 16)
-                    (let* ((ptr (first args))
-                           (tuple (make-ct* :tuple (coerce ts 'vector)))
-                           (vals (%abi-load cx tuple ptr)))
-                      (coerce vals 'list))
-                    (let ((vi (make-array 16 :fill-pointer 0
-                                         :adjustable t)))
-                      (loop for a in args
-                            for ft_ in flat-types
-                            do (vector-push-extend
-                                (cons a ft_) vi))
-                      (%abi-lift-values cx 16 vi ts))))
+                (let ((acx (make-abi-cx
+                            :memory memory
+                            :realloc realloc
+                            :encoding (%abi-encoding-of enc-opt)
+                            :inst inst)))
+                  (if (> (length flat-types) 16)
+                      (let* ((ptr (first args))
+                             (tuple (make-ct* :tuple
+                                             (coerce
+                                              (loop for vt in ts
+                                                    collect
+                                                    (%abi-ct vt
+                                                             ft-inst))
+                                              'vector)))
+                             (vals (%abi-load acx tuple ptr)))
+                        (coerce vals 'list))
+                      (let ((vals '())
+                            (ai 0))
+                        (loop for vt in ts
+                              do (let ((c (%abi-ct vt ft-inst)))
+                                   (if (and (wasmdown.component:ct-p
+                                             c)
+                                            (member
+                                             (wasmdown.component:ct-kind
+                                              c)
+                                             '(:stream :future)))
+                                       (progn
+                                         (push (%lift-async-end
+                                                acx (nth ai args))
+                                               vals)
+                                         (incf ai))
+                                       (let* ((pflat
+                                                (%flat-type-of vt
+                                                               ft-inst))
+                                              (n (length pflat))
+                                              (vi (make-array
+                                                   16 :fill-pointer 0
+                                                   :adjustable t)))
+                                         (loop for k below n
+                                               do (vector-push-extend
+                                                   (cons (nth ai args)
+                                                         (nth k pflat))
+                                                   vi)
+                                                  (incf ai))
+                                         (push (first
+                                                (%abi-lift-values
+                                                 cx 16 vi (list vt)))
+                                               vals)))))
+                        (nreverse vals)))))
               ;; NOTE: no APPLY — %call-component-func-list takes the
               ;; args LIST as its third parameter (an EMPTY list
               ;; would be swallowed by apply's spread)
@@ -2486,17 +2532,30 @@ TARGET's space."
                                    :encoding (%abi-encoding-of enc-opt)
                                    :inst inst))
                              (rflat (%flat-type-of result ft-inst)))
-                        (if (> (length rflat) 1)
-                            ;; the SPILLED result: store at the [ptr]
-                            ;; out-param (the LAST core param; the sig
-                            ;; carries NO core results — the old
-                            ;; (if core-result ...) gate skipped the
-                            ;; store entirely and the caller read an
-                            ;; empty retptr)
-                            (let ((ptr (first (last args))))
-                              (%abi-store rcx res result ptr)
-                              nil)
-                            (first (%abi-lower rcx res result))))
+                        ;; the RESULT TYPE resolves against the
+                        ;; TARGET (ft-inst): an (:idx . n) ref is in
+                        ;; the CALLEE's type space — resolving it
+                        ;; against the CALLER (the rcx's inst, which
+                        ;; the TABLE ops need) yields a WRONG ct and
+                        ;; the stream result falls to the (mod ...)
+                        ;; prim arm (zero-length's FLOOR-on-END type
+                        ;; error). Pre-resolve the ct; %abi-lower
+                        ;; passes a ct through unchanged.
+                        (let ((result-ct
+                                (%abi-ct result ft-inst)))
+                          (if (> (length rflat) 1)
+                              ;; the SPILLED result: store at the
+                              ;; [ptr] out-param (the LAST core
+                              ;; param; the sig carries NO core
+                              ;; results — the old (if core-result
+                              ;; ...) gate skipped the store
+                              ;; entirely and the caller read an
+                              ;; empty retptr)
+                              (let ((ptr (first (last args))))
+                                (%abi-store rcx res result-ct ptr)
+                                nil)
+                              (first (%abi-lower rcx res
+                                                 result-ct)))))
                       res)))
              '()))))))
 
