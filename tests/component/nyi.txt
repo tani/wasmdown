@@ -331,3 +331,32 @@
 # cancel-stream (15) — needs {stream,future}.cancel-{read,write}
 # (§4376-4445, End.cancel §1719-1740), then forward, thread.*,
 # instance poisoning. ----
+# ---- M11b session 13 (2026-10-27): the CANCEL family landed
+# (14/15 of cancel-stream green). The machinery: the parser arm
+# (cancel kinds take $t + async?, §4385-4388), the validator's
+# flat-sig FIX (the cancels are (i32)->(i32) per §4386 — they
+# were mis-grouped with the no-params builtins; cancel-stream's
+# 'expected: (func)'), %end-cancel (§1732-1740: COPYING ->
+# CANCELLING-COPY + the never-overwrite pending rule), and the
+# four host-func arms (the class/COPYING/sync-waiter/in-wset
+# guards, the BLOCKED sentinel, the sync wait_for_pending_event).
+# Fixed in-session: (a) the stripped +-prefixes on the event
+# constants in the cancel arm's class guard ("EVENT-STREAM-READ
+# is unbound"), (b) %lift-async-end now CLEARS the owner (§2446
+# — the stale owner fired the same-instance trap), (c)
+# %none-or-number-type-p now resolves bare-keyword element types
+# through %abi-ct (u8 IS a number type — the §1695 exemption).
+# cancel-stream: rows 4,6,8,10,12,14 + all COMPONENT rows GREEN;
+# row 1 ("run") fails a guest unreachable at its final read
+# (expects COMPLETED|4<<4). The trace: the final read's case-3
+# NEVER fires — the read parks case-2/case-4 because the
+# PEER'S BUFFER IS ABSENT. Root-cause hypothesis (recorded for
+# the next probe): start-blocking-write is a PLAIN-ASYNC lift
+# (no callback) whose core parks inside stream.write; the SYNC
+# lower of it BLOCKS the caller ($D's run) inside %canon-lift-
+# async's caller loop — the run's read after it never executes
+# (the unreachable is the oracle-adjacent failure). The probe:
+# instrument the start-blocking-write sync-lower's block point
+# vs the spec's §3689 (a sync lower of an async-typed callee
+# must park the CALLER thread, not block the whole lift).
+# GATED GREEN: units 407/0, lane 1041/0/0/0. ----

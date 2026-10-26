@@ -3433,11 +3433,14 @@ flat-sig helper handles the result-bearing case)."
      (cons '(:i32) '()))
     ((:context-get :waitable-set-new :thread-index
       :resource-new :resource-rep
-      :stream-cancel-read :stream-cancel-write
-      :future-cancel-read :future-cancel-write
       :thread-new-indirect :stream-forward :future-forward)
      (cons '() '(:i32)))
-    ;; M11a (CanonicalABI.md 4115): waitable.join is
+    ;; M11b (§4386): the cancel builtins take ONE i32 and return
+    ;; one i32 — they were mis-grouped with the no-params builtins
+    ;; (cancel-stream's 'expected: (func)')
+    ((:stream-cancel-read :stream-cancel-write
+      :future-cancel-read :future-cancel-write)
+     (cons '(:i32) '(:i32)))
     ;; (func (param $wi i32) (param $si i32)) — TWO i32 params, no
     ;; results (it was mis-grouped with the no-params builtins, so
     ;; every fixture importing waitable.join failed the with-bag

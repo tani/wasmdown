@@ -1833,6 +1833,18 @@ async?, context.get/set's valtype + u32 index."
       (list kind
             (%parse-builtin-typeidx (first items) scope)
             (%parse-canonopts (rest items) scope)))
+     ((member h '("stream.cancel-read" "stream.cancel-write"
+                  "future.cancel-read" "future.cancel-write")
+              :test #'string=)
+      ;; M11b: the CANCEL builtins take $t + async? (§4385-4388; the
+      ;; binary shape: (kind typeidx async?) — §1153-1159)
+      (list kind
+            (%parse-builtin-typeidx (first items) scope)
+            (and (some (lambda (it)
+                         (and (%tokp it)
+                              (string= (%tok-text it) "async")))
+                       (rest items))
+                 t)))
      ((member h *builtin-typeidx-kinds* :test #'string=)
       (list kind
             (%parse-builtin-typeidx (first items) scope)))

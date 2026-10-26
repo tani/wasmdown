@@ -2779,13 +2779,16 @@ progress by the count."
 
 (defun %none-or-number-type-p (t-ct)
   "The same-instance copy trap's exemption (§1695): number-typed
-elements may copy within one instance."
-  (or (null t-ct)
-      (and (wasmdown.component:ct-p t-ct)
-           (member (wasmdown.component:ct-kind t-ct) '(:prim))
-           (member (wasmdown.component:ct-payload t-ct)
-                   '(:u8 :s8 :u16 :s16 :u32 :s32 :u64 :s64
-                     :f32 :f64 :float16 :float32 :float64 :char :bool)))))
+elements may copy within one instance. T-CT may be a bare keyword
+(the (stream u8) payload) — resolve through %abi-ct."
+  (let ((c (and t-ct (%abi-ct t-ct nil))))
+    (or (null t-ct)
+        (and c
+             (eq (wasmdown.component:ct-kind c) :prim)
+             (member (wasmdown.component:ct-payload c)
+                     '(:u8 :s8 :u16 :s16 :u32 :s32 :u64 :s64
+                       :f32 :f64 :float16 :float32 :float64
+                       :char :bool))))))
 
 (defun %end-copy (end buffer is-read)
   "End.copy (§1687): the single parameterized copy. The buffer is
@@ -2867,6 +2870,16 @@ already has a pending event; detach both ends."
   ;; Waitable.drop: leave any waitable set
   (%waitable-join end nil))
 
+(defun %end-cancel (end)
+  "End.cancel (CanonicalABI.md 1732-1740): COPYING -> CANCELLING-
+COPY, arming the pending event with progress 0 (the deterministic
+profile's always-notify — the host-owned nondeterministic branch
+is the host's freedom, taken as notify here) unless one is
+already armed (never overwrite a previous progress)."
+  (setf (async-end-state end) :cancelling-copy)
+  (unless (async-waitable-pending-event end)
+    (%end-notify end 0)))
+
 (defun %lift-async-end (cx i)
   "lift_stream / lift_future (§2432-2460): the i32 index I in CX's
 instance resolves the READABLE end; the guards; the end transfers
@@ -2884,6 +2897,8 @@ OUT of this table (the caller re-adds it at its boundary)."
       (error 'wasmdown:wasm-trap :kind :generic
              :message "cannot lift stream while it's in a waitable set"))
     (setf (aref (%inst-handles inst) (1- i)) nil)
+    ;; §2446: lift_async_value clears the owner (lower re-sets it)
+    (setf (async-end-owner end) nil)
     end))
 
 (defun %lower-async-end (end cx)
@@ -3979,15 +3994,68 @@ is the valtype."
             (%end-drop end)
             (setf (aref (%inst-handles inst) (1- i)) nil))
           '()))))
+    ;; M11b: {stream,future}.cancel-{read,write} (§4376-4445):
+    ;; cancel_copy — the guards (the class, the COPYING state, the
+    ;; sync-waiter, the in-wset-without-async), End.cancel, then
+    ;; the event delivery / BLOCKED / the sync wait
+    ((:stream-cancel-read :stream-cancel-write
+      :future-cancel-read :future-cancel-write)
+     (let* ((read-p (member kind '(:stream-cancel-read
+                                    :future-cancel-read)))
+            (async-p (third imms)))
+       (wasmdown.runtime:make-host-func-instance
+        (wasmdown.types:make-wasm-func-type '(:i32) '(:i32))
+        (lambda (args)
+          (let* ((i (first args))
+                 (end (%handle-at inst i #'async-end-p "stream end")))
+            ;; the class guard (§4409): cancel-read takes READ ends
+            (unless (member (async-end-event-code end)
+                            (list (if read-p +event-stream-read+
+                                      +event-stream-write+)
+                                  (if read-p +event-future-read+
+                                      +event-future-write+)))
+              (error 'wasmdown:wasm-trap :kind :generic
+                     :message "handle index used with the wrong type"))
+            ;; §4411: only an in-progress copy can cancel
+            (unless (eq (async-end-state end) :copying)
+              (error 'wasmdown:wasm-trap :kind :generic
+                     :message
+                     "cannot cancel a stream or future in a non-copying state"))
+            ;; §4412: the sync waiter guard
+            (when (async-waitable-has-sync-waiter end)
+              (error 'wasmdown:wasm-trap :kind :generic
+                     :message "waitable has a sync waiter"))
+            ;; §4413: a sync cancel of an end in a waitable set
+            (when (and (%waitable-in-wset end) (not async-p))
+              (error 'wasmdown:wasm-trap :kind :generic
+                     :message
+                     "cannot cancel a stream or future in a waitable set"))
+            (%end-cancel end)
+            (if (async-waitable-pending-event end)
+                (let* ((event (%waitable-get-pending-event end))
+                       (payload (third event)))
+                  (list payload))
+                (if async-p
+                    (list #xffffffff)  ; BLOCKED (§4419)
+                    (progn
+                      (setf (async-waitable-has-sync-waiter end) t)
+                      (unwind-protect
+                           (async-thread-wait-until
+                            *current-thread*
+                            (lambda ()
+                              (not (null (async-waitable-pending-event
+                                          end)))))
+                        (setf (async-waitable-has-sync-waiter end)
+                              nil))
+                      (let* ((event (%waitable-get-pending-event end))
+                             (payload (third event)))
+                        (list payload))))))))))
     ;; the still-opaque kinds: the slot exists, the call traps
     ((:thread-yield :thread-suspend :thread-resume-later
       :thread-suspend-then-resume :thread-yield-then-resume
       :thread-suspend-then-promote :thread-yield-then-promote
       :thread-index :thread-new-indirect
-      :stream-cancel-read :stream-cancel-write
-      :stream-forward
-      :future-cancel-read :future-cancel-write
-      :future-forward
+      :stream-forward :future-forward
       :error-context-new :error-context-debug-message
       :error-context-drop)
      nil)))
