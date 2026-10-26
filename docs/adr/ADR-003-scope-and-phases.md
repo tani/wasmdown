@@ -19,7 +19,7 @@ conformance gates. This repository delivers an honest **partial** slice
    tracked by loop number; the Component Model work is tracked by
    PLAN.md §14 milestone id (M7 slices) — the two counters never
    renumber each other.*
-   *Superseded in part (loops 18–24 + M7 slices 1–5 + M8 + M9 + M10, 2026-10-25): tail calls
+   *Superseded in part (loops 18–24 + M7 slices 1–5 + M8 + M9 + M10 + M11a, 2026-10-26): tail calls
    (`return_call`/`return_call_indirect`, constant-stack trampoline),
    exception handling (tags, `try_table`, `throw`, named module
    definition/instance forms), typed function references
@@ -133,6 +133,28 @@ conformance gates. This repository delivers an honest **partial** slice
    machinery) + validation/kebab (the vendored exclusion,
    now effective via the nyi-p matcher fix). Still out of
    scope: async (the task state machine), WIT-level
+   Component/WASI, threads, FASL cache. M11a (2026-10-26: the
+   ASYNC CORE — the task/thread state machine per
+   CanonicalABI.md Tasks 569-825: the callback event loop
+   (the real-park YIELD — the always-true hot-spin replaced
+   with a condition-wait; the exclusive lock released around
+   both the YIELD park and the WAIT, per 3470-3483), the
+   backpressure gate with pre-park scheduler registration,
+   the deadlock oracle (the progress counter + the
+   quiescent-cycle trap, 3539-3542), the async built-ins as
+   real host funcs (task.return/cancel, context.get/set,
+   backpressure.{inc,dec}, waitable-set.{new,wait,poll,
+   drop}, waitable.join, subtask.{cancel,drop} with the exact
+   trap messages incl. the sync-task block trap 3522-3543),
+   the packed async lower with the STARTED-wait (3707) and
+   cross-thread wake propagation at the resolution sites) is
+   implemented; the component lane whitelists the 7
+   async-core-green files and measures 1031 pass / 0 fail / 0
+   unsupported / 0 harness-error of 1031 — FULLY GREEN. The
+   remaining 38 async files stay in nyi.txt with per-file
+   probe evidence (37 need the M11b canons — future/stream/
+   thread/error-context; async-calls-sync has one open
+   interleave bug). Still out of scope: M11b, WIT-level
    Component/WASI, threads, FASL cache.
    `declared_support` stays `partial`.*
 2. **Failure phases are distinct conditions** (PLAN.md §12.2):

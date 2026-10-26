@@ -37,27 +37,33 @@ calls all pass.
 
 The component lane (`make test-component`, the vendored
 component-model suite at commit `d095e2f60dd...` per
-`specs/lock.toml`) measures M7-M10: **1015 pass / 0 fail / 0
-unsupported / 0 harness-error of 1015** in {binary,validation,
-linking,values} minus nyi.txt — FULLY GREEN: every row passes.
-The component TEXT parser + the full validation rule set
-(M7), component instantiation EXECUTION (M8: the
+`specs/lock.toml`) measures M7-M11a: **1031 pass / 0 fail / 0
+unsupported / 0 harness-error of 1031** in {binary,validation,
+linking,values,async-core} minus nyi.txt — FULLY GREEN: every
+row passes. The component TEXT parser + the full validation
+rule set (M7), component instantiation EXECUTION (M8: the
 comp-instance runtime — two-level core linking, with-args,
-aliases, canon lift, start funcs), and the LINKING suite
-(M9: canon lower as real host funcs, resource built-ins
-with per-instance handle tables + own/borrow transfer, the
-imported-instance identity machinery — declarator-space
-remaps, per-slot skip vectors, the with-args substitution —
-the outer-aliased core module resolution, the export-alias
-chains, the ascribed-type projections, EH tag identity
-across instances, component invoke/get in the runner), and the VALUES suite
-(M10: the canonical ABI at runtime — string/list/record/variant/
-map lowering through realloc + memory, the MAX_FLAT pointer
-indirection, the declarator-space functype remaps at the entry-at
-count, the lowered-host-func's OWN canonopt memory) are
-implemented. nyi.txt carries values/post-return.wast +
-values/variants.wast (their task.return/async fixtures — the async
-milestone) and validation/kebab.wast (the vendored exclusion).
+aliases, canon lift, start funcs), the LINKING suite (M9: canon
+lower as real host funcs, resource built-ins with per-instance
+handle tables + own/borrow transfer, the imported-instance
+identity machinery, the outer-aliased core module resolution,
+the export-alias chains, the ascribed-type projections, EH tag
+identity across instances, component invoke/get in the runner),
+the VALUES suite (M10: the canonical ABI at runtime —
+string/list/record/variant/map lowering through realloc +
+memory, the MAX_FLAT pointer indirection, the lowered-host-
+func's OWN canonopt memory), and the ASYNC CORE (M11a: the
+task/thread state machine — the callback event loop with the
+real-park YIELD + the exclusive-lock-released WAIT, the
+backpressure gate, the deadlock oracle, the async built-ins as
+real host funcs with the exact trap messages, the packed async
+lower with the STARTED-wait; 7 files in the lane, the remaining
+38 in nyi.txt with per-file probe evidence — 37 need the M11b
+canons (future/stream/thread/error-context), async-calls-sync
+has one open interleave bug) are implemented. nyi.txt also
+carries values/post-return.wast + values/variants.wast (the
+same async machinery) and validation/kebab.wast (the vendored
+exclusion).
 See `CONFORMANCE-COMPONENT.md`.
 
 Regenerate with `make report-conformance` (writes `CONFORMANCE.md` +
@@ -108,11 +114,12 @@ harness-errors.
 | API / CLI | `src/api.lisp`, `src/cli.lisp` | `read-module`, `validate-module`, `instantiate`, `invoke`, …; CLI `validate`/`inspect`/`compile`/`run`. |
 | Component | `src/component.lisp` | M7 slices 1–5: layer discrimination (magic + version 0x0D + layer byte), the full component binary reader (all 12 sections, WIT value types incl. map 0x63, aliases, canon incl. all 47 async built-ins, value sections), the validator (labels/index/max-size, canonopt lift/lower + unicity + signature checks, semver/canonical-version grammar, externname visibility + type-use walks, annotated resource names, moduletype internals, structural instantiation type matching with per-component type identities + generativity, core-subtype moduletype matching, the de Bruijn outer-alias stack, resource identity/local/canon rules, projection chains), the `(component ...)` script-command family, `make test-component`. |
 | Component text | `src/component-text.lisp` | M7 slices 2–5: the full component TEXT grammar into the same IR (valtypes, functypes, imports/exports + attributes, canon lift/lower + built-ins upright/inverted, core module via `parse-wat`, core instance, aliases incl. outer-alias sugar + projections + declarator bind-ids + type-use externtypes + the sort-aware binding table + moduletype desc shapes, the named-form `(component definition ...)` marker). |
-| Component runtime | `src/component-runtime.lisp` | M8-M10: component instantiation execution — the comp-instance record (per-sort index vectors in validator order + import/export tables), two-level core-instance linking, component-instance with-args, alias projection, canon lift/lower as real host funcs, resource built-ins with per-instance handle tables + own/borrow transfer + dtor resolution, the outer-aliased core module resolution, the per-instantiation closure side table, start funcs; THE CANONICAL ABI AT RUNTIME (M10: cx.allocate/reallocate with the trap taxonomy, store/load per type — string transcodes (utf8/utf16/latin1+utf16), list/record/variant/flags/enum/option/result, the map despecialization — lift/lower_flat + the MAX_FLAT 16/1 pointer indirection, post-return); the runner's component invoke/get + the compound value literals. |
+| Component runtime | `src/component-runtime.lisp` | M8-M11a: component instantiation execution — the comp-instance record (per-sort index vectors in validator order + import/export tables), two-level core-instance linking, component-instance with-args, alias projection, canon lift/lower as real host funcs, resource built-ins with per-instance handle tables + own/borrow transfer + dtor resolution, the outer-aliased core module resolution, the per-instantiation closure side table, start funcs; THE CANONICAL ABI AT RUNTIME (M10: cx.allocate/reallocate with the trap taxonomy, store/load per type — string transcodes (utf8/utf16/latin1+utf16), list/record/variant/flags/enum/option/result, the map despecialization — lift/lower_flat + the MAX_FLAT 16/1 pointer indirection, post-return); THE ASYNC CORE (M11a: the task/thread state machine — the callback event loop with the real-park YIELD + the exclusive-lock-released WAIT, the backpressure gate with pre-park scheduler registration, the deadlock oracle via the progress counter, the async built-ins as real host funcs with the exact trap messages, the packed async lower with the STARTED-wait; the thread/future/stream/error-context canons stay opaque — M11b); the runner's component invoke/get + the compound value literals. |
 
-Not implemented (see `PLAN.md` for the full contract): async (the
-task state machine — post-return's 66 may_leave rows +
-values/variants' task.return fixtures), WASI (all versions),
+Not implemented (see `PLAN.md` for the full contract): the M11b
+async canons (future/stream/thread/error-context — 37 files in
+nyi.txt with probe evidence) + async-calls-sync's interleave
+bug, WASI (all versions),
 threads/atomics, FASL cache, annotations (an unadopted proposal —
 permanently out of scope per PLAN.md §3.3). SIMD (v128 + relaxed,
 loop 24: the full 236-op v128 family + the 20 relaxed ops with
