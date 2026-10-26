@@ -3421,11 +3421,13 @@ flat-sig helper handles the result-bearing case)."
       :error-context-drop :resource-drop)
      (cons '() '()))
     ;; M11b (§4652/§4631): thread.yield/suspend return i32 (the
-    ;; literal 0); the -then-resume/-then-promote variants likewise
-    ((:thread-yield :thread-suspend
-      :thread-suspend-then-resume :thread-yield-then-resume
-      :thread-suspend-then-promote :thread-yield-then-promote)
+    ;; literal 0); §4668/§4695/§4722/§4749: the -then-resume/
+    ;; -then-promote variants take the target index + return 0
+    ((:thread-yield :thread-suspend)
      (cons '() '(:i32)))
+    ((:thread-suspend-then-resume :thread-yield-then-resume
+      :thread-suspend-then-promote :thread-yield-then-promote)
+     (cons '(:i32) '(:i32)))
     ;; §4606: thread.resume-later takes the i32 thread index
     ((:thread-resume-later)
      (cons '(:i32) '()))
@@ -3439,8 +3441,12 @@ flat-sig helper handles the result-bearing case)."
      (cons '(:i32) '()))
     ((:context-get :waitable-set-new :thread-index
       :resource-new :resource-rep
-      :thread-new-indirect :stream-forward :future-forward)
+      :stream-forward :future-forward)
      (cons '() '(:i32)))
+    ;; §4565: thread.new-indirect takes the table index + the
+    ;; closure param and returns the thread index — a FIXED shape
+    ((:thread-new-indirect)
+     (cons '(:i32 :i32) '(:i32)))
     ;; M11b (§4386): the cancel builtins take ONE i32 and return
     ;; one i32 — they were mis-grouped with the no-params builtins
     ;; (cancel-stream's 'expected: (func)')

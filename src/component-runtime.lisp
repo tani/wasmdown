@@ -2929,6 +2929,7 @@ wrong-index probe: one transfer produced index 3)."
   blocking state + the per-thread STORAGE (context.get/set TLS)."
   (task nil)
   (index nil)
+  (spawn-thunk nil)                   ; new-indirect's suspended body
   (storage (make-array 2 :initial-element 0))
   (cancellable nil)
   (mutex (sb-thread:make-mutex :name "thread"))
@@ -2981,8 +2982,15 @@ holds, re-testing on each wakeup."
 
 (defun async-thread-resume (thread)
   "Thread.resume (CanonicalABI.md 474): nudge the blocked thread; it
-re-tests its own readiness condition."
+re-tests its own readiness condition. A thread.new-indirect thread
+starts SUSPENDED (§4590): its spawn thunk hasn't started the SBCL
+thread yet — the FIRST resume starts it (the thunk re-parks itself
+on the waitqueue if its body immediately blocks)."
   (sb-thread:with-recursive-lock ((async-thread-mutex thread))
+    (let ((th (async-thread-spawn-thunk thread)))
+      (when (functionp th)
+        (setf (async-thread-spawn-thunk thread) nil)
+        (funcall th)))
     (sb-thread:condition-broadcast (async-thread-waitqueue thread)
                                )))
 
@@ -3614,7 +3622,12 @@ drop-readable must return index 1 again)."
       (etypecase (car cell)
         ((eql t)
          (let ((r (cdr cell)))
-           (if (eq r :cancelled) nil r)))
+           (cond
+            ((eq r :cancelled) nil)
+            ;; a trapped CALLEE re-signs at the boundary (§3584)
+            ((and (consp r) (eq (car r) :trap))
+             (error (cdr r)))
+            (t r))))
         (null
          ;; the guest body finished without resolving the task: no
          ;; thread can make further progress — the deadlock trap
@@ -4107,6 +4120,68 @@ is the valtype."
           (when target
             (async-thread-resume target)))
         '())))
+    ;; thread.new-indirect (§4555-4596): read the funcref from the
+    ;; canon's core TABLE (trap OOB/null), create a SUSPENDED
+    ;; thread registered on the current instance, return the index.
+    ;; The thread runs the funcref with the closure param on its
+    ;; first resume (§4590's suspended() assert).
+    ((:thread-new-indirect)
+     (let* ((tbl-idx (third imms))
+            (tbl (and (integerp tbl-idx)
+                      (< tbl-idx
+                         (length (comp-instance-core-tables inst)))
+                      (aref (comp-instance-core-tables inst)
+                            tbl-idx))))
+       (wasmdown.runtime:make-host-func-instance
+        (wasmdown.types:make-wasm-func-type '(:i32 :i32) '(:i32))
+        (lambda (args)
+          (let* ((task *current-task*)
+                 (elem (and tbl
+                            (< (first args)
+                               (length (wasmdown.runtime:table-instance-elems
+                                        tbl)))
+                            (aref (wasmdown.runtime:table-instance-elems
+                                   tbl)
+                                  (first args)))))
+            (unless task
+              (error 'wasmdown:wasm-trap :kind :generic
+                     :message
+                     "called an async builtin outside a task"))
+            (unless elem
+              (error 'wasmdown:wasm-trap :kind :generic
+                     :message "undefined element"))
+            ;; §4590: the suspended thread calls the funcref with
+            ;; the closure param $c, unregisters on return
+            (let* ((fields (%inst-async-fields inst))
+                   (th (make-async-thread :task task))
+                   (c (second args)))
+              (setf (async-thread-spawn-thunk th)
+                    (lambda ()
+                      (sb-thread:make-thread
+                       (lambda ()
+                         (let ((*current-task* task)
+                               (*current-thread* th))
+                           (unwind-protect
+                               (wasmdown.runtime:wasm-call
+                                elem c)
+                             ;; unregister on return (§4588)
+                             (sb-thread:with-recursive-lock
+                                 ((async-thread-mutex th))
+                               (setf (async-thread-spawn-thunk
+                                      th)
+                                     :done)))))
+                       :name "new-indirect-thread")))
+              ;; §4591: register_thread (the instance's next
+              ;; index assignment, the :threads list + scheduler)
+              (setf (async-thread-index th)
+                    (1+ (loop for t2 in (getf fields :threads)
+                              maximize (or (async-thread-index t2)
+                                           0))))
+              (setf (getf fields :threads)
+                    (cons th (getf fields :threads)))
+              (sb-thread:with-recursive-lock (*scheduler-mutex*)
+                (push th *scheduler-threads*))
+              (list (async-thread-index th))))))))
     ;; the still-opaque kinds: the slot exists, the call traps
     ((:thread-suspend-then-resume :thread-yield-then-resume
       :thread-suspend-then-promote :thread-yield-then-promote
@@ -4227,6 +4302,18 @@ is the valtype."
                            (setf (async-subtask-state subtask) 1))
                :on-resolve (lambda (val)
                              (cond
+                              ((and (consp val) (eq (car val) :trap))
+                               ;; the callee TRAPPED: resolve the
+                               ;; subtask; the trap rides flat-
+                               ;; results (stashed AFTER the resolve
+                               ;; — %subtask-resolve overwrites
+                               ;; the slot) and re-signs at the
+                               ;; caller's DELIVERY boundary
+                               (setf resolved-val val)
+                               (%subtask-resolve subtask 2 nil)
+                               (setf (async-subtask-flat-results
+                                      subtask)
+                                     val))
                               ((eq val :cancelled)
                                (setf resolved-state
                                      (if (= (async-subtask-state
@@ -4258,16 +4345,24 @@ is the valtype."
          ;; so WAIT for the STARTING->STARTED transition (or the
          ;; eager resolve) before packing. A sync-typed inline
          ;; callee resolves before reaching here (no wait).
-         (unless (%subtask-resolved-p subtask)
-           (loop
-             with cycles = 0
-             until (or (%subtask-resolved-p subtask)
-                       (/= (async-subtask-state subtask) 0)
-                       (async-task-gate-parked
-                        (async-subtask-task subtask)))
-             do (async-thread-resume-all)
-                (sleep 0.001)))
-         (if (%subtask-resolved-p subtask)
+         (let ((eager-p nil))
+           (unless (%subtask-resolved-p subtask)
+             (loop
+               with cycles = 0
+               until (or (%subtask-resolved-p subtask)
+                         (/= (async-subtask-state subtask) 0)
+                         (async-task-gate-parked
+                          (async-subtask-task subtask)))
+               do (async-thread-resume-all)
+                  (sleep 0.001))
+             ;; the STARTED transition may race the callee's own
+             ;; callback turn (an already-pending event resolves the
+             ;; task on the callee's thread before we pack): the
+             ;; embedder's schedule hands the caller STARTED and the
+             ;; resolution arrives as the subtask's EVENT — only a
+             ;; resolution observed BEFORE the wait exited is eager
+             (setf eager-p (%subtask-resolved-p subtask)))
+         (if eager-p
              ;; the EAGER case (§3714-3717): resolved before return
              (progn
                (%subtask-deliver-resolve subtask)
@@ -4280,10 +4375,18 @@ is the valtype."
                      (lambda ()
                        (when (%subtask-resolved-p subtask)
                          (%subtask-deliver-resolve subtask))
+                       ;; a TRAPPED callee re-signs at the delivery
+                       ;; boundary (§3584): the caller's wait/poll
+                       ;; observes the trap, not a state
+                       (let ((fr (async-subtask-flat-results
+                                  subtask)))
+                         (when (and (consp fr)
+                                    (eq (car fr) :trap))
+                           (error (cdr fr))))
                        (list 1 subtaski          ; EventCode.SUBTASK
                              (async-subtask-state subtask))))
                (list (logior (async-subtask-state subtask)
-                             (ash subtaski 4))))))))))
+                             (ash subtaski 4)))))))))))
 
 (defun %call-async-funcinst (f component-args &key on-start on-resolve)
   "Start the callee's FuncInst: F is the target lifted func; the
@@ -4325,7 +4428,6 @@ is the valtype."
                      :realloc (lifted-func-realloc f)
                      :inst (lifted-func-inst f)))
                  (error (c)
-                   (declare (ignore c))
                    ;; Like the invoke-side trap handler: the guest
                    ;; body died mid-turn holding the exclusive lock
                    ;; + scheduler registration — release FIRST
@@ -4334,10 +4436,13 @@ is the valtype."
                    (handler-case
                        (%task-exit-implicit-thread task)
                      (error () nil))
-                   ;; a trapped callee resolves as cancelled (the
-                   ;; trap semantics propagate at the boundary)
+                   ;; a trapped callee resolves as (:trap . c) — the
+                   ;; trap PROPAGATES at the boundary (§3584): the
+                   ;; caller observes it (the sync lower's caller
+                   ;; loop re-signs; the async lower's delivery
+                   ;; closure re-signs at the caller's wait/poll)
                    (unless (async-task-resolved-p task)
-                     (funcall on-resolve :cancelled))
+                     (funcall on-resolve (cons :trap c)))
                    (sb-thread:with-recursive-lock
                        ((async-task-mutex task))
                      (setf (async-task-resolved-p task) t)
