@@ -15,15 +15,15 @@ Baseline measurement, not a release gate (PLAN.md §12.8).
 
 | Outcome | Count |
 | --- | --- |
-| pass | 1201 |
+| pass | 1277 |
 | fail | 0 |
 | skip | 0 |
 | unsupported | 0 |
 | timeout | 0 |
 | harness-error | 0 |
-| **total** | **1201** |
+| **total** | **1277** |
 
-Executed: 1201 commands; pass rate 100.0%.
+Executed: 1277 commands; pass rate 100.0%.
 
 ## Per-file counts
 
@@ -40,8 +40,13 @@ Executed: 1201 commands; pass rate 100.0%.
 | component/drop-stream.wast | 5 | 0 | 0 | 0 |
 | component/drop-subtask.wast | 3 | 0 | 0 | 0 |
 | component/drop-waitable-set.wast | 2 | 0 | 0 | 0 |
+| component/empty-wait.wast | 2 | 0 | 0 | 0 |
 | component/forward.wast | 95 | 0 | 0 | 0 |
+| component/same-component-stream-future.wast | 9 | 0 | 0 | 0 |
 | component/self-switch-traps.wast | 9 | 0 | 0 | 0 |
+| component/trap-if-done.wast | 31 | 0 | 0 | 0 |
+| component/trap-if-sync-and-waitable-set.wast | 29 | 0 | 0 | 0 |
+| component/trap-if-transfer-in-waitable-set.wast | 5 | 0 | 0 | 0 |
 | component/validate-no-async-abi-for-sync-type.wast | 3 | 0 | 0 | 0 |
 | component/validate-no-stream-char.wast | 1 | 0 | 0 | 0 |
 | component/validate-task-return.wast | 3 | 0 | 0 | 0 |

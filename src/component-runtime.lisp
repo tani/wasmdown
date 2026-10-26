@@ -4226,15 +4226,22 @@ is the valtype."
                        (lambda ()
                          (let ((*current-task* task)
                                (*current-thread* th))
-                           (unwind-protect
-                               (wasmdown.runtime:wasm-call
-                                elem c)
-                             ;; unregister on return (§4588)
-                             (sb-thread:with-recursive-lock
-                                 ((async-thread-mutex th))
-                               (setf (async-thread-spawn-thunk
-                                      th)
-                                     :done)))))
+                           ;; §4587's call_and_trap_on_throw: the
+                           ;; thread body's trap ENDS the thread
+                           ;; (an unhandled trap on a guest thread
+                           ;; would kill the whole process — the
+                           ;; spawned thread has no outer handler)
+                           (handler-case
+                               (unwind-protect
+                                   (wasmdown.runtime:wasm-call
+                                    elem c)
+                                 ;; unregister on return (§4588)
+                                 (sb-thread:with-recursive-lock
+                                     ((async-thread-mutex th))
+                                   (setf (async-thread-spawn-thunk
+                                          th)
+                                         :done)))
+                             (wasmdown:wasm-trap () nil))))
                        :name "new-indirect-thread")))
               ;; §4591: register_thread (the instance's next
               ;; index assignment, the :threads list + scheduler)

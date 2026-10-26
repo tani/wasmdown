@@ -17,21 +17,16 @@
 ./async/during-sync-call-may-block-if-other-ready-threads.wast
 ./async/during-sync-call-no-sibling-resume.wast
 ./async/during-sync-scheduling-candidates.wast
-./async/empty-wait.wast
 ./async/future-completion-order.wast
 ./async/futures-must-write.wast
 ./async/idle-drop.wast
 ./async/partial-stream-copies.wast
 ./async/passing-resources.wast
 ./async/reentrance.wast
-./async/same-component-stream-future.wast
 ./async/switch-to-ready-callback.wast
 ./async/sync-barges-in.wast
 ./async/sync-streams.wast
 ./async/trap-if-block-and-sync.wast
-./async/trap-if-done.wast
-./async/trap-if-sync-and-waitable-set.wast
-./async/trap-if-transfer-in-waitable-set.wast
 # ---- M11b step 1 (post-72bfb62): async-calls-sync. The exit-path
 # repair (72bfb62) fixed the deadlock: run2 (the $AsyncMiddle
 # variant) is GREEN and run1 reaches the endgame deterministically
@@ -696,3 +691,71 @@
 # the sync call (the arm's YIELD-parked callback thread is the
 # fixture's designated resumer — the suspend must run a
 # scheduler pass, not a bare park). ----
+# ---- M11b session 22 (2026-10-27, REVERTED to the eleventh
+# rung): THE BINDING MYSTERY BRACKETED TO ONE CALL. With the
+# sync-lift context applied + a MINI REPRO (the first component
+# extracted to /tmp/dsm.wast — the extraction technique works
+# for any fixture family), the trace chain is now airtight:
+#   [PRE-CALL] bound=T core-kind=:WASM   (the binding active at
+#                                        the funcall site)
+#   [IN-LET] bound=T                     (no APPLY — a direct
+#                                        FUNCALL #'wasm-call)
+#   [II] bound=NIL os="main thread"      (interp-invoke entry,
+#                                        SAME OS thread, reads NIL)
+#   [DO] bound=NIL                        (the arms, consistent)
+# THE ELIMINATIONS (all verified this session): the probe is
+# honest ((let ((*current-thread* :v)) (%cur-thread-probe)) →
+# :v; symbol-value+find-symbol DOES see dynamic bindings); the
+# symbols are EQ (the runtime's *current-thread* IS the
+# package's symbol); the core IS :wasm; the sync path IS the
+# edited one ([SYNC-BIND]/[PRE-CALL]/[IN-LET] all fire from
+# the edited text); the OS thread is the same (main). THE
+# REMAINING SUSPECT (the next session's FIRST probe — one
+# print): *INVOKE-WASM-FUNC*'s VALUE at the call site — the
+# ecase's (funcall *INVOKE-WASM-FUNC* func args) may be bound
+# to something other than #'interp-invoke at fixture time (a
+# per-module rebind or a wrapper). The print:
+#   (format t "~&[HOOK] ~s~%" wasmdown.runtime:*invoke-wasm-func*)
+# at the funcall site + grep for setf *invoke-wasm-func* beyond
+# interp.lisp:1851. IF the hook IS interp-invoke, the next
+# suspect is the interp-invoke TRAMPOLINE's (catch
+# *tail-call-tag*) re-entry (print at the %exec-seq's :CALL
+# handler). THE SESSION'S OTHER LESSON: session-21's [SYNC-
+# BIND] traces were from INTERACTIVE edits lost in the revert —
+# the s21 script has NO trace; always re-add traces from the
+# script, not from memory of the output. ----
+# ---- M11b session 22b (2026-10-27): TWO MORE FIXTURES IN THE
+# LANE (1201 -> 1212): empty-wait (2 rows) + same-component-
+# stream-future (9 rows) — BOTH green EN PASSANT from the
+# session-19/20 landings (the -then-* variants / forward / the
+# empty-element take), no new changes needed; both stable x3.
+# THE THREE-SHAPE RULE re-tested against the CURRENT tree (the
+# s18 script applies cleanly): sync-streams' + partial-stream-
+# copies' rows STILL red (their failures are the LATER checks —
+# the 0x41 DROPPED rendezvous-turn design, not the state pack),
+# AND the rule breaks cancel-and-exclusive-lock (deadlock —
+# session 17's finding, unchanged) + empty-wait (NEW: the rule's
+# %wset-wait flip interacts with empty-wait's flow). THE RULE
+# IS NOT LANDABLE until the token scheduler (M12): revert-
+# verified, the tree stays at 1212/0/0/0 (units 408/0).
+# REMAINING nyi: sync-streams (1 row), partial-stream-copies
+# (1), cancel-and-exclusive-lock (1), the during-sync family
+# (the binding mystery — one print from the hook check), the
+# trap-if-* files, + the scheduler-blocked set. ----
+# ---- M11b session 22c (2026-10-27): THE SPAWN-THUNK TRAP
+# HANDLER + THREE trap-if FIXTURES IN THE LANE (1212 -> 1277,
+# 65 rows). trap-if-sync-and-waitable-set was CRASHING THE
+# PROBE (an unhandled trap on a new-indirect guest thread
+# killed the process — 0 rows reported); trap-if-done (31) +
+# trap-if-transfer-in-waitable-set (5) were already green but
+# nyi'd. THE FIX: thread.new-indirect's spawn thunk wraps its
+# body in (handler-case (unwind-protect (wasm-call ...) ...)
+# (wasmdown:wasm-trap () nil)) — §4587's call_and_trap_on_
+# throw: the thread body's trap ENDS the thread (the spawned
+# thread has no outer handler; an unhandled trap on a guest
+# SBCL thread is fatal for the process). All three stable x3.
+# GATED GREEN: units 408/0, lane 1277/0/0/0 x2. REMAINING nyi:
+# sync-streams (1), partial-stream-copies (1), cancel-and-
+# exclusive-lock (1), trap-if-block-and-sync (12), the during-
+# sync family (the binding mystery — one print from the hook
+# check), the scheduler-blocked set (M12). ----
