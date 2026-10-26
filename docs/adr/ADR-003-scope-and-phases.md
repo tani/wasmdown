@@ -19,7 +19,7 @@ conformance gates. This repository delivers an honest **partial** slice
    tracked by loop number; the Component Model work is tracked by
    PLAN.md §14 milestone id (M7 slices) — the two counters never
    renumber each other.*
-   *Superseded in part (loops 18–24 + M7 slices 1–5 + M8 + M9, 2026-10-25): tail calls
+   *Superseded in part (loops 18–24 + M7 slices 1–5 + M8 + M9 + M10, 2026-10-25): tail calls
    (`return_call`/`return_call_indirect`, constant-stack trampoline),
    exception handling (tags, `try_table`, `throw`, named module
    definition/instance forms), typed function references
@@ -112,9 +112,28 @@ conformance gates. This repository delivers an honest **partial** slice
    invoke/get in the runner) is implemented; the component
    lane now runs {binary,validation,linking} and measures
    911 pass / 0 fail / 0 unsupported / 0 harness-error of
-   911 — FULLY GREEN, every row passes. Still out of scope:
-   the non-flat canonical ABI (values suite), async,
-   WIT-level Component/WASI, threads, FASL cache.
+   911 — FULLY GREEN, every row passes. M10 (2026-10-25: the
+   VALUES suite — the canonical ABI at runtime:
+   cx.allocate/reallocate with the realloc trap taxonomy,
+   store/load per type (string transcodes utf8/utf16/
+   latin1+utf16; list/record/variant/flags/enum/option/
+   result; the map despecialization to list-of-tuples per
+   CanonicalABI.md 1938), lift/lower_flat + the MAX_FLAT
+   16/1 pointer indirection, post-return, the compound
+   value literals + the named (component instance $i $X)
+   script command; the canon lower's OWN canonopts drive
+   the wrapper's ABI memory; the declarator-space entry-at
+   remap counts every declarator) is implemented; the
+   component lane now runs {binary,validation,linking,
+   values} and measures 1015 pass / 0 fail / 0 unsupported /
+   0 harness-error of 1015 — FULLY GREEN, every row passes
+   (alignment 25, concat 46, numerics 26, realloc 16,
+   strings 17, transcode 10). nyi.txt: values/post-return
+   + values/variants (the async task.return/may_leave
+   machinery) + validation/kebab (the vendored exclusion,
+   now effective via the nyi-p matcher fix). Still out of
+   scope: async (the task state machine), WIT-level
+   Component/WASI, threads, FASL cache.
    `declared_support` stays `partial`.*
 2. **Failure phases are distinct conditions** (PLAN.md §12.2):
    `decode-error` → `validation-error` → `link-error` →
