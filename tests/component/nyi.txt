@@ -58,6 +58,45 @@
 ./async/partial-stream-copies.wast
 ./async/passing-resources.wast
 ./async/reentrance.wast
+# ---- M12 session 6 (2026-10-27): THE STARTED-HANDSHAKE
+# EXPERIMENT (shape (b)) MEASURED AND REVERTED; the flake map
+# refined (no code change landed — the tree stays at 381d259's
+# 410/1396-0-0-0). THE EXPERIMENT: the callee yields ONE turn
+# after OnStart (the per-caller sequential handshake at the
+# STARTED boundary — §507's host freedom: the caller's pack may
+# keep running). MEASURED: acs UNCHANGED (the pack's "unreachable"
+# is the SECOND pair's guest-data race — the two sync-func
+# instances' counter interleave — not the eager-RETURNED class);
+# reentrance REGRESSED cmd 14 (test 7: 7/8 fails vs the baseline's
+# 1/10 — the yield gave b's OnStart a window against c's
+# STARTING-check); REVERTED per the one-change-per-gate rule. THE
+# REFINED FLAKE MAP (the full-file reentrance, 10+ runs each):
+# - cmd 18 (test 9 after test 8's deadlock oracle): ~10/10 FAIL —
+#   NOT load-dependent as session-2 recorded: DETERMINISTIC with
+#   T8 present. Running T9 WITHOUT T8 (the line-extraction
+#   probe): 0-1/10 fails (the residual is the cmd-14-class flake).
+#   The T8 zombie executor (its deadlock-oracle teardown leaves
+#   the parked thread registered) interferes with T9's
+#   STARTED-wait. NEXT PROBE for cmd 18: the oracle-teardown's
+#   completeness — after the teardown broadcast, does the zombie
+#   executor's SBCL thread EXIT (join it), or does it re-park and
+#   keep consuming ticks (a repeated-nudge CPU thief)?
+# - cmd 14 (test 7): 1/10 at baseline — b's OnStart races c's
+#   STARTING-check; the fixture pins the pack BEFORE b's gate
+#   (§3707's STARTING = args unread). The handshake's failure
+#   shows the pack-vs-OnStart order needs the CALLEE-side gate,
+#   not a post-OnStart yield. NEXT PROBE: hold the callee's
+#   guest-body START (before %task-enter-implicit-thread) until
+#   the caller's pack completes — the async lower's pack loop
+#   sets a per-subtask "packed" mark the callee's body waits on
+#   (one turn), restoring the sequential order at the STARTING
+#   boundary (the pack is the caller's; the callee cannot start
+#   reading args before the caller has returned).
+# THE TOKEN SCHEDULER's remaining yield is therefore TWO mechanisms:
+# (1) the pack-order handshake (the STARTING boundary — the
+# callee-start gate, not the post-OnStart yield); (2) the oracle
+# teardown's completeness (the zombie executor must JOIN, not
+# re-park). Both are one-change candidates. ----
 # ---- M12 session 5 (2026-10-27): THE RESUME-LATER TRAPS LANDED
 # + trap-if-block-and-sync IN THE LANE (1348 -> 1396, its 48
 # rows; units 410/0; core 21187/0/73 unchanged; the lane x3
