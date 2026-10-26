@@ -176,11 +176,39 @@
 #         shape HUNG the whole run (no oracle, no output). The
 #         fix (park holding ONLY the thread's own mutex) got the
 #         run to the oracle again with the data above.
-#     NEXT PROBE (single, decisive): trace the outer guest's
-#     steps between %token-acquire's return and its first
-#     wait-until — counters at: the unwind-protect entry, the
-#     %async-lift-guest-body entry, the gate's no-park path, and
-#     the first core call. The duplicate-registration and the
-#     third task need the same trace (the register sites: the
-#     guest lambda vs the gate's pushnew).
+#     NEXT PROBE (single, decisive) — RAN (2026-10-27 sess 6).
+#     THE SPAN LOG NAMES THE BUG:
+#       (REGISTER-INVOKE 1CBC.. 1) (UP-ENTRY 1CBC.. 1)
+#       (BODY-HEAD 1CBC.. 1) (GATE-CHECK 1CBC.. 1)
+#       (POST-GATE 1CBC.. 1) (CORE-CALL 1CBC.. 1)
+#       (REGISTER-CALLEE 30DB.. 2)     <- the callee, issue seq 2
+#       (REGISTER-INVOKE 7256.. 1)     <- A SECOND TASK, INVOKE
+#                                        lambda, INHERITED seq 1
+#     (ACQ-PARK . 2), no WU-PARK ever, owner log = 1 entry.
+#     VERDICT: the outer (1CBC) takes the token, runs its core,
+#     and NEVER PARKS — stuck inside (apply #'wasm-call ...) at
+#     the async lower's call. TWO tasks spawn for ONE logical
+#     callee: the lower's %call-async-funcinst (the CALLEE
+#     lambda, the :gate-seq ISSUE stamp = 2) AND a second via
+#     %canon-lift-async's INVOKE lambda (the INHERITED stamp =
+#     1 — lifted-func-call routes async-typed targets there).
+#     BOTH park at acquire (:want, INITIAL — the token design
+#     serializes them behind an owner that never releases).
+#     THE DOUBLE-SPAWN is the M11a sync-lower/async-callee
+#     routing: %lower-host-func -> lifted-func-call ->
+#     %canon-lift-async spawns its OWN task while the async
+#     lower's %call-async-funcinst spawns ANOTHER for the same
+#     call. Under resume-all this was masked (both ran); under
+#     the token the SECOND spawn's :want readiness (seq 1,
+#     SMALLER than the callee's 2) makes it the tick's preferred
+#     grant — but the outer never releases, so nothing moves and
+#     the oracle fires. NEXT: instrument %canon-lower-async-host-
+#     func's call path vs %lower-host-func's to name which lower
+#     the pin's fixture actually takes (the fixture uses `(canon
+#     lower ... async)` — the ASYNC lower — so WHY does the
+#     invoke lambda fire? suspected: the callee's own
+#     callback-loop lift or a nested lifted-func-call), then
+#     unify: ONE task per logical callee (the async lower's),
+#     with %canon-lift-async's caller-loop reused rather than a
+#     second task spawned.
 ./async/async-calls-sync.wast
