@@ -501,3 +501,33 @@
 # [PACK state=0/1] traces confirm all four fixtures' state
 # checks pass with it), then chase the two deadlocks with
 # serial-number identity traces. ----
+# ---- M11b session 18 (2026-10-27, REVERTED to the ninth rung):
+# THE THREE-SHAPE RULE RE-APPLIED + THE FULL TRACE MAP of
+# cancel-and-exclusive-lock's flow (serialized traces via a
+# *trace-mutex* %tr macro — the raw format/finish pairs interleaved
+# across threads made every earlier ordering conclusion UNRELIABLE;
+# ALWAYS serialize). WITH THE RULE: [PACK serial=1 state=1 i=1] +
+# [PACK serial=2 state=1 i=2] — BOTH state checks PASS (the rule is
+# verified end-to-end at the pack level); [CANCEL] BLOCKED ✓;
+# [RW-EAGER] payload=0 (the write's COMPLETED ✓). THE REMAINING
+# FAILURE (the row's unreachable): the FIRST wset.wait delivers the
+# park's SUBTASK event, then subtask.drop(park) crashes a CALLEE
+# thread with a TYPE-ERROR "expected ASYNC-SUBTASK, datum
+# ASYNC-END" — a subtask op (cancel/drop arm) resolved an index
+# that holds an END. THE ALLOCATION MAP (all consistent, verified):
+# $C: wset=1, reader(end)=1, hold-wset=2; $D: park-subtask=1,
+# future(r=2,w=3) [the arg lift frees $D's 2 → the hold's subtask
+# pops it → i=2 ✓ the free list is CORRECT here]. THE PRIME
+# SUSPECT (next session's first probe): THE PARK'S ARG LIFT — the
+# $park import is (param i32) but the COMPONENT func has NO
+# params; the lower's positional walk over ts=() should add
+# NOTHING, yet the $D free list had an entry at the hold's pack
+# — from the hold-lock's future-param lift (legitimate) ✓; the
+# crash's END-at-a-subtask-index: check whether THE PARK'S LOWER
+# consumed a flat arg (the i32) as an async-value lift (the
+# positional walk's flat-type walk vs ts mismatch) OR the
+# subtask.drop's instance scoping. NEXT SESSION: re-apply the rule
+# (the /tmp/s18-rule.py script's shape, verified) + serialize all
+# traces + chase the crash from the drop arm's (first args) index
+# + the instance identity. The serialized trace map in this note
+# is the reference for the flow's correct ordering. ----
