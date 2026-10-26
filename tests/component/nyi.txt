@@ -21,6 +21,57 @@
 ./async/partial-stream-copies.wast
 ./async/passing-resources.wast
 ./async/reentrance.wast
+# ---- M12 session 1 (2026-10-27): THE REENTRANCE BISECT + THREE
+# LANDED FIXES + THE MINI-SCHEDULER ROOT-CAUSE MAP (the tree stays
+# green: units 408/0, the lane's spot fixtures unchanged — forward
+# 95/0, cross-task-future 2/0, wait-during-callback 2/0,
+# trap-if-sync-and-waitable-set 29/0, dont-block-start 2/0,
+# cancel-and-exclusive-lock 2/0). THE BISECT (line-range runs):
+# tests 1-8 (cmds 0-17) ALL PASS with the sync-lift context landed
+# (21 pass of the first 18 commands — the fixture PARSES and runs
+# green through cmd 17 incl. the async tests 7/8's 42s and the
+# deadlock trap at cmd 16); test 9 (524-658) FAILs "unreachable";
+# test 10 (659-786) FAILs "unreachable"; test 11 (the
+# suspend-then-promote-while-running shape) HANGS (0 rows in 90s);
+# test 12 (the join trap) FAILs the type error -> FIXED. THREE
+# LANDED FIXES: (1) %waitable-join's sync-waiter trap now uses the
+# SPEC's message "waitable cannot be used synchronously while added
+# to a waitable set" (reentrance's cmd 24 + trap-if-sync's rows
+# map to :generic either way — both still green); (2) the
+# async-thread YIELD-PARKED field (set/cleared around
+# async-thread-yield's park) — a promote target's READY condition;
+# (3) the -then-{resume,promote} arm rewritten per §549-565: the
+# promote pair only resumes a READY target (spawn-thunk pending or
+# yield-parked), falls back to a plain suspend/yield otherwise; the
+# resume pair resumes any found target; ONE resume-all precedes the
+# switch so the target gets its slice. THE MINI-SCHEDULER ROOT CAUSE
+# (the serialized %tr trace on /tmp/mini9.wast — the extraction
+# technique re-derivable from the line ranges above): a SYNC-TYPED
+# lift's core call runs INLINE on the caller's OS thread, so when
+# the guest body parks (thread.yield-then-resume at run's tail),
+# NOBODY drives the scheduler — the main thread is blocked inside
+# wasm-call and the parked thread's only waker (the sibling it
+# handed control to) has EXITED (unregistered). THE SPEC'S ANSWER
+# (§3538-3543): the non-async canon_lift drain loop — the sync lift
+# must run its core call on a FRESH executor thread (the per-call
+# Task+implicit Thread of §572) with the caller parking (nested:
+# the enclosing drain ticks) or the main thread draining (top
+# level). PROTOTYPED + MEASURED (then REVERTED to the green state —
+# ONE change per gate): %sync-lift-run (the executor + the drain
+# loop + the deadlock oracle) made mini9's run PASS end-to-end but
+# regressed the nested shape (mini10's promote-the-running-thread
+# traps: a nested sync call ran INLINE on the caller's thread — the
+# index collision; making nested calls spawn their OWN executor
+# (the *current-thread* check) then failed "invalid waitable index
+# 0" — the subtask pack raced). THE REMAINING DEFECT CLASS (the
+# next session's probe): the nested-sync-call handshake — a nested
+# sync lift must BOTH spawn its own task+thread (the index
+# semantics) AND wake the CALLER (not just park on a condition) —
+# the caller's own scheduler pass must observe the callee's
+# resolution as a nudge; the candidate shape is %canon-lift-async's
+# waitqueue protocol reused for the sync callee (the caller parks
+# on the task's resolution, the resolve broadcasts BOTH the task
+# waitqueue AND resume-all). ----
 ./async/switch-to-ready-callback.wast
 ./async/sync-barges-in.wast
 ./async/sync-streams.wast

@@ -1915,6 +1915,42 @@ of flat arguments)."
 
 ;;; ---- the lifted call (canon_lift, sync; CanonicalABI.md 3389) ----
 
+(defun %sync-lift-context (lf)
+  "The SYNC-LIFT THREAD CONTEXT (sessions 21-23, during-sync family):
+when a SYNC-TYPED export's body calls a thread.*/waitable built-in,
+the built-ins need a task+thread. The outer async context (a nested
+sync call INSIDE a guest turn) reuses *CURRENT-TASK*/*CURRENT-THREAD*;
+a top-level sync lift creates the task+thread pair and registers it
+through the gate (needs-exclusive: the sync func holds the exclusive
+lock for the call's duration, per the sync-call semantics). Returns
+the (values task thread) to bind."
+  (if *current-task*
+      (values *current-task* *current-thread*)
+      (let* ((inst (lifted-func-inst lf))
+             (task (make-async-task
+                    :ft (lifted-func-type lf)
+                    :opts (lifted-func-opts lf)
+                    :inst inst
+                    :on-start (lambda () nil)
+                    :on-resolve (lambda (r) (declare (ignore r)))))
+             (th (make-async-thread :task task)))
+        (setf (async-task-implicit-thread task) th)
+        (setf (async-task-gate-parked task) t) ; inhibit the enter gate's backpressure park
+        (unless (%task-enter-implicit-thread task)
+          (error 'wasmdown:wasm-trap :kind :generic
+                 :message "sync lift cancelled at gate"))
+        (setf (async-task-gate-parked task) nil)
+        (setf (async-task-state task) :started)
+        (values task th))))
+
+(defun %sync-lift-exit (task th)
+  "The sync-lift context's EXIT: unregister the thread (idempotent —
+the caller's unwind-protect may run twice on the same task)."
+  (when (and task th (async-thread-index th))
+    (ignore-errors
+      (setf (async-task-gate-parked task) t)
+      (%task-exit-implicit-thread task))))
+
 (defun lifted-func-call (lf &rest args)
   "canon_lift (CanonicalABI.md 3389): the ASYNC-TYPED functype lifts
   route through the task state machine (%canon-lift-async — the
@@ -2023,8 +2059,21 @@ of flat arguments)."
                               ft (comp-instance-types (lifted-func-inst lf))
                               :lift))))
           (declare (ignore core-sig))
-          (let ((res (apply #'wasmdown.runtime:wasm-call core
-                            flat-args)))
+          ;; THE SYNC-LIFT THREAD CONTEXT (sessions 21-23): the
+          ;; core call runs with a task+thread bound so the
+          ;; thread.*/waitable built-ins in a SYNC body find their
+          ;; context; the unwind-protect ALWAYS exits the implicit
+          ;; thread (the exclusive lock + the registration).
+          (multiple-value-bind (sync-task sync-th)
+              (%sync-lift-context lf)
+            (declare (ignorable sync-task sync-th))
+          (let ((res
+                  (let ((*current-task* sync-task)
+                        (*current-thread* sync-th))
+                    (unwind-protect
+                         (apply #'wasmdown.runtime:wasm-call core
+                                flat-args)
+                      (%sync-lift-exit sync-task sync-th)))))
             (let ((vi (make-array 16 :fill-pointer 0 :adjustable t)))
               (loop for r in (coerce res 'list)
                     for rt in (result-core-types lf result)
@@ -2081,7 +2130,7 @@ of flat arguments)."
                                           (second pr)))))
                       (when prf
                         (apply #'wasmdown.runtime:wasm-call prf res)))))
-                (first lifted)))))))))
+                (first lifted))))))))))
 
 (defun result-core-types (lf result)
   "The core result types the LIFT produces for RESULT (flatten of
@@ -3006,6 +3055,7 @@ wrong-index probe: one transfer produced index 3)."
   (spawn-thunk nil)                   ; new-indirect's suspended body
   (storage (make-array 2 :initial-element 0))
   (cancellable nil)
+  (yield-parked nil)                 ; parked by async-thread-yield (READY)
   (mutex (sb-thread:make-mutex :name "thread"))
   (waitqueue (sb-thread:make-waitqueue :name "thread")))
 
@@ -3081,10 +3131,15 @@ list concurrently from guest threads)."
 CPU. wait-until with an always-true predicate returns IMMEDIATELY
 (§507's host freedom) which hot-spins a yielding guest and starves
 siblings; instead PARK on the thread's waitqueue for a single
-scheduler nudge (Store.tick / resume-all) so other threads run."
+scheduler nudge (Store.tick / resume-all) so other threads run. The
+YIELD-PARKED flag marks the thread READY while parked (a promote
+target's resumability condition, §549)."
   (sb-thread:with-recursive-lock ((async-thread-mutex thread))
-    (sb-thread:condition-wait (async-thread-waitqueue thread)
-                              (async-thread-mutex thread))))
+    (setf (async-thread-yield-parked thread) t)
+    (unwind-protect
+         (sb-thread:condition-wait (async-thread-waitqueue thread)
+                                   (async-thread-mutex thread))
+      (setf (async-thread-yield-parked thread) nil))))
 
 ;;; ---- the ComponentInstance concurrency fields (§133-150) ----
 
@@ -3293,7 +3348,7 @@ does not exist)."
   when WSET is NIL)."
   (when (async-waitable-has-sync-waiter w)
     (error 'wasmdown:wasm-trap :kind :generic
-           :message "waitable has a sync waiter"))
+           :message "waitable cannot be used synchronously while added to a waitable set"))
   (when (async-waitable-wset w)
     (setf (async-waitable-set-elems (async-waitable-wset w))
           (remove w (async-waitable-set-elems
@@ -3913,6 +3968,10 @@ is the valtype."
           (when (async-waitable-has-sync-waiter w)
             (error 'wasmdown:wasm-trap :kind :generic
                    :message "waitable has a sync waiter"))
+          ;; §4124's trap_if(w.has_sync_waiter) — the SPEC's own
+          ;; message: a waitable being synchronously waited by
+          ;; ANOTHER built-in (the subtask.cancel reentrance case)
+          ;; cannot join a set (the sync user would deadlock)
           (%waitable-join w wset))
         '())))
     ((:subtask-cancel)
@@ -4361,12 +4420,19 @@ is the valtype."
                                            t)))))))))
             '())))))
     ;; M11b: thread.{suspend,yield}-then-{resume,promote}
-    ;; (§4668-4770): all four take the target index + return 0.
-    ;; The -then-resume pair: SWITCH to the target — the current
-    ;; thread parks (suspend) or stays ready (yield: one
-    ;; scheduler pass); the target is nudged. The -then-promote
-    ;; pair: the same but traps on i == thread.index and only
-    ;; nudges a READY target.
+    ;; (§4668-4770; Thread.suspend_then_{resume,promote} §549-565).
+    ;; All four take the target index + return 0. The SPEC SHAPE:
+    ;;  - then-resume: SWITCH — the current thread parks (suspend:
+    ;;    blocked, no readiness) or stays READY (yield: parked but
+    ;;    re-runnable at the next tick), and the TARGET is resumed
+    ;;    unconditionally (§531/§536: assert other.suspended()).
+    ;;  - then-promote: resume the target ONLY when it is READY
+    ;;    (a RUNNING or SUSPENDED-not-waiting target is left alone
+    ;;    and the call falls back to a plain suspend/yield, §549).
+    ;; A thread parked on its waitqueue by async-thread-yield is
+    ;; WAITING (resumable); a thread blocked inside wait-until is
+    ;; waiting on its own condition. The CURRENT thread is running
+    ;; — never its own promote target (the trap).
     ((:thread-suspend-then-resume :thread-yield-then-resume
       :thread-suspend-then-promote :thread-yield-then-promote)
      (let ((promote-p (member kind '(:thread-suspend-then-promote
@@ -4395,21 +4461,54 @@ is the valtype."
               (when (and (async-thread-index th)
                          (= (async-thread-index th) (first args)))
                 (setf target th)))
-            (cond
-             (target
-              ;; the SWITCH: park the current (suspend) or leave
-              ;; it ready (yield — one scheduler pass first so
-              ;; the target runs), then nudge the target
-              (if yield-p
-                  (async-thread-resume-all)
-                  (async-thread-yield *current-thread*))
-              (async-thread-resume target))
-             (promote-p
-              ;; an out-of-bounds/unready target: the promote
-              ;; variants still leave the current suspended/ready
-              (if yield-p
-                  (async-thread-resume-all)
-                  (async-thread-yield *current-thread*))))
+            ;; §4688/§4714: trap_if(not other_thread.suspended()) —
+            ;; the target must be SUSPENDED (spawn thunk pending or
+            ;; parked). The CURRENT thread is running: a self-index
+            ;; (or a running sibling) traps here, in the arm — the
+            ;; fixture's "cannot resume thread which is not
+            ;; suspended". (The promote pair additionally traps on
+            ;; i == thread.index above; a not-found index is
+            ;; out-of-bounds — also a trap.)
+            (unless (and target
+                         (or (functionp (async-thread-spawn-thunk
+                                         target))
+                             (async-thread-yield-parked target)))
+              (error 'wasmdown:wasm-trap :kind :generic
+                     :message
+                     "cannot resume thread which is not suspended"))
+            ;; §549-565: the promote pair only resumes a READY
+            ;; target (its spawn thunk pending = suspended, its
+            ;; SBCL thread parked by async-thread-yield = ready);
+            ;; a RUNNING target (on the stack below the reentrant
+            ;; call) is NOT ready — the plain suspend/yield
+            ;; fallback leaves it alone. The -then-resume pair
+            ;; resumes any found target.
+            (let ((resumable-target
+                    (if promote-p
+                        (and target
+                             (or (functionp (async-thread-spawn-thunk
+                                             target))
+                                 (async-thread-yield-parked target)))
+                        target)))
+              ;; park the current thread: SUSPEND leaves it blocked
+              ;; (a -then-resume's switch needs the target to make
+              ;; progress first); YIELD parks it ready (re-runnable
+              ;; at the next scheduler pass). One scheduler pass
+              ;; first so the target gets its CPU slice.
+              (if resumable-target
+                  (progn
+                    (async-thread-resume-all)
+                    (async-thread-resume resumable-target)
+                    (if yield-p
+                        (async-thread-yield *current-thread*)
+                        ;; the SUSPEND: parked with NO readiness —
+                        ;; only the target's explicit resume (or a
+                        ;; scheduler nudge) returns here
+                        (async-thread-yield *current-thread*)))
+                  ;; no switch: the plain suspend/yield fallback
+                  (progn
+                    (async-thread-resume-all)
+                    (async-thread-yield *current-thread*))))
             (list 0))))))
     ;; the still-opaque kinds: the slot exists, the call traps
     ((:thread-new-indirect
