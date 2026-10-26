@@ -16,11 +16,8 @@
 ./async/cancel-stream.wast
 ./async/cancel-subtask.wast
 ./async/cancel-targeted-resume.wast
-./async/closed-stream.wast
 ./async/cross-abi-calls.wast
-./async/cross-task-future.wast
 ./async/drop-cross-task-borrow.wast
-./async/drop-stream.wast
 ./async/during-sync-call-exclusive-resume.wast
 ./async/during-sync-call-may-block-if-other-ready-threads.wast
 ./async/during-sync-call-no-sibling-resume.wast
@@ -315,3 +312,22 @@
 # a small per-end transferred-instance marker — or route the
 # result through ONE lower site. After that: the write->read
 # rendezvous completes and cross-task-future enters the lane. ----
+# ---- M11b session 12 (2026-10-27): THREE FIXTURES GREEN + IN
+# THE LANE — the first end-to-end completions. (1) The
+# wrong-index fix: the backtrace probe showed ONE lower per
+# transfer (not multi-add) into the WRONG instance — %lower-
+# host-func's result path reused the ARG-LIFT cx whose inst is
+# the TARGET's ($C), so the end re-entered the callee's table;
+# the fix gives the RESULT its own CALLER-side cx (+ the
+# %lower-async-end idempotency guard, kept as defense).
+# cross-task-future then completed END-TO-END (the write->read
+# rendezvous, 5/5 runs) -> IN THE LANE. (2) The drop family
+# landed (§4448-4492: %end-drop's peer notify + the four
+# host-func arms with the class/copying-or-cancelling/
+# WritableFutureEnd-DONE guards) -> closed-stream (3/3) AND
+# drop-stream (5/5, both trap messages exact) GREEN -> IN THE
+# LANE. LANE: 1033 -> 1041 pass / 0 fail / 0 unsupported / 0
+# harness-error (stable x3); units 407/0. NEXT per the ladder:
+# cancel-stream (15) — needs {stream,future}.cancel-{read,write}
+# (§4376-4445, End.cancel §1719-1740), then forward, thread.*,
+# instance poisoning. ----

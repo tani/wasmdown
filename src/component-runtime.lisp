@@ -2471,8 +2471,20 @@ TARGET's space."
                   (if result
                       ;; lower_flat_values: FLAT when <= 1 flat slot,
                       ;; else the result STORED at the [ptr] out-param
-                      ;; (the last core arg)
-                      (let ((rflat (%flat-type-of result ft-inst)))
+                      ;; (the last core arg). M11b: the RESULT's
+                      ;; lower/store context is the CALLER (THIS
+                      ;; instance) — the arg-lift cx's inst is the
+                      ;; TARGET's ($C), so a stream/future result
+                      ;; would re-enter the CALLEE's table (the
+                      ;; wrong-index bug: the end landed in $C at 3
+                      ;; while $D read the index expecting its own
+                      ;; table). A caller-side cx for the result.
+                      (let* ((rcx (make-abi-cx
+                                   :memory memory
+                                   :realloc realloc
+                                   :encoding (%abi-encoding-of enc-opt)
+                                   :inst inst))
+                             (rflat (%flat-type-of result ft-inst)))
                         (if (> (length rflat) 1)
                             ;; the SPILLED result: store at the [ptr]
                             ;; out-param (the LAST core param; the sig
@@ -2481,9 +2493,9 @@ TARGET's space."
                             ;; store entirely and the caller read an
                             ;; empty retptr)
                             (let ((ptr (first (last args))))
-                              (%abi-store cx res result ptr)
+                              (%abi-store rcx res result ptr)
                               nil)
-                            (first (%abi-lower cx res result))))
+                            (first (%abi-lower rcx res result))))
                       res)))
              '()))))))
 
@@ -2841,6 +2853,20 @@ the (memory ptr length progress) list. The 5 cases in order:
 ;;; ---- lift_async_value / lower_async_value (CanonicalABI.md 2432-2460
 ;;; ---- / 2851-2865): the READABLE end crossing a component boundary.
 
+(defun %end-drop (end)
+  "End.drop (CanonicalABI.md 1778-1790): notify the peer (progress 0,
+DROPPED on its next event delivery) unless it is already DONE or
+already has a pending event; detach both ends."
+  (let ((other (async-end-other end)))
+    (when other
+      (unless (or (eq (async-end-state other) :done)
+                  (async-waitable-pending-event other))
+        (%end-notify other 0))
+      (setf (async-end-other other) nil))
+    (setf (async-end-other end) nil))
+  ;; Waitable.drop: leave any waitable set
+  (%waitable-join end nil))
+
 (defun %lift-async-end (cx i)
   "lift_stream / lift_future (§2432-2460): the i32 index I in CX's
 instance resolves the READABLE end; the guards; the end transfers
@@ -2862,12 +2888,22 @@ OUT of this table (the caller re-adds it at its boundary)."
 
 (defun %lower-async-end (end cx)
   "lower_stream / lower_future (§2851-2865): the END enters the
-callee's table; returns the new index."
+callee's table; returns the new index. IDEMPOTENT per (end,
+instance): a second lower of the SAME end into the SAME instance
+(the multi-site result path — the sync lower's lower_flat_values
+AND the %abi-store out-param site both fire for one boundary
+crossing) returns the EXISTING index instead of re-adding (the
+wrong-index probe: one transfer produced index 3)."
   (let* ((inst (abi-cx-inst cx))
-         (i (%handle-add-any inst end)))
-    (setf (async-end-index end) i)
-    (setf (async-end-owner end) inst)
-    i))
+         (h (%inst-handles inst))
+         (i (and (> (length h) 0)
+                 (position end h :test #'eq :from-end t))))
+    (if i
+        (1+ i)
+        (let ((j (%handle-add-any inst end)))
+          (setf (async-end-index end) j)
+          (setf (async-end-owner end) inst)
+          j))))
 
 ;;; ---- The Thread record (CanonicalABI.md 391-407) ----
 
@@ -3902,15 +3938,55 @@ is the valtype."
                         (let* ((event (%waitable-get-pending-event end))
                                (payload (third event)))
                           (list payload)))))))))))
+    ;; M11b: {stream,future}.drop-{readable,writable} (§4448-4492):
+    ;; the guards (the readable/writable class, the copying-or-
+    ;; cancelling check, the WritableFutureEnd DONE check) + End.drop
+    ((:stream-drop-readable :stream-drop-writable
+      :future-drop-readable :future-drop-writable)
+     (let* ((readable-p (member kind '(:stream-drop-readable
+                                       :future-drop-readable)))
+            (t-ct (and (second imms)
+                       (< (second imms)
+                          (length (comp-instance-types inst)))
+                       (aref (comp-instance-types inst)
+                             (second imms)))))
+       (wasmdown.runtime:make-host-func-instance
+        (wasmdown.types:make-wasm-func-type '(:i32) '())
+        (lambda (args)
+          (let* ((i (first args))
+                 (end (%handle-at inst i #'async-end-p "stream end")))
+            ;; the class guard: readable drops take READ ends
+            (unless (member (async-end-event-code end)
+                            (list (if readable-p +event-stream-read+
+                                      +event-stream-write+)
+                                  (if readable-p +event-future-read+
+                                      +event-future-write+)))
+              (error 'wasmdown:wasm-trap :kind :generic
+                     :message "handle index used with the wrong type"))
+            ;; §4488: trap on a copy in progress
+            (when (%end-copying-or-cancelling-p end)
+              (error 'wasmdown:wasm-trap :kind :generic
+                     :message
+                     "cannot remove busy stream"))
+            ;; §4489: dropping a WRITABLE FUTURE end traps unless
+            ;; the value was written (DONE) or the reader already
+            ;; dropped (the peer notify armed DROPPED)
+            (when (and (not readable-p)
+                       (async-end-future-p end)
+                       (not (eq (async-end-state end) :done)))
+              (error 'wasmdown:wasm-trap :kind :generic
+                     :message "cannot drop busy stream"))
+            (%end-drop end)
+            (setf (aref (%inst-handles inst) (1- i)) nil))
+          '()))))
     ;; the still-opaque kinds: the slot exists, the call traps
     ((:thread-yield :thread-suspend :thread-resume-later
       :thread-suspend-then-resume :thread-yield-then-resume
       :thread-suspend-then-promote :thread-yield-then-promote
       :thread-index :thread-new-indirect
       :stream-cancel-read :stream-cancel-write
-      :stream-drop-readable :stream-drop-writable :stream-forward
+      :stream-forward
       :future-cancel-read :future-cancel-write
-      :future-drop-readable :future-drop-writable
       :future-forward
       :error-context-new :error-context-debug-message
       :error-context-drop)
