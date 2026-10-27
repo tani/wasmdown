@@ -436,3 +436,53 @@
 # token scheduler's scope, NOT validator work). The fixture
 # stays nyi'd with its validator layer fixed. GATES with the
 # change: units 410/0, lane 1466/0/0/0, core 21187/0/73. ----
+# ---- M13-tok session 1 (2026-10-27): THE FRESH-ACS PROBE — the
+# family's shape UNCHANGED (~7/8 runs, run1's unreachable), and
+# the decode is now COMPLETE with the exact mechanism + three
+# measured negative results. THE TRAP (a new probe names the
+# trapping guest func: the *trap-func-name* bind in interp-invoke,
+# saved at /tmp/trapname-probe.patch): $AsyncOuter's $run-cb
+# (CoreAsyncOuter defined-index 2) — the RETURNED-path check
+# (i32.load (index*4)) = index. THE MECHANISM (the OUT-STORE
+# trace on the lower's on-resolve): the four $blocking-call
+# callees share ONE instance ($AsyncInner); each core does
+# context.set($counter) then $counter++ — the value each subtask
+# asserts is the counter AT ITS CORE'S ENTRY. Run1's 3rd/4th
+# subtask values CROSSED (4 stored at subtask 5's out-param
+# [20], 5 at [16]): the cores entered 2,3,5,4. THE ORDER KEY
+# INSIGHT: the plain creation seq (stamped at the gate) is
+# re-assigned by the thread-start lottery — the $SyncMiddle
+# BODIES (different instances!) run in arbitrary start order and
+# CREATE their blocking-call callees in that order; a per-instance
+# FIFO then correctly orders ITS OWN set but the seqs themselves
+# crossed. The needed key is the CALL-TREE PATH (a nested callee
+# inherits the caller's path + a per-parent call index). THREE
+# MEASURED NEGATIVES: (1) per-instance FIFO alone — the
+# earlier-parked check cannot see a task that has not yet
+# REACHED the gate (the arrival window); adding the pending-set
+# consult at the GATE still left the window between the
+# turnstile and the gate. (2) GLOBAL gate+turnstile (the M11b
+# attempt-2 class) — DEADLOCKS (a gate-parked task holds the
+# turnstile of a later task whose progress the parked task
+# needs; the park-trace shows tasks (3),(4),(7),(8) parked with
+# excl=HELD and nothing releasing). (3) GLOBAL turnstile +
+# per-instance gate + park-time pending-exit — STILL deadlocks:
+# the stamp points are inconsistent (some tasks stamped at the
+# spawn, some at the gate; the sync-lift's task has no path when
+# its children stamp — the bodies got ROOT paths (3),(4) instead
+# of (1 2),(1 3), breaking the parent chain). THE NEXT SHAPE TO
+# TRY: stamp EVERY task at CREATION (all three make-async-task
+# sites + the invoke-side lift), with the path inherited from
+# *current-task* (bound on every guest thread), the global
+# start turnstile ordered by path, and the per-instance FIFO
+# gate ordered by path with the pending consult — the deadlocks
+# came from the BROKEN PATHS ((3),(4) roots colliding with the
+# run task's (1) children), not from the design. ALSO RECORDED:
+# the durable-wake finding — %subtask-resolve's only real wake
+# is the TRANSIENT resume-all nudge; a parked wset waiter's
+# condition-wait registration can MISS it (run1's 4th delivery
+# stalled there in one trace) — the wset's waiters list + a
+# real wake-count post at resolve is the fix (built and
+# verified non-regressing, then reverted with the tree; re-add
+# with the token). GATES at the parked state: units 410/0, lane
+# 1466/0/0/0, core 21187/0/73 (all green; nothing landed). ----
