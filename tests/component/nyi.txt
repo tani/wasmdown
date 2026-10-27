@@ -1835,3 +1835,31 @@
 # THE STATE at the close: the tree = the ledger only; the lane
 # 1469/0 + units 410/0 re-verified at HEAD.
 # ----
+# ---- M13-tok session 32 (2026-10-28): THE NON-INTRUSIVE
+# LANE PROBE LANDED (/tmp/lane-ni3.lisp — the global-log
+# pattern, the LANE's member list only, the out-of-band FAILS
+# dump at the end): the probe survives the full lane (36
+# fixtures, ~3s per run) and profiles the class. THE 40-RUN
+# PROFILE: 37 GREEN, 3 single-fail (acs::1 twice,
+# switch-to-ready::8 once) — the ~7-10% class the parent's
+# 30-run sweep measured; no-sibling's ::2 did NOT recur in 40
+# probe runs (its ~3% rate is below this sample's resolution).
+# THE HANG ROOT (found): the earlier probes hung because they
+# globbed the WHOLE async directory — big-interleaving-test
+# (nyi'd, its own stall) hangs standalone (0 rows in 100s) —
+# THE PROBE MUST USE THE LANE'S MEMBER LIST (the fixed shape).
+# THE CANCEL-TARGETED-RESUME DECODE (opened): rows ::1/::7/::9
+# — the fixture's 5 shapes (the exiter's gone-implicit-thread,
+# the exclusive-lock park, the three resume variants) — the
+# ::1 'unreachable' is one of the packed/cancel checks; the
+# fixture's exiter: task.return EARLY + the explicit keeper
+# thread — the cancel must return BLOCKED (the implicit thread
+# gone) — the resolved-yet family's cousin (the
+# BLOCKED-vs-CANCELLED race).
+# THE STATE at the close: the tree = the ledger only; the lane
+# 1469/0 + units 410/0 at HEAD; the probe tool recorded for
+# the sprint's next session (the window capture: add the
+# *win* dump per FAILS occurrence — the global log already
+# captures the suspend/resume paths; the next step is the
+# FAILING RUN's log diff vs the green runs).
+# ----
