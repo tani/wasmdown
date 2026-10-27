@@ -1177,3 +1177,47 @@
 # THE STATE at the close: the probe reverted; the lane 1469/0
 # x3 + units 410/0 re-verified; the tree = the ledger only.
 # ----
+# ---- M13-tok session 16 (2026-10-27): THE GATE-PARK PROBE
+# ANSWERED + THE TWO-FIXTURE CONFLICT SETTLED BY THE PARAM-KIND
+# DISTINGUISHER. The lane 1469/0 x3 (+4 more green; one
+# known-flake single-fail run in the batch) + units 410/0.
+# THE PROBE'S ANSWER: the sync-streams' set callee does NOT
+# gate-park (gate-parked=NIL, task-state=:STARTED, its thread
+# neither yield- nor suspend-parked — blocked inside the sync
+# read's raw condition-wait) — the gate-park shape DOES NOT
+# APPLY; the callee's core IS mid-execution at the caller's
+# packed read. The parent's alternative #3 (the grant
+# deferral) would break the LANDED acs (its first pair pins
+# STARTED for entered callees).
+# THE ENUM SETTLED (specs/CanonicalABI.md §1395-1412):
+# STARTING=0, STARTED=1 — the sync-streams fixture's CHECK
+# pins STARTING(0) while its own COMMENT says 'returns STARTED'
+# — the comment is stale; the check is the ground truth.
+# THE CONFLICT: acs pins STARTED for its first pair (entered,
+# no backpressure) AND STARTING for its second pair (the
+# backpressure gate-park — our exit trace shows
+# gate-parked=T state=:INITIAL for those: THE GATE-PARK HALF
+# ALREADY WORKS); sync-streams pins STARTING for an ENTERED
+# callee — two entered callees, opposite pins — no single
+# pack-timing policy satisfies both.
+# THE RESOLUTION CANDIDATE (the param-kind distinguisher, per
+# the spec's own semantics — 'STARTING tells the caller that
+# they need to keep the memory for both the arguments and
+# results allocated; STARTED tells the caller that the
+# arguments have been read'): the report is about THE ARGS'
+# READ (on_start). The acs's callees' params are PLAIN i32s
+# (the out-param pointers — read eagerly); the sync-streams'
+# set callee's param is a STREAM HANDLE (the rx — its on_start
+# performs the handle lift/transfer — the HEAVY read). THE
+# SHAPE: defer the callee's ON_START (the args read) past the
+# pack for the ASYNC-VALUE (stream/future) params — the plain
+# params read eagerly (STARTED for acs's first pair), the
+# handle params deferred (STARTING for the set) — the
+# backpressure gate-park stays the third case. THE NEXT
+# SESSION'S GATE: implement the on_start deferral at the task
+# layer (the guest body's on-start call site — NOT the pack
+# flow) + the 10-run FAILROW probes on acs + sync-streams +
+# the full gates.
+# THE STATE at the close: the probe reverted; the tree = the
+# ledger only.
+# ----
