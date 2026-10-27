@@ -26,6 +26,18 @@
 # own recorded ~8-12% rate, unchanged by this gate) — the class's
 # own fixture stays parked; the lane itself (1449, without the
 # parked files) is 1449/0/0/0.
+# THE UN-PARK GATE 1 (same session, the follow-on): reentrance's
+# 25 rows ENTER THE LANE — the whitelist entry + the nyi line
+# removal; the lane 1474/0/0/0 x3 + units 411/0. THE FAILROW
+# PROBE at the new denominator (481 rows/run): 6/10 green — the
+# 4 fails are SINGLE-fails on FOUR DIFFERENT rows (reentrance
+# ::14 once, cross-abi-calls ::14 once, switch-to-ready ::8
+# twice — the PARKED fixture's own class, not in the lane): the
+# KNOWN-FLOOR class (the campaign's recorded 1-2/10 single-fail
+# drift), NOT a raised rate on any one row (reentrance ::14
+# standalone re-measured 10/10 AFTER the probe; its lane flake
+# is the cross-fixture drift class, the same shape the teardown
+# join closed for cancel-resumed).
 #
 # THE ROOT (the chronological capture, the non-intrusive
 # global-log pattern): (:REQ :STARTED T) then (:REQ-DONE
@@ -135,7 +147,6 @@
 ./async/cancel-subtask.wast
 ./async/cancel-targeted-resume.wast
 ./async/partial-stream-copies.wast
-./async/reentrance.wast
 ./async/sync-streams.wast
 # ---- M12 session 12 (2026-10-27): THE ATOMIC EXIT LANDED (a
 # strictly-safer read) — the flake class did NOT collapse; THE

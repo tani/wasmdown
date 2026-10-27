@@ -152,7 +152,19 @@ parent dir), not the first (the grandparent 'component' — the old
                                  ;; (49 rows: the task.return
                                  ;; [ptr] collapse + the async-lift
                                  ;; guest-body 16-flat rule)
-                                 "cross-abi-calls.wast")
+                                 "cross-abi-calls.wast"
+                                 ;; M14 (the resolved-yet family's
+                                 ;; un-park gate 1): reentrance —
+                                 ;; row 18's state-read race CLOSED
+                                 ;; by the spec's synchronous
+                                 ;; resume (§761-770's TURN
+                                 ;; boundary: the eager-cancel
+                                 ;; shape resolves BEFORE
+                                 ;; subtask.cancel returns). 0/10 ->
+                                 ;; 10/10 standalone at the gate;
+                                 ;; the lane + the FAILROW probe
+                                 ;; at the new denominator.
+                                 "reentrance.wast")
                                :test #'string=)))
                 (or (directory (merge-pathnames
                                 "tests/component/async/*.wast" *root*))
