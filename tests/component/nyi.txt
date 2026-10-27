@@ -2041,3 +2041,31 @@
 # the lane 1469/0 (x3 + the flake class) + units 410/0 + core
 # 21187/0/73.
 # ----
+# ---- M13-tok session 38 (2026-10-28): THE PRESENCE PROBE
+# ANSWERED (the last bounded probe of the sprint) — the
+# acs::1 window's surface named precisely: the GREEN run's
+# third-call gate check (the *gate-log* global, the
+# non-intrusive shape; the format-print probe broke the
+# fixture — the same I/O-latency trap) shows the exclusive
+# slot = A THREAD OBJECT (the (1 1)'s lock HELD) -> the raw-
+# lock gate fires -> the third parks -> 0x40 passes. THE
+# FAILING RUNS' SHAPE (per the session-35 captures): the same
+# check with the slot NIL (the (1 1)'s yield-park release
+# landed first) -> admits -> the 0x40 fails. THE RACE'S
+# SURFACE: the (1 1)'s FIRST yield-park (the blocking-call
+# spin, the §3470 release-and-restore) vs the run task's
+# continuation to the third call — the STARTED-wait's exit
+# guarantees the (1 1)'s START, not its park; the lock slot's
+# state at the third call's check is the interleave's coin.
+# THE FIX SPACE (exhausted for this sprint): holding the slot
+# until the task's exit would break the §3470-mandated
+# release (cancel-and-exclusive-lock's park shape); the
+# ancestor gate (session 37) held the fixtures but did not
+# close the window (the same release-race on the :threads
+# read side); the live-task gate (session 36) over-blocked
+# the concurrent blocking-calls. THE RESIDUAL is the
+# embedder's interleave freedom the fixtures pin — the
+# FALLBACK IS THE CALL per the parent's criterion.
+# THE STATE at the close: the probe REVERTED; the lane 1469/0
+# x3 + units 410/0 at HEAD; the tree = the ledger only.
+# ----
