@@ -596,3 +596,51 @@
 # only after unblock — if the 1st body exits before unblock,
 # THE SYNC LOWER'S BLOCK IS BROKEN for the async-typed callee
 # case, and THAT is the next session's first gate). ----
+# ---- M13-tok session 4 (2026-10-27): THE ASSEMBLY AT THE
+# THRESHOLD — run1 FULLY GREEN ONCE (all four stores at the right
+# out-params: 2@8 3@12 4@16 5@20) and run2 green STABLY at the
+# same build; reverted at the budget's end (the baseline re-verified
+# green: units 410/0, lane 1466/0/0/0, core 21187/0/73). THE
+# BUILD (all pieces from sessions 2-3, assembled): the path stamps
+# (seq slot + %tok-stamp-task at all three creation sites, the
+# slot-based child count), the PER-FUNC CONCURRENCY CAP (>=2 live
+# same-ft tasks of the instance parks; the $unblock callee exempt
+# by its different ft), the path-ordered tick WALK (resume-all
+# sorted by the path key — the yield-parked callbacks then wake in
+# the call order), the gate-grant (the nudge posts a real count for
+# gate-parked threads), the FIFO (the earlier-parked consult), and
+# the sibling-discriminated arrival consult. THE MEASURED CHAIN
+# (the pack/store traces): the OUTER packs 0x21/0x31/0x40/0x50
+# CORRECT and STABLE with the held exclusive + the per-func cap;
+# the FIRST pair's resolution order (which callback's task.return
+# completes first after $unblock) determines the $SyncMiddle
+# bodies' exit order, which determines the SECOND pair's spawn
+# and core-entry order — the values 4/5 cross when the 2nd body
+# exits before the 1st. THE ORDERED TICK WALK fixed run2 (the
+# second invoke's first pair resolves in path order — 100% of 8
+# runs); run1's first pair still resolves 2nd-first ~4/5 runs
+# (the two callbacks race after the nudge — the walk orders the
+# NUDGES, not the COMPLEIONS; run1's cold-start timing loses the
+# order ~4/5). THE LAST-LEG HYPOTHESES (the next session's
+# order): (1) SERIALIZED COMPLEION: make the yield-parked
+# callbacks' post-nudge resumption strictly one-at-a-time in path
+# order (the tick grants ONE thread per tick — §932's one-quantum
+# reading: the nudge loop can BREAK after the first successfully
+# woken path-smallest thread, the next tick takes the next —
+# the wasmtime run-to-block shape); (2) THE BODY-EXIT ORDER
+# fallback: the bodies' gates order the second pair by the
+# CONSULT on the first pair's completion state; (3) the counter
+# re-entrancy: the $blocking-call core's context.set+counter++
+# pair under the exclusive is already atomic — the entry order is
+# the only variable. ALSO MEASURED THIS SESSION: the sibling
+# consult WITHOUT the same-func discriminator deadlocks (the
+# $unblock callee parks behind the STARTING bodies — the cap
+# cycle); WITH same-func it frees the unblock but cannot order
+# the bodies (sync-func1 vs sync-func2 are different funcs); the
+# arrival entry must exit at the park for the consult-with-same-
+# func shape. THE flet/body STRUCTURE NOTE (for the next builder):
+# the gate's flet must wrap BOTH the park-when and the exclusive-
+# when (a defs-only flet leaves #'earlier-parked-p unbound at the
+# wait-until); the tail close count: setf(1) when(2) flet(3)
+# let-hasbp(4) when-ftasync(5) — then the let*'s own body
+# continues (the §705 region), `t))` closes let*+defun. ----
