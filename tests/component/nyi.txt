@@ -49,6 +49,49 @@
 # WATCH it at the next gate; if it holds or rises, the row's own
 # window (the reentrance ::14 state-read, the ledger's recorded
 # row) re-enters the decode queue.
+# THE PACK-WINDOW LANDING (the follow-on session, the same
+# working tree): ::1 GREEN (5/5) — the KEEPER decode's fix chain:
+# (a) THE FLIP-TIME PACK (the async lower's on-start captures the
+# STARTED fact at the flip; the pack reports STARTED even when a
+# later resolution lands in the STARTED-wait's window); (b) THE
+# CALLEE-ONLY SPIN (the STARTED-wait's driver grants ONLY the
+# callee task's implicit thread via %task-grant-callee — the full
+# resume-all fired the callee instance's OTHER ready threads);
+# (c) THE PACK WINDOW'S SPAWN-FIRE SUPPRESSION (*suppress-spawn-
+# fire*, set/cleared around the wait+pack — the priority pass and
+# the no-quantum fallback skip ready-marked pending spawns; a
+# GLOBAL: the callee's thread does not inherit dynamic bindings);
+# (d) resume_later's PENDING-SPAWN arm reverted to the SPEC-EXACT
+# MARK-ONLY (§462-465's start_waiting(ready=True) — the M13-4 eager
+# fire ran the keeper inside the callee's core); (e) THE CANCEL-
+# WAIT WINDOW'S M11a DEFERRAL (*defer-resume-all* + the deferred
+# queue, gated at FOUR sites: %task-return, %task-cancel,
+# %subtask-resolve, %task-exit-implicit-thread — the resumed
+# callee's own completion propagations must not grant the callee's
+# OTHER ready threads in the caller's observation window; NO DRAIN
+# — the deferred nudges deliver at the caller's next natural
+# tick); (f) THE WSET PARK'S BLOCK-FIRST ENTRY (§507's embedder
+# choice — the YIELD arm's own recorded shape: a callback task
+# whose wset already holds a ready event parks FIRST, re-tests on
+# wake; the hot-return ran the worker's callback inside the
+# caller's window).
+# IMPACT (standalone x5): cancel-targeted-resume ::1 GREEN 5/5
+# (::7/::9 remain — the worker-stays-put window); reentrance 4/5
+# (one ::14 fail at a NEW shape (6 imports,2 funcs) — the drift
+# row under the deferral, watch); cancel-subtask/cancel-resumed/
+# cancel-delivery/cancel-not-delivered/cancel-and-exclusive-lock/
+# async-calls-sync/during-sync-scheduling-candidates ALL 5/5 —
+# ZERO regressions from the six-part change.
+# THE ::7/::9 RESIDUAL: the worker (ready via its future's event)
+# still takes its turn inside the cancel's window — resolve(2)
+# before req-done; the four-site deferral + block-first did not
+# close it. THE NEXT PROBE: the broadcast hook on the worker's
+# thread waitqueue (the waker's identity — one probe).
+# THE FULL GATES AT THE SIX-PART CHANGE: units 411/0; the lane
+# 1482/0 + 1482/0 + 1481/1 (the one fail acs::1 — THE ACCEPTED
+# RATE's own ~8-10%, the M13 close-out's recorded release-race
+# surface); core 21187/0/73; THE 10-RUN FAILROW PROBE 9/10 (the
+# single fail reentrance ::14 ONCE — the drift row's band).
 # THE NEXT DECODE (cancel-targeted-resume ::1/::7/::9, the
 # rows isolated verbatim — each fails ALONE the same way): THE
 # CANCEL PATHS ARE CORRECT AT THE LANDED BUILD (the trace: row 9's

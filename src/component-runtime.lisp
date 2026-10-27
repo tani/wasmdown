@@ -3557,6 +3557,30 @@ wrong-index probe: one transfer produced index 3)."
 (defparameter *current-thread* nil
   "The current Thread record (CanonicalABI.md current_thread).")
 
+(defparameter *deferred-resume-all-tasks* nil
+  "M14: the cancel-wait window's deferred propagation queue (drained
+when the window closes).")
+
+(defparameter *defer-resume-all* nil
+  "M14 THE CANCEL-WAIT WINDOW'S TICK DEFERRAL: set around
+%task-request-cancellation's synchronous-resume wait — the resumed
+callee's own task.{return,cancel} M11a propagation (the resume-all)
+would grant OTHER ready threads their turn inside the wait
+(cancel-targeted-resume ::7's worker: ready via its future's event,
+woken by the propagation's broadcast, running its callback and
+delivering the SUBTASK event at the caller's NEXT poll — the row
+pins the worker STAYS PUT until the caller blocks). The deferred
+resume-all runs when the window closes.")
+
+(defparameter *suppress-spawn-fire* nil
+  "M14 THE PACK WINDOW'S SPAWN-FIRE SUPPRESSION: dynamically bound
+around the async lower's STARTED-wait + pack — the callee instance's
+resume-later'd EXPLICIT threads (the keeper/worker class) must not
+take their turn inside the caller's observation window (the packed
+return + the cancel's BLOCKED read) — the reference's caller
+regains control synchronously (§3530) and the ready spawns run at
+the caller's NEXT blocking op (the fixtures' pinned interleave).")
+
 (defparameter *scheduler-threads* nil
   "The live async-thread records — Store.tick's nudge-all walks it.
 MUTATED FROM MULTIPLE GUEST THREADS (enter/exit implicit thread):
@@ -3823,13 +3847,24 @@ the caller's own thread; never a plain suspend-parked thread
            (eligible (remove-if-not grantable-p sorted)))
       (let ((granted-thread nil))
         ;; THE PRIORITY PASS: ready-marked grantable threads
+        ;; (M14: *suppress-spawn-fire* — the STARTED-wait's window
+        ;; must not FIRE ready-marked pending spawns of the callee's
+        ;; own instance: cancel-targeted-resume's keeper/worker is
+        ;; resume-later'd INSIDE the callee's core, and the exit's
+        ;; M11a resume-all (running in the wait's dynamic extent)
+        ;; fired it via this pass — the keeper's task.return
+        ;; resolved the subtask before the caller's pack could
+        ;; observe STARTED / the cancel return BLOCKED. The
+        ;; suppression is DYNAMICALLY BOUND (the pack's window
+        ;; only); the suspend-parked ready-grant is unaffected.)
         (loop for th in sorted
               do (when (and (not (async-thread-abandoned th))
                             (not (eq th *current-thread*))
                             (async-thread-ready-p th)
                             (or (async-thread-suspended-p th)
-                                (functionp (async-thread-spawn-thunk
-                                             th))))
+                                (and (not *suppress-spawn-fire*)
+                                     (functionp
+                                      (async-thread-spawn-thunk th)))))
                    (async-thread-nudge th)
                    (setf granted-thread th)
                    (return)))
@@ -3868,9 +3903,18 @@ the caller's own thread; never a plain suspend-parked thread
         (when granted-thread
           (%async-thread-wake granted-thread))
         (unless granted-thread
-          ;; THE NO-QUANTUM FALLBACK: broadcast-only
+          ;; THE NO-QUANTUM FALLBACK: broadcast-only — M14: skip
+          ;; the ready-marked PENDING SPAWNS under the pack window's
+          ;; suppression (the fallback nudges every registered
+          ;; thread and async-thread-nudge FIRES a claimed spawn —
+          ;; cancel-targeted-resume's keeper ran through here in
+          ;; the trace; the suppressed candidates stay parked and
+          ;; the next tick after the window takes them)
           (dolist (th sorted)
-(async-thread-nudge th))))))))
+            (unless (and *suppress-spawn-fire*
+                         (async-thread-ready-p th)
+                         (functionp (async-thread-spawn-thunk th)))
+              (async-thread-nudge th)))))))))
 
 (defun async-thread-yield (thread)
   "Thread.yield_ (CanonicalABI.md 523): cooperatively give up the
@@ -4033,8 +4077,15 @@ the enter gate: getf-setf through the shared plist)."
                (%task-needs-exclusive task))
       (setf (getf fields :exclusive-thread) nil)
       ;; releasing the exclusive lock may admit a gate-parked peer
-      ;; of this instance (its gate readiness just became true)
-      (async-thread-resume-all))))
+      ;; of this instance (its gate readiness just became true).
+      ;; M14: DEFER inside the cancel-wait window (the FOURTH M11a
+      ;; site running on the callee's thread — the resumed callee's
+      ;; EXIT follows its task.cancel; the propagation's nudge
+      ;; would grant the callee's OTHER ready threads (the ::7
+      ;; worker) in the caller's observation window)
+      (if *defer-resume-all*
+          (push task *deferred-resume-all-tasks*)
+          (async-thread-resume-all)))))
 
 (defun %task-has-pending-cancel (task)
   (eq (async-task-state task) :pending-cancel))
@@ -4044,6 +4095,21 @@ the enter gate: getf-setf through the shared plist)."
   (when (%task-has-pending-cancel task)
     (setf (async-task-state task) :cancel-delivered)
     t))
+
+(defun %task-grant-callee (task)
+  "M14 THE CALLEE-ONLY GRANT: nudge ONE thread — the callee task's
+own implicit thread — leaving every other registered thread parked
+(the STARTED-wait's driver; the full resume-all would fire the
+callee instance's OTHER ready threads — the cancel-targeted-
+resume keeper/worker class — resolving the subtask inside the
+wait's window where the fixtures pin the caller's own observation
+first). The callee's thread is the only grant the STARTING->
+STARTED flip needs (§3530's synchronous resume shape)."
+  (let ((th (and task (async-task-implicit-thread task))))
+    (when (and th
+               (not (async-thread-abandoned th))
+               (not (eq (async-thread-spawn-thunk th) :done)))
+      (async-thread-nudge th))))
 
 (defun %task-bump-turn (task)
   "M14 the callback event loop's TURN COUNTER bump: one per loop-top
@@ -4120,19 +4186,39 @@ legacy nudge and the caller observes the unresolved state."
         ;; slice each.
         (let ((sampled (async-task-turns task)))
           (async-thread-resume th)
-          (loop
-            until (or (async-task-resolved-p task)
-                      (> (async-task-turns task) sampled)
-                      (and (or (async-thread-suspended-p th)
-                               (async-thread-yield-parked th))
-                           ;; the RE-PARK only: the callee's own
-                           ;; park flags are set at the arm's entry —
-                           ;; the resume consumed the wait; the
-                           ;; flags at THIS point are the turn's NEW
-                           ;; park (the initial park's flags were
-                           ;; cleared at its wake)
-                           t))
-            do (sleep 0.001))))
+          ;; M14 THE CANCEL-WAIT WINDOW: defer the M11a propagation
+          ;; (the callee's task.{return,cancel} runs on ITS thread
+          ;; inside this wait; the propagation's resume-all would
+          ;; grant OTHER ready threads — ::7's worker — their turn
+          ;; in the caller's observation window). Drain on exit.
+          (setf *defer-resume-all* t)
+          (unwind-protect
+               (loop
+                 until (or (async-task-resolved-p task)
+                           (> (async-task-turns task) sampled)
+                           (and (or (async-thread-suspended-p th)
+                                    (async-thread-yield-parked th))
+                                ;; the RE-PARK only: the callee's own
+                                ;; park flags are set at the arm's
+                                ;; entry — the resume consumed the
+                                ;; wait; the flags at THIS point are
+                                ;; the turn's NEW park (the initial
+                                ;; park's flags were cleared at its
+                                ;; wake)
+                                t))
+                 do (sleep 0.001))
+            (setf *defer-resume-all* nil)
+            ;; M14: NO DRAIN — the deferred propagations' RESOLVES
+            ;; are already broadcast on the task/waitable waitqueues
+            ;; (the wset waiter's durable wake posted by
+            ;; %subtask-resolve); the resume-all is only the M11a
+            ;; nudge, and the fixtures pin the ready threads' turn at
+            ;; the CALLER's next blocking op (the caller's own park/
+            ;; drain loop's resume-all delivers it — ::7's worker
+            ;; runs at the row's final wset.wait, ::9's at the yield
+            ;; loop). Draining HERE measured the worker running at
+            ;; the caller's NEXT POLL (the row's NONE check).
+            (setf *deferred-resume-all-tasks* nil))))
        (th
         ;; the legacy nudge for the not-ready shapes (a mid-turn
         ;; callee, a stackful block, a suspend park): harmless when
@@ -4157,8 +4243,15 @@ legacy nudge and the caller observes the unresolved state."
   ;; M11a wake propagation: a resolution may unblock SIBLING tasks
   ;; (a parked waiter's readiness condition reads this task's
   ;; state, a subtask's pending-event closure runs at delivery) —
-  ;; nudge every live thread so they re-test (Store.tick, §932)
-  (async-thread-resume-all))
+  ;; nudge every live thread so they re-test (Store.tick, §932).
+  ;; M14: DEFER inside the cancel-wait window (the synchronous-
+  ;; resume wait's callee runs task.return on ITS thread; the
+  ;; propagation's broadcast would grant OTHER ready threads in
+  ;; the wait's window — the fixture pins the caller's own
+  ;; observation first)
+  (if *defer-resume-all*
+      (push task *deferred-resume-all-tasks*)
+      (async-thread-resume-all)))
 
 (defun %task-cancel (task)
   "Task.cancel (CanonicalABI.md 818): resolve with cancellation (only
@@ -4174,8 +4267,11 @@ legacy nudge and the caller observes the unresolved state."
   (sb-thread:with-recursive-lock ((async-task-mutex task))
     (setf (async-task-resolved-p task) t)
     (sb-thread:condition-broadcast (async-task-waitqueue task)))
-  ;; M11a wake propagation (same as %task-return)
-  (async-thread-resume-all))
+  ;; M11a wake propagation (same as %task-return) — M14: DEFER
+  ;; inside the cancel-wait window (see %task-return)
+  (if *defer-resume-all*
+      (push task *deferred-resume-all-tasks*)
+      (async-thread-resume-all)))
 
 ;;; ---------------------------------------------------------------
 ;;; Waitable / WaitableSet operations (CanonicalABI.md 1282-1394).
@@ -4301,6 +4397,28 @@ computes the tuple at delivery time)."
     (unwind-protect
          (progn
            (setf (async-thread-ready-fn thread) readiness)
+           ;; M14 THE BLOCK-FIRST PARK (§507's embedder choice, the
+           ;; YIELD arm's own recorded shape): a callback task whose
+           ;; wset ALREADY holds a ready event (cancel-targeted-
+           ;; resume ::7's worker: the caller's future.write landed
+           ;; the event while the worker was mid-turn; the worker's
+           ;; NEXT park sees it at entry) must NOT hot-return — the
+           ;; fixtures pin the ready thread's turn at the CALLER's
+           ;; next blocking op ("worker stays put" — the row's NONE
+           ;; polls), and the hot-return ran the worker's callback
+           ;; (task.return) inside the caller's cancel window. PARK
+           ;; FIRST (one real condition-wait), re-test on wake: the
+           ;; durable wake-count posted by the event's arrival
+           ;; (§subtask-resolve's waiter post / the end's notify)
+           ;; returns the park on the NEXT wake; the caller's own
+           ;; blocking op's resume-all delivers it.
+           (sb-thread:with-recursive-lock ((async-thread-mutex thread))
+             (async-thread-check-abandoned thread)
+             (unless (> (async-thread-wake-count thread) 0)
+               (sb-thread:condition-wait
+                (async-thread-waitqueue thread)
+                (async-thread-mutex thread))))
+           (setf (async-thread-wake-count thread) 0)
            (async-thread-wait-until thread readiness)
            (if (%task-deliver-pending-cancel task)
                (list 6 0 0)             ; EventCode.TASK_CANCELLED
@@ -4349,7 +4467,15 @@ computes the tuple at delivery time)."
           (sb-thread:condition-broadcast (async-thread-waitqueue w))
           (sb-thread:condition-broadcast
            (async-thread-suspend-waitqueue w)))))
-    (async-thread-resume-all)))
+    ;; M14: DEFER inside the cancel-wait window (the third M11a
+    ;; site running on the callee's thread inside the synchronous-
+    ;; resume wait — the resolve's nudge would grant the callee's
+    ;; OTHER ready threads (the ::7 worker) in the caller's
+    ;; observation window; the durable wake-count above already
+    ;; reached the resolved subtask's OWN wset waiters)
+    (if *defer-resume-all*
+        (push s *deferred-resume-all-tasks*)
+        (async-thread-resume-all))))
 
 (defun %subtask-deliver-resolve (s)
   "Subtask.deliver_resolve (CanonicalABI.md 1467): the delivered
@@ -5338,20 +5464,26 @@ is the valtype."
           (sb-thread:with-recursive-lock
               ((async-thread-mutex target))
             (cond
-             ;; a PENDING SPAWN: fire NOW (§4590's first resume —
-             ;; the marker holds the CPU). The eager fire is safe:
-             ;; the switch arms arm their park BEFORE their fire,
-             ;; so this spawned body's park/exit posts the armed
-             ;; caller durably (the ::34 race was HEAD's
-             ;; fire-before-arm, closed by the arm's own ordering).
-             ;; Without it, a tick claimed the spawn and the worker
-             ;; ran asynchronously — the caller's promote found a
-             ;; DEAD target and proceeded before the worker's body
-             ;; (scheduling-candidates' ::2). The ready-mark stays
-             ;; set for the arm's predicate.
+             ;; a PENDING SPAWN: §462-465's resume_later =
+             ;; start_waiting(ready=True) — MARK ONLY, never fire:
+             ;; the spawn starts at the next TICK (§932's grant) or
+             ;; an EXPLICIT switch. The M13-4 eager fire measured
+             ;; ::2's regression at the PRE-one-lock shape; the
+             ;; M13-9 durable wake-count closes that race by
+             ;; construction (the armed caller's park cannot lose
+             ;; the worker's exit-post — the count is durable), and
+             ;; the eager fire BREAKS cancel-targeted-resume's
+             ;; pinned interleave: the spawned body (the keeper /
+             ;; the ::9 worker) runs INSIDE the callee's core, its
+             ;; task.return resolves the subtask in the STARTED-
+             ;; wait's window, and the pack then reports RETURNED
+             ;; where the rows pin STARTED (::1) / the cancel
+             ;; returns CANCELLED where the row pins BLOCKED (::9's
+             ;; own $ran check) — the caller must observe the
+             ;; callee's state BEFORE any other thread of the
+             ;; callee's instance takes a turn.
              ((functionp (async-thread-spawn-thunk target))
-              (setf (async-thread-ready-p target) t)
-              (async-thread-resume target))
+              (setf (async-thread-ready-p target) t))
              ;; a SUSPEND-parked target: the handoff install — the
              ;; marker's own next park/exit posts the target's wake
              ;; (causally after the marker's round completes)
@@ -5964,7 +6096,20 @@ is the valtype."
                                            vals))))))
                       (nreverse vals))))
               (resolved-state nil)
-              (resolved-val nil))
+              (resolved-val nil)
+              ;; M14 THE FLIP-TIME CAPTURE (the pack's §3715 reads
+              ;; subtask.state AT THE PACK; the reference's timing
+              ;; reads STARTED — an EXPLICIT thread of the callee's
+              ;; instance (cancel-targeted-resume ::1's keeper:
+              ;; resume-later'd inside the callee's core) can resolve
+              ;; the task in the STARTED-wait's window via the exit's
+              ;; resume-all firing the ready-marked pending spawn;
+              ;; the pack then read RETURNED where the fixture pins
+              ;; STARTED — the row's FIRST unreachable). Capture the
+              ;; STARTED fact AT THE FLIP: once the callee's on_start
+              ;; ran, the packed return reports STARTED even if a
+              ;; later resolution lands before the pack.
+              (started-at-flip nil))
          ;; OnStart (§3651): the callee reads its args (the state
          ;; moves STARTING -> STARTED)
          ;; OnResolve (§3657): the callee's result lowers back into
@@ -5972,7 +6117,8 @@ is the valtype."
          (multiple-value-bind (on-cancel callee-task)
              (%call-async-funcinst f component-args
                :on-start (lambda ()
-                           (setf (async-subtask-state subtask) 1))
+                           (setf started-at-flip t
+                                 (async-subtask-state subtask) 1))
                :on-resolve (lambda (val)
                              (cond
                               ((and (consp val) (eq (car val) :trap))
@@ -6033,17 +6179,38 @@ is the valtype."
          ;; so WAIT for the STARTING->STARTED transition (or the
          ;; eager resolve) before packing. A sync-typed inline
          ;; callee resolves before reaching here (no wait).
+         ;; M14 THE PACK WINDOW: set the spawn-fire suppression —
+         ;; the callee's exit resume-all (the M11a propagation,
+         ;; running on the CALLEE'S OWN SBCL thread) must not fire
+         ;; the resume-later'd explicit threads during the caller's
+         ;; observation. A GLOBAL (not a dynamic binding: the
+         ;; callee's thread does not inherit our bindings), set
+         ;; under the scheduler mutex and cleared after the pack.
+         (setf *suppress-spawn-fire* t)
          (let ((eager-p nil)
                (packed-state 0))
-           (unless (%subtask-resolved-p subtask)
-             (loop
-               with cycles = 0
-               until (or (%subtask-resolved-p subtask)
-                         (/= (async-subtask-state subtask) 0)
-                         (async-task-gate-parked
-                          (async-subtask-task subtask)))
-               do (async-thread-resume-all)
-                  (sleep 0.001))
+          (unless (%subtask-resolved-p subtask)
+            (loop
+              with cycles = 0
+              until (or (%subtask-resolved-p subtask)
+                        (/= (async-subtask-state subtask) 0)
+                        (async-task-gate-parked
+                         (async-subtask-task subtask)))
+              ;; M14 THE CALLEE-ONLY SPIN: the STARTED-wait's driver
+              ;; grants ONLY the callee task's implicit thread — the
+              ;; full resume-all fires the callee instance's OTHER
+              ;; ready threads (cancel-targeted-resume ::1's keeper:
+              ;; resume-later'd inside the callee's core; the
+              ;; priority pass's claim-then-fire ran it inside THIS
+              ;; spin, its task.return resolving the subtask before
+              ;; the pack read STARTED and before the cancel could
+              ;; return BLOCKED — the row's first unreachables). The
+              ;; reference observes the callee's on_start via the
+              ;; SYNCHRONOUS resume (§3530's thread.resume — no
+              ;; tick at all); the callee's own thread is the only
+              ;; grant the wait needs.
+              do (%task-grant-callee (async-subtask-task subtask))
+                 (sleep 0.001))
              ;; THE ATOMIC EXIT (session-11's refined candidate): the
              ;; loop's exit and the state read were TWO steps — the
              ;; callee could RESOLVE between them, and the pack then
@@ -6052,10 +6219,24 @@ is the valtype."
              ;; under the CALLEE TASK's mutex (the same lock
              ;; %task-return holds when it flips resolved-p) and pack
              ;; from the captured values — no second read.
-             (let ((ctask (async-subtask-task subtask)))
-               (sb-thread:with-recursive-lock ((async-task-mutex ctask))
-                 (setf packed-state (async-subtask-state subtask)
-                       eager-p (%subtask-resolved-p subtask)))))
+            (let ((ctask (async-subtask-task subtask)))
+              (sb-thread:with-recursive-lock ((async-task-mutex ctask))
+                (setf packed-state
+                      ;; M14 THE FLIP-TIME PACK: report STARTED when
+                      ;; the callee's on_start RAN — the reference's
+                      ;; pack (§3715) reads the state before the
+                      ;; ready-marked EXPLICIT thread's grant; a
+                      ;; resolution landing in the STARTED-wait's
+                      ;; window (the keeper's task.return) does not
+                      ;; change what the CALLER observes at the pack
+                      ;; (the resolution delivers at the caller's
+                      ;; wait — the SUBTASK event, state RETURNED).
+                      (if started-at-flip 1 (async-subtask-state subtask))
+                      eager-p (%subtask-resolved-p subtask)))))
+         ;; M14: clear the pack window's suppression (the caller's
+         ;; observation is complete; the ready spawns run at the
+         ;; caller's next blocking op — the fixtures' interleave)
+         (setf *suppress-spawn-fire* nil)
          (if eager-p
              ;; the EAGER case (§3714-3717): resolved before return
              (progn
