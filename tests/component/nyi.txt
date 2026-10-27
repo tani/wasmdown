@@ -745,3 +745,64 @@
 # from the ledger's description).
 # The during-sync sentinel holds at the landed state (the lane's
 # 1466 includes the family green). ----
+# ---- M13-tok session 7 (2026-10-27): THE WSET-CORRELATION
+# SESSION — the parent's structural hypothesis INVESTIGATED AND
+# SUPERSEDED by a sharper root; the full assembly built and
+# measured at the boundary, REVERTED at the budget's end (the
+# committed baseline re-verified green: units 410/0, lane
+# 1466/0/0/0, core 21187/0/73).
+# THE INVESTIGATION (all traced):
+# 1. THE PARENT'S HYPOTHESIS (the YIELD arm never polls the wset)
+# was checked against the SPEC first: the callback returning YIELD
+# means 'call me again later with NO event' — (0 0 0) IS the
+# correct delivery for a YIELD turn; the wset poll belongs to the
+# WAIT arm. The hypothesis was NOT the candidates rows' shape.
+# 2. THE REAL ROOT (the CORE-CALL probe): the DRIVER task's core
+# returns YIELD(1) REPEATEDLY (1479+ parks at the YIELD arm, the
+# backtrace pinned inside %async-lift-guest-body's callback loop)
+# — because the driver's core's run' call — the SYNC lower of
+# $D's imported $c.run — runs the CALLEE'S BODY INLINE ON THE
+# DRIVER'S GUEST THREAD: the $c.run's yield-loop parks THE
+# DRIVER'S OWN THREAD (the thread.yield reads *current-thread* =
+# the driver's), the callee's own scheduling never exists, and the
+# callback loop sees core=YIELD forever. THE M12 DESIGN NOTE
+# ('a nested sync call must NOT run inline on the caller's thread')
+# was written for the sync-lift but NEVER APPLIED to the LOWER's
+# inline path: %lower-host-func's sync case calls
+# %call-component-func-list -> lifted-func-call -> the SYNC FLAT
+# path (the callee's core ON THE CALLER'S THREAD).
+# 3. THE NESTED-SYNC RULE (built, guarded, measured): a GUEST-
+# thread caller + a SYNC-TYPED callee routes through
+# %sync-lift-run (the callee on its own executor; the caller parks
+# on done-p). The guard: ASYNC-typed callees keep the inline path
+# (lifted-func-call routes them through %canon-lift-async's own
+# thread already — unguarded, the rule broke acs 2 rows).
+# THE MEASURED RESULT: the rule FIRES (the probe: cur-thread
+# BOUND, callee-async NIL, once) and the CALLEE now parks ITS OWN
+# thread ((8) yield-parked in the tick trace — the executor ✓)
+# — but the stall SHAPE MOVED, not closed: the (7) driver is
+# STILL yield-parked with its task RESOLVED, and the run's
+# worker is ABSENT from the scheduler (it spawned, ran, and
+# unregistered per gate 1 BEFORE the trace's window — or never
+# spawned). The (7)'s core STILL returns 1 with the rule in —
+# the %sync-lift-run result decode is the NEXT probe (the
+# wrapper's res path: (car cell) vs the pack; the executor's
+# r for a yield-loop core).
+# 4. THE MEMORY BLOWUP (the lane crash): with the nested rule,
+# the lane CRASHES on the streams/zero-length fixtures — a GC
+# 'PROCEED WITH CAUTION' (756MB available, 1.2GB requested) on an
+# async-lower-callee thread: the per-nested-call executor spawn
+# explodes memory in the stream-copy loops (each nested sync-lower
+# call allocates a full executor). THE RULE IS NOT VIABLE AS-IS —
+# a nested executor must be bounded or the route must distinguish
+# the blocking (thread.*-using) callees from the plain ones.
+# THE RECORDED STATE: the full assembly (token block + stamps +
+# the quantum with the grant-count post + the nested rule) gives
+# acs 14-15 green / 15 at the lane-stable shape; the candidates
+# rows 10-12 (driver), 16/19, 23/26/29 (the blocked-callback
+# family) still stall; the lane is NOT green with the quantum in.
+# THE NEXT SESSION: (1) the %sync-lift-run result decode (the (7)
+# core's 1); (2) the bounded nested route (the memory blowup);
+# (3) the blocked-callback rows (16-29) are a SEPARATE stall (the
+# suspended-mid-frame + exclusive-lock shape — not the driver's).
+# ----
