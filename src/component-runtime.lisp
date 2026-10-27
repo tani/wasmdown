@@ -3966,8 +3966,18 @@ drop-readable must return index 1 again)."
                        collect (%abi-arg-domain a (cdr p) cx)))
            (flat-args
              (if (or (abi-cx-memory cx) params)
+                 ;; M13-lad (cross-abi-calls ::8-::11): the LIFT
+                 ;; direction's guest body lowers the caller's
+                 ;; component params into the CALLEE's core args with
+                 ;; MAX_FLAT_PARAMS (16) ALWAYS — the async 4-limit
+                 ;; (MAX_FLAT_ASYNC_PARAMS) is the LOWER direction's
+                 ;; core-param rule (§2914-2929: the async LOWER's
+                 ;; collapse); the async-callback LIFT's core funcs
+                 ;; take their params flat up to 16 (async-5-param:
+                 ;; five flat slots; async-17-param: the [ptr]
+                 ;; collapse via the canon's memory+realloc).
                  (%abi-lower-values
-                  cx (if (%task-opts-async-p task) 4 16)
+                  cx 16
                   vals (loop for p in (or params '())
                              collect (cdr p)))
                  '()))
@@ -4228,9 +4238,19 @@ is the valtype."
   "The flat core PARAMS of task.return — the result type's flattened
   slots (CanonicalABI.md 3929: flatten_functype of (func (param $t)?)
   in the LOWER context: the params ARE the flat result slots, no
-  out-param is appended)."
-  (let ((rt (%task-return-result-type imms)))
-    (if rt (%flat-type-of rt inst) '())))
+  out-param is appended). M13-lad: the MEMORY collapse — when the
+  canon carries the `memory` opt and the flat slots exceed
+  MAX_FLAT_PARAMS (16), the values pass through memory and the core
+  func takes the single [ptr] param (cross-abi-calls' task.return17:
+  the (memory ...) canon of a 17-tuple result)."
+  (let* ((rt (%task-return-result-type imms))
+         (opts (%task-return-opts imms))
+         (mem-opt (and opts
+                       (wasmdown.component:canon-opt opts :memory))))
+    (let ((flat (if rt (%flat-type-of rt inst) '())))
+      (if (and mem-opt (> (length flat) 16))
+          '(:i32)
+          flat))))
 
 (defun %wset-event-cx (inst kind imms)
   "waitable-set.wait/poll's memory option (the event-payload store

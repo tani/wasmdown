@@ -112,7 +112,13 @@ parent dir), not the first (the grandparent 'component' — the old
                                  "idle-drop.wast"
                                  "switch-to-ready-callback.wast"
                                  "sync-barges-in.wast"
-                                 "drop-cross-task-borrow.wast")
+                                 "drop-cross-task-borrow.wast"
+                                 ;; M13-lad: the cross-ABI
+                                 ;; signature/memory-collapse family
+                                 ;; (49 rows: the task.return
+                                 ;; [ptr] collapse + the async-lift
+                                 ;; guest-body 16-flat rule)
+                                 "cross-abi-calls.wast")
                                :test #'string=)))
                 (or (directory (merge-pathnames
                                 "tests/component/async/*.wast" *root*))

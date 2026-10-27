@@ -6,7 +6,6 @@
 ./async/cancel-resumed-callback-switch.wast
 ./async/cancel-subtask.wast
 ./async/cancel-targeted-resume.wast
-./async/cross-abi-calls.wast
 ./async/partial-stream-copies.wast
 ./async/passing-resources.wast
 ./async/reentrance.wast
@@ -372,3 +371,37 @@
 # was the harness's swallowed condition — the raw type-error
 # never reached the runner's taxonomy; the *break-on-signals*
 # backtrace was the only window. ----
+# ---- M13 ladder, cross-abi-calls (2026-10-27): FULLY GREEN
+# (49 rows; lane 1417 -> 1466). The residual was NOT the
+# text-layer strip (the definition-span decode was wrong: the
+# stored text round-trips balanced and reparse yields 65 defs)
+# — it was a chain of four ABI-shape gaps, each one fix:
+# (1) VALIDATE: the task.return canon's marker sig —
+# canon-builtin-flat-sig flattened the result into params
+# UNCONDITIONALLY; the canon's `memory` opt with flat slots >
+# MAX_FLAT_PARAMS (16) collapses to the single [ptr] param
+# (task.return17: 17-tuple + (memory ...) = [i32] -> the
+# fixture's import (param i32); the recorded marker then
+# matched and row 0's 'expected: (func)' cleared). The opts
+# read: the BINARY reader stores them in the canonrec's :opts
+# slot, the TEXT parser embeds them as the imms' THIRD slot
+# (the %task-return-opts convention) — the caller reads BOTH
+# (never the third of a non-task-return imms: context.get's
+# nat slot). (2) VALIDATE: %check-canon-opts demanded `memory`
+# for flat RESULTS > 1 on the ASYNC lift — the async lift's
+# core functype never carries the results (they return via
+# task.return's canon; %flat-functype :lift/async yields the
+# packed [:i32] or []) — the requirement is SYNC-lift only.
+# (3) LINK: %task-return-flat-types (the runtime's host-func
+# build) had the same unconditional flatten — the same
+# memory-collapse rule applied at instantiate time (the
+# 'function type mismatch' on .task.return17). (4) RUNTIME:
+# %async-lift-guest-body lowered the caller's params with
+# (if async-p 4 16) — MAX_FLAT_ASYNC_PARAMS (4) is the LOWER
+# direction's core-param rule; the LIFT's guest body lowers
+# into the CALLEE's core args with 16 always (async-5-param:
+# five flat slots; the 4-limit trap fired reaped at the next
+# drain — the error surfaced rows away from its row).
+# CanonicalABI.md: 3929 (task.return flatten), 2914-2929
+# (the async limits' direction), 3348-3350. GATES: units
+# 410/0, lane 1466/0/0/0, core 21187/0/73. ----

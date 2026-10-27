@@ -3473,7 +3473,7 @@ flat-sig helper handles the result-bearing case)."
     (t (cons '(:i32) '(:i32)))))
 
 
-(defun canon-builtin-flat-sig (imms state)
+(defun canon-builtin-flat-sig (imms state &optional (mem-opt nil))
   "The flat core sig of a canon BUILT-IN canonrec's immediate list
 IMMS, with STATE resolving task.return's result type references.
 task.return's (result $t)? flattens the single result's types into
@@ -3507,7 +3507,10 @@ flat params)."
                                     (%flat-type-list x state))
                                    '()))
                              results)))
-          (cons (or flat '()) '()))
+          (if (and mem-opt (> (length flat) 1))
+              ;; the memory path: the single [ptr] out-param
+              (cons '(:i32) '())
+              (cons (or flat '()) '())))
         (builtin-canon-sig kind imms))))
 
 (defun %canon-core-func-sig (comp core-idx)
@@ -4041,7 +4044,15 @@ task-return shapes are a later slice."
                        (%verr "canonical option `realloc` is required"))))
               (:lower (unless mem
                         (%verr "canonical option `memory` is required")))))
-          (when (> nresults 1)
+          ;; M13-lad (cross-abi-calls ::69): the ASYNC lift's core
+          ;; functype never carries the results — they return via
+          ;; task.return's canon (whose own flat params carry the
+          ;; memory discipline; %flat-functype :lift/async yields
+          ;; the packed [:i32] or []). The `memory` requirement on
+          ;; flattened results applies to the SYNC lift only.
+          (when (and (> nresults 1)
+                     (not (and (%opt opts :async)
+                               (eq context :lift))))
             (ecase context
               (:lift (unless mem
                        (%verr "canonical option `memory` is required")))
@@ -7893,7 +7904,34 @@ the number of enclosing component/type scopes (outer aliases)."
                                     (t (cons :canon-sig
                                              (canon-builtin-flat-sig
                                               (canonrec-imms payload)
-                                              state))))))))
+                                              state
+                                              ;; M13-lad: the memory
+                                              ;; canonopt rides the
+                                              ;; sig (the [ptr]
+                                              ;; collapse). The
+                                              ;; BUILTIN canon's opts
+                                              ;; live in the canonrec's
+                                              ;; OWN opts slot (the
+                                              ;; binary reader) or,
+                                              ;; for task.return, the
+                                              ;; TEXT parser's imms'
+                                              ;; THIRD slot (the
+                                              ;; %task-return-opts
+                                              ;; convention) — never
+                                              ;; the third of a
+                                              ;; NON-task-return imms
+                                              ;; (context.get's nat)
+                                              (%opt (or (canonrec-opts
+                                                         payload)
+                                                        (and (eq
+                                                              (first
+                                                               (canonrec-imms
+                                                                payload))
+                                                              :task-return)
+                                                             (third
+                                                              (canonrec-imms
+                                                               payload))))
+                                                    :memory)))))))))
                         (incf (cval-core-funcs state)))))
                  (:import
                   (%check-externname (importrec-name payload) state t)
