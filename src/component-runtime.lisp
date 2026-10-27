@@ -2145,8 +2145,33 @@ reentrance phase checks). The CALLER then waits:
                                         ty))))
                              (if (wasmdown.component:ct-resourcetype-p
                                  rt)
-                                 (let ((rep (%handle-rep caller rt a)))
-                                   (or rep a))
+                                 (let* ((rep (%handle-rep caller rt a))
+                                        ;; M13-lad §2834/§3690: the SYNC
+                                        ;; lower of a borrow LENDS like
+                                        ;; the async branch — a borrow
+                                        ;; handle is added to the
+                                        ;; CALLEE-DEFINING table (SELF)
+                                        ;; and the callee's core gets
+                                        ;; ITS index — ONLY for an
+                                        ;; ASYNC-TYPED callee (the
+                                        ;; cross-task shape: the callee
+                                        ;; holds the handle across a
+                                        ;; task boundary and drops it
+                                        ;; from another task). A SYNC-
+                                        ;; typed callee ($C's rep/dtor
+                                        ;; funcs — the §2834 same-
+                                        ;; implementor optimization)
+                                        ;; takes the REP positionally;
+                                        ;; lending there broke ::2 (the
+                                        ;; identity rep func returned
+                                        ;; the index)
+                                        (bi (and rep
+                                                 (third
+                                                  (wasmdown.component:ct-payload
+                                                   ft))
+                                                 (%handle-add self rt
+                                                              rep nil))))
+                                   (or bi rep a))
                                  a))
                            a))))
                (or params '())
@@ -2654,40 +2679,77 @@ TARGET's space."
                             (ai 0))
                         (loop for vt in ts
                               do (let ((c (%abi-ct vt ft-inst)))
-                                   (if (and (wasmdown.component:ct-p
-                                             c)
-                                            (member
-                                             (wasmdown.component:ct-kind
-                                              c)
-                                             '(:stream :future)))
-                                       (progn
-                                         (push (%lift-async-end
-                                                acx (nth ai args))
-                                               vals)
-                                         (incf ai))
-                                       (let* ((pflat
-                                                (%flat-type-of vt
-                                                               ft-inst))
-                                              (n (length pflat))
-                                              (vi (make-array
-                                                   16 :fill-pointer 0
-                                                   :adjustable t)))
-                                         (loop for k below n
-                                               do (vector-push-extend
-                                                   (cons (nth ai args)
-                                                         (nth k pflat))
-                                                   vi)
-                                                  (incf ai))
-                                         (push (first
-                                                (%abi-lift-values
-                                                 cx 16 vi (list vt)))
-                                               vals)))))
+                                   (cond
+                                    ((and (wasmdown.component:ct-p c)
+                                          (member (wasmdown.component:ct-kind c)
+                                                  '(:stream :future)))
+                                     (push (%lift-async-end acx (nth ai args))
+                                           vals)
+                                     (incf ai))
+                                    ;; M13-lad §2834/§3690: the (borrow $R)
+                                    ;; param LENDS — resolve the index on
+                                    ;; the CALLER's table (INST: the
+                                    ;; lowering side, where the source
+                                    ;; handle lives), add a borrow handle
+                                    ;; to the CALLEE-DEFINING table
+                                    ;; (FT-INST: the local shape the
+                                    ;; callee's resource arms resolve
+                                    ;; against), pass ITS index to the
+                                    ;; callee's core; the num-borrows
+                                    ;; counts the lend on the current task
+                                    ;; until the call returns (§3690 — the
+                                    ;; SYNC case has no subtask; the
+                                    ;; call's own unwind below decrements).
+                                    ;; The raw-index pass-through was the
+                                    ;; M11b gap (::4: the callee's R-drop
+                                    ;; hit whatever sat at the raw index).
+                                    ((and (wasmdown.component:ct-p c)
+                                          (eq (wasmdown.component:ct-kind c) :borrow)
+                                          (integerp (wasmdown.component:ct-payload c))
+                                          (< (wasmdown.component:ct-payload c)
+                                             (length (comp-instance-types ft-inst)))
+                                          ;; ONLY an ASYNC-TYPED callee: the
+                                          ;; cross-task shape (the callee
+                                          ;; holds the handle across a
+                                          ;; task boundary). A SYNC-typed
+                                          ;; callee ($C's rep/dtor — the
+                                          ;; §2834 same-implementor case)
+                                          ;; takes the REP positionally;
+                                          ;; lending there broke ::2 (the
+                                          ;; identity rep func returned
+                                          ;; the index)
+                                          (third (wasmdown.component:ct-payload ft)))
+                                     (let* ((rt-idx (wasmdown.component:ct-payload c))
+                                            (rt (aref (comp-instance-types ft-inst) rt-idx))
+                                            (rep (%handle-rep inst rt (nth ai args)))
+                                            (bi (and rep (%handle-add ft-inst rt rep nil))))
+                                       (when bi
+                                         (incf (async-task-num-borrows *current-task*)))
+                                       (push bi vals)
+                                       (incf ai)))
+                                    (t
+                                     (let* ((pflat (%flat-type-of vt ft-inst))
+                                            (n (length pflat))
+                                            (vi (make-array 16 :fill-pointer 0 :adjustable t)))
+                                       (loop for k below n
+                                             do (vector-push-extend
+                                                 (cons (nth ai args) (nth k pflat))
+                                                 vi)
+                                                (incf ai))
+                                       (push (first (%abi-lift-values cx 16 vi (list vt)))
+                                             vals))))))
                         (nreverse vals)))))
               ;; NOTE: no APPLY — %call-component-func-list takes the
               ;; args LIST as its third parameter (an EMPTY list
               ;; would be swallowed by apply's spread)
-              (res (%call-component-func-list inst fidx
-                                              component-args)))
+              (res (unwind-protect
+                        (%call-component-func-list inst fidx
+                                                  component-args)
+                     ;; §3690: the sync case's lent borrows are logically
+                     ;; returned when the call returns
+                     (when (and *current-task*
+                                (> (async-task-num-borrows *current-task*) 0))
+                       (decf (async-task-num-borrows *current-task*))))))
          (if (or core-result result)
              (list
               (if (and (consp res) (eq (first res) :own-handle))
@@ -2737,6 +2799,7 @@ TARGET's space."
                                                  result-ct)))))
                       res)))
              '()))))))
+
 
 (defun %call-component-func-list (inst fidx args)
   "Like %call-component-func but takes the args as a LIST (the lower

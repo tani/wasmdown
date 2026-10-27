@@ -336,3 +336,39 @@
 # %call-async-funcinst:5235; INVOKERS %task-return:3612 +
 # %task-cancel:3633 (both take the task from the closure; a
 # :cancelled arg cannot produce the set). ----
+# ---- M13 ladder RESOLVED (2026-10-27): drop-cross-task-borrow
+# ALL 7 ROWS GREEN — THE FIXTURE ENTERS THE LANE (the
+# denominator 1410 -> 1417). THE FIX (the complete chain, per
+# the decoded layers): (1) the %handle-remove/%handle-rep
+# CLASS GUARDS (the single-namespace table's stale-index
+# discipline — a resource op on a reused slot TRAPS 'wrong
+# resource type' instead of the raw (caar set) type-error);
+# (2) the ASYNC lower's (borrow $R) LEND (§2834/§2838): the
+# param's i32 resolves on the LOWERING CALLER's table, a
+# borrow handle (own=false) is added to the CALLEE-DEFINING
+# table (the LOCAL SHAPE — our async-callee rebind at 5337
+# and the resource arms' captured-inst resolution BOTH point
+# there), the callee's core receives ITS INDEX, the task's
+# num-borrows counts the lend, and the subtask's LENDERS slot
+# (the dead M11b field — §1446's accounting home) records the
+# lending task so deliver_resolve decrements it (the
+# 'outstanding borrows' trap at the callee's resolution was
+# the missing decrement); (3) the SYNC lower's walk
+# (%lower-host-func's positional walk — NOT
+# lifted-func-call's) carries the SAME lend, guarded to
+# ASYNC-TYPED callees only (the §2834 same-implementor case:
+# a SYNC-typed callee takes the REP positionally — lending
+# there broke ::2, the identity rep func returned the index),
+# with the call's own unwind-protect decrementing (§3690: the
+# sync case has no subtask; the borrows return when the call
+# returns). THE DECODED LAYERS (the six error-message
+# transitions, each one fix): wrong-resource-type (the
+# guards) -> 'outstanding borrows' (the lenders accounting)
+# -> invalid index 10/11 (the rep-passing shape) -> invalid
+# index 2 (the caller's-table lend) -> unreachable (the
+# unguarded sync lend) -> ::4's 'invalid index 1' (the sync
+# walk's missing branch) -> ALL GREEN. THE HARNESS
+# SUBTLETY (for the record): the census's original message
+# was the harness's swallowed condition — the raw type-error
+# never reached the runner's taxonomy; the *break-on-signals*
+# backtrace was the only window. ----

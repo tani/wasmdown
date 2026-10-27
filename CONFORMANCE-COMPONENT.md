@@ -15,15 +15,15 @@ Baseline measurement, not a release gate (PLAN.md §12.8).
 
 | Outcome | Count |
 | --- | --- |
-| pass | 1410 |
+| pass | 1417 |
 | fail | 0 |
 | skip | 0 |
 | unsupported | 0 |
 | timeout | 0 |
 | harness-error | 0 |
-| **total** | **1410** |
+| **total** | **1417** |
 
-Executed: 1410 commands; pass rate 100.0%.
+Executed: 1417 commands; pass rate 100.0%.
 
 ## Per-file counts
 
@@ -38,6 +38,7 @@ Executed: 1410 commands; pass rate 100.0%.
 | component/cross-task-future.wast | 2 | 0 | 0 | 0 |
 | component/deadlock.wast | 2 | 0 | 0 | 0 |
 | component/dont-block-start.wast | 2 | 0 | 0 | 0 |
+| component/drop-cross-task-borrow.wast | 7 | 0 | 0 | 0 |
 | component/drop-stream.wast | 5 | 0 | 0 | 0 |
 | component/drop-subtask.wast | 3 | 0 | 0 | 0 |
 | component/drop-waitable-set.wast | 2 | 0 | 0 | 0 |

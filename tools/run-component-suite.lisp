@@ -111,7 +111,8 @@ parent dir), not the first (the grandparent 'component' — the old
                                  "cancel-delivery.wast"
                                  "idle-drop.wast"
                                  "switch-to-ready-callback.wast"
-                                 "sync-barges-in.wast")
+                                 "sync-barges-in.wast"
+                                 "drop-cross-task-borrow.wast")
                                :test #'string=)))
                 (or (directory (merge-pathnames
                                 "tests/component/async/*.wast" *root*))
