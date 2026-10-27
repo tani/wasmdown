@@ -6,8 +6,8 @@
 ./async/big-interleaving-test.wast
 ./async/cancel-subtask.wast
 ./async/cancel-targeted-resume.wast
-./async/partial-stream-copies.wast
 ./async/passing-resources.wast
+./async/partial-stream-copies.wast
 ./async/reentrance.wast
 ./async/sync-streams.wast
 # ---- M12 session 12 (2026-10-27): THE ATOMIC EXIT LANDED (a
@@ -1775,4 +1775,26 @@
 # passing-resources' fixture is fully green (its 3 rows) and
 # READY TO LAND (the un-park + the whitelist entry as the next
 # gate); NOT COMMITTED (the parent commits at green).
+# ----
+# ---- M13-tok session 30 (2026-10-28): THE UN-PARK GATE —
+# passing-resources LANDED at the 1472 denominator. The lane
+# 1472/0 x3 + the 10-run FAILROW probe 9/10 GREEN (the 1 fail:
+# cross-abi-calls::40 — the known flake class at the floor,
+# each occurrence a DIFFERENT row; the follow-up 6 runs: 5
+# GREEN + 1 the same class) + 3 more green at the close; units
+# 410/0; core 21187/0/73. The fixture's 3 rows enter the lane
+# (the own-transfer chain's fixture: the resource crosses the
+# stream with its rep; the borrow crosses the call; the
+# builtin drops through the borrowed record).
+# THE REMAINING RUNGS (the census's order, each its own
+# decode): cancel-subtask ::1, cancel-targeted-resume's 3
+# rows, partial-stream-copies ::1 (the timing-window class);
+# the cancel-resumed-callback-switch ::3 window probe (the
+# row-window print in the lane); big-interleaving-test's last
+# 3; trap-if-block ::34 (the capture loop); the reentrance
+# outstanding-IO distinguisher; the deferral's re-attack
+# (parked with the notify-path instrumentation shape).
+# THE STATE at the close: the tree = the un-park (the nyi line
+# removed + the member entry) + this ledger; NOT COMMITTED
+# (the parent commits at green).
 # ----
