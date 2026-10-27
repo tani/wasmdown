@@ -542,3 +542,57 @@
 # sync_middle-exclusive-across-the-pack-wait cycle is the
 # machinery's real deadlock: release it (the M12 pattern) with
 # the correct holder identity. ----
+# ---- M13-tok session 3 (2026-10-27): THE REBUILD — three gates
+# built and measured to the CLOSEST state yet (the fixture's exact
+# pack shape achieved once: 0x21/0x31/0x40/0x50 + the stores
+# 3@12/4@16/5@20 ordered), then reverted at the budget's end (the
+# final flet restructure regressed the packs; the committed gate-1
+# baseline re-verified green: units 410/0, lane 1466/0/0/0, core
+# 21187/0/73). THE THREE INPUTS, MEASURED: (1) THE EXCLUSIVE
+# RELEASE (gate A) — releasing around the pack's STARTED-wait
+# OVER-ADMITS: the 3rd/4th $SyncMiddle bodies admit to STARTED
+# where the fixture pins STARTING (0x41/0x51, the run body's
+# checks); REVERTING it (the exclusive held across the wait) gave
+# THE CORRECT PACKS — the session-2 deadlock does NOT return
+# because the START TURNSTILE is REMOVED (the cycle needed it).
+# (2) THE NUDGE'S GATE-GRANT (gate B) — a real wake-count for
+# gate-parked waitcondition parkers: built, benign. (3) THE
+# ORPHAN CLEANUP: built, benign. THE DISCOVERED RULES (the
+# rebuild's real yield): (a) THE PER-FUNC CONCURRENCY CAP — the
+# auto-backpressure is PER LIFTED FUNC (the task's ft), NOT
+# instance-wide: the instance-wide cap deadlocks ($unblock's
+# callee shares $AsyncInner with the $blocking-calls but must
+# run while they are in flight — the cap that only their exit
+# could open); the per-func cap gives the fixture's shape (the
+# first pair admit 0x21/0x31, the second park 0x40/0x50) AND
+# row 2 PASSED with it. (b) THE START TURNSTILE IS UNNECESSARY —
+# the path-ordered FIFO on the shared instance orders the
+# (1 x 1) cousins regardless of the bodies' start order (the
+# paths are inherited); the turnstile was the deadlock maker
+# (session-2's cycle). (c) THE ARRIVAL SET (the en-route consult)
+# is needed for the CROSS-INSTANCE body race ((1 3)/(1 4) park
+# at DIFFERENT sync_middles; the later body's callee can reach
+# the shared gate first) — but its blocking must be
+# SIBLING-DISCRIMINATED (same path length + same level-1
+# ancestor): a plain path-earlier check parks the unblock
+# callee (1 5) behind its longer-path cousins (the cap cycle
+# again). (d) THE YIELD-RELEASE SEMANTICS: keeping the exclusive
+# across the callback YIELD (no release) holds the 3rd/4th out
+# too STRONGLY (the 2nd callee also parks — 0x30, the 0x31
+# check fails); the release-at-yield is correct for the pair
+# admission, the CAP is what holds the 3rd/4th. THE REMAINING
+# GAP at revert: the 3rd pack observed 0x41 in the final flet
+# restructure (the sibling consult passed because the 1st body's
+# arrival entry exited at its admission — the 3rd body's
+# admission raced the 1st body's EXIT; the exclusive was free)
+# — the pack's exit conditions (resolved/started/gate-parked)
+# have NO exit for the callee-still-en-route case, and the
+# SYNC-LOWER-BLOCKS rule means the 1st body holds its
+# sync_middle UNTIL ITS BLOCKING-CALL RESOLVES (after $unblock)
+# — the 0x41 means the 1st body exited early (its sync lower
+# returned before the resolution — THE NEXT PROBE: trace
+# %lower-host-func's block-wait for the 1st pair; the M11 sync
+# lower must block until (1 1 1) resolves, and (1 1 1) resolves
+# only after unblock — if the 1st body exits before unblock,
+# THE SYNC LOWER'S BLOCK IS BROKEN for the async-typed callee
+# case, and THAT is the next session's first gate). ----
