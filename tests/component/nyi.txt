@@ -1090,3 +1090,39 @@
 # only the ledger (no runtime changes remain from this
 # session).
 # ----
+# ---- M13-tok session 14 (2026-10-27): THE SYNC-STREAMS
+# WHO-READS-THE-TX QUESTION CLOSED — IT WAS A TRACE MISREAD;
+# the real root found by the interp backtrace probe: THE SET'S
+# CALLEE'S SYNC READ RETURNS EARLY (a stale/wrong pending
+# event) and its own 0x40 check traps. The session's evidence
+# chain:
+# 1. THE TRANSFER IS CORRECT (the add/lift/lower traces with
+#    instance ids): the get's rx -> the run (slot 1), the
+#    second pair (rx slot 1 re-used, tx slot 2), the set's
+#    param lift (the run's slot 1) -> the lower into $C's
+#    freed slot 2 — the object IS the second reader (the
+#    %lower-async-end's index re-assignment 1->2 made the
+#    earlier copy trace LOOK like 'a read on the tx' — the
+#    index is the CURRENT-table slot, mutated by the
+#    transfer; nobody reads the tx).
+# 2. THE COPY/EVENT FLOW: the get's write (DROPPED 0x41 ok),
+#    the run's read (COMPLETED 0x40 + the data ok), the set's
+#    read (the third copy, blocks awaiting the write) — all
+#    correct to that point. THE RUN'S SECOND WRITE'S COPY
+#    NEVER RAN (only 3 bufmakes).
+# 3. THE INTERP BACKTRACE at the unreachable: the trap is THE
+#    SET'S CORE'S OWN (i32.ne 0x40 ret) CHECK — the read
+#    RETURNED EARLY (the pending-event branch: the reader had
+#    an event at the read; or the sync wait returned without
+#    the event) with a payload != 0x40 — the operand stack
+#    #(17 8589934593 1 2 20 0 0) shows the fresh stream.new
+#    pair (0x200000001) on the set's frame.
+# THE NEXT PROBE: the stale/wrong pending event on the
+# transferred reader — the candidates: the second reader
+# CARRIES an event from the first round's notifies (the
+# (:NOTIFY 1 4)/(:NOTIFY 2 4) pair reached the WRONG ends via
+# the index re-use?), or the sync wait's wake fired without
+# the event (a lost-wake/nudge-only class).
+# THE STATE at the close: the probe reverted (the lane 1469/0
+# x3 + units 410/0 re-verified); the tree = the ledger only.
+# ----
