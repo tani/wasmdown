@@ -58,6 +58,51 @@
 ./async/partial-stream-copies.wast
 ./async/passing-resources.wast
 ./async/reentrance.wast
+# ---- M12 session 12 (2026-10-27): THE ATOMIC EXIT LANDED (a
+# strictly-safer read) — the flake class did NOT collapse; THE
+# M12 CLOSE-OUT CALL per the standing criterion (units 410/0;
+# lane 1396/0/0/0 x3; core 21187/0/73 — all green with the
+# change in). THE CHANGE (one gate): the STARTED-wait's exit and
+# the state read are now ATOMIC — (state, resolved) captured
+# TOGETHER under the CALLEE TASK's mutex (the same lock
+# %task-return holds when it flips resolved-p) and the pack
+# reads the captured values (no second read). The exit-to-read
+# window is closed by construction. THE MEASUREMENT: reentrance
+# cmd18 UNCHANGED (8/8 — the race is NOT the exit window);
+# cmd14 at its 1/10 baseline; acs at its baseline. THE COMPLETE
+# NEGATIVE-RESULT CHAIN (sessions 6-12): (1) the post-OnStart
+# yield-park — regressed cmd14 7/8; (2) the before-OnStart pack-
+# mark hold — deadlocked the nested-async pins (the wait's own
+# STARTED exit vs the held OnStart tie); (3) the post-OnStart
+# BARE-SPIN hold — regressed cmd14 8/8; (4) the NO-WAIT pack +
+# OnStart hold — regressed cmd14+cmd18+cmd20 all 8/8 (and the
+# session-11 correction: the wait loop IS the spec's embedder
+# freedom, its three exits = the three fixture shapes); (5) the
+# atomic exit — no change. THE CONCLUSION (the close-out's
+# hand-off): the residual is the GENUINE EMBEDDER-CHOICE
+# problem — T9's flow needs a DETERMINISTIC interleave that
+# only the full TOKEN SCHEDULER (one un-parked guest turn at a
+# time, the tick as the only grant) can provide; every
+# single-boundary intervention either breaks the three-exit
+# freedom or the direct-invoke path. THE M12 LANDED INVENTORY
+# (for the docs rollforward): the nested-sync-call handshake
+# (the fresh executor + the drain loop, SS3538-3543); the
+# two-park split (suspend SS494 vs yield SS523) + the nudge/
+# resume split (the spawn-thunk firing moved to resume only,
+# SS4590); the resume-later traps (SS4605-4610); the zombie-
+# join teardowns (both oracle paths, SS3552) + the abandoned
+# park-gate; the atomic pack exit; 2 pins (sync-lift-thread-
+# context, suspend-vs-yield-determinism); the lane 1296 ->
+# 1396 (+100 rows: the during-sync family 52, trap-if-block-
+# and-sync 48). THE REMAINING nyi (the next milestone's ladder
+# with M12's evidence): the sequential-schedule family (acs 3,
+# reentrance 25 — cmd18's token-design need recorded), cancel-
+# targeted-resume 10, cancel-subtask 4, cancel-delivery 4,
+# cancel-resumed-callback-switch 4, the three single-row
+# fixtures, cross-abi-calls 49, big-interleaving-test 57,
+# idle-drop 38, passing-resources 3, switch-to-ready-callback
+# 17, sync-barges-in 3, drop-cross-task-borrow 7, T10's leak
+# (the non-oracle completion path's 4 threads). ----
 # ---- M12 session 11 (2026-10-27): THE NO-WAIT PACK MEASURED AND
 # REVERTED — THE STARTED-WAIT IS SPEC-CORRECT AFTER ALL (the
 # session-10 re-derivation CORRECTED; the tree stays at 8085c62's

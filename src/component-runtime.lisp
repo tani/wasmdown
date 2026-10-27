@@ -4894,7 +4894,8 @@ is the valtype."
          ;; so WAIT for the STARTING->STARTED transition (or the
          ;; eager resolve) before packing. A sync-typed inline
          ;; callee resolves before reaching here (no wait).
-         (let ((eager-p nil))
+         (let ((eager-p nil)
+               (packed-state 0))
            (unless (%subtask-resolved-p subtask)
              (loop
                with cycles = 0
@@ -4904,13 +4905,18 @@ is the valtype."
                           (async-subtask-task subtask)))
                do (async-thread-resume-all)
                   (sleep 0.001))
-             ;; the STARTED transition may race the callee's own
-             ;; callback turn (an already-pending event resolves the
-             ;; task on the callee's thread before we pack): the
-             ;; embedder's schedule hands the caller STARTED and the
-             ;; resolution arrives as the subtask's EVENT — only a
-             ;; resolution observed BEFORE the wait exited is eager
-             (setf eager-p (%subtask-resolved-p subtask)))
+             ;; THE ATOMIC EXIT (session-11's refined candidate): the
+             ;; loop's exit and the state read were TWO steps — the
+             ;; callee could RESOLVE between them, and the pack then
+             ;; observed RETURNED where the fixture pins STARTED
+             ;; (reentrance cmd18, ~10/10). Capture the pair TOGETHER
+             ;; under the CALLEE TASK's mutex (the same lock
+             ;; %task-return holds when it flips resolved-p) and pack
+             ;; from the captured values — no second read.
+             (let ((ctask (async-subtask-task subtask)))
+               (sb-thread:with-recursive-lock ((async-task-mutex ctask))
+                 (setf packed-state (async-subtask-state subtask)
+                       eager-p (%subtask-resolved-p subtask)))))
          (if eager-p
              ;; the EAGER case (§3714-3717): resolved before return
              (progn
@@ -4934,7 +4940,7 @@ is the valtype."
                            (error (cdr fr))))
                        (list 1 subtaski          ; EventCode.SUBTASK
                              (async-subtask-state subtask))))
-               (list (logior (async-subtask-state subtask)
+               (list (logior packed-state
                              (ash subtaski 4)))))))))))
 
 (defun %call-async-funcinst (f component-args &key on-start on-resolve)
