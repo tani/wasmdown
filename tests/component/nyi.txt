@@ -1414,3 +1414,34 @@
 # THE STATE at the close: the un-park reverted; the tree = the
 # ledger only.
 # ----
+# ---- M13-tok session 21 (2026-10-27): THE STALE-RATE RUNGS'
+# OPENING MEASUREMENT at the join build (standalone): NONE
+# closed en passant — cancel-subtask 1 fail (::1
+# 'unreachable executed'), cancel-targeted-resume 3, partial-
+# stream-copies 1, passing-resources 1 (::1 'The value NIL is
+# not of type REAL'). All remain nyi'd with fresh evidence.
+# THE PASSING-RESOURCES DECODE (in progress, the evidence
+# recorded): the row's NIL is the RESOURCE element's own-
+# transfer through the stream copy — the fixture writes two
+# (own R) resources into the stream, the consumer reads 1
+# (the async stream.read canon), and the R.foo(res1) call
+# finds the resource's rep NIL — the resource reached the
+# consumer's table but its REP is gone (or the handle resolved
+# to an empty slot). THE COPY CHAIN to probe next: the
+# %end-copy case 3 (the reader's %buffer-take of the (own R)
+# element -> the %abi-load of the resource handle at the
+# producer's memory ptr -> the resource's own-load (the
+# handle REMOVE from the producer's table + the value) ->
+# %buffer-put into the consumer's buffer -> the consumer's
+# %abi-load of the transferred handle -> the R.foo lookup).
+# The NIL rep points at the own-load/lift arm (the resource's
+# %abi-load :own case) or the transfer's handle re-add losing
+# the rep — the next session's probe: trace the %buffer-take/
+# put + the resource's %abi-load at the read.
+# THE OTHER RUNGS' fresh evidence: cancel-subtask ::1's
+# 'unreachable' (the same checks class); cancel-targeted-
+# resume's 3 rows; partial-stream-copies' ::1 — each needs its
+# own decode next (the census notes have the row shapes).
+# THE STATE at the close: the lane 1469/0 x3 (the committed
+# baseline unchanged), units 410/0; the tree = the ledger only.
+# ----
