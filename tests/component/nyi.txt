@@ -1,10 +1,10 @@
 # See README.md
+./async/cancel-resumed-callback-switch.wast
 ./validation/kebab.wast
 ./values/post-return.wast
 ./values/variants.wast
 ./async/big-interleaving-test.wast
 ./async/cancel-subtask.wast
-./async/cancel-resumed-callback-switch.wast
 ./async/cancel-targeted-resume.wast
 ./async/partial-stream-copies.wast
 ./async/passing-resources.wast
@@ -1378,4 +1378,39 @@
 # THE STATE at the close: the tree = the join (the native slot
 # + the 3 spawn-site setfs + the teardown's collect-and-join)
 # + the ledger; NOT COMMITTED.
+# ----
+# ---- M13-tok session 20 (2026-10-27): THE UN-PARK GATE
+# MEASURED AND HELD — cancel-resumed-callback-switch's lane
+# rate at the join build is 7/10 green + 3/10 with a mixed
+# fail set (::3 twice, ::1+::3+switch-to-ready-callback::8
+# once) — the 10-run FAILROW standard NOT met; the un-park
+# REVERTED (the lane back at 1469/0 x3 + units 410/0).
+# THE MEASUREMENT CHAIN:
+# 1. STANDALONE at the join build: 20/20 + 10/10 green (the
+#    fixture is correct alone — confirmed twice).
+# 2. THE LANE at the un-park (the 1473 denominator): x3 green
+#    then the 10-run FAILROW probe: 7/10 GREEN, 3/10 with
+#    ::3 ('unreachable' — the BLOCKED/ran/state checks class)
+#    and one run with ::1+::3+switch-to-ready-callback::8.
+# 3. THE RESIDUAL CLASS: the teardown join closed the unwind
+#    storm (session 19's fix: the ~3-in-6 class) but a NARROWER
+#    lane-only window remains for this fixture's deep switch
+#    shape (the cancel's callback's suspend-then-resume to the
+#    holder's explicit thread + the two blocked tasks) — the
+#    interference is no longer the predecessors' DYING threads
+#    but a timing coupling the join's own blocking shape may
+#    contribute (the teardown's joins delay the next fixture's
+#    start; the fixture's START timing shifts its internal
+#    races).
+# THE NEXT PROBE (the next session): the fixture's lane-only
+# ::3 window — run the lane with the fixture's own row-window
+# print (the run's task paths + the switch's grants) to see
+# WHICH check trips; the candidate: the subtask.cancel's
+# BLOCKED return racing the switch-back (the fixture's own
+# comment: 'control flows back out through subtask.cancel,
+# which reports BLOCKED because the cancelled task has not
+# resolved' — the resolved-yet window again, the
+# resolve-stash class's cousin).
+# THE STATE at the close: the un-park reverted; the tree = the
+# ledger only.
 # ----
