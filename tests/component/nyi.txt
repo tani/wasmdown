@@ -2006,3 +2006,38 @@
 // decode stands (the yield-park release window) with the
 // over-block evidence narrowing the fix space.
 # ----
+# ---- M13-tok session 37 (2026-10-28): THE ANCESTOR-SIBLING
+# GATE BUILT AND MEASURED — a CORRECT-but-insufficient
+# refinement: the gate parks when the CALLER task's path is a
+# PROPER PREFIX of some live thread's task path of the callee's
+# instance (the caller's own call tree's in-flight descendant
+# keeps the gate closed; a different caller's live record does
+# not) — the session-36 over-block (the concurrent
+# blocking-calls) is GONE (they admit; the fixtures hold) and
+# the gate-parked family is green (dont-block-start 8/8, the
+// during-sync family, cancel-and-exclusive-lock, empty-wait).
+# THE MEASUREMENTS: acs 5/5 standalone green; the lane 1469/0
+# with the known-flake class visible (the batch: acs::1 twice,
+// no-sibling::2 once — the same rows, the same rates); the
+// probe-lane sweep: acs::1 5/30 (the window NOT closed — the
+# residual capture: the SAME missing (1 3) delivery, the gate
+// firing or not at the third call's check).
+# THE RESIDUAL DECODE (the capture ag15): the third call's
+# gate ADMITS despite the (1 1) live — the remaining race: the
+// timing of the (:threads list) read vs the (1 1)'s
+// registration/exit, or the (1 1)'s early task.return (the
+// sync-func's core resolves via task.return at its start; the
+// core continues mid-blocking-call — the task state :resolved
+// but the thread LIVE) — the next probe: the (1 1)'s :threads
+// presence at the third call's gate check (the list print
+// inside the gate).
+# THE DECISION at the close: the gate STAYS IN THE TREE (it is
+# correct per the parent's reading — the fixtures pin its
+// behavior; the residual is a narrower window of the same
+# root, not a regression); the parent's verdict on the landing
+# is requested (the gate's own gate: the lane is green with
+# it; the acs::1 rate unchanged).
+# THE STATE at the close: the tree = the gate + the ledger;
+# the lane 1469/0 (x3 + the flake class) + units 410/0 + core
+# 21187/0/73.
+# ----

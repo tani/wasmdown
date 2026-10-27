@@ -15,15 +15,15 @@ Baseline measurement, not a release gate (PLAN.md §12.8).
 
 | Outcome | Count |
 | --- | --- |
-| pass | 1469 |
-| fail | 0 |
+| pass | 1468 |
+| fail | 1 |
 | skip | 0 |
 | unsupported | 0 |
 | timeout | 0 |
 | harness-error | 0 |
 | **total** | **1469** |
 
-Executed: 1469 commands; pass rate 100.0%.
+Executed: 1469 commands; pass rate 99.9%.
 
 ## Per-file counts
 
@@ -36,7 +36,7 @@ Executed: 1469 commands; pass rate 100.0%.
 | component/cancel-not-delivered.wast | 2 | 0 | 0 | 0 |
 | component/cancel-stream.wast | 15 | 0 | 0 | 0 |
 | component/closed-stream.wast | 3 | 0 | 0 | 0 |
-| component/cross-abi-calls.wast | 49 | 0 | 0 | 0 |
+| component/cross-abi-calls.wast | 48 | 1 | 0 | 0 |
 | component/cross-task-future.wast | 2 | 0 | 0 | 0 |
 | component/deadlock.wast | 2 | 0 | 0 | 0 |
 | component/dont-block-start.wast | 2 | 0 | 0 | 0 |
