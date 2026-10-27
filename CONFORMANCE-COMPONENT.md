@@ -15,20 +15,21 @@ Baseline measurement, not a release gate (PLAN.md §12.8).
 
 | Outcome | Count |
 | --- | --- |
-| pass | 1466 |
+| pass | 1469 |
 | fail | 0 |
 | skip | 0 |
 | unsupported | 0 |
 | timeout | 0 |
 | harness-error | 0 |
-| **total** | **1466** |
+| **total** | **1469** |
 
-Executed: 1466 commands; pass rate 100.0%.
+Executed: 1469 commands; pass rate 100.0%.
 
 ## Per-file counts
 
 | File | pass | fail | unsupported | other |
 | --- | --- | --- | --- | --- |
+| component/async-calls-sync.wast | 3 | 0 | 0 | 0 |
 | component/builtin-trap-poisons-instance.wast | 8 | 0 | 0 | 0 |
 | component/cancel-and-exclusive-lock.wast | 2 | 0 | 0 | 0 |
 | component/cancel-delivery.wast | 4 | 0 | 0 | 0 |

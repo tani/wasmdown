@@ -134,6 +134,15 @@ parent dir), not the first (the grandparent 'component' — the old
                                  "switch-to-ready-callback.wast"
                                  "sync-barges-in.wast"
                                  "drop-cross-task-borrow.wast"
+                                 ;; M13-tok11 (the family ladder):
+                                 ;; async-calls-sync — the acs
+                                 ;; interleave (the four concurrent
+                                 ;; sync-func calls' backpressure
+                                 ;; pin) is DETERMINISTIC under the
+                                 ;; aging quantum + the path key.
+                                 ;; The 10-run FAILROW probe 10/10;
+                                 ;; the lane green with it in.
+                                 "async-calls-sync.wast"
                                  ;; M13-lad: the cross-ABI
                                  ;; signature/memory-collapse family
                                  ;; (49 rows: the task.return

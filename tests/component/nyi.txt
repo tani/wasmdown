@@ -10,7 +10,6 @@
 ./async/passing-resources.wast
 ./async/reentrance.wast
 ./async/sync-streams.wast
-./async/async-calls-sync.wast
 # ---- M12 session 12 (2026-10-27): THE ATOMIC EXIT LANDED (a
 # strictly-safer read) — the flake class did NOT collapse; THE
 # M12 CLOSE-OUT CALL per the standing criterion (units 410/0;
@@ -1011,4 +1010,35 @@
 # THE UN-PARKS (the whitelist's both sides, per the acs
 # landing's mechanism): cancel-not-delivered + switch-to-ready-
 # callback — the lane denominator back to 1466.
+# ----
+# ---- M13-tok session 12 (2026-10-27): THE FAMILY LADDER
+# RUNG 5 — acs RE-LANDED (the session-10 landing had never been
+# committed; the adjudication built without it). The 10-run
+# FAILROW probe 10/10; the lane 1469/0 x3 + units 410/0 at the
+# re-landing. THE LADDER RUNG 1 (reentrance) — the 10-run probe
+# at the post-resolve-stash build: 8x1-fail + 2x2-fail — WORSE,
+# NOT the predicted closure (the parent's hypothesis that the
+# resolve-stash fix closed the (1 5) window did not hold: the
+# sync-delivery was REVERTED at the session-10 close, so
+# reentrance is back to the raw state-read race — the row-18
+# fails are that race, unchanged). The sync-delivery's
+# re-landing needs its cancel-delivery::1 window re-measured
+# FIRST (the next session's opening probe).
+# THE sync-streams DECODE (rung 2, in progress, the evidence
+# recorded): the row's 'unreachable' is a HANDLE-TABLE
+# collision — the slot-level trace (the %handle-add-any /
+# %handle-free-slot hooks with instance ids): the second
+# stream.new RE-USES the freed slot 1 for its rx; the set
+# call's param lift frees the rx (slot 1) and the SUBTASK
+# takes slot 1; the set's param-rx transfers into $C's slot 2
+# (the get's tx slot, freed just before) — the adds/frees are
+# individually CORRECT per the trace; the residual mismatch:
+# the %end-copy trace shows a READ on the end with index 2
+# (the second pair's TX) where the set's callee should read
+# its transferred rx (index 1) — the WHO-reads-the-tx question
+# is the next probe (the candidates: the set's callee reading
+# the wrong slot, or the run's own read after a stale local).
+# THE LANE at the session close: 1469/0 x3, units 410/0, the
+# tree = the acs re-landing only (no runtime changes this
+# session).
 # ----
