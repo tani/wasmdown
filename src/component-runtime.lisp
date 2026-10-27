@@ -3548,11 +3548,17 @@ does not exist)."
 
 (defun %task-exit-implicit-thread (task)
   "Task.exit_implicit_thread (CanonicalABI.md 730): release the
-  exclusive lock and unregister the thread (the FIELDS local, like
-  the enter gate: getf-setf through the shared plist)."
+exclusive lock and unregister the thread (the FIELDS local, like
+the enter gate: getf-setf through the shared plist)."
   (let* ((th (async-task-implicit-thread task))
          (inst (async-task-inst task))
          (fields (%inst-async-fields inst)))
+    ;; the leaving record is marked :done — the lookups' dead-record
+    ;; filter: a removed-but-still-visible record (a stale list
+    ;; reference from a concurrent registration) must never resolve
+    ;; as a target (the ::34 self-resume was a prior row's caller
+    ;; record at a colliding index passing the filter)
+    (setf (async-thread-spawn-thunk th) :done)
     (setf (getf fields :threads)
           (remove th (getf fields :threads)))
     (sb-thread:with-recursive-lock (*scheduler-mutex*)
@@ -4578,7 +4584,13 @@ is the valtype."
         (let* ((fields (%inst-async-fields inst))
                (target nil))
           (dolist (th (getf fields :threads))
+            ;; §4605-4610: threads.get(i) returns the LIVE thread at
+            ;; index i — a :done record (fired and finished, or swept
+            ;; by the task-exit unfired-spawn teardown) is not a
+            ;; target; the spec's Table.get would not return it
             (when (and (async-thread-index th)
+                       (not (eq (async-thread-spawn-thunk th) :done))
+                       (not (async-thread-abandoned th))
                        (= (async-thread-index th) (first args)))
               (setf target th)))
           ;; §4605-4610: Table.get traps OOB/empty; §4609's
@@ -4852,7 +4864,12 @@ is the valtype."
               (error 'wasmdown:wasm-trap :kind :generic
                      :message "cannot switch to the current thread"))
             (dolist (th (getf fields :threads))
+              ;; threads.get(i) returns the LIVE thread at index i —
+              ;; a :done record (fired and finished, or swept by the
+              ;; task-exit unfired-spawn teardown) is not a target
               (when (and (async-thread-index th)
+                         (not (eq (async-thread-spawn-thunk th) :done))
+                         (not (async-thread-abandoned th))
                          (= (async-thread-index th) (first args)))
                 (setf target th)))
             ;; §4688/§4714 (canon_thread_{suspend,yield}_then_resume
