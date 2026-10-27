@@ -1042,3 +1042,51 @@
 # tree = the acs re-landing only (no runtime changes this
 # session).
 # ----
+# ---- M13-tok session 13 (2026-10-27): THE CANCEL-DELIVERY::1
+# WINDOW RE-MEASURED — the answer is NOT the window: the sync
+# delivery's wait SELF-DEADLOCKS the gated-callee round, and
+# the revert is final for this shape (the reentrance row 18
+# needs a DIFFERENT fix — the distinguisher decoded below).
+# THE MEASUREMENTS:
+# 1. THE BASELINE (HEAD, no sync delivery): cancel-delivery
+#    20/20 green (the (1 5) window from session 10 did NOT
+#    reproduce — the atomic resolve + the quantum's timing at
+#    the current build close it WITHOUT the wait).
+# 2. THE SYNC DELIVERY RE-APPLIED (the exact cancellable +
+#    lock-free shape): cancel-delivery 10/10 ROW-1 FAILS (the
+#    window is now the DEFAULT outcome — deterministic, not a
+#    window), reentrance 8x0 + 2x1 (unchanged — the wait did
+#    not even fix row 18 reliably), cancel-and-exclusive-lock
+#    10/10 green, cancel-subtask 10/10 green.
+# 3. THE NON-INTRUSIVE TRACE (globals, no I/O — the format
+#    hooks close this class by timing): the log's tail shows
+#    the ROOT: (:DELIVER (1 5) T) — the TASK_CANCELLED was
+#    DELIVERED — then (:DELIVER NIL) + (:PARK-YIELD) forever:
+#    the gated_cb received the cancel event, set its
+#    gated-delivered flag, and returned YIELD(1) per its own
+#    contract ('the read is still outstanding, so this task
+#    cannot resolve yet'); its subsequent NONE turns poll the
+#    waitable set and re-park — THE READ NEVER COMPLETES
+#    because the future's WRITE comes from the CANCEL'S OWN
+#    CALLER, which MY WAIT has parked — THE SELF-DEADLOCK.
+#    The fixture's design: the cancel returns BLOCKED, the
+#    caller proceeds, writes the future, and the callee then
+#    completes.
+# THE DISTINGUISHER (recorded for the next session): the
+# reentrance row 18's callee (the park task) resolves from the
+# CANCELLATION ALONE (its callback delivers -> task.cancel ->
+# resolved — no caller action needed); the gated callee's
+# resolution DEPENDS ON THE CALLER'S SUBSEQUENT WRITE. A
+# correct wait condition must see the callee's outstanding-IO
+# state (e.g. its joined-waitable's has-sync-waiter / the
+# pending future read) — the cancellation-only-resolvable
+# shape is the waitable one. THE REENTRANCE ROW 18's OWN
+# COMMENT supplies the fixture-side condition ('does not take
+# this instance's exclusive lock... park stays resumable while
+# this call is on the stack') but the runtime-side
+# outstanding-IO probe is the missing piece.
+# THE STATE at the close: the sync delivery REVERTED (the
+# lane 1469/0 x3 + units 410/0 re-verified); the tree carries
+# only the ledger (no runtime changes remain from this
+# session).
+# ----
