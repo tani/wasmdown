@@ -15,15 +15,15 @@ Baseline measurement, not a release gate (PLAN.md §12.8).
 
 | Outcome | Count |
 | --- | --- |
-| pass | 1396 |
-| fail | 0 |
+| pass | 1457 |
+| fail | 1 |
 | skip | 0 |
 | unsupported | 0 |
 | timeout | 0 |
 | harness-error | 0 |
-| **total** | **1396** |
+| **total** | **1458** |
 
-Executed: 1396 commands; pass rate 100.0%.
+Executed: 1458 commands; pass rate 99.9%.
 
 ## Per-file counts
 
@@ -31,6 +31,7 @@ Executed: 1396 commands; pass rate 100.0%.
 | --- | --- | --- | --- | --- |
 | component/builtin-trap-poisons-instance.wast | 8 | 0 | 0 | 0 |
 | component/cancel-and-exclusive-lock.wast | 2 | 0 | 0 | 0 |
+| component/cancel-delivery.wast | 4 | 0 | 0 | 0 |
 | component/cancel-not-delivered.wast | 2 | 0 | 0 | 0 |
 | component/cancel-stream.wast | 15 | 0 | 0 | 0 |
 | component/closed-stream.wast | 3 | 0 | 0 | 0 |
@@ -48,9 +49,12 @@ Executed: 1396 commands; pass rate 100.0%.
 | component/forward.wast | 95 | 0 | 0 | 0 |
 | component/future-completion-order.wast | 5 | 0 | 0 | 0 |
 | component/futures-must-write.wast | 14 | 0 | 0 | 0 |
+| component/idle-drop.wast | 38 | 0 | 0 | 0 |
 | component/same-component-stream-future.wast | 9 | 0 | 0 | 0 |
 | component/self-switch-traps.wast | 9 | 0 | 0 | 0 |
-| component/trap-if-block-and-sync.wast | 48 | 0 | 0 | 0 |
+| component/switch-to-ready-callback.wast | 17 | 0 | 0 | 0 |
+| component/sync-barges-in.wast | 3 | 0 | 0 | 0 |
+| component/trap-if-block-and-sync.wast | 47 | 1 | 0 | 0 |
 | component/trap-if-done.wast | 31 | 0 | 0 | 0 |
 | component/trap-if-sync-and-waitable-set.wast | 29 | 0 | 0 | 0 |
 | component/trap-if-transfer-in-waitable-set.wast | 5 | 0 | 0 | 0 |

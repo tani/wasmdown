@@ -3,18 +3,13 @@
 ./values/post-return.wast
 ./values/variants.wast
 ./async/big-interleaving-test.wast
-./async/cancel-delivery.wast
 ./async/cancel-resumed-callback-switch.wast
 ./async/cancel-subtask.wast
 ./async/cancel-targeted-resume.wast
 ./async/cross-abi-calls.wast
-./async/drop-cross-task-borrow.wast
-./async/idle-drop.wast
 ./async/partial-stream-copies.wast
 ./async/passing-resources.wast
 ./async/reentrance.wast
-./async/switch-to-ready-callback.wast
-./async/sync-barges-in.wast
 ./async/sync-streams.wast
 ./async/async-calls-sync.wast
 # ---- M12 session 12 (2026-10-27): THE ATOMIC EXIT LANDED (a
@@ -80,3 +75,45 @@
 # approximates parked=suspended pending a real blocked/ready
 # thread state (harmless in-lane today; the M12 scheduler work
 # should give the Thread record its spec states). ----
+# ---- M13 session 1 (2026-10-27): THE FULL CENSUS PROBED + 4
+# FILES LANDED GREEN (cancel-delivery 4, idle-drop 38,
+# switch-to-ready-callback 17, sync-barges-in 3 = +62 rows; the
+# four probed 3x each, 0 fails every run). THE CENSUS
+# RECLASSIFIES THE LADDER — not everything nyi'd is scheduler:
+# (a) VALIDATOR GAP, not scheduler: big-interleaving-test cmd0 —
+# 'instance not valid to be used as export' at the (instance
+# $types (export "event-kind" (type $driver "event-kind")) ...)
+# bag re-export; bisected to the INLINE-EXPORTS bag's alias
+# chain vs the vis-check (a minimal 5-line (component (component
+# $D (type $ek (enum "a")) (export $e "event-kind" (type $ek)))
+# (instance $driver (instantiate $D)) (instance $types (export
+# "event-kind" (type $driver "event-kind"))) (export "types"
+# (instance $types))) VALIDATES standalone but the same shape in
+# the full 892-line fixture fails — the walk mis-resolves the
+# bag's projected TYPE index in a component with >2 instances);
+# cross-abi-calls cmd0 — 'expected: (func)' (the (component
+# definition $C) with a nested (component $Bottom (component
+# $Top ...)) shape: the definition's stored source fails
+# re-parse; the component-definition strip leaves the inner
+# (component $Top ...) nested under $Bottom unbalanced). Both
+# are TEXT/VALIDATOR work, NOT the token scheduler.
+# (b) MECHANISM GAP, not scheduler: drop-cross-task-borrow ::2/
+# ::4/::6 — 'an ASYNC-WAITABLE-SET is not of type LIST' at
+# waitable-set.wait's delivery (a %wset-get-pending-event
+# path returns the set where an event list is expected — the
+# drop-cross-task BORROW transfer interacts with the pending-
+# event closure shape). (c) GENUINE sequential-schedule (the
+# token family, unchanged): acs run1 (0x21 eager race, 8/8
+# baseline), reentrance cmd18 (8/8), sync-streams, cancel-subtask,
+# cancel-targeted-resume ::1/::7/::9, cancel-resumed-callback-
+# switch ::1/::3, partial-stream-copies ::1, passing-resources
+# ::1. THE LANDED 4: cancel-delivery's 2 rows green WITHOUT the
+# scheduler (the reentrant-cancel path M11b built is already
+# deterministic); idle-drop ALL 26 rows (the idle stream/future
+# drop family needs no interleave); switch-to-ready-callback ALL
+# 8 rows (the two deadlock traps + the switch pins M11b landed);
+# sync-barges-in ALL 3 rows (the sync-typed reentrant barges:
+# the enter gate's non-async skip is exactly the spec's §681
+# non-async rule). NOTE: the M12 flake row (cancel-not-delivered
+# ::1, ~1-in-8) did NOT reappear in this session's runs — its
+# root-cause note (the token scheduler) stands. ----
