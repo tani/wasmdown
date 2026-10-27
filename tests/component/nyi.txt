@@ -62,3 +62,21 @@
 # idle-drop 38, passing-resources 3, switch-to-ready-callback
 # 17, sync-barges-in 3, drop-cross-task-borrow 7, T10's leak
 # (the non-oracle completion path's 4 threads). ----
+# ---- M12 close-out ADDENDUM (2026-10-27, the review pass):
+# IN-LANE FLAKE: cancel-not-delivered::1 — observed ~1-in-8
+# full-lane runs (1332/1 at the session-3 verify, 1395/1 in
+# the final close-out gate; "expected a trap but the action
+# returned" = the cancel occasionally lands AFTER delivery).
+# Root fix = the sequential-schedule family (the token
+# scheduler): the cancel's delivery order vs the callee's
+# completion is the same deterministic-interleave class as
+# acs/reentrance-cmd18. Do NOT re-derive on a red gate — re-run
+# the lane first.
+# ALSO RECORDED (the -then-* arm's known approximation, from
+# the M12 session-1 review): yield-parked is READY, not
+# SUSPENDED, in the spec's Thread model — resuming a
+# yield-parked target via suspend_then_resume should trap per
+# assert(other.suspended()); the arm's suspended-predicate
+# approximates parked=suspended pending a real blocked/ready
+# thread state (harmless in-lane today; the M12 scheduler work
+# should give the Thread record its spec states). ----
