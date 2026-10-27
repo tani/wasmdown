@@ -644,3 +644,62 @@
 # wait-until); the tail close count: setf(1) when(2) flet(3)
 # let-hasbp(4) when-ftasync(5) — then the let*'s own body
 # continues (the §705 region), `t))` closes let*+defun. ----
+# ---- M13-tok session 5 (2026-10-27): THE QUANTUM LANDED THE
+# FAMILY'S HEAD — acs ALL THREE ROWS GREEN (0 fails across 35+ runs
+# at the high-water build; run1's crossing CLOSED by the serialized
+# completion) — but the build was REVERTED at the budget's end: the
+# quantum's strictness starved the DURING-SYNC family (the lane
+# regressed 1466 -> 1454 with during-sync-scheduling-candidates 6-11
+# fails, switch-to-ready-callback 2, plus the sync-lift-pin leak
+# poisoned suspend-vs-yield-determinism (units 409/1). The committed
+# baseline re-verified green: units 410/0, lane 1466/0/0/0, core
+# 21187/0/73. THE WIN: THE QUANTUM IS THE RIGHT PRIMITIVE — the
+# spec's own text (§922-941: 'each call to Store.tick just allows
+# a SINGLE THREAD to make a single quantum of cooperative progress',
+# the reference tick picks ONE candidate) — the nudge-everyone
+# resume-all is the deviation. With the path-ordered walk +
+# first-parked-grant + no-quantum-fallback: acs 3/3 rows, 20/20+
+# runs stable. THE MEASURED SIDE-EFFECTS (all recorded with traces):
+# (1) THE DRAIN'S EXCLUSIVE: the sync-lift drain must RELEASE the
+# instance's exclusive for its duration (the runner's task HOLDS it;
+# the ready siblings park at their gates BEHIND it — the worker
+# cycle; landed and helped but the getf-setf must use the FIELDS-
+# LOCAL plist (the (SETF %INST-ASYNC-FIELDS) undefined-function
+# trap)). (2) THE QUANTUM'S GRANT SET: never the caller's own
+# thread; never a PLAIN suspend-parked thread (§494 — only the
+# explicit resume wakes it; the ready-marked ones go through a
+# PRIORITY pass first: ready+suspended or ready+pending-spawn);
+# never a resolved-task thread. (3) THE YIELD-RESTORE vs THE RELEASE:
+# the callback YIELD arm restores the exclusive on wake — it races
+# the drain's release (the candidates fixture's worker still
+# starves: the runner's wake re-holds before the worker's gate
+# re-test — the during-sync family needs the yield arm's restore to
+# LOSE that race or the worker's admission to not need the
+# exclusive). (4) THE EXIT-POST: %task-exit-implicit-thread now
+# posts the handoff (a promote target running to completion must
+# hand back — §242-273's 'park OR EXIT'); the async-lift spawn
+# lambdas' NORMAL-return path calls the exit (the old code exited
+# only on the trap path — the thread leaked registered); both landed
+# and switch-to-ready-callback's POST-HANDOFF now fires (2 rows
+# still block on the target's unresolved subtask — the wset waits
+# block though the resolve fires; the wait/resolution correlation
+# needs one more probe). (5) THE PIN LEAK: the sync-lift pin leaves
+# a yield-parked unregistered-idx thread in the scheduler; the
+# next pin's resumer collides at idx 2; the quantum grants the
+# leak (un-stamped sorts first — flipping to LAST did not fix: the
+# leak is yield-parked and eligible; the resumer's grant still
+# starves — the tick trace shows the resumer parked forever; the
+# resume-later's ready-mark landed on a (2) not f's (1) — the
+# INDEX COLLISION is the live lead: the leak holds idx 2, the
+# resumer ALSO displays idx 2, and f vanishes from the list late).
+# THE NEXT SESSION'S GATES (in order): (1) THE LEAK: the sync-lift
+# pin's exit must unregister its executor's thread (the zombie-
+# teardown covers the oracle path only — the normal completion
+# path leaks; %sync-lift-exit runs but the thread record's idx
+# persists — probe %sync-lift-exit's remove against the trace's
+# leftover). (2) THE IDX ASSIGNMENT: §705's (1+ (maximize index))
+# with a stale registered thread hands out COLLIDING indices —
+# the fix: assign from the LIVE count or sweep :done records at
+# assignment. (3) THEN re-land the quantum + the drain release +
+# the exit-posts (all proven individually) and re-run the lane: the
+# during-sync family's residual is the yield-restore race (3). ----
