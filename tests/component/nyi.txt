@@ -1487,3 +1487,58 @@
 # THE STATE at the close: the lane 1469/0 x3 + units 410/0;
 # the tree = the ledger only.
 # ----
+# ---- M13-tok session 23 (2026-10-28): THE OWN-TRANSFER
+# CHAIN COMPLETED TO ITS LAST INCH — the parser interning was
+# CORRECT all along (the parent's probe design); the canon's
+# elem extraction was the drop site; the transfer fires
+# end-to-end; the last link (the borrow-deref's rep) remains.
+# The transfer REVERTED at the budget's end (the lane green
+# 1469/0 x3 + units 410/0 re-verified); the tree = the ledger
+# only.
+# THE CHAIN (all measured):
+# 1. THE TYPE-SPACE PROBE (the parent's first probe): the
+#    producer's space holds [0] R (:RESOURCE (:I32)), [1]
+#    (:OWN 0) — THE INTERNED OWN CT EXISTS — and [2] the ST
+#    (:STREAM (:IDX . 1)) whose payload IS the ref to the OWN
+#    ct. THE PARSER'S INTERNING IS CORRECT — the own-ness was
+#    never dropped at the parse.
+# 2. THE DROP SITE (the parent's candidate (b)): the
+#    stream-new canon's elem extraction (ct-payload t-ct)
+#    passed the RAW (:IDX . 1) to the pair — the end's t-ct
+#    was the raw ref; every consumer re-resolved (the take one
+#    level too far — the RESOURCE ct). THE FIX: the canon
+#    resolves the element ref ONCE (an (:idx . k) payload
+#    resolved through the instance's types; a non-ref payload
+#    as-is) — the end's t-ct IS the element ct (measured:
+#    #S(CT :KIND :OWN :PAYLOAD 0)).
+# 3. THE TRANSFER (the recorded second half, landed with the
+#    canon fix): the take's own arm (%own-elem-take: the raw
+#    index REMOVED from the SOURCE instance — the first
+#    attempt used the reader's inst and missed the slot; the
+#    fix passes the WRITER's owner (async-end-owner other))
+#    + the put's re-add (the (:own-handle rt rep) record
+#    re-ADDED into the dest's table, the new index stored).
+#    MEASURED: (:OWNTAKE (:OWN-HANDLE R-ct 50)) — the resource
+#    R with rep 50 removed from the producer + re-added at the
+#    consumer — THE TRANSFER WORKS.
+# 4. THE LAST INCH: the run's own (i32.ne 100 (call R.foo
+#    res1)) check traps — the backtrace's operand stack #(55
+#    1 2): R.foo returned 55 (rep 5 + 50) where the fixture
+#    expects 100 (rep 50 + 50) — the BORROW-deref path of the
+#    consumer's res1 handle yields rep 5, not the stored 50 —
+#    the re-add's rep or the borrow deref's slot walk loses
+#    the rep. THE NEXT PROBE: the consumer's table print at
+#    the foo (the res1 slot's stored (rt . rep) pair) — the
+#    candidates: the put's %handle-add storing the rt/rep
+#    swapped, or the borrow-deref reading the wrong slot.
+# 5. THE LANE at the transfer build: 1469/0 with the KNOWN
+#    flake class visible (single-fail runs: acs::1,
+#    cross-abi-calls::14, no-sibling-resume::2 — 3 of 16
+#    runs, each a DIFFERENT row — the class the parent's
+#    20-run sweep records at the floor); the transfer is NOT
+#    the cause (the same class at the base).
+# THE STATE at the close: everything reverted; the two-piece
+# fix (the canon resolution + the take/put transfer) is
+# recorded verbatim in this chain for the next session's
+# one-gate landing with the borrow-deref probe first.
+# ----
