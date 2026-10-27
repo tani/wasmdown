@@ -58,6 +58,47 @@
 ./async/partial-stream-copies.wast
 ./async/passing-resources.wast
 ./async/reentrance.wast
+# ---- M12 session 10 (2026-10-27): THE PACK-ORDER HANDSHAKE
+# MEASURED TWICE (both shapes) AND REVERTED — plus the STARTED-
+# wait's SPEC RE-DERIVATION (the tree stays at edf7137's green
+# 410/1396-0-0-0 x3/core, re-verified after the revert). SHAPE 1
+# (the before-OnStart hold: the callee's body waits on the
+# per-task PACK-MARK before %task-enter-implicit-thread; the
+# async lower's pack sets it; %canon-lift-async marks its own
+# direct-invoke tasks at spawn): units 404/6 — the pins whose
+# flow nests an async callee DEADLOCK (async-wset-wait-join
+# first: the pack's STARTED-wait loop waits for the callee's
+# OnStart which the hold blocks — a tie neither side breaks).
+# SHAPE 2 (the post-OnStart BARE-SPIN hold before the core
+# call, NOT the yield-park): units 410/0 BUT reentrance cmd 14
+# went 8/8 (worse than session 6's yield's 7/8; the baseline is
+# 1/10) AND cmd 18 unchanged. THE RE-DERIVATION (the important
+# finding): the two fixtures pin OPPOSITE pack states — T7's c
+# checks STARTING(0) (b's OnStart must NOT have fired: §3731's
+# "on_start is called AFTER the async-lowered call returns") vs
+# acs's 0x21/0x31 checks STARTED(1) — and acs's STARTED comes
+# from the SYNC-TYPED-INLINE path (the M11b three-shape rule's
+# shape 1: a sync-typed callee resolves inline BEFORE the pack
+# checks, state=STARTED by construction — NO wait loop needed),
+# NOT from the STARTED-wait. THE STARTED-WAIT LOOP ITSELF (the
+# M11-era "wait for STARTING->STARTED before packing") is the
+# NON-SPEC INTERPOSITION: §3707-3729's pack reports the state AS
+# OBSERVED at the return — no wait — and the callee's OnStart is
+# sequenced AFTER the pack per §3731. THE CANDIDATE (one gate,
+# the next session): REMOVE the STARTED-wait loop + hold the
+# CALLEE's OnStart on the pack-mark (shape 1's hold, but with
+# the wait loop GONE the tie breaks: the pack returns STARTING
+# immediately, sets the mark, the callee's OnStart fires; the
+# sync-inline path is untouched — it never parks). acs's 0x21
+# then comes from its sync-typed inline callee (the resolve
+# happens inline in %call-async-funcinst's apply — BEFORE the
+# pack reads the state, exactly the M11b shape-1 rule). RISK:
+# the async-callback callees' 0x31-class checks (cancel-and-
+# exclusive-lock's hold-lock expects STARTED at the pack per the
+# three-shape rule's shape 3) — those flow through the WAIT/
+# event-protocol park whose state is STARTED before the park, so
+# the no-wait pack still observes STARTED. The measurable set
+# unchanged: acs run1, reentrance cmd14+cmd18. ----
 # ---- M12 session 9 (2026-10-27): THE cmd-18 CAUSE FOUND — T9
 # STARTS CLEAN (the leak theory disproven; the earlier one-run/
 # five-run divergence was a TIMING artifact, not state). THE
