@@ -2369,7 +2369,16 @@ index handed to wasm is the 1-based slot."
 
 (defun %handle-remove (inst rt i)
   "Table.remove (lift_own / canon_resource_drop): the handle at slot
-I of THIS instance, type-checked against RT; an empty slot traps."
+I of THIS instance, type-checked against RT; an empty slot traps.
+CLASS GUARD (M13-lad): the handle table is SINGLE-NAMESPACE
+(§121-130) — waitable sets, subtasks and stream/future ends share
+the slots, and a FREED index is legitimately REUSABLE by another
+class. A resource op on a stale index (freed by an earlier drop,
+reallocated as a waitable set — drop-cross-task-borrow's shape)
+must TRAP, never reach the record accessors: (caar h) on a
+non-resource struct signals a raw TYPE-ERROR whose datum is the
+whole record (the observed crash). Guard the SHAPE: only a cons
+whose car is a cons eql RT passes; everything else traps."
   (let ((v (%inst-handles inst)))
     (unless (and (integerp i) (> i 0) (<= i (length v))
                  (aref v (1- i)))
@@ -2377,7 +2386,7 @@ I of THIS instance, type-checked against RT; an empty slot traps."
              :kind :generic
              :message (format nil "invalid handle index ~a" i)))
     (let ((h (aref v (1- i))))
-      (unless (eql (caar h) rt)
+      (unless (and (consp h) (consp (car h)) (eql (caar h) rt))
         (error 'wasmdown:wasm-trap
                :kind :generic
                :message (format nil "handle ~a has the wrong resource type" i)))
@@ -2390,11 +2399,15 @@ I of THIS instance, type-checked against RT; an empty slot traps."
 at slot I of the CALLER's table, type-checked against RT, WITHOUT
 removing it (a borrow holds no ownership; the handle stays). NIL when
 the slot is empty or out of range (the caller passes the raw value
-through)."
+through). CLASS GUARD (M13-lad): the single-namespace table may hold
+ANY record at a reused index — only a resource-shaped record (a cons
+whose car is a cons eql RT) yields a rep; a stale index reused by
+another class reads as no-resource (NIL — the raw value passes
+through), never as a raw accessor crash."
   (let ((v (%inst-handles inst)))
     (when (and (integerp i) (> i 0) (<= i (length v)))
       (let ((h (aref v (1- i))))
-        (when (and h (eql (caar h) rt))
+        (when (and (consp h) (consp (car h)) (eql (caar h) rt))
           (cdar h))))))
 
 (defun %resource-rt (inst typeidx)
