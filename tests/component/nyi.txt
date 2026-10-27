@@ -263,3 +263,45 @@
 # stale record from a previous command vs a genuine self-
 # index. The tree stays green at 671d491; the fixture
 # remains in nyi. ----
+# ---- M13 sessions 8-9 (2026-10-27): THE INDEX RACE
+# DISPROVEN; THE TRUE ORACLE IDENTIFIED (a LOST HANDOFF);
+# THE NO-CLEAR WAIT-THEN-CHECK PARK LANDED (::34 HALVED; the
+# chapter closes at the measured ~10-15%). SESSION 8: the
+# self-resume (from=1 -> idx=1) appears in GREEN runs too
+# (exactly one per run, passing or failing) — BENIGN fixture
+# flow, not the killer; the reg-mutex on both index sites
+# measured 8/40, WORSE than the 6/30 baseline (contention,
+# not a fix) — reverted. THE TRUE ORACLE (marked trap
+# messages, 30 runs): ALL 7 fails were the SYNC-LIFT oracle
+# — the main thread's drain loop fires while the executor
+# is parked in a switch arm waiting for a handoff that
+# never arrives. THE RESIDUAL IS A LOST HANDOFF, not an
+# index collision. INSTALL-AT-BIRTH measured 9/40 (worse:
+# it closes the eager-fire window but leaves the arm-time-
+# clear window). SESSION 9: THE LANDED SHAPE (whole-defun
+# replacement of the arm's park region) — NO ARM-TIME
+# CLEAR + WAIT-THEN-CHECK (no entry check): a pre-set count
+# (a target's exit-post landing while the caller ran
+# between rounds) is ABSORBED by the first wait's wake
+# check instead of wiped; the round BARRIER holds (the wait
+# still happens). Distinct from the session-5 conflated
+# 5/20 version (which added immediate-return-on-entry —
+# the barrier violation). MEASURED: the 40-run battery
+# 34x48, 6x47 (::34 ~15%); the 20-run five-fixture battery
+# ::34 fails 2/20 (~10%); the sentinels all 0 fails; the
+# pins green (the barrier held everywhere). THE REMAINING
+# WINDOW (the recorded next lead, NOT a candidate claim):
+# the residual is a post that NEVER FIRED — either a body
+# whose single-use post-to slot was consumed by an earlier
+# round, or THE DOUBLE-FIRE HYPOTHESIS: a ready-marked
+# spawn claimed by the TICK's claim-then-fire (which
+# installs no handoff) and then fired again by the
+# caller's arm via the :claimed recover path — one body,
+# two fires' expectations, one handoff. The double-fire
+# hypothesis is the ONLY one consistent with all four
+# sessions' traces (the multiple START-SPAWN calls on one
+# record appear in every trace). THE NEXT PROBE (if the
+# ::34 chapter reopens): trace the TICK's claim-then-fire
+# path against the arm's fire on the SAME record. The
+# fixture's 48 rows return to the lane when the residual
+# collapses. ----
