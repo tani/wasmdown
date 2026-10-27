@@ -486,3 +486,59 @@
 # verified non-regressing, then reverted with the tree; re-add
 # with the token). GATES at the parked state: units 410/0, lane
 # 1466/0/0/0, core 21187/0/73 (all green; nothing landed). ----
+# ---- M13-tok session 2 (2026-10-27): GATE 1 LANDED (the durable
+# resolve wake) + the gate-2/3 machinery BUILT AND MEASURED, then
+# reverted (the integration's failure modes recorded). GATE 1
+# (in the tree): %subtask-resolve posts a REAL wake-count to the
+# wset's parked WAITERS (the wset struct's new waiters slot; both
+# wait fns register/unregister under the set's mutex; the resolve
+# copies the list and posts incf wake-count + both broadcasts to
+# each) — the M13-4 lost-broadcast closure applied to the resolve
+# path. Gates: units 410/0, lane 1466/0/0/0 x3, core 21187/0/73.
+# GATE 2 (built, measured, REVERTED with the machinery): the PATH
+# stamp at creation — the task struct's seq slot (a PATH list) +
+# %tok-stamp-task (the root gets (n) from the global counter; a
+# nested callee gets parent-path + a per-parent child index from
+# the DEDICATED tok-child-count slot — the opts plist must not be
+# mutated: the getf-setf there produced the (:tok-child-count
+# not LIST) type error) + the stamp at all three make-async-task
+# sites. THE PATHS MEASURED CONSISTENT: run1's bodies (1 1)..(1 4),
+# the blocking-call callees (1 x 1) — the phantom-root defect of
+# session 1 GONE. GATE 3 (built, measured, REVERTED): the GLOBAL
+# start turnstile (the *tok-pending-starts* set; registered at the
+# lower's spawn; a 0.5ms sleep-poll wait in the guest lambda; the
+# exit at the gate's ADMISSION — the park-exit variant breaks the
+# cross-gate ordering, the admission-exit variant deadlocks the
+# sync_middle exclusive held across the pack's STARTED-wait) +
+# the per-instance FIFO gate ordered by path (the earlier-parked-p
+# consults the instance's parked set AND the global pending set)
+# + the orphan cleanup at the guest body's trap path (a died-
+# before-admission task must leave the pending set — row 2's
+# (2 1) stalled behind row 1's orphaned (1 5), the cross-row
+# deadlock). THE MEASURED WINS: the OUT-STORE trace showed the
+# crossing FIXED (4@16 path (1 3), 5@20 path (1 4) — the right
+# values at the right out-params, twice) and the admissions
+# ordered ((1 3) before (1 4), (1 3 1) before (1 4 1)) in two
+# traces. THE FAILURE MODES (why reverted): (a) the gate's
+# wait-until lost-broadcast — (1 4 1) stalled 60s in the
+# registration window (admitted only at the oracle's teardown);
+# the POLL replacement fixed it but (b) the polls do not feed
+# *async-progress* — the drain's idle-cycles oracle fired on
+# healthy polls (the deadlock trap on a LIVE flow); adding the
+# incf at the poll exits was not enough — (c) the run's core
+# stalls between the pack's exit and the unblock call remained
+# (the (1 5) registration never reached), and (d) one trace
+# re-crossed ((1 4 1) before (1 3 1)) — the interaction of the
+# poll waits + the exclusive release + the turnstile is
+# nondeterministic in new ways. THE NEXT SESSION'S DESIGN INPUT:
+# the ordering machinery must be built ON the wait-until
+# primitives (not polls) — the durable wake-count must be posted
+# by the NUDGE for gate-parked threads (extending the M13-4
+# ready-grant to waitcondition parkers), and the pack's
+# STARTED-wait exclusive release must use the INSTANCE's holder
+# (the sync-lift executor's thread, not the pack's *current-
+# thread* — the inline sync callee runs on the caller's thread
+# while the exclusive was acquired by the executor). The
+# sync_middle-exclusive-across-the-pack-wait cycle is the
+# machinery's real deadlock: release it (the M12 pattern) with
+# the correct holder identity. ----

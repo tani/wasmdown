@@ -2926,7 +2926,14 @@ the callee's progression through the FuncInst protocol."
   (elems nil)
   (num-waiting 0)
   (mutex (sb-thread:make-mutex :name "wset"))
-  (waitqueue (sb-thread:make-waitqueue :name "wset")))
+  (waitqueue (sb-thread:make-waitqueue :name "wset"))
+  ;; M13-tok2 GATE 1: the parked WAITER THREADS — %subtask-resolve
+  ;; posts a REAL wake (the durable count) to each: the resume-all
+  ;; nudge is TRANSIENT (a bare broadcast), and a parked waiter's
+  ;; condition-wait registration can MISS it — the lost-broadcast
+  ;; window (the set's OWN waitqueue broadcast reaches nobody: the
+  ;; waiters park on their THREAD queues, not the set's)
+  (waiters nil))
 
 ;;; ---- The {Stream,Future} End records (CanonicalABI.md 1598-1922) ----
 ;;; The End base derives from Waitable (both ends can join waitable
@@ -3799,12 +3806,22 @@ computes the tuple at delivery time)."
     (error 'wasmdown:wasm-trap :kind :generic
            :message "cannot block a synchronous task before returning"))
   (incf (async-waitable-set-num-waiting wset))
+  ;; M13-tok2 GATE 1: the parked-waiter registration (the durable
+  ;; wake target)
+  (sb-thread:with-recursive-lock ((async-waitable-set-mutex wset))
+    (pushnew *current-thread* (async-waitable-set-waiters wset)
+             :test #'eq))
   (unwind-protect
        (progn
          (async-thread-wait-until
           *current-thread*
           (lambda () (%wset-has-pending-event wset)))
          (%wset-get-pending-event wset))
+    (sb-thread:with-recursive-lock ((async-waitable-set-mutex wset))
+      (setf (async-waitable-set-waiters wset)
+            (remove *current-thread*
+                    (async-waitable-set-waiters wset)
+                    :test #'eq)))
     (decf (async-waitable-set-num-waiting wset))))
 
 (defun %wset-poll (wset)
@@ -3829,6 +3846,10 @@ computes the tuple at delivery time)."
          (task *current-task*)
          (inst (async-task-inst task)))
     (incf (async-waitable-set-num-waiting wset))
+    ;; M13-tok2 GATE 1: the parked-waiter registration (the durable
+    ;; wake target)
+    (sb-thread:with-recursive-lock ((async-waitable-set-mutex wset))
+      (pushnew thread (async-waitable-set-waiters wset) :test #'eq))
     (unwind-protect
          (progn
            (async-thread-wait-until
@@ -3840,6 +3861,10 @@ computes the tuple at delivery time)."
            (if (%task-deliver-pending-cancel task)
                (list 6 0 0)             ; EventCode.TASK_CANCELLED
                (%wset-get-pending-event wset)))
+      (sb-thread:with-recursive-lock ((async-waitable-set-mutex wset))
+        (setf (async-waitable-set-waiters wset)
+              (remove thread (async-waitable-set-waiters wset)
+                      :test #'eq)))
       (decf (async-waitable-set-num-waiting wset)))))
 
 ;;; ---------------------------------------------------------------
@@ -3860,10 +3885,25 @@ computes the tuple at delivery time)."
   ;; on the owning set must re-test (§1282-1294 — the pending-event
   ;; exists only once resolved)
   (when (async-waitable-wset s)
-    (sb-thread:with-recursive-lock
-        ((async-waitable-set-mutex (async-waitable-wset s)))
-      (sb-thread:condition-broadcast
-       (async-waitable-set-waitqueue (async-waitable-wset s))))
+    ;; M13-tok2 GATE 1: post the DURABLE wake to the parked waiters
+    ;; — a REAL wake-count (the M13-4 lost-broadcast closure
+    ;; applied to the resolve path) rather than only the transient
+    ;; resume-all nudge; a count posted inside the park's
+    ;; registration window is consumed at the park itself. The
+    ;; set's own broadcast stays (harmless when no count rides it).
+    (let ((waiters
+            (sb-thread:with-recursive-lock
+                ((async-waitable-set-mutex (async-waitable-wset s)))
+              (sb-thread:condition-broadcast
+               (async-waitable-set-waitqueue (async-waitable-wset s)))
+              (copy-list (async-waitable-set-waiters
+                          (async-waitable-wset s))))))
+      (dolist (w waiters)
+        (sb-thread:with-recursive-lock ((async-thread-mutex w))
+          (incf (async-thread-wake-count w))
+          (sb-thread:condition-broadcast (async-thread-waitqueue w))
+          (sb-thread:condition-broadcast
+           (async-thread-suspend-waitqueue w)))))
     (async-thread-resume-all)))
 
 (defun %subtask-deliver-resolve (s)
