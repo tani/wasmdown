@@ -1445,3 +1445,45 @@
 # THE STATE at the close: the lane 1469/0 x3 (the committed
 # baseline unchanged), units 410/0; the tree = the ledger only.
 # ----
+# ---- M13-tok session 22 (2026-10-27): THE PASSING-RESOURCES
+# ROOT FOUND AND IT IS OUTSIDE MY REGION — the own-ness of a
+# stream's element type is LOST AT THE TEXT PARSER. The lane
+# 1469/0 x3 + units 410/0 re-verified at the revert.
+# THE DECODE CHAIN (all measured):
+# 1. THE TAKE PROBE (the source-level print at the %end-copy
+#    case 3's reader arm): TAKE vals=(3) with t-ct-kind=NIL —
+#    the buffer carries the RAW HANDLE INDEX (3) — the M9
+#    own-transfer (the handle LEAVES the source table + the
+#    rep rides) and the M10 buffer machinery meet at the
+#    %buffer-take boundary and the buffer carries the bare
+#    index — the consumer's resource.rep finds the rep gone
+#    ('NIL is not of type REAL') — the parent's call exactly.
+# 2. THE FIX ATTEMPT (built, compiled, measured): the take's
+#    own-transfer (the %own-elem-take helper: the raw index at
+#    PTR is REMOVED from the source instance (type-checked),
+#    the abstract (:own-handle rt rep) record returned) + the
+#    put's re-add (the record re-ADDED into the dest's table,
+#    the new index stored) — the %buffer-take's own-p check
+#    NEVER FIRED: the end's t-ct is NOT an own ct.
+# 3. THE RESOLUTION PROBE: the end's t-ct = the RAW (:IDX . 1)
+#    — resolving against the instance gives a RESOURCE ct
+#    (#S(CT :KIND RESOURCE :PAYLOAD (I32))) — THE OWN WRAPPER
+#    IS ABSENT FROM THE CHAIN: the fixture's (type $ST (stream
+#    (own $R)))'s ct payload is a BARE REF to $R — the
+#    (own $R)'s OWN-NESS was dropped at the TEXT PARSER
+#    (src/component.lisp — the stream/future element valtype
+#    parsing) — the stream-new canon's elem extraction
+#    (ct-payload) faithfully carries what the parser stored.
+# THE FIX'S LOCUS: ONE parser site — the stream/future
+# element valtype must keep the OWN wrapper (a ct or a marked
+# ref) so the runtime's take can see it. OUTSIDE MY REGION
+# (src/component.lisp); the finding is recorded for the
+# parent (the region rule: src/component-runtime.lisp + the
+# tools + the tests).
+# THE REVERT: the take/put transfer code reverted (it is
+# inert without the own marker; the parser fix would re-add
+# it as its own gate). The passing-resources rung stays nyi'd
+# with this chain.
+# THE STATE at the close: the lane 1469/0 x3 + units 410/0;
+# the tree = the ledger only.
+# ----
