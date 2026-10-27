@@ -58,6 +58,33 @@
 ./async/partial-stream-copies.wast
 ./async/passing-resources.wast
 ./async/reentrance.wast
+# ---- M12 session 8 (2026-10-27): THE cmd-18 PROBE — THE
+# HARNESS-STATE AND PARSE HYPOTHESES BOTH DISPROVEN (no code
+# change; the tree stays at 8a06a64's 410/1396-0-0-0). THE
+# PROBES: (1) the %resolve-action-instance wrapper on the full
+# file: EVERY invoke resolves a live target, current is set at
+# all 13 invokes, the NAMED-INSTANCES table is EMPTY (named-
+# keys NIL) — NO shadowing; the instance identity is a fresh
+# comp-instance per test as expected. (2) The one-run parse dump:
+# 25 commands, the exact expected map (T9 = idx17 component +
+# idx18 assert) — the parse is clean. (3) THE STABLE DIVERGENCE
+# re-measured x8 each: the SAME lines as FIVE run-script calls
+# = 1/8 flake; as ONE run-script = 8/8 fail — the difference is
+# REAL but is NOT the resolution, NOT the named table, NOT the
+# registry (no register commands), NOT the parse. (4) The
+# instrumented full-file run (one format per invoke) failed BOTH
+# cmd14 AND cmd18 — TIMING-PERTURBATION-SENSITIVE. THE REMAINING
+# HYPOTHESIS (the next session's probe): the one-run keeps T1-
+# T8's INSTANCES ALIVE (referenced from the single wast-state's
+# results/current chain) while the five-run's fresh states drop
+# them — the LIVE instances' :async fields plists + handles +
+# any still-registered threads change the scheduler's nudge
+# population and the per-instance exclusive-lock state for T9's
+# flow. PROBE: print *scheduler-threads*' length + each live
+# instance's :threads/:exclusive-thread at T9's component command
+# (before its assert) in both shapes; diff. THE ZOMBIE-JOIN
+# TEARDOWNS (session 7) remain LANDED and green (410/0,
+# 1396/0/0/0 x3, core 21187/0/73 re-verified this session). ----
 # ---- M12 session 7 (2026-10-27): THE ZOMBIE-JOIN TEARDOWNS
 # LANDED (both oracle paths); the cmd-18 trigger REFINED to the
 # SHARED-STATE prefix (units 410/0; lane 1396/0/0/0 x3; core
