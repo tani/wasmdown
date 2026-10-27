@@ -2751,6 +2751,20 @@ path's apply shape) and returns the single result or NIL."
       (t (error 'wasmdown:link-error
                 :message "lowered func target has no runtime value")))))
 
+(defun %resource-current-inst (inst)
+  "M13-lad §3783 current_instance() for the resource OPS: a handle
+index refers to the table of the instance whose DYNAMIC CONTEXT is
+on the thread — *HANDLE-CALLER-INST* (the M9 dynamic binding: the
+comp-instance whose table an incoming own/borrow PARAM index
+refers to, bound at the lower's call sites). A cross-task BORROW's
+lent handle lives on the LOWERING CALLER's table ($E — the async
+guest's binding); the callee's own task ($D — the sync-lift task
+for drop-handle) is NOT where the index resolves. Same-instance
+callers (the M9/M10 lanes: the defining instance's own tasks —
+*HANDLE-CALLER-INST* eq the captured inst, or unbound at the
+top-level runner) are a NO-OP."
+  (or *handle-caller-inst* inst))
+
 (defun %resource-builtin-host-func (inst kind rt &optional dtor)
   "The canon resource built-in's core wrapper: [i32] -> [i32] for
 resource.new (param rep, result handle), [i32] -> [] for
@@ -2765,7 +2779,9 @@ resource.drop (param handle), [i32] -> [i32] for resource.rep."
      (wasmdown.runtime:make-host-func-instance
       (wasmdown.types:make-wasm-func-type '(:i32) '())
       (lambda (args)
-        (let* ((h (%handle-remove inst rt (first args)))
+        ;; §3783: the handle resolves on the dynamic-context table
+        (let* ((h (%handle-remove (%resource-current-inst inst)
+                                   rt (first args)))
                (rep (cdar h)))
           ;; an OWNING handle's drop runs the resource's dtor with
           ;; the rep (canon_resource_drop, CanonicalABI.md 3782)
@@ -2776,7 +2792,8 @@ resource.drop (param handle), [i32] -> [i32] for resource.rep."
      (wasmdown.runtime:make-host-func-instance
       (wasmdown.types:make-wasm-func-type '(:i32) '(:i32))
       (lambda (args)
-        (let ((v (%inst-handles inst)))
+        ;; §3783: the handle resolves on the dynamic-context table
+        (let ((v (%inst-handles (%resource-current-inst inst))))
           (list (cdar (aref v (1- (first args)))))))))))
 
 ;;; ---------------------------------------------------------------
@@ -3787,9 +3804,19 @@ computes the tuple at delivery time)."
     (async-thread-resume-all)))
 
 (defun %subtask-deliver-resolve (s)
-  "Subtask.deliver_resolve (CanonicalABI.md 1467): the delivered mark
-  (the num_lends accounting is M11b's borrow transfer)."
-  (setf (async-subtask-resolve-delivered-p s) t))
+  "Subtask.deliver_resolve (CanonicalABI.md 1467): the delivered
+  mark + §1446-1456's num_lends accounting: all the borrowed
+  handles are logically returned to the caller at this point —
+  every LENDING task's num-borrows decrements (the async lower's
+  (borrow $R) branch recorded each lend's lender on the subtask's
+  LENDERS list, §2838/§1446; without the decrement the lending
+  task's own resolution traps 'outstanding borrows' —
+  drop-cross-task-borrow ::2's decoded layer)."
+  (setf (async-subtask-resolve-delivered-p s) t)
+  (dolist (lender (async-subtask-lenders s))
+    (when (> (async-task-num-borrows lender) 0)
+      (decf (async-task-num-borrows lender))))
+  (setf (async-subtask-lenders s) nil))
 
 (defun %subtask-drop (s)
   "Subtask.drop (CanonicalABI.md 1485): trap when the resolve has
@@ -5137,31 +5164,59 @@ is the valtype."
                                           (rt (aref
                                                (comp-instance-types ft-inst)
                                                rt-idx))
-                                          ;; §2834 lower_borrow (the
-                                          ;; non-implementor case): the
-                                          ;; BORROW HANDLE is added to
-                                          ;; the LOWERING CALLER's table
-                                          ;; (a second entry, own=false,
-                                          ;; for the same rep — the
-                                          ;; callee's core gets ITS
-                                          ;; index; the callee's R-rep/
-                                          ;; R-drop resolve against the
-                                          ;; caller's table via their own
-                                          ;; lower's cx.inst) and the
-                                          ;; task's num-borrows counts
-                                          ;; it (§2838) until the
+                                          ;; M13-lad §2834 lower_borrow,
+                                          ;; the LOCAL-SHAPE move (the
+                                          ;; parent's (b)): the BORROW
+                                          ;; HANDLE is added to the
+                                          ;; CALLEE-DEFINING instance's
+                                          ;; table (FT-INST — the
+                                          ;; lifted func's inst, $D)
+                                          ;; rather than the spec's
+                                          ;; lowering-caller table ($E):
+                                          ;; our runtime's async-callee
+                                          ;; rebind (5337's
+                                          ;; *HANDLE-CALLER-INST* =
+                                          ;; (lifted-func-inst f)) and
+                                          ;; the resource arms'
+                                          ;; captured-inst resolution
+                                          ;; BOTH point at the callee's
+                                          ;; defining table, so the
+                                          ;; callee's core stashes the
+                                          ;; index and its R-rep/R-drop
+                                          ;; resolve it there — the
+                                          ;; M11b/M12 lanes' local
+                                          ;; shape (the spec's 3648
+                                          ;; cx.inst = the caller is
+                                          ;; the upstream shape our
+                                          ;; 5337 diverged from). The
+                                          ;; rep still derefs from the
+                                          ;; LOWERING CALLER's table
+                                          ;; (INST — the source handle
+                                          ;; lives there); the task's
+                                          ;; num-borrows counts the
+                                          ;; lend (§2838) until the
                                           ;; subtask's resolution
                                           (rep (%handle-rep inst rt
                                                             (nth ai args)))
                                           (bi (and rep
-                                                   (%handle-add inst rt
-                                                                rep nil))))
+                                                   (%handle-add ft-inst
+                                                                rt rep nil))))
                                      (when bi
-                                       ;; the task's borrow count (§2838):
-                                       ;; the subtask holds the lent
-                                       ;; handle until it resolves
+                                       ;; §2838/§1446: the LENDING
+                                       ;; task's borrow count + the
+                                       ;; lender recorded on the
+                                       ;; subtask — deliver_resolve
+                                       ;; decrements every lender
+                                       ;; (the count is what the
+                                       ;; lender's own resolution
+                                       ;; checks; the subtask's
+                                       ;; LENDERS list is the
+                                       ;; §1446 accounting home)
                                        (incf (async-task-num-borrows
-                                              *current-task*)))
+                                              *current-task*))
+                                       (push *current-task*
+                                             (async-subtask-lenders
+                                              subtask)))
                                      (push bi vals)
                                      (incf ai)))
                                   (t
