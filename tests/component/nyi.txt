@@ -1798,3 +1798,40 @@
 # removed + the member entry) + this ledger; NOT COMMITTED
 # (the parent commits at green).
 # ----
+# ---- M13-tok session 31 (2026-10-28): THE STABILITY SPRINT
+# OPENED — the target chosen (no-sibling's resume window), the
+# lane-scale probe built, the probe's own interference found
+# (the next session's first fix); the cancel-subtask decode
+# opened (the eager-cancel shape = the resolved-yet window
+# class). The lane 1469/0 + units 410/0 at the close; the
+# tree = the ledger only.
+# THE SPRINT'S PROGRESS:
+# 1. THE TARGET: no-sibling-resume's ::2 ('run' — the fixture
+#    has only 4 rows; the flaky one is the sync-block's 4
+#    rounds of suspend-then-resume X) — the M13-lad three-park
+#    machinery's own trap ('cannot resume thread which is not
+#    suspended') — the resume-after-suspend window.
+# 2. THE LANE-SCALE PROBE (/tmp/lane-window.lisp): the async
+#    subset in the suite's order (the coupling IS the lane's
+#    predecessor state) with the suspend/resume hooks (the
+#    task paths + the caller thread) + the teardown join
+#    timing. THE PROBE HANGS AT THE FIRST FIXTURE (acs) —
+#    the hooks' own interference (the output buffering or a
+#    hook's return shape) — THE NEXT SESSION'S FIRST FIX: the
+#    non-intrusive shape (the global-log pattern, session 18's
+#    lesson, instead of the format-per-event print).
+# 3. THE CANCEL-SUBTASK DECODE (opened): the fixture's first
+#    row expects the subtask.cancel(async) to return
+#    CANCELLED_BEFORE_RETURNED(4) EAGERLY — 'the pending
+#    cancellation request is delivered to the callee's event
+#    loop as a TASK_CANCELLED event... resolves before
+#    subtask.cancel returns, so this completes eagerly' — THE
+#    RESOLVED-YET WINDOW CLASS AGAIN (the same family as the
+#    reentrance row-18 state-read race + cancel-resumed ::3):
+#    the cancel's return must observe the delivery COMPLETED.
+#    The failing check ('unreachable' at ::1) is one of the
+#    (i32.ne 4 ret) checks — the probe shape: the cancel's
+#    return value print (the same non-intrusive pattern).
+# THE STATE at the close: the tree = the ledger only; the lane
+# 1469/0 + units 410/0 re-verified at HEAD.
+# ----
