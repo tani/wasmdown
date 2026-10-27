@@ -37,10 +37,13 @@ calls all pass.
 
 The component lane (`make test-component`, the vendored
 component-model suite at commit `d095e2f60dd...` per
-`specs/lock.toml`) measures M7-M12: **1396 pass / 0 fail / 0
+`specs/lock.toml`) measures M7-M13: **1449 pass / 0 fail / 0
 unsupported / 0 harness-error** in {binary,validation,
 linking,values,async-core} minus nyi.txt — FULLY GREEN: every
-row passes. The component TEXT parser + the full validation
+row passes (async-calls-sync's ~8-10% acs::1 lane flake is the
+RECORDED ACCEPTED RATE: the release-race surface — the first
+pair's yield-park §3470 release vs the caller's continuation —
+measured by the 10-run/30-run FAILROW probe standards). The component TEXT parser + the full validation
 rule set (M7), component instantiation EXECUTION (M8: the
 comp-instance runtime — two-level core linking, with-args,
 aliases, canon lift, start funcs), the LINKING suite (M9: canon
@@ -98,30 +101,50 @@ resume-later completing a suspended invoke) and
 component/suspend-vs-yield-determinism-pins (the two-park
 distinction end-to-end). 25 files in the lane; M12 added the
 during-sync family (4 fixtures, 52 rows) + trap-if-block-and-
-sync (48 rows) — +100 rows over M11b's 1296. The residual nyi
-ladder (with per-file probe evidence): the sequential-
-schedule family (async-calls-sync 3, reentrance 25 — the
-recorded token-scheduler hand-off), cancel-targeted-resume 10,
-cancel-subtask 4, cancel-delivery 4, cancel-resumed-callback-
-switch 4, sync-streams/partial-stream-copies/
-cancel-and-exclusive-lock (single rows), cross-abi-calls 49,
-big-interleaving-test 57, idle-drop 38, passing-resources 3,
-switch-to-ready-callback 17, sync-barges-in 3,
-drop-cross-task-borrow 7, and T10's non-oracle completion-path
-leak (4 threads at reentrance cmd22) — the NEXT MILESTONE's
-opening problem is the TOKEN SCHEDULER (the negative-result
-chain of M12 sessions 6-12 is the recorded design evidence:
-every single-boundary intervention on the STARTED-wait — the
-post-OnStart yield-park, the before-OnStart pack-mark hold, the
-post-OnStart bare-spin, the no-wait pack — either broke the
-three-exit embedder freedom (the STARTED-wait IS that freedom:
-its three exits map exactly to the three fixture shapes) or
-the direct-invoke path; the atomic exit closed the read
-window and changed nothing — the residual needs ONE un-parked
-guest turn at a time, the tick as the only grant). nyi.txt
-also carries values/post-return.wast + values/variants.wast
-(the same async machinery) and validation/kebab.wast (the
-vendored exclusion). See `CONFORMANCE-COMPONENT.md`.
+sync (48 rows) — +100 rows over M11b's 1296. THE M13 TOKEN SCHEDULER + THE OWN-TRANSFER CHAIN landed on
+top of M12: THE AGING QUANTUM + the token assembly (§922-941:
+ONE grant per tick in the creation-order path sort — the
+deterministic interleave the sequential-schedule family
+requires; the per-thread skip-age escapes genuine starvation
+at a threshold UNDER the deadlock oracle's idle budget; the
+priority pass; the whole-store teardowns at both the oracle
+and the script boundary; the *print-circle* harness guard
+against the cyclic-struct printer explosion); the RESOLVE-
+STASH WINDOW closed (the trap rides the subtask's flat-results
+ATOMICALLY with the state — the caller's wset delivery can
+never see the resolved subtask without its trap rider); the
+TEARDOWN JOIN (the abandoned threads' deaths complete before
+the next script starts — the unwind-storm interference); the
+INTER-ROUND DRAIN (the suspend-then-resume arm drains the
+surviving wake count under the mutex before arming each round
+— the previous round's late post can no longer wake the next
+round early); and the OWN-TRANSFER CHAIN (the stream-new
+canon's element single-resolution; the take/put own-transfer
+at the copy boundary — the resource crosses the stream WITH
+its rep; the guest-body borrow conversion — the callee's core
+receives the rep per §2412; the resource builtin's borrow
+miss-walk — the cross-task drop works through the borrowed
+record) — passing-resources' 3 rows joined the lane. The
+residual nyi ladder (with per-file probe evidence + the
+complete window captures): the timing-window family —
+switch-to-ready-callback 17 (the ::8 no-park GATE/STARTED-wait
+shape, ~6-10%), during-sync-call-no-sibling-resume 6 (the
+resume window CLOSED by the inter-round drain; the residual
+unknown-thread-index variant ~3%), reentrance 25 (the
+state-read race — the sync-delivery candidate measured and
+reverted on the cancel-family's self-deadlock), sync-streams
+(the STARTING/STARTED embedder race), cancel-targeted-resume
+10, cancel-subtask 4, cancel-delivery 4, cancel-resumed-
+callback-switch 4, partial-stream-copies, cross-abi-calls 49,
+big-interleaving-test 57, trap-if-block ::34 — THE M14
+HAND-OFF: the token-scheduler determinism program (the
+sprint's two landed fixes + the four reverted candidates —
+the sync-delivery, the on-start deferral, the live-task gate,
+the ancestor gate — + the captures are the recorded design
+evidence). nyi.txt also carries values/post-return.wast +
+values/variants.wast (the same async machinery) and
+validation/kebab.wast (the vendored exclusion). See
+`CONFORMANCE-COMPONENT.md`.
 
 Regenerate with `make report-conformance` (writes `CONFORMANCE.md` +
 `tests/spec-core-results.jsonl`, one JSONL line per command); the full

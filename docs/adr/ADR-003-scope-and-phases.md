@@ -246,7 +246,65 @@ conformance gates. This repository delivers an honest **partial** slice
    passing-resources 3, switch-to-ready-callback 17,
    sync-barges-in 3, drop-cross-task-borrow 7, and T10's
    non-oracle completion-path leak (4 threads at reentrance
-   cmd22). Still out of scope: the token scheduler, WIT-
+   cmd22). M13 (2026-10-28: THE TOKEN SCHEDULER — the aging quantum
+   per CanonicalABI.md 922-941: ONE grant per tick in the
+   creation-order path sort (the deterministic interleave the
+   sequential-schedule family requires), the per-thread
+   skip-age escape at a threshold UNDER the deadlock
+   oracle's idle budget (40 < 50: the starved thread takes
+   the grant before the oracle fires), the priority pass (the
+   ready-marked suspend-parked/spawn-pending), the
+   whole-store teardowns (the oracle's abandon-and-join AND
+   the between-script boundary — a script's parked threads
+   never leak into the next script's grants), the
+   *print-circle* harness guard (the cyclic async-end
+   printer explosion), and the inter-round drain (the
+   suspend-then-resume arm drains the surviving wake count
+   under the mutex before arming each round — the previous
+   round's late post can no longer wake the next round
+   early; the no-sibling resume window closed 0/50); THE
+   RESOLVE-STASH WINDOW (the trap rides the subtask's
+   flat-results ATOMICALLY with the state — the caller's
+   wset delivery never sees a resolved subtask without its
+   trap rider; the cancel-not-delivered ~29% flake dead);
+   THE TEARDOWN JOIN (the abandoned threads' SBCL deaths
+   complete before the next script starts — the
+   unwind-storm interference class); and THE OWN-TRANSFER
+   CHAIN (the stream-new canon's element single-resolution
+   per 4242-4277; the take/put own-transfer at the copy
+   boundary per 1687-1711 — the resource crosses the stream
+   WITH its rep; the guest-body borrow conversion per 2412 —
+   the callee's core receives h.rep; the resource builtin's
+   borrow miss-walk per 3783 — the cross-task drop works
+   through the borrowed record; passing-resources' 3 rows
+   joined the lane). The lane whitelists 27 async fixtures
+   and measures 1449 pass / 0 fail / 0 unsupported / 0
+   harness-error — FULLY GREEN, +53 rows over M12's 1396
+   (the acs 3 + the passing-resources 3 landed; the
+   switch-to-ready 17 + the no-sibling 6 parked). THE M13
+   STABILITY SPRINT'S RECORDED DESIGN EVIDENCE (the
+   negative-result chain, all measured and reverted per the
+   one-change-per-gate rule): the sync-delivery wait (the
+   cancellable+lock-free condition made reentrance 38/38 but
+   self-deadlocked the gated-callee round — the caller's
+   own future-write dependency), the on-start deferral (the
+   pack half worked — the STARTING report achieved — but
+   the get-thread exit never completed under it), the
+   live-task gate (the instance's live-count over-blocked
+   the concurrent blocking-calls), and the ancestor gate
+   (the caller-path prefix test held the fixtures but the
+   acs release window admitted anyway; batch 6/10 vs the
+   revert's floor class) — plus the COMPLETE WINDOW
+   CAPTURES (the no-sibling incomplete pair; the
+   switch-to-ready no-park; the acs missing (1 3) delivery
+   with the release-race surface: the first pair's
+   yield-park 3470 release vs the caller's continuation —
+   the STARTED-wait guarantees the callee's START, not its
+   park). CONCLUSION: the timing-window residual (acs's
+   accepted ~8-10% rate recorded; switch-to-ready +
+   no-sibling parked with their rates) is the M14 HAND-OFF:
+   the token-scheduler determinism program. Still out of
+   scope: the timing-window family's full closure, WIT-
    level Component/WASI, threads beyond the canon core,
    FASL cache.
    `declared_support` stays `partial`.*

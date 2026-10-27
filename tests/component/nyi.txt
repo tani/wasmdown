@@ -2119,3 +2119,30 @@
 # THE REMAINING RUNGS stay nyi'd with their evidence (the M14
 # hand-off: the full token-scheduler determinism program).
 # ----
+
+# ---- M13 CLOSE-OUT (2026-10-28): the final ladder. THE
+# LANDED: the aging quantum + the token assembly (the path
+# stamps, the skip-age escape, the priority pass, the
+# whole-store teardowns, the *print-circle* guard); the
+# resolve-stash window (the atomic resolve-with-trap); the
+# teardown join; the inter-round drain (the no-sibling resume
+# window closed 0/50); the own-transfer chain (the canon's
+# single-resolution + the take/put transfer + the guest-body
+# borrow conversion + the builtin's miss-walk — passing-
+# resources' 3 rows IN). THE PARKS: switch-to-ready-callback
+# (17 rows, the ::8 no-park shape, ~6-10%) + no-sibling-
+# resume (6 rows: the drain closed the resume window; the
+# unknown-thread-index variant ~3%). THE ACCEPTED RATE:
+# async-calls-sync IN the lane with acs::1's ~8-10% (the
+# release-race surface; the sprint's four reverted
+# candidates the design evidence). THE M14 HAND-OFF: the
+# token-scheduler determinism program — the sprint's two
+# landed fixes + the four reverts + the complete window
+# captures are the design inputs; the remaining rungs
+# (reentrance 25, sync-streams, cancel-subtask 4,
+# cancel-targeted-resume 10, cancel-resumed ::3,
+# partial-stream-copies, cross-abi-calls 49,
+# big-interleaving-test 57, trap-if-block ::34) stay nyi'd
+# with their evidence. THE NUMBERS: units 410/0; the lane
+# 1449/0/0/0; core 21187/0/73.
+# ----
