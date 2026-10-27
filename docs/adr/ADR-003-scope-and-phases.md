@@ -183,21 +183,72 @@ conformance gates. This repository delivers an honest **partial** slice
    guest arms, the sessions-21-23 binding-visibility
    mystery) is implemented; the component lane whitelists
    25 async files and measures 1296 pass / 0 fail / 0
-   unsupported / 0 harness-error — FULLY GREEN. The
-   remaining 20 async files stay in nyi.txt with per-file
-   probe evidence: the sequential-schedule family (cancel-
-   targeted-resume, cancel-delivery row 3, cancel-subtask
-   rows 1/3, async-calls-sync, cancel-and-exclusive-lock,
-   sync-streams, partial-stream-copies — the callee thread
-   races the lower's bounded wait; the token scheduler is
-   M12's opening problem with the full evidence chain), the
-   sync-lift thread context's reentrance hang (proven sound
-   in isolation; the lane's reentrance.wast hangs — the
-   next probe is the gate trace), the during-sync family
-   (unblocked once reentrance resolves), trap-if-block-and-
-   sync, and the error-context residuals. Still out of
-   scope: M12, WIT-level Component/WASI, threads beyond the
-   canon core, FASL cache.
+   unsupported / 0 harness-error — FULLY GREEN. M12
+   (2026-10-27: THE SCHEDULER SEMANTICS — the nested-sync-call
+   handshake per CanonicalABI.md 572 + 3538-3543: every
+   sync-typed lift runs its core call through a FRESH
+   executor SBCL thread bound to the per-call Task+implicit-
+   Thread, the caller DRAINING at the top level (resume-all +
+   poll + the deadlock oracle at 200 idle cycles) or PARKING
+   when nested — the spec's non-async drain loop; the
+   TWO-PARK split per 494 vs 523 — thread.suspend parks with
+   NO readiness on the suspend waitqueue (only an EXPLICIT
+   resume may wake it; Store.tick's resume-all does NOT)
+   while thread.yield parks READY (any nudge re-runs it) —
+   with the NUDGE/RESUME split (the spawn-thunk firing moved
+   out of the nudge into resume only per 4590: a
+   thread.new-indirect thread is created SUSPENDED and a bare
+   tick can never start it — the no-sibling-resume stall's
+   root cause, probe-confirmed); the RESUME-LATER TRAPS per
+   4605-4610 (the unknown-index OOB trap + the
+   not-suspended trap — the silent (when target ...) skip
+   that dropped wakes is gone); the ZOMBIE-JOIN TEARDOWNS at
+   both oracle paths per 3552 (the thread marked ABANDONED —
+   its three park sites unwind via the async-thread-
+   abandoned condition — then unregistered, unblocked,
+   JOINed: a store cannot leak its parked threads); and the
+   ATOMIC PACK EXIT (the STARTED-wait's exit and the state
+   read captured TOGETHER under the callee task's mutex; the
+   exit-to-read window closed by construction). Two pins
+   cover the mechanisms (sync-lift-thread-context +
+   suspend-vs-yield-determinism). The lane whitelists the
+   SAME 25 async files plus the during-sync family (4
+   fixtures, 52 rows) + trap-if-block-and-sync (48 rows) and
+   measures 1396 pass / 0 fail / 0 unsupported / 0
+   harness-error — FULLY GREEN, +100 rows over M11b. THE
+   RECORDED DESIGN EVIDENCE (the negative-result chain, M12
+   sessions 6-12, all measured and reverted per the
+   one-change-per-gate rule): the post-OnStart yield-park
+   (regressed reentrance cmd14 7/8), the before-OnStart
+   pack-mark hold (deadlocked the nested-async pins — the
+   wait's own STARTED exit vs the held OnStart tie), the
+   post-OnStart bare-spin (regressed cmd14 8/8), the
+   no-wait pack + OnStart hold (regressed cmd14+cmd18+
+   cmd20 all 8/8 — and the correction: the STARTED-wait IS
+   the spec's embedder freedom, its three exits mapping
+   exactly to the three fixture shapes: resolved -> the
+   eager RETURNED(2); state!=0 -> STARTED(1) — the
+   sync-inline AND the async-callback callee whose OnStart
+   fires before its WAIT-park; gate-parked -> STARTING(0)),
+   and the atomic exit (closed the read window; changed
+   nothing — kept as strictly-safer). CONCLUSION: the
+   residual is the genuine EMBEDDER-CHOICE problem needing
+   the full TOKEN SCHEDULER (one un-parked guest turn at a
+   time, the tick as the only grant) — the next milestone's
+   opening problem. The remaining nyi ladder with per-file
+   probe evidence: the sequential-schedule family
+   (async-calls-sync 3, reentrance 25 — the token-design
+   hand-off), cancel-targeted-resume 10, cancel-subtask 4,
+   cancel-delivery 4, cancel-resumed-callback-switch 4,
+   sync-streams/partial-stream-copies/
+   cancel-and-exclusive-lock (single rows), cross-abi-calls
+   49, big-interleaving-test 57, idle-drop 38,
+   passing-resources 3, switch-to-ready-callback 17,
+   sync-barges-in 3, drop-cross-task-borrow 7, and T10's
+   non-oracle completion-path leak (4 threads at reentrance
+   cmd22). Still out of scope: the token scheduler, WIT-
+   level Component/WASI, threads beyond the canon core,
+   FASL cache.
    `declared_support` stays `partial`.*
 2. **Failure phases are distinct conditions** (PLAN.md §12.2):
    `decode-error` → `validation-error` → `link-error` →

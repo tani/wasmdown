@@ -37,7 +37,7 @@ calls all pass.
 
 The component lane (`make test-component`, the vendored
 component-model suite at commit `d095e2f60dd...` per
-`specs/lock.toml`) measures M7-M11b: **1296 pass / 0 fail / 0
+`specs/lock.toml`) measures M7-M12: **1396 pass / 0 fail / 0
 unsupported / 0 harness-error** in {binary,validation,
 linking,values,async-core} minus nyi.txt — FULLY GREEN: every
 row passes. The component TEXT parser + the full validation
@@ -57,39 +57,71 @@ task/thread state machine — the callback event loop with the
 real-park YIELD + the exclusive-lock-released WAIT, the
 backpressure gate, the deadlock oracle, the async built-ins as
 real host funcs with the exact trap messages, the packed async
-lower with the STARTED-wait), and THE M11b CANON FAMILIES
-(the End record family: {stream,future}.new/read/write with
-the five-case End.copy + the bounded-buffer backpressure +
-the BLOCKED sentinel, cancel-{read,write}, drop-{readable,
-writable}, forward with the outer-link + the both-pending
-corner + the empty-element take (a 0-byte element still
-advances the progress by the COUNT); the Table free list
-(remove appends, add pops first — the fixtures assert exact
-reused indices); the THREAD core (index/yield/suspend/
-resume-later + new-indirect's suspended spawn-thunk threads
-with the §4587 trap handler + the four -then-{resume,promote}
-variants); the three-shape STARTED semantics (sync-typed
-inline, callback at the initial return or the wset.wait park,
-stackful at on_start); the sync-lower's two-sided type/handle
-split (the result type resolves against the callee, the handle
-indices against the caller — the positional walk); the trap
-propagation (a trapped callee re-signals at the boundary: the
-sync caller loop, the async delivery closure); the {stream,
-future}.forward kind validation; and the async dynamic context
-proclaimed at the file head (a binding site preceding the
-defparameters compiled LEXICAL — the sessions-21-23 mystery).
-25 files in the lane, 20 in nyi.txt with per-file probe
-evidence — the residuals: the sequential-schedule family
-(cancel-targeted-resume, cancel-delivery row 3, cancel-subtask
-rows 1/3, async-calls-sync, cancel-and-exclusive-lock,
-sync-streams, partial-stream-copies — M12's token-scheduler
-work), the sync-lift thread context's reentrance hang, the
-during-sync family (unblocked by the context once reentrance
-resolves), trap-if-block-and-sync, and the rest of the
-error-context canon family. nyi.txt also carries values/
-post-return.wast + values/variants.wast (the same async
-machinery) and validation/kebab.wast (the vendored exclusion).
-See `CONFORMANCE-COMPONENT.md`.
+lower with the STARTED-wait), THE M11b CANON FAMILIES (the End
+record family: {stream,future}.new/read/write with the
+five-case End.copy + the bounded-buffer backpressure + the
+BLOCKED sentinel, cancel-{read,write}, drop-{readable,writable},
+forward with the outer-link + the both-pending corner + the
+empty-element take; the Table free list; the THREAD core
+(index/yield/suspend/resume-later + new-indirect's suspended
+spawn-thunk threads with the §4587 trap handler + the four
+-then-{resume,promote} variants); the three-shape STARTED
+semantics; the sync-lower's two-sided type/handle split; the
+trap propagation; the {stream,future}.forward kind validation;
+the async dynamic context proclaimed at the file head), and
+THE M12 SCHEDULER SEMANTICS (the nested-sync-call handshake:
+every sync lift runs its core call through a FRESH executor
+SBCL thread bound to the per-call Task+implicit-Thread of
+§572, with the caller DRAINING at the top level (§3538-3543:
+resume-all + poll + the deadlock oracle) or PARKING when
+nested; the TWO-PARK split — thread.suspend parks with NO
+readiness on the suspend waitqueue (§494: only an EXPLICIT
+resume may wake it — Store.tick's resume-all does NOT) while
+thread.yield parks READY (§523: any nudge re-runs it) — with
+the NUDGE/RESUME split (the spawn-thunk firing moved out of
+the nudge into resume only: a thread.new-indirect thread is
+created SUSPENDED per §4590 and a bare tick can never start
+it); the RESUME-LATER TRAPS (§4605-4610: the unknown-index OOB
+trap + the not-suspended trap — the silent (when target ...)
+skip that dropped wakes is gone); the ZOMBIE-JOIN TEARDOWNS
+(both oracle paths — the sync-lift executor AND the
+stackful-async guest — mark the thread ABANDONED, whose three
+park sites unwind via the async-thread-abandoned condition,
+then unregister + unblock + JOIN per §3552's "trap and tear
+down the whole store": a store cannot leak its parked threads);
+the ATOMIC PACK EXIT (the STARTED-wait's exit and the state
+read captured TOGETHER under the callee task's mutex); and the
+resume-later arm's OOB/not-suspended traps. Two pins cover the
+new mechanisms: component/sync-lift-thread-context-pins (a
+sync body's OWN thread index + a spawned resumer's
+resume-later completing a suspended invoke) and
+component/suspend-vs-yield-determinism-pins (the two-park
+distinction end-to-end). 25 files in the lane; M12 added the
+during-sync family (4 fixtures, 52 rows) + trap-if-block-and-
+sync (48 rows) — +100 rows over M11b's 1296. The residual nyi
+ladder (with per-file probe evidence): the sequential-
+schedule family (async-calls-sync 3, reentrance 25 — the
+recorded token-scheduler hand-off), cancel-targeted-resume 10,
+cancel-subtask 4, cancel-delivery 4, cancel-resumed-callback-
+switch 4, sync-streams/partial-stream-copies/
+cancel-and-exclusive-lock (single rows), cross-abi-calls 49,
+big-interleaving-test 57, idle-drop 38, passing-resources 3,
+switch-to-ready-callback 17, sync-barges-in 3,
+drop-cross-task-borrow 7, and T10's non-oracle completion-path
+leak (4 threads at reentrance cmd22) — the NEXT MILESTONE's
+opening problem is the TOKEN SCHEDULER (the negative-result
+chain of M12 sessions 6-12 is the recorded design evidence:
+every single-boundary intervention on the STARTED-wait — the
+post-OnStart yield-park, the before-OnStart pack-mark hold, the
+post-OnStart bare-spin, the no-wait pack — either broke the
+three-exit embedder freedom (the STARTED-wait IS that freedom:
+its three exits map exactly to the three fixture shapes) or
+the direct-invoke path; the atomic exit closed the read
+window and changed nothing — the residual needs ONE un-parked
+guest turn at a time, the tick as the only grant). nyi.txt
+also carries values/post-return.wast + values/variants.wast
+(the same async machinery) and validation/kebab.wast (the
+vendored exclusion). See `CONFORMANCE-COMPONENT.md`.
 
 Regenerate with `make report-conformance` (writes `CONFORMANCE.md` +
 `tests/spec-core-results.jsonl`, one JSONL line per command); the full
