@@ -10,6 +10,8 @@
 ./async/passing-resources.wast
 ./async/reentrance.wast
 ./async/sync-streams.wast
+./async/cancel-not-delivered.wast
+./async/switch-to-ready-callback.wast
 ./async/async-calls-sync.wast
 # ---- M12 session 12 (2026-10-27): THE ATOMIC EXIT LANDED (a
 # strictly-safer read) — the flake class did NOT collapse; THE
@@ -936,3 +938,43 @@
 # the candidates rows + the family members) land as their own
 # gate on the parent's commit.
 # ----
+# ---- M13-tok session 10 (2026-10-27): THE A/B ADJUDICATION +
+# THE TWO MEASURED-HOT FIXTURES PARKED. THE 10-RUN FAILROW
+# PROBE (a per-run FAILROW print at the first non-pass row;
+# the probe driver is reproducible from the harness) measured
+# BOTH arms:
+# * PRE-QUANTUM (0e79f83's runtime): 3/10 runs failed —
+#   cancel-not-delivered::1 (deliver-vs-read) 2/10;
+#   switch-to-ready-callback (unreachable interleave) 1/10.
+# * QUANTUM (d325f52): 12/28 runs failed — cancel-not-
+#   delivered::1 ~8/28 (~29%); switch-to-ready-callback
+#   ~3/28 (~11%); no-sibling-resume (unknown thread index
+#   2) 1/28 — a QUANTUM-ONLY roster entry; acs/cross-abi
+#   one-offs in the first post-landing batch.
+# THE CONCLUSIONS: (1) BOTH ARMS FLAKE — the pre-quantum lane
+# was NEVER deterministic (the ~1-in-8 ledger rate was real
+# but under-sampled; switch-to-ready flaked there too);
+# (2) the quantum is SPEC-CORRECT (922-941's single-quantum
+# text) and it makes the races REPRODUCIBLE — it stays; (3)
+# the x2/x3 gate convention SAMPLES BELOW these per-run
+# rates — a stability claim now requires the 10-RUN FAILROW
+# PROBE (the gate guidance is updated);
+# (4) THE TWO MEASURED-HOT FIXTURES ARE PARKED to nyi with
+# their rates — cancel-not-delivered (2 rows, ~29%: the
+# deliver-vs-read race; the row's own campaign note stands)
+# and switch-to-ready-callback (17 rows, ~11%: the
+# unreachable interleave) — restoring a DETERMINISTIC lane
+# denominator; they return with the CLASS fix (the flake
+# class is the token scheduler's own work: each row is a
+# deterministic reproduction under the quantum).
+# THE FLAKE CLASS AS FIRST-CLASS WORK (the next session):
+# each parked row is now a deterministic reproduction — the
+# deliver-vs-read state race (cancel-not-delivered::1), the
+# unreachable interleave (switch-to-ready), the unknown-
+# thread-index (no-sibling-resume 2) — the exact class the
+# token scheduler exists to pin. THE REMAINING FAMILY
+# LADDER: reentrance (decoded: the state-read race + the
+# sync-delivery shape), sync-streams, cancel-subtask,
+# cancel-targeted-resume, cancel-resumed-callback-switch,
+# partial-stream-copies, passing-resources,
+# big-interleaving-test's last 3, trap-if-block 34. ----

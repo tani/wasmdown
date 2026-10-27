@@ -15,15 +15,15 @@ Baseline measurement, not a release gate (PLAN.md §12.8).
 
 | Outcome | Count |
 | --- | --- |
-| pass | 1466 |
+| pass | 1447 |
 | fail | 0 |
 | skip | 0 |
 | unsupported | 0 |
 | timeout | 0 |
 | harness-error | 0 |
-| **total** | **1466** |
+| **total** | **1447** |
 
-Executed: 1466 commands; pass rate 100.0%.
+Executed: 1447 commands; pass rate 100.0%.
 
 ## Per-file counts
 
@@ -32,7 +32,6 @@ Executed: 1466 commands; pass rate 100.0%.
 | component/builtin-trap-poisons-instance.wast | 8 | 0 | 0 | 0 |
 | component/cancel-and-exclusive-lock.wast | 2 | 0 | 0 | 0 |
 | component/cancel-delivery.wast | 4 | 0 | 0 | 0 |
-| component/cancel-not-delivered.wast | 2 | 0 | 0 | 0 |
 | component/cancel-stream.wast | 15 | 0 | 0 | 0 |
 | component/closed-stream.wast | 3 | 0 | 0 | 0 |
 | component/cross-abi-calls.wast | 49 | 0 | 0 | 0 |
@@ -54,7 +53,6 @@ Executed: 1466 commands; pass rate 100.0%.
 | component/idle-drop.wast | 38 | 0 | 0 | 0 |
 | component/same-component-stream-future.wast | 9 | 0 | 0 | 0 |
 | component/self-switch-traps.wast | 9 | 0 | 0 | 0 |
-| component/switch-to-ready-callback.wast | 17 | 0 | 0 | 0 |
 | component/sync-barges-in.wast | 3 | 0 | 0 | 0 |
 | component/trap-if-done.wast | 31 | 0 | 0 | 0 |
 | component/trap-if-sync-and-waitable-set.wast | 29 | 0 | 0 | 0 |
