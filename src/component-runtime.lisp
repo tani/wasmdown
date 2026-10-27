@@ -3544,6 +3544,18 @@ wrong-index probe: one transfer produced index 3)."
   ;; M13-tok19: the SBCL thread handle (for the teardown JOIN —
   ;; the abandoned threads' deaths must complete before the
   ;; next script starts; the unwind storm stole its ticks).
+  ;; M14 THE TURN GRANT (§932's model made explicit): set by
+  ;; async-thread-resume-all — the REAL tick (the drain loops, the
+  ;; caller's blocking-op-driven resume-all) — for every thread the
+  ;; tick nudges; the callback loop's post-first-turn GATE parks until
+  ;; granted (the unsupervised-continuation decode: the worker's
+  ;; OS-thread continuation — end-copy -> WAIT -> loop-top -> the
+  ;; callback's task.return — completed inside the caller's cancel
+  ;; window with no grant; the reference's continuation is granted by
+  ;; Store.tick and the caller does not tick until it blocks). The
+  ;; deferred/incidental propagations (the cancel-wait window's four
+  ;; sites) never set it — the incidental broadcasts do not grant.
+  (granted nil)
   (native nil))
 
 ;;; ---- Thread-local context: bound per SBCL thread by the task
@@ -3782,6 +3794,11 @@ TRANSIENT except the ready-grant (a real wake)."
     (sb-thread:with-recursive-lock ((async-thread-mutex thread))
       (when post-to-p
         (setf (async-thread-post-to thread) post-to))
+      ;; M14 THE TURN GRANT: the explicit resume (the switch arms, the
+      ;; cancellation's synchronous resume) IS a grant — the resumed
+      ;; callee's continuation takes its turn (the TASK_CANCELLED
+      ;; delivery); the incidental broadcasts do not set this
+      (setf (async-thread-granted thread) t)
       (unless started-p
         (incf (async-thread-wake-count thread))
         (sb-thread:condition-broadcast
@@ -3900,6 +3917,16 @@ the caller's own thread; never a plain suspend-parked thread
                        (unless (member th live)
                          (remhash th *tok-skip-age*)))
                      *tok-skip-age*)))
+        ;; M14 THE TURN GRANT: this resume-all IS a real Store.tick
+        ;; (§932 — the drain loops', the blocking-op-driven, the
+        ;; switch arms' one-tick) for every thread it touches: mark
+        ;; ALL of them granted (the callback loop's post-first-turn
+        ;; gate re-tests on any broadcast; the flag answers WHICH
+        ;; broadcast was a tick — the deferred/incidental
+        ;; propagations never reach here in the cancel-wait window)
+        (dolist (th sorted)
+          (unless (async-thread-abandoned th)
+            (setf (async-thread-granted th) t)))
         (when granted-thread
           (%async-thread-wake granted-thread))
         (unless granted-thread
@@ -4397,28 +4424,37 @@ computes the tuple at delivery time)."
     (unwind-protect
          (progn
            (setf (async-thread-ready-fn thread) readiness)
-           ;; M14 THE BLOCK-FIRST PARK (§507's embedder choice, the
-           ;; YIELD arm's own recorded shape): a callback task whose
-           ;; wset ALREADY holds a ready event (cancel-targeted-
-           ;; resume ::7's worker: the caller's future.write landed
-           ;; the event while the worker was mid-turn; the worker's
-           ;; NEXT park sees it at entry) must NOT hot-return — the
-           ;; fixtures pin the ready thread's turn at the CALLER's
-           ;; next blocking op ("worker stays put" — the row's NONE
-           ;; polls), and the hot-return ran the worker's callback
-           ;; (task.return) inside the caller's cancel window. PARK
-           ;; FIRST (one real condition-wait), re-test on wake: the
-           ;; durable wake-count posted by the event's arrival
-           ;; (§subtask-resolve's waiter post / the end's notify)
-           ;; returns the park on the NEXT wake; the caller's own
-           ;; blocking op's resume-all delivers it.
-           (sb-thread:with-recursive-lock ((async-thread-mutex thread))
-             (async-thread-check-abandoned thread)
-             (unless (> (async-thread-wake-count thread) 0)
-               (sb-thread:condition-wait
-                (async-thread-waitqueue thread)
-                (async-thread-mutex thread))))
-           (setf (async-thread-wake-count thread) 0)
+           ;; M14 THE GRANTED PARK (the §932 turn model at the
+           ;; callback WAIT arm): the park returns only on a GRANT
+           ;; — the real tick (async-thread-resume-all sets granted
+           ;; on every thread it touches: the caller's blocking-op
+           ;; resume-all, the drain loops' ticks) or the explicit
+           ;; resume (async-thread-resume — the switch arms, the
+           ;; cancellation's synchronous resume). The incidental
+           ;; broadcasts (the end-notify of an arriving event, the
+           ;; spurious condition-wait return, the leaked inter-park
+           ;; count) do NOT grant: the worker's continuation past
+           ;; its first block waits for the caller's next blocking
+           ;; op — the fixtures' pinned interleave ("the worker
+           ;; stays put"; ::7's NONE polls, ::9's $ran check). The
+           ;; readiness is re-tested AFTER the grant (the event may
+           ;; have arrived during the park — the grant + the
+           ;; readiness together complete the turn); a grant without
+           ;; readiness loops (the count is consumed, the wait
+           ;; re-arms).
+           (loop
+             do (sb-thread:with-recursive-lock
+                    ((async-thread-mutex thread))
+                  (async-thread-check-abandoned thread)
+                  (when (async-thread-granted thread)
+                    (setf (async-thread-granted thread) nil)
+                    (setf (async-thread-wake-count thread) 0)
+                    (return))
+                  (when (> (async-thread-wake-count thread) 0)
+                    (setf (async-thread-wake-count thread) 0))
+                  (sb-thread:condition-wait
+                   (async-thread-waitqueue thread)
+                   (async-thread-mutex thread))))
            (async-thread-wait-until thread readiness)
            (if (%task-deliver-pending-cancel task)
                (list 6 0 0)             ; EventCode.TASK_CANCELLED

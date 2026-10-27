@@ -109,7 +109,47 @@
 #     the caller's own wset.wait's resume-all is a BROADCAST, not
 #     a count; the loop re-waits and the row's final wait starves
 #     (the resume-all is the ONLY waker at the row's end).
-# THE NEXT SHAPE (recorded for the next session): the fix must
+# THE GRANTED-PARK LANDING (the follow-on session; IN THE TREE):
+# the composed shape — (a) a GRANTED slot on async-thread;
+# (b) async-thread-resume (the switch arms, the cancellation's
+# synchronous resume) sets granted; (c) async-thread-resume-all
+# (the real Store.tick) sets granted on every thread it touches;
+# (d) THE GRANTED PARK at the callback WAIT arm: the park returns
+# only on a grant (the incidental broadcasts — the end-notify, the
+# spurious wake, the leaked inter-park count — do not), then the
+# wait-until re-tests the readiness. THE LOOP-TOP GATE variant
+# measured FIRST and REJECTED (the worker's whole flow is its
+# FIRST turn — the gate only covered turns 2+).
+# MEASURED: row ::1 GREEN (3/3); row ::7 PASS under the hook's
+# timing, FAIL 6/6 standalone — the worker's completion moved but
+# a residual grant path remains. THE RESUME-ALL GRANTER TRACE: 6
+# ticks land (the outer %canon-lift-async drain — the run task's
+# own invoke drain ticks the world while the run's core is inside
+# the cancel builtin; each tick grants the worker).
+# THE RESIDUAL DECODED (the next gate): THE EXCLUSIVE — the run
+# task (async-typed, sync-ABI-lifted) blocks at its final
+# wset.wait HOLDING the instance's exclusive; the worker's park
+# readiness requires exclusive-free, so the granted worker parks
+# AGAIN at the wait-until (held) — and the row's own comment
+# ("worker still runs once this task blocks") expects the BLOCK
+# to RELEASE the exclusive: THE SYNC TASK'S BLOCKING-WAIT RELEASE
+# (the callback loop's own §3483 pattern applied to the sync-ABI
+# task's block) — %wset-wait (and the sync blocking paths) must
+# release the instance's exclusive for the duration of the wait.
+# Until then the worker holds at the wait-until and the row's
+# final wset.wait would deadlock if the row reached it (the
+# current fails trap earlier at the NONE polls — the worker's
+# completion lands inside the window via the wait-until's own
+# re-test on the drain ticks: exclusive-free moments exist
+# between the run's own turns).
+# THE FULL GATES AT THE GRANTED-PARK BUILD: units 411/0; the lane
+# 1482/0 + 1481/1 + 1482/0 (the single fail in the middle run =
+# the KNOWN floor class — the run's jsonl was overwritten by the
+# third run; the class identity per the prior probes: acs::1 /
+# reentrance::14, both recorded at their bands); THE 10-RUN
+# FAILROW PROBE 10/10 GREEN — the drift rows did NOT appear in
+# any run (the granted park's holding may have cooled them;
+# re-watch at the next build).# THE NEXT SHAPE (recorded for the next session): the fix must
 # distinguish the CALLER'S OWN BLOCKING-OP TICK (a broadcast that
 # SHOULD return the park) from the WINDOW's incidental broadcasts
 # (which should NOT) — e.g. a per-park "granted" flag set by the
