@@ -38,6 +38,44 @@
 # standalone re-measured 10/10 AFTER the probe; its lane flake
 # is the cross-fixture drift class, the same shape the teardown
 # join closed for cancel-resumed).
+# THE UN-PARK GATE 2 (same session): cancel-subtask's 4 rows
+# ENTER THE LANE — ::1's eager-cancel row (the fixture's first
+# row pins CANCELLED_BEFORE_RETURNED(4) eagerly) CLOSED by the
+# same synchronous resume. The lane 1478/0/0/0 x3 + units 411/0.
+# THE FAILROW PROBE at the new denominator (485 rows/run):
+# 7/10 green — the 3 fails ALL reentrance ::14 (the drift row;
+# cancel-subtask clean in all 10 runs). The ::14 band (1/10 at
+# gate 1's probe, 3/10 here) is the drift class's variance —
+# WATCH it at the next gate; if it holds or rises, the row's own
+# window (the reentrance ::14 state-read, the ledger's recorded
+# row) re-enters the decode queue.
+# THE NEXT DECODE (cancel-targeted-resume ::1/::7/::9, the
+# rows isolated verbatim — each fails ALONE the same way): THE
+# CANCEL PATHS ARE CORRECT AT THE LANDED BUILD (the trace: row 9's
+# eager cancel RESOLVES under the synchronous wait — (:REQ
+# :STARTED NIL T NIL) then (:RESOLVE 4) then (:REQ-DONE
+# :RESOLVED); rows 1/7's gates correctly report not-ready ->
+# BLOCKED as pinned). THE FAILS ARE DOWNSTREAM — row 1's window
+# capture (the keeper's task.return fires, the subtask RESOLVES
+# state 2, but :GETEV NEVER LOGS: the caller's waitable-set.wait
+# NEVER DELIVERS — the subtask is JOINED to the set AFTER the
+# resolution (the fixture's order: cancel -> wset.new ->
+# waitable.join -> wset.wait), so NO waiter was registered at
+# resolve time; the pending-event closure must deliver at the
+# wait — the %waitable-event-ready-p / %wset-wait path for a
+# POST-RESOLUTION join is the residual surface. Rows 7/9 the same
+# class (the later wset.wait/yield-loop checks).
+# THE UN-PARK GATE 3 (same session): cancel-resumed-callback-
+# switch's 4 rows ENTER THE LANE — BOTH the own-task and the
+# cross-task switch shapes: the resumed callback's SWITCH turn
+# blocks and the canceller observes the mid-turn RE-PARK (the
+# "blocks" half of §756-759's boundary) reporting BLOCKED as the
+# fixture pins. The lane 1482/0/0/0 x3 + units 411/0. THE PROBE
+# at the new denominator (489 rows/run): 9/10 green — the single
+# fail reentrance ::14 ONCE (the drift row's band across the
+# three probes: 1/10 -> 3/10 -> 1/10 — variance, NOT a raised
+# rate); cancel-resumed CLEAN in all 10 runs (the M13 lane-only
+# ::1/::3 window GONE at the synchronous-resume build).
 #
 # THE ROOT (the chronological capture, the non-intrusive
 # global-log pattern): (:REQ :STARTED T) then (:REQ-DONE
@@ -139,12 +177,10 @@
 # touched). THE M14 HAND-OFF — the class-fix queue's head
 # candidate.
 ./async/during-sync-call-no-sibling-resume.wast
-./async/cancel-resumed-callback-switch.wast
 ./validation/kebab.wast
 ./values/post-return.wast
 ./values/variants.wast
 ./async/big-interleaving-test.wast
-./async/cancel-subtask.wast
 ./async/cancel-targeted-resume.wast
 ./async/partial-stream-copies.wast
 ./async/sync-streams.wast

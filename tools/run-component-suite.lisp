@@ -164,7 +164,32 @@ parent dir), not the first (the grandparent 'component' — the old
                                  ;; 10/10 standalone at the gate;
                                  ;; the lane + the FAILROW probe
                                  ;; at the new denominator.
-                                 "reentrance.wast")
+                                 "reentrance.wast"
+                                 ;; M14 (the resolved-yet family's
+                                 ;; un-park gate 2): cancel-subtask
+                                 ;; — ::1's eager-cancel row CLOSED
+                                 ;; by the same synchronous resume
+                                 ;; (the fixture's first row pins
+                                 ;; CANCELLED_BEFORE_RETURNED(4)
+                                 ;; eagerly). 0/10 -> 10/10
+                                 ;; standalone at gate 1's build.
+                                 "cancel-subtask.wast"
+                                 ;; M14 (the resolved-yet family's
+                                 ;; un-park gate 3): cancel-resumed-
+                                 ;; callback-switch — BOTH rows (the
+                                 ;; own-task and the cross-task
+                                 ;; switch shapes) GREEN at the
+                                 ;; synchronous-resume build: the
+                                 ;; resumed callback's SWITCH turn
+                                 ;; blocks and the canceller observes
+                                 ;; the mid-turn RE-PARK (the
+                                 ;; "blocks" half of §756-759's
+                                 ;; boundary), reporting BLOCKED
+                                 ;; exactly as the fixture pins.
+                                 ;; 10/10 standalone (the turn-only
+                                 ;; wait's deadlock regression
+                                 ;; measured and closed at gate 1).
+                                 "cancel-resumed-callback-switch.wast")
                                :test #'string=)))
                 (or (directory (merge-pathnames
                                 "tests/component/async/*.wast" *root*))
