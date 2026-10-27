@@ -1732,3 +1732,47 @@
 # reverted); the lane 1469/0 x3 + units 410/0 re-verified at
 # HEAD (the committed pieces 1+2 state).
 # ----
+# ---- M13-tok session 29 (2026-10-28): THE OWN-TRANSFER CHAIN
+# CLOSED — the last boundary landed as the parent's shape: THE
+# GUEST-BODY BORROW CONVERSION + THE BUILTIN'S BORROW MISS-WALK,
+# one gate. passing-resources' rows GREEN (10/10 + the full
+# fixture's 3 rows); drop-cross-task-borrow's 7 rows HOLD
+# (10/10); the lane 1469/0 (x3 + the 10-run FAILROW probe
+# 10/10 GREEN after one known-flake single-fail run);
+# units 410/0; core 21187/0/73.
+# THE GATE (both halves, as the parent directed):
+# 1. THE GUEST-BODY BORROW CONVERSION (the last boundary): in
+#    %async-lift-guest-body's vals walk, a (borrow $R) param
+#    whose domain value is an INT (the BI — the index at the
+#    callee-defining table, the record the lower's lend added)
+#    derefs the BI at the callee's own table and passes THE
+#    REP to the core (the spec's §2412 h.rep). MEASURED:
+#    passing-resources ::1 GREEN (the R.foo core receives 50
+#    -> 100; 5/5 then 10/10).
+# 2. THE BUILTIN'S BORROW MISS-WALK: the (canon resource.drop
+#    $R) builtin's first remove wrapped in ignore-errors (the
+#    class-guard TRAPS on a miss — the first attempt's miss-
+#    walk never ran); on the miss, the param resolves BY REP
+#    through the BORROW records on the callee's own table (the
+#    BI handles the lends added) and the FOUND handle drops.
+#    MEASURED: drop-cross-task-borrow ::2/::4 GREEN (the
+#    cross-task drop works through the borrowed record; 3/3
+#    then 10/10).
+# THE CHAIN'S LEDGER (sessions 22-29, complete): the parser's
+# interning was CORRECT (the own ct intact in the type space);
+# the drop site was the stream-new canon's elem extraction (the
+# raw ref — fixed by the single resolution, session 25 piece
+# 1); the take/put own-transfer (session 25 piece 2 — the
+# resource crosses WITH its rep); the wiring (the BI at every
+# LOWER boundary — the parent's verdict, session 26); the
+# live-path map (session 27 — the guest body's walk, not the
+# 5651/2204 arms); the conversion + the miss-walk (this
+# session) — THE RESOURCE NOW CROSSES THE STREAM, THE BORROW
+# CROSSES THE CALL, AND THE BUILTIN DROPS THROUGH THE BORROWED
+# RECORD.
+# THE STATE at the close: the full gate in the tree (the
+# conversion + the miss-walk + the committed pieces 1+2);
+# passing-resources' fixture is fully green (its 3 rows) and
+# READY TO LAND (the un-park + the whitelist entry as the next
+# gate); NOT COMMITTED (the parent commits at green).
+# ----

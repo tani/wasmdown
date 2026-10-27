@@ -2942,10 +2942,41 @@ resource.drop (param handle), [i32] -> [i32] for resource.rep."
      (wasmdown.runtime:make-host-func-instance
       (wasmdown.types:make-wasm-func-type '(:i32) '())
       (lambda (args)
-        ;; §3783: the handle resolves on the dynamic-context table
-        (let* ((h (%handle-remove (%resource-current-inst inst)
-                                   rt (first args)))
-               (rep (cdar h)))
+        ;; §3783: the handle resolves on the dynamic-context table.
+        ;; M13-tok29: the remove's GUARD TRAPS on a miss (the
+        ;; class-guard's 'invalid handle index' error) — the
+        ;; miss-walk below must see the miss, so ignore-errors
+        ;; around the first remove.
+        (let* ((h (ignore-errors
+                   (%handle-remove (%resource-current-inst inst)
+                                   rt (first args))))
+               (rep (and h (cdar h))))
+          ;; M13-tok29 THE BORROW MISS-WALK (the own-transfer
+          ;; chain's companion to the guest-body conversion):
+          ;; when the index misses the local table (the callee's
+          ;; core received the REP for a borrowed param — the
+          ;; spec's §2412 value — and passed it here as the
+          ;; index: drop-cross-task-borrow's dont-drop stashes
+          ;; its borrow param and calls this builtin with it),
+          ;; resolve the param BY REP through the BORROW records
+          ;; on the callee's own table (the BI handles the
+          ;; lends added) and drop THE FOUND handle — the
+          ;; fixture's cross-task drop works through the
+          ;; borrowed record.
+          (unless h
+            (let* ((tab (%inst-handles (%resource-current-inst inst)))
+                   (hit (loop for k from 0 below (length tab)
+                              for v = (aref tab k)
+                              when (and (consp v)
+                                        (consp (car v))
+                                        (eql (caar v) rt)
+                                        (eql (cdar v)
+                                             (first args)))
+                              do (return-from nil (1+ k)))))
+              (when hit
+                (setf h (%handle-remove (%resource-current-inst inst)
+                                        rt hit)
+                      rep (first args)))))
           ;; an OWNING handle's drop runs the resource's dtor with
           ;; the rep (canon_resource_drop, CanonicalABI.md 3782)
           (when (and (cdr h) dtor)
@@ -4318,7 +4349,51 @@ drop-readable must return index 1 again)."
                                            ft)) 'list)))
            (vals (loop for p in (or params '())
                        for a in (or args '())
-                       collect (%abi-arg-domain a (cdr p) cx)))
+                       collect
+                       ;; M13-tok29 THE GUEST-BODY BORROW
+                       ;; CONVERSION (the last boundary of the
+                       ;; own-transfer chain, sessions 22-28):
+                       ;; the lower's borrow arm put the BI (the
+                       ;; index at the CALLEE-DEFINING table —
+                       ;; the cx's inst, the record the lend
+                       ;; added) in the component args; the OLD
+                       ;; domain conversion passed the raw INT
+                       ;; through to the core (passing-
+                       ;; resources' R.foo core received the
+                       ;; index 5 and returned 55 where the
+                       ;; fixture pins 100). For a (borrow $R)
+                       ;; param whose domain value is an INT,
+                       ;; deref the BI at the callee's own table
+                       ;; and pass the REP (the spec's §2412
+                       ;; h.rep — the core consumes it
+                       ;; positionally). The BI's record stays
+                       ;; in the table for the callee's resource
+                       ;; BUILTINS (drop-cross-task-borrow's
+                       ;; R-drop resolves its index there).
+                       (let ((c (and (cdr p)
+                                     (%abi-ct (cdr p)
+                                              (abi-cx-inst cx)))))
+                         (if (and c
+                                  (wasmdown.component:ct-p c)
+                                  (eq (wasmdown.component:ct-kind c)
+                                      :borrow)
+                                  (integerp a))
+                             (let* ((rt-idx
+                                      (wasmdown.component:ct-payload c))
+                                    (rt (and (integerp rt-idx)
+                                             (< rt-idx
+                                                (length
+                                                 (comp-instance-types
+                                                  (abi-cx-inst cx))))
+                                             (aref
+                                              (comp-instance-types
+                                               (abi-cx-inst cx))
+                                              rt-idx))))
+                               (or (and rt
+                                        (%handle-rep
+                                         (abi-cx-inst cx) rt a))
+                                   (%abi-arg-domain a (cdr p) cx)))
+                             (%abi-arg-domain a (cdr p) cx)))))
            (flat-args
              (if (or (abi-cx-memory cx) params)
                  ;; M13-lad (cross-abi-calls ::8-::11): the LIFT
