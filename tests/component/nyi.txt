@@ -1542,3 +1542,58 @@
 # recorded verbatim in this chain for the next session's
 # one-gate landing with the borrow-deref probe first.
 # ----
+# ---- M13-tok session 24 (2026-10-28): THE BORROW-DEREF
+# PROBE ANSWERED — the transfer is FULLY CORRECT; the last
+# inch is a RECORDED DESIGN TENSION (the async lift's borrow
+# param: the SPEC's REP vs the M13-lad local shape's INDEX).
+# The transfer REVERTED at the budget's end (the lane 1469/0
+# x3 + units 410/0 re-verified); the tree = the ledger only.
+# THE PROBE'S EVIDENCE (all three links measured):
+# 1. THE TAKE'S REMOVE (the handle-remove hook): RM#1 idx=3
+#    rt=:RESOURCE -> (:RESOURCE . 50) — the producer's slot 3
+#    held (R . 50), removed CORRECTLY.
+# 2. THE PUT'S RE-ADD + THE FOO'S BORROW DEREF (the
+#    handle-rep hook): REP idx=2 -> 50 — the consumer's slot 2
+#    holds (:RESOURCE 50) — the re-add stored the rep
+#    INTACT and the consumer's borrow deref yields 50.
+# 3. THE FOO'S RETURN: 55 = 5 + 50 — the callee's core
+#    received **5**, not 50 — THE ASYNC LIFT'S BORROW ARM
+#    (5651-5740) passes the BI (the callee-defining table's
+#    INDEX — 5 at ft-inst) as the core's param value, per the
+#    M13-lad local-shape move ('the BORROW HANDLE is added to
+#    the CALLEE-DEFINING instance's table... the callee's
+#    core stashes the index and its R-rep/R-drop resolve it
+#    there') — the arm's OWN COMMENT cites the spec it
+#    diverged from: '§2412: lift_borrow returns h.rep' —
+#    passing the REP to the callee.
+# THE DESIGN TENSION (recorded for the parent's adjudication):
+# - THE SPEC (§2406-2412): lift_borrow returns h.rep — the
+#   callee's core receives the REP for a borrow param.
+# - THE M13-LAD LOCAL SHAPE: the BI (the index at the
+#   callee-defining table) — needed by the drop-cross-task-
+#   borrow shape (::2/::4: the callee's core calls
+#   resource.rep/drop AT the index across a task boundary).
+# - THE FIXTURES PIN BOTH SIDES: passing-resources' R.foo
+#   ('(i32.add rep 50)' — the REP positionally) vs
+#   drop-cross-task-borrow's callee (the resource ops AT the
+#   index) — the callee's usage is NOT statically decidable
+#   from the lower/lift site.
+# THE CANDIDATE RESOLUTIONS for the next session: (a) the
+# spec-conformant REP + the drop-cross-task callee's ops
+# re-routed (the ops' borrowed-index resolution through the
+# recorded lender — the subtask's lenders list already
+# tracks the source); (b) the BI + the R.foo-class fixtures
+# re-read (the spec suite's intent may be the REP-only
+# convention with the ops' own re-resolution — the spec's
+# 3691 lift_borrow creates the borrow handle at the CALLEE's
+# table and returns h.rep, so the callee's R-rep(borrow-
+# index) path exists per the spec too — the ops take the
+# index and the PARAM is the rep: TWO different values for
+# the two uses).
+# THE STATE at the close: the two-piece transfer (the canon
+# resolution + the take/put own-transfer) is recorded verbatim
+# in the session-23/24 chains and WORKS end-to-end (the
+# resource crosses with its rep); the borrow-param's value
+# convention is the remaining gate — one decision, not a
+# probe.
+# ----
