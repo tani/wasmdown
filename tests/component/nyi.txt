@@ -58,6 +58,35 @@
 ./async/partial-stream-copies.wast
 ./async/passing-resources.wast
 ./async/reentrance.wast
+# ---- M12 session 7 (2026-10-27): THE ZOMBIE-JOIN TEARDOWNS
+# LANDED (both oracle paths); the cmd-18 trigger REFINED to the
+# SHARED-STATE prefix (units 410/0; lane 1396/0/0/0 x3; core
+# 21187/0/73 unchanged). THE LANDED CHANGES (one gate, §3552's
+# "trap and tear down the whole store"): (1) %sync-lift-run's
+# oracle teardown now MARKS the executor ABANDONED (a new
+# async-thread flag; the three park sites — wait-until, suspend,
+# yield — check it and unwind via the async-thread-abandoned
+# condition, aborting the guest body), unblocks every park, and
+# JOINS the SBCL thread; (2) %canon-lift-async's oracle (the
+# stackful-async path — T8's shape) gets the SAME teardown (mark
+# + unblock + unregister; the guest thread exits on its own).
+# The re-parked zombie (the nudge-consuming CPU thief) can no
+# longer outlive its store. THE MEASURED YIELD: acs hit 3/0 once
+# in 12 runs (its good side; the counter race persists — the
+# baseline 2/1-1/2 rate unchanged); reentrance cmd 18 UNCHANGED
+# (the zombie was NOT its mechanism). THE cmd-18 TRIGGER
+# REFINED (the decisive line-probe): T1-8+T9 as FIVE separate
+# run-script calls PASSES 6/6; the SAME lines as ONE run-script
+# (the shared wast-state) FAILS 3/3 with cmd14+cmd18 — the
+# interference lives in the HARNESS'S SHARED STATE (the named
+# instance bindings/exports across commands), NOT the scheduler's
+# thread population. NEXT PROBE for cmd 18: the wast-state's
+# current-instance/export resolution for T9's (invoke "run") —
+# whether an earlier test's binding (T7's $c export of "c"? T8's
+# instance?) SHADOWS T9's "run" resolution (the earlier tests'
+# $ids may collide across components: T5 binds $d, T7 binds $c,
+# T9 binds... check the named-instances table's entries at T9's
+# assert). ----
 # ---- M12 session 6 (2026-10-27): THE STARTED-HANDSHAKE
 # EXPERIMENT (shape (b)) MEASURED AND REVERTED; the flake map
 # refined (no code change landed — the tree stays at 381d259's

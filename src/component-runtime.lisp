@@ -2005,7 +2005,6 @@ reentrance phase checks). The CALLER then waits:
                       (setf done-p t)
                       (sb-thread:condition-broadcast done)))))
               :name "sync-lift-executor")))
-      (declare (ignore executor))
       (unwind-protect
            (cond
             ((sb-thread:main-thread-p)
@@ -2043,13 +2042,22 @@ reentrance phase checks). The CALLER then waits:
         ;; Unregister it and unblock its park so the SBCL thread
         ;; can finish (the cell stays empty; the caller traps).
         (when oracled
+          ;; THE ZOMBIE JOIN (§3552's teardown): mark the executor
+          ;; ABANDONED — its park sites unwind (the guest body
+          ;; aborts) instead of re-parking — unblock every park,
+          ;; and JOIN the SBCL thread so the next test's resume-all
+          ;; can never nudge it (the T8->T9 interference: the
+          ;; re-parked zombie consumed ticks and starved T9's
+          ;; STARTED-wait, ~10/10 deterministic).
           (setf (async-thread-suspended-p th) nil)
           (setf (async-thread-yield-parked th) nil)
+          (setf (async-thread-abandoned th) t)
           (%sync-lift-exit task th)
           (sb-thread:with-recursive-lock ((async-thread-mutex th))
             (sb-thread:condition-broadcast
              (async-thread-suspend-waitqueue th))
-            (sb-thread:condition-broadcast (async-thread-waitqueue th))))
+            (sb-thread:condition-broadcast (async-thread-waitqueue th)))
+          (ignore-errors (sb-thread:join-thread executor)))
         (unless oracled
           (%sync-lift-exit task th)))
       (when (cdr cell) (error (cdr cell)))
@@ -3155,6 +3163,7 @@ wrong-index probe: one transfer produced index 3)."
   (spawn-thunk nil)                   ; new-indirect's suspended body
   (storage (make-array 2 :initial-element 0))
   (cancellable nil)
+  (abandoned nil)                    ; store-teardown mark: parks unwind, the thread exits
   (yield-parked nil)                 ; parked by async-thread-yield (READY)
   (suspended-p nil)                  ; SUSPENDED (§494): only an explicit resume wakes
   (mutex (sb-thread:make-mutex :name "thread"))
@@ -3196,11 +3205,27 @@ no candidate thread can ever make progress — the deadlock trap.")
                     async-thread-resume-all async-thread-yield
                     async-thread-suspend async-thread-nudge))
 
+(define-condition async-thread-abandoned (wasmdown:wasm-trap)
+  ()
+  (:documentation "The store's teardown abandoned this thread: the
+park sites unwind (the thread exits its guest body) instead of
+re-parking as a nudge-consuming zombie."))
+
+(defun async-thread-check-abandoned (thread)
+  "The park sites' teardown gate: signal ABANDONED when the store
+has torn this thread down — the unwind aborts the guest body (the
+task never resolves; the caller already trapped its oracle)."
+  (when (async-thread-abandoned thread)
+    (error 'async-thread-abandoned
+           :kind :generic
+           :message "abandoned by store teardown")))
+
 (defun async-thread-wait-until (thread ready-fn)
   "Thread.wait_until (CanonicalABI.md 505): block until READY-FN
 holds, re-testing on each wakeup."
   (loop
     (sb-thread:with-recursive-lock ((async-thread-mutex thread))
+      (async-thread-check-abandoned thread)
       (when (funcall ready-fn)
         (incf *async-progress*)
         (return))
@@ -3215,10 +3240,13 @@ resume-all does NOT touch the suspend waitqueue: a scheduler nudge
 must not un-suspend a thread that only an explicit switch may."
   (setf (async-thread-suspended-p thread) t)
   (unwind-protect
-       (sb-thread:with-recursive-lock ((async-thread-mutex thread))
-         (sb-thread:condition-wait (async-thread-suspend-waitqueue
-                                    thread)
-                                   (async-thread-mutex thread)))
+       (loop
+         (sb-thread:with-recursive-lock ((async-thread-mutex thread))
+           (async-thread-check-abandoned thread)
+           (sb-thread:condition-wait (async-thread-suspend-waitqueue
+                                      thread)
+                                     (async-thread-mutex thread))
+           (return)))
     (setf (async-thread-suspended-p thread) nil)))
 
 (defun async-thread-nudge (thread)
@@ -3268,6 +3296,7 @@ scheduler nudge (Store.tick / resume-all) so other threads run. The
 YIELD-PARKED flag marks the thread READY while parked (a promote
 target's resumability condition, §549)."
   (sb-thread:with-recursive-lock ((async-thread-mutex thread))
+    (async-thread-check-abandoned thread)
     (setf (async-thread-yield-parked thread) t)
     (unwind-protect
          (sb-thread:condition-wait (async-thread-waitqueue thread)
@@ -3877,9 +3906,25 @@ drop-readable must return index 1 again)."
              ;; quiescent cycles with the task unresolved = no ready
              ;; candidate can ever make progress
              when (>= idle-cycles 50)
-               do (error 'wasmdown:wasm-trap :kind :generic
-                         :message
-                         "deadlock detected: event loop cannot make further progress"))
+               do
+               ;; THE ZOMBIE JOIN (§3552's teardown — the same class
+               ;; as %sync-lift-run's): the unresolved task's GUEST
+               ;; thread stays parked in the scheduler; the NEXT
+               ;; test's resume-all would nudge it (a re-parking
+               ;; CPU thief). Mark it ABANDONED (its parks unwind),
+               ;; unblock every park, unregister it — the SBCL
+               ;; thread exits on its own; the caller traps.
+               (setf (async-thread-suspended-p th) nil)
+               (setf (async-thread-yield-parked th) nil)
+               (setf (async-thread-abandoned th) t)
+               (ignore-errors (%task-exit-implicit-thread task))
+               (sb-thread:with-recursive-lock ((async-thread-mutex th))
+                 (sb-thread:condition-broadcast
+                  (async-thread-suspend-waitqueue th))
+                 (sb-thread:condition-broadcast (async-thread-waitqueue th)))
+               (error 'wasmdown:wasm-trap :kind :generic
+                      :message
+                      "deadlock detected: event loop cannot make further progress"))
         (sb-thread:release-mutex (async-task-mutex task)))
       (etypecase (car cell)
         ((eql t)
