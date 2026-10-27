@@ -1646,3 +1646,52 @@
 # and (b). passing-resources stays nyi'd — the convention is
 # the last gate.
 # ----
+# ---- M13-tok session 26 (2026-10-28): THE CANON WIRING READ
+# (the deciding evidence) — the parent's prediction HOLDS on
+# the lower side; the lift side's table is the precise bug; the
+# tension relocates to drop-cross-task's BUILTIN path. The tree
+# stays at pieces 1+2 (the pure wins); the lane 1469/0 (x2 +
+# 1 known-flake single-fail in the batch) + units 410/0.
+# THE WIRING (both fixtures, the canon arms verbatim):
+# 1. passing-resources: '(canon lower (func $producer
+#    "[method]R.foo") (core func $R.foo'))' — the consumer's
+#    core passes $res1 (its OWN slot index, from the stream
+#    read) INTO THE LOWER — the lower's borrow walk derefs THE
+#    CONSUMER's table at that index (rep 50) -> the BI at the
+#    PRODUCER's table (ft-inst). The producer's LIFT then
+#    derefs the BI AS AN INDEX against FT-INST -> the rep 50
+#    -> the core's '(+ rep 50)' = 100.
+# 2. drop-cross-task-borrow: the same lower shape for R-rep
+#    ($D's table deref) + THE BUILTIN (canon resource.drop) for
+#    R-drop ($D-local index).
+# THE PRECISE BUG (the measured 55): the ASYNC LIFT's borrow
+# arm derefs 'inst' (the LOWERING CALLER) but the lower's BI
+# lives at FT-INST — the deref found NIL, the raw index (5)
+# flowed to the core. THE FIX = the ft-inst deref (my session-
+# 25 piece 3) — under it R.foo passes (measured).
+# THE RELOCATED TENSION (measured the same session): the ft-
+# inst deref gives drop-cross-task's dont-drop core the REP;
+# its R-drop($h) BUILTIN call passes the REP as the $D-local
+# INDEX — the miss traps where ::2 expects the drop to work.
+# The parent's (a)+lenders-walk refinement hits the same wall
+# my session-25 impasse did: the lenders live on the ORIGINAL
+# lend's SUBTASK (the $E->dont-drop call); the R-drop fires
+# from the drop-handle task — the lenders unreachable from
+# the builtin's context.
+# THE REMAINING DESIGN SHAPE (for the parent): the async lift
+# gives the REP (the spec's §2412) AND the CALLEE's OWN
+# resource-builtin canons get a BORROW-LEND INDEX RESOLUTION:
+# the (canon resource.drop $R) in $D — its index param, when
+# the local miss occurs, resolves through the LENDER RECORDS
+# ON THE CALLEE'S OWN TABLE (the BI's handle record could
+# carry its source index — the (%handle-add ft-inst rt rep
+# nil) at the lend could record the ORIGIN (the lower's
+# caller + the source index) on the handle; the builtin's
+# miss-walk then finds the borrowed handle by REP and drops
+# THROUGH it) — one mechanism, both fixtures.
+# THE STATE at the close: pieces 1+2 in the tree (the pure
+# wins — the canon resolution + the own-transfer); piece 3
+# (the ft-inst deref) recorded + the relocated tension + the
+# origin-recorded-BI candidate shape. NOT COMMITTED (the
+# parent commits at green).
+# ----
