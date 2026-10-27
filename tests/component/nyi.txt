@@ -225,3 +225,41 @@
 # which layers remain needed rather than assuming the mark
 # stays). THE FIXTURE RETURNS TO THE LANE (48 rows) IN THE
 # SAME GREEN COMMIT AS THE FIX. ----
+# ---- M13 session 5 (2026-10-27): THE INSTALL-MOVE measured
+# and REVERTED; ::34's residual RE-DIAGNOSED (neither the
+# install race NOR the eager-fire window). THE NEGATIVE-
+# RESULT CHAIN: (1) the install-move exactly as recorded
+# (%async-thread-start-spawn takes POST-TO, installs under
+# the same locked section BEFORE the thread start; resume-
+# later reverted to MARK-ONLY for pending spawns) — ::34
+# GREEN 0 fails, BUT scheduling-candidates ::2 REGRESSED
+# (the tick-claimed spawn's deferred fire raced the
+# caller's park wake against the body's first store — the
+# eager fire's head-start was LOAD-BEARING for ::2);
+# (2) the fallback-handoff experiment (promote arms
+# installing post-to on a tick-claimed/running target) —
+# MUCH WORSE (trap-if-block 4 fails, scheduling-candidates
+# 6: dead/:done targets never post; the caller's park
+# deadlocks into the oracle); (3) the reconciliation
+# (eager fire + install-at-birth) — all six fixtures green
+# individually, scheduling-candidates 10/10, BUT ::34's
+# 30-run battery went to 6/30 at 47 rows (WORSE than the
+# 2/20 baseline at 671d491). THE TRACED FAILING RUN'S
+# EVIDENCE: three START-SPAWN calls on one record (the
+# first fires, the rest are the resume's count path); a
+# ready-mark set on a :DONE target (a TOCTOU between
+# resume-later's guard and a concurrent fire? — both under
+# the target's mutex, so unexplained); and a SELF-RESUME
+# (from=1 -> idx=1) right before the oracle traps. THE
+# SESSION-6 PROBLEM (fully narrowed): the failure is in
+# the TARGET LOOKUP or the RECORD LIFECYCLE — the fixture
+# runs 24 (component instance \$i \$Tester) commands on the
+# SAME instance shape, and row 34's arm may find a STALE
+# :done record from a PREVIOUS instance command (an INDEX
+# COLLISION: the threads list carrying stale records whose
+# indices collide with the fresh row's threads) rather than
+# a genuine handoff race. FIRST PROBE: print the FIELDS
+# :THREADS list at the arm's target lookup on failure — a
+# stale record from a previous command vs a genuine self-
+# index. The tree stays green at 671d491; the fixture
+# remains in nyi. ----
