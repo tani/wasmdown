@@ -5565,6 +5565,22 @@ is the valtype."
               (let ((mu (async-thread-mutex *current-thread*)))
                 (sb-thread:with-recursive-lock (mu)
                   (async-thread-check-abandoned *current-thread*)
+                  ;; M13-tok34 THE INTER-ROUND DRAIN (no-sibling-
+                  ;; resume ::2's window: the capture's tail (:RES
+                  ;; (71) NIL) (:SUSP (72)) — the caller WOKE from
+                  ;; its round wait BEFORE the target's post: the
+                  ;; PREVIOUS round's late post (the target's
+                  ;; exit-post landing in the inter-round gap)
+                  ;; survived the M13-9 no-arm-clear shape and was
+                  ;; absorbed by THIS round's wait as its own wake —
+                  ;; the caller proceeded early, the target stranded
+                  ;; mid-round). Drain the surviving count UNDER THE
+                  ;; MUTEX before arming: a stale count is consumed
+                  ;; here (a REAL post for THIS round cannot exist
+                  ;; yet — the target has not been resumed; the
+                  ;; resume happens below, after the arm).
+                  (setf (async-thread-wake-count *current-thread*)
+                        0)
                   (if yield-p
                       (setf (async-thread-yield-parked *current-thread*)
                             t)

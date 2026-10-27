@@ -1901,3 +1901,28 @@
 # THE STATE at the close: the tree = the ledger only; the lane
 # 1469/0 + units 410/0 at HEAD.
 # ----
+# ---- M13-tok session 34 (2026-10-28): THE NO-SIBLING WINDOW
+# FIXED — THE INTER-ROUND DRAIN (the round-count invariant, the
+# spec-grounded bounded fix): the suspend-then-resume arm's
+# park now DRAINS the surviving wake count UNDER THE MUTEX
+# before arming each round — the PREVIOUS round's late post
+# (the target's exit-post landing in the inter-round gap) was
+# surviving the M13-9 no-arm-clear shape and absorbed by the
+# NEXT round's wait as its own wake (the capture's tail: (:RES
+# (71) NIL) (:SUSP (72)) — the caller woke early, the target
+# stranded mid-round).
+# THE MEASUREMENTS: no-sibling ::2 0 occurrences in 50 probe-
+# lane runs (the parent's sweep had ~3%); trap-if-block (the
+# ::34 class — the arm's own history) 10/10 GREEN (the drain
+# does not reopen the M13-9 wound); the switch family
+# (exclusive-resume 10/10, self-switch 6/6) green; the lane
+# 1469/0 x3 + units 410/0 + core 21187/0/73.
+# THE CLASS'S REMAINING TWO (the rates UNCHANGED — the drain
+# did not cool them, nor rise them): acs::1 4/50 (~8% — the
+# STARTED-wait/pack boundary) and switch-to-ready ::8 3/50
+# (~6% — the GATE/STARTED-wait shape, the leftover/predecessor
+# coupling). THEIR windows are the sprint's remaining targets.
+# THE STATE at the close: the tree = the drain (one bounded
+# change) + the ledger; NOT COMMITTED (the parent commits at
+# green).
+# ----
