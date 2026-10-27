@@ -2693,6 +2693,31 @@ these pins guard the executor's mechanisms directly."
     (let ((f-res (funcall (wasmdown.wast:component-invoker) ci "f" '())))
       (is (equal '(1) f-res)))))
 
+(test component/cancel-eager-resolve-pins
+  ;; M14 — THE SPEC'S SYNCHRONOUS RESUME (CanonicalABI.md 761-770 +
+  ;; 756-759 + 474-484): subtask.cancel's OnCancel resumes a
+  ;; CANCELLABLE-AND-READY callback callee and WAITS for its TURN
+  ;; BOUNDARY — the task resolved (the eager-cancel shape: the
+  ;; callback receives TASK_CANCELLED and calls task.cancel) or the
+  ;; turn moved/re-parked (BLOCKED). Pinned via the reentrance-::18
+  ;; shape VERBATIM (the fixture component + its assert_return row,
+  ;; run through the WAST script path — the fixture's own route):
+  ;; the parked callee's cancellation, reentered through a
+  ;; non-async-typed export, completes EAGERLY — run returns 42
+  ;; (the pre-M14 shape: the cancel read the unresolved state,
+  ;; returned BLOCKED, and the run's (i32.ne 4) check trapped; the
+  ;; standalone fixture was 0/10, now 10/10).
+  (let* ((wast
+          (format nil "~{~a~%~}" (list "(component" "  (canon subtask.cancel async (core func $subtask.cancel-async))" "  (canon subtask.drop (core func $subtask.drop))" "" "  ;; Called by $Callee.reenter, and thus reached while $Callee is on the" "  ;; stack, to cancel the subtask of $Callee.park started by \"run\" below." "  (core module $Canceller" "    (import \"\" \"subtask.cancel-async\" (func $subtask.cancel-async (param i32) (result i32)))" "    (global $parked-subtask (export \"parked-subtask\") (mut i32) (i32.const 0))" "    (func (export \"cancel-parked\") (result i32)" "      (call $subtask.cancel-async (global.get $parked-subtask)))" "  )" "  (core instance $canceller (instantiate $Canceller (with \"\" (instance" "    (export \"subtask.cancel-async\" (func $subtask.cancel-async))))))" "  (func $cancel-parked (result u32) (canon lift (core func $canceller \"cancel-parked\")))" "" "  (component $Callee" "    (import \"cancel-parked\" (func $cancel-parked (result u32)))" "    (canon lower (func $cancel-parked) (core func $cancel-parked'))" "    (canon task.cancel (core func $task.cancel))" "    (canon waitable-set.new (core func $waitable-set.new))" "    (core module $CalleeModule" "      (import \"\" \"cancel-parked\" (func $cancel-parked (result i32)))" "      (import \"\" \"task.cancel\" (func $task.cancel))" "      (import \"\" \"waitable-set.new\" (func $waitable-set.new (result i32)))" "      (global $never-signalled (mut i32) (i32.const 0))" "      (func $start (global.set $never-signalled (call $waitable-set.new)))" "      (start $start)" "      ;; Parks in the event loop on a waitable set that never gets an event," "      ;; so only the delivery of a pending cancellation can wake this task." "      (func (export \"park\") (result i32)" "        (i32.or (i32.const 2 (; WAIT ;))" "                (i32.shl (global.get $never-signalled) (i32.const 4))))" "      (func (export \"park-cb\") (param $event i32) (param i32 i32) (result i32)" "        (if (i32.ne (local.get $event) (i32.const 6 (; TASK_CANCELLED ;)))" "          (then unreachable))" "        (call $task.cancel)" "        (i32.const 0 (; EXIT ;)))" "      ;; Not async-typed, so it doesn't take this instance's exclusive lock" "      ;; and \"park\" above stays resumable while this call is on the stack." "      (func (export \"reenter\") (result i32) (call $cancel-parked))" "    )" "    (core instance $callee (instantiate $CalleeModule (with \"\" (instance" "      (export \"cancel-parked\" (func $cancel-parked'))" "      (export \"task.cancel\" (func $task.cancel))" "      (export \"waitable-set.new\" (func $waitable-set.new))))))" "    (func (export \"park\") async" "      (canon lift (core func $callee \"park\") async (callback (core func $callee \"park-cb\"))))" "    (func (export \"reenter\") (result u32) (canon lift (core func $callee \"reenter\")))" "  )" "  (instance $c (instantiate $Callee (with \"cancel-parked\" (func $cancel-parked))))" "  (canon lower (func $c \"park\") async (core func $park'))" "  (canon lower (func $c \"reenter\") (core func $reenter'))" "" "  (core module $Main" "    (import \"\" \"park\" (func $park (result i32)))" "    (import \"\" \"reenter\" (func $reenter (result i32)))" "    (import \"\" \"parked-subtask\" (global $parked-subtask (mut i32)))" "    (import \"\" \"subtask.drop\" (func $subtask.drop (param i32)))" "    (func (export \"run\") (result i32)" "      (local $packed i32) (local $state i32)" "      (local.set $packed (call $park))" "      (if (i32.ne (i32.and (local.get $packed) (i32.const 0xf)) (i32.const 1 (; STARTED ;)))" "        (then unreachable))" "      (global.set $parked-subtask (i32.shr_u (local.get $packed) (i32.const 4)))" "      ;; reentrantly cancel the parked subtask from inside $Callee" "      (local.set $state (call $reenter))" "      (if (i32.ne (local.get $state) (i32.const 4 (; CANCELLED_BEFORE_RETURNED ;)))" "        (then unreachable))" "      (call $subtask.drop (global.get $parked-subtask))" "      (i32.const 42))" "  )" "  (core instance $main (instantiate $Main (with \"\" (instance" "    (export \"park\" (func $park'))" "    (export \"reenter\" (func $reenter'))" "    (export \"parked-subtask\" (global $canceller \"parked-subtask\"))" "    (export \"subtask.drop\" (func $subtask.drop))))))" "  ;; async-typed (but sync-ABI-lifted) so that \"run\" may block" "  (func (export \"run\") async (result u32) (canon lift (core func $main \"run\")))" ")" "(assert_return (invoke \"run\") (u32.const 42))")))
+         (results (wasmdown.wast:run-script wast
+                                            :file "cancel-eager-pin.wast")))
+    ;; the script yields the component command + the one assert row
+    (is (= 2 (length results)))
+    (is (every (lambda (r)
+                 (eq (wasmdown.wast:wast-result-outcome r) :pass))
+               results))))
+
+
 (defun run-component-pins ()
   "Run the component pins (registered via TEST; returns T)."
   (let ((wasmdown.test::*tests*
@@ -2761,7 +2786,8 @@ these pins guard the executor's mechanisms directly."
                       component/async-cancel-delivery-pins
                       component/async-stream-roundtrip-pins
                       component/sync-lift-thread-context-pins
-                      component/suspend-vs-yield-determinism-pins)))
+                      component/suspend-vs-yield-determinism-pins
+                      component/cancel-eager-resolve-pins)))
           wasmdown.test::*tests*)))
     (multiple-value-bind (passed failed)
         (wasmdown.test:run-all-tests)

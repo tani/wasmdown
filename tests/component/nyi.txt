@@ -1,4 +1,94 @@
 # See README.md
+# M14 session 1 (2026-10-28): THE RESOLVED-YET FAMILY FIXED —
+# THE SPEC'S SYNCHRONOUS RESUME + THE PARK READINESS + THE TURN
+# BOUNDARY, one gate. The family's shared root DECODED and closed:
+# reentrance ::18 (was 0/10 standalone — now 10/10), cancel-subtask
+# ::1 (was 0/10 — now 10/10), cancel-resumed-callback-switch ALL
+# 2 ROWS (the lane-only ::1/::3 window GONE — 10/10), cancel-
+# delivery / cancel-not-delivered / cancel-and-exclusive-lock all
+# 10/10 (no regressions). THE LANE at the fix: 1449/0 held (x1 this session;
+# the parent's x2 verify at the same build).
+# units 411/0 (the new mechanism pin
+# component/cancel-eager-resolve-pins — the reentrance-::18
+# shape VERBATIM through the WAST script path: run returns 42,
+# the eager CANCELLED_BEFORE_RETURNED(4) pinned; the pin's own
+# build lesson recorded: SBCL string literals do NOT support
+# the \n escape — the newline must be joined at runtime
+# ((format nil "~{~a~%~}" (list ...))), the literal-\n shape
+# read as the CHARACTER n and produced 'unclosed parenthesis'). THE REMAINING: cancel-targeted-resume's ::1/::7/::9
+# (a different residual — the fixture's exiter/hold-lock rows now
+# fail with a NEW shape, the family's next decode) + the parked
+# classes (switch-to-ready ::8, no-sibling's idx variants).
+# THE 10-RUN FAILROW PROBE at the final build (the lane's async
+# subset + the two parked fixtures as the overlay, 456 rows/run):
+# 7/10 GREEN; the 3 fails ALL switch-to-ready ::8 'unreachable'
+# (RUN 0/5/9 — the GATE/STARTED-wait class, the parked fixture's
+# own recorded ~8-12% rate, unchanged by this gate) — the class's
+# own fixture stays parked; the lane itself (1449, without the
+# parked files) is 1449/0/0/0.
+#
+# THE ROOT (the chronological capture, the non-intrusive
+# global-log pattern): (:REQ :STARTED T) then (:REQ-DONE
+# :PENDING-CANCEL NIL) then (:RESOLVE 4) — our %task-request-
+# cancellation returned BEFORE the resumed callee completed its
+# turn; subtask.cancel then observed the unresolved state and
+# returned BLOCKED where the fixtures pin CANCELLED_BEFORE_
+# RETURNED(4). THE SPEC'S SHAPE (§761-770): the resume is
+# SYNCHRONOUS — "Thread.resume will return as soon as the
+# callback function returns or blocks" (§756-759 + §474-484's
+# while loop) — the canceller waits for the callee's TURN
+# BOUNDARY, then handles the resolved and not-resolved cases.
+#
+# THE FIX (three pieces, one mechanism — CanonicalABI.md §433-440
+# the Thread states' ready_func, §447-456 start_waiting/stop_
+# waiting, §761-770 request_cancellation, §474-484 resume):
+# 1. THE PARK READINESS (the spec's ready_func made explicit): a
+#    ready-fn slot on the async-thread record — the closure
+#    installed at each WAITING park (the callback loop's YIELD
+#    turn: `(lambda () t)` per §523's always-ready; the WAIT
+#    turn: %wset-wait-from-callback's hoisted readiness —
+#    exclusive-free AND (has-event OR pending-cancel) per §1373)
+#    and cleared at the wake. A thread with no ready-fn is
+#    SUSPENDED (§494), running, or exited.
+# 2. THE TURN COUNTER: an async-task turns slot bumped at each
+#    callback-loop-top entry (%task-bump-turn, broadcast under the
+#    task's mutex) — the "returns" observable of the boundary.
+# 3. THE GATED SYNCHRONOUS RESUME in %task-request-cancellation's
+#    STARTED arm: the §769 gate (cancellable AND ready — the
+#    not-ready shapes keep the legacy nudge: the exclusive held
+#    (cancel-targeted-resume ::7's hold-lock), a stackful block
+#    (::2's stuck, cancellable=NIL), a gone implicit thread (::1's
+#    exiter, ready-fn=NIL)) — then resume and observe the
+#    boundary: resolved OR turn moved OR the mid-turn re-park (the
+#    switch arms' suspended-p/yield-parked flags — the "blocks"
+#    observable; cancel-resumed-callback-switch's callback
+#    suspends-then-resumes an explicit thread that BLOCKS — the
+#    turn-only wait's measured DEADLOCK regression: the parked
+#    callback can never take the next turn, the wait hung into
+#    the oracle; the re-park flag is the boundary for that shape).
+#
+# THE NEGATIVE-RESULT CHAIN SUPERSEDED (the M12/M13 sync-delivery
+# record): the OnCancel "MAY wait" wait (§761's else-arm) dead-
+# locked the gated callee BECAUSE it waited for RESOLUTION — the
+# callee's resolution depended on the caller's future write which
+# the wait parked. The TURN-BOUNDARY wait is strictly bounded: it
+# exits when the callback returns (resolve or re-park), never
+# waiting for a resolution the callee cannot reach — the
+# outstanding-IO distinguisher the ledger recorded is exactly
+# the re-park observable (the callback returned YIELD/WAIT
+# without resolving = BLOCKED, per the spec's own two cases).
+#
+# THE MEASUREMENTS: the family standalone x10 each — reentrance
+# 10/10 (row 18 GREEN; one earlier row-14 flake in the first
+# build's batch did not reproduce in the re-probe), cancel-subtask
+# 10/10, cancel-resumed-callback-switch 10/10 (the ::1/::3
+# deadlock regression of the turn-only build fixed by the
+# re-park observable), cancel-delivery 10/10, cancel-not-
+# delivered 10/10, cancel-and-exclusive-lock 10/10. THE LANE
+# 1449/0 (the family's nyi'd files are NOT in the lane yet — the
+# un-park gates are the next step after the remaining rows'
+# decode). units 410/0.
+# ----
 # M13-tok38 THE ACCEPTED RATE (the fallback call): async-calls-
 # sync (3 rows) STAYS IN THE LANE with its recorded ~8-10%
 # flake rate (acs::1) — the RELEASE-RACE SURFACE (session 38's

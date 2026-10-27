@@ -3029,7 +3029,13 @@ the callee's progression through the FuncInst protocol."
   (gate-parked nil)                 ; parked at the backpressure gate
   (result nil)
   (seq nil)
-  (tok-child-count 0))
+  (tok-child-count 0)
+  (turns 0))                        ; M14 the callback event loop's TURN
+                                    ; COUNTER (§756-759: Thread.resume
+                                    ; returns when the resumed callback
+                                    ; "returns or blocks") — the boundary
+                                    ; %task-request-cancellation's
+                                    ; synchronous-resume wait observes
 
 ;;; M13-tok: THE DETERMINISTIC-INTERLEAVE TOKEN — the creation-order
 ;;; key (a PATH list) + the start turnstile + the FIFO gate.
@@ -3526,6 +3532,15 @@ wrong-index probe: one transfer produced index 3)."
   (mutex (sb-thread:make-mutex :name "thread"))
   (waitqueue (sb-thread:make-waitqueue :name "thread"))
   (suspend-waitqueue (sb-thread:make-waitqueue :name "thread-suspend"))
+  ;; M14 THE PARK READINESS (the spec's ready_func, §433-440/§447-456,
+  ;; made explicit): the closure installed at each WAITING park (the
+  ;; callback event loop's YIELD/WAIT turns) and cleared at the wake.
+  ;; A thread with no ready-fn is SUSPENDED (§494 — only an explicit
+  ;; resume), running, or exited; Task.request_cancellation's §769
+  ;; gate (cancellable AND ready) tests this slot — the canceller
+  ;; waits for the callee's turn boundary only when the callee is
+  ;; actually ready to take its turn.
+  (ready-fn nil)
   ;; M13-tok19: the SBCL thread handle (for the teardown JOIN —
   ;; the abandoned threads' deaths must complete before the
   ;; next script starts; the unwind storm stole its ticks).
@@ -3873,10 +3888,14 @@ count arriving with the wake is THIS park's, never the next's."
   (sb-thread:with-recursive-lock ((async-thread-mutex thread))
     (async-thread-check-abandoned thread)
     (setf (async-thread-yield-parked thread) t)
+    ;; M14 the PARK READINESS (§523: a yield is ALWAYS ready — the
+    ;; park's ready-fn, per the spec's start_waiting(ready_func))
+    (setf (async-thread-ready-fn thread) (lambda () t))
     (unless (> (async-thread-wake-count thread) 0)
       (sb-thread:condition-wait (async-thread-waitqueue thread)
                                 (async-thread-mutex thread)))
     (setf (async-thread-wake-count thread) 0)
+    (setf (async-thread-ready-fn thread) nil)
     (setf (async-thread-yield-parked thread) nil)))
 
 ;;; ---- the ComponentInstance concurrency fields (§133-150) ----
@@ -4026,13 +4045,37 @@ the enter gate: getf-setf through the shared plist)."
     (setf (async-task-state task) :cancel-delivered)
     t))
 
+(defun %task-bump-turn (task)
+  "M14 the callback event loop's TURN COUNTER bump: one per loop-top
+entry, broadcast under the task's mutex so the synchronous-resume
+waiter in %task-request-cancellation re-tests (the spec §756-759:
+`Thread.resume` returns as soon as the callback function returns or
+blocks — the turn boundary is the observable)."
+  (sb-thread:with-recursive-lock ((async-task-mutex task))
+    (incf (async-task-turns task))
+    (sb-thread:condition-broadcast (async-task-waitqueue task))))
+
 (defun %task-request-cancellation (task)
   "Task.request_cancellation (CanonicalABI.md 761): the OnCancel the
-  caller's subtask.cancel invokes. INITIAL (still at the backpressure
-  gate): mark PENDING and nudge the gate — the gate's re-test
-  performs Task.cancel, so wait for the resolution (the spec asserts
-  RESOLVED on return). STARTED: mark PENDING and nudge (the callback
-  event loop delivers TASK_CANCELLED on its next turn)."
+caller's subtask.cancel invokes. INITIAL (still at the backpressure
+gate): mark PENDING and nudge the gate — the gate's re-test
+performs Task.cancel, so wait for the resolution (the spec asserts
+RESOLVED on return). STARTED: mark PENDING; the SPEC's §769 gate
+(`implicit_thread.cancellable and implicit_thread.ready()`) then
+resumes the callee SYNCHRONOUSLY (§474-484: Thread.resume returns
+when the resumed continuation returns or blocks) — the canceller
+waits for the callee's TURN BOUNDARY: the task resolved (the
+eager-cancel shape: the callback receives TASK_CANCELLED and calls
+task.{cancel,return} — cancel-subtask ::1, reentrance ::18,
+cancel-targeted-resume ::5's pins) OR the turn counter moved (the
+callback returned/blocked again WITHOUT resolving — the BLOCKED
+shape). The readiness gate is the M12 sync-delivery negative
+result's resolution: a NOT-ready callee (the exclusive held —
+cancel-targeted-resume ::7's hold-lock; a stackful blocked task —
+::2's stuck, cancellable=NIL; a gone implicit thread — ::1's
+exiter, ready-fn=NIL) is NOT resumed-and-waited (the wait would
+self-deadlock on a callee that cannot take its turn); it keeps the
+legacy nudge and the caller observes the unresolved state."
   (cond
    ((eq (async-task-state task) :initial)
     (setf (async-task-state task) :pending-cancel)
@@ -4044,8 +4087,58 @@ the enter gate: getf-setf through the shared plist)."
                                          (async-task-mutex task)))))
    (t
     (setf (async-task-state task) :pending-cancel)
-    (when (async-task-implicit-thread task)
-      (async-thread-resume (async-task-implicit-thread task))))))
+    (let* ((th (async-task-implicit-thread task))
+           (ready-th
+             (and th
+                  (not (eq (async-thread-spawn-thunk th) :done))
+                  (async-thread-cancellable th)
+                  (async-thread-ready-fn th)
+                  (funcall (async-thread-ready-fn th)))))
+      (cond
+       (ready-th
+        ;; the SPEC's synchronous resume (§756-759: `Thread.resume`
+        ;; returns as soon as the callback function RETURNS OR
+        ;; BLOCKS): the callee IS parked at a cancellable turn whose
+        ;; readiness holds (the pending-cancel mark just made the wset
+        ;; park's readiness true / the yield park is always ready).
+        ;; Sample the turn count BEFORE the resume so any subsequent
+        ;; loop-top entry is > sampled (the RETURNS case); the BLOCKS
+        ;; case is the mid-turn re-park — the switch arms' park sets
+        ;; suspended-p/yield-parked (cancel-resumed-callback-switch:
+        ;; the resumed callback suspends-then-resumes an explicit
+        ;; thread that blocks; the canceller must observe the BLOCK,
+        ;; not wait for a turn the parked callback can never take —
+        ;; the measured deadlock regression of the turn-only wait).
+        ;; The observation is the STARTED-wait's own spin shape
+        ;; (§3707's loop): a condition-wait here would need the
+        ;; callee's re-park to broadcast the TASK's queue — the park
+        ;; sites broadcast the THREAD's queues, so SPIN + sleep and
+        ;; re-test all three observables (resolved / turn moved /
+        ;; re-parked); the resolved case is the common one (the
+        ;; resumed turn delivers TASK_CANCELLED and the callback
+        ;; resolves in-bounds), the two-block cases take one spin
+        ;; slice each.
+        (let ((sampled (async-task-turns task)))
+          (async-thread-resume th)
+          (loop
+            until (or (async-task-resolved-p task)
+                      (> (async-task-turns task) sampled)
+                      (and (or (async-thread-suspended-p th)
+                               (async-thread-yield-parked th))
+                           ;; the RE-PARK only: the callee's own
+                           ;; park flags are set at the arm's entry —
+                           ;; the resume consumed the wait; the
+                           ;; flags at THIS point are the turn's NEW
+                           ;; park (the initial park's flags were
+                           ;; cleared at its wake)
+                           t))
+            do (sleep 0.001))))
+       (th
+        ;; the legacy nudge for the not-ready shapes (a mid-turn
+        ;; callee, a stackful block, a suspend park): harmless when
+        ;; the park re-tests and stays; the caller observes the
+        ;; unresolved state (BLOCKED) per the spec's own else-arm
+        (async-thread-resume th)))))))
 
 (defun %task-return (task result)
   "Task.return_ (CanonicalABI.md 802): resolve with a value."
@@ -4190,7 +4283,16 @@ computes the tuple at delivery time)."
   pending cancellation is delivered as TASK_CANCELLED (code 6)."
   (let* ((thread *current-thread*)
          (task *current-task*)
-         (inst (async-task-inst task)))
+         (inst (async-task-inst task))
+         ;; M14 THE PARK READINESS (§1373's readiness condition,
+         ;; hoisted to the thread's ready-fn per the spec's
+         ;; start_waiting(ready_func) — Task.request_cancellation's
+         ;; §769 `cancellable and ready()` gate tests THIS closure)
+         (readiness
+           (lambda ()
+             (and (null (%inst-exclusive-thread inst))
+                  (or (%wset-has-pending-event wset)
+                      (%task-has-pending-cancel task))))))
     (incf (async-waitable-set-num-waiting wset))
     ;; M13-tok2 GATE 1: the parked-waiter registration (the durable
     ;; wake target)
@@ -4198,15 +4300,12 @@ computes the tuple at delivery time)."
       (pushnew thread (async-waitable-set-waiters wset) :test #'eq))
     (unwind-protect
          (progn
-           (async-thread-wait-until
-            thread
-            (lambda ()
-              (and (null (%inst-exclusive-thread inst))
-                   (or (%wset-has-pending-event wset)
-                       (%task-has-pending-cancel task)))))
+           (setf (async-thread-ready-fn thread) readiness)
+           (async-thread-wait-until thread readiness)
            (if (%task-deliver-pending-cancel task)
                (list 6 0 0)             ; EventCode.TASK_CANCELLED
                (%wset-get-pending-event wset)))
+      (setf (async-thread-ready-fn thread) nil)
       (sb-thread:with-recursive-lock ((async-waitable-set-mutex wset))
         (setf (async-waitable-set-waiters wset)
               (remove thread (async-waitable-set-waiters wset)
@@ -4421,6 +4520,16 @@ drop-readable must return index 1 again)."
         (let ((packed (first (apply #'wasmdown.runtime:wasm-call
                                      core flat-args))))
           (loop
+            ;; M14 THE TURN BOUNDARY bump (§756-759: Thread.resume
+            ;; returns when the resumed thread's callback "returns
+            ;; or blocks"): each loop-top entry is one turn. The
+            ;; broadcast under the TASK's mutex wakes the
+            ;; synchronous-resume waiter in %task-request-
+            ;; cancellation (the task resolved — the waiter checks
+            ;; resolved-p — or the turn moved: the callback
+            ;; returned/blocked WITHOUT resolving, the BLOCKED
+            ;; case).
+            (%task-bump-turn task)
             (let ((code/si (%unpack-callback-result packed)))
               (when (eq (car code/si) 0) (return)) ; EXIT
               ;; the turn boundary: deliver pending cancel FIRST
