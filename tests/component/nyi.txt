@@ -405,3 +405,34 @@
 # CanonicalABI.md: 3929 (task.return flatten), 2914-2929
 # (the async limits' direction), 3348-3350. GATES: units
 # 410/0, lane 1466/0/0/0, core 21187/0/73. ----
+# ---- M13 ladder, big-interleaving-test cmd0 (2026-10-27):
+# THE VALIDATOR GAP FIXED — the census decode confirmed and
+# refined by the minimal-repro growth (the trigger is NOT >2
+# instances: it is a bag whose TYPE exports include a record
+# whose field refs an export-declarator alias, >=3 bag types;
+# the 25-line repro is /tmp/repro9.wast's shape). TWO LAYERED
+# DEFECTS, each confirmed by walk traces: (1) THE REF REMAP —
+# %alias-exported-type-shape-from-hash copied the child's ct
+# VERBATIM: the record's (:idx . n) field refs stayed in the
+# CHILD's type space (the named export COPY index — sibling
+# types ref (export $id "n" (type ...))'s copy, not the source
+# def); the parent's vis walk then read an unrelated parent
+# type at that index. FIX: %remap-ct-refs walks the projected
+# ct remapping (:idx . n) via a map of TWO child index families
+# (the export table's source idx + the COPY indices the child's
+# own export defs introduced — %inst-export-copy-remap). (2)
+# THE BAG NAMING — the :instance export arm's inline-bag walk
+# judged namedness against the ENCLOSING component's vis-exports
+# only; an alias-projected type the bag exports has no
+# component-level export declarator. FIX: a HYBRID state whose
+# vis-exports carries the bag's own :type-sorted entries (the
+# exported instance's exported types are transitively named).
+# RESULT: cmd0 green; the fixture now runs 54 rows (0-53:
+# definition + the sync/basic-assert families, 4x stable) where
+# HEAD ran 0. THE REMAINING 3 ROWS (1706's backpressure +
+# subtask-cancel x2 interleave; 1726's 8-slot stream/future
+# interleave) HANG in the async runtime — the same
+# sequential-schedule family as acs/reentrance-cmd18 (the
+# token scheduler's scope, NOT validator work). The fixture
+# stays nyi'd with its validator layer fixed. GATES with the
+# change: units 410/0, lane 1466/0/0/0, core 21187/0/73. ----

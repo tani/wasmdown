@@ -4890,6 +4890,144 @@ earlier's and the func-arg match read the wrong identity vector)."
 
 (declaim (notinline %func-arg-ids-at))
 
+(defun %remap-ct-refs (c map)
+  "M13-lad (big-interleaving-test): remap a projected type shape's
+VALTYPE refs across instance boundaries. A type shape taken from an
+INSTANTIATED child instance's state (an alias-export type
+projection) carries (:idx . n) refs in the CHILD's type space; the
+parent's own checks (the external-visibility walk, the flattening)
+read them in the PARENT's space. MAP is an alist (child-idx .
+parent-idx) built from the source instance's export table plus the
+alias-export type projections recorded in *inst-alias-typeidx*;
+refs with no mapping stay untouched (the caller's space may itself
+hold the source — a BAG's entry idx is this scope's own)."
+  (labels
+      ((remap-valtype (vt)
+         (cond
+          ((and (consp vt) (eq (car vt) :idx) (integerp (cdr vt)))
+           (let ((hit (assoc (cdr vt) map)))
+             (if hit (cons :idx (cdr hit)) vt)))
+          ((ct-p vt) (remap-ct vt))
+          (t vt)))
+       (remap-ct (c)
+         (if (not (ct-p c))
+             c
+             (case (ct-kind c)
+               ((:prim :resource) c)
+               (:list
+                (make-ct :kind :list
+                         :payload (cons (remap-valtype
+                                         (car (ct-payload c)))
+                                        (cdr (ct-payload c)))
+                         :offset (ct-offset c)))
+               (:record
+                (make-ct :kind :record
+                         :payload (coerce
+                                   (loop for (l . fvt)
+                                         across (ct-payload c)
+                                         collect (cons l
+                                                       (remap-valtype
+                                                        fvt)))
+                                   'vector)
+                         :offset (ct-offset c)))
+               (:tuple
+                (make-ct :kind :tuple
+                         :payload (coerce
+                                   (loop for t_ across (ct-payload c)
+                                         collect (remap-valtype t_))
+                                   'vector)
+                         :offset (ct-offset c)))
+               (:variant
+                (make-ct :kind :variant
+                         :payload (coerce
+                                   (loop for (l . cvt)
+                                         across (ct-payload c)
+                                         collect (cons l
+                                                       (and cvt
+                                                            (remap-valtype
+                                                             cvt))))
+                                   'vector)
+                         :offset (ct-offset c)))
+               (:option (make-ct :kind :option
+                                 :payload (remap-valtype
+                                           (ct-payload c))
+                                 :offset (ct-offset c)))
+               (:result
+                (make-ct :kind :result
+                         :payload (cons
+                                   (and (car (ct-payload c))
+                                        (remap-valtype
+                                         (car (ct-payload c))))
+                                   (and (cdr (ct-payload c))
+                                        (remap-valtype
+                                         (cdr (ct-payload c)))))
+                         :offset (ct-offset c)))
+               ((:own :borrow)
+                (make-ct :kind (ct-kind c)
+                         :payload (remap-valtype (ct-payload c))
+                         :offset (ct-offset c)))
+               ((:stream :future)
+                (make-ct :kind (ct-kind c)
+                         :payload (and (ct-payload c)
+                                       (remap-valtype
+                                        (ct-payload c)))
+                         :offset (ct-offset c)))
+               (:map
+                (make-ct :kind :map
+                         :payload (cons (car (ct-payload c))
+                                       (remap-valtype
+                                        (cdr (ct-payload c))))
+                         :offset (ct-offset c)))
+               (:func
+                (make-ct :kind :func
+                         :payload (list
+                                   (coerce
+                                    (loop for (l . pvt)
+                                          across (first (ct-payload c))
+                                          collect (cons l
+                                                        (remap-valtype
+                                                         pvt)))
+                                    'vector)
+                                   (and (second (ct-payload c))
+                                        (remap-valtype
+                                         (second (ct-payload c))))
+                                   (third (ct-payload c)))
+                         :offset (ct-offset c)))
+               (:enum (make-ct :kind :enum
+                              :payload (ct-payload c)
+                              :offset (ct-offset c)))
+               (:flags (make-ct :kind :flags
+                                :payload (ct-payload c)
+                                :offset (ct-offset c)))
+               (t c)))))
+    (remap-ct c)))
+
+(defun %inst-export-copy-remap (child-comp src-idx)
+  "M13-lad (big-interleaving-test): the child's OWN (export $id
+\"n\" (type ...)) defs each introduce a COPY index in the child's
+type space (every declarator introduces a type index); sibling type
+defs reference the NAMED copy, not the source def. For each
+type-sorted export in CHILD-COMP, the copy's index paired with the
+parent's alias-introduced typeidx (the (alias export ...) recorded
+in *inst-alias-typeidx*) — the alist consumed by %remap-ct-refs."
+  (let ((copies '())
+        (n -1))
+    (loop for d across (comp-defs child-comp)
+          do (case (compdef-kind d)
+               ((:type :alias :import :export)
+                (incf n))
+               (otherwise nil))
+             (when (and (eq (compdef-kind d) :export)
+                        (eq (sortidx-sort (exportrec-sortidx
+                                           (compdef-payload d)))
+                            :type))
+               (let* ((nm (exportrec-name (compdef-payload d)))
+                      (pt (gethash (cons src-idx nm)
+                                   *inst-alias-typeidx*)))
+                 (when pt
+                   (push (cons n pt) copies)))))
+    copies))
+
 (defun %alias-exported-type-shape (payload state)
   "Slice 4 (family 3): the SOURCE type SHAPE an (alias export i n
 (type)) introduces. A bag's table entry idx is THIS scope's typeidx
@@ -4932,9 +5070,31 @@ instantiated instance's export table)."
          ((and child-state
                (< ti (length (cval-types child-state)))
                (ct-p (aref (cval-types child-state) ti)))
-          (aref (cval-types child-state) ti))
+          ;; M13-lad (big-interleaving-test): the child's ct carries
+          ;; (:idx . n) refs in the CHILD's type space — REMAP them
+          ;; to the parent's alias-introduced indices so the
+          ;; parent's visibility walk and flattening read the
+          ;; PROJECTED types, not the child's indices (the old
+          ;; verbatim copy made a record's ref land on an unrelated
+          ;; parent type — the 'instance not valid to be used as
+          ;; export' on the $types bag re-export). TWO child indices
+          ;; map to each parent alias: the SOURCE def's index (the
+          ;; export table's idx) AND the COPY index the child's own
+          ;; (export ...) def introduced (sibling types ref the
+          ;; NAMED copy: (export $id "n" (type ...))).
+          (%remap-ct-refs
+           (aref (cval-types child-state) ti)
+           (append
+            (loop for nm2 being the hash-keys of ent
+                  using (hash-value hit2)
+                  when (and (consp hit2)
+                            (eq (car hit2) :type)
+                            (integerp (cdr hit2)))
+                  collect (let ((pt (gethash (cons src-idx nm2)
+                                              *inst-alias-typeidx*)))
+                            (and pt (cons (cdr hit2) pt))))
+            (%inst-export-copy-remap child-comp src-idx))))
          (t nil))))))
-
 (defun %instance-ct-exported-type-shape (name ct)
   "The declared SHAPE of an IMPORTED instance's exported TYPE name —
 the instance ct's (export \"n\" (type <bound>)) declarator: a (sub
@@ -8221,31 +8381,70 @@ the number of enclosing component/type scopes (outer aliases)."
                             (when (and inst
                                        (eq (instrec-kind inst)
                                            :inline-exports))
-                              (loop for pair across (instrec-exports
-                                                     inst)
-                                    for si = (cdr pair)
-                                    do (case (sortidx-sort si)
-                                        (:func
-                                         (let ((n (sortidx-idx si)))
-                                           (when (and
-                                                  (< n (length
-                                                        (cval-func-types
-                                                         state)))
+                              ;; M13-lad (big-interleaving-test): the
+                              ;; bag's OWN type exports NAME the
+                              ;; indices they carry (the instance is
+                              ;; being exported — its exported types
+                              ;; are transitively named; the enclosing
+                              ;; component's vis-exports alone miss
+                              ;; them: an alias-projected type the
+                              ;; bag exports has no component-level
+                              ;; export declarator). A HYBRID state
+                              ;; with the bag's type indices added to
+                              ;; vis-exports judges nameability in
+                              ;; the bag's own scope.
+                              (let* ((bag-vis (make-hash-table)))
+                                (loop for pair across
+                                      (instrec-exports inst)
+                                      for si = (cdr pair)
+                                      when (and
+                                            (eq (sortidx-sort si)
+                                                :type)
+                                            (< (sortidx-idx si)
+                                               (length (cval-types
+                                                        state))))
+                                      do (setf (gethash
+                                                (sortidx-idx si)
+                                                bag-vis)
+                                               t))
+                                (let ((hstate
+                                        (make-cval
+                                         :types (cval-types state)
+                                         :core-types (cval-core-types
+                                                      state)
+                                         :func-types (cval-func-types
+                                                      state)
+                                         :instance-types
+                                          (cval-instance-types state)
+                                         :vis-imports
+                                          (cval-vis-imports state)
+                                         :vis-exports bag-vis)))
+                                  (loop for pair across
+                                        (instrec-exports inst)
+                                        for si = (cdr pair)
+                                        do (case (sortidx-sort si)
+                                            (:func
+                                             (let ((n (sortidx-idx si)))
+                                               (when (and
+                                                      (< n (length
+                                                            (cval-func-types
+                                                             state)))
+                                                      (aref
+                                                       (cval-func-types
+                                                        state) n))
+                                                 (%vis-check
+                                                  hstate
                                                   (aref (cval-func-types
-                                                         state) n))
-                                             (%vis-check
-                                              state
-                                              (aref (cval-func-types
-                                                     state) n)
-                                              nil "instance"))))
-                                        (:type
-                                         (when (< (sortidx-idx si)
-                                                  (length (cval-types
-                                                           state)))
-                                           (%vis-check
-                                            state (sortidx-idx si)
-                                            nil "instance")))
-                                        (t nil))))))))
+                                                         state) n)
+                                                  nil "instance"))))
+                                            (:type
+                                             (when (< (sortidx-idx si)
+                                                      (length (cval-types
+                                                               state)))
+                                               (%vis-check
+                                                hstate (sortidx-idx si)
+                                                nil "instance")))
+                                            (t nil))))))))))
                      (:type
                       (let ((bound (cdr (exportrec-type payload))))
                         (cond
