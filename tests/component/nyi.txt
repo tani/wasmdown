@@ -58,6 +58,41 @@
 ./async/partial-stream-copies.wast
 ./async/passing-resources.wast
 ./async/reentrance.wast
+# ---- M12 session 11 (2026-10-27): THE NO-WAIT PACK MEASURED AND
+# REVERTED — THE STARTED-WAIT IS SPEC-CORRECT AFTER ALL (the
+# session-10 re-derivation CORRECTED; the tree stays at 8085c62's
+# green 410/1396-0-0-0, re-verified). THE MEASUREMENT: the
+# no-wait pack (the state as observed at return + the callee's
+# OnStart held on the pack-mark) landed with units 410/0 (the
+# direct-invoke mark added for the runner-INVOKE pins) BUT
+# reentrance went WORSE: cmd14+cmd18+cmd20 ALL 8/8 (the
+# baseline: cmd14 1/10 + cmd18 ~10/10). cmd20 = T10's mid checks
+# STARTED for its async-callback callee inner — the pack now
+# reports STARTING (the held OnStart) where the fixture pins
+# STARTED. THE CORRECTED ANALYSIS (the decisive fact): the
+# STARTED-wait loop's THREE exits map EXACTLY to the three
+# fixture shapes — (1) resolved -> the eager RETURNED(2); (2)
+# state!=0 (OnStart fired) -> STARTED(1) — acs's sync-inline AND
+# T10's async-callback callee (its OnStart fires BEFORE its
+# WAIT-park: the event-protocol park happens in the callback
+# loop AFTER OnStart, so the pack observes STARTED); (3)
+# GATE-PARKED -> STARTING(0) — T7's c: its callee b parks at the
+# BACKPRESSURE GATE (T7's own comment: "blocks on automatic
+# backpressure") and the pack reports the gate state. THE WAIT
+# LOOP IS THE SPEC'S EMBEDDER FREEDOM — §3707-3729 reports the
+# state AT THE RETURN, and the embedder CHOOSES when to return:
+# after the callee blocks (STARTED or gate-STARTING) — the loop
+# IS that choice. NOT the interposition. The M12 candidate is
+# therefore DEAD; the cmd18 residual is the STARTED-wait's EXIT
+# RACE: the loop exits on state!=0, then reads (setf eager-p
+# (resolved-p)) — BETWEEN the exit and the eager-p read, the
+# callee can RESOLVE (the fixture's (state==STARTED) checks then
+# see RETURNED — the trap). THE REFINED NEXT CANDIDATE (one
+# gate): make the loop's exit ATOMIC with the state read —
+# capture (state, resolved) TOGETHER under the subtask's
+# mutex... the subtask has no mutex; the task's mutex guards
+# resolved-p — capture the pair under (async-task-mutex task)
+# and pack from the captured values (no second read). ----
 # ---- M12 session 10 (2026-10-27): THE PACK-ORDER HANDSHAKE
 # MEASURED TWICE (both shapes) AND REVERTED — plus the STARTED-
 # wait's SPEC RE-DERIVATION (the tree stays at edf7137's green
