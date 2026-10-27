@@ -58,6 +58,37 @@
 ./async/partial-stream-copies.wast
 ./async/passing-resources.wast
 ./async/reentrance.wast
+# ---- M12 session 9 (2026-10-27): THE cmd-18 CAUSE FOUND — T9
+# STARTS CLEAN (the leak theory disproven; the earlier one-run/
+# five-run divergence was a TIMING artifact, not state). THE
+# DECISIVE PROBE (the per-command scheduler dump on the full
+# file, before+after each invoke): cmd18 (T9's assert_return run)
+# begins with sched=0 — NO leaked threads; the invoke never
+# returns (traps the fixture's mid!=STARTED unreachable). The
+# sched=4 pollution appears LATER, at cmd22 (T10's run — T10's
+# own flow leaks its inner/mid chain threads; a separate issue,
+# T11 then starts with 3). THE MEASURED SPECULATIVE FIX (a
+# store-level teardown at the async-lift oracle: abandon every
+# still-registered thread with an unresolved task) did NOT change
+# cmd 18 (T9 starts clean — nothing to tear down) and shifted
+# T8's own trap timing under the probe instrumentation; REVERTED.
+# THE REFINED TRUTH: cmd 18 is T9's OWN scheduler-order race —
+# the STARTED-wait (the async lower's pack) vs the callee mid's
+# resolution, from sched=0 — the same class as acs's run1 (the
+# recorded "callback-task callee whose event is ALREADY pending
+# resolves before the caller observes STARTED" — the M11b
+# session-15 evidence). THE NEXT CANDIDATE remains the
+# pack-order handshake at the STARTING boundary (session 6's
+# recorded shape: hold the CALLEE's guest-body START — before
+# %task-enter-implicit-thread — until the caller's pack
+# completes; the async lower's pack sets a per-subtask "packed"
+# mark the callee's body waits on, ONE turn), which session 6
+# measured WRONG as a post-OnStart YIELD (the STARTING boundary
+# is BEFORE OnStart, not after). ALSO RECORDED: T10's leak (its
+# run leaves 4 threads in the scheduler — cmd22) — a teardown
+# gap for the NON-oracle completion path worth a separate gate
+# after the handshake. The tree stays at e8632d3's green
+# 410/1396-0-0-0 x3/core (all re-verified after the revert). ----
 # ---- M12 session 8 (2026-10-27): THE cmd-18 PROBE — THE
 # HARNESS-STATE AND PARSE HYPOTHESES BOTH DISPROVEN (no code
 # change; the tree stays at 8a06a64's 410/1396-0-0-0). THE
