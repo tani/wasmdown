@@ -3450,7 +3450,11 @@ wrong-index probe: one transfer produced index 3)."
                                      ;; once by %async-thread-post-handoff)
   (mutex (sb-thread:make-mutex :name "thread"))
   (waitqueue (sb-thread:make-waitqueue :name "thread"))
-  (suspend-waitqueue (sb-thread:make-waitqueue :name "thread-suspend")))
+  (suspend-waitqueue (sb-thread:make-waitqueue :name "thread-suspend"))
+  ;; M13-tok19: the SBCL thread handle (for the teardown JOIN —
+  ;; the abandoned threads' deaths must complete before the
+  ;; next script starts; the unwind storm stole its ticks).
+  (native nil))
 
 ;;; ---- Thread-local context: bound per SBCL thread by the task
 ;;; body, so the built-ins find their task/instance. SBCL
@@ -5153,8 +5157,10 @@ is the valtype."
                     (lambda ()
                       (sb-thread:make-thread
                        (lambda ()
-                         (let ((*current-task* task)
-                               (*current-thread* th))
+                         (let* ((*current-task* task)
+                                (*current-thread* th))
+                           (setf (async-thread-native th)
+                                 sb-thread:*current-thread*)
                            ;; §4587's call_and_trap_on_throw: the
                            ;; thread body's trap ENDS the thread
                            ;; (an unhandled trap on a guest thread
@@ -5893,19 +5899,34 @@ NEXT script's rounds then compete with them for each tick's
 single grant (empty-wait::1 deadlocked only in the LANE — its
 predecessor's leftovers consumed every grant; alone it passes).
 Abandon + unblock + unregister every still-registered thread."
-  (sb-thread:with-recursive-lock (*scheduler-mutex*)
-    (dolist (th (copy-list *scheduler-threads*))
-      (setf (async-thread-suspended-p th) nil)
-      (setf (async-thread-yield-parked th) nil)
-      (setf (async-thread-abandoned th) t)
-      (when (async-thread-task th)
-        (ignore-errors
-          (%task-exit-implicit-thread (async-thread-task th))))
-      (sb-thread:with-recursive-lock ((async-thread-mutex th))
-        (sb-thread:condition-broadcast
-         (async-thread-suspend-waitqueue th))
-        (sb-thread:condition-broadcast (async-thread-waitqueue th))))
-    (setf *scheduler-threads* nil)))
+  (let ((threads-to-join nil))
+    (sb-thread:with-recursive-lock (*scheduler-mutex*)
+      (dolist (th (copy-list *scheduler-threads*))
+        (setf (async-thread-suspended-p th) nil)
+        (setf (async-thread-yield-parked th) nil)
+        (setf (async-thread-abandoned th) t)
+        (when (async-thread-task th)
+          (ignore-errors
+            (%task-exit-implicit-thread (async-thread-task th))))
+        (sb-thread:with-recursive-lock ((async-thread-mutex th))
+          (sb-thread:condition-broadcast
+           (async-thread-suspend-waitqueue th))
+          (sb-thread:condition-broadcast (async-thread-waitqueue th)))
+        (when (and (async-thread-native th)
+                   (sb-thread:thread-alive-p
+                    (async-thread-native th))
+                   (not (eq sb-thread:*current-thread*
+                            (async-thread-native th))))
+          (push (async-thread-native th) threads-to-join)))
+      (setf *scheduler-threads* nil))
+    ;; M13-tok19 THE TEARDOWN JOIN: the abandoned threads'
+    ;; unwinds run CONCURRENTLY with the next fixture's flow
+    ;; otherwise (the unwind storm — cancel-resumed-callback-
+    ;; switch's lane-only ~3-in-6 single-fail class: 20/20
+    ;; standalone; the predecessors' dying threads stole its
+    ;; ticks). JOIN them so the next script starts clean.
+    (dolist (n threads-to-join)
+      (ignore-errors (sb-thread:join-thread n)))))
 
 (setf wasmdown.wast:*store-teardown-hook* #'%store-teardown)
 
