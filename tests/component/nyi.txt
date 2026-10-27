@@ -1926,3 +1926,43 @@
 # change) + the ledger; NOT COMMITTED (the parent commits at
 # green).
 # ----
+# ---- M13-tok session 35 (2026-10-28): THE ACS::1 WINDOW
+# CAPTURED AND ITS ROOT DECODED — the missing delivery: all
+# three failing captures (the %subtask-deliver-resolve hook)
+# show 7 deliveries (state=2, the paths (1 1)(1 2)(1 4)(2 1)
+# (2 2)(2 3)(2 4)) with (1 3) ABSENT — the third callee (the
+# fixture's second sync-func1 call, the BACKPRESSURE pair's
+# first) never resolved: the row traps at the THIRD call's
+# 0x40 check (STARTING expected) before the unblock.
+# THE ROOT (the backpressure admission race): the fixture's
+# first pair's callees are YIELD-PARKED in their callback
+# loops (the blocking-call spin) — the §3470 arm RELEASES the
+# exclusive lock for the park's duration — the THIRD call's
+# gate (the spec's implicit backpressure: needs_exclusive +
+# exclusive_thread held) sees the lock FREE (the yield-parked
+# sibling's release-and-restore window) and ADMITS the third
+# task — it STARTS — the 0x40 check fails -> 'unreachable'.
+# THE SPEC-SHAPE QUESTION (recorded for the parent): the
+# spec's gate (§657-690: the three sources) checks ONLY the
+# exclusive_thread slot + backpressure + num_waiting — the
+# yield-parked sibling's lock is GENUINELY free per the
+# spec's own §3470 release — BUT the fixture pins the third
+# call as STARTING (the backpressure engaged) — the spec's
+# RESIDUAL source (3: 'tasks waiting to enter') is not yet
+# engaged (the third is the FIRST waiter). THE RECONCILING
+# READING: the spec's implicit backpressure must count the
+# yield-parked sibling as HOLDING (the release-and-restore
+# is an implementation detail of the park; the INSTANCE is
+// still 'occupied' by the in-flight task) — the gate's
+// condition: the instance has a LIVE TASK IN FLIGHT (not
+// just the raw lock slot).
+# THE FIX CANDIDATE (for the next session): the gate's
+// has-backpressure adds the instance's LIVE-TASK count (the
+// :threads list's live entries of this instance) — an
+// in-flight yield-parked sibling keeps the gate closed; the
+// STARTING report returns.
+# THE STATE at the close: no code changes this session (the
+// root decode + the candidate only); the lane 1469/0 (x2 + 1
+// known-flake single-fail in the batch) + units 410/0 at
+# HEAD; the tree = the ledger only.
+# ----
