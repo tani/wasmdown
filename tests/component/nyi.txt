@@ -12,8 +12,11 @@
 # the ancestor gate — held the fixtures, did not close the
 # window) are the recorded design evidence. THE M14 HAND-OFF.
 # M13-tok38 PARK (the fallback call): switch-to-ready-callback
-# (17 rows) — the ::8 deadlock variant (~6-10%): the row stalls
-# with NOTHING parked of its own (the window capture: 4 RES
+# (17 rows) — the measured LANE rate ~8-12% (the review's
+# consolidated count: ~3-5 events in ~40 runs; the ledger's
+# earlier 1-in-30 was under-sampled): the ::8 deadlock variant
+# (~6-10%) + the unreachable variant — the row stalls with
+# NOTHING parked of its own (the window capture: 4 RES
 # events, no suspends — the GATE/STARTED-wait class, the callee
 # never got its first turn — the leftover/predecessor coupling
 # the teardown join did not fully close); the sprint's
@@ -23,9 +26,16 @@
 # M13-tok38 PARK (the fallback call): during-sync-call-
 # no-sibling-resume (6 rows) — the resume window IS CLOSED (the
 # inter-round drain, session 34: 0/50) but the residual
-# unknown-thread-index variant (~3%, the drift class) remains;
-# the M13-lad exit-unregister + live-only idx machinery's
-# recorded follow-up. THE M14 HAND-OFF.
+# UNKNOWN-THREAD-INDEX variants remain at the measured ~5-10%
+# (the review's consolidated count: 3-4 recurrences in ~70
+# runs ACROSS THREE MESSAGE VARIANTS — index 2, index 5, the
+# not-suspended trap — the ledger's earlier 'below-the-sample'
+# was under-sampled; the three signatures all point at the
+# idx/resume machinery: a lookup/timerace between the
+# live-only idx assignment (0e79f83) and a thread exiting
+# mid-handoff — the same family the ::34 lifecycle work
+# touched). THE M14 HAND-OFF — the class-fix queue's head
+# candidate.
 ./async/during-sync-call-no-sibling-resume.wast
 ./async/cancel-resumed-callback-switch.wast
 ./validation/kebab.wast
