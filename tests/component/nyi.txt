@@ -1863,3 +1863,41 @@
 # captures the suspend/resume paths; the next step is the
 # FAILING RUN's log diff vs the green runs).
 # ----
+# ---- M13-tok session 33 (2026-10-28): THE WINDOW CAPTURES
+# LANDED (both rows) — the per-fixture log reset was the key
+# (the first captures showed the PREDECESSORS' events, not the
+# failing row's own window); the two windows' shapes recorded.
+# The lane at the close: 1469/0 (x3 + the known-flake
+# single-fail class visible in the batch — acs::1 once); units
+# 410/0; the tree = the ledger only.
+# THE CAPTURE TOOL (/tmp/lane-cap2.lisp): the global-log
+# pattern + the per-fixture *win* reset at each START + the
+# dump at the FAILS occurrence (the last 80 events of the
+# FAILING fixture's own window).
+# THE TWO WINDOWS' SHAPES:
+# 1. no-sibling-resume ::2 (the run row): the dump's tail —
+#    (:RES (71) NIL) then (:SUSP (72)) AS THE LAST EVENT — the
+#    final round's suspend-then-resume X pair INCOMPLETE: X
+#    (path 72) suspended, the matching (:RES (72) T) NEVER
+#    COMES — the sync-block's caller returned while X was
+#    suspended mid-round — the resume-after-suspend race: the
+#    caller's flow ends before the 4th round's resume posts.
+#    THE FIX CANDIDATE: the sync-call's exit path (the caller's
+#    return from the sync call) must not strand the target of
+#    its own last suspend-then-resume — the round-count
+#    invariant (the M13-lad three-park machinery's own class).
+# 2. switch-to-ready ::8 (the deadlock variant): the fixture's
+#    own window has only 4 RES events (paths 182-185) and NO
+#    SUSPENDS — the row stalls with NOTHING parked of its own —
+#    the GATE/STARTED-wait class (the row's callee never got
+#    its first turn) — the leftover/predecessor coupling the
+#    teardown join did not fully close.
+# THE NEXT SESSION'S STEP: the diff of the FAILING runs' full
+# logs vs the green runs (the same fixture, the same rows) —
+# the grant/park interleaving that differs — then ONE fix
+# candidate per the sprint's hypothesis space (the join's
+# blocking shape / the start-timing compensation / the grant
+# ordering).
+# THE STATE at the close: the tree = the ledger only; the lane
+# 1469/0 + units 410/0 at HEAD.
+# ----
