@@ -305,3 +305,34 @@
 # path against the arm's fire on the SAME record. The
 # fixture's 48 rows return to the lane when the residual
 # collapses. ----
+# ---- M13 ladder (2026-10-27): drop-cross-task-borrow ::2/::4/
+# ::6 — the census's diagnosis CORRECTED (located to the
+# frame, not fixed; the tree unchanged). THE CENSUS'S GUESS
+# (the %wset-get-pending-event delivery path) is WRONG — the
+# harness SWALLOWED the raw type-error into the fail detail
+# (the message was the harness's, not the runner's).
+# Instrumented %wset-wait never fires (the failure PRECEDES
+# the wait). THE *break-on-signals* BACKTRACE: the type-error
+# (datum = the ASYNC-WAITABLE-SET, expected LIST) is signaled
+# DIRECTLY in %canon-lift-async, frame 8, no inner frame — the
+# defun's only type-dispatch is the (etypecase (car cell)) at
+# 4071: (car cell) holds the SET at the lift loop's exit. THE
+# FLOW TRACE: HANDLE-ADD-ANY subtask->2, set->1 (the free list
+# reusing a dropped future's index), NO task-return, NO
+# subtask-resolve — the cell was clobbered BEFORE any
+# resolution. THE PUZZLE: the only cell writers are the
+# on-resolve closure (t), the guest trap path (:trap), and the
+# initial (cons nil nil) — none can store a set. THE NEXT
+# PROBE (two shapes): (1) THE CELL-IDENTITY CHECK — print the
+# cell's ADDRESS at creation, at each writer, and at the
+# etypecase; a stale/second cell reference (the drop flow runs
+# THREE lifts — drop-other-no-self, dont-drop, resume-dont-
+# drop) would read a different address than written; (2) THE
+# 5235 WRAPPER — the lower-side on-resolve wrapper fires with
+# the CALLEE's result; if the callee's result IS the set (a
+# lower returning a waitable-set handle mis-lifted as a
+# component value), the chain reaches the cell. ALSO: the
+# on-resolve map — INSTALLERS %canon-lift-async:3990 +
+# %call-async-funcinst:5235; INVOKERS %task-return:3612 +
+# %task-cancel:3633 (both take the task from the closure; a
+# :cancelled arg cannot produce the set). ----
