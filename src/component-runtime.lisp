@@ -1942,6 +1942,7 @@ thread) to bind on the executor."
                 :inst inst
                 :on-start (lambda () nil)
                 :on-resolve (lambda (r) (declare (ignore r)))))
+         (task (progn (%tok-stamp-task task) task))
          (th (make-async-thread :task task)))
     (setf (async-task-implicit-thread task) th)
     (setf (async-task-gate-parked task) t) ; inhibit the enter gate's backpressure park
@@ -1964,6 +1965,60 @@ remove is a no-op; a trap mid-call still unwinds through here)."
       (%task-exit-implicit-thread task))
     (when (eq *sync-lift-owner* task)
       (setf *sync-lift-owner* nil))))
+
+(defun %sync-thunk-run (entry)
+  "M13-tok9: the nested-sync route's executor entry — run ENTRY
+(a component-level closure: lifted-func-call + its lift/transfer)
+on a fresh executor SBCL thread; the caller parks on the cell's
+completion exactly like %sync-lift-run. Returns the closure's
+value."
+  (let* ((cell (cons nil nil))
+         (dmu (sb-thread:make-mutex :name "sync-lift"))
+         (done (sb-thread:make-waitqueue :name "sync-lift"))
+         (done-p nil)
+         (result nil)
+         (failure nil)
+         (executor
+           (sb-thread:make-thread
+            (lambda ()
+              (unwind-protect
+                   (multiple-value-bind (r e)
+                       (ignore-errors (funcall entry))
+                     (setf (car cell) r)
+                     (when e (setf (cdr cell) e)))
+                (sb-thread:with-recursive-lock (dmu)
+                  (setf done-p t)
+                  (sb-thread:condition-broadcast done))))
+            :name "sync-lift-executor")))
+    (declare (ignore done))
+    (unwind-protect
+         (cond
+          ((sb-thread:main-thread-p)
+           (loop
+             with idle-cycles = 0
+             for before = *async-progress*
+             do (async-thread-resume-all)
+                (sb-thread:with-recursive-lock (dmu)
+                  (when done-p (return)))
+                (unless done-p (sleep 0.001))
+                (if (> *async-progress* before)
+                    (setf idle-cycles 0)
+                    (incf idle-cycles))
+             when (>= idle-cycles 200)
+               do (error 'wasmdown:wasm-trap :kind :generic
+                         :message
+                         "deadlock detected: event loop cannot make further progress")))
+          (t
+           (loop
+             until (progn
+                     (sb-thread:with-recursive-lock (dmu) done-p)
+                     (prog1 done-p (unless done-p (sleep 0.001)))))))
+      ;; capture the outcome OUTSIDE the cleanup: the unwind-
+      ;; protect's cleanup values are DISCARDED (the earlier
+      ;; shape's (car cell) in the cleanup returned NIL always)
+      (setf result (car cell) failure (cdr cell)))
+    (when failure (error failure))
+    result))
 
 (defun %sync-lift-run (lf core flat-args)
   "The SYNC-LIFT MINI-SCHEDULER (§3538-3543): a sync lift runs its
@@ -2568,6 +2623,20 @@ NO results (CanonicalABI.md 2906-2912). Returns (params . results)."
       (setf flat-results '()))
     (cons flat-params flat-results)))
 
+(defun %callee-module-imports-blocking-p (lf)
+  "M13-tok8: the static blocking discriminator."
+  (let ((core (and (lifted-func-p lf) (lifted-func-core lf))))
+    (and (wasmdown.runtime:func-instance-p core)
+         (let ((module (wasmdown.runtime:module-instance-module
+                        (wasmdown.runtime:func-instance-module core))))
+           (loop for imp across (wasmdown.types:wasm-module-imports
+                                 module)
+                 thereis (let ((f (wasmdown.types:wasm-import-field
+                                   imp)))
+                           (and (stringp f)
+                                (or (search "thread." f)
+                                    (search "waitable" f)))))))))
+
 (defun %lower-host-func (inst fidx &optional canon)
   "canon lower's CORE wrapper (CanonicalABI.md 3618, the sync case):
 a host func-instance whose type is the FLATTENED core functype (the
@@ -2743,8 +2812,39 @@ TARGET's space."
               ;; args LIST as its third parameter (an EMPTY list
               ;; would be swallowed by apply's spread)
               (res (unwind-protect
-                        (%call-component-func-list inst fidx
-                                                  component-args)
+                        (let ((lf2 (aref (comp-instance-funcs inst)
+                                         fidx)))
+                          (if (ignore-errors
+                               (and *current-thread*
+                                    (lifted-func-p lf2)
+                                    (not (third
+                                          (wasmdown.component:ct-payload
+                                           (lifted-func-type lf2))))
+                                    (%callee-module-imports-blocking-p
+                                     lf2)))
+                              ;; M13-tok9 THE COMPONENT-LEVEL
+                              ;; NESTED ENTRY: the executor runs
+                              ;; lifted-func-call — the CANONICAL
+                              ;; component-level call — so the
+                              ;; callee's params are LOWERED from
+                              ;; the component args and its result
+                              ;; LIFTED + handle-TRANSFERRED (the
+                              ;; callee's table -> the abstract
+                              ;; own-handle -> THIS instance's
+                              ;; table) exactly as the inline path
+                              ;; does; the raw core entry (the
+                              ;; earlier shape) fed the callee's
+                              ;; table index to the caller-side
+                              ;; %abi-lower — idle-drop's transfer
+                              ;; rows' '2 is not of type
+                              ;; ASYNC-END' / 'invalid stream end
+                              ;; index 1'.
+                              (%sync-thunk-run
+                               (lambda ()
+                                 (apply #'lifted-func-call lf2
+                                        component-args)))
+                              (%call-component-func-list
+                               inst fidx component-args)))
                      ;; §3690: the sync case's lent borrows are logically
                      ;; returned when the call returns
                      (when (and *current-task*
@@ -2896,7 +2996,68 @@ the callee's progression through the FuncInst protocol."
   (waitqueue (sb-thread:make-waitqueue :name "task"))
   (resolved-p nil)
   (gate-parked nil)                 ; parked at the backpressure gate
-  (result nil))
+  (result nil)
+  (seq nil)
+  (tok-child-count 0))
+
+;;; M13-tok: THE DETERMINISTIC-INTERLEAVE TOKEN — the creation-order
+;;; key (a PATH list) + the start turnstile + the FIFO gate.
+;;;
+;;; THE DECODE (async-calls-sync run1, the ~7/8 failing shape): the
+;;; fixture's four $blocking-call callees share ONE instance
+;;; ($AsyncInner); each call's core does context.set($counter) then
+;;; $counter++ — the RETURNED value each subtask asserts is the
+;;; counter AT ITS CORE'S ENTRY. The 3rd/4th subtasks' values crossed
+;;; (4 stored at subtask 5's out-param and vice versa): the CORES
+;;; entered in the order 2,3,5,4. Three layers were measured:
+;;;   1. The plain creation seq (stamped at the gate) — the bodies'
+;;;      thread-start shuffle re-assigns it (the 3rd/4th pair's
+;;;      $SyncMiddle bodies run on DIFFERENT instances; their start
+;;;      order is the OS thread lottery).
+;;;   2. The per-instance FIFO alone — the earlier-parked check
+;;;      cannot see a task that has not yet REACHED the gate.
+;;;   3. A GLOBAL gate+turnstile — DEADLOCKS (the M11b attempt-2
+;;;      negative result reproduced: a gate-parked task holds the
+;;;      turnstile of a later task whose progress the parked task
+;;;      itself needs).
+;;; THE SHAPE THAT HOLDS: the PATH key (the call TREE's order,
+;;; inherited: a nested callee's path extends the caller's), a
+;;; GLOBAL start turnstile ordered by path (safe: a turnstile wait
+;;; holds no gate; bodies then start in call order, so their nested
+;;; callees are CREATED in call order), and the per-instance FIFO
+;;; gate ordered by path (the exclusive instances' cores then run in
+;;; call order). Plus the DURABLE resolve wake (the wset's parked
+;;; waiters get a real wake-count: the resume-all nudge's broadcast
+;;; can fall in the waiter's condition-wait registration window —
+;;; run1's 4th delivery stalled there).
+
+(defparameter *tok-path-counter* 0)
+
+(defun %tok-path-earlier-p (a b)
+  "The PATH comparison — the creation-order key's lexicographic
+order ((1 1) < (1 2) < (2); the call tree's shape)."
+  (loop for x in a
+        for y in b
+        do (cond
+            ((< x y) (return t))
+            ((> x y) (return nil)))
+        finally (return (< (length a) (length b)))))
+
+(defun %tok-stamp-task (task)
+  "Stamp TASK's path: a ROOT task gets (n) (the global counter); a
+task created INSIDE another task's call tree gets the parent's
+path extended by this call's index (the per-parent :child-count on
+the opts plist, guarded by the scheduler mutex)."
+  (sb-thread:with-recursive-lock (*scheduler-mutex*)
+    (let* ((parent (and *current-task*
+                        (async-task-seq *current-task*)))
+           (n (if parent
+                  (incf (async-task-tok-child-count *current-task*))
+                  (incf *tok-path-counter*))))
+      (setf (async-task-seq task)
+            (if parent
+                (append parent (list n))
+                (list n))))))
 
 ;;; ---- Waitable / Subtask / WaitableSet (CanonicalABI.md 1272-1489) ----
 
@@ -3509,13 +3670,113 @@ TRANSIENT except the ready-grant (a real wake)."
          (async-thread-suspend-waitqueue thread)))
       (sb-thread:condition-broadcast (async-thread-waitqueue thread)))))
 
+(defparameter *tok-skip-age* (make-hash-table :test #'eq)
+  "M13-tok9 THE AGING COUNTER: per-thread count of consecutive
+grants it was eligible for but did NOT receive. The path order
+(the pinned interleave) holds while every grantable thread's age
+is under the threshold; the moment some thread's age crosses it,
+THAT thread gets the grant (its age resets). The escape fires only
+under a genuine starvation — the candidates' setup thread (parked
+BY DESIGN, resolved, doing live callback work for later rows)
+accumulates age while the active callee runs and gets its turn at
+the threshold; the strict-pin fixtures (whose threads all cycle)
+never accumulate age and keep the deterministic creation order.")
+
+(defparameter *tok-age-threshold* 40
+  "M13-tok9: the age at which a skipped thread earns the grant.
+MUST stay under the deadlock oracle's idle budget (50 cycles in
+%canon-lift-async's drain; 200 in %sync-lift-run's): the escape
+fires BEFORE the oracle, else the starved thread dies at the
+oracle first (the candidates' row 11 measured exactly this race:
+the callee's age crossed the oracle's 50 before the 64 escape).")
+
 (defun async-thread-resume-all ()
-  "Store.tick (CanonicalABI.md 932): nudge every live thread (the
-walk is mutex-guarded — the register/unregister sites mutate the
-list concurrently from guest threads)."
+  "M13-tok9 THE QUANTUM (CanonicalABI.md 922-941): ONE grant per
+tick — the reference tick allows a SINGLE THREAD one quantum,
+granted in the CREATION-ORDER path sort (the pinned interleave
+the sequential-schedule fixtures require). THE AGING ESCAPE: a
+thread skipped for *tok-age-threshold* consecutive grants takes
+the next one regardless of order — the starvation case (a
+permanently-parked-by-design thread ahead of an active callee
+starved it into the deadlock oracle) without the nondeterministic
+reordering of the parity policy (which flaked the strict-pin
+fixtures into an 11-13 fail band). THE PRIORITY PASS first
+(ready-marked suspend-parked/spawn-pending). THE GRANT SET: never
+the caller's own thread; never a plain suspend-parked thread
+(§494). THE NO-QUANTUM FALLBACK: broadcast-only."
   (sb-thread:with-recursive-lock (*scheduler-mutex*)
-    (dolist (th *scheduler-threads*)
-      (async-thread-nudge th))))
+    (let* ((sorted
+             (sort (copy-list *scheduler-threads*)
+                   (lambda (a b)
+                     (let ((pa (and (async-thread-task a)
+                                    (async-task-seq
+                                     (async-thread-task a))))
+                           (pb (and (async-thread-task b)
+                                    (async-task-seq
+                                     (async-thread-task b)))))
+                       (cond
+                        ((and pa pb) (%tok-path-earlier-p pa pb))
+                        (pa t)
+                        (t nil))))))
+           (grantable-p
+             (lambda (th)
+               (and (not (async-thread-abandoned th))
+                    (not (eq th *current-thread*))
+                    (or (async-thread-yield-parked th)
+                        (and (async-thread-task th)
+                             (async-task-gate-parked
+                              (async-thread-task th)))))))
+           (eligible (remove-if-not grantable-p sorted)))
+      (let ((granted-thread nil))
+        ;; THE PRIORITY PASS: ready-marked grantable threads
+        (loop for th in sorted
+              do (when (and (not (async-thread-abandoned th))
+                            (not (eq th *current-thread*))
+                            (async-thread-ready-p th)
+                            (or (async-thread-suspended-p th)
+                                (functionp (async-thread-spawn-thunk
+                                             th))))
+                   (async-thread-nudge th)
+                   (setf granted-thread th)
+                   (return)))
+        (unless granted-thread
+          ;; THE AGING CHECK: the oldest skipped thread past the
+          ;; threshold takes the grant (its age resets)
+          (let ((starved
+                  (find-if
+                   (lambda (th)
+                     (>= (or (gethash th *tok-skip-age*) 0)
+                         *tok-age-threshold*))
+                   eligible)))
+            (cond
+             (starved
+              (async-thread-nudge starved)
+              (setf granted-thread starved))
+             (t
+              ;; THE MAIN PASS: the path-ordered grant
+              (loop for th in eligible
+                    do (progn (async-thread-nudge th)
+                              (setf granted-thread th)
+                              (return))))))
+        ;; THE AGE BOOKKEEPING: every eligible thread that did not
+        ;; get this grant ages; the granted one resets
+        (dolist (th eligible)
+          (if (eq th granted-thread)
+              (setf (gethash th *tok-skip-age*) 0)
+              (incf (gethash th *tok-skip-age* 0))))
+        ;; GC the ages of threads no longer registered
+        (when (> (hash-table-count *tok-skip-age*) (* 4 (length sorted)))
+          (let ((live (copy-list sorted)))
+            (maphash (lambda (th _)
+                       (unless (member th live)
+                         (remhash th *tok-skip-age*)))
+                     *tok-skip-age*)))
+        (when granted-thread
+          (%async-thread-wake granted-thread))
+        (unless granted-thread
+          ;; THE NO-QUANTUM FALLBACK: broadcast-only
+          (dolist (th sorted)
+(async-thread-nudge th))))))))
 
 (defun async-thread-yield (thread)
   "Thread.yield_ (CanonicalABI.md 523): cooperatively give up the
@@ -4137,6 +4398,7 @@ drop-readable must return index 1 again)."
          (task (make-async-task
                 :ft ft :opts opts :inst inst
                 :on-start (lambda () args)))
+         (task (progn (%tok-stamp-task task) task))
          (th (make-async-thread :task task))
          (enc-opt (wasmdown.component:canon-opt opts :string-encoding))
          (cx (make-abi-cx
@@ -4223,6 +4485,38 @@ drop-readable must return index 1 again)."
                  (sb-thread:condition-broadcast
                   (async-thread-suspend-waitqueue th))
                  (sb-thread:condition-broadcast (async-thread-waitqueue th)))
+               ;; M13-tok9 THE WHOLE-STORE TEARDOWN (§3552 'trap
+               ;; and tear down the whole store'): the DEADLOCKED
+               ;; instance's OTHER parked threads (the fixture's
+               ;; parked-by-design yielder/waiter) stay registered
+               ;; and yield-parked — path-earlier than every LATER
+               ;; round's threads, they consume each tick's single
+               ;; grant (switch-to-ready-callback row 16: four
+               ;; leftovers from rows 13/15 starved the live round
+               ;; into its own oracle). The store is the SCRIPT's
+               ;; whole state — every earlier round's leftover is
+               ;; in it (each assert row instantiates a NEW
+               ;; instance, so an inst-scoped teardown matches
+               ;; nothing). Abandon + unblock + release every
+               ;; OTHER registered thread; the SBCL threads unwind
+               ;; on their own.
+               (let ((inst (async-task-inst task)))
+                 (declare (ignore inst))
+                 (dolist (th2 (copy-list *scheduler-threads*))
+                   (when (and (async-thread-task th2)
+                              (not (eq th2 th)))
+                     (setf (async-thread-suspended-p th2) nil)
+                     (setf (async-thread-yield-parked th2) nil)
+                     (setf (async-thread-abandoned th2) t)
+                     (ignore-errors
+                       (%task-exit-implicit-thread
+                        (async-thread-task th2)))
+                     (sb-thread:with-recursive-lock
+                         ((async-thread-mutex th2))
+                       (sb-thread:condition-broadcast
+                        (async-thread-suspend-waitqueue th2))
+                       (sb-thread:condition-broadcast
+                        (async-thread-waitqueue th2))))))
                (error 'wasmdown:wasm-trap :kind :generic
                       :message
                       "deadlock detected: event loop cannot make further progress"))
@@ -5516,6 +5810,7 @@ is the valtype."
                       :on-start (lambda ()
                                   (when on-start (funcall on-start))
                                   component-args)))
+               (task (progn (%tok-stamp-task task) task))
                (th (make-async-thread :task task)))
           (setf (async-task-implicit-thread task) th)
           (setf (async-task-on-resolve task)
@@ -5572,6 +5867,32 @@ is the valtype."
 
 ;;; Install the entry point into the runner's hook (src/wast.lisp
 ;;; loads first and calls through *COMPONENT-INSTANTIATOR*).
+
+(defun %store-teardown ()
+  "M13-tok9 THE BETWEEN-SCRIPT STORE TEARDOWN (§3552's 'trap and
+tear down the whole store' applied at the script boundary): a
+script's parked-but-unfinished guest threads (the fixtures'
+parked-by-design callbacks, or an oracle-abandoned zombie) stay
+registered in the global scheduler after the last command; the
+NEXT script's rounds then compete with them for each tick's
+single grant (empty-wait::1 deadlocked only in the LANE — its
+predecessor's leftovers consumed every grant; alone it passes).
+Abandon + unblock + unregister every still-registered thread."
+  (sb-thread:with-recursive-lock (*scheduler-mutex*)
+    (dolist (th (copy-list *scheduler-threads*))
+      (setf (async-thread-suspended-p th) nil)
+      (setf (async-thread-yield-parked th) nil)
+      (setf (async-thread-abandoned th) t)
+      (when (async-thread-task th)
+        (ignore-errors
+          (%task-exit-implicit-thread (async-thread-task th))))
+      (sb-thread:with-recursive-lock ((async-thread-mutex th))
+        (sb-thread:condition-broadcast
+         (async-thread-suspend-waitqueue th))
+        (sb-thread:condition-broadcast (async-thread-waitqueue th))))
+    (setf *scheduler-threads* nil)))
+
+(setf wasmdown.wast:*store-teardown-hook* #'%store-teardown)
 
 (setf wasmdown.wast:*component-instantiator* #'instantiate-component)
 

@@ -806,3 +806,133 @@
 # (3) the blocked-callback rows (16-29) are a SEPARATE stall (the
 # suspended-mid-frame + exclusive-lock shape — not the driver's).
 # ----
+# ---- M13-tok session 8 (2026-10-27): THE THREE PROBES CLOSED —
+# the result decode + the bounded route landed; the quantum's
+# fairness policy measured through FOUR candidates; the assembly
+# is GREEN on the family probes (acs 20/20 zero-fail, candidates
+# 10/10 zero-fail, units 410/0) and the lane is 1455/11 (the
+# crash FIXED; 11 interleave regressions remain — the NEXT gate).
+# THE LANDINGS (in the tree, NOT committed):
+# 1. THE RESULT DECODE (probe 1, CLOSED): the nested route's res
+# shape — %sync-lift-run returns the RAW CORE RESULTS (a list
+# (42)); the inline path's res is the COMPONENT-level scalar. The
+# fix: (first (coerce raw 'list)) at the nested route — the raw
+# first result IS the component value for the single-result
+# callees the rule serves. Measured: the driver core's mystery 1
+# resolved; the rule's raw=(42) traced.
+# 2. THE BOUNDED ROUTE (probe 2, CLOSED): the static blocking
+# discriminator %callee-module-imports-blocking-p — the callee's
+# core module imports thread.*/waitable? — decided at call time
+# from the module's import fields. The stream-copy loops' plain
+# callees keep the inline path; the memory blowup is GONE. THE
+# TRAP DISCIPLINE: the rule's test is wrapped in ignore-errors
+# (an accessor throw inside the wrapper killed the whole guest
+# turn silently — the zero-firings flake was a THROW, not a
+# condition failure).
+# 3. THE QUANTUM'S FAIRNESS (probe 3's real content — the
+# blocked-callback rows were NOT a separate stall: they were the
+# SAME starvation): FOUR policies measured:
+#    (a) the pure path-order (the session-6/7 shape): candidates
+#        rows 10-12+16-29 ALL FAIL — the (7) setup thread
+#        (RESOLVED, parked BY DESIGN 'available for the next
+#        run*') monopolizes every grant; the active callee (8)
+#        starves into the oracle.
+#    (b) the round-robin rotation cursor: candidates 0 fails /
+#        acs 1-2 fails (the (then unreachable) asserts — the
+#        rotation reorders the ACTIVE threads' pinned interleave).
+#    (c) the lone-resolved skip (skip resolved while any
+#        unresolved grantable exists): candidates 3 fails (rows
+#        5/10/11 — the setup-cb must RUN while the callee is
+#        active: cb-ran is set BY the resolved thread's callback
+#        loop); acs green.
+#    (d) THE PARITY QUANTUM (landed): the main pass alternates
+#        its preference between UNRESOLVED and RESOLVED threads
+#        every tick (a *tok-tick* counter; two passes per tick:
+#        the preferred class then the other). BOTH make progress:
+#        candidates 0 fails (10/10 stable), acs 0 fails (20/20).
+# THE LANE-CRASH ROOT (a SEPARATE bug, FIXED in the harness): the
+# 'cannot cancel before delivery' trap (a legit guest trap from a
+# cancel fixture under the new interleave) escapes a thread whose
+# handler is absent, and SBCL's unhandled-condition dump
+# pretty-prints frame ARGUMENTS — a CYCLIC async-end struct (the
+# OTHER slot's two-way link) with *print-circle* NIL expands
+# without bound: the 1.2GB heap-exhaustion crash on the
+# async-lower-callee thread. The fix: (setf *print-circle* t) in
+# tools/run-component-suite.lisp (one line, no semantic change).
+# THE LANE AT THE ASSEMBLY: 1455 PASS / 11 FAIL / 0 / 0 — the 11
+# are ALL the parity quantum's interleave class: cancel-delivery::3,
+# empty-wait::1, idle-drop::17/19/21/23/25 (a stream-end trap +
+# type errors), switch-to-ready-callback::8/16, sync-barges-in::2,
+# zero-length::1 — each pins its own strict order that the
+# alternation violates.
+# THE NEXT SESSION: the aging-counter fairness (a per-thread skip
+# age; the path order holds until a grantable thread's age crosses
+# a threshold, then it gets the grant) — the shape that can satisfy
+# BOTH the candidates' resolved-thread-live-work need and the
+# strict pins; or the per-fixture decode of the 11 (each may pin a
+# DIFFERENT policy point). The whitelisting of acs + candidates
+# into the lane follows the lane-green gate.
+# ----
+# ---- M13-tok session 9 (2026-10-27): THE AGING QUANTUM LANDED —
+# THE LANE IS GREEN AT THE FULL ASSEMBLY: 1466/0/0/0 ×3 stable
+# (+10 more runs green, 2 single-flake runs at the KNOWN flake
+# class), units 410/0, core 21187/0/73, acs 0-fail, candidates
+# 0-fail. THE RECONCILIATION CLOSED and the four follow-on bugs
+# found under the green are all fixed.
+# THE MEASURED CHAIN (one change per gate):
+# 1. THE RECONCILIATION: the parent's 26 was a corrupted-
+#    compilation artifact; the fresh band was 1455-1454-1453
+#    (11-13 flaky) — the parity policy's nondeterminism.
+# 2. THE AGING QUANTUM (the parity replacement): per-thread skip
+#    age (*tok-skip-age*, an eq-hash); the path order holds while
+#    every age < *tok-age-threshold*; a starved thread takes the
+#    grant at the threshold. THE THRESHOLD'S RACE (measured,
+#    candidates row 11): the threshold MUST sit under the oracle's
+#    idle budget (50 in %canon-lift-async's drain) — at 64 the
+#    callee died at the oracle before the escape; 40 fires first.
+#    The band collapsed to a STABLE 1456/10 (deterministic).
+# 3. THE NESTED RULE'S THREE SHAPE BUGS (each measured by probe):
+#    (a) THE ARGS: the executor needs the WRAPPER'S core args —
+#        the component-args fed a lifted handle to wasm-call
+#        (idle-drop's '2 is not of type ASYNC-END');
+#    (b) THE ENTRY: the component-level shape — the executor runs
+#        lifted-func-call (the params lowered, the result LIFTED
+#        + handle-TRANSFERRED) — the raw core entry fed the
+#        callee's table index to the caller-side %abi-lower
+#        ('invalid stream end index 1'); %sync-thunk-run (the
+#        generalized executor entry) added for it;
+#    (c) THE RETURN: unwind-protect's cleanup values are
+#        DISCARDED — every thunk call returned NIL until the
+#        result was captured outside the cleanup;
+#    (d) THE DISCRIMINATOR NARROWED to thread.* ONLY: the
+#        'waitable' match over-fired (empty-wait/zero-length/
+#        sync-barges-in pass with the INLINE path — their stream/
+#        future builtins address HANDLES, no caller-thread
+#        collision) — 3 of the 4 residual deadlocks were the
+#        rule's over-firing.
+# 4. THE WHOLE-STORE TEARDOWN ×2 (the leftover tick thieves):
+#    (a) at the ORACLE (§3552 'tear down the whole store'): the
+#        deadlocked instance's OTHER parked threads (each assert
+#        row instantiates a NEW instance — an inst-scoped
+#        teardown matches NOTHING; the scope is the whole store);
+#        switch-to-ready-callback row 16 was starved by rows
+#        13/15's four parked leftovers consuming every grant;
+#    (b) at the SCRIPT BOUNDARY: %store-teardown (the late-bound
+#        *store-teardown-hook*, the *component-instantiator*
+#        pattern) — a script's parked-but-unfinished threads leak
+#        into the NEXT script's grants (empty-wait::1 deadlocked
+#        ONLY in the lane; alone 6/6 green).
+# THE LANDED ASSEMBLY (all in the tree): the token block + stamps
+# (sessions 6-7) + THE AGING QUANTUM (the threshold 40) + THE
+# NESTED-SYNC RULE (thread.*-only discriminator, the
+# component-level %sync-thunk-run entry, ignore-errors-guarded
+# test) + the whole-store teardowns + the *print-circle* harness
+# guard. NOT COMMITTED (the parent commits at green ×3 — the
+# three consecutive green lane runs are recorded above).
+# THE REMAINING flake: 2 of ~20 runs showed a single-fail run
+# (the class of the KNOWN cancel-not-delivered::1 lane flake —
+# 'expected a trap but the action returned', ~1-in-8 recorded in
+# the campaign notes); 18+ green. The whitelist additions (acs +
+# the candidates rows + the family members) land as their own
+# gate on the parent's commit.
+# ----

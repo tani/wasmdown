@@ -35,6 +35,7 @@
            ;; src/component-text.lisp) + the M8 instantiator hook
            ;; (installed by src/component-runtime.lisp).
            #:*component-text-parser* #:component-text-parser
+           #:*store-teardown-hook*
            #:*component-instantiator* #:component-instantiator
            ;; M9: the component-instance ACTION hook (installed by
            ;; src/component-runtime.lisp alongside the instantiator).
@@ -1639,6 +1640,12 @@ loaded. M7 slice 2.")
   "The installed component text parser (a function) or NIL."
   *component-text-parser*)
 
+(defvar *store-teardown-hook* nil
+  "M13-tok9: the between-script store teardown — set by
+component-runtime's %store-teardown; each .wast script is a
+fresh STORE (the harness model) and a script's parked guest
+threads must not leak into the next script's tick grants.")
+
 (defvar *component-instantiator* nil
   "The component INSTANTIATOR entry point (installed at load time by
 src/component-runtime.lisp, which loads after this file — the M8
@@ -2297,7 +2304,21 @@ given, receives a JSONL line per result (PLAN.md 12.8)."
                 (error (c)
                   (record cmd :harness-error nil
                           (format nil "unexpected error: ~a" c)
-                          nil))))))))
+                          nil))))
+            ;; M13-tok9 THE BETWEEN-SCRIPT STORE TEARDOWN: a
+            ;; script's parked-but-unfinished guest threads (the
+            ;; fixtures' parked-by-design callbacks) stay in the
+            ;; global scheduler after the last command; the NEXT
+            ;; script's rounds then compete with them for each
+            ;; tick's single grant (empty-wait::1 deadlocked only
+            ;; in the LANE — its predecessor's leftovers consumed
+            ;; the grants; alone it passes 6/6). Each script is a
+            ;; fresh STORE per the harness model — release every
+            ;; still-registered thread at the script's end. The
+            ;; hook is late-bound (component-runtime loads after
+            ;; this file — the *component-instantiator* pattern).
+            (when *store-teardown-hook*
+              (funcall *store-teardown-hook*))))))
       (nreverse results)))))
 
 (defun %execute-command (state cmd record)

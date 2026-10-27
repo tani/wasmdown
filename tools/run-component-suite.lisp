@@ -149,6 +149,12 @@ parent dir), not the first (the grandparent 'component' — the old
 
 ;;; Because run-directory takes ONE pattern, drive the suites directly:
 
+;; M13-tok8: SBCL's unhandled-condition dump pretty-prints frame
+;; ARGUMENTS; a cyclic async-end struct (the OTHER slot's two-way
+;; link) printed with *print-circle* NIL expands without bound —
+;; the 1.2GB heap-exhaustion crash on the async-lower-callee
+;; thread. Print cycles finitely instead.
+(setf *print-circle* t)
 (setf *results* nil)
 (dolist (f *files*)
   (setf *results*
