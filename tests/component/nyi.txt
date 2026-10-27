@@ -1695,3 +1695,40 @@
 # origin-recorded-BI candidate shape. NOT COMMITTED (the
 # parent commits at green).
 # ----
+# ---- M13-tok session 27 (2026-10-28): THE PARENT'S FINAL
+# SHAPE MEASURED — BOTH HALVES — and the live chain mapped to
+# its true arms; the attempt REVERTED at the budget's end
+# (the lane 1469/0 x3 + units 410/0 re-verified); the tree =
+# the ledger only.
+# THE MEASUREMENTS (the parent's shape, both halves):
+# 1. THE REP-VALUE HALF (the 5651 arm: the ft-inst deref + the
+#    (push rep vals)): passing-resources ::1 STILL FAILS (the
+#    R.foo check receives 55 — UNCHANGED) AND drop-cross-task-
+#    borrow ::2/::4 BREAK (2 fails). The 5651 arm NEVER FIRES
+#    in the R.foo chain (the ARM28 probe: 0 firings) — the arm
+#    is the CONSUMER'S LOWER walk (the %lower-host-func's
+#    component-args); the producer's LIFT path is the guest
+#    body's own walk.
+# 2. THE CHAIN'S TRUE ARMS (mapped): the consumer's LOWER (the
+#    2760 arm) derefs the consumer's table at $res1 -> the rep
+#    50 -> the BI at the producer (push bi) — the LOWER works;
+#    the producer's LIFT: lifted-func-call's async return ->
+#    %canon-lift-async -> the GUEST BODY's own walk (the
+#    (%abi-arg-domain a (cdr p) cx) over the on-start args =
+#    the component-args (the BI 5)) — the domain conversion of
+#    an INT for a (borrow R) param passes the RAW 5 through —
+#    THE GUEST BODY'S WALK IS THE LIVE PATH — the 5651/2204
+#    arms are the OTHER boundaries.
+# THE REMAINING GAP (for the parent): the guest body's
+# (%abi-arg-domain + flat-args) walk needs the borrow-aware
+# conversion — the (borrow R) param's domain value (the BI at
+# the callee's table) deref'd to the rep at the guest body's
+# boundary — OR the parent's miss-walk covers the whole class.
+# drop-cross-task's ::2/::4 break under the 5651 rep-value:
+# its chain's lift ALSO routes elsewhere; the measured break is
+# the (or bi rep a) class — REVERTED with the rest.
+# THE STATE at the close: pieces 1+2 (the committed wins) are
+# the tree's runtime delta = NONE (all piece-3 attempts
+# reverted); the lane 1469/0 x3 + units 410/0 re-verified at
+# HEAD (the committed pieces 1+2 state).
+# ----
