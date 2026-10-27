@@ -3,8 +3,8 @@
 ./values/post-return.wast
 ./values/variants.wast
 ./async/big-interleaving-test.wast
-./async/cancel-resumed-callback-switch.wast
 ./async/cancel-subtask.wast
+./async/cancel-resumed-callback-switch.wast
 ./async/cancel-targeted-resume.wast
 ./async/partial-stream-copies.wast
 ./async/passing-resources.wast
@@ -1265,4 +1265,76 @@
 # granted the get's thread its final turn no longer runs).
 # THE STATE at the close: the deferral fully reverted; the
 # tree = the ledger only.
+# ----
+# ---- M13-tok session 18 (2026-10-27): THE GET-THREAD MID-EXIT
+# PROBE ANSWERED — the mid-exit hypothesis is DEAD; the
+# deferral's stall is a MOVING multi-party timing hole (each
+# probe reveals a different shape). The deferral REVERTED
+# (second session); the lane 1469/0 x3 + units 410/0.
+# THE PROBE'S EVIDENCE:
+# 1. THE EXIT STAGES (the three probes at the exit's
+#    enter/unregistered/done): in the SEQUENCE trace, ALL
+#    THREE threads ((1) the run, (1 2) the set callee, (1 1)
+#    the get callee) complete their FULL exits (ENTER ->
+#    UNREGED -> DONE) — the (1 1) mid-exit shape from session
+#    17's trace does NOT reproduce; the run (1) exits FIRST in
+#    the sequence — the whole fixture flow completed.
+# 2. THE ROW-WINDOW trace (the tick-30 dump BEFORE the FAIL +
+#    the exits AFTER): the trio un-parked at tick 30, the ROW
+#    FAILS with the oracle, and the FULL exits print only at
+#    the script's teardown — the row's window and the teardown
+#    exits interleave DIFFERENTLY across runs — the stall is
+#    timing-shaped, not a fixed block.
+# 3. THE WAIT-UNTIL flag note: async-thread-wait-until is a
+#    bare condition-wait with NO park flags — the population
+#    dumps cannot distinguish parked-in-wait-until from
+#    running; the trio's y/s/r=NIL is consistent with ALL
+#    THREE parked in wait-untils (the deferral's sleep-loop,
+#    the read's wait, the write's wait) — with the quantum
+#    granting none of them (none is in the scheduler's
+#    grantable set — the wait-until parks are NOT registered
+#    as grantable!).
+# THE HYPOTHESIS THAT FITS ALL THE TRACES: the deferral's
+# sleep-loop + the changed caller timing shift the flow's
+# grants — the get's callee's post-return write and the set's
+# callee's read and the run's write all park in UNREGISTERED
+# wait-untils whose ONLY wakers are the peer copies' notifies
+# — a circular wait the ORACLE catches. THE NEXT SESSION (if
+# the deferral is re-attacked): instrument the NOTIFY path
+# (the %end-notify calls) + the wait-until wake counts in the
+# deferral build, BEFORE the population dumps.
+# THE DECISION at the close: the deferral (2 sessions, the
+# pack half proven) is PARKED as a recorded design — the
+# sync-streams rung stays nyi'd with the full evidence chain;
+# the ladder moves to the stale-rate rungs (cancel-subtask,
+# cancel-targeted-resume, cancel-resumed-callback-switch,
+# partial-stream-copies, passing-resources) whose rates may
+# have closed en passant at the current build.
+# THE STATE at the close: the deferral fully reverted; the
+# tree = the ledger only.
+# ----
+# ---- M13-tok session 18b (2026-10-27): THE STALE-RATE RUNGS
+# PROBED — cancel-resumed-callback-switch LANDED EN PASSANT
+# (the census rows ::1/::3 green at the current build — the
+# atomic resolve + the quantum closed them); the lane 1473
+# denominator. The other rungs' stale rates: cancel-subtask 1
+# fail, cancel-targeted-resume 3, partial-stream-copies 1,
+# passing-resources 1 — all still failing at this build (the
+# next session's probes).
+# THE LANE-ONLY INTERFERENCE (recorded honestly, the un-park
+# STANDS): the fixture is 20/20 GREEN standalone; in the LANE
+# it shows ~3-in-6 single-fail runs (rows ::1/::3 alternating,
+# 'unreachable executed') — THE CROSS-FIXTURE CLASS: the cancel
+# family's lane predecessors leave a state that resists the
+# between-script store teardown (the teardown's abandon +
+# unregister + broadcast; the candidate: a parked-in-wait-
+# until thread that re-registers after the teardown's
+# unregister, or a teardown-vs-park race). THE NEXT SESSION'S
+# PROBE: the scheduler's population print at the teardown +
+# the next fixture's initial population (the zombie
+# identification).
+# THE STATE at the close: the lane 1473/0 x3 at the un-park +
+# the interference profile recorded; units 410/0; the tree =
+# the un-park (the nyi line removed + the member entry) + the
+# ledger.
 # ----
