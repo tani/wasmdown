@@ -117,3 +117,55 @@
 # non-async rule). NOTE: the M12 flake row (cancel-not-delivered
 # ::1, ~1-in-8) did NOT reappear in this session's runs — its
 # root-cause note (the token scheduler) stands. ----
+./async/trap-if-block-and-sync.wast
+# ---- M13 session 2 (2026-10-27): THE ::34 LOST-WAKE — root
+# cause CONFIRMED, the fix's design constraint derived, the
+# fixture REVERTED to nyi pending the switch-lock design (the
+# parent's remediation for the red-commit breach: the
+# census landing exposed the pre-existing ::34 flake as an
+# every-run lane failure at the raised thread pressure). THE
+# ROOT CAUSE: the switch arms resume the target BEFORE the
+# caller parks, so the spawned thread's
+# suspend-then-resume(caller) broadcast can land on an
+# UNPARKED caller and be lost — the deadlock oracle fires.
+# The mark-ready landing (::34 0/20, from ~15%) CONFIRMS the
+# fire->park window. THE SIX-ITERATION NEGATIVE-RESULT CHAIN
+# (each closed one window, opened the next): (1) mark-ready +
+# tick-fires-ready-spawns + sticky-resume-mark — ::34 0/20
+# AND no-sibling-resume ::2 20/20, BUT trap-if-block's yield
+# rows STALLED (the sticky-mark-only arm-loop missed the
+# noop-target shape's tick-broadcast wake — a liveness
+# regression); (2) yield-parks-any-nudge + suspend-parks-
+# explicit-only — fixed the stalls BUT no-sibling-resume hung
+# in cross-file runs (resume-later, now 494-correct, removed
+# the only wake its 4-round interleave had); (3) the spec's
+# shape for that wake = the 242-273 HANDLER HANDSHAKE (X's
+# own park IS the caller's wake) — implemented as the
+# resumer field + wake-back in async-thread-suspend; (4) the
+# wake-back DEADLOCKED on the caller's own mutex (the caller
+# between park-decision and condition-wait, holding mu); (5)
+# the lock-free wake-back (mark + broadcast) still hung —
+# the mark lands after the arm-loop's pre-wait check, and the
+# loop only re-checks after a wait returns (a lost broadcast
+# + mid-window mark never resolves). THE STRUCTURAL LESSON
+# (the next session's design constraint): the switch arms'
+# park is a THREE-PARTY RENDEZVOUS (the caller's park, the
+# target's fire, the target's park-back) and every two-party
+# fix races the third. The spec solves it with ONE LOCK HELD
+# ACROSS THE WHOLE HANDOFF (the Handler.lock: resume
+# RELEASES cont.lock then ACQUIRES handler.lock; the
+# continuation's block() RELEASES handler.lock — the
+# switcher is by construction holding handler.lock between
+# decision and wait). THE NEXT ATTEMPT MUST DESIGN THE LOCK
+# OWNERSHIP FIRST: a dedicated switch-lock pair per handoff
+# (acquired by the switcher before arming, released only
+# inside the condition-wait, taken by the target's park-
+# back) — NOT iterating on mark/broadcast orderings. THE
+# MEASURED CONSTRAINT SET: no early-skip of the wait;
+# resume-later must NOT wake suspend-parks; the yield-park's
+# any-nudge wake AND the suspend-park's explicit-resume-only
+# wake BOTH required in the same arm. NOTE: the sticky-mark
+# layer may SIMPLIFY under the one-lock discipline (verify
+# which layers remain needed rather than assuming the mark
+# stays). THE FIXTURE RETURNS TO THE LANE (48 rows) IN THE
+# SAME GREEN COMMIT AS THE FIX. ----

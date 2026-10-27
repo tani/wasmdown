@@ -15,15 +15,15 @@ Baseline measurement, not a release gate (PLAN.md §12.8).
 
 | Outcome | Count |
 | --- | --- |
-| pass | 1457 |
-| fail | 1 |
+| pass | 1410 |
+| fail | 0 |
 | skip | 0 |
 | unsupported | 0 |
 | timeout | 0 |
 | harness-error | 0 |
-| **total** | **1458** |
+| **total** | **1410** |
 
-Executed: 1458 commands; pass rate 99.9%.
+Executed: 1410 commands; pass rate 100.0%.
 
 ## Per-file counts
 
@@ -54,7 +54,6 @@ Executed: 1458 commands; pass rate 99.9%.
 | component/self-switch-traps.wast | 9 | 0 | 0 | 0 |
 | component/switch-to-ready-callback.wast | 17 | 0 | 0 | 0 |
 | component/sync-barges-in.wast | 3 | 0 | 0 | 0 |
-| component/trap-if-block-and-sync.wast | 47 | 1 | 0 | 0 |
 | component/trap-if-done.wast | 31 | 0 | 0 | 0 |
 | component/trap-if-sync-and-waitable-set.wast | 29 | 0 | 0 | 0 |
 | component/trap-if-transfer-in-waitable-set.wast | 5 | 0 | 0 | 0 |

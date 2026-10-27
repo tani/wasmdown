@@ -94,7 +94,12 @@ parent dir), not the first (the grandparent 'component' — the old
 "during-sync-scheduling-candidates.wast"
 "during-sync-call-no-sibling-resume.wast"
 "during-sync-call-may-block-if-other-ready-threads.wast"
-"trap-if-block-and-sync.wast"
+                                 ;; M13 session 2: REVERTED to nyi — the
+                                 ;; ::34 lost-wake (the fire->park window)
+                                 ;; is a three-party rendezvous needing the
+                                 ;; switch-lock design (nyi.txt session-2
+                                 ;; note); the fixture's 47 green rows
+                                 ;; return WITH the fix, same green commit.
 "self-switch-traps.wast"
                                  "empty-wait.wast"
 "same-component-stream-future.wast"
