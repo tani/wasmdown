@@ -3637,8 +3637,14 @@ does not exist)."
     ;; §705: register_thread assigns the instance's next index
     (unless (async-thread-index th)
       (setf (async-thread-index th)
+            ;; M13-tok6 GATE 2: the LIVE-ONLY idx assignment — a
+            ;; stale :done record (a raced unregister window) must
+            ;; not inflate the max; the assignment skips dead marks
             (1+ (loop for t2 in (getf fields :threads)
-                      maximize (or (async-thread-index t2) 0)))))
+                      when (not (eq (async-thread-spawn-thunk t2)
+                                    :done))
+                        maximize (or (async-thread-index t2)
+                                     0)))))
     (setf (getf fields :threads)
           (cons th (getf fields :threads)))
     (sb-thread:with-recursive-lock (*scheduler-mutex*)
@@ -4877,15 +4883,42 @@ is the valtype."
                                    (setf (async-thread-spawn-thunk
                                           th)
                                          :done))
+                                 ;; M13-tok6 GATE 1: UNREGISTER —
+                                 ;; §4588's unregister_on_return: the
+                                 ;; thread leaves the instance's
+                                 ;; :threads list AND the scheduler
+                                 ;; (the :done mark alone kept the
+                                 ;; record resolvable-by-walk: the
+                                 ;; next test's resume-all nudged a
+                                 ;; finished thread, and §705's
+                                 ;; maximize-index counted it — the
+                                 ;; colliding idx 2 in the pin trace)
+                                 (let ((fields (%inst-async-fields
+                                                inst)))
+                                   (setf (getf fields :threads)
+                                         (remove th (getf fields
+                                                          :threads)
+                                                 :test #'eq)))
+                                 (sb-thread:with-recursive-lock
+                                     (*scheduler-mutex*)
+                                   (setf *scheduler-threads*
+                                         (remove th
+                                                 *scheduler-threads*
+                                                 :test #'eq)))
                                  (%async-thread-post-handoff th))
                              (wasmdown:wasm-trap () nil))))
                        :name "new-indirect-thread")))
               ;; §4591: register_thread (the instance's next
               ;; index assignment, the :threads list + scheduler)
               (setf (async-thread-index th)
+                    ;; M13-tok6 GATE 2: the live-only idx
+                    ;; assignment (see the enter gate's note)
                     (1+ (loop for t2 in (getf fields :threads)
-                              maximize (or (async-thread-index t2)
-                                           0))))
+                              when (not (eq (async-thread-spawn-thunk
+                                             t2)
+                                            :done))
+                                maximize (or (async-thread-index t2)
+                                             0))))
               (setf (getf fields :threads)
                     (cons th (getf fields :threads)))
               (sb-thread:with-recursive-lock (*scheduler-mutex*)

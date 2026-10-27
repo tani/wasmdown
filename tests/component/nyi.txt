@@ -703,3 +703,45 @@
 # assignment. (3) THEN re-land the quantum + the drain release +
 # the exit-posts (all proven individually) and re-run the lane: the
 # during-sync family's residual is the yield-restore race (3). ----
+# ---- M13-tok session 6 (2026-10-27): THE INTEGRATION GATES 1+2
+# LANDED (the pure wins) — the leak + the idx collision, both green
+# across all gates: units 410/0, lane 1466/0/0/0 x4, core 21187/0/73.
+# GATE 1 (THE LEAK): the new-indirect spawn thunk's exit marked
+# spawn-thunk :done + posted the handoff but NEVER UNREGISTERED —
+# the thread stayed in the instance's :threads list AND
+# *scheduler-threads* (the next test's resume-all nudged a finished
+# thread; §705's maximize-index counted it). The fix: the thunk's
+# unwind removes the thread from BOTH lists before the handoff
+# post (§4588's unregister_on_return). THE PIN TRACE (the proof):
+# the sync-lift pin's exit left threads-left=(2) — a stale idx-2
+# record; after the fix threads-left=NIL, and the suspend-vs-yield
+# determinism pin (which the leak poisoned via the idx collision)
+# is green again in the full units run.
+# GATE 2 (THE IDX): §705's (1+ (maximize index)) now counts LIVE
+# records only (a :done-marked stale entry cannot inflate the max)
+# — at BOTH assignment sites (the enter gate + the new-indirect
+# spawn).
+# GATE 3 (THE QUANTUM RE-LAND): BUILT AND MEASURED, NOT LANDED —
+# the quantum + the token block + the stamps + the grant-count
+# post (the tick's one quantum IS a real wake; the broadcast alone
+# has the lost-registration window) gives acs 14-20 green runs out
+# of 15-20 (vs the baseline's ~1-in-6) — BUT the during-sync
+# family regressed (candidates 8/21 fails: rows 10-12, the DRIVER
+# region; switch-to-ready-callback 2) and the lane went 1466 ->
+# 1453. THE DECODE (the tick traces): the terminal stall shows TWO
+# yield-parked threads — (2) and (1 RESOLVED) — the resolved task's
+# guest body is STILL in its callback loop parked at YIELD; the
+# resolution came from OUTSIDE its own flow (the outer task
+# resolved it), and the callback's next iteration needs the wset
+# event correlation to see the EXIT — the loop yields forever
+# waiting for an event the resolution path already fired into the
+# wset. THE NEXT SESSION'S PROBE: trace %wset-get-pending-event
+# against the resolved subtask's pending-event closure in the
+# driver region — the closure's (when resolved-p deliver) arm may
+# be skipping (the subtask's deliver state), or the callback's
+# WAIT arm parks on a wset whose event was consumed by the OTHER
+# waiter. The grant-count post and the resolved-skip-removal are
+# both in the measured build (the branch state is reproducible
+# from the ledger's description).
+# The during-sync sentinel holds at the landed state (the lane's
+# 1466 includes the family green). ----
