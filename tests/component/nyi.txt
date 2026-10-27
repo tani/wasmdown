@@ -1966,3 +1966,43 @@
 // known-flake single-fail in the batch) + units 410/0 at
 # HEAD; the tree = the ledger only.
 # ----
+# ---- M13-tok session 36 (2026-10-28): THE LIVE-TASK GATE
+# BUILT, MEASURED, AND REVERTED — the over-block found: the
+# fixture family pins BOTH admissions on the SAME visible
+# shape. The lane 1469/0 x3 + units 410/0 re-verified at the
+# revert; the tree = the ledger only.
+# THE MEASUREMENT (the live-task-in-flight rule at the gate):
+# acs went 0/5 GREEN to 2-fail-every-run (BOTH rows:
+# 'abandoned by store teardown' + 'deadlock detected') — the
+# gate over-blocked the CONCURRENT BLOCKING-CALLS: the four
+# $AsyncInner blocking-call tasks (the fixture's design: they
+# run CONCURRENTLY, the $counter 2..5) — the SECOND's gate
+# counted the FIRST's live record (yield-parked, its lock
+# released per §3470) and parked — the four serialized — the
+# unblock (called after all four) could never run — the
+# deadlock.
+# THE FINDING (the root decode refined): the acs::1 third-call
+# case and the concurrent-blocking-call case are the SAME
+# VISIBLE SHAPE (a live yield-parked sibling of the callee's
+# own instance, the lock free per §3470) — THE FIXTURES PIN
+# OPPOSITE GATES on it: the third sync-func must PARK (0x40)
+# while the second blocking-call must ADMIT. THE DISTINGUISHER
+# IS NOT THE LIVE COUNT. The remaining candidates: (a) the
+# SPEC's residual backpressure (source 3: the num_waiting
+# path — the third call is the FIRST waiter: not engaged);
+# (b) the DEPTH: the third sync-func is the CALLER'S SECOND
+# call to the SAME instance (the instance already SERVED one
+# call of this caller — the gate could count the CALLER's
+# prior subtasks of THIS instance — the (1 1) is the run's own
+# first subtask: the 'in-flight' is per-CALLER-per-INSTANCE,
+# not per-instance raw); (c) the fixture's own comment ('the
+# sync-call scheduling') — the SYNC-CALL context: the third
+# call happens INSIDE the run's callback-loop task (the
+# async-typed run) — the blocking-call callees are NESTED
+# (their callers are the sync-func tasks) — the depth/context
+// distinguishes.
+# THE STATE at the close: the live-task gate fully REVERTED;
+# the lane 1469/0 x3 + units 410/0 at HEAD; the acs::1 root
+// decode stands (the yield-park release window) with the
+// over-block evidence narrowing the fix space.
+# ----
