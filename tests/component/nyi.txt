@@ -1221,3 +1221,48 @@
 # THE STATE at the close: the probe reverted; the tree = the
 # ledger only.
 # ----
+# ---- M13-tok session 17 (2026-10-27): THE ON-START DEFERRAL
+# BUILT AND MEASURED — THE PACK HALF WORKS (the sync-streams
+# STARTING report achieved; the fixture's unreachable GONE)
+# but the deferral exposes the NEXT stall (a get-thread exit
+# that never completes + the set callee's gate-park behind
+# it). REVERTED at the budget's end; the lane 1469/0 (x3 +
+# 4 more, two known-flake single-fail runs in the batch — the
+# 30-run class at the sample floor) + units 410/0.
+# THE LANDED-THEN-REVERTED SHAPE (all at the task layer, the
+# pack flow untouched per the negative-result chain):
+# 1. TWO TASK SLOTS: deferred-args-p (the lower sets it when
+#    the callee's signature has ANY async-value param — the
+#    resolution needs (%abi-ct (cdr p) ft-inst): the params
+#    list's entries are (name . type) pairs, the raw p is NOT
+#    a ct — the first attempt's (ct-p p) never matched) +
+#    args-readable-p (the release flag).
+# 2. THE GUEST BODY's deferral wait: a marked task parks
+#    (sleep-loop until args-readable-p/abandoned) BEFORE the
+#    :started flip + the on-start call.
+# 3. THE CALLER's STARTED-wait gains the deferred-args exit
+#    (packing STARTING(0) without waiting for the callee's
+#    start).
+# 4. THE POST-PACK RELEASE: after the pack, the caller sets
+#    args-readable-p (the callee proceeds at its next turn).
+# THE MEASUREMENTS: the mark fires (marked=T for the set's
+# callee (1 2)); the pack passes (the run's STARTING check ✓
+# the 'unreachable' is GONE); the new failure is 'deadlock
+# detected' — the stall trace: the GET's callee (1 1)
+# resolved=T but ITS THREAD still registered + un-parked
+# (mid-exit, never completing — the $C exclusive lock still
+# held), the SET's callee (1 2) un-parked + unresolved (its
+# deferral wait never entered — the probe prints show the
+# DEFER-WAIT line never firing — it is stuck EARLIER: the
+# enter gate behind the get's unreleased lock), the RUN (1)
+# un-parked mid-write. THE NEXT SESSION'S PROBE: why the get's
+# thread's exit never completes under the deferral (the exit
+# path: the callback loop's return -> %task-exit-implicit-
+# thread -> the unregister + the lock release) — the (1 1)
+# mid-exit shape suggests the exit blocks on a mutex or the
+# thread was orphaned by the caller's changed timing (the
+# run's pack now exits EARLY — the drain that previously
+# granted the get's thread its final turn no longer runs).
+# THE STATE at the close: the deferral fully reverted; the
+# tree = the ledger only.
+# ----
