@@ -15,15 +15,15 @@ Baseline measurement, not a release gate (PLAN.md §12.8).
 
 | Outcome | Count |
 | --- | --- |
-| pass | 1446 |
+| pass | 1482 |
 | fail | 0 |
 | skip | 0 |
 | unsupported | 0 |
 | timeout | 0 |
 | harness-error | 0 |
-| **total** | **1446** |
+| **total** | **1482** |
 
-Executed: 1446 commands; pass rate 100.0%.
+Executed: 1482 commands; pass rate 100.0%.
 
 ## Per-file counts
 
@@ -34,7 +34,9 @@ Executed: 1446 commands; pass rate 100.0%.
 | component/cancel-and-exclusive-lock.wast | 2 | 0 | 0 | 0 |
 | component/cancel-delivery.wast | 4 | 0 | 0 | 0 |
 | component/cancel-not-delivered.wast | 2 | 0 | 0 | 0 |
+| component/cancel-resumed-callback-switch.wast | 4 | 0 | 0 | 0 |
 | component/cancel-stream.wast | 15 | 0 | 0 | 0 |
+| component/cancel-subtask.wast | 4 | 0 | 0 | 0 |
 | component/closed-stream.wast | 3 | 0 | 0 | 0 |
 | component/cross-abi-calls.wast | 49 | 0 | 0 | 0 |
 | component/cross-task-future.wast | 2 | 0 | 0 | 0 |
@@ -52,6 +54,8 @@ Executed: 1446 commands; pass rate 100.0%.
 | component/future-completion-order.wast | 5 | 0 | 0 | 0 |
 | component/futures-must-write.wast | 14 | 0 | 0 | 0 |
 | component/idle-drop.wast | 38 | 0 | 0 | 0 |
+| component/passing-resources.wast | 3 | 0 | 0 | 0 |
+| component/reentrance.wast | 25 | 0 | 0 | 0 |
 | component/same-component-stream-future.wast | 9 | 0 | 0 | 0 |
 | component/self-switch-traps.wast | 9 | 0 | 0 | 0 |
 | component/sync-barges-in.wast | 3 | 0 | 0 | 0 |
