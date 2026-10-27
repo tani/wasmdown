@@ -10,8 +10,6 @@
 ./async/passing-resources.wast
 ./async/reentrance.wast
 ./async/sync-streams.wast
-./async/cancel-not-delivered.wast
-./async/switch-to-ready-callback.wast
 ./async/async-calls-sync.wast
 # ---- M12 session 12 (2026-10-27): THE ATOMIC EXIT LANDED (a
 # strictly-safer read) — the flake class did NOT collapse; THE
@@ -978,3 +976,39 @@
 # cancel-targeted-resume, cancel-resumed-callback-switch,
 # partial-stream-copies, passing-resources,
 # big-interleaving-test's last 3, trap-if-block 34. ----
+# ---- M13-tok session 11 (2026-10-27): THE FLAKE-CLASS SESSION
+# — the resolve-stash window found, fixed, and BOTH parked
+# fixtures un-parked: the lane 1466/0/0/0 (the parked
+# denominator RESTORED), units 410/0, core 21187/0/73.
+# THE ROOT (cancel-not-delivered's ~29% at the adjudication;
+# 6/40 in the in-image capture loop): THE RESOLVE-STASH WINDOW
+# in the async lower's on-resolve trap arm — the old order was
+# (%subtask-resolve subtask 2 nil) THEN (setf flat-results val):
+# the caller's wset delivery could observe the RESOLVED subtask
+# with the flat-results still NIL (the rider missing) — the
+# delivery closure's :trap check missed, the SUBTASK event
+# delivered, the caller continued to 42, and the assert_trap
+# failed with 'expected a trap but the action returned'. The
+# trap DID fire (the capture loop's CANCEL hook printed
+# state=:PENDING-CANCEL on every failing run) — the trap was
+# SWALLOWED at the delivery boundary, never missed.
+# THE FIX'S OWN TRAP: the stash-FIRST shape inverted it (8/8
+# fails — %subtask-resolve's flat-results param OVERWRITES the
+# slot, clobbering the stash — the comment's own warning was
+# right). THE LANDED SHAPE: (%subtask-resolve subtask 2 val) —
+# ONE ATOMIC call sets the state AND the rider — no window.
+# MEASURED: the capture loop 0/40 TWICE, the 10-run FAILROW
+# probe 10/10, the lane 1466/0 x3 + 7 more green (10
+# consecutive), units 410/0, core unchanged.
+# THE SECOND CLASS (switch-to-ready-callback's ~11%): the same
+# fix shrank it to 1-in-30 (row 8's leftover-interleave window,
+# the session-9 teardown's residual); the 10-run FAILROW probe
+# 10/10 — un-parked with the residual recorded honestly.
+# THE THIRD (no-sibling-resume's unknown-thread-index-2): the
+# 10-run probe 10/10 at this build — the row did NOT recur;
+# its 1/28 was the quantum-only appearance — recorded as
+# below-the-sample now.
+# THE UN-PARKS (the whitelist's both sides, per the acs
+# landing's mechanism): cancel-not-delivered + switch-to-ready-
+# callback — the lane denominator back to 1466.
+# ----

@@ -5702,15 +5702,30 @@ is the valtype."
                               ((and (consp val) (eq (car val) :trap))
                                ;; the callee TRAPPED: resolve the
                                ;; subtask; the trap rides flat-
-                               ;; results (stashed AFTER the resolve
-                               ;; — %subtask-resolve overwrites
-                               ;; the slot) and re-signs at the
-                               ;; caller's DELIVERY boundary
+                               ;; results and re-signs at the
+                               ;; caller's DELIVERY boundary.
+                               ;; M13-tok10 THE RESOLVE-STASH
+                               ;; WINDOW (cancel-not-delivered's
+                               ;; ~15% flake, 6/40 in the capture
+                               ;; loop): the OLD order (resolve(2
+                               ;; nil) THEN stash the :trap) left a
+                               ;; window where the caller's wset
+                               ;; delivery observed the resolved
+                               ;; subtask with the flat-results
+                               ;; still NIL — the closure's :trap
+                               ;; check missed, the SUBTASK event
+                               ;; delivered, the caller continued
+                               ;; to 42 and the assert_trap failed
+                               ;; with 'the action returned'. The
+                               ;; stash-first shape INVERTED it
+                               ;; (%subtask-resolve's flat-results
+                               ;; overwrite clobbered the stash —
+                               ;; the trap always lost). THE FIX:
+                               ;; resolve WITH the trap — one
+                               ;; atomic call sets the state AND
+                               ;; the flat-results — no window.
                                (setf resolved-val val)
-                               (%subtask-resolve subtask 2 nil)
-                               (setf (async-subtask-flat-results
-                                      subtask)
-                                     val))
+                               (%subtask-resolve subtask 2 val))
                               ((eq val :cancelled)
                                (setf resolved-state
                                      (if (= (async-subtask-state

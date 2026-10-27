@@ -85,6 +85,20 @@ parent dir), not the first (the grandparent 'component' — the old
                                  "drop-stream.wast"
                                  "cancel-stream.wast"
                                  "cancel-and-exclusive-lock.wast"
+                                 ;; M13-tok10 (the flake-class
+                                 ;; fixes): cancel-not-delivered —
+                                 ;; THE RESOLVE-STASH WINDOW (the
+                                 ;; trap rode flat-results stashed
+                                 ;; AFTER %subtask-resolve; the
+                                 ;; caller's wset delivery could
+                                 ;; observe the resolved subtask
+                                 ;; with the rider missing — the
+                                 ;; SUBTASK event delivered, the
+                                 ;; caller continued, the
+                                 ;; assert_trap failed with 'the
+                                 ;; action returned'; ~15% then,
+                                 ;; 0/40 in the capture loop + the
+                                 ;; 10-run FAILROW probe now).
                                  "cancel-not-delivered.wast"
                                  "zero-length.wast"
                                  "wait-during-callback.wast"
@@ -110,6 +124,13 @@ parent dir), not the first (the grandparent 'component' — the old
                                  "futures-must-write.wast"
                                  "cancel-delivery.wast"
                                  "idle-drop.wast"
+                                 ;; M13-tok10 (the flake-class
+                                 ;; fixes): switch-to-ready-
+                                 ;; callback — the resolve-stash
+                                 ;; fix shrank its ~11% to
+                                 ;; 1-in-30 (row 8's leftover-
+                                 ;; interleave window); the 10-run
+                                 ;; FAILROW probe 10/10.
                                  "switch-to-ready-callback.wast"
                                  "sync-barges-in.wast"
                                  "drop-cross-task-borrow.wast"
