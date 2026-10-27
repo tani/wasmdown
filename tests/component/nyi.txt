@@ -82,11 +82,47 @@
 # cancel-delivery/cancel-not-delivered/cancel-and-exclusive-lock/
 # async-calls-sync/during-sync-scheduling-candidates ALL 5/5 —
 # ZERO regressions from the six-part change.
-# THE ::7/::9 RESIDUAL: the worker (ready via its future's event)
-# still takes its turn inside the cancel's window — resolve(2)
-# before req-done; the four-site deferral + block-first did not
-# close it. THE NEXT PROBE: the broadcast hook on the worker's
-# thread waitqueue (the waker's identity — one probe).
+# THE ::7/::9 RESIDUAL — DECODED (the waker probe, the follow-on
+# session; the runtime REVERTED to 2da9f1d — the two candidate
+# fixes measured and both rejected):
+# THE TRACE (the decisive probe — %async-thread-wake + resume
+# hooks with task paths): :REQ -> (:RESUME (1 2)) [park's thread]
+# -> (:RESOLVE 4) [park cancelled] -> (:RESOLVE 2) [the WORKER] —
+# NO :wake/:resume of the worker inside the window: THE WORKER IS
+# MID-TURN, not parked. The caller's future.write (BEFORE the
+# window) unblocked the worker's future.read end-wait; the
+# worker's OS thread then CONTINUES UNSUPERVISED (the end-copy ->
+# the core returns WAIT -> the loop-top -> the FUTURE_READ event
+# -> the callback's task.return) — completing inside the cancel's
+# window with NO grant. The fixture pins the worker's turn at the
+# caller's NEXT BLOCKING OP (the row's final wset.wait).
+# THE TWO MEASURED CANDIDATES (both REVERTED):
+# (1) THE ARM-TIME DRAIN (the M13-tok34 inter-round pattern at
+#     the wset park's entry: drain the leaked count — the write's
+#     durable count posted into the inter-park gap — then one
+#     condition-wait): row 7 'unreachable' 3/4 + PASS 1/4 — the
+#     worker STILL resolved in the window (a broadcast inside the
+#     window returns the single wait; the wait-until's entry test
+#     passes on the ready event).
+# (2) THE REAL-WAKE LOOP (wait until a NEW count arrives —
+#     closing the spurious-wakeup fall-through): DEADLOCK 4/4 —
+#     the caller's own wset.wait's resume-all is a BROADCAST, not
+#     a count; the loop re-waits and the row's final wait starves
+#     (the resume-all is the ONLY waker at the row's end).
+# THE NEXT SHAPE (recorded for the next session): the fix must
+# distinguish the CALLER'S OWN BLOCKING-OP TICK (a broadcast that
+# SHOULD return the park) from the WINDOW's incidental broadcasts
+# (which should NOT) — e.g. a per-park "granted" flag set by the
+# caller's blocking ops (the wait/poll builtins' own resume-all
+# marks the parked callback tasks of THEIR instance), or the
+# worker's turn-boundary itself: the callback loop's post-wait
+# iteration checks a grant flag rather than running on the OS
+# thread's own continuation. THE SPEC'S OWN SHAPE: the reference's
+# worker is a SEPARATE NATIVE THREAD too — the difference is the
+# reference's turn model: after the end-copy completes, the
+# worker's continuation is granted by Store.tick (§932), and the
+# CALLER does not tick until it blocks; our OS-thread continuation
+# has no grant gate at the callback-loop boundary.
 # THE FULL GATES AT THE SIX-PART CHANGE: units 411/0; the lane
 # 1482/0 + 1482/0 + 1481/1 (the one fail acs::1 — THE ACCEPTED
 # RATE's own ~8-10%, the M13 close-out's recorded release-race
