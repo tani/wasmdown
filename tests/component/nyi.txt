@@ -1597,3 +1597,52 @@
 # convention is the remaining gate — one decision, not a
 # probe.
 # ----
+# ---- M13-tok session 25 (2026-10-28): THE ONE-GATE LANDING
+# SPLIT BY THE FIXTURES' OWN SHAPES — the two fixtures' call
+# chains read (the ground truth); the pieces measured
+# separately; PIECES 1+2 LANDED (the own-transfer works
+# end-to-end; the lane 1469/0 with the known flake class), the
+# BORROW-VALUE CONVENTION (piece 3) held as the parent's
+# decision.
+# THE FIXTURES' CHAINS (read per the parent's order):
+# 1. passing-resources' R.foo: the consumer lowers the borrow
+#    (the M13-lad BI at ft-inst) -> the producer's lift -> the
+#    CORE uses the value DIRECTLY ('(i32.add rep 50)') — the
+#    fixture pins THE REP positionally.
+# 2. drop-cross-task-borrow's dont-drop: the callee STASHES the
+#    param + calls R-rep (a component-level borrow call — the
+#    lower derefs the value against $D's table = the BI's
+#    home ✓ either way) AND R-drop (THE RESOURCE BUILTIN —
+#    index-taking, $D-local) — the fixture pins THE INDEX (the
+#    BI) for the builtin's shape.
+# THE IMPASSE (measured): piece 3 (the lift's value = the REP
+# per §2412) makes R.foo pass (the transfer + the rep flow
+# work) but BREAKS drop-cross-task-borrow's R-drop (the REP
+# value misses the $D-local slot); the BI makes drop-cross-task
+# pass but R.foo receive 5 (the observed 55). The two fixtures'
+# CALLEE CORES genuinely consume the value differently — the
+# convention is not a probe away, it is a DESIGN DECISION: (a)
+# the spec's REP + the ops' lenders-walk resolution (the
+# parent's candidate); (b) the BI + the R.foo-class fixtures'
+# re-read (the spec's own §3691 has the callee-side borrow
+# handle too — the two-value reading).
+# THE LANDED PIECES (in the tree):
+# - PIECE 1: the stream-new canon's element single-resolution
+#   (the raw (:idx . k) payload resolved once — the end's t-ct
+#   IS the element ct).
+# - PIECE 2: the take/put own-transfer (the %own-elem-take
+#   helper + the writer-side remove + the dest re-add) — the
+#   resource crosses WITH its rep (measured:
+#   (:OWNTAKE (:OWN-HANDLE R-ct 50)) + the consumer's slot 2
+#   (:RESOURCE 50)).
+# THE MEASUREMENTS at 1+2: the lane 1469/0 x3 + the 10-run
+# FAILROW probe 8/10 GREEN (the 2 fails are the KNOWN flake
+# class: acs::1 + switch-to-ready::8 once, no-sibling-resume::2
+# once, acs::1 once — the 30-run floor class, NOT the
+# transfer); units 410/0; core 21187/0/73. drop-cross-task-
+# borrow 0 fails (its shape unchanged).
+# THE STATE at the close: the tree = pieces 1+2 (the pure
+# wins); piece 3 awaits the parent's adjudication between (a)
+# and (b). passing-resources stays nyi'd — the convention is
+# the last gate.
+# ----

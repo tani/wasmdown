@@ -3225,6 +3225,22 @@ trap at construction; zero-length buffers skip them."
 
 (defun %buffer-progress (buf) (fourth buf))
 
+(defun %own-elem-take (cx ptr t-ct inst)
+  "M13-tok25: the OWN-typed stream element's SOURCE-side transfer
+at the copy boundary — the raw handle index at PTR is REMOVED from
+the SOURCE instance's table (type-checked against the own's
+resource type) and the abstract (:own-handle rt rep) record is
+returned; the %buffer-put re-adds at the dest. A failed remove
+(the guard traps, a stale index) falls back to the raw index."
+  (let* ((idx (%abi-load-int cx ptr 4))
+         (rt (and (integerp (wasmdown.component:ct-payload t-ct))
+                  (< (wasmdown.component:ct-payload t-ct)
+                     (length (comp-instance-types inst)))
+                  (aref (comp-instance-types inst)
+                        (wasmdown.component:ct-payload t-ct))))
+         (h (and rt (ignore-errors (%handle-remove inst rt idx)))))
+    (if h (list :own-handle rt (cdar h)) idx)))
+
 (defun %buffer-take (buf n t-ct inst)
   "ReadableGuestBuffer.read(n) (§1567-1575): load N elements from
 the buffer's memory at its advancing ptr; returns the values list
@@ -3238,9 +3254,24 @@ and advances the buffer's progress."
          (vals nil))
     (if t-ct
         (when (plusp n)
-          (let ((cx (make-abi-cx :memory memory :inst inst)))
+          ;; M13-tok25 THE OWN-TRANSFER AT THE COPY BOUNDARY: an
+          ;; OWN-typed element (a (stream (own $R))'s resource)
+          ;; would load as the RAW handle index by %abi-load's
+          ;; default arm — the M9 own-transfer (the handle LEAVES
+          ;; the source table, the rep rides) and the M10 buffer
+          ;; met HERE and the buffer carried the bare index
+          ;; (passing-resources' 'NIL is not of type REAL'). The
+          ;; take performs the SOURCE-side transfer; the put
+          ;; re-adds.
+          (let ((cx (make-abi-cx :memory memory :inst inst))
+                (own-p (and (wasmdown.component:ct-p t-ct)
+                            (eq (wasmdown.component:ct-kind t-ct)
+                                :own))))
             (dotimes (i n)
-              (push (%abi-load cx t-ct ptr) vals)
+              (push (if own-p
+                        (%own-elem-take cx ptr t-ct inst)
+                        (%abi-load cx t-ct ptr))
+                    vals)
               (incf ptr (or elem-size 1)))))
         ;; an EMPTY element type (§1567): n logical values, each
         ;; zero bytes — the COUNT drives the progress (forward's
@@ -3263,8 +3294,17 @@ progress by the count."
          (ptr (+ (second buf) (* (fourth buf) (or elem-size 1)))))
     (when (and t-ct vals)
       (let ((cx (make-abi-cx :memory memory :inst inst)))
+        ;; M13-tok25 THE OWN-TRANSFER'S DEST HALF: an
+        ;; (:own-handle rt rep) element (the take's source-side
+        ;; transfer) is RE-ADDED into THIS instance's table and
+        ;; the new index stored — the consumer's core then holds
+        ;; a live handle whose rep survives.
         (dolist (v vals)
-          (%abi-store cx v t-ct ptr)
+          (if (and (consp v) (eq (car v) :own-handle))
+              (%abi-store-int cx (%handle-add inst (second v)
+                                              (third v) t)
+                              ptr 4)
+              (%abi-store cx v t-ct ptr))
           (incf ptr (or elem-size 1)))))
     (incf (fourth buf) n)))
 
@@ -3321,7 +3361,11 @@ the (memory ptr length progress) list. The 5 cases in order:
             ;; the peer's (writable-side staged) buffer, store into
             ;; mine — the values move peer -> me
             (let* ((peer (async-end-buffer other))
-                   (vals (%buffer-take peer n t-ct inst)))
+                   ;; M13-tok25 THE OWN REMOVE'S SIDE: the
+                   ;; element's handle lives in the WRITER's
+                   ;; table — the transfer removes it THERE.
+                   (vals (%buffer-take peer n t-ct
+                                       (async-end-owner other))))
               (%buffer-put buffer vals t-ct inst))
             ;; the WRITER's buffer is the SOURCE: load n from mine,
             ;; store into the peer's writable buffer — me -> peer
@@ -4816,7 +4860,26 @@ is the valtype."
                           (length (comp-instance-types inst)))
                        (aref (comp-instance-types inst)
                              (second imms))))
-            (elem (and t-ct (wasmdown.component:ct-payload t-ct)))
+            ;; M13-tok25 THE ELEMENT'S SINGLE RESOLUTION: the
+            ;; stream ct's payload is the element's RAW REF (an
+            ;; (:idx . k) to the INTERNED element ct — passing-
+            ;; resources' (stream (own $R)): the OWN ct sits at
+            ;; that idx, its own-ness INTACT in the type space);
+            ;; the OLD shape passed the raw ref to the pair and
+            ;; every consumer re-resolved — the take one level
+            ;; too far (the resource). Resolve ONCE here: the
+            ;; end's t-ct IS the element ct.
+            (elem (and t-ct
+                       (wasmdown.component:ct-p t-ct)
+                       (let ((raw (wasmdown.component:ct-payload t-ct)))
+                         (or (and (consp raw)
+                                  (eq (car raw) :idx)
+                                  (integerp (cdr raw))
+                                  (< (cdr raw)
+                                     (length (comp-instance-types inst)))
+                                  (aref (comp-instance-types inst)
+                                        (cdr raw)))
+                             raw))))
             (future-p (eq kind :future-new)))
        ;; the element ct: (stream $t?)'s payload — NIL for the
        ;; empty (stream) form (§4251)
@@ -5646,6 +5709,13 @@ is the valtype."
                                           ;; the upstream shape our
                                           ;; 5337 diverged from). The
                                           ;; rep still derefs from the
+                                          ;; LOWERING CALLER's table
+                                          ;; (INST — the source handle
+                                          ;; lives there); the task's
+                                          ;; num-borrows counts the
+                                          ;; lend (§2838) until the
+                                          ;; subtask's resolution
+                                          ;; The rep still derefs from the
                                           ;; LOWERING CALLER's table
                                           ;; (INST — the source handle
                                           ;; lives there); the task's
