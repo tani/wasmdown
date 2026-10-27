@@ -4938,15 +4938,31 @@ is the valtype."
                             t))
                   (unwind-protect
                        (progn
-                         ;; ARM-TIME CLEAR: a count surviving from a
-                         ;; previous round is stale — this park's
-                         ;; honored counts can only originate from
-                         ;; THIS round (the fire happens after the
-                         ;; clear, under this mutex; the parks clear
-                         ;; their own counts on exit, so anything
-                         ;; here predates this arm)
-                         (setf (async-thread-wake-count *current-thread*)
-                               0)
+                         ;; M13-9 NO ARM-TIME CLEAR + WAIT-THEN-CHECK:
+                         ;; a count present here arrived while we
+                         ;; were RUNNING — a REAL wake (the target's
+                         ;; exit-post landing between an earlier
+                         ;; fire and this arm; the parks clear their
+                         ;; own counts on exit, so a surviving count
+                         ;; is fresh). The clear was the lost-
+                         ;; handoff killer: it wiped an exit-post
+                         ;; that had already fired, and the park then
+                         ;; waited on a body that would never post
+                         ;; again — the SYNC-LIFT oracle fired
+                         ;; (::34's ~20% residual, 7/30 all
+                         ;; SYNC-LIFT). The loop WAITS FIRST and
+                         ;; checks AFTER (no entry check): the pre-set
+                         ;; count is absorbed by the first wait's
+                         ;; wake check — the round BARRIER holds (the
+                         ;; caller still hands the CPU over once;
+                         ;; the immediate-return-on-entry shape was
+                         ;; session-5's 5/20 regression, a different
+                         ;; change). A spurious wake loops (the
+                         ;; check re-tests on every wake): the
+                         ;; durable count is the suspend pair's only
+                         ;; exit (§494 — the drain's nudges are
+                         ;; ignored BY DESIGN), any wake the yield
+                         ;; pair's (§536).
                          (when resumable-target
                            ;; §242-273: BOTH pairs switch — the
                            ;; then-resume pair unconditionally
@@ -4959,30 +4975,9 @@ is the valtype."
                            ;; resume's locked section: atomic against
                            ;; the target's own handoff claim, no lock
                            ;; cycle (the far-side wake is mutex-free).
-                           ;; The target's spawn may already have been
-                           ;; CLAIMED by an earlier tick (a
-                           ;; ready-marked spawn claimed between the
-                           ;; marker's resume-later and this switch —
-                           ;; the worker fires asynchronously; without
-                           ;; the handoff the caller's any-nudge
-                           ;; yield-park returned BEFORE the worker's
-                           ;; body ran, scheduling-candidates'
-                           ;; worker-ran check trapped).
                            (async-thread-resume resumable-target
                                                 *current-thread*))
-                         ;; the park: the SUSPEND pair consumes the
-                         ;; DURABLE count ONLY (§494: a bare nudge
-                         ;; must not un-suspend); the YIELD pair
-                         ;; returns on ANY wake (§536: ready)
                          (loop
-                           (when (and (not yield-p)
-                                      (> (async-thread-wake-count
-                                          *current-thread*)
-                                         0))
-                             (setf (async-thread-wake-count
-                                    *current-thread*)
-                                   0)
-                             (return))
                            (sb-thread:condition-wait
                             (if yield-p
                                 (async-thread-waitqueue *current-thread*)
@@ -4998,14 +4993,14 @@ is the valtype."
                              (setf (async-thread-wake-count
                                     *current-thread*)
                                    0)
-                             (return)))))
+                             (return))))
                     (if yield-p
                         (setf (async-thread-yield-parked *current-thread*)
                               nil)
                         (setf (async-thread-suspended-p *current-thread*)
                               nil))
                     (setf (async-thread-wake-count *current-thread*)
-                          0))))
+                          0)))))
             (list 0))))))
     ;; the still-opaque kinds: the slot exists, the call traps
     ((:thread-new-indirect
