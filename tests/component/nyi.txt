@@ -1126,3 +1126,54 @@
 # THE STATE at the close: the probe reverted (the lane 1469/0
 # x3 + units 410/0 re-verified); the tree = the ledger only.
 # ----
+# ---- M13-tok session 15 (2026-10-27): THE SYNC-STREAMS ROOT
+# IS THE STARTED-WAIT ITSELF — the spec reading resolves the
+# packed-state contradiction. The session's chain:
+# 1. THE STALE-EVENT CANDIDATE IS DEAD: the notify/getevent
+#    trace shows the FIRST round's notifies/gets are all
+#    correct (the reader's (2 1 64), the writer's (3 2 65))
+#    and THE SET'S READ NEVER GETS AN EVENT (its getevent
+#    never logs — the read is still blocked awaiting the
+#    write). No stale event, no wrong-end notify.
+# 2. THE INTERP BACKTRACE + THE PACKED PROBE: the unreachable
+#    is THE RUN'S OWN (i32.ne 0 STARTING (and ret 0xf)) CHECK
+#    on the set call's packed return — the operand stack
+#    carries the run's own second stream.new pair — and the
+#    packed probe prints state=1 (STARTED): OUR STARTED-WAIT
+#    (the M12 addition) waits for the callee's STARTING->
+#    STARTED transition, so the packed return always reports
+#    STARTED once the callee's core began (the set's callee's
+#    first op — the sync stream.read — blocked, i.e. the core
+#    is mid-execution).
+# 3. THE SPEC READING (§3693-3720): the reference's async-
+#    lowered call returns [subtask.state | (subtaski << 4)]
+#    DIRECTLY — NO STARTED-WAIT AT ALL. The STARTING/STARTED
+#    bits are a RACE the spec leaves to the embedder; STARTING
+#    tells the caller to keep the ARG memory (the on_start has
+#    not read it), STARTED says the args were read. THE
+#    FIXTURE PINS STARTING(0) — the reference's timing (the
+#    callee's thread not yet granted at the read); OUR
+#    STARTED-WAIT pins the other side of the same race.
+# THE DESIGN QUESTION FOR THE NEXT SESSION: the acs fixture's
+# 0x21/0x31 checks pin STARTED (the M12 record: 'the fixtures
+# REQUIRE STARTED when the callee actually got started') — two
+# fixtures pin OPPOSITE sides of the spec's own race. The
+# reconciling shape per the spec's own text: the report is
+# about the ARGS' memory (on_start read or not) — the acs's
+# callees' on_start ran (the observable host call) before the
+# caller's read; the sync-streams' set callee's on_start (the
+# rx param's lift) may be DEFERRED — the interleave the
+# fixtures pin is the embedder's choice of WHEN the callee's
+# first turn happens relative to the caller's packed read: the
+# sync-call scheduling (the spec's §464-472 sync-call shape)
+# vs the async lower's non-yielding return. THE CANDIDATE
+# SHAPE: the STARTED-wait's exit prefers the GATE-PARKED
+# (STARTING) when the callee's task parked at the BACKPRESSURE
+# gate (the callee was NOT granted its first turn) and
+# STARTED only when the callee's core actually entered — the
+# acs's callees enter (no backpressure at their call); the
+# sync-streams' set callee — the gate at its call — probe
+# whether it gate-parks at this build.
+# THE STATE at the close: the probe reverted; the lane 1469/0
+# x3 + units 410/0 re-verified; the tree = the ledger only.
+# ----
