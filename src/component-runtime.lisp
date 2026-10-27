@@ -5102,6 +5102,68 @@ is the valtype."
                                           (nth ai args))
                                          vals)
                                    (incf ai))
+                                  ;; M13-LADDER §2406 lift_borrow: the
+                                  ;; (borrow $R) param's i32 is an index
+                                  ;; in the LOWERING CALLER's table
+                                  ;; (INST — the same table the sync
+                                  ;; path's own-transfer consumes from,
+                                  ;; lifted-func-call 2130): resolve it,
+                                  ;; LEND (record the lender on the
+                                  ;; subtask, §1446: the handle's
+                                  ;; num-lends guards the source against
+                                  ;; a premature drop; the count
+                                  ;; decrements at the subtask's
+                                  ;; deliver_resolve), and pass the REP
+                                  ;; to the callee (§2412: lift_borrow
+                                  ;; returns h.rep — the raw INDEX was
+                                  ;; the M11b gap: dont-drop's core
+                                  ;; stashed it and its later R-rep/
+                                  ;; R-drop at that index hit the
+                                  ;; waitable-set the callee's own
+                                  ;; waitable-set.new allocated at the
+                                  ;; same slot — drop-cross-task-borrow
+                                  ;; ::2/::4's wrong-resource-type)
+                                  ((and (wasmdown.component:ct-p c)
+                                        (eq (wasmdown.component:ct-kind c)
+                                            :borrow)
+                                        (integerp
+                                         (wasmdown.component:ct-payload c))
+                                        (< (wasmdown.component:ct-payload c)
+                                           (length
+                                            (comp-instance-types ft-inst))))
+                                   (let* ((rt-idx
+                                            (wasmdown.component:ct-payload
+                                             c))
+                                          (rt (aref
+                                               (comp-instance-types ft-inst)
+                                               rt-idx))
+                                          ;; §2834 lower_borrow (the
+                                          ;; non-implementor case): the
+                                          ;; BORROW HANDLE is added to
+                                          ;; the LOWERING CALLER's table
+                                          ;; (a second entry, own=false,
+                                          ;; for the same rep — the
+                                          ;; callee's core gets ITS
+                                          ;; index; the callee's R-rep/
+                                          ;; R-drop resolve against the
+                                          ;; caller's table via their own
+                                          ;; lower's cx.inst) and the
+                                          ;; task's num-borrows counts
+                                          ;; it (§2838) until the
+                                          ;; subtask's resolution
+                                          (rep (%handle-rep inst rt
+                                                            (nth ai args)))
+                                          (bi (and rep
+                                                   (%handle-add inst rt
+                                                                rep nil))))
+                                     (when bi
+                                       ;; the task's borrow count (§2838):
+                                       ;; the subtask holds the lent
+                                       ;; handle until it resolves
+                                       (incf (async-task-num-borrows
+                                              *current-task*)))
+                                     (push bi vals)
+                                     (incf ai)))
                                   (t
                                    (let* ((pflat (%flat-type-of vt
                                                                 ft-inst))
