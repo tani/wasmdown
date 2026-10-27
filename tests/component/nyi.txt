@@ -149,7 +149,43 @@
 # reentrance::14, both recorded at their bands); THE 10-RUN
 # FAILROW PROBE 10/10 GREEN — the drift rows did NOT appear in
 # any run (the granted park's holding may have cooled them;
-# re-watch at the next build).# THE NEXT SHAPE (recorded for the next session): the fix must
+# re-watch at the next build).# THE ::7 RESIDUAL'S TWO-HALVES GATE (the follow-on session;
+# MEASURED AND REVERTED — three parts, all spec-shaped on paper,
+# all NET NEGATIVE):
+# (1) THE SYNC-BLOCK EXCLUSIVE RELEASE (§3483's pattern at
+#     %wset-wait: release/restore the instance's exclusive for
+#     the blocking wait's duration when the caller's task holds
+#     it) — REGRESSED cancel-and-exclusive-lock ::1 5/5 (that
+#     fixture pins the cancellation NOT delivered while the
+#     exclusive is held — the release admitted it).
+# (2) THE CANCEL-WAIT WINDOW'S GRANT SUPPRESSION (resume-all's
+#     grants skip while *defer-resume-all*) + (3) THE ARM-TIME
+#     GRANT CLEAR (the stale pre-window grant cleared at the
+#     park's arm) — REGRESSED async-calls-sync ::2 (a NEW row)
+#     and cancel-targeted-resume ::5 (a previously green row);
+#     the granted park's holding depends on the pre-window ticks
+#     for the DURING-SYNC family's own interleave.
+# THE PARK-FLAG SNAPSHOT PROBE (the decisive data): both parks
+# (the worker + park) ENTER with granted=NIL count=0 and RETURN —
+# the grant posted between the arm and the wake is the OUTER
+# INVOKE DRAIN's ~2ms tick (the run task's own %canon-lift-async
+# drain ticks the world while the run's core executes inside the
+# cancel builtin).
+# THE ARCHITECTURAL DECODE (the recorded design input): the
+# REFERENCE's sync-ABI task runs INLINE on the caller's thread —
+# no concurrent drain ticks it; OUR sync-ABI task runs on an
+# EXECUTOR thread with the outer drain ticking on the main
+# thread — the worker's granted turn arrives inside the cancel's
+# window through no fault of the grant model. THE NEXT DESIGN
+# (beyond a one-gate patch): either the sync-ABI executor's
+# drain defers grants for the callee instance's OTHER tasks while
+# an exclusive-holding task's core is mid-call (a per-instance
+# drain gate), or the worker's readiness gains the RUN's
+# exclusive (the cross-instance hold — the fixture's own comment
+# 'cannot happen while the exclusive lock is held' suggests the
+# reference's cancellation gate reads the CALLER's hold).
+# THE TREE: reverted to b3c38c1 (the granted-park gate); the
+# measurements above are the gate's negative-result record.# THE NEXT SHAPE (recorded for the next session): the fix must
 # distinguish the CALLER'S OWN BLOCKING-OP TICK (a broadcast that
 # SHOULD return the park) from the WINDOW's incidental broadcasts
 # (which should NOT) — e.g. a per-park "granted" flag set by the
