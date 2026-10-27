@@ -106,7 +106,6 @@ parent dir), not the first (the grandparent 'component' — the old
 "forward.wast"
 "during-sync-call-exclusive-resume.wast"
 "during-sync-scheduling-candidates.wast"
-"during-sync-call-no-sibling-resume.wast"
 "during-sync-call-may-block-if-other-ready-threads.wast"
                                  ;; M13 session 2: REVERTED to nyi — the
                                  ;; ::34 lost-wake (the fire->park window)
@@ -127,12 +126,17 @@ parent dir), not the first (the grandparent 'component' — the old
                                  ;; M13-tok10 (the flake-class
                                  ;; fixes): switch-to-ready-
                                  ;; callback — the resolve-stash
-                                 ;; fix shrank its ~11% to
-                                 ;; 1-in-30 (row 8's leftover-
-                                 ;; interleave window); the 10-run
-                                 ;; FAILROW probe 10/10.
-                                 "switch-to-ready-callback.wast"
                                  "sync-barges-in.wast"
+                                 ;; M13-tok38 (the close-out's
+                                 ;; un-park): passing-resources —
+                                 ;; the own-transfer chain's
+                                 ;; fixture (the resource crosses
+                                 ;; the stream with its rep; the
+                                 ;; borrow crosses the call; the
+                                 ;; builtin drops through the
+                                 ;; borrowed record): 10/10
+                                 ;; standalone + the lane green.
+                                 "passing-resources.wast"
                                  "drop-cross-task-borrow.wast"
                                  ;; M13-tok11 (the family ladder):
                                  ;; async-calls-sync — the acs

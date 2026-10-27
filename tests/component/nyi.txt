@@ -1,4 +1,32 @@
 # See README.md
+# M13-tok38 THE ACCEPTED RATE (the fallback call): async-calls-
+# sync (3 rows) STAYS IN THE LANE with its recorded ~8-10%
+# flake rate (acs::1) — the RELEASE-RACE SURFACE (session 38's
+# presence probe: the (1 1)'s first yield-park's §3470
+# release-and-restore vs the run task's continuation to the
+# third call — the lock slot's state at the third call's gate
+# check is the interleave's coin; the STARTED-wait guarantees
+# the callee's START, not its park). The fixture pins the
+# embedder's interleave freedom; the sprint's candidates (the
+# live-task gate — over-blocked the concurrent blocking-calls;
+# the ancestor gate — held the fixtures, did not close the
+# window) are the recorded design evidence. THE M14 HAND-OFF.
+# M13-tok38 PARK (the fallback call): switch-to-ready-callback
+# (17 rows) — the ::8 deadlock variant (~6-10%): the row stalls
+# with NOTHING parked of its own (the window capture: 4 RES
+# events, no suspends — the GATE/STARTED-wait class, the callee
+# never got its first turn — the leftover/predecessor coupling
+# the teardown join did not fully close); the sprint's
+# candidates (the live-task gate, the ancestor gate) measured
+# and reverted. THE M14 HAND-OFF.
+./async/switch-to-ready-callback.wast
+# M13-tok38 PARK (the fallback call): during-sync-call-
+# no-sibling-resume (6 rows) — the resume window IS CLOSED (the
+# inter-round drain, session 34: 0/50) but the residual
+# unknown-thread-index variant (~3%, the drift class) remains;
+# the M13-lad exit-unregister + live-only idx machinery's
+# recorded follow-up. THE M14 HAND-OFF.
+./async/during-sync-call-no-sibling-resume.wast
 ./async/cancel-resumed-callback-switch.wast
 ./validation/kebab.wast
 ./values/post-return.wast
@@ -6,7 +34,6 @@
 ./async/big-interleaving-test.wast
 ./async/cancel-subtask.wast
 ./async/cancel-targeted-resume.wast
-./async/passing-resources.wast
 ./async/partial-stream-copies.wast
 ./async/reentrance.wast
 ./async/sync-streams.wast
@@ -2068,4 +2095,27 @@
 # FALLBACK IS THE CALL per the parent's criterion.
 # THE STATE at the close: the probe REVERTED; the lane 1469/0
 # x3 + units 410/0 at HEAD; the tree = the ledger only.
+# ----
+# ---- M13-tok session 39 (2026-10-28): THE M13 CLOSE-OUT —
+# THE FALLBACK CALLED. The parks + the accepted rate + the
+# passing-resources un-park landed; the denominator 1449
+# (1469 - 17 switch-to-ready - 6 no-sibling + 3 passing-
+# resources); the lane 1449/0 x3 (+4 more green; the 1-fail
+# run in the batch = acs::1, THE ACCEPTED RATE).
+# THE PARKS (the notes above): switch-to-ready-callback (17
+# rows, the ::8 no-park GATE/STARTED-wait shape, ~6-10%) +
+# during-sync-call-no-sibling-resume (6 rows: the resume
+# window CLOSED by the drain; the residual unknown-thread-
+# index variant ~3%, the drift class) — THE M14 HAND-OFF.
+# THE ACCEPTED RATE: async-calls-sync STAYS in the lane with
+# its ~8-10% acs::1 rate (the release-race surface: the (1 1)'s
+# first yield-park's §3470 release vs the run task's
+# continuation — the presence probe's capture; the sprint's
+# four reverted candidates the design evidence).
+# THE UN-PARK: passing-resources (3 rows — the own-transfer
+# chain's fixture; 10/10 standalone + the lane green).
+# THE FINAL GATES: units 410/0; the lane 1449/0 x3 + 4 more
+# green; core 21187/0/73.
+# THE REMAINING RUNGS stay nyi'd with their evidence (the M14
+# hand-off: the full token-scheduler determinism program).
 # ----
