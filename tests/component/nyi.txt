@@ -118,6 +118,62 @@
 # ::1, ~1-in-8) did NOT reappear in this session's runs — its
 # root-cause note (the token scheduler) stands. ----
 ./async/trap-if-block-and-sync.wast
+# ---- M13 session 4 (2026-10-27): THE ONE-LOCK HANDOFF
+# LANDED (the switch-lock design, per the session-3 constraint) —
+# the tree now carries: the DURABLE WAKE-COUNT (an atomic
+# (unsigned-byte 64) slot; every REAL wake — an explicit resume,
+# the §242-273 handoff post — increments + broadcasts; parks
+# consume; a count posted before a park's wait registers is
+# consumed at park time: the LOST-BROADCAST CLASS IS DEAD BY
+# CONSTRUCTION); %async-thread-wake MUTEX-FREE on the far side
+# (the SBCL DEADLOCK-AWARE cycle killed: X's park mutex ->
+# scheduler -> X's mutex); the arm's ONE TICK OUTSIDE the park
+# mutex (the symmetric cycle killed); async-thread-resume SPLIT
+# (the atomic claim-then-fire :claimed-sentinel spawn-start —
+# no count on a fresh thread (the round-1 double-suspend) — vs
+# the park-wake half (the durable count)); resume-later: the
+# EAGER fire for a pending spawn (safe now — the arms arm their
+# park BEFORE their fire, so the spawned body's park/exit posts
+# the armed caller durably; the ::34 race was HEAD's
+# fire-before-arm), the §242-27 handoff install for a
+# suspend-parked target (the marker's own next park/exit posts
+# the target's wake — causally after the marker's round), the
+# any-nudge broadcast for a yield park; the nudge's ready-grant
+# (a suspend-parked ready-marked target is a TICK CANDIDATE —
+# the grant posts a real count, exclusive-resume's only wake);
+# the ARM's one-lock park (armed + fired under the caller's own
+# mutex; the POST-TO rides the resume's locked section — atomic
+# against the target's own claim; the yield loop returns on ANY
+# wake (§536), the suspend loop only on the durable count
+# (§494); BOTH pairs install the handoff — the promote's ready
+# branch is §549's stop_waiting+yield_then_resume(other), and
+# without it the caller proceeded before an asynchronously-fired
+# worker's body ran (scheduling-candidates ::2)); the
+# NO-ARM-TIME-CLEAR experiment (honoring a count posted while
+# running) measured WORSE (5/20 vs 2/20) and was reverted — the
+# parks' own exit-clears mean a count at arm time predates the
+# arm. GATES with the design in: units 410/0 (both M12 pins
+# green — suspend-vs-yield's fix: the YIELD park must NOT post
+# the handoff (§523: a yield does not hand control away); its
+# post woke a switcher mid-round), the lane 1410/0 x3, core
+# 21187/0/73; every during-sync/self-switch/cancel-not-
+# delivered/deadlock/dont-block/drop-subtask fixture green
+# (scheduling-candidates' ::2 fixed by the promote's handoff +
+# the eager fire). THE FIXTURE'S RETURN PENDING: ::34
+# (suspend-then-promote-ready-is-fine) still flakes ~2/20
+# under repeated battery load (0/30 at the earlier isolated
+# cadence) — the residual window is the eager fire's resume-back
+# landing between resume-later and the caller's promote arm (the
+# arm-time clear wipes it; honoring it skips the round barrier).
+# The next session should decide the EAGER-FIRE-vs-MARK-ONLY
+# tradeoff for ::34's exact shape: the eager fire fixed
+# scheduling-candidates but opened ::34's window — the
+# reconciliation is the promote arm's ready-branch handoff
+# (the target's park/exit posts the caller) holding for an
+# ALREADY-FIRED target's exit too (the exit-post exists — the
+# install raced the exit: install post-to BEFORE the spawn's
+# SBCL-thread start inside the same locked section, i.e. move
+# the post-to install INTO %async-thread-start-spawn). ----
 # ---- M13 session 2 (2026-10-27): THE ::34 LOST-WAKE — root
 # cause CONFIRMED, the fix's design constraint derived, the
 # fixture REVERTED to nyi pending the switch-lock design (the

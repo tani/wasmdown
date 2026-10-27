@@ -3166,6 +3166,27 @@ wrong-index probe: one transfer produced index 3)."
   (abandoned nil)                    ; store-teardown mark: parks unwind, the thread exits
   (yield-parked nil)                 ; parked by async-thread-yield (READY)
   (suspended-p nil)                  ; SUSPENDED (§494): only an explicit resume wakes
+  (ready-p nil)                      ; §458-465 start_waiting(ready=True): resume-later's
+                                     ; mark — the next tick (§932) fires the pending
+                                     ; spawn / grants a suspend-park, or an explicit
+                                     ; switch starts/resumes it
+  (wake-count 0 :type (unsigned-byte 64))
+                                     ; M13-4 the DURABLE wake count: every REAL wake of
+                                     ; a park (an explicit resume, the §242-273 handoff
+                                     ; post — the target's park/exit handing control
+                                     ; back to its switcher) increments it ATOMICALLY
+                                     ; and broadcasts BOTH waitqueues. A park consumes
+                                     ; the whole count; one posted before the park's
+                                     ; wait registers is still consumed at park time —
+                                     ; the lost-broadcast window does not exist. Ticks
+                                     ;; are transient (no count): a yield-park retries
+                                     ;; on the next tick, a wait-until re-tests its
+                                     ;; own readiness.
+  (post-to nil)                      ; M13-4 the HANDOFF slot: the switcher this thread
+                                     ; must hand control back to at its NEXT park/exit
+                                     ; (§242-273's handler lock — installed through
+                                     ; async-thread-resume's locked section, posted
+                                     ;; once by %async-thread-post-handoff)
   (mutex (sb-thread:make-mutex :name "thread"))
   (waitqueue (sb-thread:make-waitqueue :name "thread"))
   (suspend-waitqueue (sb-thread:make-waitqueue :name "thread-suspend")))
@@ -3203,7 +3224,9 @@ no candidate thread can ever make progress — the deadlock trap.")
 
 (declaim (notinline async-thread-wait-until async-thread-resume
                     async-thread-resume-all async-thread-yield
-                    async-thread-suspend async-thread-nudge))
+                    async-thread-suspend async-thread-nudge
+                    %async-thread-wake %async-thread-post-handoff
+                    %async-thread-start-spawn))
 
 (define-condition async-thread-abandoned (wasmdown:wasm-trap)
   ()
@@ -3220,9 +3243,38 @@ task never resolves; the caller already trapped its oracle)."
            :kind :generic
            :message "abandoned by store teardown")))
 
+(defun %async-thread-wake (thread)
+  "M13-4 the DURABLE wake: every REAL wake of a park (an explicit
+resume, a §242-273 handoff post) increments the thread's WAKE-COUNT
+atomically and broadcasts BOTH waitqueues — NO far-side mutex (a
+lock-order inversion otherwise: this thread's park mutex held
+while taking the woken thread's, vs the tick path's scheduler
+mutex -> thread mutexs — the observed SBCL DEADLOCK cycle). The
+count's any-wake semantics make a lost broadcast harmless: the
+count is consumed at the next park."
+  (sb-ext:atomic-incf (async-thread-wake-count thread))
+  (sb-thread:condition-broadcast (async-thread-waitqueue thread))
+  (sb-thread:condition-broadcast (async-thread-suspend-waitqueue
+                                  thread)))
+
+(defun %async-thread-post-handoff (thread)
+  "M13-4 the HANDOFF post (§242-273's handler-lock release): a
+thread about to park — or exiting — hands control back to its
+switcher (the POST-TO slot, claimed under THIS thread's own mutex
+exactly once; the wake itself is the mutex-free %async-thread-wake)."
+  (let ((r nil))
+    (sb-thread:with-recursive-lock ((async-thread-mutex thread))
+      (setf r (async-thread-post-to thread))
+      (setf (async-thread-post-to thread) nil))
+    (when r
+      (%async-thread-wake r))))
+
 (defun async-thread-wait-until (thread ready-fn)
   "Thread.wait_until (CanonicalABI.md 505): block until READY-FN
-holds, re-testing on each wakeup."
+holds, re-testing on each wakeup. M13-4: the count is cleared with
+the wake — a resume posted during THIS park is THIS park's, never
+the next one's (a count leaking into a later park is a spurious
+early return)."
   (loop
     (sb-thread:with-recursive-lock ((async-thread-mutex thread))
       (async-thread-check-abandoned thread)
@@ -3230,54 +3282,132 @@ holds, re-testing on each wakeup."
         (incf *async-progress*)
         (return))
       (sb-thread:condition-wait (async-thread-waitqueue thread)
-                                (async-thread-mutex thread)))))
+                                (async-thread-mutex thread))
+      (setf (async-thread-wake-count thread) 0))))
 
 (defun async-thread-suspend (thread)
   "Thread.suspend (CanonicalABI.md 494): block with NO readiness
 condition — a SUSPENDED thread is only woken by an EXPLICIT
 async-thread-resume (the switch builtins' target). Store.tick's
 resume-all does NOT touch the suspend waitqueue: a scheduler nudge
-must not un-suspend a thread that only an explicit switch may."
+must not un-suspend a thread that only an explicit switch may.
+M13-4: the park posts the HANDOFF (§242-273 — this park IS the
+switcher's wake; the post is durable), re-checks the count after
+the post (the switcher's resume can land between the post and the
+wait's registration — its broadcast would be lost, its COUNT is
+durable), and clears the count on the returning wake."
   (setf (async-thread-suspended-p thread) t)
   (unwind-protect
        (loop
          (sb-thread:with-recursive-lock ((async-thread-mutex thread))
            (async-thread-check-abandoned thread)
+           (when (> (async-thread-wake-count thread) 0)
+             (setf (async-thread-wake-count thread) 0)
+             (return))
+           (%async-thread-post-handoff thread)
+           ;; RE-CHECK after the post: the switcher's resume can
+           ;; land between the post and the wait's registration
+           ;; (the caller was woken BY the post — it resumes us
+           ;; immediately); its broadcast would be lost to the
+           ;; not-yet-registered wait, but its COUNT is durable —
+           ;; consume it here and return without parking
+           (when (> (async-thread-wake-count thread) 0)
+             (setf (async-thread-wake-count thread) 0)
+             (return))
            (sb-thread:condition-wait (async-thread-suspend-waitqueue
                                       thread)
                                      (async-thread-mutex thread))
+           (setf (async-thread-wake-count thread) 0)
            (return)))
     (setf (async-thread-suspended-p thread) nil)))
 
-(defun async-thread-nudge (thread)
-  "Store.tick's per-thread nudge: wake the WAITCONDITION parkers
-(wait-until loops re-test their readiness; yield-parks return).
-A SUSPENDED thread (§494 — parked by async-thread-suspend with NO
-readiness) is NOT touched: only an explicit switch may resume it.
-Likewise a PENDING SPAWN (§4590: a thread.new-indirect thread is
-created SUSPENDED — its spawn thunk has not started the SBCL
-thread yet) is NOT started by a bare tick: only the EXPLICIT
-async-thread-resume may. (The observed no-sibling-resume stall: a
-nudge fired X's spawn during setup, BEFORE inner-block set
-$implicit-thread-index — X's first resume-later read 0xdead and
-silently no-oped; the exec's round-1 park then starved.)"
-  (sb-thread:with-recursive-lock ((async-thread-mutex thread))
-    (sb-thread:condition-broadcast (async-thread-waitqueue thread))))
+(defun %async-thread-start-spawn (thread)
+  "M13-4 the SPAWN-START half of Thread.resume (§474/§4590): the
+pending spawn's thunk fires ONCE, atomically — the claim and the
+fire BOTH under the thread's mutex with a :CLAIMED sentinel: a
+racing nudge sees the sentinel and SKIPS (one fire, ever), and a
+thread re-entering resume re-fires the :CLAIMED thunk (the resume
+is the explicit grant — the sentinel is only ever set by the nudge
+whose fire is deferred to the unlock, so a resume arriving in that
+window re-fires rather than losing the spawn). Returns T when the
+spawn was started. NO count: a fresh §4590 thread has no park to
+wake, and a count left on it is consumed by its FIRST park as a
+spurious early return (X's round-1 double-suspend)."
+  (let ((started nil))
+    (sb-thread:with-recursive-lock ((async-thread-mutex thread))
+      (let ((th (async-thread-spawn-thunk thread)))
+        (cond
+         ((functionp th)
+          (setf (async-thread-spawn-thunk thread) nil)
+          (setf started t)
+          (funcall th))
+         ;; RECOVER: a nudge claimed the thunk but its deferred
+         ;; fire has not run yet (or was lost) — the explicit
+         ;; resume re-fires it now; the sentinel's :done-clear
+         ;; happens in the thunk's own body
+         ((eq th :claimed)
+          (setf (async-thread-spawn-thunk thread) nil)
+          (setf (async-thread-ready-p thread) nil)
+          (setf started t))))
+      started)))
 
-(defun async-thread-resume (thread)
-  "Thread.resume (CanonicalABI.md 474) — the EXPLICIT switch
-(the -then-{resume,promote} builtins' target, the cancellation
-resume, resume-later): starts a PENDING SPAWN (§4590's first
-resume), nudges the waitqueue parkers, and wakes a SUSPENDED park
-(§494's only waker)."
-  (sb-thread:with-recursive-lock ((async-thread-mutex thread))
-    (let ((th (async-thread-spawn-thunk thread)))
-      (when (functionp th)
-        (setf (async-thread-spawn-thunk thread) nil)
-        (funcall th)))
-    (sb-thread:condition-broadcast (async-thread-waitqueue thread))
-    (sb-thread:condition-broadcast (async-thread-suspend-waitqueue
-                                    thread))))
+(defun async-thread-nudge (thread)
+  "Store.tick's per-thread nudge (§932: the candidates are the
+READY threads; a nudge = one quantum): wake the WAITCONDITION
+parkers (wait-until loops re-test; yield-parks return), GRANT a
+suspend-parked thread marked READY by resume-later (§458-465:
+start_waiting(ready=True) makes the thread a tick candidate —
+the grant posts a REAL count so ANY of its parks honors it), and
+CLAIM a ready-marked PENDING SPAWN's thunk — the :CLAIMED sentinel
+with the fire deferred past the unlock (holding the guest's mutex
+across the thunk's SBCL-thread start re-enters on the new thread).
+A spawn that is NOT ready-marked is NOT started by a bare tick
+(only the explicit switch/resume may — the observed
+no-sibling-resume stall: a nudge fired X's spawn during setup,
+BEFORE inner-block set $implicit-thread-index; X's first
+resume-later read 0xdead and no-oped). An ABANDONED thread's spawn
+is never fired (the cross-file zombie leak). The nudge is
+TRANSIENT except the ready-grant (a real wake)."
+  (let ((thunk nil) (ready-grant nil))
+    (sb-thread:with-recursive-lock ((async-thread-mutex thread))
+      (when (and (not (async-thread-abandoned thread))
+                 (async-thread-ready-p thread)
+                 (functionp (async-thread-spawn-thunk thread)))
+        (setf thunk (async-thread-spawn-thunk thread))
+        (setf (async-thread-spawn-thunk thread) :claimed)
+        (setf (async-thread-ready-p thread) nil))
+      (when (and (async-thread-ready-p thread)
+                 (async-thread-suspended-p thread))
+        (setf (async-thread-ready-p thread) nil)
+        (setf ready-grant t))
+      (sb-thread:condition-broadcast (async-thread-waitqueue thread)))
+    ;; the deferred fires — OUTSIDE the thread's mutex
+    (when (functionp thunk)
+      (funcall thunk))
+    (when ready-grant
+      (%async-thread-wake thread))))
+
+(defun async-thread-resume (thread &optional (post-to nil post-to-p))
+  "Thread.resume (CanonicalABI.md 474) — the EXPLICIT switch (the
+  -then-{resume,promote} builtins' target, the cancellation resume):
+  starts a PENDING SPAWN (§4590's first resume — the atomic
+  claim-then-fire), wakes every park (§494's only waker) via the
+  DURABLE wake-count, and — when POST-TO is given (the switch
+  arms' §242-273 handoff install) — sets the target's HANDOFF slot
+  under the SAME locked section (atomic against the target's own
+  post-handoff claim; the caller's park mutex held across the call
+  creates no cycle: the far-side wake is mutex-free). The COUNT is
+  posted ONLY on the park-wake half (a spawn-START's fresh thread
+  has no park to wake)."
+  (let ((started-p (%async-thread-start-spawn thread)))
+    (sb-thread:with-recursive-lock ((async-thread-mutex thread))
+      (when post-to-p
+        (setf (async-thread-post-to thread) post-to))
+      (unless started-p
+        (incf (async-thread-wake-count thread))
+        (sb-thread:condition-broadcast
+         (async-thread-suspend-waitqueue thread)))
+      (sb-thread:condition-broadcast (async-thread-waitqueue thread)))))
 
 (defun async-thread-resume-all ()
   "Store.tick (CanonicalABI.md 932): nudge every live thread (the
@@ -3294,14 +3424,20 @@ CPU. wait-until with an always-true predicate returns IMMEDIATELY
 siblings; instead PARK on the thread's waitqueue for a single
 scheduler nudge (Store.tick / resume-all) so other threads run. The
 YIELD-PARKED flag marks the thread READY while parked (a promote
-target's resumability condition, §549)."
+target's resumability condition, §549). M13-4: NO HANDOFF POST —
+a yield does NOT hand control away (§523: the yielder expects to
+CONTINUE; its post woke a switcher mid-round, suspend-vs-yield's
+(0)). A pending durable wake is honored (a resume posted before
+the park registered), and the count is cleared with the wake — a
+count arriving with the wake is THIS park's, never the next's."
   (sb-thread:with-recursive-lock ((async-thread-mutex thread))
     (async-thread-check-abandoned thread)
     (setf (async-thread-yield-parked thread) t)
-    (unwind-protect
-         (sb-thread:condition-wait (async-thread-waitqueue thread)
-                                   (async-thread-mutex thread))
-      (setf (async-thread-yield-parked thread) nil))))
+    (unless (> (async-thread-wake-count thread) 0)
+      (sb-thread:condition-wait (async-thread-waitqueue thread)
+                                (async-thread-mutex thread)))
+    (setf (async-thread-wake-count thread) 0)
+    (setf (async-thread-yield-parked thread) nil)))
 
 ;;; ---- the ComponentInstance concurrency fields (§133-150) ----
 
@@ -4446,10 +4582,23 @@ is the valtype."
                        (= (async-thread-index th) (first args)))
               (setf target th)))
           ;; §4605-4610: Table.get traps OOB/empty; §4609's
-          ;; trap_if(not other_thread.suspended()) — the SILENT
-          ;; SKIP (the (when target ...) no-op) DROPPED the wake
-          ;; in the no-sibling-resume stall (X's 0xdead read);
-          ;; a resume path must never silently no-op.
+          ;; trap_if(not other_thread.suspended()) — the target must
+          ;; be SUSPENDED (a pending spawn, a suspend park, a yield
+          ;; park); a resume path must never silently no-op (the
+          ;; no-sibling-resume stall's 0xdead read).
+          ;; §458-465 resume_later = start_waiting(ready = True):
+          ;; MARK READY, never FIRE, never wake directly. The
+          ;; pending spawn starts at the next TICK (the nudge's
+          ;; claim-then-fire); a SUSPEND-parked target gets the
+          ;; §242-273 HANDOFF install — THIS thread (the marker)
+          ;; hands control back to the target at ITS next park/exit,
+          ;; so the target's wake is causally AFTER the marker's
+          ;; round completes (suspend-vs-yield's determinism: $r
+          ;; set before the caller observes it); the tick's
+          ;; ready-grant covers the case the marker never parks
+          ;; again. A yield-parked target keeps its any-nudge wake.
+          ;; (The old shape fired the spawn EAGERLY: the spawned
+          ;; body raced the caller's switch — the ::34 flake.)
           (unless target
             (error 'wasmdown:wasm-trap :kind :generic
                    :message
@@ -4460,7 +4609,35 @@ is the valtype."
                       (async-thread-yield-parked target))
             (error 'wasmdown:wasm-trap :kind :generic
                    :message "cannot resume thread which is not suspended"))
-          (async-thread-resume target))
+          (sb-thread:with-recursive-lock
+              ((async-thread-mutex target))
+            (cond
+             ;; a PENDING SPAWN: fire NOW (§4590's first resume —
+             ;; the marker holds the CPU). The eager fire is safe:
+             ;; the switch arms arm their park BEFORE their fire,
+             ;; so this spawned body's park/exit posts the armed
+             ;; caller durably (the ::34 race was HEAD's
+             ;; fire-before-arm, closed by the arm's own ordering).
+             ;; Without it, a tick claimed the spawn and the worker
+             ;; ran asynchronously — the caller's promote found a
+             ;; DEAD target and proceeded before the worker's body
+             ;; (scheduling-candidates' ::2). The ready-mark stays
+             ;; set for the arm's predicate.
+             ((functionp (async-thread-spawn-thunk target))
+              (setf (async-thread-ready-p target) t)
+              (async-thread-resume target))
+             ;; a SUSPEND-parked target: the handoff install — the
+             ;; marker's own next park/exit posts the target's wake
+             ;; (causally after the marker's round completes)
+             ((async-thread-suspended-p target)
+              (setf (async-thread-ready-p target) t)
+              (setf (async-thread-post-to target) *current-thread*)
+              (setf (async-thread-wake-count target) 0))
+             ;; otherwise (a yield park): the any-nudge wake
+             (t
+              (setf (async-thread-ready-p target) t)
+              (sb-thread:condition-broadcast
+               (async-thread-waitqueue target))))))
         '())))
     ;; thread.new-indirect (§4555-4596): read the funcref from the
     ;; canon's core TABLE (trap OOB/null), create a SUSPENDED
@@ -4512,12 +4689,20 @@ is the valtype."
                                (unwind-protect
                                    (wasmdown.runtime:wasm-call
                                     elem c)
-                                 ;; unregister on return (§4588)
+                                 ;; unregister on return (§4588) —
+                                 ;; and POST THE HANDOFF: the body's
+                                 ;; EXIT hands control back to a
+                                 ;; resume-later marker still parked
+                                 ;; (the §242-273 exit-side release;
+                                 ;; suspend-vs-yield's X never parks
+                                 ;; again after its resume-later —
+                                 ;; its EXIT is the handoff)
                                  (sb-thread:with-recursive-lock
                                      ((async-thread-mutex th))
                                    (setf (async-thread-spawn-thunk
                                           th)
-                                         :done)))
+                                         :done))
+                                 (%async-thread-post-handoff th))
                              (wasmdown:wasm-trap () nil))))
                        :name "new-indirect-thread")))
               ;; §4591: register_thread (the instance's next
@@ -4693,6 +4878,7 @@ is the valtype."
                        (not (and target
                                  (or (functionp (async-thread-spawn-thunk
                                                  target))
+                                     (async-thread-ready-p target)
                                      (async-thread-suspended-p target)
                                      (async-thread-yield-parked
                                       target)))))
@@ -4700,40 +4886,110 @@ is the valtype."
                      :message
                      "cannot resume thread which is not suspended"))
             ;; §549-565: the promote pair only resumes a READY
-            ;; target (its spawn thunk pending = suspended, its
-            ;; SBCL thread parked by async-thread-yield = ready);
-            ;; a RUNNING target (on the stack below the reentrant
-            ;; call) is NOT ready — the plain suspend/yield
-            ;; fallback leaves it alone. The -then-resume pair
-            ;; resumes any found target.
+            ;; target (a pending spawn, a resume-later ready-mark,
+            ;; a yield-park); a RUNNING target (on the stack below
+            ;; the reentrant call) is NOT ready — the plain
+            ;; suspend/yield fallback leaves it alone. The
+            ;; -then-resume pair resumes any found target.
             (let ((resumable-target
                     (if (and promote-p target
                              (or (functionp (async-thread-spawn-thunk
                                              target))
+                                 (async-thread-ready-p target)
                                  (async-thread-suspended-p target)
                                  (async-thread-yield-parked target)))
                         target
                         (if promote-p nil target))))
-              ;; park the current thread: the SUSPEND pair parks on
-              ;; the SUSPEND waitqueue (§494 — NO readiness: a bare
-              ;; scheduler nudge does NOT wake it, only the target's
-              ;; explicit async-thread-resume); the YIELD pair parks
-              ;; READY (re-runnable at the next scheduler pass). One
-              ;; scheduler pass first so the target gets its slice.
-              (if resumable-target
-                  (progn
-                    (async-thread-resume-all)
-                    (async-thread-resume resumable-target)
+              ;; M13-4 THE ONE-LOCK HANDOFF (§242-273's discipline,
+              ;; per the session-3 design): ONE TICK FIRST, OUTSIDE
+              ;; the park mutex (§932 — resume-all takes the scheduler
+              ;; mutex then each thread's; holding the caller's park
+              ;; mutex across it was the DEADLOCK cycle), then the
+              ;; park is armed and the fire happens INSIDE the
+              ;; caller's own mutex — the condition-wait's release is
+              ;; the only window, and the target's park-back post is
+              ;; DURABLE, so no interleaving of the three parties
+              ;; loses a wake.
+              (async-thread-resume-all)
+              (let ((mu (async-thread-mutex *current-thread*)))
+                (sb-thread:with-recursive-lock (mu)
+                  (async-thread-check-abandoned *current-thread*)
+                  (if yield-p
+                      (setf (async-thread-yield-parked *current-thread*)
+                            t)
+                      (setf (async-thread-suspended-p *current-thread*)
+                            t))
+                  (unwind-protect
+                       (progn
+                         ;; ARM-TIME CLEAR: a count surviving from a
+                         ;; previous round is stale — this park's
+                         ;; honored counts can only originate from
+                         ;; THIS round (the fire happens after the
+                         ;; clear, under this mutex; the parks clear
+                         ;; their own counts on exit, so anything
+                         ;; here predates this arm)
+                         (setf (async-thread-wake-count *current-thread*)
+                               0)
+                         (when resumable-target
+                           ;; §242-273: BOTH pairs switch — the
+                           ;; then-resume pair unconditionally
+                           ;; (§531/§536's block(switch_to=other)),
+                           ;; the promote pair on its ready branch
+                           ;; (§549: stop_waiting +
+                           ;; yield_then_resume(other)) — and the
+                           ;; caller proceeds only at the target's
+                           ;; NEXT park/exit. The POST-TO rides the
+                           ;; resume's locked section: atomic against
+                           ;; the target's own handoff claim, no lock
+                           ;; cycle (the far-side wake is mutex-free).
+                           ;; The target's spawn may already have been
+                           ;; CLAIMED by an earlier tick (a
+                           ;; ready-marked spawn claimed between the
+                           ;; marker's resume-later and this switch —
+                           ;; the worker fires asynchronously; without
+                           ;; the handoff the caller's any-nudge
+                           ;; yield-park returned BEFORE the worker's
+                           ;; body ran, scheduling-candidates'
+                           ;; worker-ran check trapped).
+                           (async-thread-resume resumable-target
+                                                *current-thread*))
+                         ;; the park: the SUSPEND pair consumes the
+                         ;; DURABLE count ONLY (§494: a bare nudge
+                         ;; must not un-suspend); the YIELD pair
+                         ;; returns on ANY wake (§536: ready)
+                         (loop
+                           (when (and (not yield-p)
+                                      (> (async-thread-wake-count
+                                          *current-thread*)
+                                         0))
+                             (setf (async-thread-wake-count
+                                    *current-thread*)
+                                   0)
+                             (return))
+                           (sb-thread:condition-wait
+                            (if yield-p
+                                (async-thread-waitqueue *current-thread*)
+                                (async-thread-suspend-waitqueue
+                                 *current-thread*))
+                            mu)
+                           (async-thread-check-abandoned
+                            *current-thread*)
+                           (when (or yield-p
+                                     (> (async-thread-wake-count
+                                         *current-thread*)
+                                        0))
+                             (setf (async-thread-wake-count
+                                    *current-thread*)
+                                   0)
+                             (return)))))
                     (if yield-p
-                        (async-thread-yield *current-thread*)
-                        (async-thread-suspend *current-thread*)))
-                  ;; no switch: the plain suspend/yield fallback
-                  (progn
-                    (async-thread-resume-all)
-                    (if yield-p
-                        (async-thread-yield *current-thread*)
-                        (async-thread-suspend *current-thread*))))
-            (list 0)))))))
+                        (setf (async-thread-yield-parked *current-thread*)
+                              nil)
+                        (setf (async-thread-suspended-p *current-thread*)
+                              nil))
+                    (setf (async-thread-wake-count *current-thread*)
+                          0))))
+            (list 0))))))
     ;; the still-opaque kinds: the slot exists, the call traps
     ((:thread-new-indirect
       :error-context-new :error-context-debug-message
