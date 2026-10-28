@@ -64,6 +64,7 @@
            #:host-end-set-error
            #:host-end-drop
            #:host-end-drain
+           #:host-end-read
            #:host-future-resolve
            #:make-host-buffer
            #:host-buffer-p
@@ -73,6 +74,7 @@
            ;; descriptor: a provider-owned resource whose rep is a CL
            ;; record and whose drop runs a host finalizer)
            #:host-resource-rep
+           #:host-resource-take
            #:*host-resource-dtor-table*))
 (in-package #:wasmdown.component.runtime)
 
@@ -1851,24 +1853,29 @@ pairs consumed in order)."
                                                  (abi-cx-inst cx)))))
                   (when payload
                     ;; coerce each slot to the payload's own type and
-                    ;; re-push for the recursive lift
-                    (loop for (rv . rt) in slots
-                          for i from 0
-                          do (vector-push-extend
-                              (cons (%abi-coerce-lift
-                                     rv (nth i want) (nth i have))
-                                    (nth i have))
-                              vi)
-                          finally
-                            ;; push back in REVERSE (vector-pop LIFO)
-                            (loop for i from 0 below (length have)
-                                  do (vector-push-extend
-                                      (vector-pop vi) vi))))
+                    ;; re-push for the recursive lift. VI is a LIFO
+                    ;; stack: the slots were popped in flat order, so
+                    ;; they must be pushed back REVERSED for the
+                    ;; payload's lift to read them in flat order (the
+                    ;; earlier pop-and-push-onto-the-same-vector was a
+                    ;; no-op and left a multi-slot payload — a variant
+                    ;; case holding a string — with its ptr/len
+                    ;; swapped).
+                    (let ((items
+                            (loop for (rv . nil) in slots
+                                  for i from 0
+                                  collect
+                                  (cons (%abi-coerce-lift
+                                         rv (nth i want) (nth i have))
+                                        (nth i have)))))
+                      (dolist (item (reverse items))
+                        (vector-push-extend item vi))))
                   (let ((v (if payload (lift payload) nil)))
-                    ;; drop the unconsumed pad slots
-                    (loop repeat (- (length want)
-                                    (if payload (length have) 0))
-                          do (vector-pop vi))
+                    ;; drop the unconsumed pad slots (a NO-PAYLOAD case
+                    ;; already dropped every joined slot above)
+                    (when payload
+                      (loop repeat (- (length want) (length have))
+                            do (vector-pop vi)))
                     (cons (car case) v)))))
              (:flags
               (let ((labels (coerce (wasmdown.component:ct-payload c)
@@ -3681,6 +3688,46 @@ read — or now, if the guest is already parked with a buffer."
                      (async-end-owner reader))
         (%end-notify reader 1))))
   value)
+
+(defun host-end-read (reader)
+  "The provider-side read of a GUEST-RESOLVED value on READER (the
+READABLE future end a guest handed over and later wrote through its
+writable peer). Only an already-resolved value is read: a value the
+peer delivered into the HOST-VALUE slot, or a copy that is already
+parked on the peer's buffer (the guest's `future.write' staged it).
+Returns (values value present-p); (values NIL NIL) when nothing is
+ready — the provider never blocks the executor on a guest future."
+  (let* ((peer (async-end-other reader))
+         (buffer (and peer (async-end-buffer peer))))
+    (cond
+      ((null peer) (values nil nil))
+      ((async-end-host-value-p peer)
+       (let ((v (async-end-host-value peer)))
+         (setf (async-end-host-value-p peer) nil)
+         (values v t)))
+      ((or (null buffer) (zerop (%buffer-remain buffer)))
+       (values nil nil))
+      (t
+       ;; the canonical copy: READER's host buffer <- PEER's staged
+       ;; buffer (one future element). The protocol's notifications
+       ;; fire exactly as for a guest-to-guest copy.
+       (let ((buf (make-host-buffer 1)))
+         (ignore-errors (%end-copy reader buf t))
+         (let ((vals (host-buffer-values buf)))
+           (if vals
+               (values (first vals) t)
+               (values nil nil))))))))
+
+(defun host-resource-take (rt index)
+  "Consume the OWN resource handle at INDEX: the rep is REMOVED from
+the dynamic caller's handle table (the canon-lower own-transfer) and
+returned. The provider now owns the rep and must release it through
+its own finalizer. (values NIL NIL) when no such handle exists (a
+direct CL call passes the rep itself)."
+  (let* ((inst (or *handle-caller-inst* *host-provider-inst*))
+         (h (and inst (integerp index)
+                 (ignore-errors (%handle-remove inst rt index)))))
+    (if h (values (cdar h) t) (values nil nil))))
 
 ;;; ---- End.copy (CanonicalABI.md 1687-1711): the 5 cases ----
 
