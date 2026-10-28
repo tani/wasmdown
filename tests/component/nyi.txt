@@ -209,7 +209,19 @@
 #   reentrance ::14 ONCE — the drift row's band) + units 411/0
 #   + core 21187/0/73 unchanged.
 # THE DENOMINATOR: 1482 -> 1536 (+54: the no-sibling 6 + the
-# trap-if-block 48) — past the milestone's ~1526 target.# THE NEXT SHAPE (recorded for the next session): the fix must
+# trap-if-block 48) — past the milestone's ~1526 target.
+# THE REMAINING RUNGS' FRESH EVIDENCE (the close-out re-probe at
+# e8b1937): sync-streams ::1 — the surface MOVED: the M13 record
+# ('the run's own STARTING check' — the unreachable) is now
+# 'deadlock detected' 10/10 standalone (the granted-park model
+# moved it; a callee-grant candidate at %task-grant-callee
+# measured — the deadlock UNCHANGED — and was reverted: the
+# callee is a STACKFUL task, the granted park is not its path;
+# the deadlock's surface is the caller's drain vs the callee's
+# first turn — the next decode's target). partial-stream-copies
+# ::1 — 'unreachable' 10/10, UNCHANGED (the stream-copy window,
+# the M13 record stands). Both stay nyi'd with this evidence
+# (the M15 hand-off).# THE NEXT SHAPE (recorded for the next session): the fix must
 # distinguish the CALLER'S OWN BLOCKING-OP TICK (a broadcast that
 # SHOULD return the park) from the WINDOW's incidental broadcasts
 # (which should NOT) — e.g. a per-park "granted" flag set by the
