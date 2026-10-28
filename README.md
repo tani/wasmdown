@@ -10,9 +10,10 @@ baseline SBCL code generation, a public Lisp API and CLI for the **core
 Wasm subset** below, plus the stateful `.wast` spec-script runner and a
 measured baseline against the vendored official test suite. It is
 **not** a conformant Core 3.0 implementation and makes no conformance
-claim. No Component Model, WIT, WASI or
-threads support yet — those are PLAN.md milestones M5, M7–M12. SIMD
-(v128 + relaxed) IS implemented end to end as of loop 24.
+claim. The Component Model (M7–M15) and the WASI 0.3.2 host providers
+(M16) **are** implemented; threads/atomics, the WASI 0.1/0.2 facades
+and the FASL cache are not. SIMD (v128 + relaxed) IS implemented end
+to end as of loop 24.
 
 ## Conformance baseline (honest, per PLAN.md §12.8)
 
@@ -233,12 +234,12 @@ harness-errors.
 | Component | `src/component.lisp` | M7 slices 1–5: layer discrimination (magic + version 0x0D + layer byte), the full component binary reader (all 12 sections, WIT value types incl. map 0x63, aliases, canon incl. all 47 async built-ins, value sections), the validator (labels/index/max-size, canonopt lift/lower + unicity + signature checks, semver/canonical-version grammar, externname visibility + type-use walks, annotated resource names, moduletype internals, structural instantiation type matching with per-component type identities + generativity, core-subtype moduletype matching, the de Bruijn outer-alias stack, resource identity/local/canon rules, projection chains), the `(component ...)` script-command family, `make test-component`. |
 | Component text | `src/component-text.lisp` | M7 slices 2–5: the full component TEXT grammar into the same IR (valtypes, functypes, imports/exports + attributes, canon lift/lower + built-ins upright/inverted, core module via `parse-wat`, core instance, aliases incl. outer-alias sugar + projections + declarator bind-ids + type-use externtypes + the sort-aware binding table + moduletype desc shapes, the named-form `(component definition ...)` marker). |
 | Component runtime | `src/component-runtime.lisp` | M8-M11a: component instantiation execution — the comp-instance record (per-sort index vectors in validator order + import/export tables), two-level core-instance linking, component-instance with-args, alias projection, canon lift/lower as real host funcs, resource built-ins with per-instance handle tables + own/borrow transfer + dtor resolution, the outer-aliased core module resolution, the per-instantiation closure side table, start funcs; THE CANONICAL ABI AT RUNTIME (M10: cx.allocate/reallocate with the trap taxonomy, store/load per type — string transcodes (utf8/utf16/latin1+utf16), list/record/variant/flags/enum/option/result, the map despecialization — lift/lower_flat + the MAX_FLAT 16/1 pointer indirection, post-return); THE ASYNC CORE (M11a: the task/thread state machine — the callback event loop with the real-park YIELD + the exclusive-lock-released WAIT, the backpressure gate with pre-park scheduler registration, the deadlock oracle via the progress counter, the async built-ins as real host funcs with the exact trap messages, the packed async lower with the STARTED-wait; the thread/future/stream/error-context canons stay opaque — M11b); the runner's component invoke/get + the compound value literals. |
+| WIT reader | `src/wit.lisp` | M16: tokenizer + recursive-descent reader with type resolution and WIT→component-`ct` conversion; parses all six vendored 0.3.2 packages without error (packages, interfaces, worlds, `use` incl. cross-package, records/enums/variants/flags, resources with constructors/static/async/methods, aliases, `map<K,V>`, `own`/`borrow`/`stream`/`future`, `@since`/`@unstable` parsed and recorded). |
+| WASI providers | `src/wasi.lisp` | M16: the host-provider framework (`parsed iface + impl alist → comp-instance` of `lifted-func`s carrying the WIT functype + a CL closure over the component value domain), the host stream/future ABI, and the `wasi:clocks`, `wasi:random`, `wasi:cli`, `wasi:filesystem`, `wasi:sockets`, `wasi:http` providers under an explicit `wasi-context`; `run-component` drives `wasi:cli/run`. See *WASI 0.3.2 host providers (M16)* below. |
 
-Not implemented (see `PLAN.md` for the full contract): the M11b
-async canons (future/stream/thread/error-context — 37 files in
-nyi.txt with probe evidence) + async-calls-sync's interleave
-bug, WASI (all versions),
-threads/atomics, FASL cache, annotations (an unadopted proposal —
+Not implemented (see `PLAN.md` for the full contract):
+threads/atomics, FASL cache, the WASI 0.1/0.2 compatibility facades,
+annotations (an unadopted proposal —
 permanently out of scope per PLAN.md §3.3). SIMD (v128 + relaxed,
 loop 24: the full 236-op v128 family + the 20 relaxed ops with
 documented canonical choices, scalarized per PLAN.md §7.3 — the
@@ -268,6 +269,230 @@ implemented. The `.wat` text format and `.wast` spec runner
 **are** implemented (`src/text.lisp`, `src/wast.lisp`), as is
 conformance reporting.
 
+## WASI 0.3.2 host providers (M16)
+
+**Status: implemented, slice-scoped** (PLAN.md §9; `declared_support`
+stays `partial`). M16 lands the WASI 0.3.2 provider set on top of the
+M7–M15 Component Model: a WIT frontend, a host-provider framework that
+turns (parsed WIT interface + a Lisp implementation) into a real
+component instance, the host-backed stream/future ABI, six package
+providers, the capability model, and a CLI command runner.
+
+### Vendored WIT snapshot
+
+`specs/wasi/wasi-wit-0.3.2/` is the official **v0.3.2** release asset
+(published 2026-10-13), vendored verbatim: **15 files / 2,448 lines**
+covering `cli`, `clocks`, `filesystem`, `http`, `random`, `sockets`
+plus the release's own `*/deps/*.wit` copies of the depended-on
+interfaces. `specs/wasi/MANIFEST.md` records the URL, the tarball's
+SHA-256 (`2e918e04…c0ec311`), the re-verification recipe (`curl` +
+`sha256sum` + `tar xzf`) and the policy: exact stable snapshots only,
+never a floating main-branch WIT. Version dispatch is by the `@0.3.2`
+suffix in the import name (`wasi:clocks/monotonic-clock@0.3.2`);
+`@unstable(feature = ...)` interfaces are feature-gated off by default
+(`clocks-timezone` is the first such gate). The pin is recorded in
+`specs/lock.toml`.
+
+### The WIT reader (`src/wit.lisp`)
+
+A tokenizer plus recursive-descent reader with type resolution and the
+WIT → component-`ct` conversion. **All six vendored 0.3.2 packages
+parse without error** (pinned test `wit/all-six-vendored-packages-parse`).
+Constructs: `package ns:name@ver`; `interface`; `world` with bare and
+fully-qualified import/export; `use pkg/iface@ver.{a,b}` (local and
+cross-package); type aliases; `record`; `enum`; `variant` (payload
+cases, uppercase labels); `flags`; `resource` (constructor, static
+func, async func, methods); `func(params) -> T`; `async`/`static`
+modifiers; value types `u8..s64`/`f32`/`f64`/`bool`/`char`/`string`/
+`error-context`, `list<T>`, `tuple<...>`, `option<T>`,
+`result`/`result<_,E>`, `stream<T>`, `future<T>`, `borrow<T>`,
+`own<T>`, `map<K,V>`, `_`; `%`-escaped identifiers; `@since` and
+`@unstable` are parsed and recorded, never rejected. Resource types
+carry a per-interface memo so `own<T>`/`borrow<T>` payloads share one
+stable handle identity.
+
+### The host-provider framework (`src/wasi.lisp`)
+
+A parsed interface plus an implementation alist becomes a real
+`comp-instance` whose exports are `lifted-func` values carrying the
+WIT-derived functype (instant, duration = `u64`, `list<u8>`,
+`list<tuple<string,string>>`, `option<string>`, `tuple<u64,u64>`, …)
+and a CL host closure over the component **value domain**.
+`lifted-func` gained a `host` slot; `lifted-func-call` dispatches the
+host closure with the domain argument list instead of the flat core
+path — the provider already speaks the canonical value domain, and the
+`canon lower` wrapper around it lifts/lowers the ABI in the *caller's*
+memory. With `host` NIL the flat core path is unchanged. Providers are
+supplied through instantiation `:with-args` under the exact WIT names.
+The exported surface includes `make-wasi-context`, the per-package
+provider constructors, `cli-provider`, `command-provider`,
+`run-component`, `parse-wasi-endpoint`, and `open/close-wasi-preopen`.
+Host resources register finalizers in
+`wasmdown.component.runtime:*host-resource-dtor-table*`, so
+`canon resource.drop` deterministically closes owned OS handles; a
+borrow parameter is resolved via `host-resource-rep` against the
+dynamic caller's table (`*host-provider-inst*` is the fallback).
+
+### The host stream/future ABI
+
+The M11b end machinery gained host-backing slots on `async-end`:
+`host-sink` (a `byte-list → error-code|NIL` draining the guest's
+writes), `host-source` (`(max) → (values bytes eof-p)` feeding the
+guest's reads), `host-value`/`host-value-p` (a resolved future's
+domain value), `host-eof-p`/`host-error`, and `host-on-drop` (one-shot,
+fired when the paired *guest* end is dropped). A `host-buffer` struct
+is the CL stand-in for a guest linear-memory region, so
+`%buffer-remain/-progress/-take/-put` generalize over it and the copy
+protocol keeps ONE shape. Insertion points: `%end-copy`'s case 2 now
+consults the peer before parking (sink-backed → `%host-sink-drain`,
+source-backed → `%host-source-fill` with EOF ⇒ the host writer is
+dropped and my event is DROPPED, resolved future →
+`%host-value-deliver`); `%end-drop` fires the detached peer's
+`host-on-drop`; `host-end-drain` is the registration-time drain;
+`host-future-resolve` delivers into an already-parked read or leaves
+the value, and a sink error marks the host end, drops it (the guest
+see DROPPED) and rides the future as `(:err . "io")`. Exported from
+`wasmdown.component.runtime`: `make-host-stream-pair`,
+`make-host-future-pair`, `host-end-set-{sink,source,on-drop}`,
+`host-end-drain`, `host-future-resolve`, `make-host-buffer`.
+
+### Package coverage
+
+| Package | Delivered |
+| --- | --- |
+| `wasi:clocks` | `monotonic-clock` `now`/`get-resolution` (`clock_gettime` `CLOCK_MONOTONIC`); `system-clock` `now` → the `instant` record (`CLOCK_REALTIME`), resolution 1 µs; `types.duration`. `wait-until`/`wait-for` are **declared but unsupported** (`host-error`) — there is no timer/waitable reactor. `clocks-timezone` stays gated off (`@unstable`). |
+| `wasi:random` | `get-random-bytes`/`get-random-u64` and the insecure `get-insecure-random-bytes`/`-u64`/`get-insecure-seed`, all from `/dev/urandom` — **never** `CL:RANDOM`. Zero length → empty list; a positive request is short-read-capped at 1 MiB. |
+| `wasi:cli` | `environment.get-environment`/`get-arguments`/`get-initial-cwd`, `exit.exit`/`exit-with-code` (the `wasi-exit` condition), stdin/stdout/stderr as streams (`read-via-stream`/`write-via-stream`, with the `result<_, error-code>` element `ct` taken from the WIT functype), the `terminal-*` interfaces (`isatty` → `some<own<terminal-*>>` or `none`, never a fabricated handle), and the command world (`wasi:cli/run`). All driven ONLY by the explicit `wasi-context` (arguments/environment/cwd/stdin/stdout/stderr) — no ambient globals. An absent stream keeps the interface exported but traps `host-error` ("no … capability in this wasi-context"). |
+| `wasi:filesystem` | The capability model below, the `descriptor` resource (own/borrow, dtor finalizers, non-owning preopens), all 25 non-stream methods with the errno → `error-code` table, `preopens.get-directories`, the four stream methods (`read-via-stream` over `pread`, `write-via-stream` over a clamped `pwrite` with a per-stream cursor, `append-via-stream` re-reading the size from `fstat` on every drain — the kernel fd offset is **never** consulted or moved), the flag gating (`read` for read/read-directory, `write` for write/append) riding the WIT's own error channel (a DROPPED stream + `(:err . "not-permitted"|"read-only")`), and `read-directory` (`fdopendir` over a fresh `openat(fd, ".", …)`, `readdir` through SB-ALIEN with the LP64 `dirent` layout verified empirically, `.`/`..` omitted inside the walk, `DT_UNKNOWN` → `fstat`). |
+| `wasi:sockets` | The `wasi-network` authority (outbound endpoints, listen bind addresses, DNS policy `:none`/`:all`/name-list with `**.suffix`), `tcp-socket` (create/bind/connect/listen/accept-stream/send/receive/addresses/knobs), `udp-socket` (create/bind/connect/disconnect/send/receive/knobs), `ip-name-lookup` via `getaddrinfo`, the errno → `sockets-error-code` table, and empirically verified `sockaddr_in`/`sockaddr_in6`/`addrinfo` layouts. The shared-ownership refs: a socket rep counts the handle PLUS every send/receive/listen stream; the fd closes at zero; a stream drop is `SHUT_WR`/`SHUT_RD`. **Vendored truth:** the pinned `sockets.wit@0.3.2` has no `network` resource, no `instance-network`, no `shutdown` and no `@unstable` interfaces — the authority therefore legitimately travels through provider construction. |
+| `wasi:http` | The `types` resources — `fields` (case-insensitive, original casing/order preserved, append/set/get-and-delete semantics), `request`, `request-options` (three timeouts, `clone`; zero duration → `not-supported`), `response` — with the RFC 7230 validation and the `header-error` cases `invalid-syntax` (token/field-value, CR/LF/NUL), `forbidden` (the host-owned set: connection, content-length, host, te, trailer, transfer-encoding, upgrade, …), `immutable` and `size-exceeded` (64 KiB value, 1 MiB aggregate, 256-byte name); and `client.send` over HTTP/1.1 with content-length / chunked (extensions + a parsed trailer section) / read-to-close framing, the request/response timeouts (30 s defaults), the outbound policy on the *resolved* destination IP, and the **pluggable transport**. |
+
+### The capability model and its security invariants
+
+Every host import receives an explicitly allocated authority object,
+never an ambient Lisp global (PLAN.md §9.1):
+
+1. **No ambient authority.** Capabilities come only from a
+   `wasi-context`. An absent stream traps; an absent
+   `wasi-network` denies all; `--dir`/`--env`/`--net`/`--listen`/
+   `--dns` are refused without `--wasi`.
+2. **Handle-relative filesystem, no path-prefix filter.** A
+   `wasi-preopen` is an OPEN host directory fd plus the guest-visible
+   name; every operation is `*at` against a descriptor fd (`openat`,
+   `mkdirat`, `unlinkat`, `renameat`, `linkat`, `symlinkat`,
+   `readlinkat`, `utimensat`/`futimens`, `ftruncate`, `fsync`,
+   `posix_fadvise`, `fstat`).
+3. **The kernel never follows a symlink for us.** `%resolve-path`
+   walks components itself, opening each with `O_NOFOLLOW`; links are
+   expanded with `readlinkat` under a **32-link budget**, and an
+   absolute or `..`-bearing target is REFUSED. `..`, NUL, and empty
+   paths are refused (`not-permitted`/`invalid`) outright.
+4. **No cross-authority moves.** Descriptors are checked against the
+   calling context's preopen list; a socket from another provider's
+   network is rejected.
+5. **Preopens are non-owning.** Dropping the guest handle never closes
+   the root; finalizers close owned fds only.
+6. **Network policy is consulted per operation** (bind/connect/UDP
+   send/resolve), refusing with the WIT's `access-denied`.
+7. **HTTP headers are host-owned where they must be** (the forbidden
+   set), guest fields are re-checked for CR/LF before serialization
+   (defence in depth), and **no plaintext fallback**: an `https`
+   request with no registered transport returns the WIT's
+   `configuration-error`; there is **no custom TLS** (PLAN.md §9.2).
+
+Pinned by the filesystem security suite (absolute / `..` / NUL / empty
+escapes, cross-authority, the three symlink escapes — absolute link,
+climbing link, escaping *intermediate* link — `readlink-at`/`symlink-at`
+refusal, an invalid handle index → `bad-descriptor`, finalizers closing
+owned fds only), the sockets policy matrix, and the HTTP transport
+refusals (https-without-transport, outbound, DNS, CRLF injection).
+
+### CLI usage
+
+```sh
+sbcl --script tools/wasmdown.lisp run \
+  app.wasm --wasi --dir . --env K=V --net host:port app-arg
+```
+
+(`wasmdown run …` is the same command once `tools/wasmdown.lisp` is
+wrapped as a launcher.)
+
+`--dir HOST[::GUEST]` (a preopen, opened only after validation and
+closed after the run), `--env K=V`, `--net HOST:PORT`,
+`--listen ADDR:PORT`, `--dns NAME|*` — all refused without `--wasi`.
+`--http-transport` is explicitly rejected as **embedder-only** (a
+transport is an embedder service, PLAN.md §9.2; it is reachable from
+Lisp via `wasi-context-http-transports`). The runner discriminates a
+component from a core module by the component preamble: a component
+goes through decode → validate → `run-component` under the command
+provider set; a core module keeps the `--invoke` path. Guest `argv[0]`
+is the component path; `run` returns `ok` → 0, `err` → 1, and
+`wasi:cli/exit` (or an exit during a start func) propagates its exact
+status. The store is torn down on every path (0 registered threads
+after ok/err/exit runs). The Lisp entry point:
+
+```commonlisp
+(let* ((bytes (with-open-file (s #P"app.wasm" :element-type '(unsigned-byte 8))
+                (let ((b (make-array (file-length s)
+                                     :element-type '(unsigned-byte 8))))
+                  (read-sequence b s) b)))
+       (comp (wasmdown.component:decode-component bytes))
+       (ctx  (wasmdown.wasi:make-wasi-context
+              :arguments (list "app.wasm")
+              :environment '(("K" . "V"))
+              :stdin *standard-input* :stdout *standard-output*
+              :stderr *error-output*
+              :preopens (list (wasmdown.wasi:open-wasi-preopen ".")))))
+  (wasmdown.component:validate-component comp)
+  (wasmdown.wasi:run-component comp ctx))
+```
+
+### Residuals (honest, recorded)
+
+- **`wasi:http` handler/service/middleware worlds** (the guest-exported,
+  incoming-request side) are not implemented — only the outgoing
+  `client` world is.
+- **Streaming request uploads**: the body is staged before
+  `client.send`; a fully streaming upload needs an I/O reactor, not
+  the pull model.
+- **No socket reactor**: a receive source parks on would-block after
+  one bounded (2 s) readiness poll, so a guest cannot be woken later;
+  `clocks.wait-until`/`wait-for` are declared-unsupported for the same
+  reason.
+- **The nested `option<stream<u8>>` through a host lower** — the
+  canon-lower argument lift resolves a nested async end in the
+  provider's table instead of the caller's (a pre-existing M16-b
+  limit).
+- **Descriptor-dtor / lend-list accumulation** for long-lived hosts.
+- **`%abi-lower`'s top-level error-result discriminant** (compound
+  outer shapes) and the pre-existing **text/validator limits** around
+  imported-instance functypes with outer compound refs (records
+  containing tuples, `result<own, variant>` type indices) — the
+  runtime always lifts with the real WIT functype, so the e2e fixtures
+  work around the validator, not the ABI.
+- **`@unstable` feature gating is parsed but not enforced** (the
+  timezone interface is simply not registered).
+- HTTP **keep-alive/pipelining/redirects/100-continue/proxies** are out
+  of scope (one request per connection, `Connection: close`);
+  outgoing request trailers are accepted-and-skipped; `wasi:sockets`
+  has no `shutdown` in this WIT revision.
+- The **WASI 0.1/0.2 facades** (PLAN.md §8.4) are not implemented.
+- World `include`, `implements`/`external-id`, and nominal resource
+  typing are not yet read by the WIT frontend.
+- The component lane's **pre-existing, machine-load-dependent async
+  flake class** at the probe metric (below) is not a WASI regression.
+
+### Gates
+
+Units **481 / 0**; core **21,187 pass / 0 fail / 73 unsupported**;
+the component lane **1,631 / 0 / 0 / 0** (the lane metric, M7–M15
+unchanged by M16). The per-row **probe** metric retains the
+pre-existing, machine-load-dependent async flake class recorded in the
+ledger (`async-calls-sync` ::1 ≈7–10% ACCEPTED, `switch-to-ready` ::8,
+`during-sync-scheduling-candidates`, `cancel-targeted-resume` ::9,
+`reentrance` ::14, `sync-streams` ::1, `big-interleaving` ::24) — the
+M15 robustness target, not an M16 slice property.
+
 ## Error/phase taxonomy (PLAN.md §12.2)
 
 `decode-error` (malformed binary; byte offset) → `validation-error`
@@ -281,7 +506,7 @@ These classes are never interchangeable.
 ## Usage
 
 ```sh
-make test                 # full unit/integration suite (139+ tests)
+make test                 # full unit/integration suite (481 tests)
 sbcl --script tools/wasmdown.lisp validate file.wasm
 sbcl --script tools/wasmdown.lisp inspect file.wasm
 sbcl --script tools/wasmdown.lisp run file.wasm --invoke add 42 13
@@ -335,7 +560,16 @@ What remains, per milestone:
 2. **Canonical ABI + async runtime** (§8.2/§8.3: lift/lower,
    flattening, resources, post-return, the task state machine,
    may-suspend propagation).
-3. **WASI 0.3.2 providers** (§9) + the 0.1/0.2 facades (M8-M10).
+3. **WASI 0.3.2 providers** (§9): **IMPLEMENTED, slice-scoped (M16)** —
+   the vendored WIT snapshot + reader, the host-provider framework, the
+   host stream/future ABI, the six packages (`clocks`, `random`,
+   `cli`, `filesystem`, `sockets`, `http`), the capability model, and
+   the CLI command runner; see *WASI 0.3.2 host providers (M16)*.
+   Residuals: the `wasi:http` handler/service/middleware worlds,
+   streaming request uploads, no socket/timer reactor, the nested
+   `option<stream<u8>>` host lower, descriptor-dtor/lend accumulation,
+   `%abi-lower`'s top-level error-result discriminant, unenforced
+   `@unstable` gating, and the **WASI 0.1/0.2 facades** (still open).
 4. **The §12 remaining gates**: compiler-backend parity matrix
    (§12.3's :optimized/:aot + the differential oracle), the
    property/fuzz lanes (§12.6), the remaining CI lanes (M11).
@@ -347,4 +581,12 @@ loop 22 (GC value opcodes end to end), loop 23 (multi-memory
 runtime + memory64), loop 24 (SIMD — v128 + relaxed, the last
 opcode family; 32 self-authored pins), **M7 slice 1** (the
 component binary reader + WIT value types + the validation rules
-+ `make test-component`).
++ `make test-component`), **M7 rest–M15** (text/validator
+completeness, instantiation, linking, the canonical ABI at runtime,
+resources, the async core + canon families, the scheduler
+determinism program — the lane at 1,631/0/0/0, the async suite
+45/45 complete), and **M16** (the WASI 0.3.2 host providers —
+`specs/wasi/wasi-wit-0.3.2/` vendored + the WIT reader, the
+host-provider framework + host stream/future ABI, `clocks`,
+`random`, `cli`, `filesystem`, `sockets`, `http`, the capability
+model and the CLI command runner; units 481/0, core 21,187/0/73).

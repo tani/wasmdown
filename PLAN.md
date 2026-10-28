@@ -2,7 +2,11 @@
 
 **Technical specification and implementation plan — revision 1.1 (22 October 2026)**
 
-> **Status:** Proposed architecture; not implemented or conformance-tested. Baseline: Core WebAssembly 3.0, the Component Model adopted by WASI 0.3.2, and optional backward-compatibility facades for WASI 0.1/0.2. Primary platform: SBCL on Linux x86-64, then Linux AArch64/macOS. Production goal: zero mandatory third-party Common Lisp libraries.
+> **Status:** Proposed architecture, **partially implemented and
+> conformance-measured** — the core subset, the Component Model (M7–M15)
+> and the WASI 0.3.2 host providers (M16) are in the tree; see
+> `README.md` and `specs/lock.toml`. `declared_support` = `partial`
+> (§2). Baseline: Core WebAssembly 3.0, the Component Model adopted by WASI 0.3.2, and optional backward-compatibility facades for WASI 0.1/0.2. Primary platform: SBCL on Linux x86-64, then Linux AArch64/macOS. Production goal: zero mandatory third-party Common Lisp libraries.
 
 **Changes in revision 1.1:** Converted the complete HTML specification to Markdown; expanded §12 with executable test-harness contracts, official test suite pinning, failure-phase classification, Component Model and WASI test adapters, fuzz/differential testing, CI commands, machine-readable reports, and exact conformance/release gates.
 
@@ -298,6 +302,28 @@ WASI 0.2 keeps its own canonical interfaces and `wasi:io` resource semantics, ma
 | `wasi:sockets` | IP lookup, TCP/UDP creation and connection/binding/listening, address-family and errors, async stream and network capability restrictions. |
 | `wasi:http` | HTTP outgoing client and incoming service/middleware worlds, header/body/trailer semantics, backpressure, status/errors; TLS/HTTPS via an explicit host transport abstraction. |
 | Other versioned stable interfaces | Generate required-interface inventory from vendored WASI 0.3.2 release WIT and implement every interface exposed by the selected stable worlds; experimental proposals are feature-gated. |
+
+> **Implementation status (M16, 2026-10-28): implemented, slice-scoped.**
+> The pinned WIT is vendored at `specs/wasi/wasi-wit-0.3.2/` (v0.3.2
+> release asset, 15 files / 2,448 lines, SHA-256 pinned in
+> `specs/lock.toml` + `specs/wasi/MANIFEST.md`) and read by
+> `src/wit.lisp`; `src/wasi.lisp` supplies the provider framework and
+> the `clocks`, `random`, `cli` (environment/exit/stdio/terminals/`run`),
+> `filesystem` (the `*at` capability model + streams + `read-directory`),
+> `sockets` (the `wasi-network` authority + tcp/udp + `ip-name-lookup`)
+> and `http` (the `types` resources + `client.send` over HTTP/1.1 with a
+> pluggable transport) providers, all under an explicit `wasi-context`.
+> Measured: units 481/0, core 21,187/0/73, the component lane
+> 1,631/0/0/0 (the lane metric; the probe metric retains the pre-existing,
+> machine-load-dependent async flake class). **Residuals:** the
+> `wasi:http` handler/service/middleware (guest-exported) worlds;
+> streaming request uploads; no socket/timer reactor (`wait-until`/
+> `wait-for` unsupported); the nested `option<stream<u8>>` host lower;
+> descriptor-dtor/lend accumulation; `%abi-lower`'s top-level
+> error-result discriminant; pre-existing text/validator limits;
+> unenforced `@unstable` gating; and the WASI 0.1/0.2 facades (§8.4).
+> See `README.md`'s *WASI 0.3.2 host providers (M16)* and ADR-003.
+> `declared_support` stays `partial`.
 
 ### 9.1 Capabilities
 

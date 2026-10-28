@@ -382,11 +382,101 @@ conformance gates. This repository delivers an honest **partial** slice
    closure, WIT-level Component/WASI, threads beyond the canon
    core, FASL cache. `declared_support` stays `partial`.
 
+   M16 (2026-10-28: THE WASI 0.3.2 HOST PROVIDERS — six slices,
+   units 429 → 481; core 21,187/0/73 and the lane 1631/0/0/0 held
+   throughout). **THE WIT FRONTEND** (`src/wit.lisp`): a tokenizer +
+   recursive-descent reader with type resolution and the WIT →
+   component-`ct` conversion; all six vendored 0.3.2 packages parse
+   (`specs/wasi/wasi-wit-0.3.2/`, the official release asset, 15 files
+   / 2,448 lines, SHA-256 `2e918e04…`, with `MANIFEST.md`'s
+   re-verification recipe and version-dispatch policy —
+   `wasi:clocks/monotonic-clock@0.3.2`). `@since`/`@unstable` are
+   parsed and RECORDED, never rejected; a per-interface `ct` memo gives
+   resources a stable identity for `own<T>`/`borrow<T>` payloads.
+   **THE HOST-PROVIDER MODEL**: a parsed interface plus an
+   implementation alist becomes a real `comp-instance` whose exports
+   are `lifted-func`s carrying the WIT-derived functype and a CL
+   closure over the component VALUE domain; `lifted-func`'s new HOST
+   slot makes `lifted-func-call` dispatch the closure directly, while
+   the `canon lower` wrapper lifts/lowers the ABI in the CALLER's
+   memory — the provider speaks domain values, the guest pays the flat
+   ABI (the flat core path is untouched when HOST is NIL). Providers
+   arrive through instantiation `:with-args` under the exact WIT import
+   names, never through a global registry. **THE HOST STREAM/FUTURE
+   ABI** (extended, not duplicated): `async-end` gains
+   host-sink/host-source/host-value/host-on-drop; `%end-copy`'s case 2
+   consults the peer before parking (sink drain to a CL stream, source
+   fill into the guest buffer with EOF ⇒ the host writer is dropped and
+   the event is DROPPED, resolved-future delivery);
+   `%end-drop` fires the detached peer's one-shot `host-on-drop`;
+   `host-end-drain` covers the registration-time drain; and
+   `make-host-buffer` is the CL stand-in for a guest linear-memory
+   region, so `%buffer-remain/-progress/-take/-put` keep ONE copy
+   protocol over both. **THE CAPABILITY MODEL** (PLAN.md §9.1): one
+   explicit `wasi-context` authority object (arguments, environment,
+   cwd, stdin/stdout/stderr, preopens, networks, HTTP transports); no
+   ambient Lisp globals; an absent capability traps `host-error` rather
+   than defaulting. FILESYSTEM invariants, each pinned by the security
+   suite: a preopen is an OPEN directory fd and every operation is
+   `*at` (no path-prefix filter anywhere); `%resolve-path` walks
+   components itself with `O_NOFOLLOW` per component, so the kernel
+   never follows a symlink for us; `readlinkat` expansion has a 32-link
+   budget and absolute/`..`-bearing/empty/NUL paths are REFUSED;
+   descriptors cannot cross authorities; preopens are non-owning
+   (dropping the guest handle never closes the root); owned fds close
+   through `*host-resource-dtor-table*` finalizers at `canon
+   resource.drop`. NETWORK invariants: a `wasi-network` authority
+   (declared outbound endpoints, listen bind addresses, DNS policy
+   `:none`/`:all`/name-list) is consulted at every bind/connect/UDP
+   send/resolve, and a socket from another provider's network is
+   rejected; absent authority = deny all; socket refs count the handle
+   plus every send/receive/listen stream, closing the fd at zero. The
+   vendored WIT is the truth here: the pinned `sockets.wit@0.3.2` has
+   no `network` resource, no `instance-network`, no `shutdown` and no
+   `@unstable` interfaces, so the authority legitimately travels
+   through provider construction. HTTP invariants: RFC 7230
+   token/field-value validation, the host-owned FORBIDDEN header set,
+   immutability of the request/response views, size ceilings, a
+   defence-in-depth CR/LF check before serialization, and the outbound
+   policy applied to the RESOLVED destination IP. **THE TRANSPORT
+   ABSTRACTION** (PLAN.md §9.2): `wasi-http-transport`
+   {scheme, tls-p, connect} + `wasi-http-connection` {read, write,
+   close}, a built-in plain-TCP transport for `http`, and
+   embedder-supplied transports ONLY from
+   `wasi-context-http-transports`. An `https` request with no matching
+   transport returns the WIT's `configuration-error`: NO PLAINTEXT
+   FALLBACK and NO CUSTOM TLS — writing cryptographic TLS to satisfy a
+   "pure Lisp" slogan is explicitly rejected; a no-TLS installation
+   simply does not claim a turnkey HTTPS host. This is also why
+   `--http-transport` is rejected at the CLI (a transport is an
+   embedder service). **THE COMMAND WORLD**: `run-component`
+   instantiates with the command provider set, invokes the
+   `wasi:cli/run@0.3.2` export (async or sync), maps ok → 0 / err → 1,
+   honours `wasi:cli/exit` (including during a start func), and always
+   tears the store down (0 registered threads after every path). **THE
+   RESIDUALS**: the `wasi:http` handler/service/middleware (guest-
+   exported) worlds; streaming request uploads (needs an I/O reactor);
+   no socket/timer reactor (`wait-until`/`wait-for` declared-
+   unsupported; a receive source parks after one bounded 2 s readiness
+   poll); the nested `option<stream<u8>>` through a host lower; the
+   descriptor-dtor/lend-list accumulation; `%abi-lower`'s top-level
+   error-result discriminant; the pre-existing text/validator limits on
+   imported-instance functypes with compound outer refs; `@unstable`
+   gating parsed but not enforced; and the WASI 0.1/0.2 facades
+   (PLAN.md §8.4). The lane's probe-metric async flake class is
+   unchanged and remains the M15 robustness target.
+   `declared_support` stays `partial`.
+
 ## Consequences
 
 +: The public support declaration stays honest; `partial` per PLAN.md §2.
 +: Test suite asserts both positive behavior and exact condition types
    and trap kinds.
++: WASI hosts receive explicit authority objects only (no ambient
+   globals); the filesystem escape suite, the network policy matrix and
+   the HTTP transport refusals pin those invariants as executable tests.
++: No custom TLS: an `https` request without an embedder transport is
+   the WIT's `configuration-error`, never a silent plaintext fallback.
 −: `:call-stack-exhausted` limit is an implementation limit (PLAN.md
    §3.4) — documented, deterministic; deep-but-finite guest recursion
    beyond the limit is rejected as a resource limit, never a crash.
