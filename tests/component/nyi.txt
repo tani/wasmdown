@@ -2510,3 +2510,81 @@
 # with their evidence. THE NUMBERS: units 410/0; the lane
 # 1449/0/0/0; core 21187/0/73.
 # ----
+# ---- M14 ALL-TESTS SESSION (2026-10-28, the user's
+# directive: "try to fix all tests"): ALL FIVE REMAINING
+# FIXTURES REACHED STANDALONE GREEN, BUT THE SHARED TICK
+# MODEL THEY RIDE ON REGRESSES THE DURING-SYNC FAMILY — THE
+# TREE WAS REVERTED TO b785efb (the last green: units 411/0,
+# lane 1536/0/0/0, core 21187/0/73). THE SESSION'S EIGHT
+# MECHANISMS (each tied to a spec section + a measured
+# before/after — the next session's landing candidates):
+# 1. THE GRANTED PARK = GRANT AND READINESS (§932, §1373):
+#    the un-gated async-thread-wait-until tail of
+#    %wset-wait-from-callback removed; one grant = one
+#    quantum; a grant spent while not ready RE-ARMS.
+# 2. THE TICK-EXECUTION GATE (async-thread-blocked-p,
+#    §932/§3538-3543): wait-until, yield, suspend, the
+#    callback WAIT park, the switch park and the nested
+#    sync-lift park SET it; %canon-lift-async's drain ticks
+#    only while the invoked thread is parked.
+# 3. TICKS WAKE EVERY GRANTED THREAD (resume-all's
+#    grant-marking also %async-thread-wake's).
+# 4. THE CANCEL-WINDOW FIRE GATE: the priority pass skips
+#    the cancelled instance's ready-marked spawns; the async
+#    lower's on-resolve became the FIFTH M11a deferral site
+#    (cancel-targeted-resume ::9's $ran).
+# 5. THE FIRST-TURN PACK BOUNDARY (§3650-3729): the
+#    STARTED-wait also exits on the callee's first
+#    block/exit (partial-stream-copies' eager RETURNED(2)).
+# 6. THE SYNC LIFT'S TASK.RETURN SINK + SWITCH-BACK (§802):
+#    the caller waits for the task's resolution (the callee
+#    may keep executing after returning); the executor owns
+#    the thread exit.
+# 7. THE SYNC RENDEZVOUS: %end-notify posts a durable wake
+#    to the end's sync waiter; the sync read/write is a
+#    GRANTED park (the peer continues at the caller's next
+#    tick, §932 + sync-streams' "switch to the caller").
+# 8. THE ASYNC-LOWER RESULT STORE'S TWO SPACES: the result
+#    valtype resolves in the callee's type space, the new
+#    stream handle is added to the CALLER's table
+#    (partial-stream-copies' re-used slot 1).
+# THE STANDALONE RESULTS (all with those mechanisms in):
+# cancel-targeted-resume 10/10 x10 (::7 was 2/6);
+# switch-to-ready 17/17 x5; sync-streams 8/8 (was deadlock
+# 10/10); partial-stream-copies 3/3; big-interleaving-test
+# 0 failures x3 (moved by the grant/park work).
+# THE BLOCKER (the revert's cause — DETERMINISTIC
+# regressions, not the floor class): async-calls-sync ::1 +
+# ::2 'unreachable' (3/3 — beyond the accepted ~8-10% ::1
+# rate); during-sync-call-exclusive-resume ::2
+# 'unreachable'; during-sync-call-may-block-if-other-ready-
+# threads ::3 ('got 57005') + ::8; the lane STALLED after
+# during-sync-scheduling-candidates (no per-file progress
+# within 900s); the units' cancel-eager-resolve pin FAILED
+# (assertion (EVERY ...)); and the lane died ('unhandled
+# condition ... quitting'). THE PRIME SUSPECTS in order:
+# (a) the drain gate starves the during-sync family's
+# interleave (the ledger's own warning: the family's
+# interleave depends on the pre-window ticks); (b)
+# %task-grant-callee-only spins inside nested lowers that
+# now get no drain ticks; (c) the unconditional wake-every-
+# granted changing the pinned path order.
+# THE RECORDED NEXT-SESSION DESIGN INPUT (the exact shape):
+# THE GATE NEEDS A PER-INVOCATION CONCURRENCY CLASS — when
+# the invoked task has an OUTSTANDING NESTED SYNC-LIFT /
+# STARTED-WAIT (a 'synchronous call in flight'), the drain
+# MUST tick (the reference's caller is blocked INSIDE the
+# call); a plain mid-turn execution must NOT. That is the
+# 'granter's caller was blocking' provenance applied to the
+# DRAIN rather than to the flag — the same distinguisher the
+# cancel-window gate uses per-instance, here per-INVOCATION.
+# THE LANDING ORDER for the next session (one change per
+# gate, the safest first): mechanism 1 (the granted park's
+# readiness) ALONE → the gates; then 5 (the first-turn pack
+# boundary) ALONE; then 6+7 (the sync-lift sink + the
+# rendezvous) ALONE; then 8 (the two spaces) ALONE; then 4
+# (the cancel-window fire gate); THEN 2+3 (the tick-execution
+# gate + the wake-every-granted) WITH the per-invocation
+# concurrency class — the regressions' source. Mechanisms 1,
+# 5, 8 are the most likely pure wins (they touch different
+# surfaces); 2+3 are the risky pair that needs the class.
