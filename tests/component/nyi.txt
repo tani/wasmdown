@@ -1,3 +1,30 @@
+# M17 SESSION 2 (same plan, resumed on branch wip/abi-type-space): STEPS 1-3 LANDED.
+# THE ABI/HANDLE REWORK IS BACK IN THE TREE (commit 99c7e23) and the earlier
+# "reverted, not preserved" note below is superseded: abi-cx carries TYPE-INST
+# beside the value/handle INST (%abi-type-inst), handles are resource-handle
+# records again (rt rep own-p num-lends borrow-scope; %handle-add stays
+# APPEND-only), and the lend ledger is split (subtask.LENDERS = lent handle
+# records, subtask.LENDING-TASKS = the lending tasks; deliver_resolve clears
+# both FIRST then returns each num-lends once).
+# THE SELECTION CORE OF STEP 3 IS IN (commit 354e2f2): make-wit-selection /
+# validate-wit-package / select-wit-package / resolve-wit-world over the
+# existing WIT AST, SemVer ordering reusing component::%semver-parse, @since /
+# @unstable / @deprecated gating with container inheritance, member-gate
+# exclusion signalled instead of silently changing layout. 10 wit/selection-*
+# tests. NOT YET DONE in step 3: world include/rename, named/inline interface
+# bindings, positional @external-id, provider/link-time enforcement.
+# THE MEASUREMENTS (serial, same meter as the HEAD row above):
+#   units 491 passed / 0 failed (481 + the 10 new WIT tests).
+#   component lane, integrated tree, 6 runs: fails 0,0,1,0,1,2 -> 4 fail
+#   commands over 6 runs = PARITY with the HEAD meter's 4/6, and the
+#   async-calls-sync class (::1 and ::2, which failed 10/10 in one earlier
+#   batch and 1-2/6 at HEAD) did NOT recur in any of the 6 runs.
+#   The residual rows are the recorded structural flakes: reentrance::14
+#   (drift), cancel-targeted-resume::9, and cancel-delivery::1 (the
+#   "NIL is not of type NUMBER" signature, which the HEAD baseline also shows
+#   on a different row - cancel-resumed-callback-switch::3).
+# NEXT: step 4 (the single-permit store scheduler) is the only remaining
+# blocker to a green lane; steps 5-8 all sit on it.
 # M17 session (WASI 0.3.2 residuals, plan steps 1-4): MEASURED, MOSTLY NOT LANDED.
 # THE LANE IS NOW A GATE: tools/run-component-suite.lisp exits NON-ZERO on
 # fail/harness-error/timeout/skip/census-problem and prints the executed

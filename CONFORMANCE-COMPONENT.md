@@ -15,8 +15,8 @@ Baseline measurement, not a release gate (PLAN.md §12.8).
 
 | Outcome | Count |
 | --- | --- |
-| pass | 1630 |
-| fail | 1 |
+| pass | 1629 |
+| fail | 2 |
 | skip | 0 |
 | unsupported | 0 |
 | timeout | 0 |
@@ -29,16 +29,16 @@ Executed: 1631 commands; pass rate 99.9%.
 
 | File | pass | fail | unsupported | other |
 | --- | --- | --- | --- | --- |
-| component/async-calls-sync.wast | 2 | 1 | 0 | 0 |
+| component/async-calls-sync.wast | 3 | 0 | 0 | 0 |
 | component/big-interleaving-test.wast | 57 | 0 | 0 | 0 |
 | component/builtin-trap-poisons-instance.wast | 8 | 0 | 0 | 0 |
 | component/cancel-and-exclusive-lock.wast | 2 | 0 | 0 | 0 |
-| component/cancel-delivery.wast | 4 | 0 | 0 | 0 |
+| component/cancel-delivery.wast | 3 | 1 | 0 | 0 |
 | component/cancel-not-delivered.wast | 2 | 0 | 0 | 0 |
 | component/cancel-resumed-callback-switch.wast | 4 | 0 | 0 | 0 |
 | component/cancel-stream.wast | 15 | 0 | 0 | 0 |
 | component/cancel-subtask.wast | 4 | 0 | 0 | 0 |
-| component/cancel-targeted-resume.wast | 10 | 0 | 0 | 0 |
+| component/cancel-targeted-resume.wast | 9 | 1 | 0 | 0 |
 | component/closed-stream.wast | 3 | 0 | 0 | 0 |
 | component/cross-abi-calls.wast | 49 | 0 | 0 | 0 |
 | component/cross-task-future.wast | 2 | 0 | 0 | 0 |
