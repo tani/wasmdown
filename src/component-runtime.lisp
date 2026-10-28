@@ -47,7 +47,9 @@
            #:lifted-func-opts
            #:lifted-func-memory
            #:lifted-func-realloc
+           #:lifted-func-host
            #:lifted-func-call
+           #:make-comp-instance
            #:bag-p
            #:bag-ref
            #:runtime-export-value))
@@ -100,7 +102,11 @@ the DEFINING comp-instance — the own/borrow handle transfer
   (opts nil)
   (memory nil)                       ; memory-instance | NIL
   (realloc nil)                      ; func-instance | NIL
-  (inst nil))                        ; the defining comp-instance (M9)
+  (inst nil)                         ; the defining comp-instance (M9)
+  (host nil))                        ; M16: a host closure
+                                     ; (domain-args-list -> domain value)
+                                     ; called INSTEAD of the flat core
+                                     ; path (the WASI providers)
 
 ;;; ---------------------------------------------------------------
 ;;; Bags: inline-export instances. A bag is a hash table mapping the
@@ -2135,6 +2141,14 @@ reentrance phase checks). The CALLER then waits:
   and re-enters the defining instance's table."
   (let* ((ft (lifted-func-type lf))
          (core (lifted-func-core lf)))
+    ;; M16: a HOST-PROVIDER lifted func carries a CL closure that takes
+    ;; the component-domain ARGS list and returns the domain value. It
+    ;; runs INSTEAD of the flat core path (the provider already speaks
+    ;; the canonical VALUE domain; the canon-lower wrapper around it
+    ;; lifts/lowers the ABI in the caller's memory).
+    (when (lifted-func-host lf)
+      (return-from lifted-func-call
+        (funcall (lifted-func-host lf) args)))
     (unless (and core (wasmdown.runtime:func-instance-p core))
       (error 'wasmdown:host-error
              :message "lifted func wraps no core func"))

@@ -237,3 +237,144 @@
 (defpackage #:wasmdown.cli
   (:use #:cl)
   (:export #:main))
+
+;;; ---- M16: the WIT frontend + the WASI host-provider framework ----
+;;; The component subsystem's packages are defined at their own file
+;;; heads (src/component.lisp, src/component-runtime.lisp); these two
+;;; are listed here because they are the M16 public surface. Both use
+;;; only CL (the component ct constructors are referenced by their
+;;; package-qualified names), so there is no load-order dependency.
+
+(defpackage #:wasmdown.wit
+  (:use #:cl)
+  (:export
+   ;; reader entry points
+   #:parse-wit-file
+   #:parse-wit-string
+   #:wit-error
+   #:wit-error-path
+   #:wit-error-offset
+   ;; package nodes
+   #:wit-package
+   #:wit-package-p
+   #:wit-package-name
+   #:wit-package-namespace
+   #:wit-package-basename
+   #:wit-package-version
+   #:wit-package-interfaces
+   #:wit-package-worlds
+   #:wit-package-annotations
+   #:package-interface
+   ;; interface nodes
+   #:wit-interface
+   #:wit-interface-p
+   #:wit-interface-name
+   #:wit-interface-package
+   #:wit-interface-items
+   #:wit-interface-types
+   #:wit-interface-funcs
+   #:wit-interface-func-list
+   #:wit-interface-resources
+   #:wit-interface-uses
+   #:wit-interface-annotations
+   ;; type / func / resource / world nodes
+   #:wit-type
+   #:wit-type-p
+   #:wit-type-name
+   #:wit-type-expr
+   #:wit-type-annotations
+   #:wit-func
+   #:wit-func-p
+   #:wit-func-name
+   #:wit-func-params
+   #:wit-func-result
+   #:wit-func-async-p
+   #:wit-func-static-p
+   #:wit-func-constructor-p
+   #:wit-func-annotations
+   #:wit-resource
+   #:wit-resource-p
+   #:wit-resource-name
+   #:wit-resource-methods
+   #:wit-resource-annotations
+   #:wit-use
+   #:wit-use-p
+   #:wit-use-namespace
+   #:wit-use-package
+   #:wit-use-interface
+   #:wit-use-version
+   #:wit-use-items
+   #:wit-use-annotations
+   #:wit-world
+   #:wit-world-p
+   #:wit-world-name
+   #:wit-world-package
+   #:wit-world-imports
+   #:wit-world-exports
+   #:wit-world-annotations
+   #:wit-world-item
+   #:wit-world-item-p
+   #:wit-world-item-sort
+   #:wit-world-item-namespace
+   #:wit-world-item-package
+   #:wit-world-item-interface
+   #:wit-world-item-version
+   #:wit-world-item-annotations
+   #:wit-annotation
+   #:wit-annotation-p
+   #:wit-annotation-name
+   #:wit-annotation-args
+   ;; type resolution / conversion
+   #:resolve-wit-type
+   #:wit-type->ct
+   #:wit-func->ct
+   #:interface-import-name))
+
+(defpackage #:wasmdown.wasi
+  (:use #:cl)
+  (:export
+   ;; the capability context (PLAN.md §9.1: an explicit authority
+   ;; object, never ambient Lisp globals)
+   #:wasi-context
+   #:wasi-context-p
+   #:make-wasi-context
+   #:wasi-context-arguments
+   #:wasi-context-environment
+   #:wasi-context-cwd
+   ;; host exit
+   #:wasi-exit
+   #:wasi-exit-p
+   #:wasi-exit-status
+   ;; the host-provider framework
+   #:provider-instance
+   #:provider-instance-function
+   #:make-host-lifted-func
+   #:wasi-package
+   #:wasi-package-file
+   #:*wasi-wit-root*
+   ;; clocks
+   #:monotonic-now
+   #:monotonic-resolution
+   #:system-now
+   #:system-resolution
+   #:clocks-provider
+   #:monotonic-clock-instance
+   #:system-clock-instance
+   ;; random (OS entropy only — never CL:RANDOM)
+   #:os-random-bytes
+   #:random-bytes
+   #:insecure-random-bytes
+   #:random-u64
+   #:insecure-random-u64
+   #:insecure-seed
+   #:random-provider
+   #:random-instance
+   #:insecure-random-instance
+   #:insecure-seed-instance
+   ;; cli (environment + exit; the streams are slice 2)
+   #:environment-get-environment
+   #:environment-get-arguments
+   #:environment-get-initial-cwd
+   #:cli-environment-instance
+   #:cli-exit-instance
+   #:cli-provider))

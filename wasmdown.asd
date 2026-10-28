@@ -25,7 +25,9 @@
    (:file "src/text")
    (:file "src/wast")
    (:file "src/component-runtime")
-   (:file "src/component-text")))
+   (:file "src/component-text")
+   (:file "src/wit")
+   (:file "src/wasi")))
 
 (asdf:defsystem #:wasmdown/test
   :description "WASMDOWN unit and integration tests."
@@ -42,4 +44,6 @@
    (:file "tests/api")
    (:file "tests/text")
    (:file "tests/simd")
-   (:file "tests/wast")))
+   (:file "tests/wast")
+   (:file "tests/wit")
+   (:file "tests/wasi")))
