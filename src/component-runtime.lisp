@@ -4138,8 +4138,18 @@ does not exist)."
           (setf (async-task-gate-parked task) t)
           (sb-thread:with-recursive-lock (*scheduler-mutex*)
             (pushnew th *scheduler-threads* :test #'eq))
+          ;; M15 GATE-2: a task CANCELLED while waiting at the gate
+          ;; must WAKE and deliver CANCELLED_BEFORE_STARTED
+          ;; (CanonicalABI.md §681 + §761's deliver_pending_cancel) —
+          ;; the backpressure itself may never subside (big-
+          ;; interleaving-test's mock-bp-inc row: bp-inc, then
+          ;; call-block-empty at the gate, then subtask.cancel,
+          ;; pinned CANCELLED_BEFORE_STARTED(3) WITHOUT a bp-dec).
+          ;; The readiness therefore ALSO holds on a pending cancel.
           (async-thread-wait-until
-           th (lambda () (not (funcall has-backpressure))))
+           th (lambda ()
+                (or (not (funcall has-backpressure))
+                    (%task-has-pending-cancel task))))
           (setf (async-task-gate-parked task) nil)
           (decf (getf fields :num-waiting-to-enter))
           (when (%task-deliver-pending-cancel task)

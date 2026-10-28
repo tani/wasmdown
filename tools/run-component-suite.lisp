@@ -236,7 +236,11 @@ parent dir), not the first (the grandparent 'component' — the old
                                  ;; row hangs — see nyi.txt).
                                  "cancel-targeted-resume.wast"
                                  "switch-to-ready-callback.wast"
-                                 "partial-stream-copies.wast")
+                                 "partial-stream-copies.wast"
+                                 ;; M15 gate 6: the backpressure
+                                 ;; gate's pending-cancel readiness
+                                 ;; closed the mock-bp-inc hang.
+                                 "big-interleaving-test.wast")
                                :test #'string=)))
                 (or (directory (merge-pathnames
                                 "tests/component/async/*.wast" *root*))
