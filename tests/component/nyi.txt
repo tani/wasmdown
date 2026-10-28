@@ -1,3 +1,62 @@
+# M17 SESSION 3: STEP 4 PIECE (i) KEPT, THE PERMIT REJECTED (dump-backed); STEP 6
+# BACKEND LANDED. MEASUREMENT INTEGRITY CORRECTION: an SBCL probe from the M14
+# session (/tmp/m14-standalone.lisp) was found still running with 1 day 02:38
+# elapsed and was killed. EVERY rate in sessions 1-2 above was taken with it
+# pegging the box, so those "HEAD-parity" claims are measurement artifacts, not
+# batch properties. On the quiet machine (isolated worktree at c52a38e, serial
+# 6 runs): batch-baseline 7 fail commands / 6 runs (acs::2 x5, reentrance::14,
+# ctr::9), walls 8.1-13.1 s.
+# PIECE (i) — MEASURED, KEPT (commit 3edd099): guest threads from
+# %canon-lift-async / %call-async-funcinst / %sync-lift-run record
+# ASYNC-THREAD-NATIVE (only thread.new-indirect did), so %store-teardown's join
+# covers them; the teardown also clrhash's *tok-skip-age* (EQ keys on THREAD
+# objects: a recycled object can alias a dead entry) and resets
+# *tok-path-counter* / *async-progress*. METER: 6 fail commands / 6 runs
+# (acs::2 x5, reentrance::14), no new signature, no rc=124 — parity-or-better.
+# THE 12-SITE PARK TABLE (the deliverable that outlives the permit): every site
+# below released NOTHING before this work and is entered at permit depth 1
+# except the drains, which are depth 0 on the runner thread:
+#   1 async-thread-wait-until (also the backpressure gate, %wset-wait)
+#   2 async-thread-suspend    3 async-thread-yield
+#   4 %wset-wait-from-callback  5 sync read/write rendezvous  6 switch park
+#   7 %task-request-cancellation :initial (UNBOUNDED condition-wait)
+#   8 %task-request-cancellation :started (sleep spin)
+#   9 %canon-lift-async oracle drain  10 %sync-thunk-run  11 %sync-lift-run
+#  12 canon-lower pack's STARTED wait
+# THE PERMIT: IMPLEMENTED, MEASURED, DROPPED — not parked behind a toggle.
+#  v1 release-per-park + timed waits: every run died in <2.5 s.
+#  v2 with a mutex-re-grabbing bounded wait: acs::1/::2 trap "deadlock detected";
+#     the watchdog dump shows a LIVE owner that is neither parked nor
+#     progressing.
+#  v3 the permit code kept with the switch OFF: rc=124 x6 — THE BOUNDED-WAIT
+#     SHAPES ALONE BREAK LIVENESS. So "normalise the waits to bounded ones and
+#     defer the permit" is OFF THE TABLE; any step-4 attempt must land the two
+#     together.
+# THREE REUSABLE FACTS (each cost a measurement cycle):
+#  a. SBCL 2.6.4's (condition-wait q m :timeout t) returns with the mutex
+#     RELEASED on timeout — a second wait inside the same with-mutex errors
+#     ("not holding MUTEX"). Re-grab unless already owner.
+#  b. Releasing the right "for the park" is not enough when the park is a LOOP:
+#     later iterations re-wait holding it. The release must pair with EACH wait.
+#  c. %task-return / %task-exit-implicit-thread call async-thread-resume-all,
+#     which takes OTHER threads' mutexes — a permit holder that parks then
+#     re-acquires behind a thread whose mutex another thread holds while it
+#     waits for the permit (AB-BA). Any permit design must make resume-all
+#     not take peer mutexes while a waiter needs the permit.
+# STEP 6 BACKEND LANDED (commit d766632): wasi-reactor with reactor-step
+# (progress-p / pending-p), reactor-watch-fd (keyed by (fd registration-id
+# direction) so a reused fd cannot inherit an old registration),
+# reactor-watch-deadline, reactor-wake (O_NONBLOCK|O_CLOEXEC self-pipe, safe
+# cross-thread), reactor-close (idempotent, defers the read-end close until no
+# poller holds it). Injectable clock-fn/poll-fn; NVAL > ERR > HUP > direction
+# status precedence; one pump per step with a floored ms budget; EINTR re-poll;
+# callbacks outside the mutex in registration order. NOT yet wired into the
+# scheduler (that is the step-4 store driver's job). 6 wasi/reactor-* tests.
+# UNITS: 497 passed / 0 failed (481 + 10 wit/selection-* + 6 wasi/reactor-*).
+# NEXT: step 4 with facts (a)-(c) as hard constraints; then step 3's remainder
+# (world include/rename, named/inline interface bindings, positional
+# @external-id — %parse-world is still path-only); then step 5 (host-pending +
+# resumable stream copy) on top of the reactor, then steps 7-8.
 # M17 SESSION 2 (same plan, resumed on branch wip/abi-type-space): STEPS 1-3 LANDED.
 # THE ABI/HANDLE REWORK IS BACK IN THE TREE (commit 99c7e23) and the earlier
 # "reverted, not preserved" note below is superseded: abi-cx carries TYPE-INST
