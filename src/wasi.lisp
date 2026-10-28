@@ -660,6 +660,8 @@ exported but trapping (host-error) — the capability is withdrawable."
                     "FS-UNLINK-FILE-AT" "FS-RENAME-AT" "FS-READLINK-AT"
                     "FS-SYMLINK-AT" "FS-ADVISE" "FS-SYNC" "FS-SYNC-DATA"
                     "FS-SET-TIMES" "FS-SET-TIMES-AT" "FS-LINK-AT"
+                    "FS-READ-VIA-STREAM" "FS-WRITE-VIA-STREAM"
+                    "FS-APPEND-VIA-STREAM" "FS-READ-DIRECTORY"
                     "FS-GET-DIRECTORIES"))
       (export (intern name package) package))))
 
@@ -695,6 +697,50 @@ exported but trapping (host-error) — the capability is withdrawable."
 (sb-alien:define-alien-routine ("posix_fadvise" %libc-fadvise) sb-alien:int
   (fd sb-alien:int) (offset sb-alien:off-t) (length sb-alien:off-t)
   (advice sb-alien:int))
+
+;;; M16 slice 3b — THE STREAM SURFACE's OS primitives. pread/pwrite
+;;; keep the kernel file offset out of play entirely (the WIT: several
+;;; read/write/append streams on one open file "do not interfere").
+;;; The directory iterator goes through fdopendir/readdir: SBCL wraps
+;;; neither, so `struct dirent' is spelled out here. The layout is the
+;;; Linux LP64 one (both x86_64 and arm64): ino_t (8) + off_t (8) +
+;;; unsigned short d_reclen (2) + unsigned char d_type (1) + d_name
+;;; (256) — d_type at offset 18, d_name at 19. SBCL's struct
+;;; alignment agrees with the C compiler's (verified by layout, not
+;;; guessed: the size is 280 bytes, the 8-aligned rounding).
+(sb-alien:define-alien-routine ("pread" %libc-pread) sb-alien:long
+  (fd sb-alien:int) (buf (* sb-alien:unsigned-char))
+  (count sb-alien:size-t) (offset sb-alien:off-t))
+(sb-alien:define-alien-routine ("pwrite" %libc-pwrite) sb-alien:long
+  (fd sb-alien:int) (buf (* sb-alien:unsigned-char))
+  (count sb-alien:size-t) (offset sb-alien:off-t))
+
+(sb-alien:define-alien-type nil
+  (sb-alien:struct %dirent
+    (d-ino sb-alien:unsigned-long)
+    (d-off sb-alien:long)
+    (d-reclen sb-alien:unsigned-short)
+    (d-type sb-alien:unsigned-char)
+    (d-name (sb-alien:array sb-alien:char 256))))
+
+(sb-alien:define-alien-routine ("fdopendir" %libc-fdopendir)
+    (sb-alien:* (sb-alien:struct %dirent))
+  (fd sb-alien:int))
+(sb-alien:define-alien-routine ("readdir" %libc-readdir)
+    (sb-alien:* (sb-alien:struct %dirent))
+  (dirp (sb-alien:* (sb-alien:struct %dirent))))
+(sb-alien:define-alien-routine ("closedir" %libc-closedir) sb-alien:int
+  (dirp (sb-alien:* (sb-alien:struct %dirent))))
+
+;;; d_type values (linux dirent.h).
+(defparameter +dt-unknown+ 0)
+(defparameter +dt-fifo+ 1)
+(defparameter +dt-chr+ 2)
+(defparameter +dt-dir+ 4)
+(defparameter +dt-blk+ 6)
+(defparameter +dt-reg+ 8)
+(defparameter +dt-lnk+ 10)
+(defparameter +dt-sock+ 12)
 
 (sb-alien:define-alien-type nil
   (sb-alien:struct %wasi-timespec
@@ -1228,6 +1274,14 @@ UTIME_OMIT are the sentinels."
     p))
 
 ;;; ---------------------------------------------------------------
+;;; The WIT packages the filesystem functypes resolve against.
+
+(defun %filesystem-packages (&key (package (wasi-package "filesystem")))
+  "The WIT packages the filesystem functypes resolve against:
+filesystem itself and wasi:clocks (descriptor-stat's `instant')."
+  (list package (wasi-package "clocks")))
+
+;;; ---------------------------------------------------------------
 ;;; The descriptor methods (the WIT's async surface; the provider
 ;;; wraps each in the runtime's async-typed functype, so a guest's
 ;;; canon-lowered call goes through the canonical task protocol).
@@ -1483,6 +1537,416 @@ host error, not an error-code."
          nil)))))
 
 ;;; ---------------------------------------------------------------
+;;; M16 slice 3b — THE STREAM SURFACE: read/write/append-via-stream
+;;; and read-directory over the M16 slice-2 host stream/future ABI.
+;;;
+;;; Each method hands the guest one end of a host-backed pair and
+;;; keeps the other: a READ-VIA-STREAM's guest end pulls pread() bytes
+;;; at the guest's offset (the kernel file offset is never touched, so
+;;; several streams on one descriptor do not interfere); a
+;;; WRITE/APPEND-VIA-STREAM's guest end pushes bytes into a pwrite()
+;;; sink. The paired future resolves (:ok) at EOF / when the guest
+;;; drops the data end, (:err . code) on an OS error. The descriptor's
+;;; descriptor-flags gate all of it — the WIT's own error case.
+
+(defparameter *fs-stream-chunk* 4096
+  "The filesystem source's per-call read bound (the canonical ABI
+allows a short read; the guest simply asks again).")
+
+(defun %fs-u8-ct ()
+  "The stream<u8>'s ELEMENT ct (the pair's t-ct)."
+  (wasmdown.component:make-ct :kind :prim :payload :u8))
+
+(defun %filesystem-method-ct (method-name
+                              &key (package (wasi-package "filesystem")))
+  "The component functype of descriptor's METHOD-NAME as the WIT
+declares it (the implicit self borrow included)."
+  (let* ((interface (wasmdown.wit:package-interface package "types"))
+         (resource (find "descriptor"
+                         (wasmdown.wit:wit-interface-resource-list interface)
+                         :key #'wasmdown.wit:wit-resource-name
+                         :test #'string=))
+         (method (and resource
+                      (find method-name
+                            (wasmdown.wit:wit-resource-methods resource)
+                            :key #'wasmdown.wit:wit-func-name
+                            :test #'string=))))
+    (unless method
+      (error 'wasmdown:host-error
+             :message (format nil
+                              "wasi:filesystem/types has no descriptor.~a"
+                              method-name)))
+    (%resource-method-ct interface resource method
+                         (%filesystem-packages :package package))))
+
+(defun %fs-future-ct (method-name
+                      &key (package (wasi-package "filesystem")))
+  "The ELEMENT ct of the method's `future<result<_, error-code>>'
+(the result itself, or the future inside a tuple result)."
+  (let* ((ft (%filesystem-method-ct method-name :package package))
+         (result (second (wasmdown.component:ct-payload ft))))
+    (or (and result
+             (eq (wasmdown.component:ct-kind result) :future)
+             (wasmdown.component:ct-payload result))
+        (and result
+             (eq (wasmdown.component:ct-kind result) :tuple)
+             (let ((future
+                     (find-if (lambda (c)
+                                (eq (wasmdown.component:ct-kind c) :future))
+                              (coerce (wasmdown.component:ct-payload result)
+                                      'list))))
+               (and future (wasmdown.component:ct-payload future))))
+        (error 'wasmdown:host-error
+               :message (format nil "descriptor.~a has no future result"
+                                method-name)))))
+
+(defun %fs-stream-pair-cts (method-name
+                            &key (package (wasi-package "filesystem")))
+  "The (values ELEMENT-CT FUTURE-ELEMENT-CT) of a method whose result
+is tuple<stream<T>, future<result<_, error-code>>>."
+  (let* ((ft (%filesystem-method-ct method-name :package package))
+         (result (second (wasmdown.component:ct-payload ft)))
+         (parts (and result
+                     (coerce (wasmdown.component:ct-payload result) 'list)))
+         (stream (find-if (lambda (c)
+                            (eq (wasmdown.component:ct-kind c) :stream))
+                          parts)))
+    (unless stream
+      (error 'wasmdown:host-error
+             :message (format nil "descriptor.~a has no stream result"
+                              method-name)))
+    (values (wasmdown.component:ct-payload stream)
+            (%fs-future-ct method-name :package package))))
+
+(defun %require-read-capability (desc)
+  "The WIT's read gate: a descriptor without the read flag cannot
+produce bytes (its error case, never a trap)."
+  (unless (member "read" (wasi-descriptor-flags desc) :test #'string=)
+    (%fs-error "not-permitted")))
+
+(defun %require-write-capability (desc)
+  "The WIT's write gate: a descriptor without the write flag cannot
+produce a writable stream."
+  (unless (member "write" (wasi-descriptor-flags desc) :test #'string=)
+    (%fs-error "read-only")))
+
+(defmacro %fs-settle-once (done-var writer value)
+  `(unless ,done-var
+     (setf ,done-var t)
+     (wasmdown.component.runtime:host-future-resolve ,writer ,value)))
+
+(defun %fd-pread-source (fd offset settle)
+  "A host SOURCE over pread(FD, ..., POS): (max) -> (values byte-list
+eof-p). POS advances with every read and the kernel file offset is
+never consulted. A short/empty read is EOF and SETTLEs the future
+(:ok); an OS error SETTLEs it (:err . code) and also reports EOF (the
+source drops its end, so the guest's read sees DROPPED)."
+  (let ((pos offset))
+    (lambda (max)
+      (let ((want (min max *fs-stream-chunk*)))
+        (if (<= want 0)
+            (values nil nil)
+            (let ((buf (sb-alien:make-alien sb-alien:unsigned-char want)))
+              (unwind-protect
+                   (let ((n (%libc-pread fd buf want pos)))
+                     (cond
+                       ((minusp n)
+                        (funcall settle (cons :err (errno->error-code
+                                                    (sb-alien:get-errno))))
+                        (values nil t))
+                       ((zerop n)
+                        (funcall settle (cons :ok nil))
+                        (values nil t))
+                       (t
+                        (let ((bytes
+                                (loop for i below n
+                                      collect (sb-sys:sap-ref-8
+                                               (sb-alien:alien-sap buf) i))))
+                          (incf pos n)
+                          (when (< n want)
+                            (funcall settle (cons :ok nil)))
+                          (values bytes (< n want))))))
+                (sb-alien:free-alien buf))))))))
+
+(defun %byte-list->alien (bytes)
+  "A fresh unsigned-char alien holding BYTES (a u8 element list)."
+  (let ((buf (sb-alien:make-alien sb-alien:unsigned-char (length bytes))))
+    (loop for i from 0
+          for byte in bytes
+          do (setf (sb-sys:sap-ref-8 (sb-alien:alien-sap buf) i)
+                   (logand #xff byte)))
+    buf))
+
+(defun %fd-pwrite-sink (fd position-fn advance-fn)
+  "A host SINK writing BYTES at POSITION-FN's offset each drain:
+error-code label or NIL. ADVANCE-FN records the bytes written (the
+write-via-stream cursor advances; append re-reads the file's size
+every drain — O_APPEND/EOF-append semantics)."
+  (lambda (bytes)
+    (if (null bytes)
+        nil
+        (let ((n (length bytes)))
+          (if (zerop n)
+              nil
+              (let ((buf (%byte-list->alien bytes)))
+                (unwind-protect
+                     (let ((done 0)
+                           (pos (funcall position-fn fd)))
+                       (loop while (< done n)
+                             do (let* ((ptr (sb-alien:sap-alien
+                                             (sb-sys:sap+ (sb-alien:alien-sap buf)
+                                                          done)
+                                             (* sb-alien:unsigned-char)))
+                                       (written (%libc-pwrite fd ptr (- n done)
+                                                              pos)))
+                                  (cond
+                                    ((minusp written)
+                                     (return (errno->error-code
+                                              (sb-alien:get-errno))))
+                                    ((zerop written)
+                                     (return "io"))
+                                    (t
+                                     (incf done written)
+                                     (setf pos (funcall advance-fn pos
+                                                        written))))))
+                       nil)
+                  (sb-alien:free-alien buf))))))))
+
+(defun %fs-dropped-stream-and-future (elem-ct future-ct code)
+  "The REFUSED shape of a stream-returning method: the guest's stream
+end is already DROPPED and the paired future carries CODE (the WIT
+signature has no result, so error-code travels through the future)."
+  (multiple-value-bind (stream-reader stream-writer)
+      (wasmdown.component.runtime:make-host-stream-pair elem-ct)
+    (multiple-value-bind (future-reader future-writer)
+        (wasmdown.component.runtime:make-host-future-pair future-ct)
+      (wasmdown.component.runtime:host-end-drop stream-writer)
+      (wasmdown.component.runtime:host-future-resolve future-writer
+                                                     (cons :err code))
+      (list stream-reader future-reader))))
+
+(defun %fs-error-future (future-ct code)
+  "The REFUSED shape of a future-returning method: a future already
+resolved to (:err . CODE)."
+  (multiple-value-bind (future-reader future-writer)
+      (wasmdown.component.runtime:make-host-future-pair future-ct)
+    (wasmdown.component.runtime:host-future-resolve future-writer
+                                                   (cons :err code))
+    future-reader))
+
+(defun fs-read-via-stream (context self offset
+                           &key (package (wasi-package "filesystem")))
+  "pread-backed read stream: tuple<stream<u8>, future<result>>. The
+kernel file offset is never consulted, so concurrent streams on one
+descriptor cannot drift. A missing read flag (or a bad descriptor) is
+the REFUSED shape: a dropped stream + a future with the error-code."
+  (multiple-value-bind (elem-ct future-ct)
+      (%fs-stream-pair-cts "read-via-stream" :package package)
+    (handler-case
+        (let* ((desc (%descriptor-of context self
+                                     (descriptor-resource-ct :package package)))
+               (fd (%descriptor-fd desc)))
+          (%require-read-capability desc)
+          (multiple-value-bind (stream-reader stream-writer)
+              (wasmdown.component.runtime:make-host-stream-pair elem-ct)
+            (multiple-value-bind (future-reader future-writer)
+                (wasmdown.component.runtime:make-host-future-pair future-ct)
+              (let ((settled nil))
+                (flet ((settle (value)
+                         (%fs-settle-once settled future-writer value)))
+                  (wasmdown.component.runtime:host-end-set-source
+                   stream-writer (%fd-pread-source fd offset #'settle))
+                  (wasmdown.component.runtime:host-end-set-on-drop
+                   stream-writer
+                   (lambda (dropped error)
+                     (declare (ignore dropped))
+                     (settle (if error (cons :err error) (cons :ok nil)))))
+                  (list stream-reader future-reader))))))
+      (wasi-fs-error (c)
+        (%fs-dropped-stream-and-future elem-ct future-ct
+                                       (wasi-fs-error-code c))))))
+
+(defun %fs-write-stream (context self data future-method position-fn
+                         advance-fn)
+  "The write/append body: register DATA (the guest's readable end) as
+a pwrite sink, and resolve the result future when the guest drops its
+writable end (or a sink error drops the pair). A missing write flag
+(or a bad descriptor) drops DATA and returns a future already resolved
+to the error-code."
+  (let ((future-ct (%fs-future-ct future-method)))
+    (handler-case
+        (let* ((desc (%descriptor-of context self
+                                     (descriptor-resource-ct)))
+               (fd (%descriptor-fd desc)))
+          (%require-write-capability desc)
+          (unless (wasmdown.component.runtime:async-end-p data)
+            (%fs-error "invalid"))
+          (multiple-value-bind (future-reader future-writer)
+              (wasmdown.component.runtime:make-host-future-pair future-ct)
+            (let ((settled nil))
+              (flet ((settle (value)
+                       (%fs-settle-once settled future-writer value)))
+                (wasmdown.component.runtime:host-end-set-sink
+                 data (%fd-pwrite-sink fd position-fn advance-fn))
+                (wasmdown.component.runtime:host-end-set-on-drop
+                 data
+                 (lambda (dropped error)
+                   (declare (ignore dropped))
+                   (settle (if error (cons :err error) (cons :ok nil)))))
+                ;; the guest may have staged a write before the call
+                (wasmdown.component.runtime:host-end-drain data)
+                future-reader))))
+      (wasi-fs-error (c)
+        ;; the refused write: the guest's end learns DROPPED on its
+        ;; next write, the future carries the code
+        (when (wasmdown.component.runtime:async-end-p data)
+          (wasmdown.component.runtime:host-end-drop data))
+        (%fs-error-future future-ct (wasi-fs-error-code c))))))
+
+(defun fs-write-via-stream (context self data offset)
+  "pwrite-backed write stream starting at OFFSET."
+  (let ((pos offset))
+    (%fs-write-stream
+     context self data "write-via-stream"
+     (lambda (fd) (declare (ignore fd)) pos)
+     (lambda (p n) (+ p n)))))
+
+(defun fs-append-via-stream (context self data)
+  "append stream: every drain pwrites at the file's CURRENT size."
+  (%fs-write-stream
+   context self data "append-via-stream"
+   (lambda (fd) (nth-value 4 (%fstat fd)))
+   (lambda (p n) (declare (ignore n)) p)))
+
+;;; read-directory: a host source of directory-entry values.
+
+(defun %dirent-name (p)
+  "The NUL-terminated name of the dirent at P."
+  (let ((e (sb-alien:deref p)))
+    (map 'string #'code-char
+         (loop for i below 256
+               for n = (sb-alien:deref (sb-alien:slot e 'd-name) i)
+               until (zerop n)
+               collect n))))
+
+(defun %dirent-type (p)
+  (sb-alien:slot (sb-alien:deref p) 'd-type))
+
+(defun %dt->type (dt)
+  "The descriptor-type VARIANT value for a dirent d_type, or NIL when
+the filesystem declined to say (DT_UNKNOWN / an unknown value)."
+  (cond
+    ((= dt +dt-fifo+) (cons "fifo" nil))
+    ((= dt +dt-chr+) (cons "character-device" nil))
+    ((= dt +dt-dir+) (cons "directory" nil))
+    ((= dt +dt-blk+) (cons "block-device" nil))
+    ((= dt +dt-reg+) (cons "regular-file" nil))
+    ((= dt +dt-lnk+) (cons "symbolic-link" nil))
+    ((= dt +dt-sock+) (cons "socket" nil))
+    (t nil)))
+
+(defun %dirent-stat-type (dirfd name)
+  "The DT_UNKNOWN fallback: the entry's type via O_PATH|O_NOFOLLOW +
+fstat (never following the link — a symlink reports itself)."
+  (let ((fd (%libc-openat dirfd name (logior +o-path+ +o-nofollow+
+                                            +o-cloexec+) 0)))
+    (if (minusp fd)
+        (cons "other" nil)
+        (unwind-protect
+             (%mode->type (nth-value 2 (%fstat fd)))
+          (%close-fd fd)))))
+
+(defun %dirent-entry (p dirfd)
+  "The directory-entry domain value for the dirent at P."
+  (let ((name (%dirent-name p)))
+    (list (cons "%type" (or (%dt->type (%dirent-type p))
+                            (%dirent-stat-type dirfd name)))
+          (cons "name" name))))
+
+(defun %directory-source (dir dirfd settle)
+  "A host SOURCE over the fdopendir stream DIR (whose fds is DIRFD):
+(min) -> (values entry-list eof-p). `.` and `..` are omitted (the
+WIT's rule). At the end of the directory SETTLE the future (:ok); a
+readdir error SETTLEs (:err . code) and reports EOF."
+  (lambda (max)
+    (if (<= max 0)
+        (values nil nil)
+        (let ((entries '())
+              (eof nil))
+          ;; the requested bound counts DELIVERED entries: `.`/`..` are
+          ;; skipped inside the walk (a skipped entry must not turn the
+          ;; guest's read into a zero-progress completion).
+          (loop while (and (< (length entries) max) (not eof))
+                do (sb-alien:set-errno 0)
+                   (let ((p (%libc-readdir dir)))
+                     (cond
+                       ((sb-sys:sap= (sb-alien:alien-sap p) (sb-sys:int-sap 0))
+                        (setf eof t)
+                        (let ((errno (sb-alien:get-errno)))
+                          (if (zerop errno)
+                              (funcall settle (cons :ok nil))
+                              (funcall settle (cons :err
+                                                    (errno->error-code
+                                                     errno))))))
+                       (t
+                        (let ((name (%dirent-name p)))
+                          (unless (member name '("." "..") :test #'string=)
+                            (push (%dirent-entry p dirfd) entries)))))))
+          (values (nreverse entries) eof)))))
+
+(defun fs-read-directory (context self
+                          &key (package (wasi-package "filesystem")))
+  "A fresh directory iteration over SELF's descriptor. A missing read
+flag / a non-directory descriptor is the REFUSED shape (a dropped
+stream + a future with the error-code)."
+  (multiple-value-bind (elem-ct future-ct)
+      (%fs-stream-pair-cts "read-directory" :package package)
+    (handler-case
+        (let* ((desc (%descriptor-of context self
+                                     (descriptor-resource-ct :package package)))
+               (fd (%descriptor-fd desc)))
+          (%require-read-capability desc)
+          (unless (wasi-descriptor-dir-p desc)
+            (%fs-error "not-directory"))
+          ;; a FRESH fd for this iteration (fdopendir takes ownership:
+          ;; closedir closes it), so concurrent streams never share a
+          ;; directory cursor
+          (let ((dfd (%libc-openat fd "." (logior +o-rdonly+ +o-directory+
+                                                +o-cloexec+) 0)))
+            (when (minusp dfd)
+              (%fs-error (errno->error-code (sb-alien:get-errno))))
+            (let ((dir (%libc-fdopendir dfd)))
+              (when (sb-sys:sap= (sb-alien:alien-sap dir) (sb-sys:int-sap 0))
+                (%close-fd dfd)
+                (%fs-error (errno->error-code (sb-alien:get-errno))))
+              (multiple-value-bind (stream-reader stream-writer)
+                  (wasmdown.component.runtime:make-host-stream-pair elem-ct)
+                (multiple-value-bind (future-reader future-writer)
+                    (wasmdown.component.runtime:make-host-future-pair future-ct)
+                  (let ((settled nil)
+                        (closed nil))
+                    (labels ((close-dir ()
+                               (unless closed
+                                 (setf closed t)
+                                 (%libc-closedir dir)))
+                             (settle (value)
+                               (%fs-settle-once settled future-writer value)
+                               (when (consp value)
+                                 (close-dir))))
+                      (wasmdown.component.runtime:host-end-set-source
+                       stream-writer (%directory-source dir dfd #'settle))
+                      (wasmdown.component.runtime:host-end-set-on-drop
+                       stream-writer
+                       (lambda (dropped error)
+                         (declare (ignore dropped))
+                         (settle (if error (cons :err error) (cons :ok nil)))
+                         (close-dir)))
+                      (list stream-reader future-reader))))))))
+      (wasi-fs-error (c)
+        (%fs-dropped-stream-and-future elem-ct future-ct
+                                       (wasi-fs-error-code c))))))
+
+;;; ---------------------------------------------------------------
 ;;; preopens.get-directories.
 
 (defun fs-get-directories (context ct)
@@ -1496,11 +1960,6 @@ host error, not an error-code."
 
 (defun %bind-context (context function)
   (lambda (&rest args) (apply function context args)))
-
-(defun %filesystem-packages (&key (package (wasi-package "filesystem")))
-  "The WIT packages the filesystem functypes resolve against:
-filesystem itself and wasi:clocks (descriptor-stat's `instant')."
-  (list package (wasi-package "clocks")))
 
 (defun filesystem-types-instance (context
                                   &key (package (wasi-package "filesystem")))
@@ -1531,6 +1990,14 @@ CONTEXT's preopen authorities."
            (cons "readlink-at" (%bind-context context #'fs-readlink-at))
            (cons "symlink-at" (%bind-context context #'fs-symlink-at))
            (cons "open-at" (%bind-context context #'fs-open-at))
+           (cons "read-via-stream"
+                 (%bind-context context #'fs-read-via-stream))
+           (cons "write-via-stream"
+                 (%bind-context context #'fs-write-via-stream))
+           (cons "append-via-stream"
+                 (%bind-context context #'fs-append-via-stream))
+           (cons "read-directory"
+                 (%bind-context context #'fs-read-directory))
            (cons "is-same-object" (%bind-context context #'fs-is-same-object))
            (cons "metadata-hash" (%bind-context context #'fs-metadata-hash))
            (cons "metadata-hash-at"

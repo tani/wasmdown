@@ -960,7 +960,9 @@ removes NAMES (an evaluated list, so callers quote it) and the root."
                           "create-directory-at" "remove-directory-at"
                           "unlink-file-at" "rename-at" "link-at"
                           "readlink-at" "symlink-at" "open-at" "advise"
-                          "sync" "sync-data" "set-times" "set-times-at"))
+                          "sync" "sync-data" "set-times" "set-times-at"
+                          "read-via-stream" "write-via-stream"
+                          "append-via-stream" "read-directory"))
                (unless (has-method-p types m)
                  (error "missing exported method ~a" m)))
              ;; the method functype: the WIT signature + the implicit
@@ -1138,3 +1140,666 @@ removes NAMES (an evaluated list, so callers quote it) and the root."
                                     (wasmdown.wasi:wasi-preopen-fd pre)))
                       (wasmdown.component.runtime:lifted-func-call g)))))
         (wasmdown.wasi:close-wasi-preopen pre)))))
+
+;;; ===============================================================
+;;; M16 SLICE 3b — THE FILESYSTEM STREAM SURFACE: read/write/
+;;; append-via-stream + read-directory over the host stream/future
+;;; ABI, and the async canon path.
+;;; ===============================================================
+
+;;; ---------------------------------------------------------------
+;;; CL-side drivers for the host ends (the provider's peer).
+
+(defun fs-bytes (path)
+  "PATH's bytes as a u8 list."
+  (with-open-file (s path :element-type '(unsigned-byte 8))
+    (let ((v (make-array (file-length s)
+                         :element-type '(unsigned-byte 8))))
+      (read-sequence v s)
+      (coerce v 'list))))
+
+(defun fs-drain-source (reader &optional (limit 64))
+  "Read the guest end READER into CL buffers until DROPPED; the
+accumulated u8 values."
+  (let ((out '()))
+    (loop
+      (let ((buf (wasmdown.component.runtime:make-host-buffer limit)))
+        (rtcall "%END-COPY" reader buf t)
+        (setf out (append out (wasmdown.component.runtime:host-buffer-values
+                               buf)))
+        (let ((ev (third (rtcall "%WAITABLE-GET-PENDING-EVENT" reader))))
+          (when (< (logand ev #xf) 2)   ; DROPPED(1)/CANCELLED(2)
+            (return out)))))))
+
+(defun fs-stage-write (writer bytes)
+  "The guest's write through WRITER; returns the packed event code."
+  (rtcall "%END-COPY" writer
+          (wasmdown.component.runtime:make-host-buffer
+           (length bytes) :values bytes)
+          nil)
+  (third (rtcall "%WAITABLE-GET-PENDING-EVENT" writer)))
+
+(defun fs-drop-end (end)
+  (rtcall "%END-DROP" end))
+
+(defun fs-future-value (future)
+  "The (single) value a host future delivers."
+  (let ((buf (wasmdown.component.runtime:make-host-buffer 1)))
+    (rtcall "%END-COPY" future buf t)
+    (first (wasmdown.component.runtime:host-buffer-values buf))))
+
+(defun fs-fresh-stream ()
+  (wasmdown.component.runtime:make-host-stream-pair *u8-ct*))
+
+(defun fs-open-file (ctx base path open-flags flags)
+  "open-at through the preopen descriptor BASE."
+  (third (fs-ok-value (wasmdown.wasi:fs-open-at ctx base nil path
+                                               open-flags flags))))
+
+(test wasi/fs-write-via-stream
+  (with-fs-root (root "fs-wvs" '("out.txt"))
+    (let* ((pre (wasmdown.wasi:open-wasi-preopen root :name "/r"))
+           (ctx (wasmdown.wasi:make-wasi-context :preopens (list pre)))
+           (d (wasmdown.wasi:wasi-preopen-descriptor pre)))
+      (unwind-protect
+           (let ((desc (fs-open-file ctx d "out.txt"
+                                     (cons :flags '("create"))
+                                     (cons :flags '("read" "write")))))
+             (unwind-protect
+                  (progn
+                    ;; write "hello" at offset 0
+                    (multiple-value-bind (reader writer) (fs-fresh-stream)
+                      (let ((future (wasmdown.wasi:fs-write-via-stream
+                                     ctx desc reader 0)))
+                        (is (wasmdown.component.runtime:async-end-p future))
+                        (is (eql (%completed 5)
+                                 (fs-stage-write writer '(104 101 108 108 111))))
+                        ;; the bytes are on disk once drained (synchronously
+                        ;; at the guest's write), not only at the drop
+                        (is (equal '(104 101 108 108 111)
+                                   (fs-bytes (fs-p root "out.txt"))))
+                        ;; dropping the writable end resolves the future
+                        (fs-drop-end writer)
+                        (is (equal '(:ok) (fs-future-value future)))))
+                    ;; a second stream writes PAST the end (a zero-filled
+                    ;; gap — the WIT: "the file is extended to the extent
+                    ;; of the write")
+                    (multiple-value-bind (reader writer) (fs-fresh-stream)
+                      (let ((future (wasmdown.wasi:fs-write-via-stream
+                                     ctx desc reader 8)))
+                        (fs-stage-write writer '(88))
+                        (fs-drop-end writer)
+                        (is (equal '(:ok) (fs-future-value future))))
+                      ;; the kernel file offset never moved: the writes
+                      ;; were pwrite, so the descriptor is still at 0
+                      (is (= 0 (sb-unix:unix-lseek
+                                (wasmdown.wasi:wasi-descriptor-fd desc)
+                                0 sb-unix:l_incr))))
+                    (is (equal '(104 101 108 108 111 0 0 0 88)
+                               (fs-bytes (fs-p root "out.txt")))))
+               (wasmdown.wasi:close-wasi-descriptor desc)))
+        (wasmdown.wasi:close-wasi-preopen pre)))))
+
+(test wasi/fs-read-via-stream-offset-independence
+  (with-fs-root (root "fs-rvs" '("data.txt"))
+    (fs-write! (fs-p root "data.txt") "abcdefghij")
+    (let* ((pre (wasmdown.wasi:open-wasi-preopen root :name "/r"))
+           (ctx (wasmdown.wasi:make-wasi-context :preopens (list pre)))
+           (d (wasmdown.wasi:wasi-preopen-descriptor pre)))
+      (unwind-protect
+           (let* ((desc (fs-open-file ctx d "data.txt" nil
+                                      (cons :flags '("read"))))
+                  (a (wasmdown.wasi:fs-read-via-stream ctx desc 2))
+                  (b (wasmdown.wasi:fs-read-via-stream ctx desc 5))
+                  (sa (first a)) (fa (second a))
+                  (sb (first b)) (fb (second b)))
+             ;; two streams, different offsets: interleaved reads pull
+             ;; THEIR OWN windows (no shared offset drift)
+             (is (equal '(99 100 101) (fs-drain-3 sa)))   ; offset 2
+             (is (equal '(102 103 104) (fs-drain-3 sb)))   ; offset 5
+             (is (equal '(102 103 104) (fs-drain-3 sa)))   ; offset 5
+             (is (equal '(105 106) (fs-drain-3 sb)))       ; offset 8
+             (is (equal '(105 106) (fs-drain-3 sa)))
+             (is (equal nil (fs-drain-3 sa)))
+             (is (equal nil (fs-drain-3 sb)))
+             ;; the fd's own kernel offset was never touched
+             (is (= 0 (sb-unix:unix-lseek
+                       (wasmdown.wasi:wasi-descriptor-fd desc)
+                       0 sb-unix:l_incr)))
+             ;; both futures ended (:ok) at EOF
+             (is (equal '(:ok) (fs-future-value fa)))
+             (is (equal '(:ok) (fs-future-value fb)))
+             (wasmdown.wasi:close-wasi-descriptor desc))
+        (wasmdown.wasi:close-wasi-preopen pre)))))
+
+(defun fs-drain-3 (reader)
+  "One 3-element CL read from READER (NIL at DROPPED)."
+  (let ((buf (wasmdown.component.runtime:make-host-buffer 3)))
+    (rtcall "%END-COPY" reader buf t)
+    (let ((vals (wasmdown.component.runtime:host-buffer-values buf)))
+      (and vals (not (eql 1 (logand (third (rtcall "%WAITABLE-GET-PENDING-EVENT"
+                                                   reader))
+                                    #xf)))
+           vals))))
+
+(test wasi/fs-append-via-stream
+  (with-fs-root (root "fs-avs" '("log.txt"))
+    (fs-write! (fs-p root "log.txt") "ab")
+    (let* ((pre (wasmdown.wasi:open-wasi-preopen root :name "/r"))
+           (ctx (wasmdown.wasi:make-wasi-context :preopens (list pre)))
+           (d (wasmdown.wasi:wasi-preopen-descriptor pre)))
+      (unwind-protect
+           (let ((desc (fs-open-file ctx d "log.txt" nil
+                                     (cons :flags '("read" "write")))))
+             (unwind-protect
+                  (multiple-value-bind (reader writer) (fs-fresh-stream)
+                    (let ((future (wasmdown.wasi:fs-append-via-stream
+                                   ctx desc reader)))
+                      ;; two drains of the SAME append stream: each goes to
+                      ;; the file's CURRENT end (O_APPEND semantics), so the
+                      ;; second chunk lands after the first
+                      (is (eql (%completed 2) (fs-stage-write writer '(99 100))))
+                      (is (eql (%completed 2) (fs-stage-write writer '(101 102))))
+                      (fs-drop-end writer)
+                      (is (equal '(:ok) (fs-future-value future)))
+                      (is (equal '(97 98 99 100 101 102)
+                                 (fs-bytes (fs-p root "log.txt"))))))
+               (wasmdown.wasi:close-wasi-descriptor desc)))
+        (wasmdown.wasi:close-wasi-preopen pre)))))
+
+(test wasi/fs-stream-flag-gating
+  (with-fs-root (root "fs-gate" '("w.txt" "r.txt" "dir"))
+    (fs-write! (fs-p root "w.txt") "x")
+    (fs-write! (fs-p root "r.txt") "y")
+    (fs-mkdir! (fs-p root "dir"))
+    (let* ((pre (wasmdown.wasi:open-wasi-preopen root :name "/r"))
+           (ctx (wasmdown.wasi:make-wasi-context :preopens (list pre)))
+           (d (wasmdown.wasi:wasi-preopen-descriptor pre)))
+      (unwind-protect
+           (let ((w (fs-open-file ctx d "w.txt" nil (cons :flags '("write"))))
+                 (rd (fs-open-file ctx d "r.txt" nil (cons :flags '("read")))))
+             (unwind-protect
+                  (progn
+                    ;; read needs the read flag: a DROPPED stream and a
+                    ;; future carrying the WIT error-code
+                    (let ((pair (wasmdown.wasi:fs-read-via-stream ctx w 0)))
+                      (is (equal nil (fs-drain-3 (first pair))))
+                      (is (equal '(:err . "not-permitted")
+                                 (fs-future-value (second pair)))))
+                    (let ((pair (wasmdown.wasi:fs-read-directory ctx w)))
+                      (is (equal '(:err . "not-permitted")
+                                 (fs-future-value (second pair)))))
+                    ;; the write forms need the write flag
+                    (multiple-value-bind (reader writer) (fs-fresh-stream)
+                      (is (equal '(:err . "read-only")
+                                 (fs-future-value
+                                  (wasmdown.wasi:fs-write-via-stream
+                                   ctx rd reader 0))))
+                      ;; the guest's staged write now meets DROPPED
+                      (is (eql 1 (logand (fs-stage-write writer '(1)) #xf))))
+                    (multiple-value-bind (reader writer) (fs-fresh-stream)
+                      (declare (ignore writer))
+                      (is (equal '(:err . "read-only")
+                                 (fs-future-value
+                                  (wasmdown.wasi:fs-append-via-stream
+                                   ctx rd reader)))))
+                    ;; a directory opened read-only IS readable
+                    (let ((dir (fs-open-file ctx d "dir"
+                                             (cons :flags '("directory"))
+                                             (cons :flags '("read")))))
+                      (unwind-protect
+                           (let ((pair (wasmdown.wasi:fs-read-directory ctx dir)))
+                             (is (wasmdown.component.runtime:async-end-p
+                                  (first pair)))
+                             (is (wasmdown.component.runtime:async-end-p
+                                  (second pair))))
+                        (wasmdown.wasi:close-wasi-descriptor dir))))
+               (wasmdown.wasi:close-wasi-descriptor w)
+               (wasmdown.wasi:close-wasi-descriptor rd)))
+        (wasmdown.wasi:close-wasi-preopen pre)))))
+
+(test wasi/fs-stream-read-error-future
+  ;; A read on a DIRECTORY descriptor: pread fails with EISDIR — the
+  ;; future carries the WIT error case, the stream ends DROPPED.
+  (with-fs-root (root "fs-rerr" '("dir"))
+    (fs-mkdir! (fs-p root "dir"))
+    (let* ((pre (wasmdown.wasi:open-wasi-preopen root :name "/r"))
+           (ctx (wasmdown.wasi:make-wasi-context :preopens (list pre)))
+           (d (wasmdown.wasi:wasi-preopen-descriptor pre)))
+      (unwind-protect
+           (let* ((sub (fs-open-file ctx d "dir"
+                                     (cons :flags '("directory"))
+                                     (cons :flags '("read"))))
+                  (entry (wasmdown.wasi:fs-read-via-stream ctx sub 0))
+                  (stream (first entry))
+                  (future (second entry)))
+             (unwind-protect
+                  (progn
+                    (is (equal nil (fs-drain-3 stream)))
+                    (is (eql 1 (logand (third (rtcall "%WAITABLE-GET-PENDING-EVENT"
+                                                      stream))
+                                       #xf)))
+                    (is (equal '(:err . "is-directory")
+                               (fs-future-value future))))
+               (wasmdown.wasi:close-wasi-descriptor sub)))
+        (wasmdown.wasi:close-wasi-preopen pre)))))
+
+(test wasi/fs-read-directory
+  (with-fs-root (root "fs-rd" '("a.txt" "sub" "lnk"))
+    (fs-write! (fs-p root "a.txt") "hi")
+    (fs-mkdir! (fs-p root "sub"))
+    (fs-symlink! "a.txt" (fs-p root "lnk"))
+    (let* ((pre (wasmdown.wasi:open-wasi-preopen root :name "/r"))
+           (ctx (wasmdown.wasi:make-wasi-context :preopens (list pre)))
+           (d (wasmdown.wasi:wasi-preopen-descriptor pre)))
+      (unwind-protect
+           (let* ((pair (wasmdown.wasi:fs-read-directory ctx d))
+                  (stream (first pair))
+                  (future (second pair))
+                  (buf (wasmdown.component.runtime:make-host-buffer 16)))
+             (rtcall "%END-COPY" stream buf t)
+             (let* ((entries (wasmdown.component.runtime:host-buffer-values buf))
+                    (by-name (mapcar (lambda (e)
+                                       (cons (cdr (assoc "name" e :test #'string=))
+                                             (second (assoc "%type" e
+                                                            :test #'string=))))
+                                     entries)))
+               (is (eql (%completed 3)
+                        (third (rtcall "%WAITABLE-GET-PENDING-EVENT" stream))))
+               ;; `.` and `..` are omitted
+               (is (null (assoc "." by-name :test #'string=)))
+               (is (null (assoc ".." by-name :test #'string=)))
+               ;; every entry with its type (d_type on this filesystem)
+               (is (equal (sort (copy-list by-name) #'string< :key #'car)
+                          '(("a.txt" . "regular-file")
+                            ("lnk" . "symbolic-link")
+                            ("sub" . "directory")))))
+             ;; a second read is DROPPED (the directory is exhausted); the
+             ;; future resolved (:ok) at the end of the iteration
+             (is (equal nil (fs-drain-3 stream)))
+             (is (equal '(:ok) (fs-future-value future)))
+             ;; a SECOND stream starts at the beginning again (the WIT:
+             ;; "always returns a new stream which starts at the
+             ;; beginning"; concurrent streams do not interfere)
+             (let* ((pair2 (wasmdown.wasi:fs-read-directory ctx d))
+                    (buf2 (wasmdown.component.runtime:make-host-buffer 1)))
+               (rtcall "%END-COPY" (first pair2) buf2 t)
+               (is (eql 1 (length (wasmdown.component.runtime:host-buffer-values
+                                   buf2)))))
+             ;; the DT_UNKNOWN fallback: the entry's type from
+             ;; O_PATH|O_NOFOLLOW + fstat (a link reports ITSELF)
+             (let ((dirfd (wasmdown.wasi::%libc-openat
+                           (wasmdown.wasi:wasi-preopen-fd pre) "."
+                           (logior wasmdown.wasi::+o-rdonly+
+                                   wasmdown.wasi::+o-directory+
+                                   wasmdown.wasi::+o-cloexec+)
+                           0)))
+               (unwind-protect
+                    (progn
+                      (is (equal "regular-file"
+                                 (car (wasmdown.wasi::%dirent-stat-type
+                                       dirfd "a.txt"))))
+                      (is (equal "symbolic-link"
+                                 (car (wasmdown.wasi::%dirent-stat-type
+                                       dirfd "lnk")))))
+                 (wasmdown.wasi::%close-fd dirfd))))
+        (wasmdown.wasi:close-wasi-preopen pre)))))
+
+;;; ---------------------------------------------------------------
+;;; THE END-TO-END STREAM FIXTURE: a component writes "hello" through
+;;; write-via-stream at offset 0, appends "!" through
+;;; append-via-stream, reads the whole file back through
+;;; read-via-stream(0) into its own memory and returns n<<8|byte0.
+
+(defparameter *fs-stream-fixture*
+  (concatenate
+   'string
+   "(component"
+   " (type $ST (stream u8))"
+   " (type $FT (future (result u32 u32)))"
+   " (import \"wasi:filesystem/types@0.3.2\""
+   "   (instance $fs"
+   "     (export \"descriptor\" (type $D (sub resource)))"
+   "     (export \"[method]descriptor.write-via-stream\""
+   "       (func (param \"self\" (borrow $D)) (param \"data\" (stream u8))"
+   "             (param \"offset\" u64) (result (future (result u32 u32)))))"
+   "     (export \"[method]descriptor.read-via-stream\""
+   "       (func (param \"self\" (borrow $D)) (param \"offset\" u64)"
+   "             (result (tuple (stream u8) (future (result u32 u32))))))"
+   "     (export \"[method]descriptor.append-via-stream\""
+   "       (func (param \"self\" (borrow $D)) (param \"data\" (stream u8))"
+   "             (result (future (result u32 u32)))))"
+   "     (export \"[method]descriptor.open-at\""
+   "       (func (param \"self\" (borrow $D))"
+   "             (param \"path-flags\" u32) (param \"path\" string)"
+   "             (param \"open-flags\" u32) (param \"flags\" u32)"
+   "             (result (result (own $D) u32))))))"
+   " (import \"wasi:filesystem/preopens@0.3.2\""
+   "   (instance $pre"
+   "     (export \"descriptor\" (type $D2 (sub resource)))"
+   "     (export \"get-directories\""
+   "       (func (result (list (tuple (own $D2) string)))))))"
+   " (alias export $pre \"get-directories\" (func $gd))"
+   " (alias export $fs \"[method]descriptor.write-via-stream\" (func $wvs))"
+   " (alias export $fs \"[method]descriptor.read-via-stream\" (func $rvs))"
+   " (alias export $fs \"[method]descriptor.append-via-stream\" (func $avs))"
+   " (alias export $fs \"[method]descriptor.open-at\" (func $open-at))"
+   " (core module $Mem"
+   "   (memory (export \"mem\") 1)"
+   "   (global $bump (mut i32) (i32.const 1024))"
+   "   (func (export \"realloc\") (param i32 i32 i32 i32) (result i32)"
+   "     (local $p i32)"
+   "     (local.set $p"
+   "       (i32.and (i32.add (global.get $bump)"
+   "                         (i32.sub (local.get 2) (i32.const 1)))"
+   "                (i32.sub (i32.const 0) (local.get 2))))"
+   "     (global.set $bump (i32.add (local.get $p) (local.get 3)))"
+   "     (local.get $p)))"
+   " (core instance $memory (instantiate $Mem))"
+   " (core func $gd-lowered"
+   "   (canon lower (func $gd) (memory (core memory $memory \"mem\"))"
+   "                (realloc (core func $memory \"realloc\"))))"
+   " (core func $wvs-lowered"
+   "   (canon lower (func $wvs) (memory (core memory $memory \"mem\"))"
+   "                (realloc (core func $memory \"realloc\"))))"
+   " (core func $rvs-lowered"
+   "   (canon lower (func $rvs) (memory (core memory $memory \"mem\"))"
+   "                (realloc (core func $memory \"realloc\"))))"
+   " (core func $avs-lowered"
+   "   (canon lower (func $avs) (memory (core memory $memory \"mem\"))"
+   "                (realloc (core func $memory \"realloc\"))))"
+   " (core func $open-lowered"
+   "   (canon lower (func $open-at) (memory (core memory $memory \"mem\"))"
+   "                (realloc (core func $memory \"realloc\"))))"
+   " (canon stream.new $ST (core func $snew))"
+   " (canon stream.write $ST (memory (core memory $memory \"mem\"))"
+   "       (core func $swrite))"
+   " (canon stream.read $ST (memory (core memory $memory \"mem\"))"
+   "       (core func $sread))"
+   " (canon stream.drop-writable $ST (core func $sdropw))"
+   " (canon future.read $FT (memory (core memory $memory \"mem\"))"
+   "       (core func $fread))"
+   " (core module $M"
+   "   (import \"env\" \"mem\" (memory 1))"
+   "   (import \"env\" \"gd\" (func $gd (param i32)))"
+   "   (import \"env\" \"wvs\" (func $wvs (param i32 i32 i64) (result i32)))"
+   "   (import \"env\" \"rvs\" (func $rvs (param i32 i64 i32)))"
+   "   (import \"env\" \"avs\" (func $avs (param i32 i32) (result i32)))"
+   "   (import \"env\" \"open\" (func $open (param i32 i32 i32 i32 i32 i32 i32)))"
+   "   (import \"env\" \"snew\" (func $snew (result i64)))"
+   "   (import \"env\" \"swrite\" (func $swrite (param i32 i32 i32) (result i32)))"
+   "   (import \"env\" \"sread\" (func $sread (param i32 i32 i32) (result i32)))"
+   "   (import \"env\" \"sdropw\" (func $sdropw (param i32)))"
+   "   (import \"env\" \"fread\" (func $fread (param i32 i32) (result i32)))"
+   "   (func (export \"f\") (result i32)"
+   "     (local $d i32) (local $pair i64) (local $rx i32) (local $tx i32)"
+   "     (local $fut i32) (local $r i32) (local $n i32)"
+   "     (call $gd (i32.const 0))"
+   "     (local.set $d (i32.load (i32.load (i32.const 0))))"
+   "     (i32.store (i32.const 256) (i32.const 778530668))"
+   "     (i32.store (i32.const 260) (i32.const 7633012))"
+   "     (call $open (local.get $d) (i32.const 0) (i32.const 256)"
+   "                 (i32.const 7) (i32.const 1) (i32.const 3)"
+   "                 (i32.const 128))"
+   "     (if (i32.ne (i32.const 0) (i32.load8_u (i32.const 128)))"
+   "         (then unreachable))"
+   "     (local.set $d (i32.load (i32.const 132)))"
+   "     (i32.store8 (i32.const 512) (i32.const 104))"
+   "     (i32.store8 (i32.const 513) (i32.const 101))"
+   "     (i32.store8 (i32.const 514) (i32.const 108))"
+   "     (i32.store8 (i32.const 515) (i32.const 108))"
+   "     (i32.store8 (i32.const 516) (i32.const 111))"
+   "     (local.set $pair (call $snew))"
+   "     (local.set $rx (i32.wrap_i64 (local.get $pair)))"
+   "     (local.set $tx (i32.wrap_i64 (i64.shr_u (local.get $pair) (i64.const 32))))"
+   "     (local.set $fut (call $wvs (local.get $d) (local.get $rx) (i64.const 0)))"
+   "     (local.set $r (call $swrite (local.get $tx) (i32.const 512) (i32.const 5)))"
+   "     (if (i32.ne (i32.const 80) (local.get $r)) (then unreachable))"
+   "     (call $sdropw (local.get $tx))"
+   "     (local.set $r (call $fread (local.get $fut) (i32.const 544)))"
+   "     (if (i32.ne (i32.const 0) (local.get $r)) (then unreachable))"
+   "     (if (i32.ne (i32.const 0) (i32.load8_u (i32.const 544))) (then unreachable))"
+   "     (i32.store8 (i32.const 520) (i32.const 33))"
+   "     (local.set $pair (call $snew))"
+   "     (local.set $rx (i32.wrap_i64 (local.get $pair)))"
+   "     (local.set $tx (i32.wrap_i64 (i64.shr_u (local.get $pair) (i64.const 32))))"
+   "     (local.set $fut (call $avs (local.get $d) (local.get $rx)))"
+   "     (local.set $r (call $swrite (local.get $tx) (i32.const 520) (i32.const 1)))"
+   "     (if (i32.ne (i32.const 16) (local.get $r)) (then unreachable))"
+   "     (call $sdropw (local.get $tx))"
+   "     (if (i32.ne (i32.const 0) (call $fread (local.get $fut) (i32.const 548)))"
+   "         (then unreachable))"
+   "     (call $rvs (local.get $d) (i64.const 0) (i32.const 560))"
+   "     (local.set $rx (i32.load (i32.const 560)))"
+   "     (local.set $r (call $sread (local.get $rx) (i32.const 600) (i32.const 20)))"
+   "     (local.set $n (i32.shr_u (local.get $r) (i32.const 4)))"
+   "     (i32.or (i32.shl (local.get $n) (i32.const 8))"
+   "             (i32.load8_u (i32.const 600)))))"
+   " (core instance $m (instantiate $M (with \"env\" (instance"
+   "   (export \"mem\" (memory $memory \"mem\"))"
+   "   (export \"gd\" (func $gd-lowered))"
+   "   (export \"wvs\" (func $wvs-lowered))"
+   "   (export \"rvs\" (func $rvs-lowered))"
+   "   (export \"avs\" (func $avs-lowered))"
+   "   (export \"open\" (func $open-lowered))"
+   "   (export \"snew\" (func $snew))"
+   "   (export \"swrite\" (func $swrite))"
+   "   (export \"sread\" (func $sread))"
+   "   (export \"sdropw\" (func $sdropw))"
+   "   (export \"fread\" (func $fread))))))"
+   " (func (export \"f\") (result u32) (canon lift (core func $m \"f\"))))"))
+
+(test wasi/e2e-filesystem-stream-component
+  (with-fs-root (root "fs-stream-e2e" '("log.txt"))
+    (let* ((pre (wasmdown.wasi:open-wasi-preopen root :name "/sandbox"))
+           (ctx (wasmdown.wasi:make-wasi-context :preopens (list pre)))
+           (comp (wasmdown.component.text::parse-component-text
+                  *fs-stream-fixture*)))
+      (unwind-protect
+           (progn
+             (wasmdown.component:validate-component comp)
+             (let* ((inst (wasmdown.component.runtime:instantiate-component
+                           comp
+                           :with-args (wasmdown.wasi:filesystem-provider ctx)))
+                    (f (wasmdown.component.runtime:runtime-export-value inst "f")))
+               ;; 6 bytes read back, first byte 'h' (n<<8|byte0)
+               (is (eql 1640 (wasmdown.component.runtime:lifted-func-call f)))
+               ;; the host sees exactly the bytes the guest wrote and
+               ;; appended
+               (is (equal '(104 101 108 108 111 33)
+                          (fs-bytes (fs-p root "log.txt"))))))
+        (wasmdown.wasi:close-wasi-preopen pre)))))
+
+;;; ---------------------------------------------------------------
+;;; THE ASYNC CANON FIXTURE: a guest that canon-lowers ASYNC-typed
+;;; filesystem methods with `async` (the packed state|subtask<<4
+;;; return, the [ptr] out-param) and drives the waitable-set
+;;; protocol. `is-same-object(d, d)` proves the borrow-param lend +
+;;; scalar result; `write-via-stream` proves a STREAM/FUTURE result
+;;; lowered into the caller's table through the async path, with the
+;;; future's resolution delivered by waitable-set.wait after the
+;;; guest drops the writable end.
+
+(defparameter *fs-async-canon-fixture*
+  (concatenate
+   'string
+   "(component"
+   " (type $ST (stream u8))"
+   " (type $FT (future (result u32 u32)))"
+   " (import \"wasi:filesystem/types@0.3.2\""
+   "   (instance $fs"
+   "     (export \"descriptor\" (type $D (sub resource)))"
+   "     (export \"[method]descriptor.is-same-object\""
+   "       (func async (param \"self\" (borrow $D))"
+   "             (param \"other\" (borrow $D)) (result bool)))"
+   "     (export \"[method]descriptor.write-via-stream\""
+   "       (func async (param \"self\" (borrow $D)) (param \"data\" (stream u8))"
+   "             (param \"offset\" u64) (result (future (result u32 u32)))))"
+   "     (export \"[method]descriptor.open-at\""
+   "       (func (param \"self\" (borrow $D))"
+   "             (param \"path-flags\" u32) (param \"path\" string)"
+   "             (param \"open-flags\" u32) (param \"flags\" u32)"
+   "             (result (result (own $D) u32))))))"
+   " (import \"wasi:filesystem/preopens@0.3.2\""
+   "   (instance $pre"
+   "     (export \"descriptor\" (type $D2 (sub resource)))"
+   "     (export \"get-directories\""
+   "       (func (result (list (tuple (own $D2) string)))))))"
+   " (alias export $pre \"get-directories\" (func $gd))"
+   " (alias export $fs \"[method]descriptor.is-same-object\" (func $same))"
+   " (alias export $fs \"[method]descriptor.write-via-stream\" (func $wvs))"
+   " (alias export $fs \"[method]descriptor.open-at\" (func $open-at))"
+   " (core module $Mem"
+   "   (memory (export \"mem\") 1)"
+   "   (global $bump (mut i32) (i32.const 1024))"
+   "   (func (export \"realloc\") (param i32 i32 i32 i32) (result i32)"
+   "     (local $p i32)"
+   "     (local.set $p"
+   "       (i32.and (i32.add (global.get $bump)"
+   "                         (i32.sub (local.get 2) (i32.const 1)))"
+   "                (i32.sub (i32.const 0) (local.get 2))))"
+   "     (global.set $bump (i32.add (local.get $p) (local.get 3)))"
+   "     (local.get $p)))"
+   " (core instance $memory (instantiate $Mem))"
+   " (core func $gd-lowered"
+   "   (canon lower (func $gd) (memory (core memory $memory \"mem\"))"
+   "                (realloc (core func $memory \"realloc\"))))"
+   " (core func $same-lowered"
+   "   (canon lower (func $same) async (memory (core memory $memory \"mem\"))"
+   "                (realloc (core func $memory \"realloc\"))))"
+   " (core func $wvs-lowered"
+   "   (canon lower (func $wvs) async (memory (core memory $memory \"mem\"))"
+   "                (realloc (core func $memory \"realloc\"))))"
+   " (core func $open-lowered"
+   "   (canon lower (func $open-at) (memory (core memory $memory \"mem\"))"
+   "                (realloc (core func $memory \"realloc\"))))"
+   " (canon stream.new $ST (core func $snew))"
+   " (canon stream.write $ST async (memory (core memory $memory \"mem\"))"
+   "       (core func $swrite))"
+   " (canon stream.drop-writable $ST (core func $sdropw))"
+   " (canon future.read $FT async (memory (core memory $memory \"mem\"))"
+   "       (core func $fread))"
+   " (canon subtask.drop (core func $subdrop))"
+   " (canon waitable.join (core func $join))"
+   " (canon waitable-set.new (core func $wsnew))"
+   " (canon waitable-set.wait (memory (core memory $memory \"mem\"))"
+   "       (core func $wait))"
+   " (core module $M"
+   "   (import \"env\" \"mem\" (memory 1))"
+   "   (import \"env\" \"gd\" (func $gd (param i32)))"
+   "   (import \"env\" \"same\" (func $same (param i32 i32 i32) (result i32)))"
+   "   (import \"env\" \"wvs\" (func $wvs (param i32 i32 i64 i32) (result i32)))"
+   "   (import \"env\" \"open\" (func $open (param i32 i32 i32 i32 i32 i32 i32)))"
+   "   (import \"env\" \"snew\" (func $snew (result i64)))"
+   "   (import \"env\" \"swrite\" (func $swrite (param i32 i32 i32) (result i32)))"
+   "   (import \"env\" \"sdropw\" (func $sdropw (param i32)))"
+   "   (import \"env\" \"fread\" (func $fread (param i32 i32) (result i32)))"
+   "   (import \"env\" \"subdrop\" (func $subdrop (param i32)))"
+   "   (import \"env\" \"join\" (func $join (param i32 i32)))"
+   "   (import \"env\" \"wsnew\" (func $wsnew (result i32)))"
+   "   (import \"env\" \"wait\" (func $wait (param i32 i32) (result i32)))"
+   "   (func $poll-subtask (param $packed i32) (param $ws i32)"
+   "     (local $sub i32)"
+   "     (if (i32.ne (i32.and (local.get $packed) (i32.const 15)) (i32.const 2))"
+   "       (then"
+   "         (local.set $sub (i32.shr_u (local.get $packed) (i32.const 4)))"
+   "         (call $join (local.get $sub) (local.get $ws))"
+   "         (block $done"
+   "           (loop $poll"
+   "             (drop (call $wait (local.get $ws) (i32.const 224)))"
+   "             (br_if $done (i32.eq (i32.load (i32.const 224)) (i32.const 1)))"
+   "             (br_if $done (i32.ge_u (i32.load (i32.const 228)) (i32.const 2)))"
+   "             (br $poll)))"
+   "         (if (i32.ne (i32.const 1) (i32.load (i32.const 224)))"
+   "             (then unreachable))"
+   "         (call $subdrop (local.get $sub)))))"
+   "   (func (export \"f\") (result i32)"
+   "     (local $d0 i32) (local $d i32) (local $ws i32) (local $pair i64)"
+   "     (local $rx i32) (local $tx i32) (local $fut i32) (local $packed i32)"
+   "     (local $r i32) (local $sameok i32) (local $ok i32)"
+   "     (call $gd (i32.const 0))"
+   "     (local.set $d0 (i32.load (i32.load (i32.const 0))))"
+   "     (i32.store8 (i32.const 320) (i32.const 97))"
+   "     (i32.store8 (i32.const 321) (i32.const 115))"
+   "     (i32.store8 (i32.const 322) (i32.const 121))"
+   "     (i32.store8 (i32.const 323) (i32.const 110))"
+   "     (i32.store8 (i32.const 324) (i32.const 99))"
+   "     (i32.store8 (i32.const 325) (i32.const 46))"
+   "     (i32.store8 (i32.const 326) (i32.const 116))"
+   "     (i32.store8 (i32.const 327) (i32.const 120))"
+   "     (i32.store8 (i32.const 328) (i32.const 116))"
+   "     (call $open (local.get $d0) (i32.const 0) (i32.const 320)"
+   "                 (i32.const 9) (i32.const 1) (i32.const 3)"
+   "                 (i32.const 128))"
+   "     (if (i32.ne (i32.const 0) (i32.load8_u (i32.const 128)))"
+   "         (then unreachable))"
+   "     (local.set $d (i32.load (i32.const 132)))"
+   "     (local.set $ws (call $wsnew))"
+   "     (local.set $packed (call $same (local.get $d) (local.get $d)"
+   "                                  (i32.const 128)))"
+   "     (if (i32.ne (i32.const 2) (i32.and (local.get $packed) (i32.const 15)))"
+   "         (then unreachable))"
+   "     (call $poll-subtask (local.get $packed) (local.get $ws))"
+   "     (local.set $sameok (i32.load8_u (i32.const 128)))"
+   "     (local.set $pair (call $snew))"
+   "     (local.set $rx (i32.wrap_i64 (local.get $pair)))"
+   "     (local.set $tx (i32.wrap_i64 (i64.shr_u (local.get $pair) (i64.const 32))))"
+   "     (i32.store16 (i32.const 512) (i32.const 0x6968))"
+   "     (local.set $packed (call $wvs (local.get $d) (local.get $rx) (i64.const 0)"
+   "                                  (i32.const 160)))"
+   "     (if (i32.ne (i32.const 2) (i32.and (local.get $packed) (i32.const 15)))"
+   "         (then unreachable))"
+   "     (call $poll-subtask (local.get $packed) (local.get $ws))"
+   "     (local.set $fut (i32.load (i32.const 160)))"
+   "     (call $join (local.get $fut) (local.get $ws))"
+   "     (local.set $r (call $fread (local.get $fut) (i32.const 192)))"
+   "     (if (i32.ne (i32.const -1) (local.get $r)) (then unreachable))"
+   "     (local.set $r (call $swrite (local.get $tx) (i32.const 512) (i32.const 2)))"
+   "     (if (i32.ne (i32.const 32) (local.get $r)) (then unreachable))"
+   "     (call $sdropw (local.get $tx))"
+   "     (local.set $r (call $wait (local.get $ws) (i32.const 224)))"
+   "     (if (i32.ne (i32.const 4) (local.get $r)) (then unreachable))"
+   "     (if (i32.ne (i32.const 0) (i32.load (i32.const 228)))"
+   "         (then unreachable))"
+   "     (local.set $ok (i32.load8_u (i32.const 192)))"
+   "     (i32.or (i32.shl (local.get $sameok) (i32.const 8))"
+   "             (i32.or (i32.shl (local.get $ok) (i32.const 4))"
+   "                     (i32.const 1)))))"
+   " (core instance $m (instantiate $M (with \"env\" (instance"
+   "   (export \"mem\" (memory $memory \"mem\"))"
+   "   (export \"gd\" (func $gd-lowered))"
+   "   (export \"same\" (func $same-lowered))"
+   "   (export \"wvs\" (func $wvs-lowered))"
+   "   (export \"open\" (func $open-lowered))"
+   "   (export \"snew\" (func $snew))"
+   "   (export \"swrite\" (func $swrite))"
+   "   (export \"sdropw\" (func $sdropw))"
+   "   (export \"fread\" (func $fread))"
+   "   (export \"subdrop\" (func $subdrop))"
+   "   (export \"join\" (func $join))"
+   "   (export \"wsnew\" (func $wsnew))"
+   "   (export \"wait\" (func $wait))))))"
+   " (func (export \"f\") (result u32) (canon lift (core func $m \"f\"))))"))
+
+(test wasi/e2e-async-canon-filesystem-component
+  (with-fs-root (root "fs-async-e2e" '("async.txt"))
+    (let* ((pre (wasmdown.wasi:open-wasi-preopen root :name "/sandbox"))
+           (ctx (wasmdown.wasi:make-wasi-context :preopens (list pre)))
+           (comp (wasmdown.component.text::parse-component-text
+                  *fs-async-canon-fixture*)))
+      (unwind-protect
+           (progn
+             (wasmdown.component:validate-component comp)
+             (let* ((inst (wasmdown.component.runtime:instantiate-component
+                           comp
+                           :with-args (wasmdown.wasi:filesystem-provider ctx)))
+                    (f (wasmdown.component.runtime:runtime-export-value inst "f")))
+               ;; sameok=1 (<<8), the future's ok discriminant 0 (<<4),
+               ;; the FUTURE_READ event delivered (1)
+               (is (eql 257 (wasmdown.component.runtime:lifted-func-call f)))
+               ;; the async-lowered write-via-stream put the bytes on disk
+               (is (string= "hi" (fs-bytes->string (fs-p root "async.txt"))))))
+        (wasmdown.wasi:close-wasi-preopen pre)))))
+
+(defun fs-bytes->string (path)
+  (map 'string #'code-char (fs-bytes path)))

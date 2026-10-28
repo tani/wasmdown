@@ -61,6 +61,8 @@
            #:host-end-set-sink
            #:host-end-set-source
            #:host-end-set-on-drop
+           #:host-end-set-error
+           #:host-end-drop
            #:host-end-drain
            #:host-future-resolve
            #:make-host-buffer
@@ -331,6 +333,14 @@ first table hit leaks the wrong instance's counter.")
 incoming own/borrow PARAM index refers to — bound dynamically at the
 lower's %call-component-func so the target lifted func's lift_own
 consumes the handle from the CALLER's table and re-enters its own.")
+
+(defvar *host-provider-inst* nil
+  "M16 slice 3b: the provider's OWN comp-instance, bound while its
+host closure runs (lifted-func-call's host branch). The canon-lower
+wrappers LEND a borrow param into the callee-defining table — for a
+host provider that is its own instance — so a provider resolving
+the raw index (host-resource-rep) falls back to this table when the
+dynamic caller's table does not hold it.")
 
 
 (declaim (notinline instantiate-component %exec-core-instance
@@ -2195,8 +2205,14 @@ reentrance phase checks). The CALLER then waits:
     ;; the canonical VALUE domain; the canon-lower wrapper around it
     ;; lifts/lowers the ABI in the caller's memory).
     (when (lifted-func-host lf)
-      (return-from lifted-func-call
-        (funcall (lifted-func-host lf) args)))
+      ;; M16 slice 3b: the canon-lower wrappers LEND a borrow param
+      ;; into the CALLEE-DEFINING instance's table (the provider's
+      ;; own comp-instance) and hand the provider that index; the
+      ;; provider's host-resource-rep falls back to it when the
+      ;; dynamic caller's table does not hold the index.
+      (let ((*host-provider-inst* (lifted-func-inst lf)))
+        (return-from lifted-func-call
+          (funcall (lifted-func-host lf) args))))
     (unless (and core (wasmdown.runtime:func-instance-p core))
       (error 'wasmdown:host-error
              :message "lifted func wraps no core func"))
@@ -2562,10 +2578,16 @@ through), never as a raw accessor crash."
 DYNAMIC CALLER's handle table (*HANDLE-CALLER-INST*, bound by the
 canon-lower wrapper), type-checked against RT (the resource ct).
 A HOST provider's borrow param arrives as this raw index; the
-provider resolves it here. NIL when the index does not name an RT
-handle."
-  (let ((inst *handle-caller-inst*))
-    (and inst (integerp index) (%handle-rep inst rt index))))
+provider resolves it here. M16 slice 3b: the canon-lower wrappers
+LEND the borrow into the CALLEE-defining table, so when the caller's
+table does not name RT at INDEX the provider's own table
+(*HOST-PROVIDER-INST*, bound by lifted-func-call's host branch) is
+consulted. NIL when neither names an RT handle."
+  (and (integerp index)
+       (or (and *handle-caller-inst*
+                (%handle-rep *handle-caller-inst* rt index))
+           (and *host-provider-inst*
+                (%handle-rep *host-provider-inst* rt index)))))
 
 (defun %resource-rt (inst typeidx)
   "The runtime resource identity for the TYPEIDX'th component type —
@@ -2868,7 +2890,16 @@ TARGET's space."
                                      (let* ((rt-idx (wasmdown.component:ct-payload c))
                                             (rt (aref (comp-instance-types ft-inst) rt-idx))
                                             (rep (%handle-rep inst rt (nth ai args)))
-                                            (bi (and rep (%handle-add ft-inst rt rep nil))))
+                                            ;; M16 slice 3b: a HOST callee's
+                                            ;; provider resolves the index
+                                            ;; through the dynamic caller's
+                                            ;; table, so the lend goes THERE
+                                            ;; (the guest-callee local shape
+                                            ;; keeps the callee-defining table)
+                                            (bi (and rep (%handle-add
+                                                          (if (lifted-func-host f)
+                                                              inst ft-inst)
+                                                          rt rep nil))))
                                        (when bi
                                          (incf (async-task-num-borrows *current-task*)))
                                        (push bi vals)
@@ -3340,12 +3371,16 @@ of a stream or future pair."
     (when wt (%async-thread-wake wt))))
 
 ;;; ---- The GuestBuffer (CanonicalABI.md 1545-1586) ----
-;;; A buffer is (list memory ptr length progress) — the load/store
-;;; helpers below advance ptr and progress per element.
+;;; A buffer is (list memory ptr length progress realloc encoding) — the
+;;; load/store helpers below advance ptr and progress per element. The
+;;; last two carry the READ side's canon opts (M16 slice 3b): storing a
+;;; STRUCTURED element (a directory-entry's name string) needs the
+;;; canon lower's realloc, exactly as `store` does at any other
+;;; boundary.
 
 (defconstant +buffer-max-length+ (1- (expt 2 28)))
 
-(defun %buffer-make (end memory ptr length)
+(defun %buffer-make (end memory ptr length &key (realloc nil) (encoding :utf8))
   "GuestBuffer's eager guards (§1552-1556): the alignment + bounds
 trap at construction; zero-length buffers skip them."
   (let* ((t-ct (async-end-t-ct end))
@@ -3371,7 +3406,7 @@ trap at construction; zero-length buffers skip them."
                (length (wasmdown.runtime:memory-instance-bytes memory)))
         (error 'wasmdown:wasm-trap :kind :generic
                :message "out of bounds memory access")))
-    (list memory ptr length 0)))
+    (list memory ptr length 0 realloc encoding)))
 
 ;;; A HOST buffer (M16 slice 2): the CL-side stand-in for a guest
 ;;; linear-memory region. It carries the same (capacity progress) shape
@@ -3442,7 +3477,9 @@ domain values (no ABI encoding — there is no guest memory)."
           ;; (passing-resources' 'NIL is not of type REAL'). The
           ;; take performs the SOURCE-side transfer; the put
           ;; re-adds.
-          (let ((cx (make-abi-cx :memory memory :inst inst))
+          (let ((cx (make-abi-cx :memory memory
+                                 :encoding (or (nth 5 buf) :utf8)
+                                 :inst inst))
                 (own-p (and (wasmdown.component:ct-p t-ct)
                             (eq (wasmdown.component:ct-kind t-ct)
                                 :own))))
@@ -3477,7 +3514,10 @@ progress by the count. A HOST buffer accumulates the domain values."
          (n (length vals))
          (ptr (+ (second buf) (* (fourth buf) (or elem-size 1)))))
     (when (and t-ct vals)
-      (let ((cx (make-abi-cx :memory memory :inst inst)))
+      (let ((cx (make-abi-cx :memory memory
+                             :realloc (nth 4 buf)
+                             :encoding (or (nth 5 buf) :utf8)
+                             :inst inst)))
         ;; M13-tok25 THE OWN-TRANSFER'S DEST HALF: an
         ;; (:own-handle rt rep) element (the take's source-side
         ;; transfer) is RE-ADDED into THIS instance's table and
@@ -3527,6 +3567,19 @@ into SINK: (byte-list) -> error-code string or NIL."
 paired with the host end END is dropped (resolve the future)."
   (setf (async-end-host-on-drop end) hook)
   end)
+
+(defun host-end-set-error (end code)
+  "Record CODE (a WIT error-code label) as the host end END's error:
+the sink/source path that detects it drops END, whose one-shot hook
+then resolves the guest's result future with (:err . CODE)."
+  (setf (async-end-host-error end) code)
+  end)
+
+(defun host-end-drop (end)
+  "Drop the HOST end END: its guest peer learns DROPPED (the WIT's
+`closed' read status) and END's own one-shot hook fires. The provider
+side of a refused stream uses this to close a stream it cannot feed."
+  (%host-drop end))
 
 (defun %host-peer-dropped (host-end dropped)
   "The DROP NOTIFICATION: the guest dropped DROPPED, which was paired
@@ -5708,6 +5761,18 @@ is the valtype."
                            (length (comp-instance-core-memories inst)))
                         (aref (comp-instance-core-memories inst)
                               (second mem-opt))))
+            ;; M16 slice 3b: the READ side's canon opts supply the
+            ;; realloc/encoding a STRUCTURED element (a
+            ;; directory-entry's name) needs when the host source
+            ;; stores it into the guest buffer.
+            (realloc-opt (wasmdown.component:canon-opt opts :realloc))
+            (realloc (and realloc-opt
+                          (< (second realloc-opt)
+                             (length (comp-instance-core-funcs inst)))
+                          (aref (comp-instance-core-funcs inst)
+                                (second realloc-opt))))
+            (enc-opt (wasmdown.component:canon-opt opts
+                                                   :string-encoding))
             (t-idx (second imms))
             (t-ct (and (integerp t-idx)
                        (< t-idx (length (comp-instance-types inst)))
@@ -5740,7 +5805,9 @@ is the valtype."
                      :message "cannot read or write while in a waitable set"))
             ;; the future ends only read/write ONCE (§1666: futures
             ;; have no length param — always implicitly 1)
-            (let ((buffer (%buffer-make end memory ptr length)))
+            (let ((buffer (%buffer-make end memory ptr length
+                                        :realloc realloc
+                                        :encoding (%abi-encoding-of enc-opt))))
               (%end-copy end buffer read-p)
               (if (async-waitable-pending-event end)
                   ;; the event is ready: deliver it synchronously
@@ -6469,7 +6536,8 @@ is the valtype."
     (wasmdown.runtime:make-host-func-instance
      (wasmdown.types:make-wasm-func-type core-params '(:i32))
      (lambda (args)
-       (let* ((subtask (make-async-subtask))
+       (let* ((*handle-caller-inst* inst)
+              (subtask (make-async-subtask))
               (cx (make-abi-cx
                    :memory memory
                    :realloc realloc
@@ -6582,9 +6650,16 @@ is the valtype."
                                           ;; subtask's resolution
                                           (rep (%handle-rep inst rt
                                                             (nth ai args)))
+                                          ;; M16 slice 3b: the same
+                                          ;; host-callee rule as the
+                                          ;; sync lower — the provider
+                                          ;; reads the index off the
+                                          ;; dynamic caller's table
                                           (bi (and rep
-                                                   (%handle-add ft-inst
-                                                                rt rep nil))))
+                                                   (%handle-add
+                                                    (if (lifted-func-host f)
+                                                        inst ft-inst)
+                                                    rt rep nil))))
                                      (when bi
                                        ;; §2838/§1446: the LENDING
                                        ;; task's borrow count + the
@@ -6723,8 +6798,10 @@ is the valtype."
                                              (%abi-check-span scx ptr 4
                                                               "value")
                                              (%abi-store-int scx idx ptr 4))
-                                           (%abi-store cx val result
-                                                       ptr))))))
+                                           (if rc
+                                               (%abi-store scx val rc ptr)
+                                               (%abi-store cx val result
+                                                           ptr)))))))
                                (%subtask-resolve subtask 2 nil)))
                              (setf resolved-val val)
                              ;; M15 MECHANISM 4b — the FIFTH M11a
@@ -6754,7 +6831,7 @@ is the valtype."
          ;; callee's thread does not inherit our bindings), set
          ;; under the scheduler mutex and cleared after the pack.
          (setf *suppress-spawn-fire* t)
-         (let ((eager-p nil)
+         (let ((eager-p (%subtask-resolved-p subtask))
                (packed-state 0))
           (unless (%subtask-resolved-p subtask)
             (loop
@@ -6839,6 +6916,14 @@ is the valtype."
   Returns the OnCancel closure (the subtask's cancel hook)."
   (let ((ft (and (lifted-func-p f)
                  (lifted-func-type f))))
+    (when (and (lifted-func-p f) (lifted-func-host f))
+      ;; M16 slice 3b: a HOST provider is a CL closure — it cannot
+      ;; block, so the async lift contract reduces to on_start, the
+      ;; call, on_resolve (the caller's pack then sees the resolved
+      ;; subtask and returns RETURNED eagerly).
+      (when on-start (funcall on-start))
+      (funcall on-resolve (apply #'lifted-func-call f component-args))
+      (return-from %call-async-funcinst (values (lambda () nil) nil)))
     (if (and ft (third (wasmdown.component:ct-payload ft)))
         ;; the callee is ASYNC-TYPED: run the lift on its own thread
         ;; (the task resolves via task.return whenever it's ready)
@@ -6900,7 +6985,8 @@ is the valtype."
           (values (lambda () (%task-request-cancellation task))
                   task))
         ;; the callee is SYNC-TYPED: an inline call resolves at once
-        (let ((res (apply #'lifted-func-call f component-args)))
+        (let ((res (progn (when on-start (funcall on-start))
+                          (apply #'lifted-func-call f component-args))))
           (funcall on-resolve res)
           (values (lambda () nil) nil)))))
 
