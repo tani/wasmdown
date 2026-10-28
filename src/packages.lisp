@@ -339,7 +339,22 @@
    #:resolve-wit-type
    #:wit-type->ct
    #:wit-func->ct
-   #:interface-import-name))
+   #:interface-import-name
+   ;; version selection (plan step 3)
+   #:wit-version
+   #:wit-version-p
+   #:parse-wit-version
+   #:wit-version<
+   #:wit-version=
+   #:wit-version<=
+   #:wit-selection
+   #:wit-selection-p
+   #:make-wit-selection
+   #:wit-selection-target-versions
+   #:wit-selection-enabled-features
+   #:validate-wit-package
+   #:select-wit-package
+   #:resolve-wit-world))
 
 (defpackage #:wasmdown.wasi
   (:use #:cl)
