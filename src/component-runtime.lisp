@@ -4699,6 +4699,8 @@ drop-readable must return index 1 again)."
              :message "invalid callback result"))
     (cons code (ash packed -4))))
 
+
+
 (defun %async-lift-guest-body (task lf cx)
   "The thread_func of canon_lift (CanonicalABI.md 3390-3493): runs on
   the guest's own SBCL thread. The task resolves via task.return /
@@ -5442,6 +5444,10 @@ is the valtype."
                                              (async-waitable-pending-event
                                               end)))))
                                (setf (async-thread-blocked-p th) t)
+                               (sb-thread:with-recursive-lock
+                                   ((async-thread-mutex th))
+                                 (setf (async-thread-granted th) nil)
+                                 (setf (async-thread-wake-count th) 0))
                                (loop
                                  (sb-thread:with-recursive-lock
                                      ((async-thread-mutex th))

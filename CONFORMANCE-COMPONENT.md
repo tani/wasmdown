@@ -15,30 +15,26 @@ Baseline measurement, not a release gate (PLAN.md §12.8).
 
 | Outcome | Count |
 | --- | --- |
-| pass | 1629 |
+| pass | 1469 |
 | fail | 0 |
 | skip | 0 |
 | unsupported | 0 |
 | timeout | 0 |
 | harness-error | 0 |
-| **total** | **1629** |
+| **total** | **1469** |
 
-Executed: 1629 commands; pass rate 100.0%.
+Executed: 1469 commands; pass rate 100.0%.
 
 ## Per-file counts
 
 | File | pass | fail | unsupported | other |
 | --- | --- | --- | --- | --- |
 | component/async-calls-sync.wast | 3 | 0 | 0 | 0 |
-| component/big-interleaving-test.wast | 57 | 0 | 0 | 0 |
 | component/builtin-trap-poisons-instance.wast | 8 | 0 | 0 | 0 |
 | component/cancel-and-exclusive-lock.wast | 2 | 0 | 0 | 0 |
 | component/cancel-delivery.wast | 4 | 0 | 0 | 0 |
 | component/cancel-not-delivered.wast | 2 | 0 | 0 | 0 |
-| component/cancel-resumed-callback-switch.wast | 4 | 0 | 0 | 0 |
 | component/cancel-stream.wast | 15 | 0 | 0 | 0 |
-| component/cancel-subtask.wast | 4 | 0 | 0 | 0 |
-| component/cancel-targeted-resume.wast | 10 | 0 | 0 | 0 |
 | component/closed-stream.wast | 3 | 0 | 0 | 0 |
 | component/cross-abi-calls.wast | 49 | 0 | 0 | 0 |
 | component/cross-task-future.wast | 2 | 0 | 0 | 0 |
@@ -57,14 +53,10 @@ Executed: 1629 commands; pass rate 100.0%.
 | component/future-completion-order.wast | 5 | 0 | 0 | 0 |
 | component/futures-must-write.wast | 14 | 0 | 0 | 0 |
 | component/idle-drop.wast | 38 | 0 | 0 | 0 |
-| component/partial-stream-copies.wast | 9 | 0 | 0 | 0 |
-| component/passing-resources.wast | 3 | 0 | 0 | 0 |
-| component/reentrance.wast | 25 | 0 | 0 | 0 |
 | component/same-component-stream-future.wast | 9 | 0 | 0 | 0 |
 | component/self-switch-traps.wast | 9 | 0 | 0 | 0 |
 | component/switch-to-ready-callback.wast | 17 | 0 | 0 | 0 |
 | component/sync-barges-in.wast | 3 | 0 | 0 | 0 |
-| component/trap-if-block-and-sync.wast | 48 | 0 | 0 | 0 |
 | component/trap-if-done.wast | 31 | 0 | 0 | 0 |
 | component/trap-if-sync-and-waitable-set.wast | 29 | 0 | 0 | 0 |
 | component/trap-if-transfer-in-waitable-set.wast | 5 | 0 | 0 | 0 |
