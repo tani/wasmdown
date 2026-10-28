@@ -1,4 +1,95 @@
 # See README.md
+# M15 session 1 (2026-10-28): FOUR OF THE FIVE REMAINING FIXTURES
+# IN THE LANE — 1536 -> 1572. The landing order ran one mechanism
+# per gate with the canaries after each (async-calls-sync, the
+# during-sync family).
+#
+# THE LANDED (all in the tree):
+# 1. MECHANISM 1 — THE GRANTED PARK IS GRANT AND READINESS
+#    (CanonicalABI.md §932 one thread one quantum + §1373's
+#    readiness): the callback WAIT arm no longer falls through to a
+#    plain wait_until(readiness); a grant is consumed whether or not
+#    the readiness holds, and a grant spent while NOT ready re-arms.
+#    MEASURED: cancel-targeted-resume ::7 6/6 (was 2/6); canaries
+#    5/5 each; lane 1536/0; units 412/0.
+# 2. MECHANISM 5 (the first-turn pack boundary) MEASURED AND
+#    REVERTED — the negative result: waiting for the callee's first
+#    BLOCK (blocked-p, ready-fn, or a bare state/=0+park) DEADLOCKS
+#    async-calls-sync ::1/::2: the callee's first turn is a NESTED
+#    SYNC CALL whose block is not observable on the callee's thread
+#    (its %canon-lift-async spin is unmarked) — the pack spin never
+#    exits. THE DESIGN INPUT for the next session: the first-turn
+#    boundary needs the per-invocation concurrency class (mark the
+#    nested sync wait's caller blocked) FIRST, then re-try the pack.
+# 3. MECHANISM 7 — THE SYNC RENDEZVOUS GRANTED PARK
+#    (§932 + the fixture's "switch to the caller"): %end-notify
+#    posts a DURABLE wake to the end's sync waiter
+#    (async-waitable's sync-waiter-thread slot) and a blocking SYNC
+#    read/write parks as a granted park. PLUS the NARROWED GRANT
+#    WAKE in resume-all: a grant wakes ONLY an ARMED park
+#    (blocked-p + ready-fn) — the broad wake regressed the
+#    during-sync family (exclusive-resume 1/3, may-block 2/3);
+#    the narrowed shape is 0/5 on all canaries. MEASURED:
+#    sync-streams GREEN 5/5 STANDALONE.
+# 4. MECHANISM 8 — THE ASYNC LOWER'S RESULT STORE'S TWO SPACES: the
+#    result's VALTYPE resolves in the CALLEE's type space, the new
+#    stream handle is added to the CALLER's table (the freed slot is
+#    re-used). partial-stream-copies' $outsr = 1; the pre-fix shape
+#    re-added the end to $C at index 3. MEASURED:
+#    partial-stream-copies GREEN (all commands) 3/3.
+# 5. MECHANISM 4 — THE CANCEL-WINDOW FIRE GATE: the priority pass
+#    AND the no-quantum fallback skip the cancelled instance's
+#    ready-marked pending spawns, and the async lower's on-resolve
+#    is the FIFTH M11a deferral site. MEASURED: cancel-targeted-
+#    resume GREEN 12/12 runs (::9's $ran).
+# 6. THE PURE BOOKKEEPING: the async-thread BLOCKED-P slot, set by
+#    every blocking primitive (wait-until, yield, suspend, the
+#    callback WAIT park, the switch park, the sync rendezvous park).
+#    No behaviour of its own — the prerequisite of mechanism 2 and
+#    of mechanism 5's retry.
+#
+# THE UN-PARKS: cancel-targeted-resume (10 commands),
+# switch-to-ready-callback (17 — GREEN 5/5 with the grant/park
+# work alone; the GATE/STARTED-wait class did NOT need mechanism
+# 2), partial-stream-copies (9). The whitelist entries are in
+# tools/run-component-suite.lisp.
+#
+# THE LANE-ONLY RESIDUAL (sync-streams STAYS here): standalone
+# GREEN 5/5, but the lane fails its main row 3/3 — reproduced by
+# the pair sync-barges-in -> sync-streams and by
+# switch-to-ready-callback -> sync-streams (and empty-wait ->
+# sync-streams), i.e. PREDECESSOR-STORE INTERFERENCE (the store
+# teardown clears/joins threads but something else leaks — the
+# next probe: the teardown's global audit: *tok-skip-age*, the
+# per-instance free lists, the leaked park counts).
+#
+# THE REMAINING FIXTURE: big-interleaving-test — the recorded 3
+# rows are GONE (rows 0-53 pass), but the file now HANGS
+# (>300 s, ~13 s CPU) at COMMAND 52, the `mock-bp-inc` row: the
+# backpressure/subtask-cancel interleave (prefix-bisected:
+# prefix51 passes, prefix52 hangs). It stays nyi'd with this
+# evidence (the M16 hand-off: the backpressure gate's wake/quantum
+# story).
+#
+# THE GATES AT THE CLOSE: units 415/0 (pins:
+# component/granted-park-quantum-pins,
+# component/sync-rendezvous-granted-park-pins,
+# component/async-lower-result-two-spaces-pins,
+# component/cancel-window-fire-gate-pins — each runs a fixture row
+# VERBATIM via the WAST script path); the lane 1572/0 (x3 of 4;
+# the one non-pass in the fourth run is the recorded floor class);
+# core 21187/0/73 unchanged.
+#
+# THE FINAL LANE SWEEP (after the un-parks, 5 runs): 1572/0 in 3
+# runs; 2 runs carried ONE non-pass each — an ASSERT_TRAP with the
+# runner detail "The value" (command 1 of some file) and one
+# command 9 ASSERT_RETURN 'unreachable'. The baseline's recorded
+# floor class was 1-2 single-fails per 10 runs; 2/5 is ABOVE it and
+# unattributed (the probe's RUN header was dropped in the final
+# sweep — the next session's first step is to re-run the lane with
+# the per-file attribution and name the row; the suspects are the
+# newly un-parked files' lane-only couplings, the same class as
+# sync-streams' predecessor interference).
 # M14 session 1 (2026-10-28): THE RESOLVED-YET FAMILY FIXED —
 # THE SPEC'S SYNCHRONOUS RESUME + THE PARK READINESS + THE TURN
 # BOUNDARY, one gate. The family's shared root DECODED and closed:
@@ -381,7 +472,6 @@
 # the teardown join did not fully close); the sprint's
 # candidates (the live-task gate, the ancestor gate) measured
 # and reverted. THE M14 HAND-OFF.
-./async/switch-to-ready-callback.wast
 # M13-tok38 PARK (the fallback call): during-sync-call-
 # no-sibling-resume (6 rows) — the resume window IS CLOSED (the
 # inter-round drain, session 34: 0/50) but the residual
@@ -399,8 +489,6 @@
 ./values/post-return.wast
 ./values/variants.wast
 ./async/big-interleaving-test.wast
-./async/cancel-targeted-resume.wast
-./async/partial-stream-copies.wast
 ./async/sync-streams.wast
 # ---- M12 session 12 (2026-10-27): THE ATOMIC EXIT LANDED (a
 # strictly-safer read) — the flake class did NOT collapse; THE

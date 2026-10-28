@@ -2718,6 +2718,90 @@ these pins guard the executor's mechanisms directly."
                results))))
 
 
+(test component/granted-park-quantum-pins
+  ;; M15 MECHANISM 1 — THE GRANTED PARK IS GRANT **AND** READINESS
+  ;; (CanonicalABI.md §932 "one thread, one quantum per tick" +
+  ;; §1373's wait_from_callback readiness). The callback WAIT arm
+  ;; consumes a grant whether or not the readiness holds; a grant
+  ;; spent while NOT ready is a WASTED quantum and the park
+  ;; RE-ARMS. The pre-fix shape fell through to a plain
+  ;; `wait_until(readiness)`, so the arriving EVENT alone resumed
+  ;; the thread — the unsupervised continuation: cancel-targeted-
+  ;; resume's worker ran inside the canceller's observation window
+  ;; on its future's readiness alone (the row's NONE polls trapped).
+  ;; Pinned via the fixture's ::7 row VERBATIM (the 4th component,
+  ;; lines 465-607: worker parked with a pending FUTURE_READ, park
+  ;; cancelled eagerly while the worker must stay put until the
+  ;; caller blocks, then return 43 at the caller's wset.wait).
+  (let* ((file (merge-pathnames
+                "tests/component/async/cancel-targeted-resume.wast"
+                (make-pathname :directory
+                               '(:absolute "home" "tani" "ghq"
+                                           "github.com" "tani" "wasmdown"))))
+         (txt (let ((acc (make-string-output-stream)))
+                (with-open-file (s file)
+                  (loop for line = (read-line s nil nil)
+                        for n from 1
+                        while line
+                        when (<= 465 n 607)
+                          do (write-line line acc)))
+                (get-output-stream-string acc)))
+         (results (wasmdown.wast:run-script txt
+                                            :file "granted-park-pin.wast")))
+    ;; the one component + its one assert row
+    (is (= 2 (length results)))
+    (is (every (lambda (r)
+                 (eq (wasmdown.wast:wast-result-outcome r) :pass))
+               results))))
+
+(defun %pin-slice (rel from to)
+  "The lines FROM..TO (1-based, inclusive) of a suite file under the
+repo root, as a string — the pin runs a fixture row VERBATIM."
+  (let ((acc (make-string-output-stream)))
+    (with-open-file (s (merge-pathnames
+                        rel
+                        (make-pathname :directory
+                                       '(:absolute "home" "tani" "ghq"
+                                                   "github.com" "tani"
+                                                   "wasmdown"))))
+      (loop for line = (read-line s nil nil)
+            for n from 1
+            while line
+            when (<= from n to) do (write-line line acc)))
+    (get-output-stream-string acc)))
+
+(defun %pin-rows-pass-p (wast name)
+  (let ((results (wasmdown.wast:run-script wast :file name)))
+    (and results
+         (every (lambda (r)
+                  (eq (wasmdown.wast:wast-result-outcome r) :pass))
+                results))))
+
+(test component/async-lower-result-two-spaces-pins
+  ;; M15 MECHANISM 8 — THE ASYNC LOWER'S RESULT STORE: the result's
+  ;; VALTYPE resolves in the CALLEE's type space, the new stream
+  ;; handle is added to the CALLER's table (the freed slot is
+  ;; re-used: partial-stream-copies' $outsr must be 1). The pre-fix
+  ;; shape re-added the end to $C at index 3 and the row trapped.
+  (is (%pin-rows-pass-p
+       (%pin-slice "tests/component/async/partial-stream-copies.wast"
+                   1 238)
+       "result-two-spaces-pin.wast")))
+
+(test component/cancel-window-fire-gate-pins
+  ;; M15 MECHANISM 4 — THE CANCEL-WINDOW FIRE GATE: while the
+  ;; synchronous-resume wait is open, the drain's ticks (priority
+  ;; pass AND no-quantum fallback) must not FIRE the cancelled
+  ;; instance's ready-marked pending spawns; the async lower's
+  ;; on-resolve is the fifth M11a deferral site. Pinned by
+  ;; cancel-targeted-resume's ::9 row (the callback resume-laters a
+  ;; thread inside the cancellation; $ran must stay 0 until the
+  ;; caller yields).
+  (is (%pin-rows-pass-p
+       (%pin-slice "tests/component/async/cancel-targeted-resume.wast"
+                   613 699)
+       "cancel-fire-gate-pin.wast")))
+
 (defun run-component-pins ()
   "Run the component pins (registered via TEST; returns T)."
   (let ((wasmdown.test::*tests*
@@ -2787,7 +2871,10 @@ these pins guard the executor's mechanisms directly."
                       component/async-stream-roundtrip-pins
                       component/sync-lift-thread-context-pins
                       component/suspend-vs-yield-determinism-pins
-                      component/cancel-eager-resolve-pins)))
+                      component/cancel-eager-resolve-pins
+                      component/granted-park-quantum-pins
+                      component/async-lower-result-two-spaces-pins
+                      component/cancel-window-fire-gate-pins)))
           wasmdown.test::*tests*)))
     (multiple-value-bind (passed failed)
         (wasmdown.test:run-all-tests)

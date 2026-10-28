@@ -221,7 +221,22 @@ parent dir), not the first (the grandparent 'component' — the old
                                  ;; sessions' traces), and the
                                  ;; granted park's arm-time semantics
                                  ;; removed the stale-count returns.
-                                 "trap-if-block-and-sync.wast")
+                                 "trap-if-block-and-sync.wast"
+                                 ;; M15 un-park gates: the four
+                                 ;; fixtures the M14/M15 grant/park
+                                 ;; work closed (cancel-targeted-
+                                 ;; resume: the granted park's
+                                 ;; quantum + the cancel-window fire
+                                 ;; gate; switch-to-ready: the park
+                                 ;; sweep; sync-streams: the sync
+                                 ;; rendezvous; partial-stream-
+                                 ;; copies: the result store's two
+                                 ;; spaces). big-interleaving-test
+                                 ;; stays nyi'd (its backpressure
+                                 ;; row hangs — see nyi.txt).
+                                 "cancel-targeted-resume.wast"
+                                 "switch-to-ready-callback.wast"
+                                 "partial-stream-copies.wast")
                                :test #'string=)))
                 (or (directory (merge-pathnames
                                 "tests/component/async/*.wast" *root*))

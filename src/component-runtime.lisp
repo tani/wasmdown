@@ -3103,7 +3103,12 @@ the opts plist, guarded by the scheduler mutex)."
   its waitable set, and the sync-waiter guard."
   (pending-event nil)                ; closure -> (code p1 p2)
   (wset nil)
-  (has-sync-waiter nil))
+  (has-sync-waiter nil)
+  ;; M15 MECHANISM 7: the thread parked in a SYNC read/write's
+  ;; wait on THIS end — %end-notify posts the DURABLE wake to it
+  ;; (the rendezvous's only other wake was the transient tick
+  ;; broadcast, which a non-grantable waiter does not receive).
+  (sync-waiter-thread nil))
 
 (defstruct (async-subtask (:include async-waitable))
   "The Subtask (CanonicalABI.md 1406): the caller-side record."
@@ -3221,7 +3226,11 @@ of a stream or future pair."
                   (or (async-end-index end) 0)
                   (if (async-end-future-p end)
                       result          ; futures do NOT pack progress
-                      (logior result (ash progress 4))))))))
+                      (logior result (ash progress 4)))))))
+  ;; M15 MECHANISM 7 — THE SYNC RENDEZVOUS WAKE: a thread parked in
+  ;; this end's SYNC read/write re-tests on a REAL wake.
+  (let ((wt (async-waitable-sync-waiter-thread end)))
+    (when wt (%async-thread-wake wt))))
 
 ;;; ---- The GuestBuffer (CanonicalABI.md 1545-1586) ----
 ;;; A buffer is (list memory ptr length progress) — the load/store
@@ -3556,6 +3565,13 @@ wrong-index probe: one transfer produced index 3)."
   ;; deferred/incidental propagations (the cancel-wait window's four
   ;; sites) never set it — the incidental broadcasts do not grant.
   (granted nil)
+  ;; M15 THE BLOCKED STATE (§932's tick-execution model): set while
+  ;; this thread sits in a BLOCKING primitive (wait-until, yield,
+  ;; suspend, the callback WAIT park, the switch park). The
+  ;; STARTED-wait's FIRST-TURN BOUNDARY (mechanism 5) reads it; the
+  ;; invoke drain's tick gate (mechanism 2) also consults it. Pure
+  ;; bookkeeping here — no behaviour changes.
+  (blocked-p nil)
   (native nil))
 
 ;;; ---- Thread-local context: bound per SBCL thread by the task
@@ -3677,15 +3693,18 @@ holds, re-testing on each wakeup. M13-4: the count is cleared with
 the wake — a resume posted during THIS park is THIS park's, never
 the next one's (a count leaking into a later park is a spurious
 early return)."
-  (loop
-    (sb-thread:with-recursive-lock ((async-thread-mutex thread))
-      (async-thread-check-abandoned thread)
-      (when (funcall ready-fn)
-        (incf *async-progress*)
-        (return))
-      (sb-thread:condition-wait (async-thread-waitqueue thread)
-                                (async-thread-mutex thread))
-      (setf (async-thread-wake-count thread) 0))))
+  (setf (async-thread-blocked-p thread) t)
+  (unwind-protect
+       (loop
+         (sb-thread:with-recursive-lock ((async-thread-mutex thread))
+           (async-thread-check-abandoned thread)
+           (when (funcall ready-fn)
+             (incf *async-progress*)
+             (return))
+           (sb-thread:condition-wait (async-thread-waitqueue thread)
+                                     (async-thread-mutex thread))
+           (setf (async-thread-wake-count thread) 0)))
+    (setf (async-thread-blocked-p thread) nil)))
 
 (defun async-thread-suspend (thread)
   "Thread.suspend (CanonicalABI.md 494): block with NO readiness
@@ -3699,6 +3718,7 @@ the post (the switcher's resume can land between the post and the
 wait's registration — its broadcast would be lost, its COUNT is
 durable), and clears the count on the returning wake."
   (setf (async-thread-suspended-p thread) t)
+  (setf (async-thread-blocked-p thread) t)
   (unwind-protect
        (loop
          (sb-thread:with-recursive-lock ((async-thread-mutex thread))
@@ -3721,7 +3741,8 @@ durable), and clears the count on the returning wake."
                                      (async-thread-mutex thread))
            (setf (async-thread-wake-count thread) 0)
            (return)))
-    (setf (async-thread-suspended-p thread) nil)))
+    (setf (async-thread-suspended-p thread) nil)
+    (setf (async-thread-blocked-p thread) nil)))
 
 (defun %async-thread-start-spawn (thread)
   "M13-4 the SPAWN-START half of Thread.resume (§474/§4590): the
@@ -3889,6 +3910,21 @@ the caller's own thread; never a plain suspend-parked thread
               do (when (and (not (async-thread-abandoned th))
                             (not (eq th *current-thread*))
                             (async-thread-ready-p th)
+                            ;; M15 MECHANISM 4 — THE CANCEL-WINDOW
+                            ;; FIRE GATE (the grant gate's per-instance
+                            ;; shape, extended to the FIRE): while the
+                            ;; synchronous-resume wait is open the
+                            ;; drain's ticks must not FIRE the
+                            ;; cancelled instance's ready-marked
+                            ;; pending spawns (cancel-targeted-resume
+                            ;; ::9: the callback's resume-later'd
+                            ;; spawn ran on the HOST drain's tick
+                            ;; before subtask.cancel returned).
+                            (not (and *cancel-window-inst*
+                                      (async-thread-task th)
+                                      (eq (async-task-inst
+                                           (async-thread-task th))
+                                          *cancel-window-inst*)))
                             (or (async-thread-suspended-p th)
                                 (and (not *suppress-spawn-fire*)
                                      (functionp
@@ -3953,7 +3989,16 @@ the caller's own thread; never a plain suspend-parked thread
                            (eq (async-task-inst
                                 (async-thread-task th))
                                *cancel-window-inst*)))
-            (setf (async-thread-granted th) t)))
+            ;; M15: a grant must WAKE the PARKER it touches — a
+            ;; grant whose broadcast never arrives leaves the parker
+            ;; in its condition-wait until some later tick's
+            ;; fallback. ONLY an ARMED park is woken (blocked-p + a
+            ;; ready-fn): a mid-turn thread gets its grant consumed
+            ;; at its next park, exactly as before.
+            (setf (async-thread-granted th) t)
+            (when (and (async-thread-blocked-p th)
+                       (async-thread-ready-fn th))
+              (%async-thread-wake th))))
         (when granted-thread
           (%async-thread-wake granted-thread))
         (unless granted-thread
@@ -3965,9 +4010,19 @@ the caller's own thread; never a plain suspend-parked thread
           ;; the trace; the suppressed candidates stay parked and
           ;; the next tick after the window takes them)
           (dolist (th sorted)
-            (unless (and *suppress-spawn-fire*
-                         (async-thread-ready-p th)
-                         (functionp (async-thread-spawn-thunk th)))
+            (unless (or (and *suppress-spawn-fire*
+                             (async-thread-ready-p th)
+                             (functionp (async-thread-spawn-thunk th)))
+                        ;; M15 MECHANISM 4 (the fallback's share of
+                        ;; the cancel-window fire gate): a nudge
+                        ;; FIRES a ready-marked pending spawn
+                        (and *cancel-window-inst*
+                             (async-thread-task th)
+                             (async-thread-ready-p th)
+                             (functionp (async-thread-spawn-thunk th))
+                             (eq (async-task-inst
+                                  (async-thread-task th))
+                                 *cancel-window-inst*)))
               (async-thread-nudge th)))))))))
 
 (defun async-thread-yield (thread)
@@ -3986,6 +4041,7 @@ count arriving with the wake is THIS park's, never the next's."
   (sb-thread:with-recursive-lock ((async-thread-mutex thread))
     (async-thread-check-abandoned thread)
     (setf (async-thread-yield-parked thread) t)
+    (setf (async-thread-blocked-p thread) t)
     ;; M14 the PARK READINESS (§523: a yield is ALWAYS ready — the
     ;; park's ready-fn, per the spec's start_waiting(ready_func))
     (setf (async-thread-ready-fn thread) (lambda () t))
@@ -3994,7 +4050,8 @@ count arriving with the wake is THIS park's, never the next's."
                                 (async-thread-mutex thread)))
     (setf (async-thread-wake-count thread) 0)
     (setf (async-thread-ready-fn thread) nil)
-    (setf (async-thread-yield-parked thread) nil)))
+    (setf (async-thread-yield-parked thread) nil)
+    (setf (async-thread-blocked-p thread) nil)))
 
 ;;; ---- the ComponentInstance concurrency fields (§133-150) ----
 
@@ -4456,6 +4513,7 @@ computes the tuple at delivery time)."
     (unwind-protect
          (progn
            (setf (async-thread-ready-fn thread) readiness)
+           (setf (async-thread-blocked-p thread) t)
            ;; M14 THE GRANTED PARK (the §932 turn model at the
            ;; callback WAIT arm): the park returns only on a GRANT
            ;; — the real tick (async-thread-resume-all sets granted
@@ -4474,24 +4532,39 @@ computes the tuple at delivery time)."
            ;; readiness together complete the turn); a grant without
            ;; readiness loops (the count is consumed, the wait
            ;; re-arms).
+           ;; M15 MECHANISM 1 (§932 ONE THREAD ONE QUANTUM + §1373's
+           ;; readiness): the park exits only on GRANT **AND**
+           ;; READINESS. The grant is consumed either way — a grant
+           ;; spent while NOT ready is a wasted quantum (the thread
+           ;; re-arms for the NEXT tick). The OLD tail
+           ;; (`async-thread-wait-until thread readiness`) woke on
+           ;; the ARRIVING EVENT with NO grant: the unsupervised
+           ;; continuation — cancel-targeted-resume ::7's worker ran
+           ;; inside the cancel window on its future's readiness
+           ;; alone.
            (loop
              do (sb-thread:with-recursive-lock
                     ((async-thread-mutex thread))
                   (async-thread-check-abandoned thread)
-                  (when (async-thread-granted thread)
-                    (setf (async-thread-granted thread) nil)
-                    (setf (async-thread-wake-count thread) 0)
-                    (return))
-                  (when (> (async-thread-wake-count thread) 0)
-                    (setf (async-thread-wake-count thread) 0))
+                  (let ((g (async-thread-granted thread)))
+                    (cond
+                     (g
+                      (setf (async-thread-granted thread) nil)
+                      (setf (async-thread-wake-count thread) 0)
+                      (when (funcall readiness)
+                        (incf *async-progress*)
+                        (return)))
+                     (t
+                      (when (> (async-thread-wake-count thread) 0)
+                        (setf (async-thread-wake-count thread) 0)))))
                   (sb-thread:condition-wait
                    (async-thread-waitqueue thread)
                    (async-thread-mutex thread))))
-           (async-thread-wait-until thread readiness)
            (if (%task-deliver-pending-cancel task)
                (list 6 0 0)             ; EventCode.TASK_CANCELLED
                (%wset-get-pending-event wset)))
       (setf (async-thread-ready-fn thread) nil)
+      (setf (async-thread-blocked-p thread) nil)
       (sb-thread:with-recursive-lock ((async-waitable-set-mutex wset))
         (setf (async-waitable-set-waiters wset)
               (remove thread (async-waitable-set-waiters wset)
@@ -5339,14 +5412,52 @@ is the valtype."
                   (if (wasmdown.component:canon-opt opts :async)
                       (list #xffffffff)  ; BLOCKED (§4158)
                       (progn
-                        (setf (async-waitable-has-sync-waiter end) t)
+                        (setf (async-waitable-has-sync-waiter end) t
+                              (async-waitable-sync-waiter-thread end)
+                              *current-thread*)
                         (unwind-protect
-                             (async-thread-wait-until
-                              *current-thread*
-                              (lambda ()
-                                (not (null (async-waitable-pending-event
-                                            end)))))
+                             ;; M15 MECHANISM 7 (§932 + the fixture's
+                             ;; "switch to the caller"): a blocking
+                             ;; SYNC read/write continues at the
+                             ;; CALLER's next tick, not the moment the
+                             ;; peer's copy notifies (sync-streams
+                             ;; pins $C.get still holding $C's
+                             ;; exclusive lock when the caller's next
+                             ;; $set enters its gate -> the pack
+                             ;; reports STARTING).
+                             (let ((th *current-thread*))
+                               (setf (async-thread-ready-fn th)
+                                     (lambda ()
+                                       (not (null
+                                             (async-waitable-pending-event
+                                              end)))))
+                               (setf (async-thread-blocked-p th) t)
+                               (loop
+                                 (sb-thread:with-recursive-lock
+                                     ((async-thread-mutex th))
+                                   (async-thread-check-abandoned th)
+                                   (let ((g (async-thread-granted th)))
+                                     (cond
+                                      (g
+                                       (setf (async-thread-granted th) nil)
+                                       (setf (async-thread-wake-count th) 0)
+                                       (when (async-waitable-pending-event
+                                              end)
+                                         (incf *async-progress*)
+                                         (return)))
+                                      (t
+                                       (when (> (async-thread-wake-count th)
+                                                0)
+                                         (setf (async-thread-wake-count
+                                                th) 0))))
+                                     (sb-thread:condition-wait
+                                      (async-thread-waitqueue th)
+                                      (async-thread-mutex th)))))
+                               (setf (async-thread-ready-fn th) nil)
+                               (setf (async-thread-blocked-p th) nil))
                           (setf (async-waitable-has-sync-waiter end)
+                                nil)
+                          (setf (async-waitable-sync-waiter-thread end)
                                 nil))
                         (let* ((event (%waitable-get-pending-event end))
                                (payload (third event)))
@@ -5895,6 +6006,7 @@ is the valtype."
                             t)
                       (setf (async-thread-suspended-p *current-thread*)
                             t))
+                  (setf (async-thread-blocked-p *current-thread*) t)
                   (unwind-protect
                        (progn
                          ;; M13-9 NO ARM-TIME CLEAR + WAIT-THEN-CHECK:
@@ -5958,6 +6070,7 @@ is the valtype."
                               nil)
                         (setf (async-thread-suspended-p *current-thread*)
                               nil))
+                    (setf (async-thread-blocked-p *current-thread*) nil)
                     (setf (async-thread-wake-count *current-thread*)
                           0)))))
             (list 0))))))
@@ -6231,13 +6344,54 @@ is the valtype."
                                  (let ((rflat
                                          (%flat-type-of result
                                                         ft-inst)))
+                                   ;; M15 MECHANISM 8 — THE
+                                   ;; RESULT'S TWO SPACES: the
+                                   ;; result's VALTYPE lives in the
+                                   ;; CALLEE's type space
+                                   ;; (FT-INST), but the out-param
+                                   ;; [ptr] and the new stream handle
+                                   ;; live in the CALLER (INST). An
+                                   ;; async value result lowers the
+                                   ;; end into the CALLER's table
+                                   ;; (partial-stream-copies: the
+                                   ;; freed slot 1 is re-used;
+                                   ;; storing through the callee's cx
+                                   ;; re-added it to $C at index 3).
                                    (when rflat
-                                     (%abi-store cx val result
-                                                 (first
-                                                  (last args))))))
+                                     (let ((rc (%abi-ct result ft-inst))
+                                           (ptr (first (last args)))
+                                           (scx (make-abi-cx
+                                                 :memory memory
+                                                 :realloc realloc
+                                                 :encoding
+                                                 (%abi-encoding-of enc-opt)
+                                                 :inst inst)))
+                                       (if (and rc
+                                                (member
+                                                 (wasmdown.component:ct-kind
+                                                  rc)
+                                                 '(:stream :future)))
+                                           (let ((idx (%lower-async-end
+                                                       val scx)))
+                                             (%abi-check-align scx ptr 4
+                                                               "store")
+                                             (%abi-check-span scx ptr 4
+                                                              "value")
+                                             (%abi-store-int scx idx ptr 4))
+                                           (%abi-store cx val result
+                                                       ptr))))))
                                (%subtask-resolve subtask 2 nil)))
                              (setf resolved-val val)
-                             (async-thread-resume-all)))
+                             ;; M15 MECHANISM 4b — the FIFTH M11a
+                             ;; DEFERRAL SITE: the LOWER's own
+                             ;; propagation runs on the callee's
+                             ;; thread inside the synchronous-resume
+                             ;; wait; its resume-all fired the
+                             ;; callee instance's ready spawns in the
+                             ;; window (::9's $ran check).
+                             (if *defer-resume-all*
+                                 (push subtask *deferred-resume-all-tasks*)
+                                 (async-thread-resume-all))))
            (setf (async-subtask-task subtask) callee-task)
            (setf (async-subtask-on-cancel subtask) on-cancel))
          ;; §3707: the packed return reports STARTING(0) or
