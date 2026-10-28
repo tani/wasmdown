@@ -2084,10 +2084,15 @@ reentrance phase checks). The CALLER then waits:
                            :message
                            "deadlock detected: event loop cannot make further progress")))
             (t
-             (loop
-               until (progn
-                       (sb-thread:with-recursive-lock (dmu) done-p)
-                       (prog1 done-p (unless done-p (sleep 0.001)))))))
+             (let ((ct *current-thread*))
+               (%block-enter ct)
+               (unwind-protect
+                    (loop
+                      until (prog1 (sb-thread:with-recursive-lock (dmu)
+                                     done-p)
+                              (prog1 done-p
+                                (unless done-p (sleep 0.001)))))
+                 (%block-exit ct)))))
         ;; THE ORACLE-TRAP TEARDOWN (§3552: "trap and tear down the
         ;; whole store"): a deadlocked executor stays parked in the
         ;; scheduler — the NEXT test's resume-all would nudge a
@@ -3571,8 +3576,31 @@ wrong-index probe: one transfer produced index 3)."
   ;; STARTED-wait's FIRST-TURN BOUNDARY (mechanism 5) reads it; the
   ;; invoke drain's tick gate (mechanism 2) also consults it. Pure
   ;; bookkeeping here — no behaviour changes.
-  (blocked-p nil)
+  (block-depth 0 :type (unsigned-byte 64))
+  (io-parked nil)
   (native nil))
+
+(defun %block-enter (th) (when th (sb-ext:atomic-incf (async-thread-block-depth th))))
+(defun %block-exit (th) (when th (sb-ext:atomic-decf (async-thread-block-depth th))))
+(defun %thread-blocked-p (th) (and th (> (async-thread-block-depth th) 0)))
+(defun %drain-tick-needed-p (root)
+  "M15 — `a tick can help => spend it`: the ROOT parked, or any LIVE
+thread a GRANTEE only a tick wakes (yield-park, ready-mark, armed
+non-IO park ready). IO parks belong to the root's block tick. THE
+LIVENESS INVARIANT: a hang means this classification missed a site."
+  (or (%thread-blocked-p root)
+      (let ((need nil))
+        (sb-thread:with-recursive-lock (*scheduler-mutex*)
+          (dolist (t2 *scheduler-threads*)
+            (unless (or (eq t2 root) (async-thread-abandoned t2))
+              (when (or (async-thread-yield-parked t2)
+                        (async-thread-ready-p t2)
+                        (and (async-thread-ready-fn t2)
+                             (not (async-thread-io-parked t2))
+                             (ignore-errors
+                               (funcall (async-thread-ready-fn t2)))))
+                (setf need t)))))
+        need)))
 
 ;;; ---- Thread-local context: bound per SBCL thread by the task
 ;;; body, so the built-ins find their task/instance. SBCL
@@ -3693,7 +3721,7 @@ holds, re-testing on each wakeup. M13-4: the count is cleared with
 the wake — a resume posted during THIS park is THIS park's, never
 the next one's (a count leaking into a later park is a spurious
 early return)."
-  (setf (async-thread-blocked-p thread) t)
+  (%block-enter thread)
   (unwind-protect
        (loop
          (sb-thread:with-recursive-lock ((async-thread-mutex thread))
@@ -3704,7 +3732,7 @@ early return)."
            (sb-thread:condition-wait (async-thread-waitqueue thread)
                                      (async-thread-mutex thread))
            (setf (async-thread-wake-count thread) 0)))
-    (setf (async-thread-blocked-p thread) nil)))
+    (%block-exit thread)))
 
 (defun async-thread-suspend (thread)
   "Thread.suspend (CanonicalABI.md 494): block with NO readiness
@@ -3718,7 +3746,7 @@ the post (the switcher's resume can land between the post and the
 wait's registration — its broadcast would be lost, its COUNT is
 durable), and clears the count on the returning wake."
   (setf (async-thread-suspended-p thread) t)
-  (setf (async-thread-blocked-p thread) t)
+  (%block-enter thread)
   (unwind-protect
        (loop
          (sb-thread:with-recursive-lock ((async-thread-mutex thread))
@@ -3742,7 +3770,7 @@ durable), and clears the count on the returning wake."
            (setf (async-thread-wake-count thread) 0)
            (return)))
     (setf (async-thread-suspended-p thread) nil)
-    (setf (async-thread-blocked-p thread) nil)))
+    (%block-exit thread)))
 
 (defun %async-thread-start-spawn (thread)
   "M13-4 the SPAWN-START half of Thread.resume (§474/§4590): the
@@ -3996,7 +4024,7 @@ the caller's own thread; never a plain suspend-parked thread
             ;; ready-fn): a mid-turn thread gets its grant consumed
             ;; at its next park, exactly as before.
             (setf (async-thread-granted th) t)
-            (when (and (async-thread-blocked-p th)
+            (when (and (%thread-blocked-p th)
                        (async-thread-ready-fn th))
               (%async-thread-wake th))))
         (when granted-thread
@@ -4041,7 +4069,7 @@ count arriving with the wake is THIS park's, never the next's."
   (sb-thread:with-recursive-lock ((async-thread-mutex thread))
     (async-thread-check-abandoned thread)
     (setf (async-thread-yield-parked thread) t)
-    (setf (async-thread-blocked-p thread) t)
+    (%block-enter thread)
     ;; M14 the PARK READINESS (§523: a yield is ALWAYS ready — the
     ;; park's ready-fn, per the spec's start_waiting(ready_func))
     (setf (async-thread-ready-fn thread) (lambda () t))
@@ -4051,7 +4079,7 @@ count arriving with the wake is THIS park's, never the next's."
     (setf (async-thread-wake-count thread) 0)
     (setf (async-thread-ready-fn thread) nil)
     (setf (async-thread-yield-parked thread) nil)
-    (setf (async-thread-blocked-p thread) nil)))
+    (%block-exit thread)))
 
 ;;; ---- the ComponentInstance concurrency fields (§133-150) ----
 
@@ -4523,7 +4551,7 @@ computes the tuple at delivery time)."
     (unwind-protect
          (progn
            (setf (async-thread-ready-fn thread) readiness)
-           (setf (async-thread-blocked-p thread) t)
+           (%block-enter thread)
            ;; M14 THE GRANTED PARK (the §932 turn model at the
            ;; callback WAIT arm): the park returns only on a GRANT
            ;; — the real tick (async-thread-resume-all sets granted
@@ -4574,7 +4602,7 @@ computes the tuple at delivery time)."
                (list 6 0 0)             ; EventCode.TASK_CANCELLED
                (%wset-get-pending-event wset)))
       (setf (async-thread-ready-fn thread) nil)
-      (setf (async-thread-blocked-p thread) nil)
+      (%block-exit thread)
       (sb-thread:with-recursive-lock ((async-waitable-set-mutex wset))
         (setf (async-waitable-set-waiters wset)
               (remove thread (async-waitable-set-waiters wset)
@@ -4958,6 +4986,8 @@ drop-readable must return index 1 again)."
                      (async-thread-resume-all))))))))
       (declare (ignore guest))
       (sb-thread:grab-mutex (async-task-mutex task))
+      (let ((nested (and (boundp '*current-thread*) *current-thread*)))
+        (%block-enter nested))
       (unwind-protect
            (loop
              with idle-cycles = 0
@@ -4968,14 +4998,22 @@ drop-readable must return index 1 again)."
              ;; whether any thread made progress, so a bare
              ;; condition-wait (sleeping until this task's own
              ;; resolution) would hang exactly when it must trap
-             do (let ((before *async-progress*))
-                  (async-thread-resume-all)
+             do (let* ((before *async-progress*)
+                       (spent (%drain-tick-needed-p th)))
+                  (when spent
+                    (async-thread-resume-all))
                   (sb-thread:release-mutex (async-task-mutex task))
                   (sleep 0.002)
                   (sb-thread:grab-mutex (async-task-mutex task))
+                  ;; THE ORACLE'S QUISCENCE RULE: a tick SPENT with
+                  ;; no progress is a quiescent cycle (the deadlock
+                  ;; fixtures' oracle); a cycle with NO tick spent
+                  ;; cannot judge progress (the guest is mid-turn).
                   (if (> *async-progress* before)
                       (setf idle-cycles 0)
-                      (incf idle-cycles)))
+                      (if spent
+                          (incf idle-cycles)
+                          (setf idle-cycles 0))))
              ;; THE DEADLOCK TRAP (§3539-3542): enough consecutive
              ;; quiescent cycles with the task unresolved = no ready
              ;; candidate can ever make progress
@@ -4990,6 +5028,7 @@ drop-readable must return index 1 again)."
                ;; thread exits on its own; the caller traps.
                (setf (async-thread-suspended-p th) nil)
                (setf (async-thread-yield-parked th) nil)
+               (setf (async-thread-block-depth th) 0)
                (setf (async-thread-abandoned th) t)
                (ignore-errors (%task-exit-implicit-thread task))
                (sb-thread:with-recursive-lock ((async-thread-mutex th))
@@ -5018,6 +5057,7 @@ drop-readable must return index 1 again)."
                               (not (eq th2 th)))
                      (setf (async-thread-suspended-p th2) nil)
                      (setf (async-thread-yield-parked th2) nil)
+                     (setf (async-thread-block-depth th2) 0)
                      (setf (async-thread-abandoned th2) t)
                      (ignore-errors
                        (%task-exit-implicit-thread
@@ -5031,7 +5071,8 @@ drop-readable must return index 1 again)."
                (error 'wasmdown:wasm-trap :kind :generic
                       :message
                       "deadlock detected: event loop cannot make further progress"))
-        (sb-thread:release-mutex (async-task-mutex task)))
+        (sb-thread:release-mutex (async-task-mutex task))
+        (%block-exit (and (boundp '*current-thread*) *current-thread*)))
       (etypecase (car cell)
         ((eql t)
          (let ((r (cdr cell)))
@@ -5426,7 +5467,8 @@ is the valtype."
                       (progn
                         (setf (async-waitable-has-sync-waiter end) t
                               (async-waitable-sync-waiter-thread end)
-                              *current-thread*)
+                              *current-thread*
+                              (async-thread-io-parked *current-thread*) t)
                         (unwind-protect
                              ;; M15 MECHANISM 7 (§932 + the fixture's
                              ;; "switch to the caller"): a blocking
@@ -5443,7 +5485,7 @@ is the valtype."
                                        (not (null
                                              (async-waitable-pending-event
                                               end)))))
-                               (setf (async-thread-blocked-p th) t)
+                               (%block-enter th)
                                (sb-thread:with-recursive-lock
                                    ((async-thread-mutex th))
                                  (setf (async-thread-granted th) nil)
@@ -5470,7 +5512,8 @@ is the valtype."
                                       (async-thread-waitqueue th)
                                       (async-thread-mutex th)))))
                                (setf (async-thread-ready-fn th) nil)
-                               (setf (async-thread-blocked-p th) nil))
+                               (%block-exit th))
+                          (setf (async-thread-io-parked *current-thread*) nil)
                           (setf (async-waitable-has-sync-waiter end)
                                 nil)
                           (setf (async-waitable-sync-waiter-thread end)
@@ -6022,7 +6065,7 @@ is the valtype."
                             t)
                       (setf (async-thread-suspended-p *current-thread*)
                             t))
-                  (setf (async-thread-blocked-p *current-thread*) t)
+                  (%block-enter *current-thread*)
                   (unwind-protect
                        (progn
                          ;; M13-9 NO ARM-TIME CLEAR + WAIT-THEN-CHECK:
@@ -6086,7 +6129,7 @@ is the valtype."
                               nil)
                         (setf (async-thread-suspended-p *current-thread*)
                               nil))
-                    (setf (async-thread-blocked-p *current-thread*) nil)
+                    (%block-exit *current-thread*)
                     (setf (async-thread-wake-count *current-thread*)
                           0)))))
             (list 0))))))
@@ -6593,6 +6636,7 @@ Abandon + unblock + unregister every still-registered thread."
       (dolist (th (copy-list *scheduler-threads*))
         (setf (async-thread-suspended-p th) nil)
         (setf (async-thread-yield-parked th) nil)
+        (setf (async-thread-block-depth th) 0)
         (setf (async-thread-abandoned th) t)
         (when (async-thread-task th)
           (ignore-errors

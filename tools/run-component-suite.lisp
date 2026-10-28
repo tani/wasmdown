@@ -237,6 +237,7 @@ parent dir), not the first (the grandparent 'component' — the old
                                  "cancel-targeted-resume.wast"
                                  "switch-to-ready-callback.wast"
                                  "partial-stream-copies.wast"
+                                 "sync-streams.wast"
                                  ;; M15 gate 6: the backpressure
                                  ;; gate's pending-cancel readiness
                                  ;; closed the mock-bp-inc hang.

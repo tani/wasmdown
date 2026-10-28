@@ -1,4 +1,51 @@
 # See README.md
+# M15 session 2 (2026-10-28): THE ASYNC SUITE IS COMPLETE — 45/45
+# files, lane 1631/0/0/0. sync-streams (the last file) IN THE LANE.
+#
+# THE LANDED SHAPE (one mechanism, measured through four shapes):
+# 1. THE BLOCK DEPTH (a COUNTER, not a boolean; sb-ext:atomic-incf
+#    requires an (unsigned-byte 64) slot): paired enter/exit at
+#    every park site (wait-until, suspend, yield, the callback WAIT
+#    park, the switch park, the sync-IO park, the nested
+#    %sync-thunk-run park, the Canon-lift nested wait) and zeroed
+#    by the three abandon sweeps. THE LIVENESS INVARIANT: a lost
+#    clear cannot permanently silence the drain.
+# 2. THE GUARDED MARKER (the raw type-error class's SITE):
+#    %sync-thunk-run's nested executor binds neither *current-task*
+#    nor *current-thread*, so an unguarded slot accessor there
+#    signaled "NIL is not of type ASYNC-THREAD" and escaped as a
+#    component trap. The fix: (let ((ct *current-thread*)) (when ct
+#    ...)).
+# 3. THE REFINED DRAIN PREDICATE — `a tick can help => spend it`:
+#    tick when the ROOT is parked, or any LIVE thread is a GRANTEE
+#    only a tick wakes: yield-parked, ready-marked (resume-later),
+#    or an ARMED park whose readiness holds. IO parks (the sync
+#    rendezvous) are EXCLUDED — they are granted by the root's own
+#    block tick (the fixture's "switch to the caller"), which is
+#    what closes sync-streams' first-run race.
+# 4. THE ORACLE'S QUIESCENCE RULE: a tick SPENT with no progress is
+#    a quiescent cycle (deadlock.wast's oracle); a cycle with NO
+#    tick spent cannot judge progress (the guest is mid-turn).
+#
+# THE MEASUREMENTS: lane 1631/0 x3; units 414/0; core 21187/0/73;
+# the pair probe (sync-barges-in -> sync-streams x3, the cold first
+# included) 3/3; the seven canaries 0/3; the cancel family 0 fails
+# in 5 runs each.
+#
+# THE 10-RUN FAILROW (per-file attribution): 5/10 runs CLEAN; the
+# other 5 carry SINGLE non-passes on FIVE different rows —
+# big-interleaving ::24 (once), async-calls-sync ::1 (once, the
+# ACCEPTED rate), cancel-targeted-resume ::9 (twice),
+# sync-streams ::1 (once), reentrance ::14 (once, the recorded
+# drift row). The band is ~0.7 single-fails/run across the suite's
+# timing-pinned rows.
+#
+# THE PRE-EXISTING FLAKE FOUND EN ROUTE (recorded, NOT caused by
+# this session): during-sync-scheduling-candidates fails ~47%
+# STANDALONE at the committed base (14 fails in 30 runs) and ~63%
+# under the gate (19/30) — the row is timing-pinned on the
+# pre-block ticks. The LANE masks it (one run per file). It is the
+# next robustness target.
 # M15 session 1 (2026-10-28): FOUR OF THE FIVE REMAINING FIXTURES
 # IN THE LANE — 1536 -> 1572. The landing order ran one mechanism
 # per gate with the canaries after each (async-calls-sync, the
@@ -495,7 +542,6 @@
 ./validation/kebab.wast
 ./values/post-return.wast
 ./values/variants.wast
-./async/sync-streams.wast
 # ---- M12 session 12 (2026-10-27): THE ATOMIC EXIT LANDED (a
 # strictly-safer read) — the flake class did NOT collapse; THE
 # M12 CLOSE-OUT CALL per the standing criterion (units 410/0;
