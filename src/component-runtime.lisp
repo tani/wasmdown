@@ -66,7 +66,12 @@
            #:make-host-buffer
            #:host-buffer-p
            #:host-buffer-values
-           #:host-buffer-progress))
+           #:host-buffer-progress
+           ;; M16 slice 3 — the HOST RESOURCE path (wasmdown.wasi's
+           ;; descriptor: a provider-owned resource whose rep is a CL
+           ;; record and whose drop runs a host finalizer)
+           #:host-resource-rep
+           #:*host-resource-dtor-table*))
 (in-package #:wasmdown.component.runtime)
 
 ;;; THE ASYNC DYNAMIC CONTEXT: proclaimed SPECIAL at the file's
@@ -294,6 +299,13 @@ func-instance, resolved at the TYPE def walk in the DEFINING
 instance's core-func space. A consumer's resource.drop canon reads
 the ORIGIN's dtor — the ct's payload dtor index is meaningful only
 there.")
+
+(defvar *host-resource-dtor-table* (make-hash-table :test #'eq)
+  "M16 slice 3: resource-ct -> (lambda (rep) ...) for a HOST-provided
+resource (wasi:filesystem's descriptor). Such a resource has no guest
+dtor func-instance; canon resource.drop calls this finalizer with the
+rep so the host capability (the fd) is released deterministically.")
+
 (defun %fresh-resource-id ()
   (cons :fresh (incf *resource-id-counter*)))
 
@@ -1380,6 +1392,17 @@ with the TAGGED code-unit count under CX's encoding. Traps on OOB
        ;; lower_async_value (§2857): the END (the domain value)
        ;; enters THIS instance's table; store the new index
        (%abi-store-int cx (%lower-async-end v cx) ptr 4))
+      ((:own :borrow :resource)
+       ;; M16 slice 3: a RESOURCE value inside a compound result
+       ;; (the host-provider shape): the abstract (:own-handle rt rep)
+       ;; record enters THIS (the caller's) table, the index is
+       ;; stored; an integer is already an index.
+       (%abi-store-int
+        cx
+        (if (and (consp v) (eq (car v) :own-handle))
+            (%handle-add (abi-cx-inst cx) (second v) (third v) t)
+            v)
+        ptr 4))
       (t (%abi-store-int cx v ptr 4)))))
 
 (defun %abi-store-list (cx v elem-type)
@@ -1677,6 +1700,17 @@ CoerceValueIter pairs) — NIL outside variants."
        ;; lower_async_value (§2851): the END enters THIS instance's
        ;; table; the flat i32 is the new index
        (list (%lower-async-end v cx)))
+      ((:own :borrow :resource)
+       ;; M16 slice 3: a RESOURCE value inside a compound result (the
+       ;; host-provider shape — `open-at`'s result<descriptor, _>, a
+       ;; list<tuple<descriptor, string>>) rides the abstract
+       ;; (:own-handle rt rep) record; lowering it ADDS the handle to
+       ;; THIS (the caller's) table and yields its index. A plain
+       ;; integer is already an index (the borrow lift's domain) and
+       ;; passes through.
+       (if (and (consp v) (eq (car v) :own-handle))
+           (list (%handle-add (abi-cx-inst cx) (second v) (third v) t))
+           (list (mod v #x100000000))))
       (t (list (mod v #x100000000))))))
 
 
@@ -2523,6 +2557,16 @@ through), never as a raw accessor crash."
         (when (and (consp h) (consp (car h)) (eql (caar h) rt))
           (cdar h))))))
 
+(defun host-resource-rep (rt index)
+  "M16 slice 3: the REP of the RESOURCE handle at INDEX on the
+DYNAMIC CALLER's handle table (*HANDLE-CALLER-INST*, bound by the
+canon-lower wrapper), type-checked against RT (the resource ct).
+A HOST provider's borrow param arrives as this raw index; the
+provider resolves it here. NIL when the index does not name an RT
+handle."
+  (let ((inst *handle-caller-inst*))
+    (and inst (integerp index) (%handle-rep inst rt index))))
+
 (defun %resource-rt (inst typeidx)
   "The runtime resource identity for the TYPEIDX'th component type —
 the validator's generative per-instantiation identity (the fresh id
@@ -3011,9 +3055,15 @@ resource.drop (param handle), [i32] -> [i32] for resource.rep."
                                         rt hit)
                       rep (first args)))))
           ;; an OWNING handle's drop runs the resource's dtor with
-          ;; the rep (canon_resource_drop, CanonicalABI.md 3782)
-          (when (and (cdr h) dtor)
-            (apply #'wasmdown.runtime:wasm-call dtor (list rep)))
+          ;; the rep (canon_resource_drop, CanonicalABI.md 3782).
+          ;; M16 slice 3: a HOST-provided resource has no guest dtor
+          ;; func-instance — its host finalizer (keyed by the ct,
+          ;; the handle's rt) releases the capability instead.
+          (when (cdr h)
+            (cond
+              (dtor (apply #'wasmdown.runtime:wasm-call dtor (list rep)))
+              (t (let ((hdtor (gethash rt *host-resource-dtor-table*)))
+                   (when hdtor (funcall hdtor rep))))))
           '()))))
     (:resource-rep
      (wasmdown.runtime:make-host-func-instance

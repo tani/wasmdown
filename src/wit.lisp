@@ -365,6 +365,13 @@ sigil and is not part of the name."
   (func-list nil)                        ; declaration order
   (resources (make-hash-table :test #'equal))
   (resource-list nil)
+  ;; M16 slice 3: resource-name -> the ONE ct object that names it.
+  ;; A host provider's handle table keys resource handles by the ct
+  ;; object (the runtime's own `rt' convention), so every occurrence
+  ;; of `descriptor' — a method's self borrow, `open-at's own
+  ;; result, the exported type — MUST resolve to the same object or
+  ;; the guest's canon resource.drop would see a type mismatch.
+  (resource-cts (make-hash-table :test #'equal))
   (uses nil))
 
 (defstruct wit-type
@@ -822,9 +829,23 @@ Follows `use` imports; NIL when unknown."
                               name (wit-interface-name scope))))
     (values (wit-type-expr ty) target)))
 
+(defun %resource-ct (interface name)
+  "The single ct object naming the resource NAME in INTERFACE (M16
+slice 3: nominal identity per interface, so every WIT occurrence of
+the resource — and every method's self borrow — shares one handle
+type identity)."
+  (let ((h (wit-interface-resource-cts interface)))
+    (or (gethash name h)
+        (setf (gethash name h)
+              (wasmdown.component:make-ct :kind :resource
+                                          :payload name)))))
+
 (defun wit-type->ct (interface expr &key packages)
   "Convert the WIT type EXPR (resolved in INTERFACE) to a
-wasmdown.component ct. Named references are resolved recursively."
+wasmdown.component ct. Named references are resolved recursively.
+A resource reference resolves to its interface's ONE resource ct,
+and `own'/'borrow' of a resource carry that ct (not a bare name) so
+the runtime's handle table has a stable type identity."
   (labels
       ((conv (expr scope seen)
          (cond
@@ -838,8 +859,10 @@ wasmdown.component ct. Named references are resolved recursively."
               (:name
                (multiple-value-bind (inner target)
                    (%named-expr scope (second expr) packages seen)
-                 (conv inner target
-                       (cons (second expr) seen))))
+                 (if (and (consp inner) (eq (car inner) :resource))
+                     (%resource-ct target (second inner))
+                     (conv inner target
+                           (cons (second expr) seen)))))
               (:list
                (wasmdown.component:make-ct
                 :kind :list
@@ -893,13 +916,19 @@ wasmdown.component ct. Named references are resolved recursively."
                                               (and te (conv te scope seen))))
                           'vector)))
               ((:own :borrow)
-               ;; slice 1 does not implement resource-typed providers;
-               ;; the name is kept so the caller sees the shape.
-               (wasmdown.component:make-ct :kind (car expr)
-                                           :payload (second expr)))
+               ;; the payload is the resource's ct (M16 slice 3) — the
+               ;; handle table's type identity; an unknown name keeps
+               ;; the bare name (the pre-resource shape).
+               (let ((inner (conv (second expr) scope seen)))
+                 (wasmdown.component:make-ct
+                  :kind (car expr)
+                  :payload (if (and (wasmdown.component:ct-p inner)
+                                    (eq (wasmdown.component:ct-kind inner)
+                                        :resource))
+                               inner
+                               (second expr)))))
               (:resource
-               (wasmdown.component:make-ct :kind :resource
-                                           :payload (second expr)))
+               (%resource-ct scope (second expr)))
               (t
                (error 'wit-error
                       :message (format nil "unknown WIT type form ~s"

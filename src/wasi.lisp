@@ -41,13 +41,16 @@
 (PLAN.md §9.1). ARGUMENTS is a list of strings, ENVIRONMENT an alist
 of (name . value) strings, CWD a string or NIL, and STDIN/STDOUT/
 STDERR the CL streams the stdio providers may use (or NIL: no such
-capability — never an ambient global)."
+capability — never an ambient global). PREOPENS is the filesystem
+authority list: wasi-preopen objects (open host directory handles,
+slice 3) — never a path-prefix string."
   (arguments nil)
   (environment nil)
   (cwd nil)
   (stdin nil)
   (stdout nil)
-  (stderr nil))
+  (stderr nil)
+  (preopens nil))
 
 ;;; ---------------------------------------------------------------
 ;;; Host exit.
@@ -123,13 +126,53 @@ back-pressure tables even for a host callee."
                             function-name
                             (wasmdown.wit:wit-interface-name interface)))))
 
+(defun %resource-method-export-name (resource method)
+  "The component-model core export name of a resource METHOD:
+[constructor]R, [static]R.m, or [method]R.m."
+  (let ((r (wasmdown.wit:wit-resource-name resource))
+        (m (wasmdown.wit:wit-func-name method)))
+    (cond
+      ((wasmdown.wit:wit-func-constructor-p method)
+       (format nil "[constructor]~a" r))
+      ((wasmdown.wit:wit-func-static-p method)
+       (format nil "[static]~a.~a" r m))
+      (t (format nil "[method]~a.~a" r m)))))
+
+(defun %resource-method-ct (interface resource method packages)
+  "The component functype of RESOURCE's METHOD: the WIT signature
+with the implicit `self: borrow<R>' prepended (CanonicalABI: a method
+is a plain func whose first param is the self borrow)."
+  (let* ((ct (wasmdown.wit:wit-func->ct interface method :packages packages))
+         (params (coerce (first (wasmdown.component:ct-payload ct)) 'list))
+         (resource-ct
+           (wasmdown.wit:wit-type->ct
+            interface (list :resource (wasmdown.wit:wit-resource-name resource))
+            :packages packages))
+         (self (cons "self"
+                     (wasmdown.component:make-ct :kind :borrow
+                                                 :payload resource-ct))))
+    (wasmdown.component:make-ct
+     :kind :func
+     :payload (list (coerce (if (wasmdown.wit:wit-func-static-p method)
+                                params
+                                (cons self params))
+                            'vector)
+                    (second (wasmdown.component:ct-payload ct))
+                    (wasmdown.wit:wit-func-async-p method)))))
+
 (defun provider-instance (interface implementations &key packages)
   "Build a comp-instance for the parsed WIT INTERFACE. IMPLEMENTATIONS
 is an alist ((\"now\" . fn) ...) of CL functions taking the component
 domain arguments; a function absent from the alist (or bound to
 :UNSUPPORTED) is still exported, as a host-error trap. The instance's
 export table also carries the interface's TYPE definitions, so a
-consumer can alias them with the runtime's type-projection path."
+consumer can alias them with the runtime's type-projection path.
+
+M16 slice 3: RESOURCE methods are exported under their component
+core names ([method]R.m / [static]R.m / [constructor]R), can be
+implemented either by that name or by the bare method name, and the
+resource type is exported as (:type . ct) — the ct every occurrence
+of the resource shares (the handle table's type identity)."
   (let ((inst (wasmdown.component.runtime:make-comp-instance)))
     (dolist (fn (wasmdown.wit:wit-interface-func-list interface))
       (let* ((fname (wasmdown.wit:wit-func-name fn))
@@ -144,8 +187,33 @@ consumer can alias them with the runtime's type-projection path."
         (setf (gethash fname
                        (wasmdown.component.runtime:comp-instance-exports inst))
               (cons :func (make-host-lifted-func ct closure :inst inst)))))
-    ;; The interface's defined types (not resources: a resource has no
-    ;; nominal identity in slice 1) are exported as (:type . ct).
+    ;; M16 slice 3: the interface's RESOURCES — the type export first
+    ;; (the shared ct), then each method as a func export.
+    (dolist (res (wasmdown.wit:wit-interface-resource-list interface))
+      (let* ((rname (wasmdown.wit:wit-resource-name res))
+             (rct (wasmdown.wit:wit-type->ct
+                   interface (list :resource rname) :packages packages)))
+        (setf (gethash rname
+                       (wasmdown.component.runtime:comp-instance-exports inst))
+              (cons :type rct))
+        (dolist (method (wasmdown.wit:wit-resource-methods res))
+          (let* ((mname (wasmdown.wit:wit-func-name method))
+                 (fname (%resource-method-export-name res method))
+                 (ct (%resource-method-ct interface res method packages))
+                 (impl (or (cdr (assoc fname implementations :test #'string=))
+                           (cdr (assoc mname implementations :test #'string=))))
+                 (closure
+                   (cond
+                     ((and impl (not (eq impl :unsupported)))
+                      (lambda (args) (apply impl args)))
+                     (t (%unsupported-closure interface fname)))))
+            (setf (gethash fname
+                           (wasmdown.component.runtime:comp-instance-exports
+                            inst))
+                  (cons :func (make-host-lifted-func ct closure
+                                                     :inst inst)))))))
+    ;; The interface's defined types (not resources: those are above)
+    ;; are exported as (:type . ct).
     (dolist (item (wasmdown.wit:wit-interface-items interface))
       (when (wasmdown.wit:wit-type-p item)
         (let ((expr (wasmdown.wit:wit-type-expr item)))
@@ -535,3 +603,958 @@ exported but trapping (host-error) — the capability is withdrawable."
            (wasmdown.wit:package-interface package "exit"))
           (cli-exit-instance :package package)))
    (cli-stdio-provider context :package package)))
+
+;;; ===============================================================
+;;; wasi:filesystem (M16 slice 3a) — THE CAPABILITY MODEL.
+;;;
+;;; PLAN.md §9.1: a file root is an OPEN HOST DIRECTORY HANDLE, never
+;;; a string prefix. Every operation is handle-relative (`*at' calls
+;;; against the descriptor's fd); there is no path-prefix filtering
+;;; anywhere. The authority object is WASI-PREOPEN — the fd, the
+;;; guest-visible name, and the descriptor the guest sees.
+;;;
+;;; Path policy (the WIT's 0.3 model, plus the conservative reading
+;;; §9.1 asks for):
+;;;   * paths are guest-relative: an empty path, an absolute path, a
+;;;     `..' component, or an embedded NUL is rejected (not-permitted
+;;;     / invalid) — a guest can never name a location outside the
+;;;     preopen;
+;;;   * the resolver walks components itself, opening each with
+;;;     O_NOFOLLOW, so the KERNEL never follows a symlink on our
+;;;     behalf (no TOCTOU window where a link swap redirects us);
+;;;     symlinks are expanded explicitly by readlinkat, and a target
+;;;     that is absolute or contains `..' is refused;
+;;;   * `path-flags.symlink-follow' decides whether the FINAL
+;;;     component is expanded; without it the operation addresses the
+;;;     link itself (stat-at reports symbolic-link, open-at fails
+;;;     closed with loop).
+;;;
+;;; The descriptor RESOURCE: one host resource per open descriptor,
+;;; with the runtime's handle table doing own/borrow (the provider's
+;;; result lowering adds the handle to the caller's table; a borrow
+;;; param arrives as that table's index and is resolved back through
+;;; the shared resource ct). The rep is the WASI-DESCRIPTOR record;
+;;; canon resource.drop runs the registered host finalizer, so the fd
+;;; is released deterministically.
+
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (let ((package (find-package '#:wasmdown.wasi)))
+    (dolist (name '("WASI-CONTEXT-PREOPENS"
+                    "WASI-PREOPEN" "WASI-PREOPEN-P" "MAKE-WASI-PREOPEN"
+                    "WASI-PREOPEN-FD" "WASI-PREOPEN-NAME"
+                    "WASI-PREOPEN-DESCRIPTOR"
+                    "OPEN-WASI-PREOPEN" "CLOSE-WASI-PREOPEN"
+                    "WASI-DESCRIPTOR" "WASI-DESCRIPTOR-P"
+                    "MAKE-WASI-DESCRIPTOR" "WASI-DESCRIPTOR-FD"
+                    "WASI-DESCRIPTOR-FLAGS" "WASI-DESCRIPTOR-PREOPEN"
+                    "WASI-DESCRIPTOR-DIR-P" "WASI-DESCRIPTOR-OWNED-P"
+                    "CLOSE-WASI-DESCRIPTOR"
+                    "WASI-FS-ERROR" "WASI-FS-ERROR-CODE"
+                    "ERRNO->ERROR-CODE"
+                    "FILESYSTEM-TYPES-INSTANCE" "FILESYSTEM-PREOPENS-INSTANCE"
+                    "FILESYSTEM-PROVIDER" "DESCRIPTOR-RESOURCE-CT"
+                    "FS-STAT" "FS-STAT-AT" "FS-OPEN-AT" "FS-GET-TYPE"
+                    "FS-GET-FLAGS" "FS-SET-SIZE" "FS-IS-SAME-OBJECT"
+                    "FS-METADATA-HASH" "FS-METADATA-HASH-AT"
+                    "FS-CREATE-DIRECTORY-AT" "FS-REMOVE-DIRECTORY-AT"
+                    "FS-UNLINK-FILE-AT" "FS-RENAME-AT" "FS-READLINK-AT"
+                    "FS-SYMLINK-AT" "FS-ADVISE" "FS-SYNC" "FS-SYNC-DATA"
+                    "FS-SET-TIMES" "FS-SET-TIMES-AT" "FS-LINK-AT"
+                    "FS-GET-DIRECTORIES"))
+      (export (intern name package) package))))
+
+;;; ---------------------------------------------------------------
+;;; The libc `*at' bindings (PLAN.md §9.2: thin, audited SB-ALIEN).
+
+(sb-alien:define-alien-routine ("open" %libc-open) sb-alien:int
+  (path sb-alien:c-string) (flags sb-alien:int) (mode sb-alien:int))
+(sb-alien:define-alien-routine ("openat" %libc-openat) sb-alien:int
+  (dirfd sb-alien:int) (path sb-alien:c-string) (flags sb-alien:int)
+  (mode sb-alien:int))
+(sb-alien:define-alien-routine ("mkdirat" %libc-mkdirat) sb-alien:int
+  (dirfd sb-alien:int) (path sb-alien:c-string) (mode sb-alien:int))
+(sb-alien:define-alien-routine ("unlinkat" %libc-unlinkat) sb-alien:int
+  (dirfd sb-alien:int) (path sb-alien:c-string) (flags sb-alien:int))
+(sb-alien:define-alien-routine ("renameat" %libc-renameat) sb-alien:int
+  (olddir sb-alien:int) (oldpath sb-alien:c-string)
+  (newdir sb-alien:int) (newpath sb-alien:c-string))
+(sb-alien:define-alien-routine ("linkat" %libc-linkat) sb-alien:int
+  (olddir sb-alien:int) (oldpath sb-alien:c-string)
+  (newdir sb-alien:int) (newpath sb-alien:c-string) (flags sb-alien:int))
+(sb-alien:define-alien-routine ("symlinkat" %libc-symlinkat) sb-alien:int
+  (target sb-alien:c-string) (dirfd sb-alien:int) (path sb-alien:c-string))
+(sb-alien:define-alien-routine ("readlinkat" %libc-readlinkat) sb-alien:long
+  (dirfd sb-alien:int) (path sb-alien:c-string)
+  (buf (* sb-alien:unsigned-char)) (size sb-alien:size-t))
+(sb-alien:define-alien-routine ("ftruncate" %libc-ftruncate) sb-alien:int
+  (fd sb-alien:int) (length sb-alien:off-t))
+(sb-alien:define-alien-routine ("fsync" %libc-fsync) sb-alien:int
+  (fd sb-alien:int))
+(sb-alien:define-alien-routine ("fdatasync" %libc-fdatasync) sb-alien:int
+  (fd sb-alien:int))
+(sb-alien:define-alien-routine ("posix_fadvise" %libc-fadvise) sb-alien:int
+  (fd sb-alien:int) (offset sb-alien:off-t) (length sb-alien:off-t)
+  (advice sb-alien:int))
+
+(sb-alien:define-alien-type nil
+  (sb-alien:struct %wasi-timespec
+    (tv-sec sb-alien:long)
+    (tv-nsec sb-alien:long)))
+(sb-alien:define-alien-type nil
+  (sb-alien:struct %wasi-timespec-pair
+    (a (sb-alien:struct %wasi-timespec))
+    (b (sb-alien:struct %wasi-timespec))))
+
+(sb-alien:define-alien-routine ("futimens" %libc-futimens) sb-alien:int
+  (fd sb-alien:int) (times (* (sb-alien:struct %wasi-timespec))))
+(sb-alien:define-alien-routine ("utimensat" %libc-utimensat) sb-alien:int
+  (dirfd sb-alien:int) (path sb-alien:c-string)
+  (times (* (sb-alien:struct %wasi-timespec))) (flags sb-alien:int))
+
+;;; Fcntl flag values. Most are asm-generic (identical on x86_64 and
+;;; arm64), but O_DIRECTORY / O_NOFOLLOW are ARCH-SPECIFIC: arm and
+;;; arm64 override them in asm/fcntl.h (O_DIRECTORY 040000,
+;;; O_NOFOLLOW 0100000) while the rest of the world uses the
+;;; asm-generic 0200000/0400000. Getting O_NOFOLLOW wrong would
+;;; silently let the kernel follow symlinks, so the arm split is
+;;; explicit.
+(defparameter +o-rdonly+ 0)
+(defparameter +o-wronly+ 1)
+(defparameter +o-rdwr+ 2)
+(defparameter +o-creat+ #x40)
+(defparameter +o-excl+ #x80)
+(defparameter +o-trunc+ #x200)
+(defparameter +o-cloexec+ #x80000)
+(defparameter +o-path+ #x200000)
+(defparameter +o-directory+
+  #+(or arm arm64) #o40000
+  #-(or arm arm64) #o200000)
+(defparameter +o-nofollow+
+  #+(or arm arm64) #o100000
+  #-(or arm arm64) #o40000)
+(defparameter +at-symlink-nofollow+ #x100)
+(defparameter +at-removedir+ #x200)
+(defparameter +at-symlink-follow+ #x400)
+(defparameter +utime-now+ 1073741823)
+(defparameter +utime-omit+ 1073741822)
+(defparameter +s-ifmt+ #o170000)
+(defparameter +s-ifreg+ #o100000)
+(defparameter +s-ifdir+ #o40000)
+(defparameter +s-iflnk+ #o120000)
+(defparameter +s-ifchr+ #o20000)
+(defparameter +s-ifblk+ #o60000)
+(defparameter +s-ififo+ #o10000)
+(defparameter +s-ifsock+ #o140000)
+
+;;; ---------------------------------------------------------------
+;;; errno -> the WIT error-code variant's cases.
+
+(defparameter *errno->error-code*
+  '((1 . "not-permitted")               ; EPERM
+    (2 . "no-entry")                    ; ENOENT
+    (4 . "interrupted")                 ; EINTR
+    (5 . "io")                          ; EIO
+    (6 . "no-such-device")              ; ENXIO
+    (9 . "bad-descriptor")              ; EBADF
+    (12 . "insufficient-memory")        ; ENOMEM
+    (13 . "access")                     ; EACCES
+    (16 . "busy")                       ; EBUSY
+    (17 . "exist")                      ; EEXIST
+    (18 . "cross-device")               ; EXDEV
+    (19 . "no-device")                  ; ENODEV
+    (20 . "not-directory")              ; ENOTDIR
+    (21 . "is-directory")               ; EISDIR
+    (22 . "invalid")                    ; EINVAL
+    (23 . "other")                      ; ENFILE
+    (24 . "other")                      ; EMFILE
+    (25 . "no-tty")                     ; ENOTTY
+    (26 . "text-file-busy")             ; ETXTBSY
+    (27 . "file-too-large")             ; EFBIG
+    (28 . "insufficient-space")         ; ENOSPC
+    (29 . "invalid-seek")               ; ESPIPE
+    (30 . "read-only")                  ; EROFS
+    (31 . "too-many-links")             ; EMLINK
+    (32 . "pipe")                       ; EPIPE
+    (35 . "deadlock")                   ; EDEADLK
+    (36 . "name-too-long")              ; ENAMETOOLONG
+    (37 . "no-lock")                    ; ENOLCK
+    (38 . "unsupported")                ; ENOSYS
+    (39 . "not-empty")                  ; ENOTEMPTY
+    (40 . "loop")                       ; ELOOP
+    (75 . "overflow")                   ; EOVERFLOW
+    (84 . "illegal-byte-sequence")      ; EILSEQ
+    (90 . "message-size")               ; EMSGSIZE
+    (95 . "unsupported")                ; EOPNOTSUPP
+    (114 . "already")                   ; EALREADY
+    (115 . "in-progress")               ; EINPROGRESS
+    (122 . "quota")                     ; EDQUOT
+    (131 . "not-recoverable"))          ; ENOTRECOVERABLE
+  "The Linux errno -> error-code case labels. Anything absent is the
+variant's `other' case (the WIT's catch-all).")
+
+(defparameter +enotdir+ 20)
+(defparameter +eloop+ 40)
+
+(defun errno->error-code (errno)
+  "The WIT error-code case label for ERRNO."
+  (or (cdr (assoc errno *errno->error-code*)) "other"))
+
+(define-condition wasi-fs-error (wasmdown:wasmdown-error)
+  ((code :initarg :code :reader wasi-fs-error-code))
+  (:report (lambda (c s)
+             (format s "wasi:filesystem error: ~a"
+                     (wasi-fs-error-code c))))
+  (:documentation "The internal short-circuit of a filesystem
+operation: the provider's method wrapper turns it into the WIT's
+`(:err . code)' result. A capability violation (an escaping path,
+a descriptor of another authority) signals it too."))
+
+(defun %fs-error (code)
+  (error 'wasi-fs-error :code code))
+
+(defmacro %fs-result (&body body)
+  "Run BODY; its value is the ok payload: (:ok . value). A
+wasi-fs-error becomes (:err . code)."
+  `(handler-case (cons :ok (progn ,@body))
+     (wasi-fs-error (c) (cons :err (wasi-fs-error-code c)))))
+
+(defun %fs-check (ret what)
+  "Turn a libc -1 return into the mapped wasi-fs-error (the errno is
+read only on failure: a successful call leaves it stale)."
+  (when (minusp ret)
+    (%fs-error (errno->error-code (sb-alien:get-errno))))
+  ret)
+
+;;; ---------------------------------------------------------------
+;;; The authority objects.
+
+(defstruct wasi-preopen
+  "A WASI file root: an OPEN HOST DIRECTORY HANDLE (PLAN.md §9.1) and
+the guest-visible path string the guest knows it by. Every operation
+on it is handle-relative; there is no path-prefix check to bypass."
+  (fd -1)
+  (name "")
+  (descriptor nil))
+
+(defstruct wasi-descriptor
+  "One open descriptor (the `descriptor' resource's rep): the host fd,
+the preopen it is confined to, the guest-visible descriptor-flags
+labels, whether the fd belongs to the descriptor (a preopen's does
+not — dropping the guest's handle must not close the root), and
+whether it names a directory."
+  (fd -1)
+  (preopen nil)
+  (flags nil)
+  (owned-p t)
+  (dir-p nil))
+
+(defun %close-fd (fd)
+  (when (and (integerp fd) (not (minusp fd)))
+    (sb-unix:unix-close fd)))
+
+(defun close-wasi-descriptor (descriptor)
+  "Release DESCRIPTOR's fd when the descriptor owns it. Idempotent."
+  (when (wasi-descriptor-p descriptor)
+    (let ((fd (wasi-descriptor-fd descriptor)))
+      (when (and (wasi-descriptor-owned-p descriptor)
+                 (integerp fd) (not (minusp fd)))
+        (setf (wasi-descriptor-fd descriptor) -1)
+        (%close-fd fd)))))
+
+(defun %open-host-directory (path)
+  "Open PATH as a directory fd (the capability's root handle)."
+  (let ((fd (%libc-open (namestring path)
+                        (logior +o-rdonly+ +o-directory+ +o-cloexec+)
+                        0)))
+    (when (minusp fd)
+      (error 'wasmdown:host-error
+             :message (format nil "cannot open preopen directory ~a (errno ~a)"
+                              path (sb-alien:get-errno))))
+    fd))
+
+(defun open-wasi-preopen (host-path &key name)
+  "Establish a file root: open HOST-PATH once as a directory handle.
+NAME is the guest-visible preopen name (defaults to the host path).
+The caller owns the preopen; close-wasi-preopen releases the fd."
+  (let* ((fd (%open-host-directory host-path))
+         (pre (make-wasi-preopen :fd fd :name (or name (namestring host-path))))
+         (desc (make-wasi-descriptor
+                :fd fd
+                :preopen pre
+                :flags '("read" "write" "mutate-directory")
+                :owned-p nil
+                :dir-p t)))
+    (setf (wasi-preopen-descriptor pre) desc)
+    pre))
+
+(defun close-wasi-preopen (preopen)
+  "Release the preopen's host directory handle."
+  (when (wasi-preopen-p preopen)
+    (%close-fd (wasi-preopen-fd preopen))
+    (setf (wasi-preopen-fd preopen) -1)))
+
+(defun descriptor-resource-ct (&key (package (wasi-package "filesystem")))
+  "The `descriptor' resource's ct for PACKAGE — the handle table's
+type identity for every descriptor handle (the provider functypes,
+the exported type and the drop finalizer all share it)."
+  (wasmdown.wit:wit-type->ct
+   (wasmdown.wit:package-interface package "types")
+   (list :resource "descriptor")
+   :packages (list package)))
+
+(defparameter *descriptor-dtor-installed* (make-hash-table :test #'eq))
+
+(defun %install-descriptor-dtor (ct)
+  "Register the host finalizer for the descriptor resource: canon
+resource.drop has no guest dtor func-instance for a host-provided
+resource, so it calls this with the rep (the wasi-descriptor)."
+  (unless (gethash ct *descriptor-dtor-installed*)
+    (setf (gethash ct *descriptor-dtor-installed*) t)
+    (setf (gethash ct
+                   wasmdown.component.runtime:*host-resource-dtor-table*)
+          #'close-wasi-descriptor))
+  ct)
+
+;;; ---------------------------------------------------------------
+;;; The descriptor domain boundary: own/borrow handles.
+
+(defun %descriptor-of (context value ct)
+  "The wasi-descriptor a method's self/borrow argument denotes:
+VALUE is either the rep itself (a direct CL call / a nested call) or
+the handle INDEX the canon-lower lift produced, resolved on the
+dynamic CALLER's handle table through the resource ct."
+  (let ((desc
+          (cond
+            ((wasi-descriptor-p value) value)
+            ((integerp value)
+             (or (wasmdown.component.runtime:host-resource-rep ct value)
+                 (%fs-error "bad-descriptor")))
+            (t (%fs-error "invalid")))))
+    (unless (wasi-descriptor-p desc)
+      (%fs-error "bad-descriptor"))
+    ;; the authority check: the descriptor must belong to a preopen
+    ;; of THIS provider's context — descriptors never travel between
+    ;; differently-authorized providers.
+    (unless (member (wasi-descriptor-preopen desc)
+                    (wasi-context-preopens context))
+      (%fs-error "not-permitted"))
+    desc))
+
+(defun %descriptor-fd (desc)
+  (let ((fd (wasi-descriptor-fd desc)))
+    (unless (and (integerp fd) (not (minusp fd)))
+      (%fs-error "bad-descriptor"))
+    fd))
+
+(defun %flag-set (v)
+  "The label list of a flags domain value (:flags (\"read\" ...)), a
+bare list, or NIL."
+  (cond ((null v) '())
+        ((and (consp v) (eq (car v) :flags)) (cdr v))
+        ((listp v) v)
+        (t (list v))))
+
+(defun %descriptor-writable-p (desc)
+  (let ((flags (wasi-descriptor-flags desc)))
+    (or (member "write" flags :test #'string=)
+        (member "mutate-directory" flags :test #'string=))))
+
+(defun %require-mutable (desc)
+  (unless (%descriptor-writable-p desc)
+    (%fs-error "read-only")))
+
+;;; ---------------------------------------------------------------
+;;; Path validation + the handle-relative resolver.
+
+(defun %path-components (path)
+  "PATH's components after dropping empty and `.' pieces. Signals the
+WIT's capability errors: empty -> invalid, absolute -> not-permitted,
+NUL -> invalid, `..' -> not-permitted (the conservative rule: the
+guest may never climb, so no symbolic-link or `..' step can leave the
+preopen)."
+  (unless (stringp path)
+    (%fs-error "invalid"))
+  (when (zerop (length path))
+    (%fs-error "invalid"))
+  (when (char= (char path 0) #\/)
+    (%fs-error "not-permitted"))
+  (when (find (code-char 0) path)
+    (%fs-error "invalid"))
+  (let ((parts '())
+        (start 0))
+    (loop for i from 0 to (length path)
+          do (when (or (= i (length path)) (char= (char path i) #\/))
+               (let ((part (subseq path start i)))
+                 (setf start (1+ i))
+                 (cond
+                   ((or (zerop (length part)) (string= part "."))
+                    nil)
+                   ((string= part "..")
+                    (%fs-error "not-permitted"))
+                   (t (push part parts))))))
+    (nreverse parts)))
+
+(defun %readlink-raw (dirfd name)
+  "The raw target text of the symlink (DIRFD, NAME)."
+  (let* ((size 4096)
+         (buf (sb-alien:make-alien sb-alien:unsigned-char size)))
+    (unwind-protect
+         (let ((n (%libc-readlinkat dirfd name buf size)))
+           (when (minusp n)
+             (%fs-error (errno->error-code (sb-alien:get-errno))))
+           (when (or (zerop n) (= n size))
+             (%fs-error "invalid"))
+           (let ((target (make-string n)))
+             (dotimes (i n)
+               (setf (char target i)
+                     (code-char (sb-sys:sap-ref-8
+                                 (sb-alien:alien-sap buf) i))))
+             target))
+      (sb-alien:free-alien buf))))
+
+(defun %readlink-components (dirfd name)
+  "The components of the symlink at (DIRFD, NAME); an absolute or
+`..'-bearing target is refused (not-permitted)."
+  (let ((target (%readlink-raw dirfd name)))
+    (when (char= (char target 0) #\/)
+      (%fs-error "not-permitted"))
+    (%path-components target)))
+
+(defparameter *max-symlink-expansions* 32
+  "The symlink budget of one path resolution (a bounded walk instead
+of the kernel's ELOOP-only feedback).")
+
+(defun %resolve-path (desc path path-flags)
+  "Resolve PATH relative to DESC's fd, one component at a time.
+Returns (values DIR-FD LEAF OWNS-DIR-P): DIR-FD is the directory the
+operation applies to, LEAF its final component (\".\" when PATH names
+the descriptor itself), and OWNS-DIR-P says whether the caller must
+close DIR-FD. Every component is opened O_NOFOLLOW — the kernel never
+follows a symlink for us — and any symlink is expanded here, so a
+link swapped in mid-walk can only make the operation FAIL, never
+escape. PATH-FLAGS is the WIT flags domain value; `symlink-follow'
+expands the final component too."
+  (let* ((parts (%path-components path))
+         (follow (member "symlink-follow" (%flag-set path-flags)
+                         :test #'string=))
+         (base (%descriptor-fd desc))
+         (cur base)
+         (owned nil)
+         (queue parts)
+         (links 0))
+    (labels
+        ((close-cur ()
+           (when owned
+             (when (not (minusp cur)) (%close-fd cur))
+             (setf owned nil)))
+         (drop-everything (code)
+           (close-cur)
+           (%fs-error code))
+         (expand (name)
+           (incf links)
+           (when (> links *max-symlink-expansions*)
+             (drop-everything "loop"))
+           (handler-case (%readlink-components cur name)
+             (wasi-fs-error (c)
+               (drop-everything (wasi-fs-error-code c)))))
+         (open-component (name flags)
+           (let ((fd (%libc-openat cur name flags 0)))
+             (if (minusp fd) -1 fd)))
+         (fail-errno ()
+           (let ((errno (sb-alien:get-errno)))
+             (cond
+               ((= errno +eloop+) :link)
+               ((= errno +enotdir+) :not-dir)
+               (t (drop-everything (errno->error-code errno)))))))
+      (loop
+        (cond
+          ((null queue)
+           (return (values cur "." owned)))
+          ((null (rest queue))
+           ;; the final component: expand it when requested
+           (when follow
+             (loop
+               (when (or (null queue) (rest queue)) (return))
+               (let ((probe (open-component (first queue)
+                                  (logior +o-path+ +o-nofollow+ +o-cloexec+))))
+                 (cond
+                   ((not (minusp probe))
+                    (let ((mode (nth-value 3 (sb-unix:unix-fstat probe))))
+                      (%close-fd probe)
+                      (if (and mode (= (logand mode +s-ifmt+) +s-iflnk+))
+                          (setf queue (expand (first queue)))
+                          (return))))
+                   ((= (sb-alien:get-errno) +eloop+)
+                    (setf queue (expand (first queue))))
+                   (t (return))))))
+           (when (or (null queue) (null (rest queue)))
+             (return (values cur (if queue (first queue) ".") owned)))
+           ;; an expansion grew the queue: keep walking
+           nil)
+          (t
+           ;; an intermediate component: it must be a directory
+           (let ((fd (open-component (first queue)
+                           (logior +o-rdonly+ +o-directory+
+                                   +o-nofollow+ +o-cloexec+))))
+             (cond
+               ((not (minusp fd))
+                (close-cur)
+                (setf cur fd owned t)
+                (setf queue (rest queue)))
+               (t
+                (case (fail-errno)
+                  (:link
+                   (setf queue (append (expand (first queue))
+                                       (rest queue))))
+                  (:not-dir
+                   ;; a symlink opened with O_NOFOLLOW|O_DIRECTORY
+                   ;; reports ENOTDIR; expand it when it IS a link so
+                   ;; the error (or the resolution) is the honest one.
+                   ;; A POLICY refusal (an absolute/climbing target)
+                   ;; must keep its code — collapsing it to
+                   ;; not-directory would hide the escape attempt.
+                   (handler-case
+                       (setf queue
+                             (append (%readlink-components cur (first queue))
+                                     (rest queue)))
+                     (wasi-fs-error (c)
+                       (let ((code (wasi-fs-error-code c)))
+                         (drop-everything
+                          (if (string= code "invalid")
+                              "not-directory"
+                              code))))))
+                  (t nil)))))))))))
+
+(defmacro %with-resolved ((dir leaf owned) (desc path flags) &body body)
+  "Resolve DESC's PATH with FLAGS into (DIR LEAF OWNED) and close the
+borrowed directory fd on exit."
+  `(multiple-value-bind (,dir ,leaf ,owned)
+       (%resolve-path ,desc ,path ,flags)
+     (unwind-protect (progn ,@body)
+       (when ,owned (%close-fd ,dir)))))
+
+;;; ---------------------------------------------------------------
+;;; Handle-relative primitives.
+
+(defun %fstat (fd)
+  "FD's (values dev ino mode nlink size mtime). SBCL's unix-fstat
+returns (t dev ino mode nlink uid gid rdev size atime mtime ctime
+blksize blocks) on success and (nil errno) on failure — the second
+slot is DEV, not an errno (a shift here made every type read as
+`other')."
+  (multiple-value-bind (ok dev ino mode nlink uid gid rdev
+                        size atime mtime ctime blksize blocks)
+      (sb-unix:unix-fstat fd)
+    (declare (ignore uid gid rdev atime ctime blksize blocks))
+    (unless ok
+      ;; on failure the second value is the errno
+      (%fs-error (errno->error-code dev)))
+    (values dev ino mode nlink size mtime)))
+
+(defun %mode->type (mode)
+  "The descriptor-type VARIANT domain value: (case-name . payload)."
+  (let ((kind (logand mode +s-ifmt+)))
+    (cond ((= kind +s-ifreg+) (cons "regular-file" nil))
+          ((= kind +s-ifdir+) (cons "directory" nil))
+          ((= kind +s-iflnk+) (cons "symbolic-link" nil))
+          ((= kind +s-ifchr+) (cons "character-device" nil))
+          ((= kind +s-ifblk+) (cons "block-device" nil))
+          ((= kind +s-ififo+) (cons "fifo" nil))
+          ((= kind +s-ifsock+) (cons "socket" nil))
+          (t (cons "other" :none)))))
+
+(defun %instant (seconds nanoseconds)
+  (list (cons "seconds" seconds) (cons "nanoseconds" nanoseconds)))
+
+(defun %stat-record (dev ino mode nlink size mtime)
+  "The WIT descriptor-stat domain value for the fstat tuple."
+  (declare (ignore dev ino))
+  (list (cons "%type" (%mode->type mode))
+        (cons "link-count" nlink)
+        (cons "size" size)
+        (cons "data-access-timestamp" (cons :some (%instant mtime 0)))
+        (cons "data-modification-timestamp" (cons :some (%instant mtime 0)))
+        (cons "status-change-timestamp" (cons :some (%instant mtime 0)))))
+
+(defun %stat-at (desc path flags)
+  "fstatat emulated with O_PATH + fstat (SBCL's stat wrapper is
+portable; the struct layout is not). The resolver has already decided
+the symlink policy, so the probe never follows a link."
+  (%with-resolved (dir leaf owned) (desc path flags)
+    (let ((fd (%libc-openat dir leaf (logior +o-path+ +o-nofollow+
+                                             +o-cloexec+) 0)))
+      (when (minusp fd)
+        (%fs-error (errno->error-code (sb-alien:get-errno))))
+      (unwind-protect
+           (%fstat fd)
+        (%close-fd fd)))))
+
+(defun %metadata-hash (dev ino mtime size)
+  "A 128-bit split hash of the metadata the WIT suggests (dev/ino/
+mtime/size mixed through a 64-bit avalanche)."
+  (let* ((x (logand (+ (* dev 1000003) (* ino 31)
+                       (* mtime 2654435761) size)
+                    #xffffffffffffffff))
+         (x (logand (* (logxor x (ash x -33)) #xff51afd7ed558ccd)
+                    #xffffffffffffffff))
+         (x (logand (* (logxor x (ash x -33)) #xc4ceb9fe1a85ec53)
+                    #xffffffffffffffff))
+         (h (logxor x (ash x -33))))
+    (list (cons "lower" (logand h #xffffffffffffffff))
+          (cons "upper" 0))))
+
+(defun %timestamp->timespec (value)
+  "The (sec . nsec) a new-timestamp domain value denotes; UTIME_NOW /
+UTIME_OMIT are the sentinels."
+  (let ((case (car value)))
+    (cond
+      ((string= case "no-change") (cons 0 +utime-omit+))
+      ((string= case "now") (cons 0 +utime-now+))
+      ((string= case "timestamp")
+       (let ((instant (cdr value)))
+         (cons (or (cdr (assoc "seconds" instant :test #'string=)) 0)
+               (or (cdr (assoc "nanoseconds" instant :test #'string=)) 0))))
+      (t (cons 0 +utime-now+)))))
+
+(defun %timespec-pair (atime mtime)
+  "Allocate the two-timespec array FUTIMENS/UTIMENSAT take."
+  (let ((p (sb-alien:make-alien (sb-alien:struct %wasi-timespec-pair))))
+    (flet ((set1 (slot spec)
+             (let ((s (sb-alien:slot (sb-alien::deref p) slot)))
+               (setf (sb-alien:slot s 'tv-sec) (car spec))
+               (setf (sb-alien:slot s 'tv-nsec) (cdr spec)))))
+      (set1 'a (%timestamp->timespec atime))
+      (set1 'b (%timestamp->timespec mtime)))
+    p))
+
+;;; ---------------------------------------------------------------
+;;; The descriptor methods (the WIT's async surface; the provider
+;;; wraps each in the runtime's async-typed functype, so a guest's
+;;; canon-lowered call goes through the canonical task protocol).
+
+(defun fs-stat (context self)
+  (%fs-result
+   (let ((desc (%descriptor-of context self (descriptor-resource-ct))))
+     (multiple-value-bind (dev ino mode nlink size mtime)
+         (%fstat (%descriptor-fd desc))
+       (%stat-record dev ino mode nlink size mtime)))))
+
+(defun fs-stat-at (context self path-flags path)
+  (%fs-result
+   (%descriptor-of context self (descriptor-resource-ct))
+   (multiple-value-bind (dev ino mode nlink size mtime)
+       (%stat-at (%descriptor-of context self (descriptor-resource-ct))
+                 path path-flags)
+     (%stat-record dev ino mode nlink size mtime))))
+
+(defun fs-get-type (context self)
+  (%fs-result
+   (let ((desc (%descriptor-of context self (descriptor-resource-ct))))
+     (%mode->type (nth-value 2 (%fstat (%descriptor-fd desc)))))))
+
+(defun fs-get-flags (context self)
+  (%fs-result
+   (cons :flags (copy-list
+                 (wasi-descriptor-flags
+                  (%descriptor-of context self (descriptor-resource-ct)))))))
+
+(defun fs-set-size (context self size)
+  (%fs-result
+   (let ((desc (%descriptor-of context self (descriptor-resource-ct))))
+     (%require-mutable desc)
+     (%fs-check (%libc-ftruncate (%descriptor-fd desc) size) "ftruncate")
+     nil)))
+
+(defun fs-is-same-object (context self other)
+  "The WIT returns a plain bool (no result wrapper). A bad handle is a
+host error, not an error-code."
+  (let* ((ct (descriptor-resource-ct))
+         (a (%descriptor-of context self ct))
+         (b (%descriptor-of context other ct)))
+    (multiple-value-bind (adev aino) (%fstat (%descriptor-fd a))
+      (multiple-value-bind (bdev bino) (%fstat (%descriptor-fd b))
+        (and (= adev bdev) (= aino bino))))))
+
+(defun fs-metadata-hash (context self)
+  (%fs-result
+   (let ((desc (%descriptor-of context self (descriptor-resource-ct))))
+     (multiple-value-bind (dev ino mode nlink size mtime)
+         (%fstat (%descriptor-fd desc))
+       (declare (ignore mode nlink))
+       (%metadata-hash dev ino mtime size)))))
+
+(defun fs-metadata-hash-at (context self path-flags path)
+  (%fs-result
+   (multiple-value-bind (dev ino mode nlink size mtime)
+       (%stat-at (%descriptor-of context self (descriptor-resource-ct))
+                 path path-flags)
+     (declare (ignore mode nlink))
+     (%metadata-hash dev ino mtime size))))
+
+(defun fs-create-directory-at (context self path)
+  (%fs-result
+   (let ((desc (%descriptor-of context self (descriptor-resource-ct))))
+     (%require-mutable desc)
+     (%with-resolved (dir leaf owned) (desc path nil)
+       (%fs-check (%libc-mkdirat dir leaf #o755) "mkdirat")
+       nil))))
+
+(defun fs-remove-directory-at (context self path)
+  (%fs-result
+   (let ((desc (%descriptor-of context self (descriptor-resource-ct))))
+     (%require-mutable desc)
+     (%with-resolved (dir leaf owned) (desc path nil)
+       (%fs-check (%libc-unlinkat dir leaf +at-removedir+) "unlinkat")
+       nil))))
+
+(defun fs-unlink-file-at (context self path)
+  (%fs-result
+   (let ((desc (%descriptor-of context self (descriptor-resource-ct))))
+     (%require-mutable desc)
+     (%with-resolved (dir leaf owned) (desc path nil)
+       (%fs-check (%libc-unlinkat dir leaf 0) "unlinkat")
+       nil))))
+
+(defun fs-rename-at (context self old-path new-descriptor new-path)
+  (%fs-result
+   (let* ((ct (descriptor-resource-ct))
+          (old (%descriptor-of context self ct))
+          (new (%descriptor-of context new-descriptor ct)))
+     (%require-mutable old)
+     (%require-mutable new)
+     (%with-resolved (odir oleaf oowned) (old old-path nil)
+       (%with-resolved (ndir nleaf nowned) (new new-path nil)
+         (%fs-check (%libc-renameat odir oleaf ndir nleaf) "renameat")
+         nil)))))
+
+(defun fs-readlink-at (context self path)
+  (%fs-result
+   (let ((desc (%descriptor-of context self (descriptor-resource-ct))))
+     (%with-resolved (dir leaf owned) (desc path nil)
+       (let ((target (%readlink-raw dir leaf)))
+         ;; the WIT: an absolute or rooted target is not-permitted
+         ;; (the guest must not learn a path it could use to reason
+         ;; about escaping, and the value must stay preopen-relative)
+         (when (char= (char target 0) #\/)
+           (%fs-error "not-permitted"))
+         (%path-components target)
+         target)))))
+
+(defun fs-symlink-at (context self old-path new-path)
+  (%fs-result
+   (let ((desc (%descriptor-of context self (descriptor-resource-ct))))
+     (%require-mutable desc)
+     (when (and (plusp (length old-path)) (char= (char old-path 0) #\/))
+       (%fs-error "not-permitted"))
+     (%path-components old-path)  ; the target must not climb either
+     (%with-resolved (dir leaf owned) (desc new-path nil)
+       (%fs-check (%libc-symlinkat old-path dir leaf) "symlinkat")
+       nil))))
+
+(defun fs-open-at (context self path-flags path open-flags flags)
+  (%fs-result
+   (let* ((desc (%descriptor-of context self (descriptor-resource-ct)))
+          (oflags (%flag-set open-flags))
+          (dflags (%flag-set flags))
+          (create (member "create" oflags :test #'string=))
+          (directory (member "directory" oflags :test #'string=))
+          (exclusive (member "exclusive" oflags :test #'string=))
+          (truncate (member "truncate" oflags :test #'string=))
+          (write-p (member "write" dflags :test #'string=)))
+     ;; the WIT's read-only rule: creating, truncating, writing or
+     ;; mutating through a descriptor that lacks mutate-directory is
+     ;; refused with read-only
+     (when (and (or create truncate write-p
+                    (member "mutate-directory" dflags :test #'string=))
+                (not (member "mutate-directory"
+                             (wasi-descriptor-flags desc) :test #'string=)))
+       (%fs-error "read-only"))
+     (let* ((access (cond ((and (member "read" dflags :test #'string=)
+                                write-p)
+                           +o-rdwr+)
+                          (write-p +o-wronly+)
+                          (t +o-rdonly+)))
+            ;; a directory is opened read-only (the OS refuses write
+            ;; modes on directories); the guest flags still record the
+            ;; intent
+            (access (if directory +o-rdonly+ access))
+            (oflags-bits (logior access +o-cloexec+ +o-nofollow+
+                                 (if create +o-creat+ 0)
+                                 (if directory +o-directory+ 0)
+                                 (if exclusive +o-excl+ 0)
+                                 (if truncate +o-trunc+ 0))))
+       (%with-resolved (dir leaf owned) (desc path path-flags)
+         (let ((fd (%libc-openat dir leaf oflags-bits #o666)))
+           (when (minusp fd)
+             (%fs-error (errno->error-code (sb-alien:get-errno))))
+           (let* ((mode (nth-value 3 (sb-unix:unix-fstat fd)))
+                  (is-dir (and mode (= (logand mode +s-ifmt+) +s-ifdir+)))
+                  (opened (make-wasi-descriptor
+                           :fd fd
+                           :preopen (wasi-descriptor-preopen desc)
+                           :flags (copy-list dflags)
+                           :owned-p t
+                           :dir-p is-dir)))
+             (list :own-handle (descriptor-resource-ct) opened))))))))
+
+(defun fs-advise (context self offset length advice)
+  (%fs-result
+   (let* ((desc (%descriptor-of context self (descriptor-resource-ct)))
+          (a (if (and (consp advice) (eq (car advice) :enum))
+                 (cdr advice)
+                 advice))
+          (code (cond ((string= a "normal") 0)
+                      ((string= a "sequential") 2)
+                      ((string= a "random") 1)
+                      ((string= a "will-need") 3)
+                      ((string= a "dont-need") 4)
+                      ((string= a "no-reuse") 5)
+                      (t 0)))
+          (ret (%libc-fadvise (%descriptor-fd desc) offset length code)))
+     ;; posix_fadvise RETURNS the error number (it does not set errno)
+     (unless (zerop ret)
+       (%fs-error (errno->error-code ret)))
+     nil)))
+
+(defun fs-sync (context self)
+  (%fs-result
+   (%fs-check (%libc-fsync (%descriptor-fd
+                            (%descriptor-of context self
+                                            (descriptor-resource-ct))))
+              "fsync")
+   nil))
+
+(defun fs-sync-data (context self)
+  (%fs-result
+   (%fs-check (%libc-fdatasync (%descriptor-fd
+                                (%descriptor-of context self
+                                                (descriptor-resource-ct))))
+              "fdatasync")
+   nil))
+
+(defun fs-set-times (context self atime mtime)
+  (%fs-result
+   (let* ((desc (%descriptor-of context self (descriptor-resource-ct)))
+          (pair (%timespec-pair atime mtime)))
+     (unwind-protect
+          (progn
+            (%fs-check (%libc-futimens
+                        (%descriptor-fd desc)
+                        (sb-alien:addr
+                         (sb-alien:slot (sb-alien::deref pair) 'a)))
+                       "futimens")
+            nil)
+       (sb-alien:free-alien pair)))))
+
+(defun fs-set-times-at (context self path-flags path atime mtime)
+  (%fs-result
+   (let ((desc (%descriptor-of context self (descriptor-resource-ct))))
+     (when (null (%descriptor-writable-p desc))
+       (%fs-error "read-only"))
+     (%with-resolved (dir leaf owned) (desc path path-flags)
+       (let ((pair (%timespec-pair atime mtime)))
+         (unwind-protect
+              (progn
+                ;; the resolver already applied the symlink policy;
+                ;; NOFOLLOW makes a raced-in link fail closed
+                (%fs-check (%libc-utimensat
+                            dir leaf
+                            (sb-alien:addr
+                             (sb-alien:slot (sb-alien::deref pair) 'a))
+                            +at-symlink-nofollow+)
+                           "utimensat")
+                nil)
+           (sb-alien:free-alien pair)))))))
+
+(defun fs-link-at (context self old-path-flags old-path
+                   new-descriptor new-path)
+  (%fs-result
+   (let* ((ct (descriptor-resource-ct))
+          (old (%descriptor-of context self ct))
+          (new (%descriptor-of context new-descriptor ct))
+          (follow (member "symlink-follow" (%flag-set old-path-flags)
+                          :test #'string=)))
+     (%require-mutable new)
+     (%with-resolved (odir oleaf oowned) (old old-path nil)
+       (%with-resolved (ndir nleaf nowned) (new new-path nil)
+         (%fs-check (%libc-linkat odir oleaf ndir nleaf
+                                  (if follow +at-symlink-follow+ 0))
+                    "linkat")
+         nil)))))
+
+;;; ---------------------------------------------------------------
+;;; preopens.get-directories.
+
+(defun fs-get-directories (context ct)
+  "list<tuple<own<descriptor>, string>>: the context's preopens."
+  (loop for pre in (wasi-context-preopens context)
+        collect (list (list :own-handle ct (wasi-preopen-descriptor pre))
+                      (wasi-preopen-name pre))))
+
+;;; ---------------------------------------------------------------
+;;; The provider instances.
+
+(defun %bind-context (context function)
+  (lambda (&rest args) (apply function context args)))
+
+(defun %filesystem-packages (&key (package (wasi-package "filesystem")))
+  "The WIT packages the filesystem functypes resolve against:
+filesystem itself and wasi:clocks (descriptor-stat's `instant')."
+  (list package (wasi-package "clocks")))
+
+(defun filesystem-types-instance (context
+                                  &key (package (wasi-package "filesystem")))
+  "The wasi:filesystem/types import: the descriptor resource (its ct
+exported, its methods exported as [method]descriptor.*) bound to
+CONTEXT's preopen authorities."
+  (let ((ct (descriptor-resource-ct :package package)))
+    (%install-descriptor-dtor ct)
+    (provider-instance
+     (wasmdown.wit:package-interface package "types")
+     (list (cons "advise" (%bind-context context #'fs-advise))
+           (cons "sync" (%bind-context context #'fs-sync))
+           (cons "sync-data" (%bind-context context #'fs-sync-data))
+           (cons "get-flags" (%bind-context context #'fs-get-flags))
+           (cons "get-type" (%bind-context context #'fs-get-type))
+           (cons "set-size" (%bind-context context #'fs-set-size))
+           (cons "set-times" (%bind-context context #'fs-set-times))
+           (cons "set-times-at" (%bind-context context #'fs-set-times-at))
+           (cons "stat" (%bind-context context #'fs-stat))
+           (cons "stat-at" (%bind-context context #'fs-stat-at))
+           (cons "create-directory-at"
+                 (%bind-context context #'fs-create-directory-at))
+           (cons "remove-directory-at"
+                 (%bind-context context #'fs-remove-directory-at))
+           (cons "unlink-file-at" (%bind-context context #'fs-unlink-file-at))
+           (cons "rename-at" (%bind-context context #'fs-rename-at))
+           (cons "link-at" (%bind-context context #'fs-link-at))
+           (cons "readlink-at" (%bind-context context #'fs-readlink-at))
+           (cons "symlink-at" (%bind-context context #'fs-symlink-at))
+           (cons "open-at" (%bind-context context #'fs-open-at))
+           (cons "is-same-object" (%bind-context context #'fs-is-same-object))
+           (cons "metadata-hash" (%bind-context context #'fs-metadata-hash))
+           (cons "metadata-hash-at"
+                 (%bind-context context #'fs-metadata-hash-at)))
+     :packages (%filesystem-packages :package package))))
+
+(defun filesystem-preopens-instance (context
+                                     &key (package (wasi-package "filesystem")))
+  (let ((ct (descriptor-resource-ct :package package)))
+    (%install-descriptor-dtor ct)
+    (provider-instance
+     (wasmdown.wit:package-interface package "preopens")
+     (list (cons "get-directories"
+                 (lambda () (fs-get-directories context ct))))
+     :packages (%filesystem-packages :package package))))
+
+(defun filesystem-provider (context
+                            &key (package (wasi-package "filesystem")))
+  "The wasi:filesystem imports as a with-args alist (types +
+preopens)."
+  (list
+   (cons (wasmdown.wit:interface-import-name
+          (wasmdown.wit:package-interface package "types"))
+         (filesystem-types-instance context :package package))
+   (cons (wasmdown.wit:interface-import-name
+          (wasmdown.wit:package-interface package "preopens"))
+         (filesystem-preopens-instance context :package package))))

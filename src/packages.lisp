@@ -275,6 +275,17 @@
    #:wit-interface-funcs
    #:wit-interface-func-list
    #:wit-interface-resources
+   #:wit-interface-resource-list
+   #:wit-resource
+   #:wit-resource-p
+   #:wit-resource-name
+   #:wit-resource-methods
+   #:wit-func-name
+   #:wit-func-params
+   #:wit-func-result
+   #:wit-func-async-p
+   #:wit-func-static-p
+   #:wit-func-constructor-p
    #:wit-interface-uses
    #:wit-interface-annotations
    ;; type / func / resource / world nodes

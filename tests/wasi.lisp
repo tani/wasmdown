@@ -480,3 +480,661 @@ machinery is deliberately not part of the public surface)."
       ;; a second invocation sees a fresh, independently-authorized run
       (is (eql 0 (wasmdown.component.runtime:lifted-func-call f)))
       (is (string= "hi" (get-output-stream-string sink))))))
+
+;;; ===============================================================
+;;; M16 SLICE 3a — wasi:filesystem: the capability model, the
+;;; descriptor resource, and the non-stream surface.
+;;; ===============================================================
+
+;;; ---------------------------------------------------------------
+;;; Fixtures: a private tree under /tmp, and the cleanup that removes
+;;; exactly the entries the tests create (files, symlinks, then
+;;; directories deepest-first) — no shell, no third-party library.
+
+(defun fs-p (dir name) (format nil "~a/~a" dir name))
+
+(defun fs-mkdir! (path &optional (mode #o755))
+  (sb-unix:unix-mkdir path mode))
+
+(defun fs-symlink! (target path)
+  "A HOST-side symlink (the test plays the part of an outside
+process planting a link inside the root)."
+  (wasmdown.wasi::%libc-symlinkat target -100 path))
+
+(defun fs-write! (path content)
+  (with-open-file (s path :direction :output :if-exists :overwrite
+                          :if-does-not-exist :create)
+    (write-string content s))
+  path)
+
+(defun fs-poke-bytes! (path n)
+  "Create PATH with N zero bytes (open-at/set-size fixtures)."
+  (with-open-file (s path :direction :output :if-exists :overwrite
+                          :if-does-not-exist :create
+                          :element-type '(unsigned-byte 8))
+    (dotimes (i n) (write-byte 0 s)))
+  path)
+
+(defun fs-test-unlink-tree (root &optional names)
+  "Remove NAMES under ROOT (files/symlinks/dirs) and then ROOT."
+  (dolist (n names)
+    (let ((p (fs-p root n)))
+      (ignore-errors (wasmdown.wasi::%libc-unlinkat -100 p 0))
+      (ignore-errors
+        (wasmdown.wasi::%libc-unlinkat -100 p wasmdown.wasi::+at-removedir+))))
+  (ignore-errors
+    (wasmdown.wasi::%libc-unlinkat -100 root wasmdown.wasi::+at-removedir+)))
+
+(defun fs-test-root (tag)
+  (let ((dir (format nil "/tmp/wasmdown-~a-~d-~d"
+                     tag (sb-unix:unix-getpid)
+                     (random 1000000))))
+    (unless (fs-mkdir! dir)
+      (error "cannot create fixture root ~a" dir))
+    dir))
+
+(defmacro with-fs-root ((root-var tag &optional (names nil)) &body body)
+  "Run BODY with ROOT-VAR bound to a fresh private tree; the cleanup
+removes NAMES (an evaluated list, so callers quote it) and the root."
+  `(let ((,root-var (fs-test-root ,tag)))
+     (unwind-protect (progn ,@body)
+       (fs-test-unlink-tree ,root-var ,names))))
+
+(defun fs-error-code-of (form)
+  "FORM must be a (:err . code) result; its code label."
+  (unless (and (consp form) (eq (car form) :err))
+    (error "expected an error result, got ~s" form))
+  (cdr form))
+
+(defun fs-ok-value (form)
+  (unless (and (consp form) (eq (car form) :ok))
+    (error "expected an ok result, got ~s" form))
+  (cdr form))
+
+(defun fs-type-name (stat)
+  "The descriptor-type case name of a descriptor-stat domain value."
+  (second (assoc "%type" stat :test #'string=)))
+
+(defmacro => (expected actual)
+  "Assert (equal EXPECTED ACTUAL) with a useful failure datum."
+  `(let ((e ,expected) (a ,actual))
+     (unless (equal e a)
+       (error "expected ~s, got ~s" e a))))
+
+;;; ---------------------------------------------------------------
+;;; The capability object: an OPEN HOST DIRECTORY HANDLE (never a
+;;; path prefix), and the operations that go through it.
+
+(test wasi/fs-preopen-capability
+  (with-fs-root (root "fs-cap" '("sub" "sub/inner" "a.txt" "lnk"))
+    (fs-mkdir! (fs-p root "sub"))
+    (fs-mkdir! (fs-p root "sub/inner"))
+    (fs-write! (fs-p root "a.txt") "hello")
+    (fs-symlink! "a.txt" (fs-p root "lnk"))
+    (let* ((pre (wasmdown.wasi:open-wasi-preopen root :name "/sandbox"))
+           (ctx (wasmdown.wasi:make-wasi-context :preopens (list pre)))
+           (d (wasmdown.wasi:wasi-preopen-descriptor pre)))
+      (unwind-protect
+           (progn
+             ;; the authority IS a real directory handle + a guest name
+             (is (plusp (wasmdown.wasi:wasi-preopen-fd pre)))
+             (is (string= "/sandbox" (wasmdown.wasi:wasi-preopen-name pre)))
+             (is (eq d (wasmdown.wasi:wasi-preopen-descriptor pre)))
+             (is (wasmdown.wasi:wasi-descriptor-p d))
+             ;; stat of the root: a directory, with the mutate right
+             (let ((stat (fs-ok-value (wasmdown.wasi:fs-stat ctx d))))
+               (=> "directory" (fs-type-name stat))
+               (is (integerp (cdr (assoc "size" stat :test #'string=))))
+               (is (member "mutate-directory"
+                           (cdr (fs-ok-value (wasmdown.wasi:fs-get-flags ctx d)))
+                           :test #'string=)))
+             ;; get-type / get-flags
+             (=> "directory" (car (fs-ok-value (wasmdown.wasi:fs-get-type ctx d))))
+             ;; stat-at: a file, a directory, a symlink (no-follow default)
+             (let ((file (fs-ok-value (wasmdown.wasi:fs-stat-at ctx d nil "a.txt"))))
+               (=> "regular-file" (fs-type-name file))
+               (=> 5 (cdr (assoc "size" file :test #'string=))))
+             (=> "directory"
+                 (fs-type-name (fs-ok-value (wasmdown.wasi:fs-stat-at ctx d nil "sub"))))
+             (=> "symbolic-link"
+                 (fs-type-name (fs-ok-value (wasmdown.wasi:fs-stat-at ctx d nil "lnk"))))
+             ;; path-flags.symlink-follow expands the FINAL component
+             (=> "regular-file"
+                 (fs-type-name
+                  (fs-ok-value
+                   (wasmdown.wasi:fs-stat-at
+                    ctx d (cons :flags '("symlink-follow")) "lnk"))))
+             ;; nested paths stay handle-relative
+             (=> "directory"
+                 (fs-type-name
+                  (fs-ok-value
+                   (wasmdown.wasi:fs-stat-at ctx d nil "sub/inner"))))
+             ;; readlink-at: the link TEXT (preopen-relative)
+             (=> "a.txt" (fs-ok-value (wasmdown.wasi:fs-readlink-at ctx d "lnk"))))
+        (wasmdown.wasi:close-wasi-preopen pre)))))
+
+;;; ---------------------------------------------------------------
+;;; THE SECURITY INVARIANTS: no absolute escape, no `..' climb, no
+;;; symlink-escape (a host-planted absolute or climbing link), and no
+;;; cross-authority descriptor.
+
+(test wasi/fs-no-absolute-or-dotdot-escape
+  (with-fs-root (root "fs-escape" '("a.txt"))
+    (fs-write! (fs-p root "a.txt") "x")
+    (let* ((pre (wasmdown.wasi:open-wasi-preopen root :name "/r"))
+           (ctx (wasmdown.wasi:make-wasi-context :preopens (list pre)))
+           (d (wasmdown.wasi:wasi-preopen-descriptor pre)))
+      (unwind-protect
+           (progn
+             ;; absolute paths never reach the host
+             (=> "not-permitted"
+                 (fs-error-code-of (wasmdown.wasi:fs-stat-at ctx d nil "/etc/passwd")))
+             (=> "not-permitted"
+                 (fs-error-code-of
+                  (wasmdown.wasi:fs-open-at ctx d nil "/tmp/x"
+                                            (cons :flags '("create")) nil)))
+             ;; `..' is refused outright (the conservative 0.3 policy):
+             ;; no step may climb, so no link or .. can leave the root
+             (=> "not-permitted"
+                 (fs-error-code-of (wasmdown.wasi:fs-stat-at ctx d nil "..")))
+             (=> "not-permitted"
+                 (fs-error-code-of
+                  (wasmdown.wasi:fs-stat-at ctx d nil "../etc/passwd")))
+             (=> "not-permitted"
+                 (fs-error-code-of
+                  (wasmdown.wasi:fs-stat-at ctx d nil "sub/../../etc")))
+             ;; empty + NUL are invalid, never a host-side surprise
+             (=> "invalid" (fs-error-code-of (wasmdown.wasi:fs-stat-at ctx d nil "")))
+             (=> "invalid"
+                 (fs-error-code-of
+                  (wasmdown.wasi:fs-stat-at ctx d nil (format nil "a~cx" (code-char 0)))))
+             ;; create-directory / unlink / rename all share the check
+             (=> "not-permitted"
+                 (fs-error-code-of
+                  (wasmdown.wasi:fs-create-directory-at ctx d "../evil")))
+             (=> "not-permitted"
+                 (fs-error-code-of
+                  (wasmdown.wasi:fs-rename-at ctx d "a.txt" d "../evil")))
+             ;; the descriptor of another authority is refused
+             (let* ((root-b (fs-test-root "fs-escape-b"))
+                    (pre-b (wasmdown.wasi:open-wasi-preopen root-b :name "/b"))
+                    (ctx-b (wasmdown.wasi:make-wasi-context
+                            :preopens (list pre-b))))
+               (unwind-protect
+                    (progn
+                      (=> "not-permitted"
+                          (fs-error-code-of
+                           (wasmdown.wasi:fs-stat ctx
+                                                  (wasmdown.wasi:wasi-preopen-descriptor
+                                                   pre-b))))
+                      ;; ... and the same descriptor is fine in its own ctx
+                      (=> "directory" (car (fs-ok-value
+                                            (wasmdown.wasi:fs-get-type
+                                             ctx-b
+                                             (wasmdown.wasi:wasi-preopen-descriptor
+                                              pre-b))))))
+                 (wasmdown.wasi:close-wasi-preopen pre-b)
+                 (fs-test-unlink-tree root-b))))
+        (wasmdown.wasi:close-wasi-preopen pre)))))
+
+(test wasi/fs-symlink-escape-refused
+  (with-fs-root (root "fs-link" '("inside.txt" "out-abs" "out-rel" "esc-dir" "good-link" "new-link"))
+    (fs-write! (fs-p root "inside.txt") "in")
+    ;; a symlink to an absolute host path, planted by the host (the
+    ;; guest can also try symlink-at, which refuses up front)
+    (fs-symlink! "/etc/passwd" (fs-p root "out-abs"))
+    ;; a relative link that climbs above the root
+    (fs-symlink! "../../etc/passwd" (fs-p root "out-rel"))
+    ;; a link to an absolute DIRECTORY (an intermediate component)
+    (fs-symlink! "/etc" (fs-p root "esc-dir"))
+    (let* ((pre (wasmdown.wasi:open-wasi-preopen root :name "/r"))
+           (ctx (wasmdown.wasi:make-wasi-context :preopens (list pre)))
+           (d (wasmdown.wasi:wasi-preopen-descriptor pre))
+           (follow (cons :flags '("symlink-follow"))))
+      (unwind-protect
+           (progn
+             ;; no-follow reads the LINK itself
+             (=> "symbolic-link"
+                 (fs-type-name (fs-ok-value
+                                (wasmdown.wasi:fs-stat-at ctx d nil "out-abs"))))
+             ;; following an absolute target is refused
+             (=> "not-permitted"
+                 (fs-error-code-of
+                  (wasmdown.wasi:fs-stat-at ctx d follow "out-abs")))
+             ;; following a climbing target is refused
+             (=> "not-permitted"
+                 (fs-error-code-of
+                  (wasmdown.wasi:fs-stat-at ctx d follow "out-rel")))
+             ;; an INTERMEDIATE escaping link is refused too
+             (=> "not-permitted"
+                 (fs-error-code-of
+                  (wasmdown.wasi:fs-stat-at ctx d nil "esc-dir/passwd")))
+             ;; opening through an escaping link fails closed
+             (=> "not-permitted"
+                 (fs-error-code-of
+                  (wasmdown.wasi:fs-open-at ctx d follow "out-abs" nil
+                                            (cons :flags '("read")))))
+             ;; readlink-at refuses an absolute target (the WIT rule)
+             (=> "not-permitted"
+                 (fs-error-code-of (wasmdown.wasi:fs-readlink-at ctx d "out-abs")))
+             (=> "not-permitted"
+                 (fs-error-code-of (wasmdown.wasi:fs-readlink-at ctx d "out-rel")))
+             ;; symlink-at refuses an absolute old-path, and never
+             ;; creates the link
+             (=> "not-permitted"
+                 (fs-error-code-of
+                  (wasmdown.wasi:fs-symlink-at ctx d "/etc/passwd" "new-link")))
+             (is (null (probe-file (fs-p root "new-link"))))
+             ;; a legitimate relative link does get created
+             (=> '(:ok)
+                 (wasmdown.wasi:fs-symlink-at ctx d "inside.txt" "good-link"))
+             (=> "inside.txt"
+                 (fs-ok-value (wasmdown.wasi:fs-readlink-at ctx d "good-link"))))
+        (wasmdown.wasi:close-wasi-preopen pre)))))
+
+;;; ---------------------------------------------------------------
+;;; The directory/file mutations, and the errno -> error-code map.
+
+(test wasi/fs-directory-operations
+  (with-fs-root (root "fs-ops" '("d" "d/e" "f.txt" "g.txt" "plain.txt"))
+    (let* ((pre (wasmdown.wasi:open-wasi-preopen root :name "/r"))
+           (ctx (wasmdown.wasi:make-wasi-context :preopens (list pre)))
+           (d (wasmdown.wasi:wasi-preopen-descriptor pre)))
+      (unwind-protect
+           (progn
+             (=> '(:ok) (wasmdown.wasi:fs-create-directory-at ctx d "d"))
+             (is (sb-unix:unix-stat (fs-p root "d")))
+             (=> "exist"
+                 (fs-error-code-of (wasmdown.wasi:fs-create-directory-at ctx d "d")))
+             (=> '(:ok) (wasmdown.wasi:fs-create-directory-at ctx d "d/e"))
+             ;; a non-empty directory cannot be removed
+             (=> "not-empty"
+                 (fs-error-code-of
+                  (wasmdown.wasi:fs-remove-directory-at ctx d "d")))
+             (=> '(:ok) (wasmdown.wasi:fs-remove-directory-at ctx d "d/e"))
+             ;; rename within one descriptor (and across descriptors)
+             (fs-write! (fs-p root "f.txt") "abc")
+             (=> '(:ok) (wasmdown.wasi:fs-rename-at ctx d "f.txt" d "g.txt"))
+             (is (null (probe-file (fs-p root "f.txt"))))
+             (is (probe-file (fs-p root "g.txt")))
+             (=> 3 (cdr (assoc "size" (fs-ok-value
+                                       (wasmdown.wasi:fs-stat-at ctx d nil "g.txt"))
+                               :test #'string=)))
+             ;; unlink a file; the missing one maps to no-entry
+             (=> '(:ok) (wasmdown.wasi:fs-unlink-file-at ctx d "g.txt"))
+             (=> "no-entry"
+                 (fs-error-code-of (wasmdown.wasi:fs-unlink-file-at ctx d "g.txt")))
+             ;; a directory is not a file (EISDIR)
+             (let ((code (fs-error-code-of
+                          (wasmdown.wasi:fs-unlink-file-at ctx d "d"))))
+               (is (member code '("is-directory" "access") :test #'string=)))
+             ;; a path THROUGH a regular file is not-directory
+             (fs-write! (fs-p root "plain.txt") "x")
+             (=> "not-directory"
+                 (fs-error-code-of
+                  (wasmdown.wasi:fs-stat-at ctx d nil "plain.txt/x")))
+             ;; remove the (now empty) directory
+             (=> '(:ok) (wasmdown.wasi:fs-remove-directory-at ctx d "d")))
+        (wasmdown.wasi:close-wasi-preopen pre)))))
+
+(test wasi/fs-error-code-mapping
+  ;; the errno -> WIT error-code table (the cases the API documents)
+  (=> "no-entry" (wasmdown.wasi:errno->error-code 2))
+  (=> "exist" (wasmdown.wasi:errno->error-code 17))
+  (=> "not-directory" (wasmdown.wasi:errno->error-code 20))
+  (=> "is-directory" (wasmdown.wasi:errno->error-code 21))
+  (=> "access" (wasmdown.wasi:errno->error-code 13))
+  (=> "not-permitted" (wasmdown.wasi:errno->error-code 1))
+  (=> "loop" (wasmdown.wasi:errno->error-code 40))
+  (=> "not-empty" (wasmdown.wasi:errno->error-code 39))
+  (=> "bad-descriptor" (wasmdown.wasi:errno->error-code 9))
+  (=> "read-only" (wasmdown.wasi:errno->error-code 30))
+  (=> "insufficient-space" (wasmdown.wasi:errno->error-code 28))
+  ;; an unmapped errno is the variant's catch-all
+  (=> "other" (wasmdown.wasi:errno->error-code 9999)))
+
+(test wasi/fs-open-at-flags
+  (with-fs-root (root "fs-open" '("made.txt" "made2.txt" "dir" "six.txt" "sixlink" "child.txt"))
+    (let* ((pre (wasmdown.wasi:open-wasi-preopen root :name "/r"))
+           (ctx (wasmdown.wasi:make-wasi-context :preopens (list pre)))
+           (d (wasmdown.wasi:wasi-preopen-descriptor pre))
+           (read (cons :flags '("read")))
+           (write (cons :flags '("read" "write")))
+           (create (cons :flags '("create")))
+           (excl (cons :flags '("create" "exclusive")))
+           (trunc (cons :flags '("create" "truncate")))
+           (direc (cons :flags '("directory"))))
+      (unwind-protect
+           (progn
+             ;; create + write: the descriptor exists as a host file
+             (let* ((ok (fs-ok-value (wasmdown.wasi:fs-open-at ctx d nil "made.txt"
+                                                               create write)))
+                    (desc (third ok)))
+               (is (wasmdown.wasi:wasi-descriptor-p desc))
+               (is (probe-file (fs-p root "made.txt")))
+               (is (member "write" (wasmdown.wasi:wasi-descriptor-flags desc)
+                           :test #'string=))
+               ;; set-size extends the file (zeros)
+               (=> '(:ok) (wasmdown.wasi:fs-set-size ctx desc 6))
+               (=> 6 (cdr (assoc "size" (fs-ok-value (wasmdown.wasi:fs-stat ctx desc))
+                                 :test #'string=)))
+               ;; sync / sync-data / advise / set-times are honest no-ops
+               ;; over the OS calls
+               (=> '(:ok) (wasmdown.wasi:fs-sync ctx desc))
+               (=> '(:ok) (wasmdown.wasi:fs-sync-data ctx desc))
+               (=> '(:ok) (wasmdown.wasi:fs-advise ctx desc 0 0
+                                                   (cons :enum "sequential")))
+               (=> '(:ok) (wasmdown.wasi:fs-set-times ctx desc
+                                                     (cons "now" nil)
+                                                     (cons "now" nil)))
+               ;; set-times-at through the directory descriptor
+               (=> '(:ok) (wasmdown.wasi:fs-set-times-at
+                           ctx d nil "made.txt" (cons "no-change" nil)
+                           (cons "now" nil)))
+               ;; the descriptor is closed ONCE the host drops it
+               (wasmdown.wasi:close-wasi-descriptor desc)
+               (is (eql -1 (wasmdown.wasi:wasi-descriptor-fd desc))))
+             ;; exclusive creation of an existing file -> exist
+             (=> "exist"
+                 (fs-error-code-of (wasmdown.wasi:fs-open-at ctx d nil "made.txt"
+                                                             excl write)))
+             ;; opening with the directory flag on a file -> not-directory
+             (let ((code (fs-error-code-of
+                          (wasmdown.wasi:fs-open-at ctx d nil "made.txt"
+                                                    direc read))))
+               (is (member code '("not-directory") :test #'string=)))
+             ;; a directory opens with the directory flag
+             (fs-mkdir! (fs-p root "dir"))
+             (let ((ok (fs-ok-value (wasmdown.wasi:fs-open-at ctx d nil "dir"
+                                                              direc read))))
+               (is (wasmdown.wasi:wasi-descriptor-dir-p (third ok)))
+               (wasmdown.wasi:close-wasi-descriptor (third ok)))
+             ;; truncate empties the file
+             (fs-write! (fs-p root "six.txt") "abcdef")
+             (let* ((ok (fs-ok-value (wasmdown.wasi:fs-open-at ctx d nil "six.txt"
+                                                               trunc write)))
+                    (desc (third ok)))
+               (=> 0 (cdr (assoc "size" (fs-ok-value
+                                         (wasmdown.wasi:fs-stat-at ctx d nil "six.txt"))
+                                 :test #'string=)))
+               (wasmdown.wasi:close-wasi-descriptor desc))
+             ;; open-at without the follow flag on a symlink fails closed
+             (fs-symlink! "six.txt" (fs-p root "sixlink"))
+             (=> "loop"
+                 (fs-error-code-of
+                  (wasmdown.wasi:fs-open-at ctx d nil "sixlink" nil read)))
+             ;; a non-directory base refuses creation (read-only)
+             (let ((file-desc (third (fs-ok-value
+                                      (wasmdown.wasi:fs-open-at ctx d nil "made.txt" nil read)))))
+               (=> "read-only"
+                   (fs-error-code-of
+                    (wasmdown.wasi:fs-open-at ctx file-desc nil "child.txt"
+                                              create write)))
+               (wasmdown.wasi:close-wasi-descriptor file-desc)))
+        (wasmdown.wasi:close-wasi-preopen pre)))))
+
+(test wasi/fs-metadata
+  (with-fs-root (root "fs-meta" '("a.txt" "b.txt" "hard.txt"))
+    (fs-write! (fs-p root "a.txt") "hello")
+    (fs-write! (fs-p root "b.txt") "hello")
+    (let* ((pre (wasmdown.wasi:open-wasi-preopen root :name "/r"))
+           (ctx (wasmdown.wasi:make-wasi-context :preopens (list pre)))
+           (d (wasmdown.wasi:wasi-preopen-descriptor pre)))
+      (unwind-protect
+           (progn
+             ;; is-same-object: the same descriptor yes, a different
+             ;; inode no
+             (is (wasmdown.wasi:fs-is-same-object ctx d d))
+             (let ((a (third (fs-ok-value (wasmdown.wasi:fs-open-at
+                                           ctx d nil "a.txt" nil
+                                           (cons :flags '("read"))))))
+                   (b (third (fs-ok-value (wasmdown.wasi:fs-open-at
+                                           ctx d nil "b.txt" nil
+                                           (cons :flags '("read")))))))
+               (unwind-protect
+                    (progn
+                      (is (not (wasmdown.wasi:fs-is-same-object ctx a b)))
+                      ;; metadata-hash is stable for an unmodified object
+                      ;; and differs across different objects
+                      (let ((ha (fs-ok-value (wasmdown.wasi:fs-metadata-hash ctx a))))
+                        (is (equal ha (fs-ok-value (wasmdown.wasi:fs-metadata-hash ctx a))))
+                        (is (not (equal ha (fs-ok-value
+                                            (wasmdown.wasi:fs-metadata-hash ctx b))))))
+                      ;; metadata-hash-at agrees with metadata-hash
+                      (is (equal (fs-ok-value (wasmdown.wasi:fs-metadata-hash ctx a))
+                                 (fs-ok-value
+                                  (wasmdown.wasi:fs-metadata-hash-at ctx d nil "a.txt")))))
+                 (wasmdown.wasi:close-wasi-descriptor a)
+                 (wasmdown.wasi:close-wasi-descriptor b)))
+             ;; link-at: a hard link shares the inode
+             (let* ((a (third (fs-ok-value (wasmdown.wasi:fs-open-at
+                                           ctx d nil "a.txt" nil
+                                           (cons :flags '("read")))))))
+               (unwind-protect
+                    (progn
+                      (=> '(:ok) (wasmdown.wasi:fs-link-at ctx d nil "a.txt" d "hard.txt"))
+                      (=> 2 (cdr (assoc "link-count"
+                                       (fs-ok-value
+                                        (wasmdown.wasi:fs-stat-at ctx d nil "hard.txt"))
+                                       :test #'string=)))
+                      (=> "exist"
+                          (fs-error-code-of
+                           (wasmdown.wasi:fs-link-at ctx d nil "a.txt" d "hard.txt"))))
+                 (wasmdown.wasi:close-wasi-descriptor a))))
+        (wasmdown.wasi:close-wasi-preopen pre)))))
+
+
+;;; ---------------------------------------------------------------
+;;; The descriptor RESOURCE through the runtime's handle table:
+;;; own/borrow, the dtor, and the provider export surface.
+
+(defun provider-exports (instance)
+  (wasmdown.component.runtime:comp-instance-exports instance))
+
+(defun has-method-p (types name)
+  (let ((hit (gethash (format nil "[method]descriptor.~a" name)
+                      (provider-exports types))))
+    (and hit (wasmdown.component.runtime:lifted-func-p (cdr hit)))))
+
+(test wasi/fs-provider-surface
+  (with-fs-root (root "fs-prov" '("a.txt"))
+    (fs-write! (fs-p root "a.txt") "hello")
+    (let* ((pre (wasmdown.wasi:open-wasi-preopen root :name "/sandbox"))
+           (ctx (wasmdown.wasi:make-wasi-context :preopens (list pre)))
+           (types (wasmdown.wasi:filesystem-types-instance ctx))
+           (preopens (wasmdown.wasi:filesystem-preopens-instance ctx))
+           (dtor-ct (wasmdown.wasi:descriptor-resource-ct))
+           (type-export (gethash "descriptor" (provider-exports types)))
+           (pre-desc (wasmdown.wasi:wasi-preopen-descriptor pre)))
+      (unwind-protect
+           (progn
+             ;; the interface instance exports the resource TYPE and
+             ;; every method under its component core name
+             (is (eq (car type-export) :type))
+             (is (eq (wasmdown.component:ct-kind (cdr type-export)) :resource))
+             ;; the type ct is THE handle identity: the exported type,
+             ;; the method self borrows and descriptor-resource-ct agree
+             (is (eq dtor-ct (cdr type-export)))
+             (dolist (m '("stat" "stat-at" "get-type" "get-flags" "set-size"
+                          "is-same-object" "metadata-hash" "metadata-hash-at"
+                          "create-directory-at" "remove-directory-at"
+                          "unlink-file-at" "rename-at" "link-at"
+                          "readlink-at" "symlink-at" "open-at" "advise"
+                          "sync" "sync-data" "set-times" "set-times-at"))
+               (unless (has-method-p types m)
+                 (error "missing exported method ~a" m)))
+             ;; the method functype: the WIT signature + the implicit
+             ;; self borrow, marked async
+             (let* ((fn (provider-fn types "[method]descriptor.stat"))
+                    (ft (wasmdown.component.runtime:lifted-func-type fn))
+                    (params (coerce (first (wasmdown.component:ct-payload ft))
+                                    'list)))
+               (is (= 1 (length params)))
+               (is (string= "self" (caar params)))
+               (is (eq :borrow (wasmdown.component:ct-kind (cdar params))))
+               (is (eq dtor-ct (wasmdown.component:ct-payload (cdar params))))
+               (is (third (wasmdown.component:ct-payload ft))))
+             ;; get-directories: own-descriptor handles + the guest name
+             (let ((dirs (call-provider preopens "get-directories")))
+               (is (= 1 (length dirs)))
+               (let* ((entry (first dirs))
+                      (own (first entry))
+                      (name (second entry)))
+                 (=> "/sandbox" name)
+                 (=> :own-handle (car own))
+                 (is (eq dtor-ct (second own)))
+                 (is (eq pre-desc (third own)))
+                 ;; a direct call with the REP works (no handle table)
+                 (=> "directory"
+                     (car (fs-ok-value
+                           (call-provider types "[method]descriptor.get-type"
+                                          pre-desc))))))
+             ;; BORROW through the handle table: a raw handle index is
+             ;; resolved on the DYNAMIC CALLER's table through the
+             ;; shared resource ct
+             (let* ((guest (wasmdown.component.runtime:make-comp-instance))
+                    (idx (wasmdown.component.runtime::%handle-add
+                          guest dtor-ct pre-desc nil)))
+               (is (eql 1 idx))
+               (is (eq pre-desc
+                       (let ((wasmdown.component.runtime::*handle-caller-inst*
+                               guest))
+                         (wasmdown.component.runtime:host-resource-rep
+                          dtor-ct idx))))
+               (is (equal "directory"
+                          (car (fs-ok-value
+                                (let ((wasmdown.component.runtime::*handle-caller-inst*
+                                        guest))
+                                  (call-provider types
+                                                 "[method]descriptor.get-type"
+                                                 idx))))))
+               ;; an index that names no descriptor is bad-descriptor
+               (is (equal "bad-descriptor"
+                          (fs-error-code-of
+                           (let ((wasmdown.component.runtime::*handle-caller-inst*
+                                   guest))
+                             (call-provider types
+                                            "[method]descriptor.get-type"
+                                            99))))))
+             ;; an OPEN descriptor is owned: the host finalizer closes
+             ;; its fd; a preopen descriptor's fd is NOT closed
+             (let* ((opened (third (fs-ok-value
+                                    (wasmdown.wasi:fs-open-at
+                                     ctx pre-desc nil "a.txt" nil
+                                     (cons :flags '("read"))))))
+                    (hdtor (gethash dtor-ct
+                                    wasmdown.component.runtime:*host-resource-dtor-table*)))
+               (is (functionp hdtor))
+               (is (plusp (wasmdown.wasi:wasi-descriptor-fd opened)))
+               (funcall hdtor opened)
+               (is (eql -1 (wasmdown.wasi:wasi-descriptor-fd opened)))
+               (funcall hdtor pre-desc)
+               (is (plusp (wasmdown.wasi:wasi-preopen-fd pre)))))
+        (wasmdown.wasi:close-wasi-preopen pre)))))
+
+;;; ---------------------------------------------------------------
+;;; THE END-TO-END FIXTURE: a component imports
+;;; wasi:filesystem/types@0.3.2 + preopens@0.3.2, calls
+;;; get-directories, opens a file with open-at(create) through the
+;;; preopen descriptor, stats it (the new file is size 0) and stats
+;;; the preopen directory itself (the guest's descriptor-stat must
+;;; equal the host's own fstat of that directory). The host sees the
+;;; file the guest created.
+
+(defparameter *fs-fixture*
+  (concatenate
+   'string
+   "(component"
+   " (import \"wasi:filesystem/types@0.3.2\""
+   "   (instance $fs"
+   "     (export \"descriptor\" (type $D (sub resource)))"
+   "     (export \"[method]descriptor.open-at\""
+   "       (func (param \"self\" (borrow $D))"
+   "             (param \"path-flags\" u32) (param \"path\" string)"
+   "             (param \"open-flags\" u32) (param \"flags\" u32)"
+   "             (result (result (own $D) u32))))"
+   "     (export \"[method]descriptor.stat\""
+   "       (func (param \"self\" (borrow $D)) (result (tuple u64 u64))))))"
+   " (import \"wasi:filesystem/preopens@0.3.2\""
+   "   (instance $pre"
+   "     (export \"descriptor\" (type $D2 (sub resource)))"
+   "     (export \"get-directories\""
+   "       (func (result (list (tuple (own $D2) string)))))))"
+   " (alias export $pre \"get-directories\" (func $gd))"
+   " (alias export $fs \"[method]descriptor.open-at\" (func $open-at))"
+   " (alias export $fs \"[method]descriptor.stat\" (func $stat))"
+   " (core module $Mem"
+   "   (memory (export \"mem\") 1)"
+   "   (global $bump (mut i32) (i32.const 1024))"
+   "   (func (export \"realloc\") (param i32 i32 i32 i32) (result i32)"
+   "     (local $p i32)"
+   "     (local.set $p"
+   "       (i32.and (i32.add (global.get $bump)"
+   "                         (i32.sub (local.get 2) (i32.const 1)))"
+   "                (i32.sub (i32.const 0) (local.get 2))))"
+   "     (global.set $bump (i32.add (local.get $p) (local.get 3)))"
+   "     (local.get $p)))"
+   " (core instance $mem (instantiate $Mem))"
+   " (core func $gd-lowered"
+   "   (canon lower (func $gd) (memory (core memory $mem \"mem\"))"
+   "                (realloc (core func $mem \"realloc\"))))"
+   " (core func $open-lowered"
+   "   (canon lower (func $open-at) (memory (core memory $mem \"mem\"))"
+   "                (realloc (core func $mem \"realloc\"))))"
+   " (core func $stat-lowered"
+   "   (canon lower (func $stat) (memory (core memory $mem \"mem\"))"
+   "                (realloc (core func $mem \"realloc\"))))"
+   " (core module $M"
+   "   (import \"env\" \"mem\" (memory 1))"
+   "   (import \"env\" \"gd\" (func $gd (param i32)))"
+   "   (import \"env\" \"open\" (func $open (param i32 i32 i32 i32 i32 i32 i32)))"
+   "   (import \"env\" \"stat\" (func $stat (param i32 i32)))"
+   "   (func (export \"f\") (result i64)"
+   "     (local $d i32)"
+   "     (call $gd (i32.const 0))"
+   "     (local.set $d (i32.load (i32.load (i32.const 0))))"
+   "     (call $open (local.get $d) (i32.const 0) (i32.const 256)"
+   "                 (i32.const 8) (i32.const 1) (i32.const 3)"
+   "                 (i32.const 128))"
+   "     (local.set $d (i32.load (i32.const 132)))"
+   "     (call $stat (local.get $d) (i32.const 512))"
+   "     (i64.load (i32.const 544)))"
+   "   (func (export \"g\") (result i64)"
+   "     (call $gd (i32.const 0))"
+   "     (call $stat (i32.load (i32.load (i32.const 0))) (i32.const 512))"
+   "     (i64.load (i32.const 544)))"
+   "   (data (i32.const 256) \"made.txt\"))"
+   " (core instance $m (instantiate $M (with \"env\" (instance"
+   "   (export \"mem\" (memory $mem \"mem\"))"
+   "   (export \"gd\" (func $gd-lowered))"
+   "   (export \"open\" (func $open-lowered))"
+   "   (export \"stat\" (func $stat-lowered))))))"
+   " (func (export \"f\") (result u64) (canon lift (core func $m \"f\")))"
+   " (func (export \"g\") (result u64) (canon lift (core func $m \"g\"))))"))
+
+(test wasi/e2e-filesystem-component
+  (with-fs-root (root "fs-e2e" '("made.txt"))
+    (let* ((pre (wasmdown.wasi:open-wasi-preopen root :name "/sandbox"))
+           (ctx (wasmdown.wasi:make-wasi-context :preopens (list pre)))
+           (comp (wasmdown.component.text::parse-component-text *fs-fixture*)))
+      (unwind-protect
+           (progn
+             (wasmdown.component:validate-component comp)
+             (let* ((inst (wasmdown.component.runtime:instantiate-component
+                           comp
+                           :with-args (wasmdown.wasi:filesystem-provider ctx)))
+                    (f (wasmdown.component.runtime:runtime-export-value inst "f"))
+                    (g (wasmdown.component.runtime:runtime-export-value inst "g")))
+               ;; open-at(create) made the file through the preopen
+               ;; handle; the guest's stat of the new descriptor says 0
+               (is (eql 0 (wasmdown.component.runtime:lifted-func-call f)))
+               (is (probe-file (fs-p root "made.txt")))
+               ;; the host sees the very same file after the call
+               (is (sb-unix:unix-stat (fs-p root "made.txt")))
+               ;; the guest's stat of the PREOPEN descriptor equals
+               ;; the host's fstat of that same directory handle (the
+               ;; st_size field, read out of the canonical layout)
+               (is (= (nth-value 8 (sb-unix:unix-fstat
+                                    (wasmdown.wasi:wasi-preopen-fd pre)))
+                      (wasmdown.component.runtime:lifted-func-call g)))))
+        (wasmdown.wasi:close-wasi-preopen pre)))))
