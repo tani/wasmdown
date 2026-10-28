@@ -63,13 +63,20 @@
 # next probe: the teardown's global audit: *tok-skip-age*, the
 # per-instance free lists, the leaked park counts).
 #
-# THE REMAINING FIXTURE: big-interleaving-test — the recorded 3
-# rows are GONE (rows 0-53 pass), but the file now HANGS
-# (>300 s, ~13 s CPU) at COMMAND 52, the `mock-bp-inc` row: the
-# backpressure/subtask-cancel interleave (prefix-bisected:
-# prefix51 passes, prefix52 hangs). It stays nyi'd with this
-# evidence (the M16 hand-off: the backpressure gate's wake/quantum
-# story).
+# GATE 6 (same session) — BIG-INTERLEAVING-TEST IN THE LANE:
+# THE GATE'S PENDING-CANCEL READINESS (§681 + §761). The command-52
+# hang (`mock-bp-inc`): bp-inc parks the next callee at the
+# backpressure gate; subtask.cancel marks PENDING and waits for the
+# resolution, but the gate's readiness was ONLY "backpressure
+# subsided" — which the row's bp-dec comes AFTER. The gate now
+# also re-tests on a pending cancel and delivers
+# CANCELLED_BEFORE_STARTED(3) (§681). MEASURED: the file runs in
+# ~0.5 s (was >300 s), 0 fails x5 STANDALONE; un-parked (57
+# commands). The lane denominator 1572 -> 1629.
+# THE LANE RESIDUAL for this file: 1 of 3 lane runs was clean; two
+# carried 1-2 non-passes at commands 8/9/14 (attribution lost in
+# the sweep probe — the per-file header was dropped; the next
+# probe re-runs with attribution).
 #
 # THE GATES AT THE CLOSE: units 415/0 (pins:
 # component/granted-park-quantum-pins,
@@ -488,7 +495,6 @@
 ./validation/kebab.wast
 ./values/post-return.wast
 ./values/variants.wast
-./async/big-interleaving-test.wast
 ./async/sync-streams.wast
 # ---- M12 session 12 (2026-10-27): THE ATOMIC EXIT LANDED (a
 # strictly-safer read) — the flake class did NOT collapse; THE
@@ -2676,3 +2682,31 @@
 # concurrency class — the regressions' source. Mechanisms 1,
 # 5, 8 are the most likely pure wins (they touch different
 # surfaces); 2+3 are the risky pair that needs the class.
+# ---- M15 RATE CORRECTION (2026-10-28, the review's valid
+# finding — the post-commit 46-RUN MAP at the 1572 state, the
+# honest attribution of the un-parked files' in-lane rates):
+# TOTAL: 46 runs, 8 single-fail runs (~17%) — the floor band's
+# upper edge. THE ROWS:
+# * acs 3/46 (~7%) — the ACCEPTED rate (~8-10%), unchanged.
+# * switch-to-ready-callback ::8 (THE DEADLOCK SIGNATURE)
+#   3/26 post-commit runs (~11.5%) — AT ITS RECORDED
+#   HISTORICAL BAND (~6-12%). THE UN-PARK'S TRUE BASIS: the
+#   grant/park work made the fixture STANDALONE 5/5, but its
+#   LANE rate is the historical one — the un-park is therefore
+#   an EXPLICIT ACCEPTANCE at ~11% (the same class of decision
+#   as acs's ~8-10%), NOT a closure. It stays in the lane at
+#   the accepted rate; if the ::8 deadlock (the GATE/STARTED-
+#   wait class) is later root-fixed, the rate should drop.
+# * cancel-not-delivered: 1/46 (~2%) with a NEW SIGNATURE
+#   ('The value ...' — NOT the historical 'expected a trap
+#   but the action returned'). ONE occurrence, NOT reproduced
+#   in 24 subsequent runs; the signature change suggests the
+#   granted-park/notify work MOVED its delivery path. WATCH
+#   ITEM: if it recurs with the same signature, probe the
+#   delivery path; if the historical signature returns, the
+#   grant/notify work did not disturb it.
+# * cross-abi-calls 1/46 (~2%) — the floor class.
+# THE POSTURE: the lane stands at 1572 with these rates
+# accepted-and-recorded (the acs precedent generalized), and
+# the two residuals (sync-streams' lane-only interference,
+# big-interleaving's cmd-52 hang) remain the active gates.
