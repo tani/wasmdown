@@ -2155,6 +2155,8 @@ reentrance phase checks). The CALLER then waits:
               (lambda ()
                 (let ((*current-task* task)
                       (*current-thread* th))
+                  ;; the teardown JOIN's target (see %canon-lift-async)
+                  (setf (async-thread-native th) sb-thread:*current-thread*)
                   (unwind-protect
                        (multiple-value-bind (r e)
                            (ignore-errors
@@ -5442,6 +5444,9 @@ drop-readable must return index 1 again)."
                (let ((*current-task* task)
                      (*current-thread* th)
                      (*handle-caller-inst* inst))
+                 ;; the teardown JOIN's target (the store must be able
+                 ;; to join every native thread that ran guest code)
+                 (setf (async-thread-native th) sb-thread:*current-thread*)
                  (handler-case
                      (%async-lift-guest-body task lf cx)
                  (error (c)
@@ -7088,6 +7093,8 @@ is the valtype."
              (let ((*current-task* task)
                    (*current-thread* th)
                    (*handle-caller-inst* (lifted-func-inst f)))
+               ;; the teardown JOIN's target (see %canon-lift-async)
+               (setf (async-thread-native th) sb-thread:*current-thread*)
                (handler-case
                    (%async-lift-guest-body
                     task f
@@ -7171,7 +7178,16 @@ Abandon + unblock + unregister every still-registered thread."
     ;; standalone; the predecessors' dying threads stole its
     ;; ticks). JOIN them so the next script starts clean.
     (dolist (n threads-to-join)
-      (ignore-errors (sb-thread:join-thread n)))))
+      (ignore-errors (sb-thread:join-thread n)))
+    ;; M17 THE FRESH-STORE RESET: *TOK-SKIP-AGE* is EQ-keyed, so a
+    ;; recycled async-thread object would inherit the previous
+    ;; script's age (an aliased key the GC rule cannot see); the
+    ;; path counter and the oracle's liveness counter are per-store
+    ;; (the next script's call tree starts at path 1 and its oracle
+    ;; at 0 progress).
+    (clrhash *tok-skip-age*)
+    (setf *tok-path-counter* 0
+          *async-progress* 0)))
 
 (setf wasmdown.wast:*store-teardown-hook* #'%store-teardown)
 
