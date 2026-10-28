@@ -1,4 +1,37 @@
 # See README.md
+# M15 CLOSE-OUT (2026-10-28): THE FINAL LADDER — NO ASYNC FILE
+# REMAINS IN THIS LIST. The async suite is COMPLETE: 45 of 45 files
+# in the lane. THE FINAL NUMBERS: units 414; the lane 1,631
+# (binary + validation + linking + values + the full async suite);
+# core 21,187 pass / 0 fail / 73 unsupported.
+#
+# THE LANE METRIC vs THE PROBE METRIC (the honest map): the lane
+# runs each file ONCE per run; the per-row rates come from the
+# 10-run/30-run FAILROW probes. THE LANE: 1631/0/0/0 x3 at the
+# close (plus the 10-run probe: 5/10 runs clean, the rest single
+# non-passes on five different rows). THE PROBE (per-row,
+# standalone): async-calls-sync ::1 ~7-10% — THE RECORDED ACCEPTED
+# RATE (the first pair's yield-park §3470 release vs the caller's
+# continuation); switch-to-ready-callback ::8 ~11% (accepted,
+# pre-M15); cancel-targeted-resume ::9; sync-streams ::1;
+# reentrance ::14 (the drift row); big-interleaving ::24; and
+# during-sync-scheduling-candidates — one failing row in 8/8 runs
+# at 7f03422 vs 6/8 at 98ebb62 (gate 10 improved it; PRE-EXISTING,
+# masked in-lane). These timing-pinned rows are THE ROBUSTNESS
+# TARGET; they are NOT lane failures (the suite's acceptance is the
+# lane's 0-fail standard).
+#
+# THE M15 MECHANISMS (see the session-2 note above for the
+# measurements): the block depth counter; the guarded marker (the
+# type-error class's exact site — %sync-thunk-run's nested executor
+# binds no *current-thread*); the refined drain predicate ("a tick
+# can help => spend it"); the oracle's quiescence rule; plus M14/15's
+# synchronous resume, pack window, granted-park model, cancel-window
+# gate, grant-AND-readiness, narrowed grant wake, sync rendezvous,
+# two-space result store, cancel-window fire gate, the gate's
+# pending-cancel wake, and the sync-IO park's arm-time clear.
+#
+# THE NEXT MILESTONE: WASI per PLAN.md §9 (the M16 hand-off).
 # M15 session 2 (2026-10-28): THE ASYNC SUITE IS COMPLETE — 45/45
 # files, lane 1631/0/0/0. sync-streams (the last file) IN THE LANE.
 #
@@ -40,12 +73,13 @@
 # drift row). The band is ~0.7 single-fails/run across the suite's
 # timing-pinned rows.
 #
-# THE PRE-EXISTING FLAKE FOUND EN ROUTE (recorded, NOT caused by
-# this session): during-sync-scheduling-candidates fails ~47%
-# STANDALONE at the committed base (14 fails in 30 runs) and ~63%
-# under the gate (19/30) — the row is timing-pinned on the
-# pre-block ticks. The LANE masks it (one run per file). It is the
-# next robustness target.
+# THE PRE-EXISTING ROW (recorded; the parent's A/B is
+# AUTHORITATIVE): during-sync-scheduling-candidates fails ONE row
+# in 8 of 8 repeated single-file runs at 7f03422 (pre-gate-10) and
+# in 6 of 8 at 98ebb62 (gate 10) — the row is timing-pinned on the
+# pre-block ticks, PRE-EXISTING, and gate 10 measurably IMPROVED
+# it. The LANE masks it (one run per file). It is the next
+# robustness target.
 # M15 session 1 (2026-10-28): FOUR OF THE FIVE REMAINING FIXTURES
 # IN THE LANE — 1536 -> 1572. The landing order ran one mechanism
 # per gate with the canaries after each (async-calls-sync, the

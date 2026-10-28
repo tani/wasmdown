@@ -37,13 +37,51 @@ calls all pass.
 
 The component lane (`make test-component`, the vendored
 component-model suite at commit `d095e2f60dd...` per
-`specs/lock.toml`) measures M7-M13: **1449 pass / 0 fail / 0
+`specs/lock.toml`) measures M7-M15: **1631 pass / 0 fail / 0
 unsupported / 0 harness-error** in {binary,validation,
-linking,values,async-core} minus nyi.txt — FULLY GREEN: every
-row passes (async-calls-sync's ~8-10% acs::1 lane flake is the
-RECORDED ACCEPTED RATE: the release-race surface — the first
-pair's yield-park §3470 release vs the caller's continuation —
-measured by the 10-run/30-run FAILROW probe standards). The component TEXT parser + the full validation
+linking,values,async} minus nyi.txt — FULLY GREEN, and the
+async suite is COMPLETE: **45 of 45 files in the lane**
+(+2 rows, the last file sync-streams). THE M14/M15 MECHANISMS
+(the model the async suite needed): THE SYNCHRONOUS RESUME
+(§761-770 + §474-484 — subtask.cancel's OnCancel resumes a
+cancellable-and-ready callback callee and observes its TURN
+BOUNDARY: resolved ∨ turn moved ∨ mid-turn re-park); THE PACK
+WINDOW (the keeper race — the flip-time pack, the callee-only
+spin, the spawn-fire suppression, the M11a deferral's four
+sites); THE GRANTED-PARK MODEL (§932 — a thread's continuation
+is a GRANT, set by a real tick or an explicit resume, never by
+an incidental broadcast; with the per-instance cancel-window
+gate); THE GRANTED PARK = GRANT **AND** READINESS (one grant =
+one quantum; a grant spent while not ready re-arms); THE
+NARROWED GRANT WAKE (only an ARMED park is woken); THE SYNC
+RENDEZVOUS (a blocking sync read/write continues at the
+caller's block, §932's "tick when the caller blocks", with
+%end-notify's durable sync-waiter wake); THE TWO-SPACE RESULT
+STORE (the async lower's result valtype callee-side, the new
+handle caller-side); THE CANCEL-WINDOW FIRE GATE (the priority
+pass + the no-quantum fallback + the fifth M11a deferral); THE
+GATE'S PENDING-CANCEL WAKE (§681 + §761 — CANCELLED_BEFORE_
+STARTED without the backpressure subsiding); THE SYNC-IO
+PARK'S ARM-TIME CLEAR (a pre-arm grant is stale for the IO
+park); THE BLOCK DEPTH COUNTER (a counter, not a boolean;
+atomic slots must be (unsigned-byte 64)) + THE GUARDED MARKER
+(the raw type-error class's exact site: %sync-thunk-run's
+nested executor binds no *current-thread*) + THE REFINED DRAIN
+PREDICATE ("a tick can help ⇒ spend it": the root parked, a
+yield-park, a ready-mark, or an armed non-IO park ready — IO
+parks belong to the root's block tick) + THE ORACLE'S
+QUIESCENCE RULE (a spent tick with no progress is quiescent).
+THE HONEST RATE MAP — the LANE METRIC (one run per file:
+1631/0/0/0 ×3) vs the PROBE METRIC (per-row, standalone): the
+10-run FAILROW at the close was 5/10 clean with single
+non-passes on five different rows — async-calls-sync ::1
+(~7-10%, the recorded ACCEPTED rate), switch-to-ready ::8
+(~11% pre-M15), cancel-targeted-resume ::9, sync-streams ::1,
+reentrance ::14 (the drift row), big-interleaving ::24; and
+during-sync-scheduling-candidates — one failing row in 8 of 8
+repeated standalone runs at the pre-gate-10 base and in 6 of 8 at
+gate 10 (PRE-EXISTING; gate 10 improved it; masked in-lane — the
+next robustness target). The component TEXT parser + the full validation
 rule set (M7), component instantiation EXECUTION (M8: the
 comp-instance runtime — two-level core linking, with-args,
 aliases, canon lift, start funcs), the LINKING suite (M9: canon

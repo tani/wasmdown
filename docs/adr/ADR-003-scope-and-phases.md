@@ -317,6 +317,71 @@ conformance gates. This repository delivers an honest **partial** slice
    exhausting the SBCL control stack (a fatal, uncatchable error).
 4. **No third-party deps**; ASDF for loading only.
 
+   M14 (2026-10-28: THE SYNCHRONOUS RESUME + THE PACK WINDOW +
+   THE GRANTED-PARK MODEL). §761-770/§474-484's synchronous resume:
+   subtask.cancel's OnCancel resumes a cancellable-and-ready
+   callback callee and observes its TURN BOUNDARY (resolved, turn
+   moved, or the mid-turn re-park — the "blocks" half). The PACK
+   WINDOW closes the keeper race: the flip-time pack (§3715), the
+   callee-only spin, resume_later's mark-only arm (§462-465), the
+   spawn-fire suppression, and the cancel-wait window's M11a
+   deferral at its five sites. THE GRANTED-PARK MODEL (§932): a
+   continuation is a GRANT from a real tick or an explicit resume,
+   never an incidental broadcast; with the per-instance
+   cancel-window gate for the drain's mid-window ticks. THE
+   NEGATIVE-RESULT CHAIN: the §3483 candidates (the arm-time drain:
+   3/4 unreachable; the real-wake loop: DEADLOCK 4/4 — the
+   resume-all is the only waker at the row's end) and the
+   whole-store suppression (acs::2 + ctr::5 regressions).
+   M15 (2026-10-28: THE ASYNC SUITE COMPLETE — 45/45 files, lane
+   1631/0/0/0, units 414, core 21,187/0/73). THE MECHANISMS, with
+   their spec sections: (1) the granted park = GRANT **AND**
+   READINESS (§932 one thread one quantum + §1373's wait-from-
+   callback readiness — a grant spent while not ready re-arms); (2)
+   the narrowed grant wake (only an ARMED park is woken — the broad
+   wake regressed the during-sync family); (3) THE SYNC RENDEZVOUS
+   (§932's "tick when the caller blocks" + the fixture's "switch to
+   the caller": a blocking sync read/write continues at the caller's
+   block, with %end-notify's DURABLE sync-waiter wake); (4) the
+   TWO-SPACE RESULT STORE (the async lower's result valtype in the
+   callee's type space, the new stream handle in the caller's
+   table); (5) THE CANCEL-WINDOW FIRE GATE (the priority pass + the
+   no-quantum fallback + the fifth M11a deferral at the async
+   lower's on-resolve); (6) THE GATE'S PENDING-CANCEL WAKE (§681 +
+   §761's deliver_pending_cancel: CANCELLED_BEFORE_STARTED without
+   the backpressure subsiding — big-interleaving's command-52 hang);
+   (7) the SYNC-IO park's ARM-TIME CLEAR (a pre-arm grant is stale
+   for the IO park; the callee's own on-resolve grants at
+   task.return time); (8) THE BLOCK DEPTH COUNTER (a counter, not a
+   boolean; sb-ext:atomic-incf requires an (unsigned-byte 64) slot)
+   with paired enter/exit at every park site and zeroing at every
+   abandon sweep; (9) THE GUARDED MARKER — the raw type-error
+   class's exact site: %sync-thunk-run's nested executor binds
+   neither *current-task* nor *current-thread*, so an unguarded
+   slot accessor there signals "NIL is not of type ASYNC-THREAD"
+   and escapes as a component trap; (10) THE REFINED DRAIN
+   PREDICATE ("a tick can help => spend it": the root parked, a
+   yield-park, a ready-mark, or an armed non-IO park whose
+   readiness holds; IO parks belong to the root's block tick); (11)
+   THE ORACLE'S QUIESCENCE RULE (a spent tick with no progress is
+   a quiescent cycle — deadlock.wast's oracle). THE NEGATIVE-RESULT
+   CHAIN, four gate shapes measured and three reverted: the broad-
+   wake gate (during-sync regressions + a lane hang); the first-
+   turn pack boundary (§3650-3729 — DEADLOCKs async-calls-sync: the
+   callee's first turn is a nested sync call whose block was
+   unobservable); the per-thread gate (lane hang at
+   during-sync-scheduling-candidates); and the refined predicate
+   (landed). THE SCOPE ADVANCE: every async file the suite vendors
+   is in the lane; the residual is the PROBE METRIC's timing-pinned
+   rows (async-calls-sync ::1 ~7-10% ACCEPTED, switch-to-ready ::8
+   ~11% pre-M15, during-sync-scheduling-candidates — one failing row in 8/8
+   repeated standalone runs at the pre-gate-10 base vs 6/8 at gate
+   10 (pre-existing, improved by the gate; masked in-lane), cancel-targeted-resume ::9,
+   sync-streams ::1, reentrance ::14, big-interleaving ::24) —
+   the robustness target. Still out of scope: those rows' full
+   closure, WIT-level Component/WASI, threads beyond the canon
+   core, FASL cache. `declared_support` stays `partial`.
+
 ## Consequences
 
 +: The public support declaration stays honest; `partial` per PLAN.md §2.
