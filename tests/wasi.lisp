@@ -3043,3 +3043,362 @@ yields every chunk the framing decodes, then EOF)."
         (is (= 104 (logand value #xff))))
       (is (search "GET /hi HTTP/1.1" (car got)))
       (is (search "x-test: h" (car got))))))
+
+;;; ===============================================================
+;;; M16 SLICE 6 — THE COMMAND WORLD, THE TERMINALS, THE RUNNER.
+;;; ===============================================================
+
+;;; ---- the terminals: some/none by isatty(3) ----
+
+(defun %pty-stream ()
+  "A CL stream over a fresh pty master (/dev/ptmx) — isatty(3) true.
+Returns (values stream fd); the caller closes FD."
+  (multiple-value-bind (fd errno)
+      (sb-unix:unix-open "/dev/ptmx" (logior 2 0) 0)
+    (unless (and (integerp fd) (not (minusp fd)))
+      (error "cannot open /dev/ptmx (errno ~a)" errno))
+    (values (sb-sys:make-fd-stream fd :input t :output t
+                                        :element-type '(unsigned-byte 8))
+            fd)))
+
+(test wasi/terminals-none-for-non-tty
+  ;; a string stream has no host fd: no terminal capability exists,
+  ;; never a fabricated handle (PLAN.md §9.1)
+  (let* ((ctx (wasmdown.wasi:make-wasi-context
+               :stdin (make-string-input-stream "")
+               :stdout (make-string-output-stream)
+               :stderr (make-string-output-stream)))
+         (in (wasmdown.wasi:terminal-stdin-instance ctx))
+         (out (wasmdown.wasi:terminal-stdout-instance ctx))
+         (err (wasmdown.wasi:terminal-stderr-instance ctx)))
+    (is (eq :none (call-provider in "get-terminal-stdin")))
+    (is (eq :none (call-provider out "get-terminal-stdout")))
+    (is (eq :none (call-provider err "get-terminal-stderr")))
+    ;; the full cli provider binds all five terminal imports
+    (let ((names (mapcar #'car (wasmdown.wasi:cli-provider ctx))))
+      (dolist (n '("wasi:cli/terminal-input@0.3.2"
+                   "wasi:cli/terminal-output@0.3.2"
+                   "wasi:cli/terminal-stdin@0.3.2"
+                   "wasi:cli/terminal-stdout@0.3.2"
+                   "wasi:cli/terminal-stderr@0.3.2"))
+        (is (member n names :test #'string=))))))
+
+(test wasi/terminals-some-for-tty
+  (multiple-value-bind (stream fd) (%pty-stream)
+    (unwind-protect
+         (let* ((ctx (wasmdown.wasi:make-wasi-context :stdout stream))
+                (out (wasmdown.wasi:terminal-stdout-instance ctx))
+                (r (call-provider out "get-terminal-stdout")))
+           (is (consp r))
+           (is (eq (car r) :some))
+           ;; the some payload is an own handle whose rep is the
+           ;; wasi-terminal (fd + isatty) — a BORROWED stream fd
+           (let* ((handle (cdr r))
+                  (rep (third handle)))
+             (is (eq (first handle) :own-handle))
+             (is (wasmdown.wasi:wasi-terminal-p rep))
+             (is (= fd (wasmdown.wasi:wasi-terminal-fd rep)))))
+      (sb-unix:unix-close fd))))
+
+;;; ---- the runner: ok / err / exit-with-code over an async run ----
+
+(defparameter *command-ok-fixture*
+  (concatenate 'string
+   "(component"
+   " (type $ERR (enum \"io\" \"illegal-byte-sequence\" \"pipe\"))"
+   " (type $ST (stream u8))"
+   " (import \"wasi:cli/environment@0.3.2\""
+   "   (instance $env"
+   "     (export \"get-arguments\" (func (result (list string))))))"
+   " (import \"wasi:cli/stdout@0.3.2\""
+   "   (instance $out"
+   "     (export \"error-code\" (type (eq $ERR)))"
+   "     (type $r (result (error $ERR)))"
+   "     (type $f (future $r))"
+   "     (type $s (stream u8))"
+   "     (export \"write-via-stream\""
+   "       (func (param \"data\" $s) (result $f)))))"
+   " (alias export $env \"get-arguments\" (func $ga))"
+   " (alias export $out \"write-via-stream\" (func $wvs))"
+   " (core module $Memory (memory (export \"mem\") 1))"
+   " (core instance $memory (instantiate $Memory))"
+   " (core module $Realloc"
+   "   (global $bump (mut i32) (i32.const 1024))"
+   "   (func (export \"realloc\") (param i32 i32 i32 i32) (result i32)"
+   "     (local $p i32)"
+   "     (local.set $p (i32.and (i32.add (global.get $bump) (i32.const 7)) (i32.const -8)))"
+   "     (global.set $bump (i32.add (local.get $p) (local.get 3)))"
+   "     (local.get $p)))"
+   " (core instance $r (instantiate $Realloc))"
+   " (alias core export $r \"realloc\" (core func $realloc))"
+   " (canon lower (func $ga) (memory (core memory $memory \"mem\")) (realloc (core func $realloc)) (core func $ga-lowered))"
+   " (core func $wvs-lowered (canon lower (func $wvs)))"
+   " (core module $M"
+   "  (import \"env\" \"mem\" (memory 1))"
+   "  (import \"env\" \"task.return\" (func $tr (param i32)))"
+   "  (import \"env\" \"get-arguments\" (func $args (param i32)))"
+   "  (import \"env\" \"stream.new\" (func $snew (result i64)))"
+   "  (import \"env\" \"stream.write\" (func $swrite (param i32 i32 i32) (result i32)))"
+   "  (import \"env\" \"stream.drop-writable\" (func $sdropw (param i32)))"
+   "  (import \"env\" \"future.read\" (func $fread (param i32 i32) (result i32)))"
+   "  (import \"env\" \"write-via-stream\" (func $wvs (param i32) (result i32)))"
+   "  (global $fut (mut i32) (i32.const 0))"
+   "  (func (export \"run\") (result i32)"
+   "    (local $p i64) (local $rx i32) (local $tx i32) (local $ret i32)"
+   "    (local $list i32) (local $sp i32) (local $sl i32)"
+   "    (call $args (i32.const 16))"
+   "    (local.set $list (i32.load (i32.const 16)))"
+   "    (local.set $sp (i32.load (local.get $list)))"
+   "    (local.set $sl (i32.load (i32.add (local.get $list) (i32.const 4))))"
+   "    (local.set $p (call $snew))"
+   "    (local.set $rx (i32.wrap_i64 (local.get $p)))"
+   "    (local.set $tx (i32.wrap_i64 (i64.shr_u (local.get $p) (i64.const 32))))"
+   "    (global.set $fut (call $wvs (local.get $rx)))"
+   "    (local.set $ret (call $swrite (local.get $tx) (local.get $sp) (local.get $sl)))"
+   "    (if (i32.and (local.get $ret) (i32.const 15)) (then unreachable))"
+   "    (call $sdropw (local.get $tx))"
+   "    (local.set $ret (call $fread (global.get $fut) (i32.const 64)))"
+   "    (if (i32.and (local.get $ret) (i32.const 15)) (then unreachable))"
+   "    (call $tr (i32.const 0))"
+   "    (i32.const 0))"
+   "  (func (export \"run-cb\") (param i32 i32 i32) (result i32) (i32.const 0)))"
+   " (type $FT (future (result (error $ERR))))"
+   " (canon task.return (result (result)) (core func $tr))"
+   " (canon stream.new $ST (core func $snew))"
+   " (canon stream.write $ST (memory (core memory $memory \"mem\")) (core func $swrite))"
+   " (canon stream.drop-writable $ST (core func $sdropw))"
+   " (canon future.read $FT (memory (core memory $memory \"mem\")) (core func $fread))"
+   " (core instance $m (instantiate $M (with \"env\" (instance"
+   "   (export \"mem\" (memory $memory \"mem\"))"
+   "   (export \"task.return\" (func $tr))"
+   "   (export \"get-arguments\" (func $ga-lowered))"
+   "   (export \"stream.new\" (func $snew))"
+   "   (export \"stream.write\" (func $swrite))"
+   "   (export \"stream.drop-writable\" (func $sdropw))"
+   "   (export \"future.read\" (func $fread))"
+   "   (export \"write-via-stream\" (func $wvs-lowered))))))"
+   " (func $run (export \"run\") async (result (result)) (canon lift (core func $m \"run\") async (callback (core func $m \"run-cb\"))))"
+   " (instance $runiface (export \"run\" (func $run)))"
+   " (export \"wasi:cli/run@0.3.2\" (instance $runiface)"
+   "   (instance (export \"run\" (func async (result (result)))))))"))
+
+(defparameter *command-err-fixture*
+  (concatenate 'string
+   "(component"
+   " (core module $M"
+   "  (import \"env\" \"task.return\" (func $tr (param i32)))"
+   "  (func (export \"run\") (result i32) (call $tr (i32.const 1)) (i32.const 0))"
+   "  (func (export \"run-cb\") (param i32 i32 i32) (result i32) (i32.const 0)))"
+   " (canon task.return (result (result)) (core func $tr))"
+   " (core instance $m (instantiate $M (with \"env\" (instance (export \"task.return\" (func $tr))))))"
+   " (func $run (export \"run\") async (result (result)) (canon lift (core func $m \"run\") async (callback (core func $m \"run-cb\"))))"
+   " (instance $runiface (export \"run\" (func $run)))"
+   " (export \"wasi:cli/run@0.3.2\" (instance $runiface)"
+   "   (instance (export \"run\" (func async (result (result)))))))"))
+
+(defparameter *command-exit-fixture*
+  (concatenate 'string
+   "(component"
+   " (import \"wasi:cli/exit@0.3.2\""
+   "   (instance $ex (export \"exit-with-code\" (func (param \"code\" u8)))))"
+   " (alias export $ex \"exit-with-code\" (func $ewc))"
+   " (core func $ewc-lowered (canon lower (func $ewc)))"
+   " (core module $M"
+   "  (import \"env\" \"task.return\" (func $tr (param i32)))"
+   "  (import \"env\" \"exit-with-code\" (func $ewc (param i32)))"
+   "  (func (export \"run\") (result i32)"
+   "    (call $ewc (i32.const 7))"
+   "    (call $tr (i32.const 0))"
+   "    (i32.const 0))"
+   "  (func (export \"run-cb\") (param i32 i32 i32) (result i32) (i32.const 0)))"
+   " (canon task.return (result (result)) (core func $tr))"
+   " (core instance $m (instantiate $M (with \"env\" (instance"
+   "   (export \"task.return\" (func $tr))"
+   "   (export \"exit-with-code\" (func $ewc-lowered))))))"
+   " (func $run (export \"run\") async (result (result)) (canon lift (core func $m \"run\") async (callback (core func $m \"run-cb\"))))"
+   " (instance $runiface (export \"run\" (func $run)))"
+   " (export \"wasi:cli/run@0.3.2\" (instance $runiface)"
+   "   (instance (export \"run\" (func async (result (result)))))))"))
+
+(defun %command-component (text)
+  (let ((comp (wasmdown.component.text::parse-component-text text)))
+    (wasmdown.component:validate-component comp)
+    comp))
+
+(test wasi/command-runner-ok-arguments-stdout
+  ;; the exported async `run' is driven to completion: get-arguments
+  ;; reaches the guest (argv[0] printed through stdout.write-via-stream)
+  ;; and the `result' ok maps to status 0
+  (let* ((sink (make-string-output-stream))
+         (context (wasmdown.wasi:make-wasi-context
+                   :arguments '("prog" "-v")
+                   :stdout sink))
+         (status (wasmdown.wasi:run-component
+                  (%command-component *command-ok-fixture*) context)))
+    (is (eql 0 status))
+    (is (string= "prog" (get-output-stream-string sink)))
+    ;; the exit boundary tore the store down: no registered guest threads
+    (is (zerop (length wasmdown.component.runtime::*scheduler-threads*)))))
+
+(test wasi/command-runner-err-and-exit
+  ;; run returning err -> 1; exit-with-code(7) -> 7 with a clean store
+  (is (eql 1 (wasmdown.wasi:run-component
+              (%command-component *command-err-fixture*)
+              (wasmdown.wasi:make-wasi-context))))
+  (is (zerop (length wasmdown.component.runtime::*scheduler-threads*)))
+  (is (eql 7 (wasmdown.wasi:run-component
+              (%command-component *command-exit-fixture*)
+              (wasmdown.wasi:make-wasi-context))))
+  (is (zerop (length wasmdown.component.runtime::*scheduler-threads*))))
+
+;;; ---- the CLI: a component binary file + the WASI flags ----
+
+(defun %u32b (n)
+  (let ((out '()))
+    (loop while (>= n 128)
+          do (push (logior 128 (logand n 127)) out) (setf n (ash n -7))
+          finally (push n out) (return (coerce (nreverse out)
+                                               '(vector (unsigned-byte 8)))))))
+
+(defun %bs (&rest xs) (coerce xs '(vector (unsigned-byte 8))))
+(defun %bcat (&rest vs) (apply #'concatenate '(vector (unsigned-byte 8)) vs))
+(defun %bname (s) (%bcat (%u32b (length s)) (map 'vector #'char-code s)))
+(defun %bna (s) (%bcat (%bs 0) (%bname s)))
+(defun %bvec (&rest xs) (%bcat (%u32b (length xs)) (apply #'%bcat xs)))
+(defun %bsec (id content) (%bcat (%bs id) (%u32b (length content)) content))
+(defun %bwat (text)
+  (wasmdown.binary:encode-module (wasmdown.text:parse-wat text)))
+
+(defun command-component-binary ()
+  "A hand-assembled command-world component: it imports
+wasi:cli/stdout@0.3.2, writes \"hi\" through a stream, task.returns
+ok, and exports `run' (the runner's direct-export fallback)."
+  (let* ((memmod (%bwat "(module (memory (export \"mem\") 1))"))
+         (mmod (%bwat
+                "(module
+                  (import \"env\" \"mem\" (memory 1))
+                  (import \"env\" \"task.return\" (func $tr (param i32)))
+                  (import \"env\" \"stream.new\" (func $snew (result i64)))
+                  (import \"env\" \"stream.write\" (func $swrite (param i32 i32 i32) (result i32)))
+                  (import \"env\" \"stream.drop-writable\" (func $sdropw (param i32)))
+                  (import \"env\" \"future.read\" (func $fread (param i32 i32) (result i32)))
+                  (import \"env\" \"write-via-stream\" (func $wvs (param i32) (result i32)))
+                  (global $fut (mut i32) (i32.const 0))
+                  (func (export \"run\") (result i32)
+                    (local $p i64) (local $rx i32) (local $tx i32) (local $ret i32)
+                    (local.set $p (call $snew))
+                    (local.set $rx (i32.wrap_i64 (local.get $p)))
+                    (local.set $tx (i32.wrap_i64 (i64.shr_u (local.get $p) (i64.const 32))))
+                    (i32.store16 (i32.const 16) (i32.const 0x6968))
+                    (global.set $fut (call $wvs (local.get $rx)))
+                    (local.set $ret (call $swrite (local.get $tx) (i32.const 16) (i32.const 2)))
+                    (if (i32.and (local.get $ret) (i32.const 15)) (then unreachable))
+                    (call $sdropw (local.get $tx))
+                    (local.set $ret (call $fread (global.get $fut) (i32.const 32)))
+                    (if (i32.and (local.get $ret) (i32.const 15)) (then unreachable))
+                    (call $tr (i32.const 0))
+                    (i32.const 0))
+                  (func (export \"run-cb\") (param i32 i32 i32) (result i32) (i32.const 0)))"))
+         (types (%bvec
+                 (%bcat (%bs #x6d 3) (%bname "io")
+                        (%bname "illegal-byte-sequence") (%bname "pipe"))
+                 (%bs #x66 1 #x7d)
+                 (%bs #x6a 0 1 0)
+                 (%bs #x65 1 2)
+                 (%bcat (%bs #x40 1) (%bname "data") (%bs 1) (%bs 0 3))
+                 (%bcat (%bs #x42 7)
+                        (%bs #x02 #x03 #x02 #x01 #x00)
+                        (%bcat (%bs #x04) (%bna "error-code") (%bs #x03 #x00 #x00))
+                        (%bs #x01 #x6a #x00 #x01 #x00)
+                        (%bs #x01 #x65 #x01 #x02)
+                        (%bs #x01 #x66 #x01 #x7d)
+                        (%bcat (%bs #x01 #x40 #x01) (%bname "data") (%bs #x04 #x00 #x03))
+                        (%bcat (%bs #x04) (%bna "write-via-stream") (%bs #x01 #x05)))
+                 (%bs #x6a 0 0)
+                 (%bcat (%bs #x43 0) (%bs 0 6))))
+         (import (%bvec (%bcat (%bna "wasi:cli/stdout@0.3.2") (%bs #x05 5))))
+         (env-bag (%bcat (%bs #x01 7)
+                         (%bcat (%bname "mem") (%bs #x02 0))
+                         (%bcat (%bname "task.return") (%bs #x00 0))
+                         (%bcat (%bname "stream.new") (%bs #x00 1))
+                         (%bcat (%bname "stream.write") (%bs #x00 2))
+                         (%bcat (%bname "stream.drop-writable") (%bs #x00 3))
+                         (%bcat (%bname "future.read") (%bs #x00 4))
+                         (%bcat (%bname "write-via-stream") (%bs #x00 5)))))
+    (%bcat (%bs 0 #x61 #x73 #x6d #x0d 0 1 0)
+           (%bsec 7 types)
+           (%bsec 10 import)
+           (%bsec 1 memmod)
+           (%bsec 1 mmod)
+           (%bsec 2 (%bvec (%bs #x00 0 0)))
+           (%bsec 6 (%bvec (%bcat (%bs #x00 #x02 #x01 0) (%bname "mem"))))
+           (%bsec 6 (%bvec (%bcat (%bs #x01 #x00 0) (%bname "write-via-stream"))))
+           (%bsec 8 (%bvec (%bs #x09 #x00 6 #x00)   ; task.return
+                           (%bs #x0e 1)              ; stream.new
+                           (%bs #x10 1 #x01 #x03 0)  ; stream.write (memory 0)
+                           (%bs #x14 1)              ; stream.drop-writable
+                           (%bs #x16 3 #x01 #x03 0)  ; future.read (memory 0)
+                           (%bs #x01 #x00 0 #x00)))  ; lower write-via-stream
+           (%bsec 2 (%bvec env-bag (%bcat (%bs #x00 1 1) (%bname "env") (%bs #x12 1))))
+           (%bsec 6 (%bvec (%bcat (%bs #x00 #x00 #x01 2) (%bname "run"))
+                           (%bcat (%bs #x00 #x00 #x01 2) (%bname "run-cb"))))
+           (%bsec 8 (%bvec (%bs #x00 #x00 6 #x02 #x06 #x07 7 7)))
+           (%bsec 11 (%bvec (%bcat (%bna "run") (%bs #x01 1) (%bs 0)))))))
+
+(defun %write-temp-bytes (name bytes)
+  (let ((path (merge-pathnames name *default-pathname-defaults*)))
+    (with-open-file (s path :element-type '(unsigned-byte 8)
+                            :direction :output :if-exists :supersede)
+      (write-sequence bytes s))
+    path))
+
+(test wasi/e2e-command-component-binary
+  ;; the same component through the runner and through the decoded IR
+  (let* ((bytes (command-component-binary))
+         (comp (wasmdown.component:decode-component bytes))
+         (sink (make-string-output-stream)))
+    (is (wasmdown.component:component-p bytes))
+    (wasmdown.component:validate-component comp)
+    (is (eql 0 (wasmdown.wasi:run-component
+                comp (wasmdown.wasi:make-wasi-context :stdout sink))))
+    (is (string= "hi" (get-output-stream-string sink)))))
+
+(test wasi/cli-run-component-wasi-flags
+  (let ((path (%write-temp-bytes "tmp-cli-command.wasm"
+                                 (command-component-binary))))
+    (unwind-protect
+         (let ((out (with-output-to-string (s)
+                      (let ((*standard-output* s))
+                        (is (eql 0 (wasmdown.cli:main
+                                    (list "run" (namestring path)
+                                          "--wasi" "--env" "HOME=/tmp"
+                                          "guest-arg"))))))))
+           ;; the guest's stdout.write-via-stream reached the CLI's
+           ;; standard output; the guest arguments were plumbed
+           (is (string= "hi" out)))
+      (when (probe-file path) (delete-file path))))
+  ;; a malformed --net endpoint is a host-invocation error (2); a
+  ;; component run without --wasi but with guest args is a usage error
+  (let ((path (%write-temp-bytes "tmp-cli-command2.wasm"
+                                 (command-component-binary))))
+    (unwind-protect
+         (progn
+           (is (eql 2 (wasmdown.cli:main
+                       (list "run" (namestring path) "--wasi"
+                             "--net" "nonsense"))))
+           (is (eql 2 (wasmdown.cli:main
+                       (list "run" (namestring path) "orphan-arg")))))
+      (when (probe-file path) (delete-file path)))))
+
+;;; ---- the CLI-side authority helpers ----
+
+(test wasi/endpoint-parsing
+  (let ((ep (wasmdown.wasi:parse-wasi-endpoint "127.0.0.1:8080")))
+    (is (equal '(127 0 0 1) (wasmdown.wasi:wasi-endpoint-address ep)))
+    (is (eql 8080 (wasmdown.wasi:wasi-endpoint-port ep))))
+  (let ((ep (wasmdown.wasi:parse-wasi-endpoint "*:*")))
+    (is (eq :any (wasmdown.wasi:wasi-endpoint-address ep)))
+    (is (eq :any (wasmdown.wasi:wasi-endpoint-port ep))))
+  (is (block nil
+        (handler-case (progn (wasmdown.wasi:parse-wasi-endpoint "nonsense") nil)
+          (wasmdown:host-error () t)))))

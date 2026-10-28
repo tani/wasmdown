@@ -3495,13 +3495,22 @@ flat params)."
                ;; bare valtype keyword is either parser's single
                ;; result.
                (results
-                 (if (and (consp rs) (consp (first rs))
-                          (consp (first (first rs))))
-                     ;; ( ( valtype... ) ) — binary: one resultlist
-                     (first rs)
-                     ;; the collected valtypes (or the binary's
-                     ;; single valtype keyword)
-                     (if (and (consp rs) (listp rs)) rs (list rs))))
+                 (cond
+                   ;; the BINARY reader's single valtype: a bare
+                   ;; keyword (:u32) or a type reference (:idx . n).
+                   ;; A DOTTED (:idx . n) cons is NOT a list of
+                   ;; valtypes — reading it as one made the flat
+                   ;; walk see the index's CDR (M16 slice 6: a binary
+                   ;; task.return of a defined `result' type).
+                   ((keywordp rs) (list rs))
+                   ((and (consp rs) (eq (car rs) :idx)) (list rs))
+                   ;; ( ( valtype... ) ) — the TEXT parser's
+                   ;; collected valtypes wrapping a compound shape
+                   ((and (consp rs) (consp (first rs))
+                         (consp (first (first rs))))
+                    (first rs))
+                   ((consp rs) rs)
+                   (t (list rs))))
                (flat (mapcan (lambda (x)
                                (or (ignore-errors
                                     (%flat-type-list x state))
@@ -7877,19 +7886,27 @@ the number of enclosing component/type scopes (outer aliases)."
                        (when (and (eq (first imms) :task-return)
                                   (second imms))
                          (let ((rs (second imms)))
-                           ;; the BINARY reader's shape: one
-                           ;; resultlist; the TEXT parser's: the
-                           ;; collected valtypes
-                           (when (and (consp rs)
-                                      (consp (first rs))
-                                      (consp (first (first rs))))
-                             (setf rs (first rs)))
-                           (dolist (r (if (and (consp rs) (listp rs))
-                                          rs (list rs)))
-                             (when (%vt-transitively-borrow-p
-                                    r state (make-hash-table))
-                               (%verr
-                                "`task.return` result cannot contain a `borrow` type")))))
+                           ;; the BINARY reader's shape: ONE valtype
+                           ;; (a keyword or a dotted (:idx . n) ref);
+                           ;; the TEXT parser's: the collected
+                           ;; valtypes (one per element). A dotted
+                           ;; cons is a single valtype, never a list
+                           ;; (M16 slice 6: the command world's
+                           ;; `result' result).
+                           (let ((vals
+                                   (cond ((keywordp rs) (list rs))
+                                         ((and (consp rs) (eq (car rs) :idx))
+                                          (list rs))
+                                         ((and (consp rs) (consp (first rs))
+                                               (consp (first (first rs))))
+                                          (first rs))
+                                         ((consp rs) rs)
+                                         (t (list rs)))))
+                             (dolist (r vals)
+                               (when (%vt-transitively-borrow-p
+                                      r state (make-hash-table))
+                                 (%verr
+                                  "`task.return` result cannot contain a `borrow` type"))))))
                       ;; slice 5m (indicies ::7/::8): only the
                       ;; TYPE-POSITION immediate bounds-checks
                       ;; against the component type space — the

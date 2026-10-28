@@ -609,8 +609,9 @@ exported but trapping (host-error) — the capability is withdrawable."
          (cli-stderr-instance context :package package))))
 
 (defun cli-provider (context &key (package (wasi-package "cli")))
-  "The full wasi:cli provider: environment, exit and the stdio streams
-(whose authority is CONTEXT's stdin/stdout/stderr slots)."
+  "The full wasi:cli provider: environment, exit, the stdio streams
+(whose authority is CONTEXT's stdin/stdout/stderr slots) and — M16
+slice 6 — the terminal authorities."
   (append
    (list
     (cons (wasmdown.wit:interface-import-name
@@ -619,7 +620,129 @@ exported but trapping (host-error) — the capability is withdrawable."
     (cons (wasmdown.wit:interface-import-name
            (wasmdown.wit:package-interface package "exit"))
           (cli-exit-instance :package package)))
-   (cli-stdio-provider context :package package)))
+   (cli-stdio-provider context :package package)
+   (cli-terminal-provider context :package package)))
+
+;;; ---------------------------------------------------------------
+;;; wasi:cli — THE TERMINALS (M16 slice 6, `cli.wit': terminal-input,
+;;; terminal-output and the three link-time authorities).
+;;;
+;;; The WIT declares only the resource types (no methods yet); the
+;;; authorities answer `option<terminal-*>' — `some' exactly when the
+;;; context stream behind stdin/stdout/stderr is a HOST TERMINAL.
+;;; `isatty(3)' is the only honest test (a redirected file/string
+;;; stream is not a terminal), so the rep is the host fd + the probe
+;;; result, and a non-TTY stream yields `none' — never a fabricated
+;;; handle (PLAN.md §9.1: the capability is explicit).
+
+(defstruct wasi-terminal
+  "The REP of a terminal-input / terminal-output handle: the host file
+descriptor behind the context stream and whether isatty(3) accepted
+it. The fd is BORROWED from the CL stream (dropping the handle never
+closes it)."
+  (fd nil)
+  (isatty nil))
+
+(defun %stream-fd (stream)
+  "The host file descriptor a CL STREAM is backed by, or NIL (string /
+broadcast streams have none). Synonym and two-way streams are
+unwrapped — a CLI launcher's *standard-output* is a synonym stream."
+  (typecase stream
+    (sb-sys:fd-stream
+     (sb-sys:fd-stream-fd stream))
+    (synonym-stream
+     (%stream-fd (symbol-value (synonym-stream-symbol stream))))
+    (two-way-stream
+     (or (%stream-fd (two-way-stream-input-stream stream))
+         (%stream-fd (two-way-stream-output-stream stream))))
+    (t nil)))
+
+(defun %terminal-probe (stream)
+  "The wasi-terminal a CL STREAM denotes, or NIL when it has no host
+fd or isatty(3) reports a non-terminal."
+  (let ((fd (%stream-fd stream)))
+    (when (and (integerp fd) (not (minusp fd)))
+      (multiple-value-bind (tty errno)
+          (sb-unix:unix-isatty fd)
+        (declare (ignore errno))
+        (when (eql tty 1)
+          (make-wasi-terminal :fd fd :isatty t))))))
+
+(defun %cli-resource-ct (package interface-name resource-name)
+  "The resource ct of RESOURCE-NAME in INTERFACE-NAME — the SHARED
+identity every occurrence of the resource (here through `use' in the
+authority interfaces) resolves to."
+  (wasmdown.wit:wit-type->ct
+   (wasmdown.wit:package-interface package interface-name)
+   (list :resource resource-name)
+   :packages (list package)))
+
+(defun terminal-input-instance (&key (package (wasi-package "cli")))
+  "The wasi:cli/terminal-input interface: the resource type alone (the
+WIT declares no functions yet)."
+  (provider-instance
+   (wasmdown.wit:package-interface package "terminal-input") nil
+   :packages (list package)))
+
+(defun terminal-output-instance (&key (package (wasi-package "cli")))
+  "The wasi:cli/terminal-output interface."
+  (provider-instance
+   (wasmdown.wit:package-interface package "terminal-output") nil
+   :packages (list package)))
+
+(defun %terminal-authority (stream interface-name resource-name
+                            &key (package (wasi-package "cli")))
+  "The `get-terminal-*' authority instance over STREAM: `some' with an
+own<resource> handle whose rep is the wasi-terminal when the stream is
+a terminal, `none' otherwise."
+  (let ((ct (%cli-resource-ct package interface-name resource-name)))
+    (provider-instance
+     (wasmdown.wit:package-interface package interface-name)
+     (list
+      (cons (format nil "get-terminal-~a"
+                    (subseq interface-name (length "terminal-")))
+            (lambda ()
+              (let ((terminal (%terminal-probe stream)))
+                (if terminal
+                    (cons :some (list :own-handle ct terminal))
+                    :none)))))
+     :packages (list package))))
+
+(defun terminal-stdin-instance (context
+                                &key (package (wasi-package "cli")))
+  (%terminal-authority (wasi-context-stdin context)
+                       "terminal-stdin" "terminal-input"
+                       :package package))
+
+(defun terminal-stdout-instance (context
+                                 &key (package (wasi-package "cli")))
+  (%terminal-authority (wasi-context-stdout context)
+                       "terminal-stdout" "terminal-output"
+                       :package package))
+
+(defun terminal-stderr-instance (context
+                                 &key (package (wasi-package "cli")))
+  (%terminal-authority (wasi-context-stderr context)
+                       "terminal-stderr" "terminal-output"
+                       :package package))
+
+(defun cli-terminal-provider (context &key (package (wasi-package "cli")))
+  "The wasi:cli terminal imports (the two resource interfaces + the
+three link-time authorities) as a with-args alist."
+  (flet ((import-name (name)
+           (wasmdown.wit:interface-import-name
+            (wasmdown.wit:package-interface package name))))
+    (list
+     (cons (import-name "terminal-input")
+           (terminal-input-instance :package package))
+     (cons (import-name "terminal-output")
+           (terminal-output-instance :package package))
+     (cons (import-name "terminal-stdin")
+           (terminal-stdin-instance context :package package))
+     (cons (import-name "terminal-stdout")
+           (terminal-stdout-instance context :package package))
+     (cons (import-name "terminal-stderr")
+           (terminal-stderr-instance context :package package)))))
 
 ;;; ===============================================================
 ;;; wasi:filesystem (M16 slice 3a) — THE CAPABILITY MODEL.
@@ -5806,3 +5929,141 @@ network authority."
           (wasmdown.wit:package-interface package "client"))
          (http-client-instance context :network network
                                :package package))))
+
+;;; ===============================================================
+;;; THE COMMAND WORLD (`wasi:cli/run`, M16 slice 6) — THE RUNNER.
+;;;
+;;; A component built from the `command' world imports the whole WASI
+;;; surface as instance imports and exports the `run' function of
+;;; `wasi:cli/run@0.3.2` (`run: async func() -> result`). The runner
+;;; is the host side of that contract:
+;;;
+;;;   1. instantiate the validated component with EVERY provider bound
+;;;      under its versioned WIT import name;
+;;;   2. call the exported `run' through `lifted-func-call' — the
+;;;      ASYNC-TYPED functype routes through the task state machine
+;;;      (its own guest thread + the caller's drain loop), a sync-typed
+;;;      `run' takes the sync path; both RETURN the component-level
+;;;      `result' domain value;
+;;;   3. map it to the process status: `ok' -> 0, `err' -> 1;
+;;;   4. `wasi:cli/exit's functions signal WASI-EXIT from the guest
+;;;      thread; the condition unwinds through the lift (the async
+;;;      trap path re-signals it at the boundary), is caught HERE, and
+;;;      its status becomes the process status;
+;;;   5. the store is torn down on every exit path (STORE-TEARDOWN):
+;;;      an exit — or a trap — leaves no parked guest thread behind.
+;;;
+;;; The provider set is capability-driven: every provider consults the
+;;; explicit WASI-CONTEXT (PLAN.md §9.1), never an ambient global.
+
+(defun command-provider (context)
+  "The full `command' world import set as a with-args alist: cli
+(environment/exit/stdio/terminals), clocks, random, filesystem
+(types + preopens), sockets (types + ip-name-lookup) and http (types
++ client), all bound to CONTEXT."
+  (append (cli-provider context)
+          (clocks-provider)
+          (random-provider)
+          (filesystem-provider context)
+          (sockets-provider context)
+          (http-provider context)))
+
+(defun component-run-export (instance)
+  "The `run' function a command-world component exports: the exported
+`wasi:cli/run@0.3.2' instance's `run' (a comp-instance or an inline
+bag), else a direct top-level `run' export. NIL when absent."
+  (flet ((%export (name)
+           (let ((hit (gethash name
+                               (wasmdown.component.runtime:comp-instance-exports
+                                instance)
+                               :missing)))
+             (unless (eq hit :missing) (cdr hit))))
+         (run-of (value)
+           (typecase value
+             (wasmdown.component.runtime:comp-instance
+              (wasmdown.component.runtime:runtime-export-value value "run"))
+             (hash-table (gethash "run" value))
+             (t nil))))
+    (or (run-of (%export "wasi:cli/run@0.3.2"))
+        (let ((direct (%export "run")))
+          (and (wasmdown.component.runtime:lifted-func-p direct) direct)))))
+
+(defun %run-result-status (result)
+  "The `result' domain value of the command's run -> the process
+status: ok -> 0, err (or an absent/false result) -> 1."
+  (if (and (consp result) (eq (car result) :ok)) 0 1))
+
+(defun run-component (comp context &key providers)
+  "Drive the VALIDATED command component COMP to completion under the
+capabilities of CONTEXT. Instantiates with PROVIDERS (default: the
+whole COMMAND-PROVIDER set for CONTEXT), calls the exported
+`wasi:cli/run@0.3.2' `run' (async or sync), and returns the process
+status. A `wasi:cli/exit' terminates the run with its status; the
+store is torn down in every case (no leaked guest threads). Traps
+propagate to the caller."
+  (let ((providers (or providers (command-provider context))))
+    (unwind-protect
+         (handler-case
+             (let* ((instance
+                      (wasmdown.component.runtime:instantiate-component
+                       comp :with-args providers))
+                    (run (component-run-export instance)))
+               (unless run
+                 (error 'wasmdown:link-error
+                        :message
+                        "component exports no wasi:cli/run@0.3.2 `run' function"))
+               (%run-result-status
+                (wasmdown.component.runtime:lifted-func-call run)))
+           (wasi-exit (c) (wasi-exit-status c)))
+      ;; the exit semantics: whatever the guest started, the command
+      ;; is over — abandon + unblock + join every registered thread
+      (wasmdown.component.runtime:store-teardown))))
+
+;;; ---------------------------------------------------------------
+;;; The CLI's network-authority parsing (`--net HOST:PORT').
+
+(defun %parse-ipv4-octets (text)
+  "TEXT as a dotted-quad IPv4 address (4 octets), or NIL."
+  (let ((parts '()) (start 0))
+    (loop
+      (let ((dot (position #\. text :start start)))
+        (let ((piece (subseq text start dot)))
+          (unless (and (plusp (length piece)) (every #'digit-char-p piece))
+            (return-from %parse-ipv4-octets nil))
+          (let ((n (parse-integer piece)))
+            (unless (<= 0 n 255) (return-from %parse-ipv4-octets nil))
+            (push n parts)))
+        (if dot (setf start (1+ dot)) (return))))
+    (when (= (length parts) 4) (nreverse parts))))
+
+(defun parse-wasi-endpoint (spec)
+  "Parse \"HOST:PORT\" into a WASI-ENDPOINT. HOST is `*' (any address)
+or a dotted-quad IPv4 address; PORT is `*' (any port) or 0..65535.
+The WIT's address slot is an ip-socket-address, so host names are not
+endpoints (they belong to the DNS policy, `--dns'). Signals
+HOST-ERROR on a malformed spec."
+  (let ((colon (position #\: spec :from-end t)))
+    (unless colon
+      (error 'wasmdown:host-error
+             :message (format nil "endpoint ~s is not HOST:PORT" spec)))
+    (let* ((host (subseq spec 0 colon))
+           (port-text (subseq spec (1+ colon)))
+           (address (cond ((string= host "*") :any)
+                          ((%parse-ipv4-octets host))
+                          (t (error 'wasmdown:host-error
+                                    :message
+                                    (format nil "endpoint host ~s is not `*' or an IPv4 address"
+                                            host)))))
+           (port (cond ((string= port-text "*") :any)
+                       ((every #'digit-char-p port-text)
+                        (let ((n (parse-integer port-text)))
+                          (unless (<= 0 n 65535)
+                            (error 'wasmdown:host-error
+                                   :message
+                                   (format nil "endpoint port ~d out of range" n)))
+                          n))
+                       (t (error 'wasmdown:host-error
+                                 :message
+                                 (format nil "endpoint port ~s is not `*' or an integer"
+                                         port-text))))))
+      (make-wasi-endpoint :address address :port port))))

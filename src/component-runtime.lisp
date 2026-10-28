@@ -75,7 +75,12 @@
            ;; record and whose drop runs a host finalizer)
            #:host-resource-rep
            #:host-resource-take
-           #:*host-resource-dtor-table*))
+           #:*host-resource-dtor-table*
+           ;; M16 slice 6 — the RUNNER's store-boundary teardown: a host
+           ;; embedder that drives one command to completion (the WASI
+           ;; `run' entry) tears the whole store down afterwards, so a
+           ;; `wasi:cli/exit' cannot leak guest threads.
+           #:store-teardown))
 (in-package #:wasmdown.component.runtime)
 
 ;;; THE ASYNC DYNAMIC CONTEXT: proclaimed SPECIAL at the file's
@@ -743,10 +748,22 @@ remaining built-ins stay opaque core-func slots (the values slice)."
          ;; kinds (thread.*/future.*/stream.*/error-context.*)
          ;; return NIL — an opaque slot that traps when called,
          ;; never at instantiate time.
-         (%push-core-func
-          inst
-          (%builtin-async-host-func inst rkind
-                                    (canonrec-imms payload))))
+         ;; M16 slice 6: the BINARY reader stores a builtin's
+         ;; canonopts on the CANONREC (`canonrec-opts'), while the
+         ;; TEXT parser embeds them as the immediates' THIRD element
+         ;; (the shape `%task-return-opts' and the stream/future copy
+         ;; builtins read). Normalize the binary shape here — without
+         ;; this, a binary `stream.write (memory ...)` resolved NO
+         ;; memory and the copy trapped on a NIL memory-instance.
+         (let* ((imms (canonrec-imms payload))
+                (opts (canonrec-opts payload))
+                (imms (if (and opts (>= (length imms) 2)
+                               (null (third imms)))
+                          (append (list (first imms) (second imms) opts))
+                          imms)))
+           (%push-core-func
+            inst
+            (%builtin-async-host-func inst rkind imms))))
         (t (%push-core-func inst nil)))))))
 
 ;;; ---- import ----
@@ -5498,15 +5515,20 @@ is the valtype."
   (let ((rs (second imms)))
     (cond
      ((null rs) nil)
+     ;; the BINARY reader's raw valtype: a keyword or a DOTTED
+     ;; (:idx . n) cons (a type reference — never a list of valtypes;
+     ;; reading it as one made the flat walk see the index's CDR).
+     ((keywordp rs) rs)
+     ((and (consp rs) (eq (car rs) :idx)) rs)
      ;; the TEXT parser's collected-valtypes list: the first element
      ;; is the valtype keyword or the (:idx . n) cons
      ((and (consp rs) (consp (first rs))
            (listp (first (first rs))))
       (first (first rs)))
-     ;; the raw valtype itself (keyword / (:idx . n)) — the binary's
-     ;; second immediate (binary.wast ::94) or the single-collect case
-     ((not (consp rs)) rs)
-     (t (first rs)))))
+     ;; the TEXT parser's collected-valtypes list (one element for a
+     ;; single-result func): the valtype itself
+     ((consp rs) (first rs))
+     (t rs))))
 
 (defun %task-return-opts (imms)
   "The canon's trailing canonopts (the third immediate)."
@@ -7081,6 +7103,16 @@ Abandon + unblock + unregister every still-registered thread."
       (ignore-errors (sb-thread:join-thread n)))))
 
 (setf wasmdown.wast:*store-teardown-hook* #'%store-teardown)
+
+(defun store-teardown ()
+  "Tear down the whole store (CanonicalABI.md §3552: 'trap and tear
+down the whole store'): abandon + unblock + unregister every still
+registered guest thread and join the native threads. The WASI command
+runner calls this at its boundary so a `wasi:cli/exit' — a host
+condition that unwinds the guest's run task — leaves no parked
+thread behind (PLAN.md §9, slice 6 exit semantics). Idempotent: an
+empty scheduler is a no-op."
+  (%store-teardown))
 
 (setf wasmdown.wast:*component-instantiator* #'instantiate-component)
 

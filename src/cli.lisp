@@ -12,8 +12,12 @@
 ;;;; "stable host exit status independent of Wasm trap representation").
 ;;;;
 ;;;; Implemented subset: validate / inspect / compile / run / help.
-;;;; No --wasi, --mapdir, --profile-conditional or artifact ABI checks
-;;;; (Component Model / WASI are out of this slice).
+;;;; M16 slice 6: `run' accepts BOTH layers — a component binary is
+;;;; driven through the WASI command runner (`--wasi', `--dir',
+;;;; `--env', `--net', `--listen', `--dns' and guest arguments), a
+;;;; core module keeps the `--invoke' path. No --mapdir / --profile-
+;;;; conditional / artifact ABI checks yet; --http-transport is
+;;;; embedder-only (documented at the run command).
 
 (in-package #:wasmdown.cli)
 
@@ -31,7 +35,10 @@
                   ~4tvalidate [--profile name] <file.wasm>~%~
                   ~4tinspect <file.wasm>~%~
                   ~4tcompile <file.wasm> --emit-lisp <out.lisp>~%~
-                  ~4trun <file.wasm> [--invoke <name> <int> ...]~%~
+                  ~4trun <file> [--invoke <name> <int> ...]~%~
+                  ~4trun <component> --wasi [--dir HOST[::GUEST]]~%~
+                  ~10t[--env K=V] [--net HOST:PORT] [--listen ADDR:PORT]~%~
+                  ~10t[--dns NAME] [arg ...]~%~
                   ~4thelp~%~
                   exit codes: 0 ok, 1 guest/compile error, 2 usage error~%"))
 
@@ -220,40 +227,175 @@ functions first)."
 
 ;;; ---------------------------------------------------------------
 ;;; Command: run.
+;;;
+;;; M16 slice 6: the run command accepts BOTH layers. A component
+;;; binary (the component preamble) goes through the WASI command
+;;; runner (`wasi:cli/run@0.3.2'), configured by the WASI flags; a
+;;; core module keeps the `--invoke' path. The flags:
+;;;
+;;;   --wasi             enable the WASI capability set (the process
+;;;                      standard streams, the guest arguments after
+;;;                      the component path, --env/--dir/--net/...)
+;;;   --dir HOST[::GUEST] a preopen (guest-visible name after `::')
+;;;   --env K=V          one environment variable
+;;;   --net HOST:PORT    declare an outbound endpoint (network policy)
+;;;   --listen ADDR:PORT declare a listen address
+;;;   --dns NAME         allow a name (or `*' for any)
+;;;
+;;; There is no --http-transport: HTTP transports are EMBEDDER-only
+;;; (PLAN.md §9.2 — pluggable TLS/transport services are CL objects on
+;;; the wasi-context, not a CLI capability; the built-in plain TCP
+;;; transport is what a guest gets, and https without an embedder
+;;; transport is the WIT's configuration-error).
 
 (defun %parse-run-args (argv)
-  "Return (values file invokes) where INVOKES is a list of
-(name . integer-args) in command-line order. --invoke may repeat;
-integer arguments may repeat."
-  (let ((rest argv) (file nil) (invokes '()))
+  "Return (values file invokes options guest-args). INVOKES is a list
+of (name . integer-args) in command-line order (core modules).
+OPTIONS is an alist of the WASI-capability flags (repeats kept, in
+order); GUEST-ARGS are the positional tokens AFTER the input file."
+  (let ((rest argv) (file nil) (invokes '()) (options '()) (guest '()))
     (loop while rest
           for tok = (pop rest)
-          do (cond ((string= tok "--invoke")
-                    (let ((name (pop rest)))
-                      (unless name
-                        (%usage-error "run: --invoke requires an export name"))
-                      (let ((ints '()))
-                        (loop while (and rest (not (%flagp (first rest))))
-                              do (push (%parse-int (pop rest)) ints))
-                        (push (cons name (nreverse ints)) invokes))))
-                   ((%flagp tok) (%usage-error "unknown option ~a" tok))
-                   (file (%usage-error "run: exactly one input file, got ~a and ~a"
-                                       file tok))
-                   (t (setf file tok))))
+          do (cond
+               ((string= tok "--invoke")
+                (let ((name (pop rest)))
+                  (unless name
+                    (%usage-error "run: --invoke requires an export name"))
+                  (let ((ints '()))
+                    (loop while (and rest (not (%flagp (first rest))))
+                          do (push (%parse-int (pop rest)) ints))
+                    (push (cons name (nreverse ints)) invokes))))
+               ((string= tok "--wasi")
+                (push (cons "--wasi" t) options))
+               ((member tok '("--dir" "--env" "--net" "--listen" "--dns")
+                        :test #'string=)
+                (let ((value (pop rest)))
+                  (unless value
+                    (%usage-error "run: ~a requires a value" tok))
+                  (push (cons tok value) options)))
+               ((string= tok "--http-transport")
+                (%usage-error
+                 "run: --http-transport is embedder-only; configure :http-transports on the wasi-context in the embedder"))
+               ((%flagp tok) (%usage-error "unknown option ~a" tok))
+               (file (push tok guest))
+               (t (setf file tok))))
     (unless file
       (%usage-error "run: missing input file"))
-    (values file (nreverse invokes))))
+    (values file (nreverse invokes) (nreverse options) (nreverse guest))))
+
+(defun %run-collect (options flag)
+  "The values of the repeated option FLAG, in command-line order."
+  (loop for (key . value) in options
+        when (string= key flag)
+          collect value))
+
+(defun %read-run-file-bytes (path)
+  (with-open-file (s path :element-type '(unsigned-byte 8)
+                          :direction :input)
+    (let ((v (make-array (file-length s)
+                         :element-type '(unsigned-byte 8))))
+      (read-sequence v s)
+      v)))
+
+(defun %env-pair (spec)
+  "NAME=VALUE -> (name . value) for the environment capability."
+  (let ((eq (position #\= spec)))
+    (unless (and eq (plusp eq))
+      (%usage-error "run: --env expects NAME=VALUE, got ~s" spec))
+    (cons (subseq spec 0 eq) (subseq spec (1+ eq)))))
+
+(defun %dir-preopen (spec)
+  "HOST[::GUEST] -> an open wasi-preopen (the host directory handle)."
+  (let* ((sep (search "::" spec))
+         (host (if sep (subseq spec 0 sep) spec))
+         (guest (if sep (subseq spec (+ sep 2)) spec)))
+    (unless (plusp (length host))
+      (%usage-error "run: --dir expects HOST[::GUEST], got ~s" spec))
+    (wasmdown.wasi:open-wasi-preopen host :name guest)))
+
+(defun %run-network (options)
+  "The network authority declared by --net/--listen/--dns, or NIL
+(no network authority: every socket operation is refused)."
+  (let ((outgoing (mapcar #'wasmdown.wasi:parse-wasi-endpoint
+                          (%run-collect options "--net")))
+        (listen (mapcar #'wasmdown.wasi:parse-wasi-endpoint
+                        (%run-collect options "--listen")))
+        (dns (%run-collect options "--dns")))
+    (when (or outgoing listen dns)
+      (wasmdown.wasi:make-wasi-network
+       :outbound outgoing
+       :listen listen
+       :dns (cond ((member "*" dns :test #'string=) :all)
+                  (dns dns)
+                  (t :none))))))
+
+(defun %component-context (options guest-args file)
+  "The capability context a component run is configured with. Without
+--wasi every capability is withdrawn (PLAN.md §9.1: the default is
+empty); with it, the process streams and the guest arguments (the
+component path as argv[0]) are the explicitly configured ones."
+  (let ((wasi (assoc "--wasi" options)))
+    (when (and (not wasi)
+               (or (%run-collect options "--dir")
+                   (%run-collect options "--env")
+                   (%run-collect options "--net")
+                   (%run-collect options "--listen")
+                   (%run-collect options "--dns")))
+      (%usage-error "run: --dir/--env/--net/--listen/--dns require --wasi"))
+    (when (and (not wasi) guest-args)
+      (%usage-error "run: guest arguments require --wasi"))
+    (let ((network (%run-network options)))
+      (wasmdown.wasi:make-wasi-context
+       :arguments (if wasi (cons file guest-args) nil)
+       :environment (mapcar #'%env-pair (%run-collect options "--env"))
+       :stdin (and wasi *standard-input*)
+       :stdout (and wasi *standard-output*)
+       :stderr (and wasi *error-output*)
+       :preopens (mapcar #'%dir-preopen (%run-collect options "--dir"))
+       :networks (and network (list network))))))
+
+(defun %run-component-file (bytes options guest-args file)
+  "Decode + validate a component binary and drive its command world."
+  (let ((comp (wasmdown.component:decode-component bytes)))
+    (wasmdown.component:validate-component comp)
+    ;; the capability context (and its preopen fds) exists only once
+    ;; the component is known to be a valid command
+    (let ((context (%component-context options guest-args file)))
+      (unwind-protect
+           (wasmdown.wasi:run-component comp context)
+        ;; the preopen handles belong to the CLI invocation
+        (dolist (preopen (wasmdown.wasi:wasi-context-preopens context))
+          (ignore-errors (wasmdown.wasi:close-wasi-preopen preopen)))))))
 
 (defun %cmd-run (args)
-  (multiple-value-bind (file invokes) (%parse-run-args args)
+  (multiple-value-bind (file invokes options guest-args) (%parse-run-args args)
     (handler-case
-        (let* ((module (wasmdown:read-module file))
-               (inst (wasmdown:instantiate module)))
-          (dolist (inv invokes)
-            (let ((results (apply #'wasmdown:invoke inst
-                                   (car inv) (cdr inv))))
-              (format t "~{~a~^ ~}~%" results)))
-          0)
+        (let ((bytes (%read-run-file-bytes file)))
+          (if (wasmdown.component:component-p bytes)
+              (progn
+                (when invokes
+                  (%usage-error
+                   "run: --invoke applies to core modules, not components"))
+                (%run-component-file bytes options guest-args file))
+              (progn
+                (when guest-args
+                  (%usage-error "run: stray argument ~s (core modules take --invoke)"
+                                (first guest-args)))
+                (when (or (assoc "--wasi" options :test #'string=)
+                          (%run-collect options "--dir")
+                          (%run-collect options "--env")
+                          (%run-collect options "--net")
+                          (%run-collect options "--listen")
+                          (%run-collect options "--dns"))
+                  (%usage-error
+                   "run: the WASI options require a Component Model component"))
+                (let* ((module (wasmdown:read-module bytes))
+                       (inst (wasmdown:instantiate module)))
+                  (dolist (inv invokes)
+                    (let ((results (apply #'wasmdown:invoke inst
+                                          (car inv) (cdr inv))))
+                      (format t "~{~a~^ ~}~%" results)))
+                  0))))
       (wasmdown:decode-error (c) (%diag c) 1)
       (wasmdown:validation-error (c) (%diag c) 1)
       (wasmdown:link-error (c) (%diag c) 1)

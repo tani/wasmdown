@@ -352,6 +352,12 @@
    #:wasi-context-arguments
    #:wasi-context-environment
    #:wasi-context-cwd
+   #:wasi-context-stdin
+   #:wasi-context-stdout
+   #:wasi-context-stderr
+   #:wasi-context-preopens
+   #:wasi-context-networks
+   #:wasi-context-http-transports
    ;; host exit
    #:wasi-exit
    #:wasi-exit-p
@@ -389,6 +395,25 @@
    #:cli-environment-instance
    #:cli-exit-instance
    #:cli-provider
+   ;; cli (M16 slice 6): the terminals, the command-world provider set,
+   ;; the `run' runner, and the CLI-side authority helpers
+   #:wasi-terminal
+   #:wasi-terminal-p
+   #:wasi-terminal-fd
+   #:terminal-input-instance
+   #:terminal-output-instance
+   #:terminal-stdin-instance
+   #:terminal-stdout-instance
+   #:terminal-stderr-instance
+   #:cli-terminal-provider
+   #:command-provider
+   #:run-component
+   #:component-run-export
+   #:parse-wasi-endpoint
+   #:open-wasi-preopen
+   #:close-wasi-preopen
+   #:wasi-preopen-p
+   #:wasi-preopen-name
    ;; sockets (M16 slice 4): the network authority, the tcp/udp
    ;; resources and ip-name-lookup
    #:wasi-network
