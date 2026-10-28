@@ -1803,3 +1803,757 @@ accumulated u8 values."
 
 (defun fs-bytes->string (path)
   (map 'string #'code-char (fs-bytes path)))
+
+;;; ===============================================================
+;;; M16 SLICE 4 — wasi:sockets: the network authority, the TCP/UDP
+;;; resources, ip-name-lookup, the errno mapping, and a TCP-echo
+;;; e2e component.
+;;; ===============================================================
+
+;;; Domains + drivers.
+(defun sock-addr (port &optional (host '(127 0 0 1)))
+  (cons "ipv4" (list (cons "port" port) (cons "address" host))))
+
+(defun sock-addr6 (port &optional (host '(0 0 0 0 0 0 0 1)))
+  (cons "ipv6" (list (cons "port" port)
+                     (cons "flow-info" 0)
+                     (cons "address" host)
+                     (cons "scope-id" 0))))
+
+(defun sock-endpoint (&optional (port :any))
+  (wasmdown.wasi:make-wasi-endpoint :address '(127 0 0 1) :port port))
+
+(defun sock-network (&key (outbound :loopback) (listen :loopback) (dns :none))
+  (wasmdown.wasi:make-wasi-network
+   :outbound (if (eq outbound :loopback) (list (sock-endpoint)) outbound)
+   :listen (if (eq listen :loopback) (list (sock-endpoint)) listen)
+   :dns dns))
+
+(defun sock-ok (result) (cdr result))
+(defun sock-code (result)
+  (wasmdown.wasi:sockets-error-code (cdr result)))
+(defun sock-rep (result) (third (sock-ok result)))
+
+(defun sock-value-port (value)
+  "The port of an ip-socket-address domain value."
+  (cdr (assoc "port" (cdr value) :test #'string=)))
+
+(defun sock-future-code (value)
+  "The error-code case name of a (:err . code) future value (NIL for
+an ok result)."
+  (when (and (consp value) (eq (car value) :err))
+    (wasmdown.wasi:sockets-error-code (cdr value))))
+
+(defun sock-stream ()
+  (wasmdown.component.runtime:make-host-stream-pair *u8-ct*))
+
+(defun sock-stage (writer bytes)
+  "The guest's write through WRITER; the packed event code."
+  (rtcall "%END-COPY" writer
+          (wasmdown.component.runtime:make-host-buffer
+           (length bytes) :values bytes)
+          nil)
+  (third (rtcall "%WAITABLE-GET-PENDING-EVENT" writer)))
+
+(defun sock-drop (end) (rtcall "%END-DROP" end))
+
+(defun sock-drain (reader &optional (limit 64) (want nil))
+  "Accumulate CL reads from READER until WANT values arrived, no
+progress is possible, or the end is DROPPED."
+  (let ((out '()))
+    (loop
+      (let ((buf (wasmdown.component.runtime:make-host-buffer limit)))
+        (rtcall "%END-COPY" reader buf t)
+        (setf out (append out
+                          (wasmdown.component.runtime:host-buffer-values buf)))
+        (let ((ev (third (rtcall "%WAITABLE-GET-PENDING-EVENT" reader))))
+          (when (or (and want (>= (length out) want))
+                    (null ev)
+                    (< (logand ev #xf) 2))
+            (return out)))))))
+
+(defun sock-future (future)
+  "The single value a HOST future delivers."
+  (let ((buf (wasmdown.component.runtime:make-host-buffer 1)))
+    (rtcall "%END-COPY" future buf t)
+    (first (wasmdown.component.runtime:host-buffer-values buf))))
+
+(defun sock-accept (listener-stream)
+  "One accepted tcp-socket rep out of LISTENER-STREAM, or NIL."
+  (let ((buf (wasmdown.component.runtime:make-host-buffer 1)))
+    (rtcall "%END-COPY" listener-stream buf t)
+    (let ((values (wasmdown.component.runtime:host-buffer-values buf)))
+      (and values (third (first values))))))
+
+;;; ---------------------------------------------------------------
+;;; The sockaddr layout is empirical: sizes + the bytes the domain
+;;; conversion writes (the slice-3b `struct dirent' discipline).
+
+(test wasi/sockets-sockaddr-layout
+  (is (= 16 (sb-alien:alien-size
+             (sb-alien:struct wasmdown.wasi::%sockaddr-in) :bytes)))
+  (is (= 28 (sb-alien:alien-size
+             (sb-alien:struct wasmdown.wasi::%sockaddr-in6) :bytes)))
+  (multiple-value-bind (alien len family)
+      (wasmdown.wasi:ip-socket-address->sockaddr (sock-addr 4321))
+    (unwind-protect
+         (let ((sap (sb-alien:alien-sap alien))
+               (d (sb-alien:deref alien)))
+           (is (eql :ipv4 family))
+           (is (= 16 len))
+           ;; family at 0 (host-endian u16), port at 2 (network order),
+           ;; address at 4..7
+           (is (= wasmdown.wasi::+af-inet+ (sb-sys:sap-ref-8 sap 0)))
+           (is (= 0 (sb-sys:sap-ref-8 sap 1)))
+           (is (= #x10 (sb-sys:sap-ref-8 sap 2)))     ; 4321 = #x10E1
+           (is (= #xE1 (sb-sys:sap-ref-8 sap 3)))
+           (is (equal '(127 0 0 1)
+                      (loop for i below 4
+                            collect (sb-sys:sap-ref-8 sap (+ 4 i)))))
+           ;; the struct's slots agree with those byte offsets
+           (is (= wasmdown.wasi::+af-inet+
+                  (sb-alien:slot d 'wasmdown.wasi::sin-family)))
+           (is (= #xE110 (sb-alien:slot d 'wasmdown.wasi::sin-port)))
+           ;; the round trip returns the same domain value
+           (is (equal (sock-addr 4321)
+                      (wasmdown.wasi:sockaddr->ip-socket-address sap))))
+      (sb-alien:free-alien alien)))
+  (multiple-value-bind (alien len family)
+      (wasmdown.wasi:ip-socket-address->sockaddr
+       (sock-addr6 1234 '(0 0 0 0 0 0 0 1)))
+    (unwind-protect
+         (let ((sap (sb-alien:alien-sap alien))
+               (d (sb-alien:deref alien)))
+           (is (eql :ipv6 family))
+           (is (= 28 len))
+           (is (= wasmdown.wasi::+af-inet6+ (sb-sys:sap-ref-8 sap 0)))
+           (is (= #x04 (sb-sys:sap-ref-8 sap 2)))     ; 1234 = #x04D2
+           (is (= #xD2 (sb-sys:sap-ref-8 sap 3)))
+           ;; sin6_flowinfo at 4, sin6_addr at 8, sin6_scope_id at 24
+           (is (= 0 (sb-alien:slot d 'wasmdown.wasi::sin6-flowinfo)))
+           (is (= 0 (sb-alien:slot d 'wasmdown.wasi::sin6-scope-id)))
+           (is (equal (sock-addr6 1234 '(0 0 0 0 0 0 0 1))
+                      (wasmdown.wasi:sockaddr->ip-socket-address sap))))
+      (sb-alien:free-alien alien)))
+  ;; a malformed address is the WIT's invalid-argument, never a crash
+  (let ((caught
+          (handler-case
+              (progn (wasmdown.wasi:ip-socket-address->sockaddr
+                      (cons "ipv4" (list (cons "port" 1)
+                                         (cons "address" '(1 2 3)))))
+                     nil)
+            (wasmdown.wasi:wasi-socket-error (c)
+              (wasmdown.wasi:sockets-error-code
+               (wasmdown.wasi:wasi-socket-error-code c))))))
+    (is (string= "invalid-argument" caught))))
+
+;;; ---------------------------------------------------------------
+;;; The capability policy.
+
+(test wasi/sockets-network-policy
+  (let ((net (sock-network :dns '("localhost" "**.example.com"))))
+    (is (wasmdown.wasi:wasi-network-allows-outbound-p
+         net :ipv4 '(127 0 0 1) 80))
+    (is (wasmdown.wasi:wasi-network-allows-outbound-p
+         net :ipv4 '(127 0 0 1) 0))
+    (is (not (wasmdown.wasi:wasi-network-allows-outbound-p
+              net :ipv4 '(10 1 2 3) 80)))
+    (is (not (wasmdown.wasi:wasi-network-allows-outbound-p
+              net :ipv6 '(0 0 0 0 0 0 0 1) 80)))
+    (is (wasmdown.wasi:wasi-network-allows-listen-p
+         net :ipv4 '(127 0 0 1) 0))
+    (is (not (wasmdown.wasi:wasi-network-allows-listen-p
+              net :ipv4 '(0 0 0 0) 0)))
+    ;; an endpoint's declared port narrows the match
+    (let ((net2 (wasmdown.wasi:make-wasi-network
+                 :outbound (list (wasmdown.wasi:make-wasi-endpoint
+                                  :address '(127 0 0 1) :port 8080)))))
+      (is (wasmdown.wasi:wasi-network-allows-outbound-p
+           net2 :ipv4 '(127 0 0 1) 8080))
+      (is (not (wasmdown.wasi:wasi-network-allows-outbound-p
+                net2 :ipv4 '(127 0 0 1) 8081))))
+    ;; DNS: exact + `**.suffix' patterns
+    (is (wasmdown.wasi:wasi-network-allows-dns-p net "localhost"))
+    (is (wasmdown.wasi:wasi-network-allows-dns-p net "a.example.com"))
+    (is (wasmdown.wasi:wasi-network-allows-dns-p net "deep.a.example.com"))
+    (is (not (wasmdown.wasi:wasi-network-allows-dns-p net "elsewhere.test"))))
+  ;; the deny-all default and the explicit :any escape hatch
+  (let ((deny (wasmdown.wasi:make-wasi-network))
+        (any (wasmdown.wasi:make-wasi-network
+              :outbound :any :listen :any :dns :all)))
+    (is (not (wasmdown.wasi:wasi-network-allows-outbound-p
+              deny :ipv4 '(127 0 0 1) 80)))
+    (is (not (wasmdown.wasi:wasi-network-allows-listen-p
+              deny :ipv4 '(0 0 0 0) 0)))
+    (is (not (wasmdown.wasi:wasi-network-allows-dns-p deny "localhost")))
+    (is (wasmdown.wasi:wasi-network-allows-outbound-p
+         any :ipv6 '(0 0 0 0 0 0 0 1) 443))
+    (is (wasmdown.wasi:wasi-network-allows-dns-p any "anything.test")))
+  ;; a NIL network authority is deny-all, never an error
+  (is (not (wasmdown.wasi:wasi-network-allows-outbound-p
+            nil :ipv4 '(127 0 0 1) 80))))
+
+;;; ---------------------------------------------------------------
+;;; TCP over real loopback sockets: create/bind/listen/connect/
+;;; accept/send/receive, both directions.
+
+(test wasi/sockets-tcp-loopback
+  (let* ((net (sock-network :dns '("localhost")))
+         (server (sock-rep (wasmdown.wasi:tcp-create
+                            nil net (cons :enum "ipv4"))))
+         (client (sock-rep (wasmdown.wasi:tcp-create
+                            nil net (cons :enum "ipv4"))))
+         (accepted nil))
+    (unwind-protect
+         (progn
+           (is (eq :unbound (wasmdown.wasi:wasi-tcp-socket-state server)))
+           (is (eq :unbound (wasmdown.wasi:wasi-tcp-socket-state client)))
+           ;; bind(127.0.0.1:0) -> an ephemeral loopback port
+           (is (equal '(:ok)
+                      (wasmdown.wasi:tcp-bind nil net server (sock-addr 0))))
+           (let* ((local (sock-ok (wasmdown.wasi:tcp-get-local-address
+                                   nil net server)))
+                  (port (sock-value-port local)))
+             (is (plusp port))
+             (is (equal "ipv4" (cdr (wasmdown.wasi:tcp-get-address-family
+                                     nil net server))))
+             (is (null (wasmdown.wasi:tcp-get-is-listening nil net server)))
+             ;; listen -> a stream of accepted sockets
+             (let ((listening (wasmdown.wasi:tcp-listen nil net server)))
+               (is (eq :ok (car listening)))
+               (is (wasmdown.wasi:tcp-get-is-listening nil net server))
+               ;; connect (the async resource method; the host resolves
+               ;; eagerly)
+               (is (equal '(:ok)
+                          (wasmdown.wasi:tcp-connect nil net client
+                                                     (sock-addr port))))
+               (is (equal port
+                          (sock-value-port
+                           (sock-ok (wasmdown.wasi:tcp-get-remote-address
+                                     nil net client)))))
+               (is (equal port
+                          (sock-value-port
+                           (sock-ok (wasmdown.wasi:tcp-get-local-address
+                                     nil net server)))))
+               (setf accepted (sock-accept (cdr listening)))
+               (is (not (null accepted)))
+               (is (eq :connected
+                       (wasmdown.wasi:wasi-tcp-socket-state accepted)))
+               ;; client -> server
+               (multiple-value-bind (reader writer) (sock-stream)
+                 (let ((future (wasmdown.wasi:tcp-send nil net client reader)))
+                   (is (eql (%completed 4)
+                            (sock-stage writer '(112 105 110 103))))
+                   (sock-drop writer)
+                   (is (equal '(:ok) (sock-future future)))))
+               (let* ((pair (wasmdown.wasi:tcp-receive nil net accepted))
+                      (stream (first pair))
+                      (future (second pair)))
+                 (is (equal '(112 105 110 103) (sock-drain stream 64 4)))
+                 (sock-drop stream)
+                 (is (equal '(:ok) (sock-future future))))
+               ;; server -> client
+               (multiple-value-bind (reader writer) (sock-stream)
+                 (let ((future (wasmdown.wasi:tcp-send nil net accepted reader)))
+                   (is (eql (%completed 4)
+                            (sock-stage writer '(112 111 110 103))))
+                   (sock-drop writer)
+                   (is (equal '(:ok) (sock-future future)))))
+               (let* ((pair (wasmdown.wasi:tcp-receive nil net client))
+                      (stream (first pair))
+                      (future (second pair)))
+                 (is (equal '(112 111 110 103) (sock-drain stream 64 4)))
+                 ;; receive is once-per-socket: the second call is the
+                 ;; REFUSED shape (a dropped stream + invalid-state)
+                 (let ((again (wasmdown.wasi:tcp-receive nil net client)))
+                   (is (equal nil (sock-drain (first again) 8 1)))
+                   (is (string= "invalid-state"
+                                (sock-future-code (sock-future
+                                                   (second again))))))
+                 (sock-drop stream)
+                 (is (equal '(:ok) (sock-future future)))))))
+      (when accepted (wasmdown.wasi:close-wasi-tcp-socket accepted))
+      (wasmdown.wasi:close-wasi-tcp-socket client)
+      (wasmdown.wasi:close-wasi-tcp-socket server))))
+
+;;; ---------------------------------------------------------------
+;;; The keep-alive / hop-limit / buffer knobs and their validation.
+
+(test wasi/sockets-tcp-knobs
+  (let* ((net (sock-network))
+         (sock (sock-rep (wasmdown.wasi:tcp-create nil net (cons :enum "ipv4")))))
+    (unwind-protect
+         (progn
+           (is (equal '(:ok) (wasmdown.wasi::tcp-set-keep-alive-enabled
+                              nil net sock t)))
+           (is (eq t (sock-ok (wasmdown.wasi::tcp-get-keep-alive-enabled
+                               nil net sock))))
+           ;; 5s idle / 2s interval / 3 probes
+           (is (equal '(:ok) (wasmdown.wasi::tcp-set-keep-alive-idle-time
+                              nil net sock 5000000000)))
+           (is (= 5000000000
+                  (sock-ok (wasmdown.wasi::tcp-get-keep-alive-idle-time
+                            nil net sock))))
+           (is (equal '(:ok) (wasmdown.wasi::tcp-set-keep-alive-interval
+                              nil net sock 2000000000)))
+           (is (= 2000000000
+                  (sock-ok (wasmdown.wasi::tcp-get-keep-alive-interval
+                            nil net sock))))
+           (is (equal '(:ok) (wasmdown.wasi::tcp-set-keep-alive-count
+                              nil net sock 3)))
+           (is (= 3 (sock-ok (wasmdown.wasi::tcp-get-keep-alive-count
+                              nil net sock))))
+           (is (equal '(:ok) (wasmdown.wasi::tcp-set-hop-limit
+                              nil net sock 7)))
+           (is (= 7 (sock-ok (wasmdown.wasi::tcp-get-hop-limit nil net sock))))
+           ;; the buffer size is a hint: set 128 KiB, read back > 0
+           (is (equal '(:ok) (wasmdown.wasi::tcp-set-receive-buffer-size
+                              nil net sock 131072)))
+           (is (plusp (sock-ok (wasmdown.wasi::tcp-get-receive-buffer-size
+                                nil net sock))))
+           (is (equal '(:ok) (wasmdown.wasi::tcp-set-send-buffer-size
+                              nil net sock 131072)))
+           (is (plusp (sock-ok (wasmdown.wasi::tcp-get-send-buffer-size
+                                nil net sock))))
+           ;; zero is the WIT's invalid-argument on every knob
+           (is (string= "invalid-argument"
+                        (sock-code (wasmdown.wasi::tcp-set-keep-alive-idle-time
+                                    nil net sock 0))))
+           (is (string= "invalid-argument"
+                        (sock-code (wasmdown.wasi::tcp-set-listen-backlog-size
+                                    nil net sock 0))))
+           (is (string= "invalid-argument"
+                        (sock-code (wasmdown.wasi::tcp-set-hop-limit
+                                    nil net sock 0))))
+           (is (string= "invalid-argument"
+                        (sock-code (wasmdown.wasi::tcp-set-send-buffer-size
+                                    nil net sock 0))))
+           ;; a valid backlog is accepted
+           (is (equal '(:ok) (wasmdown.wasi::tcp-set-listen-backlog-size
+                              nil net sock 32))))
+      (wasmdown.wasi:close-wasi-tcp-socket sock))))
+
+;;; ---------------------------------------------------------------
+;;; UDP over loopback.
+
+(test wasi/sockets-udp-loopback
+  (let* ((net (sock-network))
+         (a (sock-rep (wasmdown.wasi:udp-create nil net (cons :enum "ipv4"))))
+         (b (sock-rep (wasmdown.wasi:udp-create nil net (cons :enum "ipv4")))))
+    (unwind-protect
+         (progn
+           (is (equal '(:ok) (wasmdown.wasi:udp-bind nil net a (sock-addr 0))))
+           (is (equal '(:ok) (wasmdown.wasi:udp-bind nil net b (sock-addr 0))))
+           (let ((pa (sock-value-port
+                      (sock-ok (wasmdown.wasi:udp-get-local-address
+                                nil net a))))
+                 (pb (sock-value-port
+                      (sock-ok (wasmdown.wasi:udp-get-local-address
+                                nil net b)))))
+             (is (and (plusp pa) (plusp pb) (/= pa pb)))
+             ;; a datagram with an explicit peer address (sendto)
+             (is (equal '(:ok) (wasmdown.wasi:udp-send
+                                nil net a '(1 2 3) (cons :some (sock-addr pb)))))
+             (let ((got (wasmdown.wasi:udp-receive nil net b)))
+               (is (eq :ok (car got)))
+               (is (equal '(1 2 3) (first (cdr got))))
+               (is (equal pa (sock-value-port (second (cdr got))))))
+             ;; connect + send (the peer is implicit) + receive
+             (is (equal '(:ok) (wasmdown.wasi:udp-connect
+                                nil net b (sock-addr pa))))
+             (is (equal pa (sock-value-port
+                            (sock-ok (wasmdown.wasi:udp-get-remote-address
+                                      nil net b)))))
+             (is (equal '(:ok) (wasmdown.wasi:udp-send
+                                nil net b '(9 8) :none)))
+             (let ((got (wasmdown.wasi:udp-receive nil net a)))
+               (is (equal '(9 8) (first (cdr got))))
+               (is (equal pb (sock-value-port (second (cdr got))))))
+             ;; a connected socket rejects a different explicit peer
+             (is (string= "invalid-argument"
+                          (sock-code (wasmdown.wasi:udp-send
+                                      nil net b '(1) (cons :some (sock-addr pb))))))
+             ;; an unconnected socket needs a peer address
+             (is (string= "invalid-argument"
+                          (sock-code (wasmdown.wasi:udp-send
+                                      nil net a '(1) :none))))
+             (is (equal '(:ok) (wasmdown.wasi:udp-disconnect nil net b)))
+             (is (string= "invalid-state"
+                          (sock-code (wasmdown.wasi:udp-disconnect nil net b))))
+             (is (equal "ipv4"
+                        (cdr (wasmdown.wasi:udp-get-address-family nil net a))))
+             ;; unicast hop limit
+             (is (equal '(:ok) (wasmdown.wasi::udp-set-unicast-hop-limit
+                                nil net a 5)))
+             (is (= 5 (sock-ok (wasmdown.wasi::udp-get-unicast-hop-limit
+                                nil net a))))))
+      (wasmdown.wasi:close-wasi-udp-socket b)
+      (wasmdown.wasi:close-wasi-udp-socket a))))
+
+;;; ---------------------------------------------------------------
+;;; ip-name-lookup: literals are parsed as-is; names consult the DNS
+;;; policy and then getaddrinfo (localhost is /etc/hosts — hermetic).
+
+(test wasi/sockets-name-lookup
+  (let ((net (sock-network :dns '("localhost"))))
+    (let ((ok (wasmdown.wasi:ip-name-lookup-resolve nil net "localhost")))
+      (is (eq :ok (car ok)))
+      (is (find (cons "ipv4" '(127 0 0 1)) (cdr ok) :test #'equal)))
+    ;; an IPv4 literal needs no DNS policy at all
+    (let ((lit (wasmdown.wasi:ip-name-lookup-resolve
+                nil (wasmdown.wasi:make-wasi-network) "127.0.0.1")))
+      (is (equal '(:ok ("ipv4" 127 0 0 1)) lit)))
+    ;; an IPv6 literal goes through the numeric resolver
+    (let ((lit (wasmdown.wasi:ip-name-lookup-resolve
+                nil (wasmdown.wasi:make-wasi-network) "::1")))
+      (is (eq :ok (car lit)))
+      (is (equal "ipv6" (car (first (cdr lit))))))
+    ;; an undeclared name is denied by the policy
+    (is (string= "access-denied"
+                 (sock-code (wasmdown.wasi:ip-name-lookup-resolve
+                             nil (wasmdown.wasi:make-wasi-network)
+                             "localhost"))))
+    ;; an empty name is invalid-argument
+    (is (string= "invalid-argument"
+                 (sock-code (wasmdown.wasi:ip-name-lookup-resolve
+                             nil net ""))))))
+
+;;; ---------------------------------------------------------------
+;;; The policy refusals at the operation level: an undeclared
+;;; endpoint/listen address/DNS name is the WIT's access-denied.
+
+(test wasi/sockets-policy-refusals
+  (let* ((net (sock-network))
+         (tcp (sock-rep (wasmdown.wasi:tcp-create nil net (cons :enum "ipv4"))))
+         (udp (sock-rep (wasmdown.wasi:udp-create nil net (cons :enum "ipv4")))))
+    (unwind-protect
+         (progn
+           (is (string= "access-denied"
+                        (sock-code (wasmdown.wasi:tcp-bind
+                                    nil net tcp (sock-addr 0 '(10 1 2 3))))))
+           (is (string= "access-denied"
+                        (sock-code (wasmdown.wasi:tcp-connect
+                                    nil net tcp (sock-addr 80 '(10 1 2 3))))))
+           (is (string= "access-denied"
+                        (sock-code (wasmdown.wasi:udp-send
+                                    nil net udp '(1)
+                                    (cons :some (sock-addr 53 '(10 1 2 3)))))))
+           ;; the socket is still usable after a refused operation
+           (is (equal '(:ok) (wasmdown.wasi:udp-bind
+                              nil net udp (sock-addr 0))))
+           ;; a refused connect leaves the socket CLOSED (the WIT's
+           ;; post-failure state: the only valid action is drop)
+           (is (eq :closed (wasmdown.wasi:wasi-tcp-socket-state tcp)))
+           ;; no network authority => everything is refused
+           (let* ((ctx (wasmdown.wasi:make-wasi-context))
+                  (inst (wasmdown.wasi:sockets-types-instance ctx))
+                  (create (provider-fn inst "[static]tcp-socket.create")))
+             (declare (ignore create))
+             (let* ((bare (wasmdown.wasi::tcp-create
+                           nil nil (cons :enum "ipv4")))
+                    (sock (sock-rep bare)))
+               (unwind-protect
+                    (is (string= "access-denied"
+                                 (sock-code (wasmdown.wasi:tcp-connect
+                                             nil nil sock (sock-addr 80)))))
+                 (wasmdown.wasi:close-wasi-tcp-socket sock)))))
+      (wasmdown.wasi:close-wasi-udp-socket udp)
+      (wasmdown.wasi:close-wasi-tcp-socket tcp))))
+
+;;; ---------------------------------------------------------------
+;;; The errno -> sockets error-code mapping, observed through real
+;;; loopback failures.
+
+(test wasi/sockets-error-mappings
+  (let* ((net (sock-network))
+         (a (sock-rep (wasmdown.wasi:tcp-create nil net (cons :enum "ipv4"))))
+         (b (sock-rep (wasmdown.wasi:tcp-create nil net (cons :enum "ipv4"))))
+         (c (sock-rep (wasmdown.wasi:tcp-create nil net (cons :enum "ipv4")))))
+    (unwind-protect
+         (progn
+           (is (equal '(:ok) (wasmdown.wasi:tcp-bind nil net a (sock-addr 0))))
+           (let ((port (sock-value-port
+                        (sock-ok (wasmdown.wasi:tcp-get-local-address
+                                  nil net a)))))
+             ;; a bound-but-not-listening port refuses the connection
+             (is (string= "connection-refused"
+                          (sock-code (wasmdown.wasi:tcp-connect
+                                      nil net b (sock-addr port)))))
+             ;; the failed connect closed B (the WIT's rule)
+             (is (eq :closed (wasmdown.wasi:wasi-tcp-socket-state b)))
+             ;; a listening bind blocks a second bind (address-in-use)
+             (is (eq :ok (car (wasmdown.wasi:tcp-listen nil net a))))
+             (is (string= "address-in-use"
+                          (sock-code (wasmdown.wasi:tcp-bind
+                                      nil net c (sock-addr port)))))
+             ;; double bind / connect-after-listen = invalid-state
+             (is (string= "invalid-state"
+                          (sock-code (wasmdown.wasi:tcp-bind
+                                      nil net a (sock-addr 0)))))
+             (is (string= "invalid-state"
+                          (sock-code (wasmdown.wasi:tcp-connect
+                                      nil net a (sock-addr port)))))
+             (is (string= "invalid-state"
+                          (sock-code (wasmdown.wasi:tcp-listen nil net a)))))
+           ;; send on a non-connected socket is invalid-state, and the
+           ;; guest's stream end learns DROPPED
+           (multiple-value-bind (reader writer) (sock-stream)
+             (let ((future (wasmdown.wasi:tcp-send nil net c reader)))
+               (is (string= "invalid-state"
+                            (sock-future-code (sock-future future))))
+               (is (eql 1 (logand (sock-stage writer '(1)) #xf))))))
+      (wasmdown.wasi:close-wasi-tcp-socket c)
+      (wasmdown.wasi:close-wasi-tcp-socket b)
+      (wasmdown.wasi:close-wasi-tcp-socket a))))
+
+;;; ---------------------------------------------------------------
+;;; The provider surface: the resource cts + every method exported,
+;;; and the two import names.
+
+(test wasi/sockets-provider-surface
+  (let* ((net (sock-network))
+         (ctx (wasmdown.wasi:make-wasi-context :networks (list net)))
+         (inst (wasmdown.wasi:sockets-types-instance ctx))
+         (prov (wasmdown.wasi:sockets-provider ctx)))
+    (is (eq :type (car (gethash "tcp-socket"
+                                (wasmdown.component.runtime:comp-instance-exports
+                                 inst)))))
+    (is (eq :type (car (gethash "udp-socket"
+                                (wasmdown.component.runtime:comp-instance-exports
+                                 inst)))))
+    (dolist (name '("[static]tcp-socket.create" "[method]tcp-socket.bind"
+                    "[method]tcp-socket.connect" "[method]tcp-socket.listen"
+                    "[method]tcp-socket.send" "[method]tcp-socket.receive"
+                    "[method]tcp-socket.get-local-address"
+                    "[method]tcp-socket.get-remote-address"
+                    "[method]tcp-socket.get-is-listening"
+                    "[method]tcp-socket.get-address-family"
+                    "[method]tcp-socket.set-listen-backlog-size"
+                    "[method]tcp-socket.get-keep-alive-enabled"
+                    "[method]tcp-socket.get-receive-buffer-size"
+                    "[static]udp-socket.create" "[method]udp-socket.bind"
+                    "[method]udp-socket.connect" "[method]udp-socket.disconnect"
+                    "[method]udp-socket.send" "[method]udp-socket.receive"
+                    "[method]udp-socket.get-local-address"))
+      (is (wasmdown.wasi:provider-instance-function inst name)))
+    (is (= 2 (length prov)))
+    (is (assoc "wasi:sockets/types@0.3.2" prov :test #'string=))
+    (is (assoc "wasi:sockets/ip-name-lookup@0.3.2" prov :test #'string=))
+    ;; the provider-level create is callable through the lifted-func
+    ;; boundary (the static method's domain arg + resource result)
+    (let ((result (call-provider inst "[static]tcp-socket.create"
+                                 (cons :enum "ipv4"))))
+      (is (eq :ok (car result)))
+      (let ((sock (sock-rep result)))
+        (unwind-protect
+             (is (eq :unbound (wasmdown.wasi:wasi-tcp-socket-state sock)))
+          (wasmdown.wasi:close-wasi-tcp-socket sock))))))
+
+;;; ---------------------------------------------------------------
+;;; THE END-TO-END TCP ECHO: a component imports wasi:sockets/types,
+;;; creates a tcp-socket, connects to a host echo server on loopback,
+;;; sends "ping" through send(stream), reads "pong" through
+;;; receive(), and returns the first echoed byte.
+;;;
+;;; Two text-lane workarounds are visible here (both pre-existing
+;;; validator/parser limitations, not sockets behaviour):
+;;;   * the compound-param (connect) export is declared BEFORE the
+;;;     own-result export (create): the imported-instance
+;;;     declarator-space remap resolves the compound param only in
+;;;     that order;
+;;;   * a handful of scalar `(type $DN u32)' declarations keep the
+;;;     canon-opt memory check's raw declarator index in range.
+;;; The declared remote-address shape and the error payload are
+;;; narrowed (u32) for the same reason; the RUNTIME always lifts the
+;;; arguments/results with the provider's real WIT functype, so the
+;;; memory layout exercised is the real ip-socket-address one.
+
+(defun tcp-echo-fixture (port)
+  (format nil "(component ~
+ (type $SADDR (variant ~
+   (case \"ipv4\" (tuple u32 u32 u32)) ~
+   (case \"ipv6\" (tuple u32 u32 u32)))) ~
+ (import \"wasi:sockets/types@0.3.2\" ~
+  (instance $sock ~
+   (export \"tcp-socket\" (type $T (sub resource))) ~
+   (export \"[method]tcp-socket.connect\" ~
+     (func async (param \"self\" (borrow $T)) (param \"remote-address\" $SADDR) ~
+                 (result (result (error u32))))) ~
+   (export \"[static]tcp-socket.create\" ~
+     (func (param \"address-family\" u32) (result (result (own $T) u32)))) ~
+   (export \"[method]tcp-socket.send\" ~
+     (func (param \"self\" (borrow $T)) (param \"data\" (stream u8)) ~
+                 (result (future (result (error u32)))))) ~
+   (export \"[method]tcp-socket.receive\" ~
+     (func (param \"self\" (borrow $T)) ~
+                 (result (tuple (stream u8) (future (result (error u32))))))))) ~
+ (alias export $sock \"[static]tcp-socket.create\" (func $create)) ~
+ (alias export $sock \"[method]tcp-socket.connect\" (func $connect)) ~
+ (alias export $sock \"[method]tcp-socket.send\" (func $send)) ~
+ (alias export $sock \"[method]tcp-socket.receive\" (func $receive)) ~
+ (type $D1 u32) (type $D2 u32) (type $D3 u32) (type $D4 u32) ~
+ (type $D5 u32) (type $D6 u32) (type $D7 u32) (type $D8 u32) ~
+ (type $D9 u32) (type $D10 u32) (type $D11 u32) (type $D12 u32) ~
+ (core module $Mem (memory (export \"mem\") 1)) ~
+ (core instance $memory (instantiate $Mem)) ~
+ (core func $create-l (canon lower (func $create) (memory (core memory $memory \"mem\")))) ~
+ (core func $connect-l (canon lower (func $connect) async (memory (core memory $memory \"mem\")))) ~
+ (core func $send-l (canon lower (func $send) (memory (core memory $memory \"mem\")))) ~
+ (core func $receive-l (canon lower (func $receive) (memory (core memory $memory \"mem\")))) ~
+ (type $ST (stream u8)) ~
+ (type $FT (future (result (error u32)))) ~
+ (canon stream.new $ST (core func $snew)) ~
+ (canon stream.write $ST async (memory (core memory $memory \"mem\")) (core func $swrite)) ~
+ (canon stream.read $ST async (memory (core memory $memory \"mem\")) (core func $sread)) ~
+ (canon stream.drop-writable $ST (core func $sdropw)) ~
+ (canon subtask.drop (core func $subdrop)) ~
+ (canon waitable.join (core func $join)) ~
+ (canon waitable-set.new (core func $wsnew)) ~
+ (canon waitable-set.wait (memory (core memory $memory \"mem\")) (core func $wait)) ~
+ (core module $M ~
+  (import \"env\" \"mem\" (memory 1)) ~
+  (import \"env\" \"create\" (func $create (param i32 i32))) ~
+  (import \"env\" \"connect\" (func $connect (param i32 i32) (result i32))) ~
+  (import \"env\" \"send\" (func $send (param i32 i32) (result i32))) ~
+  (import \"env\" \"receive\" (func $receive (param i32 i32))) ~
+  (import \"env\" \"snew\" (func $snew (result i64))) ~
+  (import \"env\" \"swrite\" (func $swrite (param i32 i32 i32) (result i32))) ~
+  (import \"env\" \"sread\" (func $sread (param i32 i32 i32) (result i32))) ~
+  (import \"env\" \"sdropw\" (func $sdropw (param i32))) ~
+  (import \"env\" \"subdrop\" (func $subdrop (param i32))) ~
+  (import \"env\" \"join\" (func $join (param i32 i32))) ~
+  (import \"env\" \"wsnew\" (func $wsnew (result i32))) ~
+  (import \"env\" \"wait\" (func $wait (param i32 i32) (result i32))) ~
+  (func $poll-subtask (param $packed i32) (param $ws i32) ~
+    (local $sub i32) ~
+    (if (i32.ne (i32.and (local.get $packed) (i32.const 15)) (i32.const 2)) ~
+      (then ~
+        (local.set $sub (i32.shr_u (local.get $packed) (i32.const 4))) ~
+        (call $join (local.get $sub) (local.get $ws)) ~
+        (block $done ~
+          (loop $poll ~
+            (drop (call $wait (local.get $ws) (i32.const 224))) ~
+            (br_if $done (i32.eq (i32.load (i32.const 224)) (i32.const 1))) ~
+            (br_if $done (i32.ge_u (i32.load (i32.const 228)) (i32.const 2))) ~
+            (br $poll))) ~
+        (if (i32.ne (i32.const 1) (i32.load (i32.const 224))) (then unreachable)) ~
+        (call $subdrop (local.get $sub))))) ~
+  (func (export \"f\") (result i32) ~
+    (local $s i32) (local $ws i32) (local $packed i32) ~
+    (local $rx i32) (local $tx i32) (local $pair i64) (local $fut i32) ~
+    (local $rs i32) (local $rf i32) (local $r i32) ~
+    (call $create (i32.const 0) (i32.const 64)) ~
+    (if (i32.ne (i32.const 0) (i32.load8_u (i32.const 64))) (then unreachable)) ~
+    (local.set $s (i32.load (i32.const 68))) ~
+    (i32.store (i32.const 0) (local.get $s)) ~
+    (i32.store8 (i32.const 4) (i32.const 0)) ~
+    (i32.store16 (i32.const 8) (i32.const ~d)) ~
+    (i32.store8 (i32.const 10) (i32.const 127)) ~
+    (i32.store8 (i32.const 11) (i32.const 0)) ~
+    (i32.store8 (i32.const 12) (i32.const 0)) ~
+    (i32.store8 (i32.const 13) (i32.const 1)) ~
+    (local.set $ws (call $wsnew)) ~
+    (local.set $packed (call $connect (i32.const 0) (i32.const 16))) ~
+    (if (i32.ne (i32.const 2) (i32.and (local.get $packed) (i32.const 15))) (then unreachable)) ~
+    (call $poll-subtask (local.get $packed) (local.get $ws)) ~
+    (if (i32.ne (i32.const 0) (i32.load8_u (i32.const 16))) (then unreachable)) ~
+    (local.set $pair (call $snew)) ~
+    (local.set $rx (i32.wrap_i64 (local.get $pair))) ~
+    (local.set $tx (i32.wrap_i64 (i64.shr_u (local.get $pair) (i64.const 32)))) ~
+    (i32.store8 (i32.const 160) (i32.const 112)) ~
+    (i32.store8 (i32.const 161) (i32.const 105)) ~
+    (i32.store8 (i32.const 162) (i32.const 110)) ~
+    (i32.store8 (i32.const 163) (i32.const 103)) ~
+    (local.set $fut (call $send (local.get $s) (local.get $rx))) ~
+    (local.set $r (call $swrite (local.get $tx) (i32.const 160) (i32.const 4))) ~
+    (if (i32.ne (i32.const 64) (local.get $r)) (then unreachable)) ~
+    (call $sdropw (local.get $tx)) ~
+    (call $receive (local.get $s) (i32.const 128)) ~
+    (local.set $rs (i32.load (i32.const 128))) ~
+    (local.set $rf (i32.load (i32.const 132))) ~
+    (local.set $r (call $sread (local.get $rs) (i32.const 176) (i32.const 4))) ~
+    (if (i32.ne (i32.const 64) (local.get $r)) (then unreachable)) ~
+    (i32.load8_u (i32.const 176)))) ~
+ (core instance $m (instantiate $M (with \"env\" (instance ~
+   (export \"mem\" (memory $memory \"mem\")) ~
+   (export \"create\" (func $create-l)) ~
+   (export \"connect\" (func $connect-l)) ~
+   (export \"send\" (func $send-l)) ~
+   (export \"receive\" (func $receive-l)) ~
+   (export \"snew\" (func $snew)) ~
+   (export \"swrite\" (func $swrite)) ~
+   (export \"sread\" (func $sread)) ~
+   (export \"sdropw\" (func $sdropw)) ~
+   (export \"subdrop\" (func $subdrop)) ~
+   (export \"join\" (func $join)) ~
+   (export \"wsnew\" (func $wsnew)) ~
+   (export \"wait\" (func $wait)))))) ~
+ (func (export \"f\") (result u32) (canon lift (core func $m \"f\"))))"
+          port))
+
+(defun sock-host-listener ()
+  "A BLOCKING loopback TCP listener (the host side of the echo); the
+caller closes FD."
+  (let ((fd (wasmdown.wasi::%libc-socket
+             wasmdown.wasi::+af-inet+ wasmdown.wasi::+sock-stream+
+             wasmdown.wasi::+ipproto-tcp+)))
+    (multiple-value-bind (alien len)
+        (wasmdown.wasi::%make-sockaddr
+         "ipv4" (list (cons "port" 0) (cons "address" '(127 0 0 1))))
+      (unwind-protect
+           (progn
+             (when (minusp (wasmdown.wasi::%libc-bind
+                            fd (sb-alien:alien-sap alien) len))
+               (error "host listener bind failed"))
+             (wasmdown.wasi::%libc-listen fd 4))
+        (sb-alien:free-alien alien)))
+    (values (sock-value-port
+             (wasmdown.wasi::%getsockname-domain fd :local))
+            fd)))
+
+(defun sock-echo-thread (listen-fd got)
+  "Accept one connection, remember its bytes in GOT, echo `pong'."
+  (sb-thread:make-thread
+   (lambda ()
+     (let ((cfd (wasmdown.wasi::%libc-accept4
+                 listen-fd (sb-sys:int-sap 0) (sb-sys:int-sap 0) 0)))
+       (unwind-protect
+            (let ((buf (sb-alien:make-alien sb-alien:unsigned-char 8)))
+              (unwind-protect
+                   (let ((n (wasmdown.wasi::%libc-recv
+                             cfd (sb-alien:alien-sap buf) 8 0)))
+                     (setf (car got)
+                           (loop for i below n
+                                 collect (sb-sys:sap-ref-8
+                                          (sb-alien:alien-sap buf) i)))
+                     (let ((msg (make-array
+                                 4 :element-type '(unsigned-byte 8)
+                                   :initial-contents '(112 111 110 103))))
+                       (wasmdown.wasi::%libc-send
+                        cfd (sb-sys:vector-sap msg) 4 0)))
+                (sb-alien:free-alien buf)))
+         (wasmdown.wasi::%close-fd cfd))))
+   :name "sock-echo"))
+
+(test wasi/e2e-tcp-echo-component
+  (multiple-value-bind (port listen-fd) (sock-host-listener)
+    (let* ((got (list nil))
+           (thread (sock-echo-thread listen-fd got)))
+      (unwind-protect
+           (let* ((net (sock-network :dns '("localhost")))
+                  (context (wasmdown.wasi:make-wasi-context :networks (list net)))
+                  (comp (wasmdown.component.text::parse-component-text
+                         (tcp-echo-fixture port))))
+             (wasmdown.component:validate-component comp)
+             (let* ((inst (wasmdown.component.runtime:instantiate-component
+                           comp
+                           :with-args (wasmdown.wasi:sockets-provider context)))
+                    (f (wasmdown.component.runtime:runtime-export-value
+                        inst "f")))
+               ;; the guest read "pong" and returned its first byte
+               (is (eql 112 (wasmdown.component.runtime:lifted-func-call f))))
+             (sb-thread:join-thread thread)
+             ;; the host received exactly the guest's "ping"
+             (is (equal '(112 105 110 103) (car got))))
+        (ignore-errors (sb-thread:join-thread thread :timeout 2))
+        (wasmdown.wasi::%close-fd listen-fd)))))

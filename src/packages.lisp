@@ -388,4 +388,62 @@
    #:environment-get-initial-cwd
    #:cli-environment-instance
    #:cli-exit-instance
-   #:cli-provider))
+   #:cli-provider
+   ;; sockets (M16 slice 4): the network authority, the tcp/udp
+   ;; resources and ip-name-lookup
+   #:wasi-network
+   #:wasi-network-p
+   #:make-wasi-network
+   #:wasi-network-outbound
+   #:wasi-network-listen
+   #:wasi-network-dns
+   #:wasi-network-allows-outbound-p
+   #:wasi-network-allows-listen-p
+   #:wasi-network-allows-dns-p
+   #:wasi-endpoint
+   #:wasi-endpoint-p
+   #:make-wasi-endpoint
+   #:wasi-endpoint-address
+   #:wasi-endpoint-port
+   #:wasi-tcp-socket
+   #:wasi-tcp-socket-p
+   #:wasi-tcp-socket-fd
+   #:wasi-tcp-socket-state
+   #:wasi-tcp-socket-family
+   #:wasi-tcp-socket-network
+   #:wasi-udp-socket
+   #:wasi-udp-socket-p
+   #:wasi-udp-socket-fd
+   #:wasi-socket-error
+   #:wasi-socket-error-code
+   #:sockets-error-code
+   #:tcp-socket-resource-ct
+   #:udp-socket-resource-ct
+   #:close-wasi-tcp-socket
+   #:close-wasi-udp-socket
+   #:tcp-create
+   #:tcp-bind
+   #:tcp-connect
+   #:tcp-listen
+   #:tcp-send
+   #:tcp-receive
+   #:tcp-get-local-address
+   #:tcp-get-remote-address
+   #:tcp-get-is-listening
+   #:tcp-get-address-family
+   #:tcp-set-listen-backlog-size
+   #:udp-create
+   #:udp-bind
+   #:udp-connect
+   #:udp-disconnect
+   #:udp-send
+   #:udp-receive
+   #:udp-get-local-address
+   #:udp-get-remote-address
+   #:udp-get-address-family
+   #:ip-name-lookup-resolve
+   #:sockets-types-instance
+   #:ip-name-lookup-instance
+   #:sockets-provider
+   #:ip-socket-address->sockaddr
+   #:sockaddr->ip-socket-address))

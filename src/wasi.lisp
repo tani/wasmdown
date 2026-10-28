@@ -50,7 +50,11 @@ slice 3) — never a path-prefix string."
   (stdin nil)
   (stdout nil)
   (stderr nil)
-  (preopens nil))
+  (preopens nil)
+  ;; M16 slice 4: the network authorities (wasi-network objects). A
+  ;; socket provider is built from ONE of them; every bind/connect/
+  ;; resolve consults it. NIL = no network authority at all.
+  (networks nil))
 
 ;;; ---------------------------------------------------------------
 ;;; Host exit.
@@ -2025,3 +2029,1881 @@ preopens)."
    (cons (wasmdown.wit:interface-import-name
           (wasmdown.wit:package-interface package "preopens"))
          (filesystem-preopens-instance context :package package))))
+
+;;; ===============================================================
+;;; wasi:sockets (M16 slice 4) — THE NETWORK CAPABILITY + the
+;;; tcp-socket/udp-socket RESOURCES + ip-name-lookup.
+;;;
+;;; PLAN.md §9.1: "A host import must receive an explicitly allocated
+;;; authority object, not ambient Lisp globals." WASI-NETWORK is that
+;;; object: the declared OUTBOUND endpoints, the allowed LISTEN
+;;; addresses and the DNS policy. Every socket is created through one
+;;; network; bind/connect/send/resolve consult it and an undeclared
+;;; destination is refused with the WIT's `access-denied' error case.
+;;;
+;;; The pinned WIT (specs/wasi/wasi-wit-0.3.2/sockets/sockets.wit) has
+;;; no `network' resource/parameter: 0.3.2's resolve-addresses takes
+;;; only `name'. The authority therefore travels through provider
+;;; CONSTRUCTION (sockets-types-instance/sockets-provider take the
+;;; network), which is the only capability-parameter channel the
+;;; vendored interface offers.
+;;;
+;;; The OS surface is SB-ALIEN only (PLAN.md §9.2): the sockaddr
+;;; structs are spelled out for the Linux LP64 layout (x86_64 and
+;;; arm64 identical) and the offsets are verified empirically by the
+;;; tests, the same discipline slice 3b used for `struct dirent'.
+
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (let ((package (find-package '#:wasmdown.wasi)))
+    (dolist (name '("WASI-NETWORK" "WASI-NETWORK-P" "MAKE-WASI-NETWORK"
+                    "WASI-NETWORK-OUTBOUND" "WASI-NETWORK-LISTEN"
+                    "WASI-NETWORK-DNS"
+                    "WASI-ENDPOINT" "WASI-ENDPOINT-P" "MAKE-WASI-ENDPOINT"
+                    "WASI-ENDPOINT-ADDRESS" "WASI-ENDPOINT-PORT"
+                    "WASI-NETWORK-ALLOWS-OUTBOUND-P"
+                    "WASI-NETWORK-ALLOWS-LISTEN-P"
+                    "WASI-NETWORK-ALLOWS-DNS-P"
+                    "WASI-TCP-SOCKET" "WASI-TCP-SOCKET-P"
+                    "WASI-TCP-SOCKET-FD" "WASI-TCP-SOCKET-STATE"
+                    "WASI-TCP-SOCKET-FAMILY" "WASI-TCP-SOCKET-NETWORK"
+                    "WASI-UDP-SOCKET" "WASI-UDP-SOCKET-P"
+                    "WASI-UDP-SOCKET-FD" "WASI-SOCKET-ERROR"
+                    "WASI-SOCKET-ERROR-CODE" "SOCKETS-ERROR-CODE"
+                    "TCP-SOCKET-RESOURCE-CT" "UDP-SOCKET-RESOURCE-CT"
+                    "CLOSE-WASI-TCP-SOCKET" "CLOSE-WASI-UDP-SOCKET"
+                    "TCP-CREATE" "TCP-BIND" "TCP-CONNECT" "TCP-LISTEN"
+                    "TCP-SEND" "TCP-RECEIVE" "TCP-GET-LOCAL-ADDRESS"
+                    "TCP-GET-REMOTE-ADDRESS" "TCP-GET-IS-LISTENING"
+                    "TCP-GET-ADDRESS-FAMILY" "TCP-SET-LISTEN-BACKLOG-SIZE"
+                    "UDP-CREATE" "UDP-BIND" "UDP-CONNECT" "UDP-DISCONNECT"
+                    "UDP-SEND" "UDP-RECEIVE" "UDP-GET-LOCAL-ADDRESS"
+                    "UDP-GET-REMOTE-ADDRESS" "UDP-GET-ADDRESS-FAMILY"
+                    "IP-NAME-LOOKUP-RESOLVE"
+                    "SOCKETS-TYPES-INSTANCE" "IP-NAME-LOOKUP-INSTANCE"
+                    "SOCKETS-PROVIDER"
+                    "IP-SOCKET-ADDRESS->SOCKADDR"
+                    "SOCKADDR->IP-SOCKET-ADDRESS"))
+      (export (intern name package) package))))
+
+;;; ---------------------------------------------------------------
+;;; Linux socket constants (asm-generic: x86_64 and arm64 agree).
+
+(defparameter +af-unspec+ 0)
+(defparameter +af-inet+ 2)
+(defparameter +af-inet6+ 10)
+(defparameter +sock-stream+ 1)
+(defparameter +sock-dgram+ 2)
+(defparameter +sock-nonblock+ #o4000)     ; SOCK_NONBLOCK
+(defparameter +sock-cloexec+ #o2000000)   ; SOCK_CLOEXEC
+(defparameter +ipproto-tcp+ 6)
+(defparameter +ipproto-udp+ 17)
+(defparameter +ipproto-ipv6+ 41)
+(defparameter +ipproto-ip+ 0)           ; IPPROTO_IP: IP_TTL's level
+(defparameter +sol-socket+ 1)
+(defparameter +sol-tcp+ 6)
+(defparameter +so-reuseaddr+ 2)
+(defparameter +so-error+ 4)
+(defparameter +so-sndbuf+ 7)
+(defparameter +so-rcvbuf+ 8)
+(defparameter +so-keepalive+ 9)
+(defparameter +so-acceptconn+ 30)
+(defparameter +so-domain+ 39)
+(defparameter +tcp-keepidle+ 4)
+(defparameter +tcp-keepintvl+ 5)
+(defparameter +tcp-keepcnt+ 6)
+(defparameter +ip-ttl+ 2)
+(defparameter +ipv6-unicast-hops+ 16)
+(defparameter +ipv6-v6only+ 26)
+(defparameter +shut-rd+ 0)
+(defparameter +shut-wr+ 1)
+(defparameter +msg-nosignal+ #x4000)
+(defparameter +pollin+ 1)
+(defparameter +pollout+ 4)
+(defparameter +eintr+ 4)
+(defparameter +eagain+ 11)
+(defparameter +einprogress+ 115)
+
+;;; The sockaddr layouts (Linux LP64). Offsets are the C ABI's:
+;;;   sockaddr_in  : family u16 @0, port u16 @2, addr[4] @4, zero @8 (size 16)
+;;;   sockaddr_in6 : family u16 @0, port u16 @2, flowinfo u32 @4,
+;;;                  addr[16] @8, scope-id u32 @24 (size 28)
+;;; The tests verify alien-size and the written bytes at these offsets.
+
+(sb-alien:define-alien-type nil
+  (sb-alien:struct %sockaddr-in
+    (sin-family sb-alien:unsigned-short)
+    (sin-port sb-alien:unsigned-short)
+    (sin-addr (sb-alien:array sb-alien:unsigned-char 4))
+    (sin-zero (sb-alien:array sb-alien:unsigned-char 8))))
+
+(sb-alien:define-alien-type nil
+  (sb-alien:struct %sockaddr-in6
+    (sin6-family sb-alien:unsigned-short)
+    (sin6-port sb-alien:unsigned-short)
+    (sin6-flowinfo sb-alien:unsigned-int)
+    (sin6-addr (sb-alien:array sb-alien:unsigned-char 16))
+    (sin6-scope-id sb-alien:unsigned-int)))
+
+(defparameter +sockaddr-in-size+ 16)
+(defparameter +sockaddr-in6-size+ 28)
+(defparameter +sockaddr-storage-size+ 128)
+
+;;; The libc socket surface.
+
+(sb-alien:define-alien-routine ("socket" %libc-socket) sb-alien:int
+  (domain sb-alien:int) (type sb-alien:int) (protocol sb-alien:int))
+(sb-alien:define-alien-routine ("bind" %libc-bind) sb-alien:int
+  (fd sb-alien:int) (addr sb-sys:system-area-pointer)
+  (len sb-alien:unsigned-int))
+(sb-alien:define-alien-routine ("listen" %libc-listen) sb-alien:int
+  (fd sb-alien:int) (backlog sb-alien:int))
+(sb-alien:define-alien-routine ("accept4" %libc-accept4) sb-alien:int
+  (fd sb-alien:int) (addr sb-sys:system-area-pointer)
+  (addrlen sb-sys:system-area-pointer) (flags sb-alien:int))
+(sb-alien:define-alien-routine ("connect" %libc-connect) sb-alien:int
+  (fd sb-alien:int) (addr sb-sys:system-area-pointer)
+  (len sb-alien:unsigned-int))
+(sb-alien:define-alien-routine ("send" %libc-send) sb-alien:long
+  (fd sb-alien:int) (buf sb-sys:system-area-pointer)
+  (len sb-alien:size-t) (flags sb-alien:int))
+(sb-alien:define-alien-routine ("sendto" %libc-sendto) sb-alien:long
+  (fd sb-alien:int) (buf sb-sys:system-area-pointer)
+  (len sb-alien:size-t) (flags sb-alien:int)
+  (addr sb-sys:system-area-pointer) (addrlen sb-alien:unsigned-int))
+(sb-alien:define-alien-routine ("recv" %libc-recv) sb-alien:long
+  (fd sb-alien:int) (buf sb-sys:system-area-pointer)
+  (len sb-alien:size-t) (flags sb-alien:int))
+(sb-alien:define-alien-routine ("recvfrom" %libc-recvfrom) sb-alien:long
+  (fd sb-alien:int) (buf sb-sys:system-area-pointer)
+  (len sb-alien:size-t) (flags sb-alien:int)
+  (addr sb-sys:system-area-pointer) (addrlen sb-sys:system-area-pointer))
+(sb-alien:define-alien-routine ("shutdown" %libc-shutdown) sb-alien:int
+  (fd sb-alien:int) (how sb-alien:int))
+(sb-alien:define-alien-routine ("getsockname" %libc-getsockname) sb-alien:int
+  (fd sb-alien:int) (addr sb-sys:system-area-pointer)
+  (addrlen sb-sys:system-area-pointer))
+(sb-alien:define-alien-routine ("getpeername" %libc-getpeername) sb-alien:int
+  (fd sb-alien:int) (addr sb-sys:system-area-pointer)
+  (addrlen sb-sys:system-area-pointer))
+(sb-alien:define-alien-routine ("setsockopt" %libc-setsockopt) sb-alien:int
+  (fd sb-alien:int) (level sb-alien:int) (opt sb-alien:int)
+  (val sb-sys:system-area-pointer) (len sb-alien:unsigned-int))
+(sb-alien:define-alien-routine ("getsockopt" %libc-getsockopt) sb-alien:int
+  (fd sb-alien:int) (level sb-alien:int) (opt sb-alien:int)
+  (val sb-sys:system-area-pointer) (len sb-sys:system-area-pointer))
+(sb-alien:define-alien-routine ("poll" %libc-poll) sb-alien:int
+  (fds sb-sys:system-area-pointer) (nfds sb-alien:unsigned-long)
+  (timeout sb-alien:int))
+(sb-alien:define-alien-routine ("getaddrinfo" %libc-getaddrinfo) sb-alien:int
+  (node sb-alien:c-string) (service sb-alien:c-string)
+  (hints sb-sys:system-area-pointer) (res sb-sys:system-area-pointer))
+(sb-alien:define-alien-routine ("freeaddrinfo" %libc-freeaddrinfo)
+    sb-alien:void
+  (res sb-sys:system-area-pointer))
+
+;;; struct addrinfo (LP64): ai_flags@0, ai_family@4, ai_socktype@8,
+;;; ai_protocol@12, ai_addrlen@16 (u32), pad@20, ai_addr@24,
+;;; ai_canonname@32, ai_next@40; size 48. Verified by the tests
+;;; through a real getaddrinfo chain.
+(defparameter +addrinfo-size+ 48)
+(defparameter +ai-flags-offset+ 0)
+(defparameter +ai-family-offset+ 4)
+(defparameter +ai-addrlen-offset+ 16)
+(defparameter +ai-addr-offset+ 24)
+(defparameter +ai-next-offset+ 40)
+(defparameter +ai-numerichost+ 4)
+
+;;; ---------------------------------------------------------------
+;;; The error-code condition: code is the WIT VARIANT DOMAIN value
+;;; (cons "label" payload), the shape the canonical store accepts for
+;;; a real `error-code' (and that the CL tests read via
+;;; SOCKETS-ERROR-CODE).
+
+(define-condition wasi-socket-error (wasmdown:wasmdown-error)
+  ((code :initarg :code :reader wasi-socket-error-code))
+  (:report (lambda (c s)
+             (format s "wasi:sockets error: ~a"
+                     (wasi-socket-error-code c))))
+  (:documentation "The internal short-circuit of a socket operation;
+the provider wrapper turns it into the WIT's `(:err . code)'."))
+
+(defun sockets-error-code (value)
+  "The error-code CASE NAME denoted by VALUE (a cons variant domain
+value or a bare label string)."
+  (if (consp value) (car value) value))
+
+(defun %socket-error (code)
+  (error 'wasi-socket-error :code code))
+
+(defmacro %socket-result (&body body)
+  "Run BODY; its value is the ok payload: (:ok . value). A
+wasi-socket-error becomes (:err . code)."
+  `(handler-case (cons :ok (progn ,@body))
+     (wasi-socket-error (c) (cons :err (wasi-socket-error-code c)))))
+
+;;; The WIT variant cases: a domain value is (label . payload).
+(defun %socket-code (label) (cons label nil))
+
+;;; errno -> the sockets error-code variant (the WIT's own POSIX
+;;; equivalences, docs on each method).
+(defparameter *socket-errno->code*
+  '((1 . "access-denied")               ; EPERM
+    (13 . "access-denied")              ; EACCES
+    (95 . "not-supported")              ; EOPNOTSUPP
+    (92 . "not-supported")              ; ENOPROTOOPT
+    (96 . "not-supported")              ; EPFNOSUPPORT
+    (93 . "not-supported")              ; EPROTONOSUPPORT
+    (94 . "not-supported")              ; ESOCKTNOSUPPORT
+    (22 . "invalid-argument")           ; EINVAL
+    (89 . "invalid-argument")           ; EDESTADDRREQ
+    (97 . "invalid-argument")           ; EAFNOSUPPORT
+    (12 . "out-of-memory")              ; ENOMEM
+    (105 . "out-of-memory")             ; ENOBUFS
+    (110 . "timeout")                   ; ETIMEDOUT
+    (99 . "address-not-bindable")       ; EADDRNOTAVAIL
+    (98 . "address-in-use")             ; EADDRINUSE
+    (113 . "remote-unreachable")        ; EHOSTUNREACH
+    (112 . "remote-unreachable")        ; EHOSTDOWN
+    (100 . "remote-unreachable")        ; ENETDOWN
+    (101 . "remote-unreachable")        ; ENETUNREACH
+    (64 . "remote-unreachable")         ; ENONET
+    (111 . "connection-refused")        ; ECONNREFUSED
+    (32 . "connection-broken")          ; EPIPE
+    (104 . "connection-reset")          ; ECONNRESET
+    (103 . "connection-aborted")        ; ECONNABORTED
+    (90 . "datagram-too-large")         ; EMSGSIZE
+    (106 . "invalid-state")             ; EISCONN
+    (107 . "invalid-state")             ; ENOTCONN
+    (114 . "invalid-state")             ; EALREADY
+    (9 . "invalid-state"))              ; EBADF
+  "The Linux errno -> sockets error-code case labels (anything else
+is the variant's `other' case).")
+
+(defun %socket-errno-code (errno)
+  (cons (or (cdr (assoc errno *socket-errno->code*)) "other") nil))
+
+(defun %socket-check (ret what)
+  "Turn a libc -1 return into the mapped wasi-socket-error."
+  (declare (ignore what))
+  (when (minusp ret)
+    (%socket-error (%socket-errno-code (sb-alien:get-errno))))
+  ret)
+
+(defun %socket-eagain-p (errno)
+  (or (= errno +eagain+) (= errno 11)))
+
+;;; ---------------------------------------------------------------
+;;; The authority objects.
+
+(defstruct wasi-endpoint
+  "One declared endpoint: ADDRESS is :any, an IPv4 4-tuple or an
+IPv6 8-tuple; PORT is :any or an integer."
+  (address :any)
+  (port :any))
+
+(defstruct wasi-network
+  "A wasi:sockets network authority (PLAN.md §9.1): the declared
+OUTBOUND destinations, the allowed LISTEN addresses and the DNS
+policy. NIL in OUTBOUND/LISTEN means `nothing is declared' (deny);
+:any means `every address/port'. DNS is :none (deny), :all, or a
+list of names (case-insensitive, `*.suffix' wildcards allowed)."
+  (outbound nil)
+  (listen nil)
+  (dns :none))
+
+(defun %endpoint-slot (network slot)
+  (ecase slot
+    (:outbound (wasi-network-outbound network))
+    (:listen (wasi-network-listen network))))
+
+(defun %endpoint-address-matches-p (spec family host)
+  (cond
+    ((eq spec :any) t)
+    ((and (listp spec) (eql (length spec) (if (eq family :ipv6) 8 4)))
+     (equal spec host))
+    (t nil)))
+
+(defun %network-allows-p (network slot family host port)
+  "Does NETWORK permit FAMILY/HOST/PORT in SLOT (:outbound/:listen)?
+No network authority permits nothing."
+  (if (null network)
+      nil
+      (let ((eps (%endpoint-slot network slot)))
+        (cond
+          ((eq eps :any) t)
+          ((null eps) nil)
+          (t (some (lambda (ep)
+                     (and (%endpoint-address-matches-p
+                           (wasi-endpoint-address ep) family host)
+                          (or (eq (wasi-endpoint-port ep) :any)
+                              (eql (wasi-endpoint-port ep) port))))
+                   eps))))))
+
+(defun wasi-network-allows-outbound-p (network family host port)
+  (%network-allows-p network :outbound family host port))
+
+(defun wasi-network-allows-listen-p (network family host port)
+  (%network-allows-p network :listen family host port))
+
+(defun %dns-pattern-matches-p (pattern name)
+  (let ((pattern (string-downcase pattern))
+        (name (string-downcase name)))
+    (cond
+      ((string= pattern name) t)
+      ((and (> (length pattern) 2)
+            (string= "**" (subseq pattern 0 2)))
+       ;; "**.example.com" or "*.example.com": any suffix match
+       (let ((suffix (if (char= (char pattern 1) #\*)
+                         (subseq pattern 2)
+                         (subseq pattern 1))))
+         (and (>= (length name) (length suffix))
+              (string= suffix name :start2 (- (length name) (length suffix))))))
+      (t nil))))
+
+(defun wasi-network-allows-dns-p (network name)
+  (let ((dns (and network (wasi-network-dns network))))
+    (cond
+      ((eq dns :all) t)
+      ((null dns) nil)
+      ((eq dns :none) nil)
+      ((listp dns) (some (lambda (pat) (%dns-pattern-matches-p pat name))
+                         dns))
+      (t nil))))
+
+;;; ---------------------------------------------------------------
+;;; sockaddr <-> the WIT's ip-socket-address domain values.
+
+(defun %u16->be-bytes (port)
+  (values (ldb (byte 8 8) port) (ldb (byte 8 0) port)))
+
+(defun %sap-u16-be (sap off)
+  (logior (ash (sb-sys:sap-ref-8 sap off) 8)
+          (sb-sys:sap-ref-8 sap (1+ off))))
+
+(defun %family-key (family)
+  (case family (:ipv4 +af-inet+) (:ipv6 +af-inet6+)))
+
+(defun %make-sockaddr (case record)
+  "The (values ALIEN LENGTH FAMILY) a WIT ip-socket-address domain
+value denotes. CASE is \"ipv4\"/\"ipv6\", RECORD the alist."
+  (let ((port (or (cdr (assoc "port" record :test #'string=)) 0))
+        (addr (cdr (assoc "address" record :test #'string=))))
+    (cond
+      ((string= case "ipv4")
+       (unless (and (listp addr) (= 4 (length addr)))
+         (%socket-error (%socket-code "invalid-argument")))
+       (let ((alien (sb-alien:make-alien (sb-alien:struct %sockaddr-in)))
+             (sap nil))
+         (setf sap (sb-alien:alien-sap alien))
+         (setf (sb-sys:sap-ref-8 sap 0) +af-inet+
+               (sb-sys:sap-ref-8 sap 1) 0)
+         (multiple-value-bind (hi lo) (%u16->be-bytes port)
+           (setf (sb-sys:sap-ref-8 sap 2) hi
+                 (sb-sys:sap-ref-8 sap 3) lo))
+         (loop for i from 0 for b in addr
+               do (setf (sb-sys:sap-ref-8 sap (+ 4 i)) (logand b #xff)))
+         (values alien +sockaddr-in-size+ :ipv4)))
+      ((string= case "ipv6")
+       (unless (and (listp addr) (= 8 (length addr)))
+         (%socket-error (%socket-code "invalid-argument")))
+       (let ((alien (sb-alien:make-alien (sb-alien:struct %sockaddr-in6)))
+             (sap nil)
+             (flow (or (cdr (assoc "flow-info" record :test #'string=)) 0))
+             (scope (or (cdr (assoc "scope-id" record :test #'string=)) 0)))
+         (setf sap (sb-alien:alien-sap alien))
+         (setf (sb-sys:sap-ref-8 sap 0) +af-inet6+
+               (sb-sys:sap-ref-8 sap 1) 0)
+         (multiple-value-bind (hi lo) (%u16->be-bytes port)
+           (setf (sb-sys:sap-ref-8 sap 2) hi
+                 (sb-sys:sap-ref-8 sap 3) lo))
+         (setf (sb-sys:sap-ref-32 sap 4) flow)
+         (loop for g from 0 below 8
+               for v in addr
+               do (setf (sb-sys:sap-ref-8 sap (+ 8 (* 2 g)))
+                        (ldb (byte 8 8) v)
+                        (sb-sys:sap-ref-8 sap (+ 9 (* 2 g)))
+                        (ldb (byte 8 0) v)))
+         (setf (sb-sys:sap-ref-32 sap 24) scope)
+         (values alien +sockaddr-in6-size+ :ipv6)))
+      (t (%socket-error (%socket-code "invalid-argument"))))))
+
+(defun ip-socket-address->sockaddr (value)
+  "The (values ALIEN LENGTH FAMILY) of a WIT ip-socket-address domain
+value (`(\"ipv4\" . record)'). The caller frees ALIEN."
+  (unless (and (consp value) (stringp (car value)))
+    (%socket-error (%socket-code "invalid-argument")))
+  (%make-sockaddr (car value) (cdr value)))
+
+(defun %sockaddr-sap->key (sap)
+  "The (values FAMILY HOST PORT) a raw sockaddr SAP denotes."
+  (let ((fam (logior (sb-sys:sap-ref-8 sap 0)
+                     (ash (sb-sys:sap-ref-8 sap 1) 8))))
+    (cond
+      ((= fam +af-inet+)
+       (values :ipv4
+               (loop for i below 4 collect (sb-sys:sap-ref-8 sap (+ 4 i)))
+               (%sap-u16-be sap 2)))
+      ((= fam +af-inet6+)
+       (values :ipv6
+               (loop for g below 8
+                     collect (logior (ash (sb-sys:sap-ref-8 sap (+ 8 (* 2 g))) 8)
+                                     (sb-sys:sap-ref-8 sap (+ 9 (* 2 g)))))
+               (%sap-u16-be sap 2)))
+      (t (values nil nil nil)))))
+
+(defun sockaddr->ip-socket-address (sap)
+  "The WIT ip-socket-address DOMAIN value a raw sockaddr SAP denotes."
+  (multiple-value-bind (family host port) (%sockaddr-sap->key sap)
+    (case family
+      (:ipv4
+       (cons "ipv4" (list (cons "port" port)
+                          (cons "address" host))))
+      (:ipv6
+       (cons "ipv6" (list (cons "port" port)
+                          (cons "flow-info" (sb-sys:sap-ref-32 sap 4))
+                          (cons "address" host)
+                          (cons "scope-id" (sb-sys:sap-ref-32 sap 24)))))
+      (t (%socket-error (%socket-code "invalid-argument"))))))
+
+(defun %sockaddr-key-equal-p (alien len other-alien other-len)
+  (and (= len other-len)
+       (loop for i below len
+             always (= (sb-sys:sap-ref-8 (sb-alien:alien-sap alien) i)
+                       (sb-sys:sap-ref-8 (sb-alien:alien-sap other-alien) i)))))
+
+;;; ---------------------------------------------------------------
+;;; Small OS helpers.
+
+(defun %sock-null () (sb-sys:int-sap 0))
+
+(defun %getsockopt-int (fd level opt)
+  (let ((alien (sb-alien:make-alien sb-alien:int))
+        (len (sb-alien:make-alien sb-alien:unsigned-int)))
+    (unwind-protect
+         (progn
+           (setf (sb-alien:deref len) 4)
+           (%socket-check
+            (%libc-getsockopt fd level opt (sb-alien:alien-sap alien)
+                              (sb-alien:alien-sap len))
+            "getsockopt")
+           (sb-alien:deref alien))
+      (sb-alien:free-alien alien)
+      (sb-alien:free-alien len))))
+
+(defun %setsockopt-int (fd level opt value)
+  (let ((alien (sb-alien:make-alien sb-alien:int)))
+    (unwind-protect
+         (progn
+           (setf (sb-alien:deref alien) value)
+           (%socket-check
+            (%libc-setsockopt fd level opt (sb-alien:alien-sap alien) 4)
+            "setsockopt"))
+      (sb-alien:free-alien alien))))
+
+(defun %poll-fd (fd events timeout-ms)
+  "Wait for EVENTS (POLLIN/POLLOUT) on FD. The pollfd layout is
+int fd @0, short events @4, short revents @6 (8 bytes). Returns the
+revents, or NIL on timeout/error."
+  (let ((alien (sb-alien:make-alien
+                (sb-alien:array sb-alien:unsigned-char 8))))
+    (unwind-protect
+         (let ((sap (sb-alien:alien-sap alien)))
+           (setf (sb-sys:sap-ref-32 sap 0) fd
+                 (sb-sys:sap-ref-16 sap 4) events
+                 (sb-sys:sap-ref-16 sap 6) 0)
+           (let ((rc (%libc-poll sap 1 timeout-ms)))
+             (when (plusp rc)
+               (sb-sys:sap-ref-16 sap 6))))
+      (sb-alien:free-alien alien))))
+
+(defun %connect-fd (fd alien len)
+  "connect(2) with the nonblocking EINPROGRESS completion wait."
+  (sb-alien:set-errno 0)
+  (let ((ret (%libc-connect fd (sb-alien:alien-sap alien) len)))
+    (cond
+      ((zerop ret) t)
+      ((= (sb-alien:get-errno) +einprogress+)
+       (unless (%poll-fd fd +pollout+ 5000)
+         (%socket-error (%socket-code "timeout")))
+       (let ((err (%getsockopt-int fd +sol-socket+ +so-error+)))
+         (unless (zerop err)
+           (%socket-error (%socket-errno-code err)))))
+      (t (%socket-check ret "connect")))))
+
+(defun %getsockname-domain (fd what)
+  "getsockname/getpeername as a WIT ip-socket-address domain value."
+  (let ((alien (sb-alien:make-alien sb-alien:unsigned-char +sockaddr-storage-size+))
+        (len (sb-alien:make-alien sb-alien:unsigned-int)))
+    (unwind-protect
+         (progn
+           (setf (sb-alien:deref len) +sockaddr-storage-size+)
+           (%socket-check
+            (if (eq what :peer)
+                (%libc-getpeername fd (sb-alien:alien-sap alien)
+                                   (sb-alien:alien-sap len))
+                (%libc-getsockname fd (sb-alien:alien-sap alien)
+                                   (sb-alien:alien-sap len)))
+            "getsockname")
+           (sockaddr->ip-socket-address (sb-alien:alien-sap alien)))
+      (sb-alien:free-alien alien)
+      (sb-alien:free-alien len))))
+
+(defun %family-of-value (value)
+  "The :ipv4/:ipv6 a WIT ip-address-family domain value denotes."
+  (let ((name (cond ((and (consp value) (eq (car value) :enum)) (cdr value))
+                    ((keywordp value) (string-downcase (symbol-name value)))
+                    (t value))))
+    (cond ((string-equal name "ipv4") :ipv4)
+          ((string-equal name "ipv6") :ipv6)
+          (t (%socket-error (%socket-code "not-supported"))))))
+
+(defun %family-value (family)
+  (cons :enum (ecase family (:ipv4 "ipv4") (:ipv6 "ipv6"))))
+
+(defun %wildcard-host (family)
+  (ecase family (:ipv4 '(0 0 0 0)) (:ipv6 '(0 0 0 0 0 0 0 0))))
+
+;;; ---------------------------------------------------------------
+;;; The socket resources.
+
+(defstruct wasi-tcp-socket
+  "The `tcp-socket' resource rep: the OS fd + the capability state.
+REFS is the shared-ownership count the WIT mandates (the handle plus
+every derived send/receive/listen stream); the fd closes at zero."
+  (fd -1)
+  (network nil)
+  (family :ipv4)
+  (state :unbound)                    ; :unbound/:bound/:listening/:connected/:closed
+  (listen-p nil)
+  (sent-p nil)
+  (received-p nil)
+  (backlog 128)
+  (refs 1))
+
+(defstruct wasi-udp-socket
+  "The `udp-socket' resource rep."
+  (fd -1)
+  (network nil)
+  (family :ipv4)
+  (bound-p nil)
+  (connected-p nil)
+  (remote nil)                        ; the connected ip-socket-address domain
+  (refs 1))
+
+(defun %socket-ct (name &key (package (wasi-package "sockets")))
+  (wasmdown.wit:wit-type->ct
+   (wasmdown.wit:package-interface package "types")
+   (list :resource name)
+   :packages (%sockets-packages :package package)))
+
+(defun tcp-socket-resource-ct (&key (package (wasi-package "sockets")))
+  (%socket-ct "tcp-socket" :package package))
+
+(defun udp-socket-resource-ct (&key (package (wasi-package "sockets")))
+  (%socket-ct "udp-socket" :package package))
+
+(defparameter *socket-dtor-installed* (make-hash-table :test #'eq))
+
+(defun %install-socket-dtors (tcp-ct udp-ct)
+  "Register the host finalizers for the two socket resources: canon
+resource.drop calls them with the rep, releasing the OS fd."
+  (unless (gethash tcp-ct *socket-dtor-installed*)
+    (setf (gethash tcp-ct *socket-dtor-installed*) t)
+    (setf (gethash tcp-ct wasmdown.component.runtime:*host-resource-dtor-table*)
+          #'close-wasi-tcp-socket))
+  (unless (gethash udp-ct *socket-dtor-installed*)
+    (setf (gethash udp-ct *socket-dtor-installed*) t)
+    (setf (gethash udp-ct wasmdown.component.runtime:*host-resource-dtor-table*)
+          #'close-wasi-udp-socket))
+  t)
+
+(defun %release-tcp (sock &optional shutdown-how)
+  "Drop one reference; SHUTDOWN-HOW (when non-NIL) shuts the OS socket
+down first (a send stream's drop = SHUT_WR, a receive stream's =
+SHUT_RD)."
+  (when (wasi-tcp-socket-p sock)
+    (let ((fd (wasi-tcp-socket-fd sock)))
+      (when (and shutdown-how (>= fd 0))
+        (ignore-errors (%libc-shutdown fd shutdown-how)))
+      (close-wasi-tcp-socket sock))))
+
+(defun close-wasi-tcp-socket (sock)
+  "Decode one reference to SOCK's fd; close it when the last goes."
+  (when (wasi-tcp-socket-p sock)
+    (when (plusp (wasi-tcp-socket-refs sock))
+      (decf (wasi-tcp-socket-refs sock))
+      (when (zerop (wasi-tcp-socket-refs sock))
+        (let ((fd (wasi-tcp-socket-fd sock)))
+          (setf (wasi-tcp-socket-fd sock) -1
+                (wasi-tcp-socket-state sock) :closed)
+          (when (and (integerp fd) (not (minusp fd)))
+            (%close-fd fd)))))))
+
+(defun close-wasi-udp-socket (sock)
+  (when (wasi-udp-socket-p sock)
+    (when (plusp (wasi-udp-socket-refs sock))
+      (decf (wasi-udp-socket-refs sock))
+      (when (zerop (wasi-udp-socket-refs sock))
+        (let ((fd (wasi-udp-socket-fd sock)))
+          (setf (wasi-udp-socket-fd sock) -1)
+          (when (and (integerp fd) (not (minusp fd)))
+            (%close-fd fd)))))))
+
+(defun %tcp-of (network value ct)
+  "The wasi-tcp-socket VALUE denotes, resolved through the caller's
+handle table (a borrow) and checked against THIS provider's network
+authority."
+  (let ((sock (cond ((wasi-tcp-socket-p value) value)
+                    ((integerp value)
+                     (or (wasmdown.component.runtime:host-resource-rep ct value)
+                         (%socket-error (%socket-code "invalid-state"))))
+                    (t (%socket-error (%socket-code "invalid-argument"))))))
+    (unless (wasi-tcp-socket-p sock)
+      (%socket-error (%socket-code "invalid-state")))
+    (unless (eq (wasi-tcp-socket-network sock) network)
+      (%socket-error (%socket-code "access-denied")))
+    (when (eq (wasi-tcp-socket-state sock) :closed)
+      (%socket-error (%socket-code "invalid-state")))
+    sock))
+
+(defun %udp-of (network value ct)
+  (let ((sock (cond ((wasi-udp-socket-p value) value)
+                    ((integerp value)
+                     (or (wasmdown.component.runtime:host-resource-rep ct value)
+                         (%socket-error (%socket-code "invalid-state"))))
+                    (t (%socket-error (%socket-code "invalid-argument"))))))
+    (unless (wasi-udp-socket-p sock)
+      (%socket-error (%socket-code "invalid-state")))
+    (unless (eq (wasi-udp-socket-network sock) network)
+      (%socket-error (%socket-code "access-denied")))
+    sock))
+
+(defun %tcp-fd (sock)
+  (let ((fd (wasi-tcp-socket-fd sock)))
+    (unless (and (integerp fd) (not (minusp fd)))
+      (%socket-error (%socket-code "invalid-state")))
+    fd))
+
+(defun %udp-fd (sock)
+  (let ((fd (wasi-udp-socket-fd sock)))
+    (unless (and (integerp fd) (not (minusp fd)))
+      (%socket-error (%socket-code "invalid-state")))
+    fd))
+
+;;; ---------------------------------------------------------------
+;;; The WIT resource/functype helpers for the sockets interfaces.
+
+(defun %sockets-packages (&key (package (wasi-package "sockets")))
+  "The WIT packages sockets functypes resolve against (duration comes
+from wasi:clocks/types)."
+  (list package (wasi-package "clocks")))
+
+(defun %sockets-resource-method (resource method
+                                 &key (package (wasi-package "sockets")))
+  (let* ((interface (wasmdown.wit:package-interface package "types"))
+         (res (find resource
+                    (wasmdown.wit:wit-interface-resource-list interface)
+                    :key #'wasmdown.wit:wit-resource-name :test #'string=))
+         (fn (and res
+                  (find method
+                        (wasmdown.wit:wit-resource-methods res)
+                        :key #'wasmdown.wit:wit-func-name :test #'string=))))
+    (unless fn
+      (error 'wasmdown:host-error
+             :message (format nil "wasi:sockets/types has no ~a.~a"
+                              resource method)))
+    (values interface res fn)))
+
+(defun %sockets-method-ct (resource method
+                           &key (package (wasi-package "sockets")))
+  (multiple-value-bind (interface res fn)
+      (%sockets-resource-method resource method :package package)
+    (%resource-method-ct interface res fn (%sockets-packages :package package))))
+
+(defun %sockets-result-ct (resource method
+                           &key (package (wasi-package "sockets")))
+  (second (wasmdown.component:ct-payload
+           (%sockets-method-ct resource method :package package))))
+
+(defun %ct-find-kind (ct kind)
+  (cond
+    ((null ct) nil)
+    ((eq (wasmdown.component:ct-kind ct) kind) ct)
+    ((member (wasmdown.component:ct-kind ct) '(:tuple :record))
+     (some (lambda (part)
+             (%ct-find-kind (if (consp part) (cdr part) part) kind))
+           (coerce (wasmdown.component:ct-payload ct) 'list)))
+    ((eq (wasmdown.component:ct-kind ct) :result)
+     (let ((payload (wasmdown.component:ct-payload ct)))
+       (or (%ct-find-kind (car payload) kind)
+           (%ct-find-kind (cdr payload) kind))))
+    ((eq (wasmdown.component:ct-kind ct) :option)
+     (%ct-find-kind (wasmdown.component:ct-payload ct) kind))
+    ((eq (wasmdown.component:ct-kind ct) :variant)
+     (some (lambda (case)
+             (%ct-find-kind (cdr case) kind))
+           (coerce (wasmdown.component:ct-payload ct) 'list)))
+    ((eq (wasmdown.component:ct-kind ct) :list)
+     (%ct-find-kind (car (wasmdown.component:ct-payload ct)) kind))
+    (t nil)))
+
+(defun %sockets-future-ct (resource method
+                           &key (package (wasi-package "sockets")))
+  "The ELEMENT ct of the method's future<result<_, error-code>>."
+  (let ((fc (%ct-find-kind (%sockets-result-ct resource method
+                                                :package package)
+                           :future)))
+    (unless fc
+      (error 'wasmdown:host-error
+             :message (format nil "~a.~a has no future result"
+                              resource method)))
+    (wasmdown.component:ct-payload fc)))
+
+(defun %sockets-stream-ct (resource method
+                           &key (package (wasi-package "sockets")))
+  "The ELEMENT ct of the method's stream<T> result."
+  (let ((sc (%ct-find-kind (%sockets-result-ct resource method
+                                                :package package)
+                           :stream)))
+    (unless sc
+      (error 'wasmdown:host-error
+             :message (format nil "~a.~a has no stream result"
+                              resource method)))
+    (wasmdown.component:ct-payload sc)))
+
+(defun %socket-error-future (future-ct code)
+  "The REFUSED shape of a future-returning method: a future already
+resolved to (:err . CODE)."
+  (multiple-value-bind (reader writer)
+      (wasmdown.component.runtime:make-host-future-pair future-ct)
+    (wasmdown.component.runtime:host-future-resolve writer (cons :err code))
+    reader))
+
+(defun %dropped-stream-and-future (elem-ct future-ct code)
+  "The REFUSED shape of a receive(): a dropped stream end + a future
+resolved to (:err . CODE)."
+  (multiple-value-bind (reader writer)
+      (wasmdown.component.runtime:make-host-stream-pair elem-ct)
+    (wasmdown.component.runtime:host-end-drop writer)
+    (list reader (%socket-error-future future-ct code))))
+
+;;; ---------------------------------------------------------------
+;;; TCP.
+
+(defun tcp-create (context network family-value
+                   &key (package (wasi-package "sockets")))
+  "socket(AF_INET|AF_INET6, SOCK_STREAM|NONBLOCK|CLOEXEC, IPPROTO_TCP).
+IPV6_V6ONLY is on (the WIT's default) and SO_REUSEADDR is set so a
+TIME_WAIT binding does not block the guest."
+  (declare (ignore context))
+  (%socket-result
+   (let* ((family (%family-of-value family-value))
+          (fd (%libc-socket
+               (%family-key family)
+               (logior +sock-stream+ +sock-nonblock+ +sock-cloexec+)
+               +ipproto-tcp+)))
+     (%socket-check fd "socket")
+     (%setsockopt-int fd +sol-socket+ +so-reuseaddr+ 1)
+     (when (eq family :ipv6)
+       (%setsockopt-int fd +ipproto-ipv6+ +ipv6-v6only+ 1))
+     (list :own-handle
+           (tcp-socket-resource-ct :package package)
+           (make-wasi-tcp-socket :fd fd :network network :family family)))))
+
+(defun %implicit-bind-tcp (sock network)
+  "Bind SOCK to the family's wildcard address on an ephemeral port
+(the WIT's implicit bind), consulting the listen policy first."
+  (multiple-value-bind (alien len family)
+      (%make-sockaddr (ecase (wasi-tcp-socket-family sock)
+                        (:ipv4 "ipv4") (:ipv6 "ipv6"))
+                      (list (cons "port" 0)
+                            (cons "address" (%wildcard-host
+                                             (wasi-tcp-socket-family sock)))))
+    (unwind-protect
+         (multiple-value-bind (fam host port) (%sockaddr-sap->key
+                                               (sb-alien:alien-sap alien))
+           (declare (ignore fam))
+           (unless (wasi-network-allows-listen-p network family host port)
+             (%socket-error (%socket-code "access-denied")))
+           (%socket-check (%libc-bind (%tcp-fd sock)
+                                      (sb-alien:alien-sap alien) len)
+                          "bind")
+           (setf (wasi-tcp-socket-state sock) :bound))
+      (sb-alien:free-alien alien))))
+
+(defun tcp-bind (context network self value
+                 &key (package (wasi-package "sockets")))
+  (declare (ignore context))
+  (%socket-result
+   (let ((sock (%tcp-of network self (tcp-socket-resource-ct
+                                      :package package))))
+     (unless (eq (wasi-tcp-socket-state sock) :unbound)
+       (%socket-error (%socket-code "invalid-state")))
+     (multiple-value-bind (alien len family)
+         (ip-socket-address->sockaddr value)
+       (unwind-protect
+            (progn
+              (unless (eq family (wasi-tcp-socket-family sock))
+                (%socket-error (%socket-code "invalid-argument")))
+              (multiple-value-bind (fam host port)
+                  (%sockaddr-sap->key (sb-alien:alien-sap alien))
+                (declare (ignore fam))
+                (unless (wasi-network-allows-listen-p network family host port)
+                  (%socket-error (%socket-code "access-denied")))
+                (%socket-check (%libc-bind (%tcp-fd sock)
+                                           (sb-alien:alien-sap alien) len)
+                               "bind")
+                (setf (wasi-tcp-socket-state sock) :bound)
+                nil))
+         (sb-alien:free-alien alien))))))
+
+(defun tcp-connect (context network self value
+                    &key (package (wasi-package "sockets")))
+  (declare (ignore context))
+  (let ((sock nil))
+    (handler-case
+        (progn
+          (setf sock (%tcp-of network self (tcp-socket-resource-ct
+                                            :package package)))
+          (when (member (wasi-tcp-socket-state sock)
+                        '(:connecting :connected :listening))
+            (%socket-error (%socket-code "invalid-state")))
+          (multiple-value-bind (alien len family)
+              (ip-socket-address->sockaddr value)
+            (unwind-protect
+                 (progn
+                   (unless (eq family (wasi-tcp-socket-family sock))
+                     (%socket-error (%socket-code "invalid-argument")))
+                   (multiple-value-bind (fam host port)
+                       (%sockaddr-sap->key (sb-alien:alien-sap alien))
+                     (declare (ignore fam))
+                     (unless (wasi-network-allows-outbound-p
+                              network family host port)
+                       (%socket-error (%socket-code "access-denied")))
+                     (%connect-fd (%tcp-fd sock) alien len)
+                     (setf (wasi-tcp-socket-state sock) :connected)))
+              (sb-alien:free-alien alien)))
+          (cons :ok nil))
+      (wasi-socket-error (c)
+        ;; the WIT: after a failed connect the socket is CLOSED and
+        ;; the only valid action is drop (a capability refusal also
+        ;; leaves no usable socket).
+        (when sock
+          (setf (wasi-tcp-socket-state sock) :closed)
+          (let ((fd (wasi-tcp-socket-fd sock)))
+            (setf (wasi-tcp-socket-fd sock) -1)
+            (when (and (integerp fd) (not (minusp fd))) (%close-fd fd))))
+        (cons :err (wasi-socket-error-code c))))))
+
+(defun tcp-listen (context network self
+                   &key (package (wasi-package "sockets")))
+  (declare (ignore context))
+  (let ((elem-ct (%sockets-stream-ct "tcp-socket" "listen" :package package)))
+    (handler-case
+        (let ((sock (%tcp-of network self (tcp-socket-resource-ct
+                                           :package package))))
+          (when (member (wasi-tcp-socket-state sock)
+                        '(:listening :connecting :connected))
+            (%socket-error (%socket-code "invalid-state")))
+          (when (eq (wasi-tcp-socket-state sock) :unbound)
+            (%implicit-bind-tcp sock network))
+          (%socket-check (%libc-listen (%tcp-fd sock)
+                                       (wasi-tcp-socket-backlog sock))
+                         "listen")
+          (setf (wasi-tcp-socket-state sock) :listening
+                (wasi-tcp-socket-listen-p sock) t)
+          (incf (wasi-tcp-socket-refs sock))
+          (multiple-value-bind (reader writer)
+              (wasmdown.component.runtime:make-host-stream-pair elem-ct)
+            (wasmdown.component.runtime:host-end-set-source
+             writer (%tcp-accept-source sock))
+            (wasmdown.component.runtime:host-end-set-on-drop
+             writer (lambda (dropped error)
+                      (declare (ignore dropped error))
+                      (%release-tcp sock)))
+            (cons :ok reader)))
+      (wasi-socket-error (c)
+        (cons :err (wasi-socket-error-code c))))))
+
+(defun %tcp-accept-source (sock)
+  "A host SOURCE yielding new tcp-socket OWN HANDLES: (max) ->
+(values element-list eof-p). EAGAIN returns what was accepted and
+parks (eof NIL); a fatal error ends the stream."
+  (let ((ct (tcp-socket-resource-ct))
+        (family (wasi-tcp-socket-family sock)))
+    (lambda (max)
+      (if (<= max 0)
+          (values nil nil)
+          (let ((out '())
+                (eof nil))
+            (loop while (and (< (length out) max) (not eof))
+                  do (sb-alien:set-errno 0)
+                     (let ((fd (%libc-accept4 (wasi-tcp-socket-fd sock)
+                                              (%sock-null) (%sock-null)
+                                              (logior +sock-nonblock+
+                                                      +sock-cloexec+))))
+                       (cond
+                         ((>= fd 0)
+                          (push (list :own-handle ct
+                                      (make-wasi-tcp-socket
+                                       :fd fd
+                                       :network (wasi-tcp-socket-network sock)
+                                       :family family
+                                       :state :connected))
+                                out))
+                         (t
+                          (let ((errno (sb-alien:get-errno)))
+                            (cond ((or (= errno +eagain+) (= errno +eintr+))
+                                   ;; park: the guest may retry the read
+                                   nil)
+                                  (t (setf eof t))))))))
+            (values (nreverse out) eof))))))
+
+(defun %fd-send-all (fd bytes)
+  "Send BYTES to the stream socket FD; returns an error-code DOMAIN
+value or NIL. EAGAIN waits (bounded) for POLLOUT; MSG_NOSIGNAL keeps
+a peer reset from killing the host."
+  (let ((n (length bytes)))
+    (if (zerop n)
+        nil
+        (let ((buf (%byte-list->alien bytes)))
+          (unwind-protect
+               (block write
+                 (let ((done 0))
+                   (loop while (< done n)
+                         do (let* ((ptr (sb-sys:sap+ (sb-alien:alien-sap buf)
+                                                     done))
+                                   (ret (%libc-send fd ptr (- n done)
+                                                    +msg-nosignal+)))
+                              (cond
+                                ((plusp ret) (incf done ret))
+                                ((zerop ret)
+                                 (return-from write (%socket-code "connection-broken")))
+                                (t
+                                 (let ((errno (sb-alien:get-errno)))
+                                   (cond
+                                     ((= errno +eintr+) nil)
+                                     ((= errno +eagain+)
+                                      (unless (%poll-fd fd +pollout+ 5000)
+                                        (return-from write
+                                          (%socket-code "timeout"))))
+                                     (t
+                                      (return-from write
+                                        (%socket-errno-code errno)))))))))
+                   nil))
+            (sb-alien:free-alien buf))))))
+
+(defun tcp-send (context network self data
+                 &key (package (wasi-package "sockets")))
+  (declare (ignore context))
+  (let ((future-ct (%sockets-future-ct "tcp-socket" "send"
+                                        :package package)))
+    (handler-case
+        (let* ((sock (%tcp-of network self (tcp-socket-resource-ct
+                                            :package package)))
+               (fd (%tcp-fd sock)))
+          (unless (eq (wasi-tcp-socket-state sock) :connected)
+            (%socket-error (%socket-code "invalid-state")))
+          (when (wasi-tcp-socket-sent-p sock)
+            (%socket-error (%socket-code "invalid-state")))
+          (unless (wasmdown.component.runtime:async-end-p data)
+            (%socket-error (%socket-code "invalid-argument")))
+          (setf (wasi-tcp-socket-sent-p sock) t)
+          (multiple-value-bind (reader writer)
+              (wasmdown.component.runtime:make-host-future-pair future-ct)
+            (let ((settled nil)
+                  (released nil))
+              (flet ((settle (v)
+                       (unless settled
+                         (setf settled t)
+                         (wasmdown.component.runtime:host-future-resolve
+                          writer v)))
+                     (release (&optional shutdown-how)
+                       (unless released
+                         (setf released t)
+                         (%release-tcp sock shutdown-how))))
+                (incf (wasi-tcp-socket-refs sock))
+                (wasmdown.component.runtime:host-end-set-sink
+                 data (lambda (bytes) (%fd-send-all fd bytes)))
+                (wasmdown.component.runtime:host-end-set-on-drop
+                 data
+                 (lambda (dropped error)
+                   (declare (ignore dropped))
+                   (if error
+                       (progn (settle (cons :err error))
+                              (release nil))
+                       (progn (settle (cons :ok nil))
+                              (release +shut-wr+)))))
+                (wasmdown.component.runtime:host-end-drain data)
+                reader))))
+      (wasi-socket-error (c)
+        (when (wasmdown.component.runtime:async-end-p data)
+          (wasmdown.component.runtime:host-end-drop data))
+        (%socket-error-future future-ct (wasi-socket-error-code c))))))
+
+(defun %tcp-recv-source (fd settle)
+  "A host SOURCE over recv(2): (max) -> (values byte-list eof-p).
+A would-block result gets one bounded poll(2) readiness wait (there
+is no socket reactor to wake the guest later); when nothing arrives
+the source parses as no-progress and the guest's read parks. A
+zero-length recv is a graceful FIN and SETTLES the future (:ok); a
+recv error SETTLES it (:err . code) and reports EOF."
+  (lambda (max)
+    (if (<= max 0)
+        (values nil nil)
+        (let ((want (min max 65536)))
+          (loop
+            (let ((buf (sb-alien:make-alien sb-alien:unsigned-char want)))
+              (unwind-protect
+                   (let ((n (%libc-recv fd (sb-alien:alien-sap buf) want 0)))
+                     (cond
+                       ((plusp n)
+                        (return
+                          (values (loop for i below n
+                                        collect (sb-sys:sap-ref-8
+                                                 (sb-alien:alien-sap buf) i))
+                                  nil)))
+                       ((zerop n)
+                        (funcall settle (cons :ok nil))
+                        (return (values nil t)))
+                       (t
+                        (let ((errno (sb-alien:get-errno)))
+                          (cond
+                            ((or (= errno +eagain+) (= errno +eintr+))
+                             (unless (%poll-fd fd +pollin+ 2000)
+                               (return (values nil nil))))
+                            (t
+                             (funcall settle
+                                      (cons :err (%socket-errno-code errno)))
+                             (return (values nil t))))))))
+                (sb-alien:free-alien buf))))))))
+
+(defun tcp-receive (context network self
+                    &key (package (wasi-package "sockets")))
+  (declare (ignore context))
+  (let* ((ft (%sockets-method-ct "tcp-socket" "receive" :package package))
+         (result (second (wasmdown.component:ct-payload ft)))
+         (elem-ct (wasmdown.component:ct-payload
+                   (%ct-find-kind result :stream)))
+         (future-ct (wasmdown.component:ct-payload
+                     (%ct-find-kind result :future))))
+    (handler-case
+        (let* ((sock (%tcp-of network self (tcp-socket-resource-ct
+                                            :package package)))
+               (fd (%tcp-fd sock)))
+          (unless (eq (wasi-tcp-socket-state sock) :connected)
+            (%socket-error (%socket-code "invalid-state")))
+          (when (wasi-tcp-socket-received-p sock)
+            (%socket-error (%socket-code "invalid-state")))
+          (setf (wasi-tcp-socket-received-p sock) t)
+          (multiple-value-bind (stream-reader stream-writer)
+              (wasmdown.component.runtime:make-host-stream-pair elem-ct)
+            (multiple-value-bind (future-reader future-writer)
+                (wasmdown.component.runtime:make-host-future-pair future-ct)
+              (let ((settled nil)
+                    (released nil))
+                (flet ((settle (v)
+                         (unless settled
+                           (setf settled t)
+                           (wasmdown.component.runtime:host-future-resolve
+                            future-writer v)))
+                       (release (&optional shutdown-how)
+                         (unless released
+                           (setf released t)
+                           (%release-tcp sock shutdown-how))))
+                  (incf (wasi-tcp-socket-refs sock))
+                  (wasmdown.component.runtime:host-end-set-source
+                   stream-writer (%tcp-recv-source fd #'settle))
+                  (wasmdown.component.runtime:host-end-set-on-drop
+                   stream-writer
+                   (lambda (dropped error)
+                     (declare (ignore dropped))
+                     (settle (if error (cons :err error) (cons :ok nil)))
+                     (release +shut-rd+)))
+                  (list stream-reader future-reader))))))
+      (wasi-socket-error (c)
+        (%dropped-stream-and-future elem-ct future-ct
+                                    (wasi-socket-error-code c))))))
+
+(defun tcp-get-local-address (context network self
+                             &key (package (wasi-package "sockets")))
+  (declare (ignore context))
+  (%socket-result
+   (let ((sock (%tcp-of network self (tcp-socket-resource-ct
+                                      :package package))))
+     (when (eq (wasi-tcp-socket-state sock) :unbound)
+       (%socket-error (%socket-code "invalid-state")))
+     (%getsockname-domain (%tcp-fd sock) :local))))
+
+(defun tcp-get-remote-address (context network self
+                              &key (package (wasi-package "sockets")))
+  (declare (ignore context))
+  (%socket-result
+   (let ((sock (%tcp-of network self (tcp-socket-resource-ct
+                                      :package package))))
+     (unless (eq (wasi-tcp-socket-state sock) :connected)
+       (%socket-error (%socket-code "invalid-state")))
+     (%getsockname-domain (%tcp-fd sock) :peer))))
+
+(defun tcp-get-is-listening (context network self
+                             &key (package (wasi-package "sockets")))
+  (declare (ignore context))
+  (eq (wasi-tcp-socket-state
+       (%tcp-of network self (tcp-socket-resource-ct :package package)))
+      :listening))
+
+(defun tcp-get-address-family (context network self
+                               &key (package (wasi-package "sockets")))
+  (declare (ignore context))
+  (%family-value
+   (wasi-tcp-socket-family
+    (%tcp-of network self (tcp-socket-resource-ct :package package)))))
+
+(defun tcp-set-listen-backlog-size (context network self value
+                                    &key (package (wasi-package "sockets")))
+  (declare (ignore context))
+  (%socket-result
+   (let ((sock (%tcp-of network self (tcp-socket-resource-ct
+                                      :package package))))
+     (when (zerop value)
+       (%socket-error (%socket-code "invalid-argument")))
+     (when (member (wasi-tcp-socket-state sock) '(:connecting :connected))
+       (%socket-error (%socket-code "invalid-state")))
+     (setf (wasi-tcp-socket-backlog sock) (min value #x7fffffff))
+     (when (eq (wasi-tcp-socket-state sock) :listening)
+       (%socket-check (%libc-listen (%tcp-fd sock)
+                                    (wasi-tcp-socket-backlog sock))
+                      "listen"))
+     nil)))
+
+;;; The keep-alive / hop-limit / buffer knobs. Duration values are
+;;; nanoseconds (wasi:clocks/types.duration); the kernel takes ms.
+
+(defun %ns->ms (ns)
+  "A positive duration in ms (the WIT rejects 0; a sub-ms value
+rounds up rather than becoming 0)."
+  (max 1 (floor ns 1000000)))
+
+(defun tcp-get-keep-alive-enabled (context network self
+                                   &key (package (wasi-package "sockets")))
+  (declare (ignore context))
+  (%socket-result
+   (not (zerop (%getsockopt-int (%tcp-fd
+                                 (%tcp-of network self
+                                          (tcp-socket-resource-ct
+                                           :package package)))
+                                +sol-socket+ +so-keepalive+)))))
+
+(defun tcp-set-keep-alive-enabled (context network self value
+                                   &key (package (wasi-package "sockets")))
+  (declare (ignore context))
+  (%socket-result
+   (%setsockopt-int (%tcp-fd (%tcp-of network self
+                                      (tcp-socket-resource-ct
+                                       :package package)))
+                    +sol-socket+ +so-keepalive+ (if value 1 0))
+   nil))
+
+(defun %tcp-knob-get (network self ct getter)
+  (%socket-result (%getsockopt-int (%tcp-fd (%tcp-of network self ct))
+                                   +sol-tcp+ getter)))
+
+(defun %tcp-knob-set (network self ct level opt value check)
+  (%socket-result
+   (when (and check (zerop value))
+     (%socket-error (%socket-code "invalid-argument")))
+   (%setsockopt-int (%tcp-fd (%tcp-of network self ct)) level opt value)
+   nil))
+
+(defun tcp-get-keep-alive-idle-time (context network self
+                                     &key (package (wasi-package "sockets")))
+  (declare (ignore context))
+  (%socket-result
+   (* 1000000 (%getsockopt-int (%tcp-fd (%tcp-of
+                                         network self
+                                         (tcp-socket-resource-ct
+                                          :package package)))
+                                +sol-tcp+ +tcp-keepidle+))))
+
+(defun tcp-set-keep-alive-idle-time (context network self value
+                                     &key (package (wasi-package "sockets")))
+  (declare (ignore context))
+  ;; the WIT rejects a ZERO duration before it reaches the kernel
+  (%socket-result
+   (when (zerop value)
+     (%socket-error (%socket-code "invalid-argument")))
+   (%tcp-knob-set network self (tcp-socket-resource-ct :package package)
+                  +sol-tcp+ +tcp-keepidle+ (%ns->ms value) nil)
+   nil))
+
+(defun tcp-get-keep-alive-interval (context network self
+                                    &key (package (wasi-package "sockets")))
+  (declare (ignore context))
+  (%socket-result
+   (* 1000000 (%getsockopt-int (%tcp-fd (%tcp-of
+                                         network self
+                                         (tcp-socket-resource-ct
+                                          :package package)))
+                                +sol-tcp+ +tcp-keepintvl+))))
+
+(defun tcp-set-keep-alive-interval (context network self value
+                                    &key (package (wasi-package "sockets")))
+  (declare (ignore context))
+  (%socket-result
+   (when (zerop value)
+     (%socket-error (%socket-code "invalid-argument")))
+   (%tcp-knob-set network self (tcp-socket-resource-ct :package package)
+                  +sol-tcp+ +tcp-keepintvl+ (%ns->ms value) nil)
+   nil))
+
+(defun tcp-get-keep-alive-count (context network self
+                                 &key (package (wasi-package "sockets")))
+  (declare (ignore context))
+  (%socket-result
+   (%getsockopt-int (%tcp-fd (%tcp-of network self
+                                      (tcp-socket-resource-ct
+                                       :package package)))
+                    +sol-tcp+ +tcp-keepcnt+)))
+
+(defun tcp-set-keep-alive-count (context network self value
+                                 &key (package (wasi-package "sockets")))
+  (declare (ignore context))
+  (%tcp-knob-set network self (tcp-socket-resource-ct :package package)
+                 +sol-tcp+ +tcp-keepcnt+ value t))
+
+(defun tcp-get-hop-limit (context network self
+                          &key (package (wasi-package "sockets")))
+  (declare (ignore context))
+  (let ((sock (%tcp-of network self (tcp-socket-resource-ct
+                                      :package package))))
+    (%socket-result
+     (let ((level (if (eq (wasi-tcp-socket-family sock) :ipv6)
+                      +ipproto-ipv6+ +ipproto-ip+))
+           (opt (if (eq (wasi-tcp-socket-family sock) :ipv6)
+                    +ipv6-unicast-hops+ +ip-ttl+)))
+       (%getsockopt-int (%tcp-fd sock) level opt)))))
+
+(defun tcp-set-hop-limit (context network self value
+                          &key (package (wasi-package "sockets")))
+  (declare (ignore context))
+  (let ((sock (%tcp-of network self (tcp-socket-resource-ct
+                                      :package package))))
+    (%socket-result
+     (when (or (zerop value) (> value 255))
+       (%socket-error (%socket-code "invalid-argument")))
+     (let ((level (if (eq (wasi-tcp-socket-family sock) :ipv6)
+                      +ipproto-ipv6+ +ipproto-ip+))
+           (opt (if (eq (wasi-tcp-socket-family sock) :ipv6)
+                    +ipv6-unicast-hops+ +ip-ttl+)))
+       (%setsockopt-int (%tcp-fd sock) level opt value))
+     nil)))
+
+(defun %fd-get-buffer (fd opt)
+  "SO_RCVBUF/SO_SNDBUF. Linux reports DOUBLE the requested size."
+  (%socket-result
+   (floor (%getsockopt-int fd +sol-socket+ opt) 2)))
+
+(defun %fd-set-buffer (fd opt value)
+  (%socket-result
+   (when (zerop value)
+     (%socket-error (%socket-code "invalid-argument")))
+   (%setsockopt-int fd +sol-socket+ opt (min value #x7fffffff))
+   nil))
+
+(defun tcp-get-receive-buffer-size (context network self
+                                    &key (package (wasi-package "sockets")))
+  (declare (ignore context))
+  (%fd-get-buffer (%tcp-fd (%tcp-of network self
+                                    (tcp-socket-resource-ct :package package)))
+                  +so-rcvbuf+))
+
+(defun tcp-set-receive-buffer-size (context network self value
+                                    &key (package (wasi-package "sockets")))
+  (declare (ignore context))
+  (%fd-set-buffer (%tcp-fd (%tcp-of network self
+                                    (tcp-socket-resource-ct :package package)))
+                  +so-rcvbuf+ value))
+
+(defun tcp-get-send-buffer-size (context network self
+                                 &key (package (wasi-package "sockets")))
+  (declare (ignore context))
+  (%fd-get-buffer (%tcp-fd (%tcp-of network self
+                                    (tcp-socket-resource-ct :package package)))
+                  +so-sndbuf+))
+
+(defun tcp-set-send-buffer-size (context network self value
+                                 &key (package (wasi-package "sockets")))
+  (declare (ignore context))
+  (%fd-set-buffer (%tcp-fd (%tcp-of network self
+                                    (tcp-socket-resource-ct :package package)))
+                  +so-sndbuf+ value))
+
+;;; ---------------------------------------------------------------
+;;; UDP.
+
+(defun udp-create (context network family-value
+                   &key (package (wasi-package "sockets")))
+  (declare (ignore context))
+  (%socket-result
+   (let* ((family (%family-of-value family-value))
+          (fd (%libc-socket
+               (%family-key family)
+               (logior +sock-dgram+ +sock-nonblock+ +sock-cloexec+)
+               +ipproto-udp+)))
+     (%socket-check fd "socket")
+     (%setsockopt-int fd +sol-socket+ +so-reuseaddr+ 1)
+     (when (eq family :ipv6)
+       (%setsockopt-int fd +ipproto-ipv6+ +ipv6-v6only+ 1))
+     (list :own-handle
+           (udp-socket-resource-ct :package package)
+           (make-wasi-udp-socket :fd fd :network network :family family)))))
+
+(defun udp-bind (context network self value
+                 &key (package (wasi-package "sockets")))
+  (declare (ignore context))
+  (%socket-result
+   (let ((sock (%udp-of network self (udp-socket-resource-ct
+                                      :package package))))
+     (when (wasi-udp-socket-bound-p sock)
+       (%socket-error (%socket-code "invalid-state")))
+     (multiple-value-bind (alien len family)
+         (ip-socket-address->sockaddr value)
+       (unwind-protect
+            (progn
+              (unless (eq family (wasi-udp-socket-family sock))
+                (%socket-error (%socket-code "invalid-argument")))
+              (multiple-value-bind (fam host port)
+                  (%sockaddr-sap->key (sb-alien:alien-sap alien))
+                (declare (ignore fam))
+                (unless (wasi-network-allows-listen-p network family host port)
+                  (%socket-error (%socket-code "access-denied")))
+                (%socket-check (%libc-bind (%udp-fd sock)
+                                           (sb-alien:alien-sap alien) len)
+                               "bind")
+                (setf (wasi-udp-socket-bound-p sock) t)
+                nil))
+         (sb-alien:free-alien alien))))))
+
+(defun udp-connect (context network self value
+                    &key (package (wasi-package "sockets")))
+  (declare (ignore context))
+  (%socket-result
+   (let ((sock (%udp-of network self (udp-socket-resource-ct
+                                      :package package))))
+     (multiple-value-bind (alien len family)
+         (ip-socket-address->sockaddr value)
+       (unwind-protect
+            (progn
+              (unless (eq family (wasi-udp-socket-family sock))
+                (%socket-error (%socket-code "invalid-argument")))
+              (multiple-value-bind (fam host port)
+                  (%sockaddr-sap->key (sb-alien:alien-sap alien))
+                (declare (ignore fam))
+                (unless (wasi-network-allows-outbound-p network family host port)
+                  (%socket-error (%socket-code "access-denied")))
+                (%socket-check (%libc-connect (%udp-fd sock)
+                                              (sb-alien:alien-sap alien) len)
+                               "connect")
+                (setf (wasi-udp-socket-connected-p sock) t
+                      (wasi-udp-socket-bound-p sock) t
+                      (wasi-udp-socket-remote sock) value)
+                nil))
+         (sb-alien:free-alien alien))))))
+
+(defun udp-disconnect (context network self
+                       &key (package (wasi-package "sockets")))
+  (declare (ignore context))
+  (%socket-result
+   (let ((sock (%udp-of network self (udp-socket-resource-ct
+                                      :package package))))
+     (unless (wasi-udp-socket-connected-p sock)
+       (%socket-error (%socket-code "invalid-state")))
+     (let ((alien (sb-alien:make-alien sb-alien:unsigned-char +sockaddr-storage-size+)))
+       (unwind-protect
+            (progn
+              ;; AF_UNSPEC: the POSIX disconnect for a datagram socket
+              (let ((sap (sb-alien:alien-sap alien)))
+                (loop for i below +sockaddr-storage-size+
+                      do (setf (sb-sys:sap-ref-8 sap i) 0))
+                (%socket-check (%libc-connect (%udp-fd sock) sap
+                                              +sockaddr-in-size+)
+                               "connect"))
+              (setf (wasi-udp-socket-connected-p sock) nil
+                    (wasi-udp-socket-remote sock) nil)
+              nil)
+         (sb-alien:free-alien alien))))))
+
+(defun udp-send (context network self data remote
+                 &key (package (wasi-package "sockets")))
+  (declare (ignore context))
+  (%socket-result
+   (let* ((sock (%udp-of network self (udp-socket-resource-ct
+                                       :package package)))
+          (fd (%udp-fd sock))
+          (dest (cond ((eq remote :none) nil)
+                      ((and (consp remote) (eq (car remote) :some))
+                       (cdr remote))
+                      ((and (consp remote) (stringp (car remote))) remote)
+                      (t (%socket-error (%socket-code "invalid-argument"))))))
+     (when (and dest (wasi-udp-socket-connected-p sock)
+                (not (equal dest (wasi-udp-socket-remote sock))))
+       (%socket-error (%socket-code "invalid-argument")))
+     (when (and (null dest) (not (wasi-udp-socket-connected-p sock)))
+       (%socket-error (%socket-code "invalid-argument")))
+     (if dest
+         (multiple-value-bind (alien len family)
+             (ip-socket-address->sockaddr dest)
+           (unwind-protect
+                (multiple-value-bind (fam host port)
+                    (%sockaddr-sap->key (sb-alien:alien-sap alien))
+                  (declare (ignore fam))
+                  (unless (wasi-network-allows-outbound-p
+                           network family host port)
+                    (%socket-error (%socket-code "access-denied")))
+                  (%udp-send-bytes fd data alien len))
+             (sb-alien:free-alien alien)))
+         (%udp-send-bytes fd data nil nil))
+     nil)))
+
+(defun %udp-send-bytes (fd bytes alien len)
+  "sendto/send BYTES; error-code DOMAIN or NIL."
+  (let ((n (length bytes)))
+    (if (zerop n)
+        nil
+        (let ((buf (%byte-list->alien bytes)))
+          (unwind-protect
+               (block write
+                 (let ((done 0))
+                   (loop while (< done n)
+                         do (let ((ret
+                                    (if alien
+                                        (%libc-sendto fd
+                                                      (sb-sys:sap+ (sb-alien:alien-sap buf) done)
+                                                      (- n done)
+                                                      +msg-nosignal+
+                                                      (sb-alien:alien-sap alien) len)
+                                        (%libc-send fd
+                                                    (sb-sys:sap+ (sb-alien:alien-sap buf) done)
+                                                    (- n done)
+                                                    +msg-nosignal+))))
+                              (cond
+                                ((plusp ret) (incf done ret))
+                                ((zerop ret) (return-from write nil))
+                                (t
+                                 (let ((errno (sb-alien:get-errno)))
+                                   (cond
+                                     ((= errno +eintr+) nil)
+                                     ((= errno +eagain+)
+                                      (unless (%poll-fd fd +pollout+ 5000)
+                                        (return-from write
+                                          (%socket-code "timeout"))))
+                                     (t
+                                      (return-from write
+                                        (%socket-errno-code errno))))))))))
+                 nil)
+            (sb-alien:free-alien buf))))))
+
+(defun udp-receive (context network self
+                    &key (package (wasi-package "sockets")))
+  (declare (ignore context))
+  (%socket-result
+   (let* ((sock (%udp-of network self (udp-socket-resource-ct
+                                       :package package)))
+          (fd (%udp-fd sock)))
+     (unless (wasi-udp-socket-bound-p sock)
+       (%socket-error (%socket-code "invalid-state")))
+     (multiple-value-bind (bytes addr) (%udp-recv fd)
+       (unless bytes
+         (%socket-error (%socket-code "timeout")))
+       (list bytes addr)))))
+
+(defun %udp-recv (fd)
+  "One datagram: (values byte-list address-domain) or (values nil NIL)
+on a bounded wait expiry."
+  (let ((cap 65536)
+        (buf (sb-alien:make-alien sb-alien:unsigned-char 65536))
+        (addr (sb-alien:make-alien sb-alien:unsigned-char +sockaddr-storage-size+))
+        (len (sb-alien:make-alien sb-alien:unsigned-int)))
+    (unwind-protect
+         (block read
+           (loop
+             (setf (sb-alien:deref len) +sockaddr-storage-size+)
+             (let ((ret (%libc-recvfrom fd (sb-alien:alien-sap buf) cap 0
+                                        (sb-alien:alien-sap addr)
+                                        (sb-alien:alien-sap len))))
+               (cond
+                 ((>= ret 0)
+                  (return-from read
+                    (values (loop for i below ret
+                                  collect (sb-sys:sap-ref-8
+                                           (sb-alien:alien-sap buf) i))
+                            (sockaddr->ip-socket-address
+                             (sb-alien:alien-sap addr)))))
+                 (t
+                  (let ((errno (sb-alien:get-errno)))
+                    (cond
+                      ((= errno +eintr+) nil)
+                      ((= errno +eagain+)
+                       (unless (%poll-fd fd +pollin+ 1000)
+                         (return-from read (values nil nil))))
+                      (t (return-from read
+                           (%socket-error
+                            (%socket-errno-code errno)))))))))))
+      (sb-alien:free-alien buf)
+      (sb-alien:free-alien addr)
+      (sb-alien:free-alien len))))
+
+(defun udp-get-local-address (context network self
+                              &key (package (wasi-package "sockets")))
+  (declare (ignore context))
+  (%socket-result
+   (let ((sock (%udp-of network self (udp-socket-resource-ct
+                                      :package package))))
+     (unless (wasi-udp-socket-bound-p sock)
+       (%socket-error (%socket-code "invalid-state")))
+     (%getsockname-domain (%udp-fd sock) :local))))
+
+(defun udp-get-remote-address (context network self
+                               &key (package (wasi-package "sockets")))
+  (declare (ignore context))
+  (%socket-result
+   (let ((sock (%udp-of network self (udp-socket-resource-ct
+                                      :package package))))
+     (unless (wasi-udp-socket-connected-p sock)
+       (%socket-error (%socket-code "invalid-state")))
+     (%getsockname-domain (%udp-fd sock) :peer))))
+
+(defun udp-get-address-family (context network self
+                               &key (package (wasi-package "sockets")))
+  (declare (ignore context))
+  (%family-value
+   (wasi-udp-socket-family
+    (%udp-of network self (udp-socket-resource-ct :package package)))))
+
+(defun udp-get-unicast-hop-limit (context network self
+                                  &key (package (wasi-package "sockets")))
+  (declare (ignore context))
+  (let ((sock (%udp-of network self (udp-socket-resource-ct
+                                     :package package))))
+    (%socket-result
+     (let ((level (if (eq (wasi-udp-socket-family sock) :ipv6)
+                      +ipproto-ipv6+ +ipproto-ip+))
+           (opt (if (eq (wasi-udp-socket-family sock) :ipv6)
+                    +ipv6-unicast-hops+ +ip-ttl+)))
+       (%getsockopt-int (%udp-fd sock) level opt)))))
+
+(defun udp-set-unicast-hop-limit (context network self value
+                                  &key (package (wasi-package "sockets")))
+  (declare (ignore context))
+  (let ((sock (%udp-of network self (udp-socket-resource-ct
+                                     :package package))))
+    (%socket-result
+     (when (or (zerop value) (> value 255))
+       (%socket-error (%socket-code "invalid-argument")))
+     (let ((level (if (eq (wasi-udp-socket-family sock) :ipv6)
+                      +ipproto-ipv6+ +ipproto-ip+))
+           (opt (if (eq (wasi-udp-socket-family sock) :ipv6)
+                    +ipv6-unicast-hops+ +ip-ttl+)))
+       (%setsockopt-int (%udp-fd sock) level opt value))
+     nil)))
+
+(defun udp-get-receive-buffer-size (context network self
+                                   &key (package (wasi-package "sockets")))
+  (declare (ignore context))
+  (%fd-get-buffer (%udp-fd (%udp-of network self
+                                    (udp-socket-resource-ct :package package)))
+                  +so-rcvbuf+))
+
+(defun udp-set-receive-buffer-size (context network self value
+                                   &key (package (wasi-package "sockets")))
+  (declare (ignore context))
+  (%fd-set-buffer (%udp-fd (%udp-of network self
+                                    (udp-socket-resource-ct :package package)))
+                  +so-rcvbuf+ value))
+
+(defun udp-get-send-buffer-size (context network self
+                                 &key (package (wasi-package "sockets")))
+  (declare (ignore context))
+  (%fd-get-buffer (%udp-fd (%udp-of network self
+                                    (udp-socket-resource-ct :package package)))
+                  +so-sndbuf+))
+
+(defun udp-set-send-buffer-size (context network self value
+                                 &key (package (wasi-package "sockets")))
+  (declare (ignore context))
+  (%fd-set-buffer (%udp-fd (%udp-of network self
+                                    (udp-socket-resource-ct :package package)))
+                  +so-sndbuf+ value))
+
+;;; ---------------------------------------------------------------
+;;; ip-name-lookup.
+
+(defun %split-string (string char)
+  (let ((parts '()) (start 0))
+    (loop
+      (let ((pos (position char string :start start)))
+        (if pos
+            (progn (push (subseq string start pos) parts)
+                   (setf start (1+ pos)))
+            (progn (push (subseq string start) parts)
+                   (return (nreverse parts))))))))
+
+(defun %parse-ipv4-literal (name)
+  "The 4-byte tuple NAME spells as a dotted quad, or NIL."
+  (let ((parts (%split-string name #\.)))
+    (when (= 4 (length parts))
+      (let ((bytes (mapcar (lambda (p)
+                             (when (and (plusp (length p))
+                                        (every #'digit-char-p p))
+                               (ignore-errors (parse-integer p))))
+                           parts)))
+        (when (every (lambda (v) (and (integerp v) (<= 0 v 255))) bytes)
+          bytes)))))
+
+(defun %gai->lookup-code (rc)
+  (cons
+   (cond
+     ((member rc '(-2 -5 -9)) "name-unresolvable") ; EAI_NONAME/NODATA/ADDRFAMILY
+     ((= rc -3) "temporary-resolver-failure")      ; EAI_AGAIN
+     ((= rc -4) "permanent-resolver-failure")      ; EAI_FAIL
+     ((= rc -1) "invalid-argument")                ; EAI_BADFLAGS
+     ((= rc -11) "permanent-resolver-failure")     ; EAI_SYSTEM
+     (t "other"))
+   nil))
+
+(defun %getaddrinfo-chain (name flags)
+  "Resolve NAME through getaddrinfo(3) into a de-duplicated
+`list<ip-address>' domain value. Signals wasi-socket-error with the
+ip-name-lookup error variant on failure."
+  (let ((hints (sb-alien:make-alien sb-alien:unsigned-char +addrinfo-size+))
+        (out (sb-alien:make-alien
+              (sb-alien:array sb-alien:unsigned-char 8))))
+    (unwind-protect
+         (let ((hsap (sb-alien:alien-sap hints))
+               (osap (sb-alien:alien-sap out)))
+           (loop for i below +addrinfo-size+
+                 do (setf (sb-sys:sap-ref-8 hsap i) 0))
+           (setf (sb-sys:sap-ref-32 hsap +ai-flags-offset+) flags)
+           (let ((rc (%libc-getaddrinfo name nil hsap osap)))
+             (unless (zerop rc)
+               (%socket-error (%gai->lookup-code rc)))
+             (let ((head (sb-sys:sap-ref-64 osap 0))
+                   (addresses '()))
+               (unwind-protect
+                    (loop for p = head then (sb-sys:sap-ref-64
+                                             (sb-sys:int-sap p)
+                                             +ai-next-offset+)
+                          while (and (integerp p) (plusp p))
+                          do (let* ((psap (sb-sys:int-sap p))
+                                    (family (sb-sys:sap-ref-32
+                                             psap +ai-family-offset+))
+                                    (addr (sb-sys:sap-ref-64
+                                           psap +ai-addr-offset+)))
+                               (when (and addr (plusp addr))
+                                 (let* ((asap (sb-sys:int-sap addr))
+                                        (value
+                                          (case family
+                                            (2 (cons "ipv4"
+                                                     (loop for i below 4
+                                                           collect
+                                                           (sb-sys:sap-ref-8
+                                                            asap (+ 4 i)))))
+                                            (10 (cons "ipv6"
+                                                      (loop for g below 8
+                                                            collect
+                                                            (logior
+                                                             (ash (sb-sys:sap-ref-8
+                                                                   asap (+ 8 (* 2 g)))
+                                                                  8)
+                                                             (sb-sys:sap-ref-8
+                                                              asap (+ 9 (* 2 g)))))))
+                                            (t nil))))
+                                   (when (and value (not (member value addresses
+                                                                 :test #'equal)))
+                                     (push value addresses))))))
+                 (when (and (integerp head) (plusp head))
+                   (%libc-freeaddrinfo (sb-sys:int-sap head))))
+               (nreverse addresses))))
+      (sb-alien:free-alien hints)
+      (sb-alien:free-alien out))))
+
+(defun ip-name-lookup-resolve (context network name
+                               &key (package (wasi-package "sockets")))
+  "resolve-addresses: an IP literal is parsed as-is (no external
+request); a name needs the network's DNS policy and then goes through
+getaddrinfo."
+  (declare (ignore context package))
+  (%socket-result
+   (cond
+     ((zerop (length name))
+      (%socket-error (%socket-code "invalid-argument")))
+     ((%parse-ipv4-literal name)
+      (list (cons "ipv4" (%parse-ipv4-literal name))))
+     ((find #\: name)
+      ;; an IPv6 literal: numeric resolution only (AI_NUMERICHOST)
+      (%getaddrinfo-chain name +ai-numerichost+))
+     (t
+      (unless (wasi-network-allows-dns-p network name)
+        (%socket-error (%socket-code "access-denied")))
+      (%getaddrinfo-chain name 0)))))
+
+;;; ---------------------------------------------------------------
+;;; The provider instances.
+
+(defun sockets-types-instance (context
+                               &key network (package (wasi-package "sockets")))
+  "The wasi:sockets/types import: the tcp-socket/udp-socket resources
+bound to CONTEXT's network authority (NETWORK overrides the context's
+first one). No network authority => every bind/connect is refused."
+  (let* ((net (or network (first (wasi-context-networks context))))
+         (tcp-ct (tcp-socket-resource-ct :package package))
+         (udp-ct (udp-socket-resource-ct :package package))
+         (pkg (%sockets-packages :package package)))
+    (%install-socket-dtors tcp-ct udp-ct)
+    (provider-instance
+     (wasmdown.wit:package-interface package "types")
+     (list
+      (cons "[static]tcp-socket.create"
+            (lambda (fam) (tcp-create context net fam :package package)))
+      (cons "[method]tcp-socket.bind"
+            (lambda (self addr) (tcp-bind context net self addr
+                                          :package package)))
+      (cons "[method]tcp-socket.connect"
+            (lambda (self addr) (tcp-connect context net self addr
+                                             :package package)))
+      (cons "[method]tcp-socket.listen"
+            (lambda (self) (tcp-listen context net self :package package)))
+      (cons "[method]tcp-socket.send"
+            (lambda (self data) (tcp-send context net self data
+                                          :package package)))
+      (cons "[method]tcp-socket.receive"
+            (lambda (self) (tcp-receive context net self :package package)))
+      (cons "[method]tcp-socket.get-local-address"
+            (lambda (self) (tcp-get-local-address context net self
+                                                  :package package)))
+      (cons "[method]tcp-socket.get-remote-address"
+            (lambda (self) (tcp-get-remote-address context net self
+                                                   :package package)))
+      (cons "[method]tcp-socket.get-is-listening"
+            (lambda (self) (tcp-get-is-listening context net self
+                                                 :package package)))
+      (cons "[method]tcp-socket.get-address-family"
+            (lambda (self) (tcp-get-address-family context net self
+                                                   :package package)))
+      (cons "[method]tcp-socket.set-listen-backlog-size"
+            (lambda (self v) (tcp-set-listen-backlog-size context net self v
+                                                          :package package)))
+      (cons "[method]tcp-socket.get-keep-alive-enabled"
+            (lambda (self) (tcp-get-keep-alive-enabled context net self
+                                                       :package package)))
+      (cons "[method]tcp-socket.set-keep-alive-enabled"
+            (lambda (self v) (tcp-set-keep-alive-enabled context net self v
+                                                         :package package)))
+      (cons "[method]tcp-socket.get-keep-alive-idle-time"
+            (lambda (self) (tcp-get-keep-alive-idle-time context net self
+                                                         :package package)))
+      (cons "[method]tcp-socket.set-keep-alive-idle-time"
+            (lambda (self v) (tcp-set-keep-alive-idle-time context net self v
+                                                           :package package)))
+      (cons "[method]tcp-socket.get-keep-alive-interval"
+            (lambda (self) (tcp-get-keep-alive-interval context net self
+                                                        :package package)))
+      (cons "[method]tcp-socket.set-keep-alive-interval"
+            (lambda (self v) (tcp-set-keep-alive-interval context net self v
+                                                          :package package)))
+      (cons "[method]tcp-socket.get-keep-alive-count"
+            (lambda (self) (tcp-get-keep-alive-count context net self
+                                                     :package package)))
+      (cons "[method]tcp-socket.set-keep-alive-count"
+            (lambda (self v) (tcp-set-keep-alive-count context net self v
+                                                       :package package)))
+      (cons "[method]tcp-socket.get-hop-limit"
+            (lambda (self) (tcp-get-hop-limit context net self
+                                              :package package)))
+      (cons "[method]tcp-socket.set-hop-limit"
+            (lambda (self v) (tcp-set-hop-limit context net self v
+                                               :package package)))
+      (cons "[method]tcp-socket.get-receive-buffer-size"
+            (lambda (self) (tcp-get-receive-buffer-size context net self
+                                                        :package package)))
+      (cons "[method]tcp-socket.set-receive-buffer-size"
+            (lambda (self v) (tcp-set-receive-buffer-size context net self v
+                                                          :package package)))
+      (cons "[method]tcp-socket.get-send-buffer-size"
+            (lambda (self) (tcp-get-send-buffer-size context net self
+                                                     :package package)))
+      (cons "[method]tcp-socket.set-send-buffer-size"
+            (lambda (self v) (tcp-set-send-buffer-size context net self v
+                                                       :package package)))
+      ;; udp-socket
+      (cons "[static]udp-socket.create"
+            (lambda (fam) (udp-create context net fam :package package)))
+      (cons "[method]udp-socket.bind"
+            (lambda (self addr) (udp-bind context net self addr
+                                          :package package)))
+      (cons "[method]udp-socket.connect"
+            (lambda (self addr) (udp-connect context net self addr
+                                             :package package)))
+      (cons "[method]udp-socket.disconnect"
+            (lambda (self) (udp-disconnect context net self
+                                           :package package)))
+      (cons "[method]udp-socket.send"
+            (lambda (self data remote) (udp-send context net self data remote
+                                                 :package package)))
+      (cons "[method]udp-socket.receive"
+            (lambda (self) (udp-receive context net self :package package)))
+      (cons "[method]udp-socket.get-local-address"
+            (lambda (self) (udp-get-local-address context net self
+                                                  :package package)))
+      (cons "[method]udp-socket.get-remote-address"
+            (lambda (self) (udp-get-remote-address context net self
+                                                   :package package)))
+      (cons "[method]udp-socket.get-address-family"
+            (lambda (self) (udp-get-address-family context net self
+                                                   :package package)))
+      (cons "[method]udp-socket.get-unicast-hop-limit"
+            (lambda (self) (udp-get-unicast-hop-limit context net self
+                                                      :package package)))
+      (cons "[method]udp-socket.set-unicast-hop-limit"
+            (lambda (self v) (udp-set-unicast-hop-limit context net self v
+                                                        :package package)))
+      (cons "[method]udp-socket.get-receive-buffer-size"
+            (lambda (self) (udp-get-receive-buffer-size context net self
+                                                        :package package)))
+      (cons "[method]udp-socket.set-receive-buffer-size"
+            (lambda (self v) (udp-set-receive-buffer-size context net self v
+                                                          :package package)))
+      (cons "[method]udp-socket.get-send-buffer-size"
+            (lambda (self) (udp-get-send-buffer-size context net self
+                                                     :package package)))
+      (cons "[method]udp-socket.set-send-buffer-size"
+            (lambda (self v) (udp-set-send-buffer-size context net self v
+                                                       :package package))))
+     :packages pkg)))
+
+(defun ip-name-lookup-instance (context
+                                &key network
+                                     (package (wasi-package "sockets")))
+  "The wasi:sockets/ip-name-lookup import, consulting CONTEXT's (or
+NETWORK's) DNS policy."
+  (let ((net (or network (first (wasi-context-networks context)))))
+    (provider-instance
+     (wasmdown.wit:package-interface package "ip-name-lookup")
+     (list (cons "resolve-addresses"
+                 (lambda (name)
+                   (ip-name-lookup-resolve context net name
+                                           :package package))))
+     :packages (%sockets-packages :package package))))
+
+(defun sockets-provider (context
+                         &key network (package (wasi-package "sockets")))
+  "The wasi:sockets imports (types + ip-name-lookup) as a with-args
+alist, all bound to one network authority."
+  (let ((net (or network (first (wasi-context-networks context)))))
+    (list
+     (cons (wasmdown.wit:interface-import-name
+            (wasmdown.wit:package-interface package "types"))
+           (sockets-types-instance context :network net :package package))
+     (cons (wasmdown.wit:interface-import-name
+            (wasmdown.wit:package-interface package "ip-name-lookup"))
+           (ip-name-lookup-instance context :network net :package package)))))
