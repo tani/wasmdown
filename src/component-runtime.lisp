@@ -3569,6 +3569,17 @@ wrong-index probe: one transfer produced index 3)."
 (defparameter *current-thread* nil
   "The current Thread record (CanonicalABI.md current_thread).")
 
+(defparameter *cancel-window-inst* nil
+  "M14 THE PER-INSTANCE CANCEL-WINDOW GATE: the cancelled task's
+instance — during the synchronous-resume wait, the drain's ticks
+(the outer invoke drain's ~2ms grants) must not grant THIS
+instance's OTHER parked callbacks (cancel-targeted-resume ::7/::9's
+worker: its event ready, granted inside the cancel window where
+the fixtures pin the caller's own observation first). The rest of
+the store keeps its grants (the during-sync family's interleave
+depends on the pre-window ticks — the whole-store suppression
+measured as the acs::2 + ctr::5 regressions).")
+
 (defparameter *deferred-resume-all-tasks* nil
   "M14: the cancel-wait window's deferred propagation queue (drained
 when the window closes).")
@@ -3925,7 +3936,23 @@ the caller's own thread; never a plain suspend-parked thread
         ;; broadcast was a tick — the deferred/incidental
         ;; propagations never reach here in the cancel-wait window)
         (dolist (th sorted)
-          (unless (async-thread-abandoned th)
+          (unless (or (async-thread-abandoned th)
+                      ;; M14 THE PER-INSTANCE CANCEL-WINDOW GATE:
+                      ;; during the synchronous-resume wait, the
+                      ;; cancelled task's INSTANCE's threads keep
+                      ;; holding (the ::7/::9 worker — the drain's
+                      ;; tick granted it inside the window; the
+                      ;; fixtures pin the caller's own observation
+                      ;; first); the REST of the store keeps its
+                      ;; grants (the during-sync interleave's
+                      ;; pre-window ticks — the whole-store
+                      ;; suppression measured as the acs::2 +
+                      ;; ctr::5 regressions)
+                      (and *cancel-window-inst*
+                           (async-thread-task th)
+                           (eq (async-task-inst
+                                (async-thread-task th))
+                               *cancel-window-inst*)))
             (setf (async-thread-granted th) t)))
         (when granted-thread
           (%async-thread-wake granted-thread))
@@ -4213,6 +4240,10 @@ legacy nudge and the caller observes the unresolved state."
         ;; slice each.
         (let ((sampled (async-task-turns task)))
           (async-thread-resume th)
+          ;; M14 THE PER-INSTANCE CANCEL-WINDOW: record the cancelled
+          ;; task's instance — the drain's ticks must not grant ITS
+          ;; parked callbacks while the window is open
+          (setf *cancel-window-inst* (async-task-inst task))
           ;; M14 THE CANCEL-WAIT WINDOW: defer the M11a propagation
           ;; (the callee's task.{return,cancel} runs on ITS thread
           ;; inside this wait; the propagation's resume-all would
@@ -4234,7 +4265,8 @@ legacy nudge and the caller observes the unresolved state."
                                 ;; wake)
                                 t))
                  do (sleep 0.001))
-            (setf *defer-resume-all* nil)
+            (setf *defer-resume-all* nil
+                  *cancel-window-inst* nil)
             ;; M14: NO DRAIN — the deferred propagations' RESOLVES
             ;; are already broadcast on the task/waitable waitqueues
             ;; (the wset waiter's durable wake posted by

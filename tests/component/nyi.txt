@@ -210,6 +210,34 @@
 #   + core 21187/0/73 unchanged.
 # THE DENOMINATOR: 1482 -> 1536 (+54: the no-sibling 6 + the
 # trap-if-block 48) — past the milestone's ~1526 target.
+# THE PER-INSTANCE CANCEL-WINDOW GATE (the user's directive's
+# rung 1 — LANDED, IN THE TREE): *cancel-window-inst* — the
+# cancelled task's instance recorded at the synchronous-resume
+# wait's open, cleared at its close; async-thread-resume-all's
+# GRANT skips that instance's threads while the window is open
+# (the drain's ~2ms ticks must not grant the ::7/::9 worker
+# inside the caller's observation window); the REST of the store
+# keeps its grants (the whole-store suppression's measured
+# regressions — acs::2 + ctr::5 — are the constraint; the
+# per-instance shape avoids them).
+# MEASURED: row ::7 improved to 2/6 PASS (from 0-1/5); ::9
+# unchanged; ZERO regressions (reentrance 5/5 standalone, acs 5/5,
+# candidates 5/5, cancel-subtask 5/5, cancel-resumed 5/5; the
+# only failing fixture is cancel-targeted-resume itself — the
+# target rows). THE FULL GATES: units 411/0; the lane 1536/0 +
+# 1536/0 + 1535/1 (reentrance ::14, the drift row's band); THE
+# 10-RUN FAILROW PROBE 10/10 GREEN.
+# THE RESIDUAL (the rung stays open): the stale grant — the
+# worker's granted flag set by its OWN STARTED-wait spin (the
+# run's worker(...) lower, BEFORE the window) survives to the
+# granted park's entry (the arm-time clear was candidate 3,
+# measured regressive for the during-sync family's pre-window
+# grants); THE DISTINGUISHER (the next design): the worker's
+# grant arrived while the RUN held its own turn mid-call — a
+# grant the RUN did not order; the during-sync family's grants
+# arrive while the caller is AT a blocking op. The gate shape:
+# the grant consumed at the park only when the granter's caller
+# was blocking (the grant's provenance).
 # THE REMAINING RUNGS' FRESH EVIDENCE (the close-out re-probe at
 # e8b1937): sync-streams ::1 — the surface MOVED: the M13 record
 # ('the run's own STARTING check' — the unreachable) is now
