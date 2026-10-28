@@ -189,7 +189,39 @@ parent dir), not the first (the grandparent 'component' — the old
                                  ;; 10/10 standalone (the turn-only
                                  ;; wait's deadlock regression
                                  ;; measured and closed at gate 1).
-                                 "cancel-resumed-callback-switch.wast")
+                                 "cancel-resumed-callback-switch.wast"
+                                 ;; M14 (the idx/resume class closed
+                                 ;; EN PASSANT): during-sync-call-
+                                 ;; no-sibling-resume — the three
+                                 ;; unknown-thread-index variants
+                                 ;; (index 2, index 5, the
+                                 ;; not-suspended trap) ABSENT from
+                                 ;; 20/20 standalone + all 10 lane-
+                                 ;; probe runs at the granted-park
+                                 ;; build: resume_later's MARK-ONLY
+                                 ;; removed the fire path that raced
+                                 ;; the exit mid-handoff (the
+                                 ;; lookup/timerace), and the granted
+                                 ;; park's arm-time semantics removed
+                                 ;; the stale returns. The inter-round
+                                 ;; drain (M13-tok34) closed the
+                                 ;; resume window proper.
+                                 "during-sync-call-no-sibling-resume.wast"
+                                 ;; M14 (the ::34 double-fire lead
+                                 ;; closed EN PASSANT): trap-if-block-
+                                 ;; and-sync — 48 rows, 40/40
+                                 ;; standalone + ABSENT from all 10
+                                 ;; lane-probe runs at the granted-
+                                 ;; park build: the mark-only
+                                 ;; resume_later removed the tick's
+                                 ;; claim-then-fire vs the arm's fire
+                                 ;; on the SAME record (the double-
+                                 ;; fire — the M13-tok9 hypothesis,
+                                 ;; consistent with all four
+                                 ;; sessions' traces), and the
+                                 ;; granted park's arm-time semantics
+                                 ;; removed the stale-count returns.
+                                 "trap-if-block-and-sync.wast")
                                :test #'string=)))
                 (or (directory (merge-pathnames
                                 "tests/component/async/*.wast" *root*))

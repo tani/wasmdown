@@ -15,15 +15,15 @@ Baseline measurement, not a release gate (PLAN.md §12.8).
 
 | Outcome | Count |
 | --- | --- |
-| pass | 1446 |
+| pass | 1452 |
 | fail | 0 |
 | skip | 0 |
 | unsupported | 0 |
 | timeout | 0 |
 | harness-error | 0 |
-| **total** | **1446** |
+| **total** | **1452** |
 
-Executed: 1446 commands; pass rate 100.0%.
+Executed: 1452 commands; pass rate 100.0%.
 
 ## Per-file counts
 
@@ -46,6 +46,7 @@ Executed: 1446 commands; pass rate 100.0%.
 | component/drop-waitable-set.wast | 2 | 0 | 0 | 0 |
 | component/during-sync-call-exclusive-resume.wast | 6 | 0 | 0 | 0 |
 | component/during-sync-call-may-block-if-other-ready-threads.wast | 9 | 0 | 0 | 0 |
+| component/during-sync-call-no-sibling-resume.wast | 6 | 0 | 0 | 0 |
 | component/during-sync-scheduling-candidates.wast | 31 | 0 | 0 | 0 |
 | component/empty-wait.wast | 2 | 0 | 0 | 0 |
 | component/forward.wast | 95 | 0 | 0 | 0 |

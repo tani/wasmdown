@@ -185,7 +185,31 @@
 # 'cannot happen while the exclusive lock is held' suggests the
 # reference's cancellation gate reads the CALLER's hold).
 # THE TREE: reverted to b3c38c1 (the granted-park gate); the
-# measurements above are the gate's negative-result record.# THE NEXT SHAPE (recorded for the next session): the fix must
+# measurements above are the gate's negative-result record.
+# THE IDX/RESUME CLASS + THE ::34 LEAD — CLOSED EN PASSANT (the
+# follow-on session): THE 10-RUN CLASS PROFILE at the granted-
+# park build: during-sync-call-no-sibling-resume 20/20 STANDALONE
+# + ABSENT from all 10 lane-probe runs (the 543-row overlay — the
+# three unknown-thread-index variants index 2 / index 5 / the
+# not-suspended trap GONE); trap-if-block-and-sync 40/40
+# STANDALONE + ABSENT from all 10 (the ::34 double-fire lead
+# GONE). THE MECHANISM (the en-passant closure): resume_later's
+# MARK-ONLY removed the fire path that raced the thread exit
+# mid-handoff (the idx lookup/timerace), and the granted park's
+# arm-time semantics removed the stale-count returns that fed
+# the ::34 residual (the M13-tok9 double-fire hypothesis — the
+# tick's claim-then-fire vs the arm's fire on the SAME record —
+# consistent with all four sessions' traces).
+# THE TWO UN-PARK GATES (both landed, one per gate):
+# - during-sync-call-no-sibling-resume (6 rows): the lane
+#   1487/1 + 1488/0 x2 (the single fail = the KNOWN floor class)
+#   + units 411/0.
+# - trap-if-block-and-sync (48 rows!): the lane 1536/0/0/0 x3
+#   + THE 10-RUN FAILROW PROBE 9/10 (the single fail
+#   reentrance ::14 ONCE — the drift row's band) + units 411/0
+#   + core 21187/0/73 unchanged.
+# THE DENOMINATOR: 1482 -> 1536 (+54: the no-sibling 6 + the
+# trap-if-block 48) — past the milestone's ~1526 target.# THE NEXT SHAPE (recorded for the next session): the fix must
 # distinguish the CALLER'S OWN BLOCKING-OP TICK (a broadcast that
 # SHOULD return the park) from the WINDOW's incidental broadcasts
 # (which should NOT) — e.g. a per-park "granted" flag set by the
@@ -331,7 +355,6 @@
 # mid-handoff — the same family the ::34 lifecycle work
 # touched). THE M14 HAND-OFF — the class-fix queue's head
 # candidate.
-./async/during-sync-call-no-sibling-resume.wast
 ./validation/kebab.wast
 ./values/post-return.wast
 ./values/variants.wast
@@ -444,7 +467,6 @@
 # non-async rule). NOTE: the M12 flake row (cancel-not-delivered
 # ::1, ~1-in-8) did NOT reappear in this session's runs — its
 # root-cause note (the token scheduler) stands. ----
-./async/trap-if-block-and-sync.wast
 # ---- M13 session 4 (2026-10-27): THE ONE-LOCK HANDOFF
 # LANDED (the switch-lock design, per the session-3 constraint) —
 # the tree now carries: the DURABLE WAKE-COUNT (an atomic
