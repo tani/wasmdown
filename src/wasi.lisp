@@ -1,8 +1,9 @@
-;;;; WASMDOWN — the WASI host-provider framework (PLAN.md §9, M16
-;;;; slice 1): the WIT interface + an implementation alist -> a
-;;;; component instance value the runtime can bind through with-args,
-;;;; plus the wasi:clocks, wasi:random and wasi:cli (environment/exit)
-;;;; providers.
+;;;; WASMDOWN — the WASI host-provider framework (PLAN.md §9, M16):
+;;;; the WIT interface + an implementation alist -> a component
+;;;; instance value the runtime can bind through with-args, plus the
+;;;; wasi:clocks, wasi:random and wasi:cli providers (environment,
+;;;; exit, and — slice 2 — the stdin/stdout/stderr streams over the
+;;;; runtime's host-backed stream/future ends).
 ;;;;
 ;;;; Design contract:
 ;;;;   * a provider instance is a real comp-instance whose exports
@@ -21,16 +22,32 @@
 
 (in-package #:wasmdown.wasi)
 
+;;; M16 slice 2 exports (kept here so the slice's surface travels with
+;;; its implementation).
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (let ((package (find-package '#:wasmdown.wasi)))
+    (dolist (name '("WASI-CONTEXT-STDIN" "WASI-CONTEXT-STDOUT"
+                    "WASI-CONTEXT-STDERR" "CL-STREAM-SOURCE" "CL-STREAM-SINK"
+                    "CLI-STDIN-INSTANCE" "CLI-STDOUT-INSTANCE"
+                    "CLI-STDERR-INSTANCE" "CLI-OUTPUT-INSTANCE"
+                    "CLI-STDIO-PROVIDER"))
+      (export (intern name package) package))))
+
 ;;; ---------------------------------------------------------------
 ;;; Capability context.
 
 (defstruct wasi-context
   "The explicit authority object a CLI provider is built from
 (PLAN.md §9.1). ARGUMENTS is a list of strings, ENVIRONMENT an alist
-of (name . value) strings, CWD a string or NIL."
+of (name . value) strings, CWD a string or NIL, and STDIN/STDOUT/
+STDERR the CL streams the stdio providers may use (or NIL: no such
+capability — never an ambient global)."
   (arguments nil)
   (environment nil)
-  (cwd nil))
+  (cwd nil)
+  (stdin nil)
+  (stdout nil)
+  (stderr nil))
 
 ;;; ---------------------------------------------------------------
 ;;; Host exit.
@@ -291,8 +308,8 @@ fewer bytes than requested; a bounded read also bounds the host).")
          (insecure-seed-instance :package package))))
 
 ;;; ---------------------------------------------------------------
-;;; wasi:cli — environment + exit. The stdio/stream interfaces are
-;;; slice 2 (they need the stream/future host machinery).
+;;; wasi:cli — environment + exit (the stdio interface follows below,
+;;; over the runtime's host stream/future machinery).
 
 (defun environment-get-environment (context)
   "list<tuple<string,string>> from the context alist."
@@ -327,11 +344,194 @@ fewer bytes than requested; a bounded read also bounds the host).")
                (lambda (code) (%wasi-exit code))))
    :packages (list package)))
 
-(defun cli-provider (context &key (package (wasi-package "cli")))
+;;; ---------------------------------------------------------------
+;;; wasi:cli — the STDIO stream/future providers (M16 slice 2): the
+;;; host side of the WIT's
+;;;   read-via-stream:  func() -> tuple<stream<u8>, future<result<_, error-code>>>
+;;;   write-via-stream: func(stream<u8>) -> future<result<_, error-code>>
+;;; over the CONTEXT's CL streams (PLAN.md §9.1: an explicit authority
+;;; object, never *STANDARD-OUTPUT*). The host ends are constructed by
+;;; the runtime's host-backed stream/future machinery: the guest's
+;;; writes drain into the sink, the guest's reads pull from the source,
+;;; and the future resolves (`(:ok)` / `(:err . "io")`) when the guest
+;;; drops the end or the source hits EOF.
+
+(defparameter *cli-stream-chunk* 4096
+  "The host source's per-call read bound (a stream read may return
+fewer bytes than the guest asked for; the canonical ABI allows it).")
+
+(defun %cli-u8-ct ()
+  "The stream<u8>'s element ct."
+  (wasmdown.component:make-ct :kind :prim :payload :u8))
+
+(defun %cli-future-ct (package interface-name func-name)
+  "The element ct of the `future<result<_, error-code>>` a CLI stdio
+function returns: the future ct from the WIT functype (it is the
+result itself for write-via-stream, the second tuple field for
+read-via-stream)."
+  (let* ((interface (wasmdown.wit:package-interface package interface-name))
+         (func (find func-name
+                     (wasmdown.wit:wit-interface-func-list interface)
+                     :key #'wasmdown.wit:wit-func-name :test #'string=))
+         (ft (and func (wasmdown.wit:wit-func->ct interface func
+                                                 :packages (list package))))
+         (result (and ft (second (wasmdown.component:ct-payload ft))))
+         (future (cond
+                   ((and result
+                         (eq (wasmdown.component:ct-kind result) :future))
+                    result)
+                   ((and result
+                         (eq (wasmdown.component:ct-kind result) :tuple))
+                    (find-if (lambda (c)
+                               (eq (wasmdown.component:ct-kind c) :future))
+                             (coerce (wasmdown.component:ct-payload result)
+                                     'list))))))
+    (unless future
+      (error 'wasmdown:host-error
+             :message (format nil "~a/~a has no future result in its WIT"
+                              interface-name func-name)))
+    (wasmdown.component:ct-payload future)))
+
+(defun %byte-stream-p (stream)
+  (subtypep (stream-element-type stream) '(unsigned-byte 8)))
+
+(defun cl-stream-source (stream)
+  "A host SOURCE over CL input STREAM: (max) -> (values byte-list
+eof-p). Character streams are encoded byte-per-character (the WASI
+byte stream is opaque; chars are taken modulo the code)."
+  (let* ((byte-p (%byte-stream-p stream))
+         (buf (if byte-p
+                  (make-array *cli-stream-chunk*
+                              :element-type '(unsigned-byte 8))
+                  (make-array *cli-stream-chunk* :element-type 'character))))
+    (lambda (max)
+      (let ((want (min max *cli-stream-chunk*)))
+        (if (<= want 0)
+            (values nil nil)
+            (let ((got (read-sequence buf stream :end want)))
+              (values (if byte-p
+                          (loop for i below got collect (aref buf i))
+                          (loop for i below got
+                                collect (char-code (aref buf i))))
+                      (< got want))))))))
+
+(defun cl-stream-sink (stream)
+  "A host SINK over CL output STREAM: (byte-list) -> an error-code
+label or NIL. Flushed on every drain."
+  (let ((byte-p (%byte-stream-p stream)))
+    (lambda (bytes)
+      (handler-case
+          (progn
+            (if byte-p
+                (write-sequence
+                 (make-array (length bytes) :element-type '(unsigned-byte 8)
+                                            :initial-contents bytes)
+                 stream)
+                (write-sequence (map 'string #'code-char bytes) stream))
+            (finish-output stream)
+            nil)
+        (error () "io")))))
+
+(defun %stdio-require (stream what)
+  (or stream
+      (error 'wasmdown:host-error
+             :message (format nil "no ~a capability in this wasi-context"
+                              what))))
+
+(defun %write-via-stream (data stream future-ct)
+  "Drain the guest's stream DATA into STREAM; the returned future
+resolves once the guest drops the stream's writable end (the WIT's
+success condition) or a sink error drops it."
+  (let ((sink-stream (%stdio-require stream "stdout/stderr")))
+    (unless (wasmdown.component.runtime:async-end-p data)
+      (error 'wasmdown:host-error
+             :message "write-via-stream: data is not a stream end"))
+    (multiple-value-bind (future-reader future-writer)
+        (wasmdown.component.runtime:make-host-future-pair future-ct)
+      (wasmdown.component.runtime:host-end-set-sink
+       data (cl-stream-sink sink-stream))
+      (wasmdown.component.runtime:host-end-set-on-drop
+       data (lambda (dropped error)
+              (declare (ignore dropped))
+              (wasmdown.component.runtime:host-future-resolve
+               future-writer
+               (if error (cons :err error) (cons :ok nil)))))
+      ;; the guest may have staged a write BEFORE handing us the end
+      (wasmdown.component.runtime:host-end-drain data)
+      future-reader)))
+
+(defun %read-via-stream (stream future-ct)
+  "A stream fed from STREAM and a future signalling the read result."
+  (let ((source-stream (%stdio-require stream "stdin")))
+    (multiple-value-bind (stream-reader stream-writer)
+        (wasmdown.component.runtime:make-host-stream-pair (%cli-u8-ct))
+      (multiple-value-bind (future-reader future-writer)
+          (wasmdown.component.runtime:make-host-future-pair future-ct)
+        (wasmdown.component.runtime:host-end-set-source
+         stream-writer (cl-stream-source source-stream))
+        (wasmdown.component.runtime:host-end-set-on-drop
+         stream-writer (lambda (dropped error)
+                         (declare (ignore dropped))
+                         (wasmdown.component.runtime:host-future-resolve
+                          future-writer
+                          (if error (cons :err error) (cons :ok nil)))))
+        ;; tuple<stream<u8>, future<result<_, error-code>>>
+        (list stream-reader future-reader)))))
+
+(defun cli-stdin-instance (context
+                           &key (package (wasi-package "cli")))
+  (let ((future-ct (%cli-future-ct package "stdin" "read-via-stream")))
+    (provider-instance
+     (wasmdown.wit:package-interface package "stdin")
+     (list (cons "read-via-stream"
+                 (lambda ()
+                   (%read-via-stream (wasi-context-stdin context)
+                                     future-ct))))
+     :packages (list package))))
+
+(defun cli-output-instance (context stream interface-name
+                            &key (package (wasi-package "cli")))
+  (let ((future-ct (%cli-future-ct package interface-name
+                                   "write-via-stream")))
+    (provider-instance
+     (wasmdown.wit:package-interface package interface-name)
+     (list (cons "write-via-stream"
+                 (lambda (data)
+                   (%write-via-stream data stream future-ct))))
+     :packages (list package))))
+
+(defun cli-stdout-instance (context &key (package (wasi-package "cli")))
+  (cli-output-instance context (wasi-context-stdout context) "stdout"
+                       :package package))
+
+(defun cli-stderr-instance (context &key (package (wasi-package "cli")))
+  (cli-output-instance context (wasi-context-stderr context) "stderr"
+                       :package package))
+
+(defun cli-stdio-provider (context &key (package (wasi-package "cli")))
+  "The wasi:cli stdio imports (stdin/stdout/stderr) as a with-args
+alist over CONTEXT's CL streams. An absent stream leaves the interface
+exported but trapping (host-error) — the capability is withdrawable."
   (list
    (cons (wasmdown.wit:interface-import-name
-          (wasmdown.wit:package-interface package "environment"))
-         (cli-environment-instance context :package package))
+          (wasmdown.wit:package-interface package "stdin"))
+         (cli-stdin-instance context :package package))
    (cons (wasmdown.wit:interface-import-name
-          (wasmdown.wit:package-interface package "exit"))
-         (cli-exit-instance :package package))))
+          (wasmdown.wit:package-interface package "stdout"))
+         (cli-stdout-instance context :package package))
+   (cons (wasmdown.wit:interface-import-name
+          (wasmdown.wit:package-interface package "stderr"))
+         (cli-stderr-instance context :package package))))
+
+(defun cli-provider (context &key (package (wasi-package "cli")))
+  "The full wasi:cli provider: environment, exit and the stdio streams
+(whose authority is CONTEXT's stdin/stdout/stderr slots)."
+  (append
+   (list
+    (cons (wasmdown.wit:interface-import-name
+           (wasmdown.wit:package-interface package "environment"))
+          (cli-environment-instance context :package package))
+    (cons (wasmdown.wit:interface-import-name
+           (wasmdown.wit:package-interface package "exit"))
+          (cli-exit-instance :package package)))
+   (cli-stdio-provider context :package package)))

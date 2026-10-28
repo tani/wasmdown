@@ -52,7 +52,21 @@
            #:make-comp-instance
            #:bag-p
            #:bag-ref
-           #:runtime-export-value))
+           #:runtime-export-value
+           ;; M16 slice 2 — the HOST side of stream<u8>/future<T>
+           #:async-end-p
+           #:async-end-other
+           #:make-host-stream-pair
+           #:make-host-future-pair
+           #:host-end-set-sink
+           #:host-end-set-source
+           #:host-end-set-on-drop
+           #:host-end-drain
+           #:host-future-resolve
+           #:make-host-buffer
+           #:host-buffer-p
+           #:host-buffer-values
+           #:host-buffer-progress))
 (in-package #:wasmdown.component.runtime)
 
 ;;; THE ASYNC DYNAMIC CONTEXT: proclaimed SPECIAL at the file's
@@ -3175,7 +3189,31 @@ of a stream or future pair."
   (owner nil)                        ; the owning comp-instance
   (index nil)                        ; the handles-table index (events)
   (event-code nil)  ; 2=STREAM_READ 3=STREAM_WRITE 4=FUTURE_READ 5=FUTURE_WRITE
-  (future-p nil))  ; T = FutureEnd (the notify/DONE transitions differ)
+  (future-p nil)   ; T = FutureEnd (the notify/DONE transitions differ)
+  ;; M16 SLICE 2 — THE HOST BACKING. A provider-owned end carries the
+  ;; CL closure that feeds/drains its PAIRED end (PLAN.md §8.3/§9.1:
+  ;; the host side of stream<u8>/future<T>, no ambient globals):
+  ;;   HOST-SINK (on a host READABLE end): (byte-list) -> error-code
+  ;;     string or NIL. Consulted when the guest's writable peer
+  ;;     stages a write: the bytes are drained immediately.
+  ;;   HOST-SOURCE (on a host WRITABLE end): (max) -> (values
+  ;;     byte-list eof-p). Consulted when the guest's readable peer
+  ;;     asks: the bytes are pulled from the CL source now.
+  ;;   HOST-VALUE(-P) (on a host WRITABLE future end): the resolved
+  ;;     component-domain value, delivered at the guest's read.
+  ;;   HOST-EOF-P: the source reported EOF (the writable peer is then
+  ;;     DROPPED, the readable side sees DROPPED).
+  ;;   HOST-ERROR: the sink/source's error-code (delivered through the
+  ;;     resolved future).
+  ;;   HOST-ON-DROP: (dropped-end error) -> side effect, fired when
+  ;;     the PAIRED guest end is dropped (resolve the future).
+  (host-sink nil)
+  (host-source nil)
+  (host-value nil)
+  (host-value-p nil)
+  (host-eof-p nil)
+  (host-error nil)
+  (host-on-drop nil))
 
 (defun %end-copying-or-cancelling-p (end)
   (member (async-end-state end) '(:copying :cancelling-copy)))
@@ -3285,10 +3323,28 @@ trap at construction; zero-length buffers skip them."
                :message "out of bounds memory access")))
     (list memory ptr length 0)))
 
-(defun %buffer-remain (buf)
-  (- (third buf) (fourth buf)))
+;;; A HOST buffer (M16 slice 2): the CL-side stand-in for a guest
+;;; linear-memory region. It carries the same (capacity progress) shape
+;;; so the copy/take/put paths need no second protocol — a provider (or
+;;; a CL-only test) can act as the other side of a stream without a
+;;; guest memory.
+(defstruct (host-buffer (:constructor make-host-buffer
+                                      (capacity &key values)))
+  (capacity 0)
+  (progress 0)
+  ;; VALUES is the element queue (domain values, in order): the staging
+  ;; side of a CL-only write, or the destination's accumulated reads.
+  ;; PROGRESS counts taken/put elements, so CAPACITY - PROGRESS is the
+  ;; remainder the copy protocol sees.
+  (values nil))
 
-(defun %buffer-progress (buf) (fourth buf))
+(defun %buffer-remain (buf)
+  (if (host-buffer-p buf)
+      (- (host-buffer-capacity buf) (host-buffer-progress buf))
+      (- (third buf) (fourth buf))))
+
+(defun %buffer-progress (buf)
+  (if (host-buffer-p buf) (host-buffer-progress buf) (fourth buf)))
 
 (defun %own-elem-take (cx ptr t-ct inst)
   "M13-tok25: the OWN-typed stream element's SOURCE-side transfer
@@ -3309,7 +3365,15 @@ returned; the %buffer-put re-adds at the dest. A failed remove
 (defun %buffer-take (buf n t-ct inst)
   "ReadableGuestBuffer.read(n) (§1567-1575): load N elements from
 the buffer's memory at its advancing ptr; returns the values list
-and advances the buffer's progress."
+and advances the buffer's progress. A HOST buffer yields its first N
+domain values (no ABI encoding — there is no guest memory)."
+  (when (host-buffer-p buf)
+    (let* ((values (host-buffer-values buf))
+           (k (min n (length values)))
+           (vals (subseq values 0 k)))
+      (setf (host-buffer-values buf) (nthcdr k values))
+      (incf (host-buffer-progress buf) k)
+      (return-from %buffer-take vals)))
   (let* ((memory (first buf))
          (elem-size (and t-ct
                          (handler-case
@@ -3349,7 +3413,12 @@ and advances the buffer's progress."
 (defun %buffer-put (buf vals t-ct inst)
   "WritableGuestBuffer.write (§1577-1585): store the VALUES list
 into the buffer's memory at its advancing ptr, advancing the
-progress by the count."
+progress by the count. A HOST buffer accumulates the domain values."
+  (when (host-buffer-p buf)
+    (setf (host-buffer-values buf)
+          (append (host-buffer-values buf) (copy-list vals)))
+    (incf (host-buffer-progress buf) (length vals))
+    (return-from %buffer-put (length vals)))
   (let* ((memory (first buf))
          (elem-size (and t-ct
                          (handler-case
@@ -3372,6 +3441,143 @@ progress by the count."
               (%abi-store cx v t-ct ptr))
           (incf ptr (or elem-size 1)))))
     (incf (fourth buf) n)))
+
+;;; ---- The HOST-BACKED ends (M16 slice 2, PLAN.md §8.3/§9.1) ----
+;;; A provider turns one end of a stream/future pair into the HOST
+;;; side: a readable end with a SINK (the guest's writes drain into a
+;;; CL stream) or a writable end with a SOURCE (the guest's reads pull
+;;; from a CL stream) / a resolved value (a future). The copy's case 2
+;;; (the peer has no buffer) consults these slots instead of parking —
+;;; the canonical stream protocol, with the host as the peer.
+
+(defun make-host-stream-pair (element-type &key (owner nil))
+  "The linked (readable . writable) STREAM end pair whose element type
+is ELEMENT-TYPE (a ct); the provider backs one end and hands the other
+to the guest. Same pair/linkage as canon stream.new."
+  (%new-async-pair element-type owner +event-stream-read+ nil))
+
+(defun make-host-future-pair (element-type &key (owner nil))
+  "The linked (readable . writable) FUTURE end pair for ELEMENT-TYPE."
+  (%new-async-pair element-type owner +event-future-read+ t))
+
+(defun host-end-set-sink (end sink)
+  "Make the READABLE end END drain the bytes its guest writer stages
+into SINK: (byte-list) -> error-code string or NIL."
+  (setf (async-end-host-sink end) sink)
+  end)
+
+(defun host-end-set-source (end source)
+  "Make the WRITABLE end END feed its guest reader from SOURCE:
+(max) -> (values byte-list eof-p)."
+  (setf (async-end-host-source end) source)
+  end)
+
+(defun host-end-set-on-drop (end hook)
+  "HOOK is (dropped-end error-code) -> side effect, run when the end
+paired with the host end END is dropped (resolve the future)."
+  (setf (async-end-host-on-drop end) hook)
+  end)
+
+(defun %host-peer-dropped (host-end dropped)
+  "The DROP NOTIFICATION: the guest dropped DROPPED, which was paired
+with the host end HOST-END. Fire its one-shot hook."
+  (let ((hook (async-end-host-on-drop host-end)))
+    (when hook
+      (setf (async-end-host-on-drop host-end) nil)
+      (funcall hook dropped (async-end-host-error host-end)))))
+
+(defun %host-drop (host-end)
+  "Drop the host end HOST-END: its guest peer learns DROPPED and the
+host end's one-shot hook fires (the future resolves)."
+  (%end-drop host-end)
+  (when (async-end-host-on-drop host-end)
+    (%host-peer-dropped host-end nil))
+  (setf (async-end-host-source host-end) nil))
+
+(defun host-end-drain (reader)
+  "The provider-side drain: READER is the host READABLE end a provider
+just took over (wasi:cli's write-via-stream). If the guest staged a
+write before the call, its parked buffer drains into the sink now;
+returns the number of elements drained (0 when nothing was staged)."
+  (let ((writer (async-end-other reader)))
+    (if (and writer (async-end-host-sink reader)
+             (let ((buf (async-end-buffer writer)))
+               (and buf (plusp (%buffer-remain buf)))))
+        (%host-sink-drain writer)
+        0)))
+
+(defun %host-sink-drain (writer)
+  "Drain WRITER's staged buffer (case 2 parked it there) into the
+HOST-SINK of its readable peer, then notify WRITER COMPLETED. A sink
+error drops the readable peer (the guest's next write sees DROPPED)
+and rides the resolved future."
+  (let* ((buf (async-end-buffer writer))
+         (reader (async-end-other writer))
+         (sink (and reader (async-end-host-sink reader)))
+         (n (if buf (%buffer-remain buf) 0)))
+    (cond
+      ((null buf) 0)
+      ((or (zerop n) (null sink))
+       (setf (async-end-buffer writer) nil)
+       0)
+      (t
+       (let* ((vals (%buffer-take buf n (async-end-t-ct writer)
+                                  (async-end-owner writer)))
+              (progress (%buffer-progress buf))
+              (err (funcall sink vals)))
+         (setf (async-end-buffer writer) nil)
+         (if err
+             (progn
+               (setf (async-end-host-error reader) err)
+               (%host-drop reader))
+             (%end-notify writer progress))
+         n)))))
+
+(defun %host-source-fill (reader buffer peer)
+  "Fill READER's BUFFER from the SOURCE on its writable peer PEER:
+bytes now -> COMPLETED with the count; none + EOF -> PEER dropped and
+READER notified DROPPED; none + not EOF -> park BUFFER and wait."
+  (if (async-end-host-eof-p peer)
+      (progn (setf (async-end-buffer reader) nil) (%host-drop peer))
+      (multiple-value-bind (bytes eof)
+          (funcall (async-end-host-source peer)
+                   (%buffer-remain buffer))
+        (when eof (setf (async-end-host-eof-p peer) t))
+        (cond
+          ((plusp (length bytes))
+           (%buffer-put buffer bytes (async-end-t-ct reader)
+                        (async-end-owner reader))
+           (%end-notify reader (%buffer-progress buffer)))
+          (eof
+           ;; §: the host writer's end is gone — DROPPED to the reader
+           (setf (async-end-buffer reader) nil)
+           (%host-drop peer))
+          (t (setf (async-end-buffer reader) buffer))))))
+
+(defun %host-value-deliver (reader buffer peer)
+  "Deliver the resolved HOST-VALUE on PEER into READER's BUFFER
+(COMPLETED). The value is consumed once (a future reads once)."
+  (let ((v (async-end-host-value peer)))
+    (setf (async-end-host-value-p peer) nil
+          (async-end-buffer reader) nil)
+    (%buffer-put buffer (list v) (async-end-t-ct reader)
+                 (async-end-owner reader))
+    (%end-notify reader 1)))
+
+(defun host-future-resolve (writer value)
+  "Resolve the host WRITABLE future end WRITER with the component
+domain VALUE (`(:ok)` / `(:err . \"io\")`): delivered at the guest's
+read — or now, if the guest is already parked with a buffer."
+  (setf (async-end-host-value writer) value
+        (async-end-host-value-p writer) t)
+  (let ((reader (async-end-other writer)))
+    (when (and reader (async-end-buffer reader))
+      (let ((buf (async-end-buffer reader)))
+        (setf (async-end-buffer reader) nil)
+        (%buffer-put buf (list value) (async-end-t-ct reader)
+                     (async-end-owner reader))
+        (%end-notify reader 1))))
+  value)
 
 ;;; ---- End.copy (CanonicalABI.md 1687-1711): the 5 cases ----
 
@@ -3404,9 +3610,21 @@ the (memory ptr length progress) list. The 5 cases in order:
      ((null other)
       ;; the drop already notified us (the pending event holds)
       nil)
-     ;; case 2: the peer has no buffer — park mine, wait for it
+     ;; case 2: the peer has no buffer — park mine, wait for it. A
+     ;; HOST-BACKED peer (M16 slice 2) acts NOW instead: a sink drains
+     ;; my staged write, a source fills my read buffer, a resolved
+     ;; future delivers its value.
      ((null (async-end-buffer other))
-      (setf (async-end-buffer end) buffer))
+      (cond
+        ((and (async-end-host-sink other)
+              (plusp (%buffer-remain buffer)))
+         (setf (async-end-buffer end) buffer)
+         (%host-sink-drain end))
+        ((async-end-host-source other)
+         (%host-source-fill end buffer other))
+        ((async-end-host-value-p other)
+         (%host-value-deliver end buffer other))
+        (t (setf (async-end-buffer end) buffer))))
      ;; case 3: both have remain > 0 — copy the min
      ((and (plusp (%buffer-remain buffer))
            (plusp (%buffer-remain (async-end-buffer other))))
@@ -3461,14 +3679,18 @@ the (memory ptr length progress) list. The 5 cases in order:
 (defun %end-drop (end)
   "End.drop (CanonicalABI.md 1778-1790): notify the peer (progress 0,
 DROPPED on its next event delivery) unless it is already DONE or
-already has a pending event; detach both ends."
+already has a pending event; detach both ends. M16 slice 2: the
+detached HOST peer's one-shot hook fires (a provider resolves its
+future when the guest drops the stream's writable end)."
   (let ((other (async-end-other end)))
     (when other
       (unless (or (eq (async-end-state other) :done)
                   (async-waitable-pending-event other))
         (%end-notify other 0))
       (setf (async-end-other other) nil))
-    (setf (async-end-other end) nil))
+    (setf (async-end-other end) nil)
+    (when (and other (async-end-host-on-drop other))
+      (%host-peer-dropped other end)))
   ;; Waitable.drop: leave any waitable set
   (%waitable-join end nil))
 

@@ -206,3 +206,277 @@
           ;; the host clock is monotonic through the whole call path
           (is (<= a b)))
         (is (plusp (wasmdown.component.runtime:lifted-func-call res-fn)))))))
+
+;;; ===============================================================
+;;; M16 SLICE 2 — THE HOST STREAM/FUTURE ABI + wasi:cli stdio.
+;;; ===============================================================
+
+(defun rt (name)
+  "The runtime's internal function/accessor NAME (the host-end
+machinery is deliberately not part of the public surface)."
+  (or (find-symbol name (find-package '#:wasmdown.component.runtime))
+      (error "no runtime symbol ~a" name)))
+
+(defmacro rtcall (name &rest args)
+  `(funcall (rt ,(string name)) ,@args))
+
+(defparameter *u8-ct*
+  (wasmdown.component:make-ct :kind :prim :payload :u8))
+
+(defun %completed (n) (logior 0 (ash n 4)))
+
+;;; ---------------------------------------------------------------
+;;; The host-backed ENDS themselves (a CL-only round trip: no guest
+;;; memory, no guest instance — the copy protocol's case 2 consults
+;;; the host backing directly).
+
+(test wasi/host-sink-end-roundtrip
+  ;; The guest's writable end stages 2 elements; its peer is a HOST
+  ;; readable end whose SINK collects them. The write completes with
+  ;; COMPLETED|2<<4 — the canonical stream protocol, host as the peer.
+  (let ((sink-bytes '()))
+    (multiple-value-bind (reader writer)
+        (wasmdown.component.runtime:make-host-stream-pair *u8-ct*)
+      (wasmdown.component.runtime:host-end-set-sink
+       reader (lambda (bytes) (setf sink-bytes bytes) nil))
+      (let ((staged (wasmdown.component.runtime:make-host-buffer
+                     2 :values '(104 105))))
+        ;; the guest's write (case 2: the peer has no buffer)
+        (rtcall "%END-COPY" writer staged nil)
+        (is (equal '(104 105) sink-bytes))
+        (is (eql (%completed 2)
+                 (third (rtcall "%WAITABLE-GET-PENDING-EVENT" writer))))
+        ;; the stream write end returns to idle after delivery
+        (is (eq :idle (rtcall "ASYNC-END-STATE" writer)))))))
+
+(test wasi/host-source-end-eof-dropped
+  ;; The guest's readable end pulls from a HOST writable end's SOURCE:
+  ;; the bytes arrive COMPLETED|n<<4; the source's EOF drops the host
+  ;; writer, so the next read is DROPPED (the canonical 1).
+  (multiple-value-bind (reader writer)
+      (wasmdown.component.runtime:make-host-stream-pair *u8-ct*)
+    (let ((pulls 0))
+      (wasmdown.component.runtime:host-end-set-source
+       writer (lambda (max)
+                (incf pulls)
+                (if (= pulls 1)
+                    (values '(1 2 3) t)     ; bytes AND eof
+                    (values nil t))))
+      (let ((buf (wasmdown.component.runtime:make-host-buffer 8)))
+        (rtcall "%END-COPY" reader buf t)
+        (is (equal '(1 2 3)
+                   (wasmdown.component.runtime:host-buffer-values buf)))
+        (is (eql (%completed 3)
+                 (third (rtcall "%WAITABLE-GET-PENDING-EVENT" reader)))))
+      (let ((buf (wasmdown.component.runtime:make-host-buffer 8)))
+        (rtcall "%END-COPY" reader buf t)
+        ;; DROPPED == 1 (copy result 1, no progress for a stream)
+        (is (eql 1 (third (rtcall "%WAITABLE-GET-PENDING-EVENT" reader))))))))
+
+(test wasi/host-future-resolve
+  ;; A host future: the provider resolves the WRITABLE end; the guest's
+  ;; READABLE read delivers COMPLETED (0) with the value at its buffer.
+  (let ((fct (wasmdown.component:make-ct
+              :kind :result
+              :payload (cons nil (wasmdown.component:make-ct
+                                  :kind :enum
+                                  :payload (vector "io" "pipe"))))))
+    (multiple-value-bind (reader writer)
+        (wasmdown.component.runtime:make-host-future-pair fct)
+      (wasmdown.component.runtime:host-future-resolve writer '(:ok))
+      (let ((buf (wasmdown.component.runtime:make-host-buffer 1)))
+        (rtcall "%END-COPY" reader buf t)
+        (is (equal '((:ok))
+                   (wasmdown.component.runtime:host-buffer-values buf)))
+        (is (eql 0 (third (rtcall "%WAITABLE-GET-PENDING-EVENT" reader))))))
+    ;; the error case rides the same slot
+    (multiple-value-bind (reader writer)
+        (wasmdown.component.runtime:make-host-future-pair fct)
+      (wasmdown.component.runtime:host-future-resolve writer '(:err . "io"))
+      (let ((buf (wasmdown.component.runtime:make-host-buffer 1)))
+        (rtcall "%END-COPY" reader buf t)
+        (is (equal '((:err . "io"))
+                   (wasmdown.component.runtime:host-buffer-values buf)))))))
+
+;;; ---------------------------------------------------------------
+;;; wasi:cli stdio over the CONTEXT's CL streams (no ambient globals).
+
+(test wasi/cli-stdout-write-via-stream
+  (let* ((sink (make-string-output-stream))
+         (ctx (wasmdown.wasi:make-wasi-context :stdout sink))
+         (inst (wasmdown.wasi:cli-stdout-instance ctx))
+         (fn (provider-fn inst "write-via-stream")))
+    (multiple-value-bind (reader writer)
+        (wasmdown.component.runtime:make-host-stream-pair *u8-ct*)
+      ;; the guest writes BEFORE handing the end over: the provider's
+      ;; registration drains the parked buffer
+      (rtcall "%END-COPY" writer
+              (wasmdown.component.runtime:make-host-buffer
+               3 :values '(104 105 33))
+              nil)
+      (let ((future (wasmdown.component.runtime:lifted-func-call fn reader)))
+        (is (wasmdown.component.runtime:async-end-p future))
+        (is (string= "hi!" (get-output-stream-string sink)))
+        (is (eql (%completed 3)
+                 (third (rtcall "%WAITABLE-GET-PENDING-EVENT" writer))))
+        ;; a second write after registration drains straight through
+        (rtcall "%END-COPY" writer
+                (wasmdown.component.runtime:make-host-buffer
+                 2 :values '(10 10))
+                nil)
+        (is (string= (format nil "~c~c" #\Newline #\Newline)
+                     (get-output-stream-string sink)))
+        ;; dropping the guest's writable end resolves the future
+        (rtcall "%END-DROP" writer)
+        (let ((fbuf (wasmdown.component.runtime:make-host-buffer 1)))
+          (rtcall "%END-COPY" future fbuf t)
+          (is (equal '((:ok))
+                     (wasmdown.component.runtime:host-buffer-values fbuf)))
+          (is (eql 0 (third (rtcall "%WAITABLE-GET-PENDING-EVENT" future)))))))))
+
+(test wasi/cli-stderr-write-via-stream
+  (let* ((sink (make-string-output-stream))
+         (ctx (wasmdown.wasi:make-wasi-context :stderr sink))
+         (inst (wasmdown.wasi:cli-stderr-instance ctx))
+         (fn (provider-fn inst "write-via-stream")))
+    (multiple-value-bind (reader writer)
+        (wasmdown.component.runtime:make-host-stream-pair *u8-ct*)
+      (wasmdown.component.runtime:lifted-func-call fn reader)
+      (rtcall "%END-COPY" writer
+              (wasmdown.component.runtime:make-host-buffer 2 :values '(111 107))
+              nil)
+      (is (string= "ok" (get-output-stream-string sink))))))
+
+(test wasi/cli-stdin-read-via-stream
+  (let* ((source (make-string-input-stream "hello"))
+         (ctx (wasmdown.wasi:make-wasi-context :stdin source))
+         (inst (wasmdown.wasi:cli-stdin-instance ctx))
+         (fn (provider-fn inst "read-via-stream")))
+    (let* ((pair (wasmdown.component.runtime:lifted-func-call fn))
+           (stream (first pair))
+           (future (second pair)))
+      (is (= 2 (length pair)))
+      (is (wasmdown.component.runtime:async-end-p stream))
+      (is (wasmdown.component.runtime:async-end-p future))
+      ;; the guest reads the whole source
+      (let ((buf (wasmdown.component.runtime:make-host-buffer 5)))
+        (rtcall "%END-COPY" stream buf t)
+        (is (string= "hello"
+                     (coerce (mapcar #'code-char
+                                     (wasmdown.component.runtime:host-buffer-values
+                                      buf))
+                             'string)))
+        (is (eql (%completed 5)
+                 (third (rtcall "%WAITABLE-GET-PENDING-EVENT" stream)))))
+      ;; the source is exhausted: the next read is DROPPED
+      (let ((buf (wasmdown.component.runtime:make-host-buffer 5)))
+        (rtcall "%END-COPY" stream buf t)
+        (is (eql 1 (third (rtcall "%WAITABLE-GET-PENDING-EVENT" stream)))))
+      ;; the read result future is already resolved (success)
+      (let ((fbuf (wasmdown.component.runtime:make-host-buffer 1)))
+        (rtcall "%END-COPY" future fbuf t)
+        (is (equal '((:ok))
+                   (wasmdown.component.runtime:host-buffer-values fbuf)))))))
+
+(test wasi/cli-stdio-capability-withdrawn
+  ;; An absent stream is a withdrawn capability: the interface is still
+  ;; exported, but calling it traps with host-error (never an ambient
+  ;; *STANDARD-OUTPUT*).
+  (let* ((ctx (wasmdown.wasi:make-wasi-context))
+         (out (wasmdown.wasi:cli-stdout-instance ctx))
+         (in (wasmdown.wasi:cli-stdin-instance ctx)))
+    (is (block nil
+          (handler-case
+              (progn (call-provider out "write-via-stream" :not-an-end) :returned)
+            (wasmdown:host-error (c)
+              (search "capability" (wasmdown:wasmdown-error-message c))))))
+    (is (block nil
+          (handler-case
+              (progn (call-provider in "read-via-stream") :returned)
+            (wasmdown:host-error (c)
+              (search "capability" (wasmdown:wasmdown-error-message c)))))))
+  ;; the provider surfaces are keyed by the versioned WIT import names
+  (let ((names (mapcar #'car
+                       (wasmdown.wasi:cli-provider
+                        (wasmdown.wasi:make-wasi-context)))))
+    (is (member "wasi:cli/stdin@0.3.2" names :test #'string=))
+    (is (member "wasi:cli/stdout@0.3.2" names :test #'string=))
+    (is (member "wasi:cli/stderr@0.3.2" names :test #'string=))
+    (is (member "wasi:cli/environment@0.3.2" names :test #'string=))))
+
+;;; ---------------------------------------------------------------
+;;; THE END-TO-END FIXTURE: a component imports wasi:cli/stdout@0.3.2,
+;;; canon-lowers write-via-stream, hands it its stream's readable end,
+;;; writes through its own stream, drops the writable end and reads the
+;;; result future. The bytes land in the CONTEXT's sink.
+
+(defparameter *stdout-fixture*
+  (concatenate 'string
+   "(component"
+   " (type $ERR (enum \"io\" \"illegal-byte-sequence\" \"pipe\"))"
+   " (type $ST (stream u8))"
+   " (import \"wasi:cli/stdout@0.3.2\""
+   "   (instance $out"
+   "     (export \"error-code\" (type (eq $ERR)))"
+   "     (type $r (result (error $ERR)))"
+   "     (type $f (future $r))"
+   "     (type $s (stream u8))"
+   "     (export \"write-via-stream\""
+   "       (func (param \"data\" $s) (result $f)))))"
+   " (alias export $out \"write-via-stream\" (func $wvs))"
+   " (core func $wvs-lowered (canon lower (func $wvs)))"
+   " (core module $Memory (memory (export \"mem\") 1))"
+   " (core instance $memory (instantiate $Memory))"
+   " (core module $M"
+   "  (import \"env\" \"mem\" (memory 1))"
+   "  (import \"env\" \"stream.new\" (func $snew (result i64)))"
+   "  (import \"env\" \"stream.write\" (func $swrite (param i32 i32 i32) (result i32)))"
+   "  (import \"env\" \"stream.drop-writable\" (func $sdropw (param i32)))"
+   "  (import \"env\" \"future.read\" (func $fread (param i32 i32) (result i32)))"
+   "  (import \"env\" \"write-via-stream\" (func $wvs (param i32) (result i32)))"
+   "  (global $fut (mut i32) (i32.const 0))"
+   "  (func (export \"f\") (result i32)"
+   "    (local $p i64) (local $rx i32) (local $tx i32) (local $ret i32)"
+   "    (local.set $p (call $snew))"
+   "    (local.set $rx (i32.wrap_i64 (local.get $p)))"
+   "    (local.set $tx (i32.wrap_i64 (i64.shr_u (local.get $p) (i64.const 32))))"
+   "    (i32.store16 (i32.const 16) (i32.const 0x6968))"
+   "    (global.set $fut (call $wvs (local.get $rx)))"
+   "    (local.set $ret (call $swrite (local.get $tx) (i32.const 16) (i32.const 2)))"
+   "    (if (i32.ne (i32.const 32) (local.get $ret)) (then unreachable))"
+   "    (call $sdropw (local.get $tx))"
+   "    (local.set $ret (call $fread (global.get $fut) (i32.const 32)))"
+   "    (if (i32.ne (i32.const 0) (local.get $ret)) (then unreachable))"
+   "    (i32.load8_u (i32.const 32)))"
+   " )"
+   " (type $FT (future (result (error $ERR))))"
+   " (canon stream.new $ST (core func $snew))"
+   " (canon stream.write $ST (memory (core memory $memory \"mem\")) (core func $swrite))"
+   " (canon stream.drop-writable $ST (core func $sdropw))"
+   " (canon future.read $FT (memory (core memory $memory \"mem\")) (core func $fread))"
+   " (core instance $m (instantiate $M (with \"env\" (instance"
+   "   (export \"mem\" (memory $memory \"mem\"))"
+   "   (export \"stream.new\" (func $snew))"
+   "   (export \"stream.write\" (func $swrite))"
+   "   (export \"stream.drop-writable\" (func $sdropw))"
+   "   (export \"future.read\" (func $fread))"
+   "   (export \"write-via-stream\" (func $wvs-lowered))))))"
+   " (func (export \"f\") (result u32) (canon lift (core func $m \"f\"))))"))
+
+(test wasi/e2e-stdout-component
+  (let* ((sink (make-string-output-stream))
+         (context (wasmdown.wasi:make-wasi-context :stdout sink))
+         (comp (wasmdown.component.text::parse-component-text
+                *stdout-fixture*)))
+    (wasmdown.component:validate-component comp)
+    (let* ((inst (wasmdown.component.runtime:instantiate-component
+                  comp :with-args (wasmdown.wasi:cli-provider context)))
+           (f (wasmdown.component.runtime:runtime-export-value inst "f")))
+      (is (wasmdown.component.runtime:lifted-func-p f))
+      ;; the guest's 2 stream bytes ("hi") reached the context's sink
+      ;; and the result future's ok discriminant is 0
+      (is (eql 0 (wasmdown.component.runtime:lifted-func-call f)))
+      (is (string= "hi" (get-output-stream-string sink)))
+      ;; a second invocation sees a fresh, independently-authorized run
+      (is (eql 0 (wasmdown.component.runtime:lifted-func-call f)))
+      (is (string= "hi" (get-output-stream-string sink))))))
