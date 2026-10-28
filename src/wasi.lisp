@@ -2666,6 +2666,584 @@ revents, or NIL on timeout/error."
            (%socket-error (%socket-errno-code err)))))
       (t (%socket-check ret "connect")))))
 
+;;; ---------------------------------------------------------------
+;;; The reactor backend (plan step 6): one poll(2) + the monotonic
+;;; clock + a self-pipe wake channel. This is a STANDALONE host
+;;; facility: the store driver owns when STEP is called; the reactor
+;;; only reports what the OS says and hands each readiness to the
+;;; registration's callback.
+;;;
+;;; Contract
+;;;   * (REACTOR-STEP reactor max-wait-ns) pumps at most once and
+;;;     never blocks longer than MAX-WAIT-NS. It returns
+;;;     (values PROGRESS-P PENDING-P): PROGRESS-P = a callback ran or
+;;;     an external producer's wake byte was consumed; PENDING-P =
+;;;     registrations remain (so a caller with neither progress nor
+;;;     pending, no ready candidate and no external producer is in
+;;;     the spec's deadlock, not merely idle).
+;;;   * (REACTOR-WATCH-FD reactor fd direction registration-id cb)
+;;;     keys a watch by (fd, registration-id, direction): a numeric
+;;;     fd number reused by a DIFFERENT connection cannot inherit the
+;;;     old watch, and two watches on one fd with the same direction
+;;;     but different registration-ids are separate poll entries, so
+;;;     they never coalesce. FD watches are level-triggered (poll
+;;;     semantics): the callback runs on every step that observes the
+;;;     fd ready until the cancel-fn runs. CB is called with one
+;;;     argument, the STATUS: :read / :write / :both for the requested
+;;;     direction, or :error / :hup / :nval for POLLERR / POLLHUP /
+;;;     POLLNVAL (in that precedence).
+;;;   * (REACTOR-WATCH-DEADLINE reactor deadline-ns cb) is one-shot;
+;;;     a past or zero DEADLINE fires on the next step, a fired
+;;;     deadline is removed before CB runs. CB takes no arguments.
+;;;   * (REACTOR-CLOSE reactor) is idempotent; it cancels every
+;;;     registration (no callback runs after it returns, unless the
+;;;    caller is itself inside a callback of this reactor) and frees
+;;;     the self-pipe.
+;;;   * Callbacks run with no reactor lock held; they are expected to
+;;;     only enqueue an event. A callback must never be called after
+;;;     its cancel-fn ran: CANCEL-FN is idempotent and waits out a
+;;;     callback that is already in flight (except when called from
+;;;     inside that very callback).
+;;;   * CLOCK-FN (monotonic ns) and POLL-FN are injectable so tests
+;;;     script time and readiness without sleeping. POLL-FN receives
+;;;     (REQUESTS TIMEOUT-MS) where each request is a plist
+;;;     (:kind :fd|:wake :fd n :events bits) and returns
+;;;     (values REVENTS STATUS); REVENTS is one revents word per
+;;;     request (a bare list is STATUS :ok), STATUS is :ok, :eintr
+;;;     (re-poll without dispatching) or :error.
+;;;   * REACTOR-WAKE writes one byte to the self-pipe so an external
+;;;     producer blocked elsewhere can interrupt a blocked STEP.
+;;;   * Without a self-pipe (WAKE-P NIL, the testing configuration) a
+;;;     step never sleeps: with no fd registration there is nothing
+;;;     pollable, so it returns immediately instead of blocking.
+
+(defparameter +pollerr+ 8)
+(defparameter +pollhup+ 16)
+(defparameter +pollnval+ 32
+  "POLLNVAL — the fd was not open when poll ran.")
+(defparameter +o-nonblock+ #x800)
+
+(sb-alien:define-alien-routine ("pipe2" %libc-pipe2) sb-alien:int
+  (fds sb-sys:system-area-pointer) (flags sb-alien:int))
+
+(defstruct (reactor-registration (:constructor %make-reactor-registration))
+  "One watch. STATE is :live or :cancelled; BUSY-P is true while its
+callback is executing (CANCEL-FN waits on it, see the section
+comment). KEY is the (fd registration-id direction) table key of an
+:fd watch."
+  (kind nil :read-only t)              ; :fd | :deadline
+  (key nil)
+  (fd nil :read-only t)
+  (direction nil :read-only t)
+  (registration-id nil :read-only t)
+  (deadline nil :read-only t)
+  (callback nil :read-only t)
+  (seq 0)
+  (state :live)
+  (busy-p nil))
+
+(defstruct (wasi-reactor (:constructor %make-wasi-reactor))
+  "The poll(2) reactor: its registrations (ordered), the injectable
+clock/poll, and the self-pipe. MUTEX guards every field below the
+constructor's input; callbacks never run under it."
+  (mutex (sb-thread:make-mutex :name "wasi-reactor"))
+  (condition (sb-thread:make-waitqueue :name "wasi-reactor"))
+  (clock-fn nil)
+  (poll-fn nil)
+  (fd-table (make-hash-table :test #'equal))
+  (fd-order '())                       ; registrations, insertion order
+  (deadlines '())                      ; registrations, (deadline, seq) order
+  (seq 0)
+  (wake-read-fd nil)
+  (wake-write-fd nil)
+  (closed-p nil)
+  (fds-closed-p nil)
+  (pollers 0)
+  (in-flight 0))
+
+(defvar *reactor-callback-registration* nil
+  "The registration whose callback is running on this thread (or
+NIL): lets CANCEL-FN/REACTOR-CLOSE avoid waiting on themselves.")
+
+(defun %reactor-clock (reactor)
+  (funcall (wasi-reactor-clock-fn reactor)))
+
+(defun %reactor-events-for-direction (direction)
+  (ecase direction
+    (:read +pollin+)
+    (:write +pollout+)
+    (:both (logior +pollin+ +pollout+))))
+
+(defun %reactor-status (direction revents)
+  "The STATUS a watch on DIRECTION reports for REVENTS, or NIL when
+the fd is not ready for it. The error statuses take precedence: a
+connection that is hung up or errored is reported as such, not as a
+plain readiness."
+  (cond
+    ((logtest +pollnval+ revents) :nval)
+    ((logtest +pollerr+ revents) :error)
+    ((logtest +pollhup+ revents) :hup)
+    (t
+     (let ((wanted (logand revents (%reactor-events-for-direction direction))))
+       (cond
+         ((= wanted (%reactor-events-for-direction direction))
+          (if (eq direction :both) :both direction))
+         ((logtest +pollin+ wanted) :read)
+         ((logtest +pollout+ wanted) :write)
+         (t nil))))))
+
+;;; --- the real backend -------------------------------------------------
+
+(defun %reactor-poll-libc (requests timeout-ms)
+  "The default POLL-FN: one poll(2) over REQUESTS, one pollfd per
+registration (never coalesced). The pollfd layout is the C ABI's:
+int fd @0, short events @4, short revents @6; the stride is 8 bytes."
+  (let* ((n (length requests))
+         (alien (sb-alien:make-alien sb-alien:unsigned-char
+                                     (max 8 (* 8 n)))))
+    (unwind-protect
+         (let ((sap (sb-alien:alien-sap alien)))
+           (loop for request in requests
+                 for i from 0
+                 for base = (* 8 i)
+                 do (setf (sb-sys:sap-ref-32 sap base) (getf request :fd)
+                          (sb-sys:sap-ref-16 sap (+ base 4))
+                          (getf request :events)
+                          (sb-sys:sap-ref-16 sap (+ base 6)) 0))
+           (sb-alien:set-errno 0)
+           (let ((rc (%libc-poll sap n (min timeout-ms #x7fffffff))))
+             (cond
+               ((plusp rc)
+                (values (loop for i below n
+                              collect (sb-sys:sap-ref-16 sap (+ (* 8 i) 6)))
+                        :ok))
+               ((zerop rc)
+                (values (make-list n :initial-element 0) :ok))
+               ((= (sb-alien:get-errno) +eintr+)
+                (values nil :eintr))
+               (t (values nil :error)))))
+      (sb-alien:free-alien alien))))
+
+(defun %reactor-open-pipe ()
+  "A nonblocking close-on-exec self-pipe as (values READ-FD WRITE-FD),
+or NIL when the OS refuses one."
+  (let ((fds (sb-alien:make-alien (sb-alien:array sb-alien:unsigned-char 8))))
+    (unwind-protect
+         (let ((sap (sb-alien:alien-sap fds)))
+           (when (zerop (%libc-pipe2 sap (logior +o-nonblock+ +o-cloexec+)))
+             (values (sb-sys:sap-ref-32 sap 0)
+                     (sb-sys:sap-ref-32 sap 4))))
+      (sb-alien:free-alien fds))))
+
+;;; --- the registry ------------------------------------------------------
+
+(defun %reactor-unlink (reactor registration)
+  "Remove REGISTRATION from its ordered list/table. The reactor mutex
+must be held."
+  (ecase (reactor-registration-kind registration)
+    (:fd
+     (remhash (reactor-registration-key registration)
+              (wasi-reactor-fd-table reactor))
+     (setf (wasi-reactor-fd-order reactor)
+           (remove registration (wasi-reactor-fd-order reactor)
+                   :test #'eq)))
+    (:deadline
+     (setf (wasi-reactor-deadlines reactor)
+           (remove registration (wasi-reactor-deadlines reactor)
+                   :test #'eq)))))
+
+(defun %reactor-finalize (reactor)
+  "Close the self-pipe's read end once it is safe: no callback is in
+flight and no poller still holds the fd. Every caller holds the
+reactor mutex."
+  (when (and (wasi-reactor-closed-p reactor)
+             (not (wasi-reactor-fds-closed-p reactor))
+             (zerop (wasi-reactor-pollers reactor)))
+    (setf (wasi-reactor-fds-closed-p reactor) t)
+    (let ((fd (wasi-reactor-wake-read-fd reactor)))
+      (setf (wasi-reactor-wake-read-fd reactor) nil)
+      (when (and fd (>= fd 0)) (%close-fd fd)))))
+
+(defun %reactor-claim (reactor registration &key one-shot)
+  "Mark REGISTRATION busy for one callback. Returns true when this
+caller won the claim (the registration was :live); false when it was
+cancelled meanwhile. A ONE-SHOT claim unlinks and cancels the
+registration before the callback runs, so a cancel-fn invoked from
+inside the callback is a harmless no-op."
+  (let ((mutex (wasi-reactor-mutex reactor))
+        (claimed nil))
+    (sb-thread:grab-mutex mutex)
+    (unwind-protect
+         (when (eq :live (reactor-registration-state registration))
+           (setf (reactor-registration-busy-p registration) t)
+           (when one-shot
+             (setf (reactor-registration-state registration) :cancelled)
+             (%reactor-unlink reactor registration))
+           (incf (wasi-reactor-in-flight reactor))
+           (setf claimed t))
+      (sb-thread:release-mutex mutex))
+    claimed))
+
+(defun %reactor-finish (reactor registration)
+  "End a callback: clear BUSY-P, wake a cancel-fn waiting on it, and
+finalize a pending close."
+  (let ((mutex (wasi-reactor-mutex reactor)))
+    (sb-thread:grab-mutex mutex)
+    (setf (reactor-registration-busy-p registration) nil)
+    (decf (wasi-reactor-in-flight reactor))
+    (sb-thread:condition-broadcast (wasi-reactor-condition reactor))
+    (%reactor-finalize reactor)
+    (sb-thread:release-mutex mutex)))
+
+(defun %reactor-cancel (reactor registration)
+  "Cancel REGISTRATION. Idempotent. Waits out a callback already in
+flight unless this is that callback (a callback cancelling itself).
+The wait also covers a registration another caller has already marked
+cancelled but whose callback is still running (the replace path)."
+  (let ((mutex (wasi-reactor-mutex reactor))
+        (self *reactor-callback-registration*))
+    (sb-thread:grab-mutex mutex)
+    (unwind-protect
+         (progn
+           (setf (reactor-registration-state registration) :cancelled)
+           (%reactor-unlink reactor registration)
+           (unless (eq self registration)
+             (loop while (reactor-registration-busy-p registration)
+                   do (sb-thread:condition-wait
+                       (wasi-reactor-condition reactor) mutex)))
+           t)
+      (sb-thread:release-mutex mutex))))
+
+(defun %reactor-write-wake-byte (reactor)
+  "Write one byte to the self-pipe (nonblocking: a full pipe is
+already a pending wake, so EAGAIN is success)."
+  (let ((fd (wasi-reactor-wake-write-fd reactor))
+        (byte (make-array 1 :element-type '(unsigned-byte 8)
+                            :initial-element 0)))
+    (when (and fd (>= fd 0))
+      ;; UNIX-WRITE is (fd buf offset len) with BUF a simple unboxed
+      ;; array (no pinning needed)
+      (sb-unix:unix-write fd byte 0 1)
+      t)))
+
+(defun reactor-wake (reactor)
+  "Wake a step blocked in poll(2) (an external producer's channel).
+Serialized against REACTOR-CLOSE so a wake never writes a closed fd."
+  (let ((mutex (wasi-reactor-mutex reactor)))
+    (sb-thread:grab-mutex mutex)
+    (unwind-protect
+         (not (null (%reactor-write-wake-byte reactor)))
+      (sb-thread:release-mutex mutex))))
+
+(defun %reactor-drain-wake (reactor wake-fd)
+  "Consume every byte the self-pipe holds on WAKE-FD (the fd
+%REACTOR-SNAPSHOT captured under the mutex). Returns true when at
+least one byte was read: an external producer signalled."
+  (declare (ignore reactor))
+  (let ((buffer (make-array 256 :element-type '(unsigned-byte 8)))
+        (drained nil))
+    (when (and wake-fd (>= wake-fd 0))
+      (loop
+        (multiple-value-bind (count errno)
+            (sb-sys:with-pinned-objects (buffer)
+              (sb-unix:unix-read wake-fd (sb-sys:vector-sap buffer) 256))
+          (declare (ignore errno))
+          (unless (and count (plusp count))
+            (return))
+          (setf drained t))))
+    drained))
+
+;;; --- the public surface ------------------------------------------------
+
+(defun make-wasi-reactor (&key clock-fn poll-fn (wake-p t))
+  "A reactor whose time comes from CLOCK-FN (default MONOTONIC-NOW)
+and whose readiness comes from POLL-FN (default the libc poll
+backend). WAKE-P NIL omits the self-pipe: useful for tests whose
+injected POLL-FN scripts readiness, and it makes STEP nonblocking
+(when nothing is registered there is nothing to wait for)."
+  (let ((reactor (%make-wasi-reactor
+                  :clock-fn (or clock-fn #'monotonic-now)
+                  :poll-fn (or poll-fn #'%reactor-poll-libc))))
+    (when wake-p
+      (multiple-value-bind (read-fd write-fd) (%reactor-open-pipe)
+        (unless (and read-fd write-fd (not (minusp read-fd))
+                     (not (minusp write-fd)))
+          (error "unable to open the reactor's self-pipe"))
+        (setf (wasi-reactor-wake-read-fd reactor) read-fd
+              (wasi-reactor-wake-write-fd reactor) write-fd)))
+    reactor))
+
+(defun reactor-watch-fd (reactor fd direction registration-id callback)
+  "Watch FD for DIRECTION (:read / :write / :both). REGISTRATION-ID is
+the caller's opaque identity for the resource behind FD; the watch is
+keyed by (fd, registration-id, direction), so a reused numeric fd
+cannot inherit this watch. Returns an idempotent cancel-fn. A repeat
+registration with the same key replaces the previous watch. Signals an
+error when the reactor is closed."
+  (unless (member direction '(:read :write :both))
+    (error "reactor direction ~s is not :read, :write or :both" direction))
+  (let* ((mutex (wasi-reactor-mutex reactor))
+         (key (list fd registration-id direction))
+         (registration
+           (%make-reactor-registration
+            :kind :fd :key key :fd fd :direction direction
+            :registration-id registration-id :callback callback))
+         (previous nil))
+    (sb-thread:grab-mutex mutex)
+    (unwind-protect
+         (progn
+           (when (wasi-reactor-closed-p reactor)
+             (error "reactor is closed"))
+           (setf previous (gethash key (wasi-reactor-fd-table reactor)))
+           (when previous
+             (setf (reactor-registration-state previous) :cancelled)
+             (%reactor-unlink reactor previous))
+           (setf (reactor-registration-seq registration)
+                 (incf (wasi-reactor-seq reactor)))
+           (setf (gethash key (wasi-reactor-fd-table reactor)) registration)
+           (setf (wasi-reactor-fd-order reactor)
+                 (append (wasi-reactor-fd-order reactor)
+                         (list registration))))
+      (sb-thread:release-mutex mutex))
+    (when previous
+      ;; a callback of the replaced watch may still be in flight; make
+      ;; sure it has returned before its replacement can run
+      (%reactor-cancel reactor previous))
+    (lambda () (%reactor-cancel reactor registration))))
+
+(defun %reactor-deadline-before-p (a b)
+  (let ((da (reactor-registration-deadline a))
+        (db (reactor-registration-deadline b)))
+    (or (< da db) (and (= da db)
+                       (< (reactor-registration-seq a)
+                          (reactor-registration-seq b))))))
+
+(defun reactor-watch-deadline (reactor deadline-ns callback)
+  "Call CALLBACK (no arguments) on the first step whose clock reads
+DEADLINE-NS or later; the registration is one-shot. A past or zero
+DEADLINE fires on the next step. Returns an idempotent cancel-fn."
+  (unless (integerp deadline-ns)
+    (error "reactor deadline ~s is not an integer" deadline-ns))
+  (let* ((mutex (wasi-reactor-mutex reactor))
+         (registration
+           (%make-reactor-registration
+            :kind :deadline :deadline deadline-ns :callback callback)))
+    (sb-thread:grab-mutex mutex)
+    (unwind-protect
+         (progn
+           (when (wasi-reactor-closed-p reactor)
+             (error "reactor is closed"))
+           (setf (reactor-registration-seq registration)
+                 (incf (wasi-reactor-seq reactor)))
+           (setf (wasi-reactor-deadlines reactor)
+                 (stable-sort (cons registration
+                                    (wasi-reactor-deadlines reactor))
+                              #'%reactor-deadline-before-p)))
+      (sb-thread:release-mutex mutex))
+    (lambda () (%reactor-cancel reactor registration))))
+
+;;; --- the pump ----------------------------------------------------------
+
+(defun %reactor-snapshot (reactor)
+  "The poll requests and the registrations they belong to. Returns
+(values REQUESTS FD-REGISTRATIONS DEADLINES WAKE-FD). The fd requests
+are in registration order, one per watch; the wake request (when the
+self-pipe exists) comes last."
+  (let ((mutex (wasi-reactor-mutex reactor))
+        (fds '()) (deadlines '()) (wake-fd nil))
+    (sb-thread:grab-mutex mutex)
+    (unwind-protect
+         (setf fds (copy-list (wasi-reactor-fd-order reactor))
+               deadlines (copy-list (wasi-reactor-deadlines reactor))
+               wake-fd (wasi-reactor-wake-read-fd reactor))
+      (sb-thread:release-mutex mutex))
+    (let ((requests
+            (loop for registration in fds
+                  collect (list :kind :fd
+                                :fd (reactor-registration-fd registration)
+                                :events (%reactor-events-for-direction
+                                         (reactor-registration-direction
+                                          registration))))))
+      (when (and wake-fd (>= wake-fd 0))
+        (setf requests (append requests
+                               (list (list :kind :wake :fd wake-fd
+                                           :events +pollin+)))))
+      (values requests fds deadlines wake-fd))))
+
+(defun %reactor-call-poll (reactor requests timeout-ms)
+  "Run the injected POLL-FN with the reactor's poller count raised, so
+REACTOR-CLOSE cannot free an fd poll(2) is still using."
+  (let ((mutex (wasi-reactor-mutex reactor)))
+    (sb-thread:grab-mutex mutex)
+    (incf (wasi-reactor-pollers reactor))
+    (sb-thread:release-mutex mutex)
+    (unwind-protect
+         (let ((revents nil) (status nil))
+           (multiple-value-setq (revents status)
+             (funcall (wasi-reactor-poll-fn reactor) requests timeout-ms))
+           (case revents
+             (:eintr (setf revents nil status :eintr))
+             (:error (setf revents nil status :error)))
+           (values revents status))
+      (sb-thread:grab-mutex mutex)
+      (decf (wasi-reactor-pollers reactor))
+      (%reactor-finalize reactor)
+      (sb-thread:release-mutex mutex))))
+
+(defun %reactor-pump (reactor limit)
+  "One poll phase, bounded by LIMIT (monotonic ns): wait no longer than
+LIMIT - now and no longer than the earliest deadline. EINTR re-polls
+(the budget shrinks, so a signal storm cannot extend the step past
+LIMIT). Returns (values REQUESTS FD-REGISTRATIONS DEADLINES WAKE-FD
+REVENTS). A closed reactor, or nothing pollable, yields REVENTS NIL
+without calling POLL-FN."
+  (loop
+    (multiple-value-bind (requests fds deadlines wake-fd)
+        (%reactor-snapshot reactor)
+      (when (null requests)
+        (return-from %reactor-pump
+          (values requests fds deadlines wake-fd nil)))
+      (let* ((now (%reactor-clock reactor))
+             (budget (- limit now)))
+        (when deadlines
+          (setf budget (min budget
+                            (- (reactor-registration-deadline
+                                (first deadlines))
+                               now))))
+        (when (minusp budget) (setf budget 0))
+        ;; FLOOR, not ceiling: poll's timeout is whole milliseconds, and
+        ;; rounding up would let a step block for up to 1ms past
+        ;; MAX-WAIT-NS. A sub-millisecond budget polls nonblockingly and
+        ;; leaves the (still future) deadline to the next step.
+        (let ((timeout-ms (floor budget 1000000)))
+          (multiple-value-bind (revents status)
+              (%reactor-call-poll reactor requests timeout-ms)
+            (unless (and (eq status :eintr) (plusp timeout-ms))
+              (return-from %reactor-pump
+                (values requests fds deadlines wake-fd
+                        (and (listp revents) revents))))))))))
+
+(defun %reactor-dispatch-fds (reactor registrations revents)
+  "Deliver FD readiness in registration order; true when any callback
+ran."
+  (let ((progress nil))
+    (loop for registration in registrations
+          for revents-word in revents
+          for status = (%reactor-status
+                        (reactor-registration-direction registration)
+                        (or revents-word 0))
+          when status
+            do (when (%reactor-claim reactor registration)
+                 (setf progress t)
+                 (unwind-protect
+                      (let ((*reactor-callback-registration* registration))
+                        (funcall (reactor-registration-callback registration)
+                                 status))
+                   (%reactor-finish reactor registration))))
+    progress))
+
+(defun %reactor-dispatch-deadlines (reactor registrations now)
+  "Fire every due deadline in (deadline, registration) order; true
+when any callback ran."
+  (let ((progress nil))
+    (dolist (registration registrations)
+      (when (<= (reactor-registration-deadline registration) now)
+        (when (%reactor-claim reactor registration :one-shot t)
+          (setf progress t)
+          (unwind-protect
+               (let ((*reactor-callback-registration* registration))
+                 (funcall (reactor-registration-callback registration)))
+            (%reactor-finish reactor registration)))))
+    progress))
+
+(defun reactor-step (reactor max-wait-ns)
+  "Pump the reactor at most once. Waits no longer than MAX-WAIT-NS, or
+until the earliest deadline, whichever comes first; a past deadline
+or a ready fd makes the wait 0. Callbacks run in this order: fd
+readiness in registration order, then due deadlines in deadline order.
+Returns (values PROGRESS-P PENDING-P)."
+  (let ((mutex (wasi-reactor-mutex reactor)))
+    (sb-thread:grab-mutex mutex)
+    (let ((closed (wasi-reactor-closed-p reactor)))
+      (unless closed (incf (wasi-reactor-pollers reactor)))
+      (sb-thread:release-mutex mutex)
+      (when closed (return-from reactor-step (values nil nil))))
+    (unwind-protect
+         (progn
+           (let* ((wait (if (and (integerp max-wait-ns) (plusp max-wait-ns))
+                            max-wait-ns
+                            0))
+                  (limit (+ (%reactor-clock reactor) wait)))
+             (multiple-value-bind (requests fds deadlines wake-fd revents)
+                 (%reactor-pump reactor limit)
+               (declare (ignore requests))
+               ;; REACTOR-CLOSE during the poll cancels everything; no
+               ;; callback runs after close.
+               (sb-thread:grab-mutex mutex)
+               (let ((closed (wasi-reactor-closed-p reactor)))
+                 (sb-thread:release-mutex mutex)
+                 (when closed (return-from reactor-step (values nil nil))))
+               (let ((progress nil))
+                 (when (and wake-fd (>= wake-fd 0) revents
+                            (plusp (or (nth (length fds) revents) 0)))
+                   (when (%reactor-drain-wake reactor wake-fd)
+                     (setf progress t)))
+                 (when revents
+                   (when (%reactor-dispatch-fds reactor fds revents)
+                     (setf progress t)))
+                 (when deadlines
+                   (when (%reactor-dispatch-deadlines reactor deadlines
+                                                      (%reactor-clock reactor))
+                     (setf progress t)))
+                 (sb-thread:grab-mutex mutex)
+                 (let ((pending (and (not (wasi-reactor-closed-p reactor))
+                                     (or (plusp (hash-table-count
+                                                 (wasi-reactor-fd-table
+                                                  reactor)))
+                                         (not (null (wasi-reactor-deadlines
+                                                     reactor)))))))
+                   (sb-thread:release-mutex mutex)
+                   (values (and progress t) (and pending t)))))))
+      ;; the permit covers the pump AND the drain/dispatch, so a
+      ;; concurrent close cannot free the self-pipe's read fd while
+      ;; this step is still reading it
+      (sb-thread:grab-mutex mutex)
+      (decf (wasi-reactor-pollers reactor))
+      (%reactor-finalize reactor)
+      (sb-thread:release-mutex mutex))))
+
+(defun reactor-close (reactor)
+  "Idempotent: cancel every registration, close the self-pipe and make
+the reactor refuse new watches. No callback starts after this returns
+(unless the caller is itself inside one of this reactor's callbacks)."
+  (let ((mutex (wasi-reactor-mutex reactor))
+        (self *reactor-callback-registration*))
+    (sb-thread:grab-mutex mutex)
+    (unwind-protect
+         (progn
+           (unless (wasi-reactor-closed-p reactor)
+             (setf (wasi-reactor-closed-p reactor) t)
+             (dolist (registration (wasi-reactor-fd-order reactor))
+               (setf (reactor-registration-state registration) :cancelled))
+             (dolist (registration (wasi-reactor-deadlines reactor))
+               (setf (reactor-registration-state registration) :cancelled))
+             (clrhash (wasi-reactor-fd-table reactor))
+             (setf (wasi-reactor-fd-order reactor) nil
+                   (wasi-reactor-deadlines reactor) nil)
+             ;; closing the write end wakes a poller blocked on the
+             ;; read end (it observes POLLHUP), so a close never waits
+             ;; for a step in another thread
+             (let ((write-fd (wasi-reactor-wake-write-fd reactor)))
+               (setf (wasi-reactor-wake-write-fd reactor) nil)
+               (when (and write-fd (>= write-fd 0)) (%close-fd write-fd)))
+             (unless self
+               (loop while (plusp (wasi-reactor-in-flight reactor))
+                     do (sb-thread:condition-wait
+                         (wasi-reactor-condition reactor) mutex))))
+           (%reactor-finalize reactor)
+           t)
+      (sb-thread:release-mutex mutex))))
+
 (defun %getsockname-domain (fd what)
   "getsockname/getpeername as a WIT ip-socket-address domain value."
   (let ((alien (sb-alien:make-alien sb-alien:unsigned-char +sockaddr-storage-size+))

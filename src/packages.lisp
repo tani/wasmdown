@@ -550,4 +550,14 @@
    #:http-client-send
    #:http-types-instance
    #:http-client-instance
-   #:http-provider))
+   #:http-provider
+   ;; reactor backend (plan step 6): poll(2) + the monotonic clock +
+   ;; the self-pipe wake channel, with injectable time/readiness
+   #:wasi-reactor
+   #:wasi-reactor-p
+   #:make-wasi-reactor
+   #:reactor-step
+   #:reactor-watch-fd
+   #:reactor-watch-deadline
+   #:reactor-close
+   #:reactor-wake))

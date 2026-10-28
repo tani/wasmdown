@@ -3402,3 +3402,320 @@ ok, and exports `run' (the runner's direct-export fallback)."
   (is (block nil
         (handler-case (progn (wasmdown.wasi:parse-wasi-endpoint "nonsense") nil)
           (wasmdown:host-error () t)))))
+
+;;; ---------------------------------------------------------------
+;;; The reactor backend (plan step 6): poll(2) + the monotonic clock +
+;;; the self-pipe wake channel. Every test here injects its clock and
+;;; readiness (or uses real loopback readiness that is already there),
+;;; so nothing sleeps and nothing polls in a loop.
+
+(defun reactor-fake (clock-fn poll-fn)
+  "A reactor with the injected CLOCK-FN/POLL-FN and no self-pipe:
+STEP never blocks, so a fake clock fully determines the outcome."
+  (wasmdown.wasi:make-wasi-reactor :clock-fn clock-fn :poll-fn poll-fn
+                                   :wake-p nil))
+
+(test wasi/reactor-deadlines
+  (let* ((now 1000000000)
+         (reactor (reactor-fake (lambda () now) nil))
+         (fired '()))
+    (unwind-protect
+         (progn
+           ;; a zero deadline fires on the next step (no pollable fd, no
+           ;; pipe: the step returns immediately and the clock decides)
+           (wasmdown.wasi:reactor-watch-deadline
+            reactor 0 (lambda () (push :zero fired)))
+           (multiple-value-bind (progress pending)
+               (wasmdown.wasi:reactor-step reactor 0)
+             (is progress)
+             (is (not pending))
+             (is (equal '(:zero) fired)))
+           ;; a past deadline fires, a future one does not; a future
+           ;; registration leaves PENDING-P true
+           (setf now 5000)
+           (wasmdown.wasi:reactor-watch-deadline
+            reactor 4000 (lambda () (push :past fired)))
+           (let ((future (wasmdown.wasi:reactor-watch-deadline
+                          reactor 9000 (lambda () (push :future fired)))))
+             (multiple-value-bind (progress pending)
+                 (wasmdown.wasi:reactor-step reactor 0)
+               (is progress)
+               (is pending)
+               (is (equal '(:past :zero) fired)))
+             (multiple-value-bind (progress pending)
+                 (wasmdown.wasi:reactor-step reactor 0)
+               (is (not progress))
+               (is pending)
+               (is (equal '(:past :zero) fired)))
+             ;; cancel is idempotent and removes the pending deadline
+             (funcall future)
+             (funcall future)
+             (multiple-value-bind (progress pending)
+                 (wasmdown.wasi:reactor-step reactor 0)
+               (is (not progress))
+               (is (not pending))
+               (is (equal '(:past :zero) fired))))
+           ;; due deadlines fire in (deadline, registration) order
+           (setf now 20000)
+           (let ((order '()))
+             (wasmdown.wasi:reactor-watch-deadline
+              reactor 10000 (lambda () (push :a order)))
+             (wasmdown.wasi:reactor-watch-deadline
+              reactor 10000 (lambda () (push :b order)))
+             (wasmdown.wasi:reactor-watch-deadline
+              reactor 9000 (lambda () (push :c order)))
+             (multiple-value-bind (progress pending)
+                 (wasmdown.wasi:reactor-step reactor 0)
+               (is progress)
+               (is (not pending))
+               (is (equal (list :c :a :b) (reverse order))))))
+      (wasmdown.wasi:reactor-close reactor))))
+
+(test wasi/reactor-fd-order
+  ;; one pump = one callback per ready registration; readiness is
+  ;; delivered in registration order, and each step repeats it
+  ;; (level-triggered) until the cancel-fn runs
+  (let* ((calls 0)
+         (requests-seen '())
+         (poll-fn (lambda (requests timeout)
+                    (declare (ignore timeout))
+                    (incf calls)
+                    (push (mapcar (lambda (request) (getf request :fd))
+                                  requests)
+                          requests-seen)
+                    (mapcar (lambda (request)
+                              (if (member (getf request :fd) '(7 9)) 1 0))
+                            requests)))
+         (reactor (reactor-fake (constantly 0) poll-fn))
+         (events '()))
+    (unwind-protect
+         (let ((seven (wasmdown.wasi:reactor-watch-fd
+                       reactor 7 :read 'conn-7
+                       (lambda (status) (push (cons 7 status) events))))
+               (nine (wasmdown.wasi:reactor-watch-fd
+                      reactor 9 :read 'conn-9
+                      (lambda (status) (push (cons 9 status) events)))))
+           (multiple-value-bind (progress pending)
+               (wasmdown.wasi:reactor-step reactor 5000000)
+             (is progress)
+             (is pending)
+             (is (= 1 calls))
+             ;; both ready fds were polled in registration order and
+             ;; both callbacks ran within the one step
+             (is (equal '((7 9)) requests-seen))
+             (is (equal '((7 . :read) (9 . :read)) (reverse events))))
+           ;; the second step pumps once more: one callback each, in order
+           (multiple-value-bind (progress pending)
+               (wasmdown.wasi:reactor-step reactor 0)
+             (is progress)
+             (is pending)
+             (is (= 2 calls))
+             (is (= 4 (length events)))
+             (is (equal '((7 . :read) (9 . :read))
+                        (subseq (reverse events) 2 4))))
+           ;; cancelled watch is skipped, the other one still fires
+           (funcall seven)
+           (multiple-value-bind (progress pending)
+               (wasmdown.wasi:reactor-step reactor 0)
+             (is progress)
+             (is pending)
+             (is (= 5 (length events)))
+             (is (equal '(9 . :read) (first events))))
+           (funcall nine)
+           (multiple-value-bind (progress pending)
+               (wasmdown.wasi:reactor-step reactor 0)
+             (is (not progress))
+             (is (not pending))))
+      (wasmdown.wasi:reactor-close reactor))))
+
+(test wasi/reactor-fd-status-and-eintr
+  ;; POLLERR / POLLHUP / POLLNVAL reach the callback as :error / :hup /
+  ;; :nval, taking precedence over a plain readiness
+  (let* ((revents-of (lambda (fd)
+                       (cond ((= fd 11) 16)     ; POLLHUP
+                             ((= fd 13) 8)      ; POLLERR
+                             ((= fd 15) 32)     ; POLLNVAL
+                             ((= fd 17) 4)      ; POLLOUT
+                             (t 0))))
+         (poll-fn (lambda (requests timeout)
+                    (declare (ignore timeout))
+                    (mapcar (lambda (request)
+                              (funcall revents-of (getf request :fd)))
+                            requests)))
+         (reactor (reactor-fake (constantly 0) poll-fn))
+         (seen '()))
+    (unwind-protect
+         (progn
+           (wasmdown.wasi:reactor-watch-fd
+            reactor 11 :read 'hup-fd (lambda (status) (push (cons :hup status) seen)))
+           (wasmdown.wasi:reactor-watch-fd
+            reactor 13 :read 'err-fd (lambda (status) (push (cons :err status) seen)))
+           (wasmdown.wasi:reactor-watch-fd
+            reactor 15 :read 'nval-fd (lambda (status) (push (cons :nval status) seen)))
+           (wasmdown.wasi:reactor-watch-fd
+            reactor 17 :write 'write-fd
+            (lambda (status) (push (cons :write status) seen)))
+           (wasmdown.wasi:reactor-step reactor 1000000)
+           (is (equal '((:hup . :hup) (:err . :error)
+                        (:nval . :nval) (:write . :write))
+                      (reverse seen))))
+      (wasmdown.wasi:reactor-close reactor)))
+  ;; the same fd, the same direction, DIFFERENT registration ids: two
+  ;; separate poll entries -> two callbacks (never coalesced)
+  (let* ((poll-fn (lambda (requests timeout)
+                    (declare (ignore timeout))
+                    (mapcar (constantly 1) requests)))
+         (reactor (reactor-fake (constantly 0) poll-fn))
+         (seen '()))
+    (unwind-protect
+         (progn
+           (wasmdown.wasi:reactor-watch-fd
+            reactor 5 :read 'conn-a
+            (lambda (status) (push (list 'a status) seen)))
+           (wasmdown.wasi:reactor-watch-fd
+            reactor 5 :read 'conn-b
+            (lambda (status) (push (list 'b status) seen)))
+           (multiple-value-bind (progress pending)
+               (wasmdown.wasi:reactor-step reactor 1000000)
+             (is progress)
+             (is pending)
+             (is (= 2 (length seen)))
+             (is (equal '((a :read) (b :read)) (reverse seen)))))
+      (wasmdown.wasi:reactor-close reactor)))
+  ;; EINTR re-polls within the same bounded step and then dispatches
+  (let* ((calls 0)
+         (poll-fn (lambda (requests timeout)
+                    (declare (ignore requests timeout))
+                    (if (= (incf calls) 1) :eintr (list 1))))
+         (reactor (reactor-fake (constantly 0) poll-fn))
+         (seen '()))
+    (unwind-protect
+         (progn
+           (wasmdown.wasi:reactor-watch-fd
+            reactor 21 :read 'eintr-fd
+            (lambda (status) (push status seen)))
+           (multiple-value-bind (progress pending)
+               (wasmdown.wasi:reactor-step reactor 2000000)
+             (is (= 2 calls))
+             (is progress)
+             (is pending)
+             (is (equal '(:read) seen))))
+      (wasmdown.wasi:reactor-close reactor))))
+
+(test wasi/reactor-cancel-close
+  (let* ((poll-fn (lambda (requests timeout)
+                    (declare (ignore timeout))
+                    (mapcar (constantly 1) requests)))
+         (reactor (reactor-fake (constantly 0) poll-fn))
+         (fired '()))
+    (unwind-protect
+         (progn
+           ;; cancel is idempotent and no callback runs afterwards
+           (let ((cancel (wasmdown.wasi:reactor-watch-fd
+                          reactor 3 :read 'cancelled
+                          (lambda (status) (push status fired)))))
+             (funcall cancel)
+             (funcall cancel)
+             (multiple-value-bind (progress pending)
+                 (wasmdown.wasi:reactor-step reactor 1000000)
+               (is (not progress))
+               (is (not pending))
+               (is (null fired))))
+           ;; a callback cancelling itself does not deadlock and stops
+           ;; the watch after exactly one delivery
+           (let ((cancel nil)
+                 (count 0))
+             (setf cancel
+                   (wasmdown.wasi:reactor-watch-fd
+                    reactor 4 :read 'self-cancel
+                    (lambda (status)
+                      (declare (ignore status))
+                      (incf count)
+                      (funcall cancel))))
+             (wasmdown.wasi:reactor-step reactor 1000000)
+             (multiple-value-bind (progress pending)
+                 (wasmdown.wasi:reactor-step reactor 1000000)
+               (is (not progress))
+               (is (not pending)))
+             (is (= 1 count)))
+           ;; close cancels every registration, is idempotent, and the
+           ;; reactor refuses new watches
+           (let ((nothing '()))
+             (wasmdown.wasi:reactor-watch-fd
+              reactor 5 :read 'closed-fd
+              (lambda (status) (push status nothing)))
+             (wasmdown.wasi:reactor-watch-deadline
+              reactor 0 (lambda () (push :deadline nothing)))
+             (wasmdown.wasi:reactor-close reactor)
+             (wasmdown.wasi:reactor-close reactor)
+             (multiple-value-bind (progress pending)
+                 (wasmdown.wasi:reactor-step reactor 0)
+               (is (not progress))
+               (is (not pending)))
+             (is (null nothing))
+             (is (handler-case
+                     (progn (wasmdown.wasi:reactor-watch-fd
+                             reactor 6 :read 'after-close
+                             (lambda (status) (declare (ignore status))))
+                            nil)
+                   (error () t)))
+             (is (handler-case
+                     (progn (wasmdown.wasi:reactor-watch-deadline
+                             reactor 0 (lambda () nil))
+                            nil)
+                   (error () t)))))
+      (wasmdown.wasi:reactor-close reactor))))
+
+(test wasi/reactor-tcp-loopback
+  ;; the real backend: a listening TCP socket becomes readable after a
+  ;; loopback connect; one bounded step reports it (no polling loop and
+  ;; no sleep in the test)
+  (let* ((net (sock-network))
+         (server (sock-rep (wasmdown.wasi:tcp-create
+                            nil net (cons :enum "ipv4"))))
+         (client (sock-rep (wasmdown.wasi:tcp-create
+                            nil net (cons :enum "ipv4"))))
+         (reactor (wasmdown.wasi:make-wasi-reactor))
+         (seen '()))
+    (unwind-protect
+         (progn
+           (is (equal '(:ok)
+                      (wasmdown.wasi:tcp-bind nil net server (sock-addr 0))))
+           (let ((port (sock-value-port
+                        (sock-ok (wasmdown.wasi:tcp-get-local-address
+                                  nil net server)))))
+             (is (eq :ok (car (wasmdown.wasi:tcp-listen nil net server))))
+             (is (equal '(:ok)
+                        (wasmdown.wasi:tcp-connect nil net client
+                                                   (sock-addr port))))
+             (let* ((fd (wasmdown.wasi:wasi-tcp-socket-fd server))
+                    (cancel (wasmdown.wasi:reactor-watch-fd
+                             reactor fd :read 'listener
+                             (lambda (status) (push status seen)))))
+               (declare (ignore cancel))
+               (multiple-value-bind (progress pending)
+                   (wasmdown.wasi:reactor-step
+                    reactor (* 2 1000 1000 1000))
+                 (is progress)
+                 (is pending)
+                 (is (equal '(:read) seen))))))
+      (wasmdown.wasi:reactor-close reactor)
+      (wasmdown.wasi:close-wasi-tcp-socket client)
+      (wasmdown.wasi:close-wasi-tcp-socket server))))
+
+(test wasi/reactor-wake-self-pipe
+  ;; an external producer's wake byte interrupts a blocked step
+  (let ((reactor (wasmdown.wasi:make-wasi-reactor)))
+    (unwind-protect
+         (let* ((result nil)
+                (thread
+                  (sb-thread:make-thread
+                   (lambda ()
+                     (multiple-value-bind (progress pending)
+                         (wasmdown.wasi:reactor-step
+                          reactor (* 5 1000 1000 1000))
+                       (setf result (list progress pending)))))))
+           (is (wasmdown.wasi:reactor-wake reactor))
+           (sb-thread:join-thread thread)
+           (is (equal '(t nil) result)))
+      (wasmdown.wasi:reactor-close reactor))))
