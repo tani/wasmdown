@@ -1,3 +1,47 @@
+# M17 session (WASI 0.3.2 residuals, plan steps 1-4): MEASURED, MOSTLY NOT LANDED.
+# THE LANE IS NOW A GATE: tools/run-component-suite.lisp exits NON-ZERO on
+# fail/harness-error/timeout/skip/census-problem and prints the executed
+# denominator, so the plan's "0 fail x 30" acceptance is enforceable (it was not).
+# SERIAL 6-RUN METER AT HEAD (c960ef7, isolated /tmp/basewt worktree): fails
+# 1,0,0,1,2 - classes reentrance::14, ctr::9, ctr::3 (NIL/NUMBER), acs::1+::2.
+# THE LANE IS RED IN 4 RUNS OF 6 AT HEAD (4 fail commands over 6 runs; 6 x 1631
+# commands executed, denominator printed by the gate): none of the rows in this
+# file is a regression, and the plan's acceptance ("0 fail x 30") is UNMET at
+# HEAD - that is the step-4 target, not a property of any one diff.
+# THE FINAL TREE OF THIS SESSION (HEAD + the gate runner + the %abi-load arm fix;
+# the ABI/scheduler work reverted) MEASURED: 7 fail commands over 5 runs of the
+# same serial meter, same class distribution (acs::2, ctr::9, ctr::3, reentrance
+# ::14) - i.e. NO systematic per-class elevation vs the HEAD meter above, and
+# still no green run. Wall time per lane run 8-11 s throughout.
+# THE MEASURED, THEN REVERTED (src/component-runtime.lisp restored to HEAD; the
+# diff was NOT kept in a branch - redo from this record):
+#  (a) an abi-cx TYPE-INST / value-inst split (%abi-type-inst): a canon-lower
+#      wrapper resolves valtype refs in the CALLEE's type space and HANDLES in the
+#      CALLER's table, which removes the positional stream/future/borrow arms;
+#  (b) a resource-handle RECORD (rt/rep/own-p/num-lends/borrow-scope) replacing the
+#      cons shape; %handle-lend records the 2412 lend on the Subtask and
+#      deliver_resolve returns it exactly once.
+# THE METER ON (a)+(b): units 481/0 GREEN; the lane's TOTAL fail count stayed within
+# noise of HEAD (4/6 vs 6/6), and one batch put acs::2 at 5/6 vs HEAD's 1/6.
+# THAT ELEVATION DID NOT REPRODUCE: the SAME row measures 1/6, 2/6 and 6/6 on
+# byte-identical trees across batches (HEAD-and-load-fix alone measured 6/6 once),
+# so the row's in-lane rate is BATCH-DEPENDENT (machine/CPU state), not a property
+# of the diff. Do not chase it on a 6-run meter; measure the row SOLO (99% green)
+# and in-lane as a distribution. What IS reproducible: the partial scheduler fixes
+# below both close the acs window solo AND break the lane. Reverted rather than
+# shipped:
+#  - the 3530 first-turn boundary (%await-first-turn) in the lower and nested lift;
+#  - a creation-path ORDERED GATE EXIT driven outside *scheduler-mutex*;
+#  - a single guest PERMIT (recursive, FIFO by task path) released at %block-enter:
+#    it CLOSED the acs window (1/300 solo) but DEADLOCKED the lane within 15 runs -
+#    a park that never broadcasts strands a permit holder only a tick could release.
+# LANDED TODAY: the gate runner (tools/run-component-suite.lisp) and the %abi-load
+# arm fix (the stream/future arm sat inside the PRIMITIVE-payload case, so only a
+# :stream/:future prim payload could ever reach it - a genuine defect).
+# THE BISECT HARNESS: tools/probe-async-interleave.lisp, tools/probe-async-watchdog
+# .lisp, tools/probe-async-perfile.sh - per-fixture interleave logs, permit/state
+# dumps on a hang, per-file hang attribution. SERIAL RUNS ONLY: a concurrent lane
+# distorts the rates by CPU contention (this cost the session two false readings).
 # See README.md
 # M15 CLOSE-OUT (2026-10-28): THE FINAL LADDER — NO ASYNC FILE
 # REMAINS IN THIS LIST. The async suite is COMPLETE: 45 of 45 files
