@@ -1,3 +1,41 @@
+# M17 SESSION 4 WAVE 2 — TWO MORE SLICES MEASURED, BOTH PARKED, MASTER RESTORED.
+# 1. STEP 1'S TYPE-VIEW (owner-qualified type resolution) — MEASURED AND REVERTED
+#    on master, preserved at branch `wip/type-view` (d864d1a).
+#    The work is real: units 499/0 twice, seven focused pins, no previously-green
+#    linking/validation/values row red. Its type-view API is one representation
+#    (make-type-view/%state-type-view/%view-ring/%type-view-entry-at/
+#    resolve-valtype/resolve-declarator-type) with provenance recorded at the
+#    DECLARING moment (*ct-owner-view*) so no remap reads ambient *outer-states*
+#    after the fact, and %parse-instancedecl now drains prerequisite type
+#    declarations in parse order.
+#    WHY IT IS NOT ON MASTER: async-calls-sync::2 in ALL SIX lane runs (7 fail
+#    commands / 6 runs, i.e. ~35/30 against a 12/30 budget) while the same
+#    fixture passes STANDALONE 3/3. So it is not a behavioural break in type
+#    resolution — it is a lane-state/timing shift, and the accept rule is the
+#    lane metric. ROOT-CAUSE BISECT PENDING, in %remap-decl-functype /
+#    %resolve-aliased-func / the %check-defvaltype alias arms.
+# 2. STEP 6 WIRING (reactor-driven sockets/UDP/monotonic clocks) — MEASURED,
+#    PARKED at branch `wip/reactor-wiring` (9f8dfb0). units 498/0 twice,
+#    lane 2 red/6 with walls 8.06-8.45 s and no rc=124, but it was measured in a
+#    tree that also carried the type-view slice, so the causal split between the
+#    two regressions is unresolved. Re-measure it alone on current master.
+#    Its scope: the driver pump (*driver-reactor* / %driver-loop-wait, one
+#    quantum then the remainder only, so an attached reactor cannot lengthen a
+#    wait), a wasi-context reactor slot with context-reactor /
+#    call-with-context-reactor, nonblocking+watch TCP connect/accept/receive/
+#    send and UDP (watch keyed by the SOCKET OBJECT plus a generation, never the
+#    raw fd; without a reactor the old bounded poll(2) is used verbatim), empty
+#    UDP datagrams no longer read as "timeout", and monotonic-clock
+#    wait-until/wait-for as one-shot deadline watches with u64 overflow trapped.
+#    STILL UNWIRED: a store-owned completion queue / host-pending tasks (plan
+#    step 5), cancel+acknowledge-cancel for in-flight socket ops, stdio fd
+#    paths, DNS/blocking-stream worker pools.
+# METHOD NOTE THAT KEPT THE SESSION HONEST: every slice was measured in the
+# LANE, not only by its own unit tests, and two slices that looked green in
+# isolation were rejected here. 6-run meters, serial, `pgrep -c sbcl` = 0,
+# walls in the 8-13 s band.
+# MASTER AFTER RESTORATION (6 runs): 4 green, 4 fail commands total
+# (acs::1, acs::2, ctr::9 x2) — the recorded distribution, restored.
 # M17 SESSION 4 — STEP 4, ATTEMPT 3: THE SINGLE STORE RIGHT. CLOSES THE acs CLASS
 # COMPLETELY, REJECTED ON THE INTERLEAVE BUDGET. Preserved at branch
 # `wip/store-right` (commit 41cd3b4); master stays at the best-measured state.
