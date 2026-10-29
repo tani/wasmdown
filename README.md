@@ -384,7 +384,10 @@ never an ambient Lisp global (PLAN.md §9.1):
    `--dns` are refused without `--wasi`.
 2. **Handle-relative filesystem, no path-prefix filter.** A
    `wasi-preopen` is an OPEN host directory fd plus the guest-visible
-   name; every operation is `*at` against a descriptor fd (`openat`,
+   name (opened by the embedder; `close-wasi-preopen` closes it and
+   invalidates the cached descriptor, while a guest `resource.drop` of
+   the preopen handle never closes it); every operation is `*at`
+   against a descriptor fd (`openat`,
    `mkdirat`, `unlinkat`, `renameat`, `linkat`, `symlinkat`,
    `readlinkat`, `utimensat`/`futimens`, `ftruncate`, `fsync`,
    `posix_fadvise`, `fstat`).

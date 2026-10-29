@@ -1,3 +1,27 @@
+# M17 SESSION 4 — TWO METHOD NOTES FOR WHOEVER READS THE BATCH METERS.
+# (i) THE SAME TREE MEASURED DIFFERENTLY IN TWO BATCHES: master's content produced
+#   1 fail command / 6 runs in one batch (bg_155) and 4 fail commands / 6 runs in
+#    another (bg_165) with no code change between them. That is the batch noise
+#   window, not an effect of the reverts — do not read a 1-vs-4 difference as a
+#   regression or an improvement unless the row classes differ.
+# (ii) STILL UNMEASURED / NOT DONE, so no reader assumes completeness:
+#   - step 5 (host-pending + resumable stream copy): NOT STARTED; it needs the
+#     store-owned completion queue that step 4 would have provided (both step-4
+#     attempts are parked: `wip/store-right`, and the permit designs before it).
+#   - step 3 remainder: `%exec-import`'s link-time contract checking, provider
+#     composition from the resolved world, and the parser half (include/rename/
+#     inline bindings/external-id — zero occurrences in the vendored corpus).
+#   - step 2 remainder: the two dtor registries (*descriptor-dtor-installed*,
+#     *socket-dtor-installed*) are still separate globals; consolidation into one
+#     host-register-resource-dtor belongs to a runtime+tests wave (it needs
+#     src/component-runtime.lisp, so it must not share a wave with a runtime
+#     slice). Only the descriptor/stream lifetime half landed (f6e70c6).
+#   - step 6: the wiring is parked at `wip/reactor-wiring` and still unwired for
+#     host-pending, cancel/acknowledge-cancel, stdio fds, DNS/blocking workers.
+#   - step 1 remainder: the two lower wrappers' positional stream/future/borrow
+#     arms are still present (deleting them needs the acceptance set from the
+#     plan's verification table, plus the borrow/own fixtures in the probe set).
+#   - the 30-run 0-fail acceptance is UNMET (master 14/30, best measured 11/30).
 # M17 SESSION 4 WAVE 2 — TWO MORE SLICES MEASURED, BOTH PARKED, MASTER RESTORED.
 # 1. STEP 1'S TYPE-VIEW (owner-qualified type resolution) — MEASURED AND REVERTED
 #    on master, preserved at branch `wip/type-view` (d864d1a).
