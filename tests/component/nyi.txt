@@ -1,5 +1,18 @@
-# M17 SESSION 4 WAVE 3b — THE NULL-DIFF MARGIN EXPERIMENT: RUN, AND IT FALSIFIES
-# THE GENERIC-MARGIN ACCOUNT FOR acs::2.
+# M17 SESSION 4 WAVE 3b — THE NULL-DIFF MARGIN EXPERIMENT: RUN, BUT **INVALID AS
+# EXECUTED** — IT DOES NOT FALSIFY ANYTHING. (Corrected in place: an earlier
+# revision of this entry read the result as a falsification. That was wrong.)
+# WHY INVALID: the manipulation was 20 ms per FILE (69 files = ~1.4 s) against a
+# lane run of 8-10 s, and `tools/run-component-suite.lisp` exits through
+# sb-ext:exit so its output carries NO wall line — the manipulation cannot be
+# confirmed from the artifacts at all. A sub-resolution delay that may not even
+# have run is not evidence either way.
+# IF IT IS RETRIED, the correct variable is ALLOCATION / GC TURNS, not wall time:
+# a per-command `(sb-ext:gc :full t)` is the manipulation that models "the two
+# slices add per-command work", and the result must be read together with the
+# runner printing a wall line (add one, or time the loop in the harness).
+# WHAT THE BATCH DID SHOW, for completeness only: acs::2 0/6, and
+# reentrance::14 / ctr::9 moving 0 -> 2/6 each. Under an unverified manipulation
+# that is not attributable either.
 # WHAT WAS RUN: master, no semantic change, a forced 20 ms delay per command in
 # tools/run-component-suite.lisp's file loop (harness restored afterwards; the
 # runner has 0 delay injections again). 6 serial runs:
