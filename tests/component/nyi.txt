@@ -1,3 +1,37 @@
+# M17 SESSION 4 WAVE 4 — PAIRED n=30: THE WIRING IS REJECTED ON MEASUREMENT, AND MY
+# OWN LOGICAL CLAIM ABOUT IT WAS FALSIFIED BY THE SAME MEASUREMENT.
+# THE PAIR (back to back, nothing between, tree verified with
+# `git branch --show-current` before the loop and an explicit abort guard):
+#   wip/reactor-wiring   29/30 red, 42 fail commands
+#   master (verified)    14/30 red, 22 fail commands
+# The wiring is WORSE by 20 fail commands. It stays parked.
+# FALSIFIED IN THIS SESSION, TWICE OVER, AND WORTH THE LEDGER SPACE:
+#   1. I argued from code paths that "nothing in the wiring diff can execute in
+#      the lane" (the only call-with-context-reactor caller is run-component, no
+#      lane fixture is a command fixture, and only the CLI sets the reactor slot).
+#      The n=30 measurement says otherwise: 42 vs 22. A logical-emptiness argument
+#      about a 650-line runtime edit is NOT evidence, however cleanly derived.
+#   2. The n=6 A/B that "confirmed" the wiring vector, and the n=6 A/B that
+#      "exonerated" the pump and the attachment, are both worthless: today's
+#      per-tree drift dwarfs them — MASTER ITSELF measured 14 fail commands/30
+#      early in the session and 22 fail commands/30 in the final pair, with no
+#      code change between those batches.
+# THE STANDING RULE FROM HERE (replaces the "<= 11 red / <= 12 fails" form, which
+# was calibrated on an easier machine state):
+#   - only a PAIRED, same-window n=30 A/B counts;
+#   - report the delta against that window's own master block, never an absolute;
+#   - n=6 is a smoke test for hangs and crashes, nothing more.
+# VOID, MUST BE REDONE PAIRED: the `wip/type-view` verdict. Its 6/6-vs-0/6 reading
+# was produced by the exact method just falsified. Before any decision about it,
+# run the same paired n=30 (type-view branch vs its window's master block) or the
+# three-function bisect with the same discipline (%remap-decl-functype /
+# %resolve-aliased-func / %check-defvaltype alias arms).
+# INCIDENT, RECORDED SO IT CANNOT BECOME A FABRICATED VERDICT: one "master" 30-run
+# block executed on the wiring tree because `git switch master` aborted on the
+# lane-generated tests/component-results.jsonl and the loop did not re-check. That
+# block (15/30 red, 20 fails) is DISCARDED. The guard is now explicit in the
+# command (`[ "$(git branch --show-current)" = master ] || exit 1`) and the
+# generated artifacts are checked out before every switch.
 # M17 SESSION 4 WAVE 3b — THE NULL-DIFF MARGIN EXPERIMENT: RUN, BUT **INVALID AS
 # EXECUTED** — IT DOES NOT FALSIFY ANYTHING. (Corrected in place: an earlier
 # revision of this entry read the result as a falsification. That was wrong.)
