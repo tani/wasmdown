@@ -1,3 +1,23 @@
+# M17 SESSION 4 WAVE 6 — THE METER IS NOW A COMMITTED SCRIPT, AND EVERY GUARD WAS
+# EXERCISED BEFORE TRUSTING IT (tools/probe-async-lane.sh, commit 1086b4b).
+# Verified behaviours, each with its exit code:
+#   T1 tree guard      wrong --branch            -> exit 2, "REFUSING: on branch ..."
+#   T2 clean guard      a scratch dirty file     -> exit 2, "working tree is not clean"
+#   T3 hang guard       --timeout 1 (SBCL killed) -> exit 3, "HANG at run 1"
+#   T4 smoke            master, 2 runs           -> 0 fails, walls 8.18 / 8.27 s
+#                          (walls are recorded BY THE SCRIPT: the runner exits via
+#                          sb-ext:exit and prints no wall line, which is why the
+#                          earlier contaminated batches were invisible)
+# What the script enforces, in the order the incidents happened: the tree guard
+# re-checks the branch before EVERY run (one "master" batch once ran on a feature
+# branch after an aborted switch); the clean guard refuses a dirty tree and names
+# the two generated artifacts the lane rewrites; the quiet guard refuses while any
+# other sbcl lives; and every exit prints the instrument-width warning.
+# THE RULE IT ENCODES, WHICH SUPERSEDES EVERY THRESHOLD IN THIS FILE:
+#   run `--branch master` then `--branch <feature>`, STRICTLY ADJACENT, nothing in
+#   between; compare only the two fail_commands totals from that window; and treat
+#   |feature - master| <= ~22 fails/30 as UNRESOLVED, because two identical-content
+#   batches on one tree have measured 20 and 42.
 # M17 SESSION 4 WAVE 5 — THE VARIANCE TABLE, AND THE ONLY HONEST CONCLUSION ABOUT
 # acs::2: AT n=30 THIS METER CANNOT ATTRIBUTE ANYTHING. Publish the batches, do not
 # summarise them.
