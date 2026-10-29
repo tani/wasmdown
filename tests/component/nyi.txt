@@ -1,3 +1,37 @@
+# M17 SESSION 5 — THE FIRST ADJACENT PAIR TAKEN WITH THE COMMITTED METER, AND IT
+# SETTLES `wip/type-view`: CONFIRMED VECTOR, ON ONE ROW, BY 14.5x.
+# Batch pair, strictly adjacent (master block immediately followed by the branch
+# block), both through tools/probe-async-lane.sh, walls recorded by the script:
+#   label   red/30  fail commands   walls            async-calls-sync::2
+#   m-A     10      12              7.98-8.43 s      2/30
+#   tv-A    29      40              7.92-12.19 s     29/30
+# DELTA = 28 fail commands, ABOVE the instrument's documented width (~22), and the
+# row count 29 vs 2 is 14.5x with no overlap in the two distributions. This is the
+# first attribution in this file that survives its own noise model.
+# ROW BREAKDOWN, which is the useful part:
+#   m-A : partial-stream-copies::1 x2, ctr::3 x2, acs::2 x2, cd::1, cres::3,
+#         reentrance::14, sync-streams::1, ctr::9
+#   tv-A: acs::2 x29, sync-streams::1 x4, partial-stream-copies::1 x2,
+#         reentrance::14 x2, ctr::9, acs::1, cd::1
+# So the branch does not raise a general noise floor: it pins ONE row that master
+# fails at its own historical rate. acs::2 is the $AsyncMiddle variant, i.e. the
+# async-lift-with-callback instantiation plus its instance aliasing.
+# BISECT CUT 1, RUN AND NEGATIVE: revert src/component-text.lisp's
+# %parse-instancedecl type-branch sink drain (the 13-line prerequisite-ordering
+# change) -> acs::2 stayed 6/6 in a 6-run smoke, totals unchanged. That hunk is NOT
+# the vector; it can be re-landed independently after the real one is found.
+# (A 6-run smoke is methodologically sufficient HERE and only here: the effect is
+# 29/30 vs 2/30, so a 6-run sample separates "fixed" from "broken" without the
+# 30-run instrument. Do not generalise that licence to marginal rows.)
+# NEXT CUTS, in this order, each by the same 6-run smoke until one clears it:
+#   1. the *ct-owner-view* provenance capture in %check-defvaltype and
+#      %current-type-view's recorded-ring fallback (the semantic heart);
+#   2. %remap-decl-functype's alias branch -> %declarator-alias-ct;
+#   3. %vis-check's OOB fallback + %vis-check-type-use's alias resource push;
+#   4. the plain view threading in %deindex-functype / %remap-ct-refs /
+#      %instance-ct-export-functype / %vis-decl-functype-at (least likely: they
+#      should be behaviour-preserving).
+# `wip/type-view` stays parked with this verdict recorded.
 # M17 SESSION 4 WAVE 6 — THE METER IS NOW A COMMITTED SCRIPT, AND EVERY GUARD WAS
 # EXERCISED BEFORE TRUSTING IT (tools/probe-async-lane.sh, commit 1086b4b).
 # Verified behaviours, each with its exit code:
