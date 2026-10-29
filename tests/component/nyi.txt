@@ -1,3 +1,34 @@
+# M17 SESSION 3 ADDENDUM 4 — acs::1 IS NOT PREDECESSOR INTERFERENCE FROM A
+# MEASURED FILE, and the runner's discarded warm-up pass was TESTED.
+# `async-calls-sync` is the FIRST file in *FILES* (verified: the jsonl's file order
+# starts with component/async-calls-sync.wast), so no measured fixture precedes it.
+# The only thing that ran before it was `tools/run-component-suite.lisp`'s opening
+# `(run-directory ... "tests/component/binary/*.wast")` whose RESULT IS DISCARDED —
+# ~1000 commands executed into the same store, invisible in the output. That made
+# the lane's acs rate incomparable with standalone (~1/300) by construction.
+# TESTED: removing that pass (each run then starts from a genuinely fresh store).
+# 30 dense runs, machine quiet: 12 red runs / 15 fail commands, acs::1 2/30,
+# ctr::9 5/30, reentrance::14 2/30, cancel-delivery::1 3/30.
+# AGAINST the same branch with the pass (11 red / 12 fails, acs::1 3/30,
+# ctr::9 5/30, reentrance 1/30, cd::1 0/30): the removal is WITHIN NOISE on
+# acs::1 and WORSE on totals and on cancel-delivery::1. Reverted — the metric is
+# the arbiter — but the finding is kept: the discarded pass must not be
+# reintroduced as a "warm-up", and if the lane is ever made store-fresh per file
+# the acs rate has to be re-baselined, not compared.
+# THE FOUR 30-RUN CONFIGURATIONS (dense, quiet machine, 1631 commands each):
+#   config                              red/30  fails  acs::1  ctr::9  reent  cd::1
+#   master c960ef7                       14      14     1       7      2      0
+#   branch + piece (i) + warm-up         13      16     8       4      0      1
+#   branch - piece (i) + warm-up         11      12     3       5      1      0
+#   branch - piece (i) - warm-up         12      15     2       5      2      3
+# THE SHIP CONFIGURATION IS ROW 3 (branch HEAD after 16d529d): best red-run count
+# and best total of any tree measured, with acs::1 at 3/30 against master's 1/30
+# (n=30: not separable) and reentrance::14 at 1/30 against master's 2/30.
+# NO FURTHER LOCAL PATCHING ON acs::1 IS JUSTIFIED: its standalone rate is ~1/300,
+# its in-lane rate is 1-3/30 in every configuration measured, and the only
+# predecessor it ever had was the discarded warm-up pass. The remaining lever is
+# the step-4 store scheduler (the 12-site park table + the three measured facts in
+# this ledger), not a fifth local change.
 # M17 SESSION 3 ADDENDUM 3 — PIECE (i) REVERTED: IT WAS THE acs::1 REGRESSION VECTOR.
 # The bisect (worktree at d111f61 with commit 3edd099 reverted, i.e. "branch minus
 # piece (i)", machine quiet, 30 dense runs each):
