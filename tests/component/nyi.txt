@@ -1,3 +1,32 @@
+# M17 SESSION 4 WAVE 3b — THE NULL-DIFF MARGIN EXPERIMENT: RUN, AND IT FALSIFIES
+# THE GENERIC-MARGIN ACCOUNT FOR acs::2.
+# WHAT WAS RUN: master, no semantic change, a forced 20 ms delay per command in
+# tools/run-component-suite.lisp's file loop (harness restored afterwards; the
+# runner has 0 delay injections again). 6 serial runs:
+#   fails: cd::1 x1, (clean), reentrance::14 x1, ctr::9 x1, (clean),
+#          ctr::9 + reentrance::14 + sync-streams::1
+#   summary: 4 red runs, 6 fail commands, and CRITICALLY acs::2 = 0/6.
+# THE VERDICT: a pure timing delay does NOT flip acs::2 (control 0/6 -> 0/6), so
+# "acs::2 is a knife-edge margin that any extra per-command work trips" is NOT the
+# account. The delay did move OTHER rows (reentrance::14 0->2/6, ctr::9 0->2/6,
+# sync-streams::1 1/6) — those rows ARE delay-sensitive, acs::2 is not.
+# WHAT THAT LEAVES: `wip/type-view` and `wip/reactor-wiring` each reproduce acs::2
+# at 6/6 against a 0/6 control in matched windows, but neither is explained by
+# generic timing. Both diffs therefore change something SPECIFIC to acs::2's
+# path — acs::2 is the $AsyncMiddle variant of the fixture, i.e. the
+# async-lifted-with-callback instantiation and its instance aliasing. THE NEXT
+# BISECT IS AT DIFF GRANULARITY, not at measurement granularity:
+#   type-view  -> the three functions the ledger already names
+#                 (%remap-decl-functype / %resolve-aliased-func / %check-defvaltype
+#                 alias arms), reverted one at a time;
+#   wiring     -> split the four separable pieces (driver pump,
+#                 wasi-context reactor slot + CLI attachment, socket/UDP
+#                 nonblocking plumbing, clock wait-until/wait-for) and measure
+#                 each; the CLI attachment is the cheapest first cut because the
+#                 lane never binds a socket yet still sees the regression.
+# Both branches stay parked. Neither is "wrong work" — both pass their own unit
+# tests twice and both were written to spec; they are unexplained vectors on one
+# pinned row, and that is exactly what the ledger must say.
 # M17 SESSION 4 WAVE 3 — `wip/reactor-wiring` RE-MEASURED ON TYPE-VIEW-FREE MASTER:
 # IT IS AN acs::2 VECTOR ON ITS OWN. Both parked branches share one signature.
 # THE MEASUREMENTS (adjacent in time, same machine, serial, 1631 commands/run):
