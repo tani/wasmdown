@@ -1,3 +1,20 @@
+# M17 SESSION 3 ADDENDUM 5 — WHAT THE acs::1 "REGRESSION" ACTUALLY WAS.
+# Three measured statements, in the order the evidence arrived:
+#  1. acs::1 at 8/30 was PIECE (i), not the ABI work: reverting only 3edd099 took
+#     it to 3/30 with the total 16 -> 12. (Re-measured separately: the ABI/wit
+#     half alone was never shown to move acs::1.)
+#  2. The lane's extra acs sensitivity vs standalone (~1/300) came from the
+#     runner's DISCARDED warm-up pass (~1000 commands into the same store before
+#     the first measured file). Removing it moved acs::1 3 -> 2/30 - inside noise,
+#     and it cost totals (12 -> 15) so it was restored per the pre-declared rule.
+#  3. THE SHIPPED CONFIGURATION THEREFORE CARRIES acs::1 AT 3/30 AGAINST MASTER'S
+#     1/30 AT n=30 - not separable, and NOT a regression introduced by the diff
+#     being shipped. The exact sentence for a reader of this ledger: the acs::1
+#     elevation was piece (i) plus lane-harness state; the ABI/handle, WIT and
+#     reactor work has never been shown to move that row.
+# The only row the shipped diff still owns is the unattributed WASI HTTP-loopback
+# unit flake (4-6/30 in dense batches, 0 in an interleaved 10+10, 0-1/30 at
+# master) - next bisect is branch minus 99c7e23 on the unit lane alone.
 # M17 SESSION 3 ADDENDUM 4 — acs::1 IS NOT PREDECESSOR INTERFERENCE FROM A
 # MEASURED FILE, and the runner's discarded warm-up pass was TESTED.
 # `async-calls-sync` is the FIRST file in *FILES* (verified: the jsonl's file order
