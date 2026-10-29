@@ -1005,7 +1005,18 @@ declarator's own index space) — see %parse-deftype-node."
             (incf (ct-scope-n-type type-scope))
             (%bind type-scope id :type
                    (1- (ct-scope-n-type type-scope)))
-            (list (make-typedecl :kind :type :payload ct)))))
+            ;; a type declarator's body can emit PREREQUISITE decls
+            ;; into the sink (an implicit outer alias for a $outer
+            ;; reference, an inline type expression); each one was
+            ;; allocated an index BEFORE this declarator's own, so
+            ;; they join in parse order AHEAD of it — the same drain
+            ;; the export/import arms perform (appending them after
+            ;; the declarator left its slot at the wrong position and
+            ;; an inline type referenced before its declaration
+            ;; resolved to nothing).
+            (let ((pre (nreverse (shiftf *type-decl-sink* nil))))
+              (nconc pre
+                     (list (make-typedecl :kind :type :payload ct)))))))
        ((string= h "alias")
         (multiple-value-bind (alias id)
             (%parse-alias-node node type-scope)
