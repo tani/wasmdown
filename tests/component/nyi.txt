@@ -1,3 +1,34 @@
+# M17 SESSION 3 — THE 30-RUN ACCEPTANCE, BOTH TREES (the plan's own gate; serial,
+# quiet machine, 30 x 1631 commands = 48,930 command executions per tree):
+#   master c960ef7          13 red runs, 16 fail commands
+#   branch wip/abi-type-space 14 red runs, 14 fail commands   <- see per-row below
+# (Both numbers are ABOVE the plan's 0 fail x 30: the acceptance is UNMET on
+# master too, so it remains the step-4 target and not a property of any diff.)
+# PER-ROW (master -> branch):
+#   cancel-targeted-resume::9      7 -> 5
+#   reentrance::14                 2 -> 0
+#   async-calls-sync::2            1 -> 0
+#   async-calls-sync::1            1 -> 8   <-- THE ROW THAT MOVED AGAINST US
+#   sync-streams::1                1 -> 2
+#   partial-stream-copies::1       1 -> 0
+#   cancel-targeted-resume::7      1 -> 0
+#   cancel-delivery::1             0 -> 1
+#   cross-abi-calls::38            0 -> 1
+#   cancel-targeted-resume::3      0 -> 1
+# THE READING: acs::1 and acs::2 are the SAME fixture's two scripts (run1 uses
+# two $SyncMiddle instances, run2 two $AsyncMiddle ones). The branch closes ::2
+# and reentrance::14 and halves ctr::9, but ::1 moved from 1/30 to 8/30 - the
+# interference path shifted with the code, it was not removed. Name it that way:
+# "same fixture, different assertion, different mechanism", NOT "acs fixed".
+# ACS::1 IS THE NEXT TARGET, and it is the cheaper one to attack now: the lane is
+# a gate, the machine is quiet, the watchdog probe dumps permit/store state, and
+# the 12-site park table above is the map.
+# WHAT THE BRANCH DOES CARRY (all measured, none of it the lane metric):
+#   steps 1-3 (ABI type/value space split, resource-handle records + the split
+#   lend ledger, WIT selection core) with units 497/0 and the lane's resource /
+#   borrow fixtures green; step 4 piece (i) (native-thread join + fresh-store
+#   reset); step 6 backend (the reactor). The ABI/wit/reactor work is what the
+#   remaining plan steps (5, 7, 8) sit on.
 # M17 SESSION 3: STEP 4 PIECE (i) KEPT, THE PERMIT REJECTED (dump-backed); STEP 6
 # BACKEND LANDED. MEASUREMENT INTEGRITY CORRECTION: an SBCL probe from the M14
 # session (/tmp/m14-standalone.lisp) was found still running with 1 day 02:38
