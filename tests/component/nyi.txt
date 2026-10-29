@@ -1,3 +1,33 @@
+# M17 SESSION 3 ADDENDUM 2 — THE UNIT SUITE IS NOT DETERMINISTIC, AND ONE FLAKE IS
+# STILL UNATTRIBUTED. All counts are "runs with a unit FAIL" out of 30 dense serial
+# runs unless stated; the same command, the same machine, the same SBCL.
+#   master c960ef7                 1/30 (component/async-lower-result-two-spaces-pins)
+#                                  then 0/30
+#   branch, load arms present      4/30 (WASI/E2E-HTTP-CLIENT-COMPONENT x2,
+#                                  WASI/HTTP-LOOPBACK-CHUNKED-TRAILERS x2)
+#   branch, load arms REVERTED     4/30 (HTTP-LOOPBACK-CONTENT-LENGTH x2,
+#                                  CHUNKED-TRAILERS x1, async pin x1) then 6/30
+#                                  (HTTP loopbacks x5, async pin x1)
+#   branch in an isolated worktree
+#     (same code, load arms off)   0/30
+#   master vs branch INTERLEAVED, 10 + 10            0 on both
+# THE LOAD ARMS ARE NOT THE CAUSE: reverting them did not change the HTTP row rate,
+# so they are reverted anyway (HEAD's arm was unreachable, and a CORRECT
+# memory-path lift transfers the end - which then needs every %abi-load call site
+# classified as transfer-or-read. That is its own slice; do not re-land it as a
+# two-line move).
+# THE HTTP-LOOPBACK FLAKE IS UNATTRIBUTED. Signature: `(EQ :OK (CAR RES))` /
+# `unreachable` inside the component, i.e. the request/response did not complete.
+# It appears in DENSE 30-run batches (4-6/30) and not at all in an interleaved
+# 10+10 - so batch density or machine state participates. THE PRIME REMAINING
+# SUSPECT is piece (i)'s teardown join (unitA, which had component-runtime from
+# c52a38e i.e. piece (i) OFF, showed NO HTTP flake in 12 runs in a dense batch).
+# NEXT BISECT: branch minus piece (i), 30 dense runs, HTTP row count. If it goes
+# to 0, the teardown join is over-reaching (an in-flight provider thread joined or
+# abandoned mid-exchange) and the join must skip threads owned by a live task.
+# CONSEQUENCE FOR THE GATE: "497 passed, 0 failed" is a SINGLE-RUN statement. The
+# unit lane needs its own rate recorded the way the component lane's is, and the
+# plan's 0-fail framing must be read as 0-in-a-run, not deterministic.
 # M17 SESSION 3 ADDENDUM — a content audit that reprioritises step 3, plus two
 # methodology items and one honest status for the reactor.
 # THE VENDORED WIT USES NONE OF THE PARSER CONSTRUCTS STEP 3 NAMES AS MISSING.

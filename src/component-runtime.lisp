@@ -1515,14 +1515,6 @@ payload at the join-aligned offset."
                 (sl (%abi-load-int cx (+ ptr 4) 4)))
             (%abi-load-string cx sp sl)))
          (t (%abi-load-int cx ptr 4))))
-      ((:stream :future)
-       ;; lift_async_value's load side (§2438): the i32 indexes the
-       ;; VALUE instance's table and the READABLE end is the value —
-       ;; an indirect (memory) lift is a transfer exactly like the
-       ;; flat one. The arm sat INSIDE the primitive-payload case
-       ;; (`:stream`/`:future` as PRIM payloads — unreachable), so a
-       ;; stream/future valtype in a spilled tuple read the raw index.
-       (%lift-async-end cx (%abi-load-int cx ptr 4)))
       (:list
        (let ((elem (car (wasmdown.component:ct-payload c)))
              (fixed (cdr (wasmdown.component:ct-payload c))))
