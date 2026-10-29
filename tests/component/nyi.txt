@@ -5,6 +5,12 @@
 #   wiring    bg_170 (verified)              29      42
 #   wiring    bg_171 (mislabeled, SAME tree)  15      20
 #   master    bg_172 (verified)              14      22
+# THE HEADLINE NUMBER, IN THE ONLY PHRASING THIS EVIDENCE SUPPORTS:
+#   wiring MEAN (20+42)/2 = 31 fails/30 vs master 22 -> **mean +9 fails/30,
+#   UNRESOLVED AT THIS INSTRUMENT** (the wiring's own batch width is 22, i.e.
+#   2.4x the delta). Not a regression, not parity, not exonerated. Every harsher
+#   difference-word used earlier in this session was falsified by the next batch;
+#   this one is deliberately left unresolved.
 # THE SAME CONTENT ON THE SAME TREE MEASURED 42 AND 20 IN BACK-TO-BACK BATCHES.
 # Per-tree variance at n=30 is >= 22 fail commands. The wiring-vs-master delta in
 # the final pair is 20 — SMALLER THAN THE VARIANCE. Therefore:
