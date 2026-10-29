@@ -1,3 +1,37 @@
+# M17 SESSION 4 WAVE 5 — THE VARIANCE TABLE, AND THE ONLY HONEST CONCLUSION ABOUT
+# acs::2: AT n=30 THIS METER CANNOT ATTRIBUTE ANYTHING. Publish the batches, do not
+# summarise them.
+#   tree      batch                         red/30  fail commands
+#   wiring    bg_170 (verified)              29      42
+#   wiring    bg_171 (mislabeled, SAME tree)  15      20
+#   master    bg_172 (verified)              14      22
+# THE SAME CONTENT ON THE SAME TREE MEASURED 42 AND 20 IN BACK-TO-BACK BATCHES.
+# Per-tree variance at n=30 is >= 22 fail commands. The wiring-vs-master delta in
+# the final pair is 20 — SMALLER THAN THE VARIANCE. Therefore:
+#   - "the wiring is an acs::2 vector (42 vs 22)" is NOT established;
+#   - "the wiring is at parity" is NOT established either;
+#   - the n=6 readings (0/6 control, 6/6 branch) that motivated the whole
+#     investigation are several times below the noise width and mean nothing;
+#   - `wip/type-view`'s verdict is void for the same reason, not only for the
+#     n=6 one.
+# WHAT IS ESTABLISHED AND USABLE:
+#   - master's fail-command total at n=30 drifted 14 -> 22 across this session with
+#     NO code change, and one identical-content batch pair on another tree drifted
+#     20 -> 42. Any absolute threshold ("<= 12 fails/30") is therefore invalid; only
+#     a delta measured INSIDE one batch pair can be used, and even that needs the
+#     delta to exceed ~22.
+#   - the lane contains NO fixture that touches sockets, the CLI or a command world
+#     (checked against the emitted case ids), so neither the wiring's socket work
+#     nor its run-component attachment is exercised there at all. Whatever moved the
+#     totals was noise or something outside those paths.
+# CONSEQUENCE FOR THE PLAN: stop spending meters on this class. Step 4's remaining
+# question is the ACQUISITION-SIDE quantum (the during-sync family at 47/54 fail
+# mass is a genuine, large, reproducible signal — far above this noise floor), and
+# that is a design problem, not a measurement problem. The parked branches stay
+# parked with their diffs intact; they are neither condemned nor cleared.
+# SAFETY DEFAULT ADOPTED FOR EVERY BATCH SCRIPT FROM NOW ON (this caught one
+# fabricated-verdict risk today):
+#   BRANCH=$(git branch --show-current); test "$BRANCH" = master || exit 1
 # M17 SESSION 4 WAVE 4 — PAIRED n=30: THE WIRING IS REJECTED ON MEASUREMENT, AND MY
 # OWN LOGICAL CLAIM ABOUT IT WAS FALSIFIED BY THE SAME MEASUREMENT.
 # THE PAIR (back to back, nothing between, tree verified with
