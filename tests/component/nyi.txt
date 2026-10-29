@@ -1,3 +1,40 @@
+# M17 SESSION 4 — STEP 4, ATTEMPT 3: THE SINGLE STORE RIGHT. CLOSES THE acs CLASS
+# COMPLETELY, REJECTED ON THE INTERLEAVE BUDGET. Preserved at branch
+# `wip/store-right` (commit 41cd3b4); master stays at the best-measured state.
+# THE MECHANISM (as approved): the right IS a mutex, and the wait IS %park --
+#   (condition-wait *right-cv* *right* :timeout slice) -- so every park releases
+#   the right BY CONSTRUCTION (the mutex waited on is the mutex released), the
+#   runtime has exactly ONE condition-wait (inside %bounded-wait) instead of 7,
+#   and every site's release is inside the wait rather than a statement at park
+#   entry. async-thread-resume-all self-wraps in %without-right and predicates
+#   read only fields written under the right, so no peer mutex is ever taken with
+#   the right held; the runner/executor takes a synthetic ticket (0) that sorts
+#   before every guest root. No *store-permit-p* switch: one shape.
+# THE METER (30 serial lane runs, 1631 commands each, no rc=124):
+#   fail counts runs 1..30: 1 1 2 4 0 2 6 2 2 3 0 3 3 0 1 3 1 0 2 3 0 0 3 2 3 3 1 1 1 1
+#   walls 7.53-7.85 s (tightest of any configuration measured)
+#   red 24/30, fails 54/30, acs::1 0/30, ctr::9 0/30, reentrance::14 11/30,
+#   cancel-delivery::1 1/30
+#   metric            threshold   master   shipped tip(68cf178)   this tree
+#   red runs /30      <= 11       14       11                    24  FAIL
+#   fail commands /30 <= 12       14       12                    54  FAIL
+#   acs::1 /30        <= 3        1        3                     0   pass (best)
+# THE COST IS ONE FAMILY: 47 of the 54 are during-sync-* (::2 ::8 ::16 ::19 ::22
+# ::23 ::25 ::26) — the ledger's own "resume a ready thread of the same instance
+# during a sync call" rows. MECHANISM: a woken parker that still owns the ticket
+# re-acquires ahead of a candidate that became ready a microsecond later, i.e. the
+# one-quantum rule is enforced at the PARK, not at the ACQUISITION.
+# THE NEXT ATTEMPT'S LEAD: an ACQUISITION-SIDE quantum (a per-wake budget on the
+# contender set), because the two obvious ends of the spectrum are now measured:
+# contending-only admission keeps the store live but loses during-sync ordering;
+# widening to the old Store.tick candidate classes rotates through sleepers and
+# HANGS (rc=124 at 300 s, 2 of 2 runs) — the permit v1/v2 lesson, now reproducible.
+# ALSO LEARNED: a hang attributed by tools/probe-async-perfile.sh had the right
+# owned by a DEAD OS thread (a missed exit path); the fix, %right-thread-death
+# wired into every factory's unwind-protect, belongs in any future attempt.
+# AND: with the right in place there were NO unbounded scheduler waits left
+# anywhere (site 7 bounded, script-boundary join bounded at 0.25 s). That property
+# is worth re-landing even if the interleave budget is never solved.
 # M17 HTTP REMOVAL LEDGER. WASI HTTP (`wasi:http`, M16 slice 5) was REMOVED
 # at user direction in M17: the provider, its public surface, its unit tests
 # (WASI/HTTP-* and WASI/E2E-HTTP-CLIENT-COMPONENT) and tests/http-client-component.wat
