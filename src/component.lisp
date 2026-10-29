@@ -1680,12 +1680,6 @@ declaration order) + the outer scope stack."
   ;; exports of other instances' types and outer-aliased resources
   ;; are not local.
   (local-resources (make-hash-table) :type hash-table)
-  ;; owner-qualified type layers (WASI residuals plan step 1): the
-  ;; ENCLOSING component VIEWS of this space, innermost first,
-  ;; captured where the space is entered — the recorded form of
-  ;; *OUTER-STATES* that later walks read instead of the ambient
-  ;; chain at read time.
-  (outers nil :type list)
   (exports '())                           ; (name kind) records seen
   (imports '()))
 
@@ -2450,11 +2444,6 @@ type's own declarators stay against STATE, the inner space)."
                              ;; ::28-30 pin the conflict message)
                              :imports (make-hash-table :test #'equal)
                              :exports (make-hash-table :test #'equal))))
-       ;; owner-qualified type layers: INNER's own ring — the chain the
-       ;; declarators' references resolve against (count 1 = OUTER, the
-       ;; declaring space; further counts = its enclosing chain).
-       (setf (cval-outers inner)
-             (%view-ring (cons outer *outer-states*)))
        (dolist (d (coerce (ct-payload c) 'list))
          (case (typedecl-kind d)
            ;; slice 5m (core-modules ::5/::6): a :core-type decl inside
@@ -2732,14 +2721,6 @@ type's own declarators stay against STATE, the inner space)."
                         (make-ct :kind :prim
                                  :payload :imported-or-exported-type)))
                 (cval-types inner)))))))))
-       ;; owner-qualified type layers (plan step 1): record, at the
-       ;; moment the ct is validated, the view of the space that
-       ;; DECLARED it — count 1 = OUTER (this declaring space), 2+ =
-       ;; its enclosing chain. A later remap/vis walk reproduces the
-       ;; declarator ring from this instead of reading *OUTER-STATES*
-       ;; at that later time.
-       (setf (gethash c *ct-owner-view*)
-             (%state-type-view outer (%view-ring *outer-states*)))
        ;; slice 5g (external-visibility ::42/::43/::44): a COMPONENT
        ;; TYPE's own export/import declarators must satisfy visibility
        ;; EAGERLY at the type's definition (instance types check at
@@ -2747,8 +2728,7 @@ type's own declarators stay against STATE, the inner space)."
        ;; instance types define freely)
        (when (eq (ct-kind c) :component)
          (%vis-check-type-use
-          (make-cval :types (vector c)
-                     :outers (%view-ring *outer-states*))
+          (make-cval :types (vector c))
           0 :auto nil)))
 
 
@@ -2774,99 +2754,6 @@ stack (the caller rejects with 'invalid outer alias count')."
   (if (zerop count)
       state
       (nth (1- count) *outer-states*)))
-
-;;; ---------------------------------------------------------------
-;;; Owner-qualified type views (WASI 0.3.2 residuals, plan step 1).
-;;;
-;;; A component type space is never ambient: a (:idx . n) reference or
-;;; a declarator-space index belongs to the space of the instance or
-;;; component that DECLARED it. A TYPE-VIEW bundles that space with its
-;;; owner identity and the ring of enclosing views, so a reference can
-;;; SWITCH OWNER as it crosses an instance/component boundary instead
-;;; of resolving at the same numeric index in whatever space happens
-;;; to be current.
-;;;
-;;;   ct          the OWNER (an instance-type ct, or the cval state of
-;;;               a component/type space)
-;;;   types       that owner's component type space (vector of ct)
-;;;   identities  the parallel identity vector (:fresh / :ref /
-;;;               :ct / :opaque)
-;;;   outers      the ENCLOSING views, innermost first — count 0 is
-;;;               the view itself, count N the Nth outer (the same de
-;;;               Bruijn convention as %outer-state-at)
-;;;
-;;; One representation only: every owner switch (outer aliases,
-;;; imported-instance declarators, remaps) goes through these.
-(defstruct (type-view (:constructor make-type-view
-                                    (&key ct types identities outers)))
-  (ct nil)
-  (types #() :type vector)
-  (identities #() :type vector)
-  (outers nil :type list))
-
-(defvar *ct-owner-view* (make-hash-table :test #'eq)
-  "PROVENANCE: an instance-type ct -> the TYPE-VIEW of the component
-that DECLARED it, captured when the ct is validated (i.e. at the
-right time). Later remaps resolve the ct's declarator references
-through this instead of the *OUTER-STATES* chain ambient AT REMAP
-TIME — that post-hoc read described whichever nesting happened to be
-current, not the ct's own.")
-
-(defun %state-type-view (state &optional outers)
-  "The type-view of STATE (a cval) with OUTERS as its enclosing ring."
-  (make-type-view :ct state
-                  :types (if (cval-p state) (cval-types state) #())
-                  :identities (if (cval-p state) (cval-type-ids state) #())
-                  :outers outers))
-
-(defun %view-ring (states)
-  "The type-views of STATES as a ring LIST (innermost first): each
-view's OUTERS is the rest of the list — the owner-qualified form of
-*OUTER-STATES*."
-  (labels ((build (ss)
-             (when ss
-               (let ((v (%state-type-view (car ss))))
-                 (setf (type-view-outers v) (build (cdr ss)))
-                 (cons v (type-view-outers v))))))
-    (build states)))
-
-(defun %current-type-view (state)
-  "STATE's view with the enclosing ring recorded on it when it was
-entered (validate-component's OUTERS slot) — never an ambient read."
-  (%state-type-view state (and (cval-p state) (cval-outers state))))
-
-(defun type-view-outer (view count)
-  "The COUNT-de-Bruijn owner of VIEW: 0 = VIEW itself, N = the Nth
-enclosing view (%outer-state-at's convention, owner-qualified). NIL
-past the end of the ring."
-  (if (<= count 0) view (nth (1- count) (type-view-outers view))))
-
-(defun %type-view-entry-at (view idx)
-  "The type-space entry of VIEW at IDX, or NIL when out of range.
-This is the ONLY index lookup in the view layer: no caller
-substitutes another scope's entry at the same numeric index."
-  (and (type-view-p view)
-       (integerp idx)
-       (<= 0 idx)
-       (< idx (length (type-view-types view)))
-       (aref (type-view-types view) idx)))
-
-(defun resolve-valtype (valtype view)
-  "Resolve VALTYPE in VIEW's type space. A (:idx . n) reference
-resolves ONLY against that space: an out-of-range reference is a
-validation error, never a silent substitution of another scope's type
-at the same numeric index. Compound cts pass through unchanged — their
-own refs belong to the same view, and every consumer holding the view
-resolves them the same way. Returns a ct or a primitive keyword."
-  (cond
-   ((keywordp valtype) valtype)
-   ((and (consp valtype) (eq (car valtype) :idx))
-    (let ((c (%type-view-entry-at view (cdr valtype))))
-      (unless (ct-p c)
-        (%verr "type index ~d out of bounds" (cdr valtype)))
-      c))
-   ((ct-p valtype) valtype)
-   (t valtype)))
 
 (defun %ct-transitively-resources-p (ct state seen)
   "Slice 5 (outer-alias B, Binary.md 133-135): does CT transitively
@@ -4971,136 +4858,11 @@ resource the (type $i \"r\") alias projects."
                 ids)))
     ids))
 
-(defvar *instance-ct-type-space* (make-hash-table :test #'eq)
-  "Memoized DECLARATOR-SPACE vectors per instance-type ct: built once
-when the ct is first resolved through a view, so a per-call remap
-never rebuilds the type tree.")
-
-(defun %instance-ct-type-space (ict)
-  "The index-aligned DECLARATOR space of instance/component type ICT:
-one entry per declarator that introduces a COMPONENT TYPE INDEX
-\(Binary.md 274 — :type, :alias, :import and :export alike; a
-:core-type declarator introduces a CORE type index and is skipped).
-A :type declarator carries its ct; an :alias declarator an
-\(:outer-alias . aliasrec) marker resolved lazily by
-resolve-declarator-type so the OWNER is switched, not guessed; an
-import/export carries a (:type-bound . bound) marker; anything else
-\(:opaque) — it names no component type shape."
-  (or (gethash ict *instance-ct-type-space*)
-      (setf (gethash ict *instance-ct-type-space*)
-            (let ((v (make-array 16 :fill-pointer 0 :adjustable t)))
-              (loop for d across (ct-payload ict)
-                    do (case (typedecl-kind d)
-                         (:type
-                          (vector-push-extend (typedecl-payload d) v))
-                         (:alias
-                          (vector-push-extend
-                           (cons :outer-alias (typedecl-payload d)) v))
-                         ((:import :export)
-                          (let ((et (third (typedecl-payload d))))
-                            (vector-push-extend
-                             (if (and (consp et) (eq (car et) :type))
-                                 (cons :type-bound (cdr et))
-                                 '(:opaque))
-                             v)))
-                         (t nil)))
-              v))))
-
-(defun %declarator-view (ict owner-view &optional (inst-idx nil))
-  "ICT's declarator space as a type-view. OWNER-VIEW is the view of
-the space that DECLARED ict; the ring starts there, so a declarator's
-de Bruijn count 1 means that declaring space (the same convention
-%check-defvaltype uses for a type's own declarators)."
-  (make-type-view
-   :ct ict
-   :types (%instance-ct-type-space ict)
-   :identities (if inst-idx (%instance-ct-ids inst-idx ict) #())
-   :outers (and owner-view
-                (cons owner-view (type-view-outers owner-view)))))
-
-(defun %declarator-owner (view count)
-  "Owner switch for a DECLARATOR-space de Bruijn count: 0 = the
-type's own space (VIEW), 1 = the declaring space (VIEW's first
-outer), N = the (N-1)th outer. NIL past the end of the ring."
-  (if (zerop count) view (nth (1- count) (type-view-outers view))))
-
-(defun %resolve-owner-index (view index)
-  "The ct at INDEX in a plain (component) owner space; NIL when the
-slot holds no component type shape (an opaque :imported slot).
-Out-of-range is a validation error — the view's own space is the only
-space consulted."
-  (when (or (not (integerp index)) (< index 0)
-            (>= index (length (type-view-types view))))
-    (%verr "type index out of bounds"))
-  (let ((entry (%type-view-entry-at view index)))
-    (and (ct-p entry) entry)))
-
-(defun %declarator-alias-ct (view alias)
-  "The ct an (:outer . aliasrec) declarator ALIAS denotes, with the
-owner switched into VIEW's ring by the alias's de Bruijn count."
-  (let* ((count (aliasrec-count alias))
-         (owner (%declarator-owner view count)))
-    (unless owner
-      (%verr "invalid outer alias count of ~d" count))
-    (if (eq owner view)
-        (%resolve-declarator-in view (aliasrec-target alias) '())
-        (%resolve-owner-index owner (aliasrec-target alias)))))
-
-(defun %resolve-declarator-in (view index seen)
-  "One step of resolve-declarator-type inside VIEW (SEE is the cycle
-guard)."
-  (when (or (not (integerp index)) (< index 0)
-            (>= index (length (type-view-types view))))
-    (%verr "type index out of bounds"))
-  (let ((key (cons view index)))
-    (when (member key seen :test #'equal)
-      (%verr "cyclic type alias"))
-    (let ((entry (%type-view-entry-at view index))
-          (seen (cons key seen)))
-      (cond
-       ((ct-p entry) entry)
-       ((and (consp entry) (eq (car entry) :outer-alias))
-        (let* ((alias (cdr entry))
-               (count (aliasrec-count alias))
-               (owner (%declarator-owner view count)))
-          (unless owner
-            (%verr "invalid outer alias count of ~d" count))
-          (if (eq owner view)
-              (%resolve-declarator-in view (aliasrec-target alias) seen)
-              (%resolve-owner-index owner (aliasrec-target alias)))))
-       ((and (consp entry) (eq (car entry) :type-bound))
-        (let ((bound (cdr entry)))
-          (cond
-           ((eq bound :sub-resource)
-            (make-ct :kind :resource :payload '(0 . nil) :offset 0))
-           ((and (listp bound) (eq (car bound) :eq))
-            (%resolve-declarator-in view (second bound) seen))
-           (t nil))))
-       (t nil)))))
-
-(defun resolve-declarator-type (instance-type index owner-view
-                                &optional (inst-idx nil))
-  "The ct a DECLARATOR-SPACE INDEX denotes in INSTANCE-TYPE's own type
-space, with OWNER-VIEW the space that declared it. The reference
-SWITCHES OWNER as it crosses a boundary: an (:alias outer COUNT ...)
-declarator resolves count 1 in OWNER-VIEW's space and count N in the
-Nth enclosing space of the recorded ring; a (type (eq i)) bound
-follows i in the SAME space; a (sub resource) bound is a resource.
-A missing alias target, an out-of-range index and a cyclic alias chain
-are VALIDATION ERRORS — never a silent substitution and never a raw
-index left for a later reader to misinterpret. NIL when the index
-names a declarator with no component type shape."
-  (%resolve-declarator-in (%declarator-view instance-type owner-view
-                                            inst-idx)
-                          index '()))
-
-(defun %instance-ct-export-functype (inst-idx name state &optional view)
+(defun %instance-ct-export-functype (inst-idx name state)
   "Slice 5e (resources ::27/::28/::43): the FUNCTYPE of an IMPORTED
 instance's exported func NAME, read from the instance ct (its (func
-(type i)) ascription indexes the ct's own DECLARATOR space — resolved
-through the owner-qualified view, so an alias declarator's reference
-is followed with the owner switched instead of read at that index in
-the caller's space). NIL when the index names no functype."
+(type i)) ascription indexes the ct's own type space — the
+declarator sequence's introduced indices). NIL when unresolvable."
   (let ((ent (and (< inst-idx (length (cval-instance-types state)))
                   (aref (cval-instance-types state) inst-idx))))
     (when (and (ct-p ent) (eq (ct-kind ent) :instance))
@@ -5112,15 +4874,18 @@ the caller's space). NIL when the index names no functype."
         (when d
           (let* ((et (third (typedecl-payload d)))
                  (fti (and (eq (car et) :func) (integerp (cdr et))
-                           (cdr et)))
-                 (view (or view
-                           (%declarator-view
-                            ent (gethash ent *ct-owner-view*)))))
-            (when (and fti
-                       (<= 0 fti)
-                       (< fti (length (type-view-types view))))
-              (let ((c (%resolve-declarator-in view fti '())))
-                (and (ct-p c) (eq (ct-kind c) :func) c)))))))))
+                           (cdr et))))
+            (when fti
+              (loop with n = -1
+                    for x across (ct-payload ent)
+                    do (case (typedecl-kind x)
+                         (:type (incf n)
+                                (when (= n fti)
+                                  (return (typedecl-payload x))))
+                         (:alias (incf n))
+                         ((:import :export) (incf n))
+                         (t nil))
+                    finally (return nil)))))))))
 
 (defun %func-arg-ids-at (arg-si &optional (state nil))
   "Slice 5e: the identity vector registered for the func ARG's own
@@ -5134,7 +4899,7 @@ earlier's and the func-arg match read the wrong identity vector)."
 
 (declaim (notinline %func-arg-ids-at))
 
-(defun %remap-ct-refs (c map &optional view)
+(defun %remap-ct-refs (c map)
   "M13-lad (big-interleaving-test): remap a projected type shape's
 VALTYPE refs across instance boundaries. A type shape taken from an
 INSTANTIATED child instance's state (an alias-export type
@@ -5144,22 +4909,13 @@ read them in the PARENT's space. MAP is an alist (child-idx .
 parent-idx) built from the source instance's export table plus the
 alias-export type projections recorded in *inst-alias-typeidx*;
 refs with no mapping stay untouched (the caller's space may itself
-hold the source — a BAG's entry idx is this scope's own).
-VIEW is the TARGET space, owner-qualified: BOTH sides of a mapping
-are resolved through it — a parent-idx value becomes the target ct
-when the view has it, so a later reader never re-reads a bare index
-against a space that might have moved on."
+hold the source — a BAG's entry idx is this scope's own)."
   (labels
       ((remap-valtype (vt)
          (cond
           ((and (consp vt) (eq (car vt) :idx) (integerp (cdr vt)))
            (let ((hit (assoc (cdr vt) map)))
-             (cond
-              ((null hit) vt)
-              ((and view (integerp (cdr hit)))
-               (let ((target (%type-view-entry-at view (cdr hit))))
-                 (or (and (ct-p target) target) (cons :idx (cdr hit)))))
-              (t (cons :idx (cdr hit))))))
+             (if hit (cons :idx (cdr hit)) vt)))
           ((ct-p vt) (remap-ct vt))
           (t vt)))
        (remap-ct (c)
@@ -6106,23 +5862,25 @@ rejected (instantiation.wast ::57)."
 (defun %vis-nameable-kind-p (kind)
   (member kind '(:resource :record :variant :enum :flags)))
 
-(defun %vis-decl-functype-at (ict fti &optional view)
+(defun %vis-decl-functype-at (ict fti)
   "M9 (linking ::104): instance-ct ICT's FUNCTYPE for a func export
-whose ascribed index FTI resolves in the CT's OWN declarator space.
-The index goes through the owner-qualified declarator view (VIEW, or
-the provenance recorded when ICT was validated): a :type entry is its
-ct, an (:alias outer ...) entry is followed into the ring with the
-owner switched, an (:export (type (eq i))) entry follows i in the same
-space. NIL when FTI is not a declarator-space index at all (the caller
-falls back to the enclosing state's space — a bounds question, never a
-silent substitution: an in-range reference that does not resolve is a
-validation error)."
-  (let ((view (or view
-                  (%declarator-view ict (gethash ict *ct-owner-view*)))))
-    (when (and (integerp fti) (<= 0 fti)
-               (< fti (length (type-view-types view))))
-      (let ((c (%resolve-declarator-in view fti '())))
-        (and (ct-p c) (eq (ct-kind c) :func) c)))))
+whose ascribed index FTI resolves in the CT's OWN declarator space
+(the :type-introducing entries counted in sequence) — the functype
+ct when found there, NIL when FTI is not a declarator-space index
+(the caller falls back to the enclosing state's space)."
+  (loop with n = -1
+        for td across (ct-payload ict)
+        do (case (typedecl-kind td)
+             ((:type :alias :import :export)
+              (incf n)
+              (when (and (= n fti)
+                         (eq (typedecl-kind td) :type)
+                         (eq (wasmdown.component:ct-kind
+                              (typedecl-payload td))
+                             :func))
+                (return-from %vis-decl-functype-at
+                  (typedecl-payload td)))))
+        finally (return-from %vis-decl-functype-at nil)))
 
 (defun %vis-named-p (state idx import-p)
   "IDX is in the visible set for this context: IMPORT-P selects the
@@ -6190,7 +5948,7 @@ instance's export func whose type index resolves (through the
 enclosing space) back to the instance itself is a legal cycle that
 per-call seen tables would loop on (annotated-names ::30).")
 
-(defun %vis-check (state root import-p what &optional view)
+(defun %vis-check (state root import-p what)
   "Signal the fixture message when the walk from ROOT (a type index
 or a ct) reaches a nameable type with no external name in this
 context. The ROOT itself is NOT nameability-checked: for a func/
@@ -6199,13 +5957,8 @@ nameable itself), and for a type import/export of `(eq i)' the bound
 type becomes named through the very declarator being checked — only
 the types it transitively REFERENCES need names (resources.wast
 ::26/:41, external-visibility ::23). WHAT names the construct for
-the message: func | type | instance. VIEW is the owner-qualified
-space of STATE; its ring is the RECORDED enclosing-component chain
-(the OUTERS slot filled where the space was entered), so an
-out-of-bounds index is looked up in the enclosing scope that actually
-encloses it — not in the *OUTER-STATES* chain ambient at walk time."
-  (let ((seen (or *vis-seen* (make-hash-table)))
-        (view (or view (%current-type-view state))))
+the message: func | type | instance."
+  (let ((seen (or *vis-seen* (make-hash-table))))
     (let ((*vis-seen* seen))
       (labels
         ((bad (i)
@@ -6221,35 +5974,33 @@ encloses it — not in the *OUTER-STATES* chain ambient at walk time."
                       (not (gethash i seen)))
              ;; M9 (EV ::52): an import-declarator's SUNK implicit
              ;; outer alias leaves the ref's index OUT OF BOUNDS in
-             ;; THIS space (the alias never introduced a slot) —
-             ;; resolve through the recorded OUTER ring so the walk
-             ;; sees the underlying type in the ENCLOSING component's
-             ;; space ('func not valid to be used as import' fires
-             ;; there; skipping it made the fixture pass wrong)
+             ;; THIS state (the alias never introduced a slot) —
+             ;; resolve through *outer-states* so the walk sees the
+             ;; underlying type in the ENCLOSING component's space
+             ;; ('func not valid to be used as import' fires there;
+             ;; skipping it made the fixture pass wrong)
              (cond
-              ((< i (length (type-view-types view)))
+              ((< i (length (cval-types state)))
                (setf (gethash i seen) t)
-               (let ((ty (aref (type-view-types view) i)))
+               (let ((ty (aref (cval-types state) i)))
                  (when (ct-p ty)
                    ;; a REACHED type must be named if nameable
                    (when (and (%vis-nameable-kind-p (ct-kind ty))
                               (not (%vis-named-p state i import-p)))
                      (bad i))
                    (walk-ct ty))))
-              ((type-view-outers view)
-               (loop for ov in (type-view-outers view)
-                     for ostate = (type-view-ct ov)
-                     when (and (< i (length (type-view-types ov)))
+              ((and (boundp '*outer-states*) *outer-states*)
+               (loop for st in *outer-states*
+                     when (and (< i (length (cval-types st)))
                                (not (gethash (cons :st i) seen)))
                        do (setf (gethash (cons :st i) seen) t)
-                          (let ((ty (aref (type-view-types ov) i)))
+                          (let ((ty (aref (cval-types st) i)))
                             (when (and (ct-p ty)
                                        (%vis-nameable-kind-p (ct-kind ty)))
                               ;; named in the ENCLOSING space: an
                               ;; outer type is visible there only if
                               ;; the ENCLOSING component named it
-                              (unless (and (cval-p ostate)
-                                           (%vis-named-p ostate i import-p))
+                              (unless (%vis-named-p st i import-p)
                                 (bad i)))
                             (when (ct-p ty) (walk-ct ty))))))))
          (walk-ct (ty)
@@ -6534,13 +6285,7 @@ freely)."
                     :func-types (make-array 16 :fill-pointer 0
                                             :adjustable t)
                     :imports (make-hash-table :test #'equal)
-                    :exports (make-hash-table :test #'equal)))
-            ;; owner-qualified type layers: the rebuilt declarator space
-            ;; resolves against the USE SITE's recorded ring (state's
-            ;; view: count 0 = the use site, N = its Nth outer) — the
-            ;; same chain the ambient read used, captured once here.
-            (use-view (%current-type-view state)))
-        (setf (cval-outers inner) (type-view-outers use-view))
+                    :exports (make-hash-table :test #'equal))))
         (dolist (d (coerce (ct-payload ct) 'list))
           (case (typedecl-kind d)
             ((:type :alias)
@@ -6556,12 +6301,14 @@ freely)."
                     ;; against the USE site's state)
                     (let ((tgt (and (eq (aliasrec-kind a) :outer)
                                     (eq (aliasrec-sort a) :type)
-                                    (type-view-outer
-                                     use-view (aliasrec-count a)))))
+                                    (%outer-state-at state
+                                                     (aliasrec-count a)))))
                       (if (and tgt
-                               (let ((e (%type-view-entry-at
-                                         tgt (aliasrec-target a))))
-                                 (ct-resourcetype-p e)))
+                               (< (aliasrec-target a)
+                                  (length (cval-types tgt)))
+                               (ct-resourcetype-p
+                                (aref (cval-types tgt)
+                                      (aliasrec-target a))))
                           (make-ct :kind :resource
                                    :payload '(0 . nil) :offset 0)
                           (make-ct :kind :prim
@@ -6976,22 +6723,21 @@ handle's representation dropped on entry)."
                              (null (cdr sig)))))
           (%verr "wrong signature for a destructor"))))))
 
-(defun %deindex-functype (ft space)
+(defun %deindex-functype (ft state)
   "Values lane (concat's map fixtures): a functype whose
-(:idx . k) valtype refs resolve against a CHILD component's space
+(:idx . k) valtype refs resolve against a CHILD component's state
 (an alias-projected func out of an INSTANTIATED instance reads the
 child's stashed functype with RAW child-space indices). Rewrite each
 ref to the RESOLVED ct so any reader sees the full shape without
-needing the child's space. SPACE is a TYPE-VIEW or a cval state (the
-latter is wrapped as a view; the ring is not needed here because the
-indices are the child's own). NIL when unresolvable."
+needing the child's space. NIL when unresolvable."
   (when (and ft (ct-p ft) (eq (ct-kind ft) :func))
-    (let ((view (if (type-view-p space) space (%current-type-view space))))
-      (labels
+    (labels
         ((deindex (vt)
            (if (and (consp vt) (eq (car vt) :idx))
-               (let ((c (%type-view-entry-at view (cdr vt))))
-                 (or (and (ct-p c) c) vt))
+               (let ((c (and (>= (cdr vt) 0)
+                             (< (cdr vt) (length (cval-types state)))
+                             (aref (cval-types state) (cdr vt)))))
+                 (or c vt))
                (if (ct-p vt)
                    (deindex-ct vt)
                    vt)))
@@ -7056,9 +6802,9 @@ indices are the child's own). NIL when unresolvable."
                                     params)
                                (and results (deindex results))
                                (third pl))
-                 :offset (ct-offset ft)))))))
+                 :offset (ct-offset ft))))))
 
-(defun %remap-decl-functype (ft inst-idx ict &optional view)
+(defun %remap-decl-functype (ft inst-idx ict)
   "M9 (linking ::90): a functype read out of an IMPORTED instance's
 declarator space — its (:idx . k) valtype payloads reference the
 DECLARATOR's own type space. An inline (own $r)/(borrow $r) result
@@ -7066,18 +6812,9 @@ DESUGARS to an interned OWN/BORROW entry at position k whose PAYLOAD
 is $r's declarator-space index m; the exportdecl whose ascribed
 (type . m) introduced m names the resource. Remap k to the
 COMPONENT-space typeidx of the (alias export $inst \"name\" (type))
-that projects that export. Unresolvable references stay untouched.
-VIEW is the owner-qualified declarator view; it is derived from the
-PROVENANCE recorded when ICT was validated (*CT-OWNER-VIEW*), never
-from the *OUTER-STATES* chain ambient at remap time."
+that projects that export. Unresolvable references stay untouched."
   (labels
-      ((decl-view ()
-         "ICT's declarator space plus the ring of the component that
-DECLARED it (count 1 = that component)."
-         (or view
-             (%declarator-view ict (gethash ict *ct-owner-view*)
-                               inst-idx)))
-      (entry-at (k)
+      ((entry-at (k)
          "The declarator's k-th type-introducing entry's payload. A
 :TYPE declarator yields its ct; an ALIAS/IMPORT yields NIL; and
 (values lane, variants.wast) an eq-BOUND :TYPE EXPORT declarator —
@@ -7105,44 +6842,36 @@ bounds')."
                      (when (= n k)
                        ;; (values lane, numerics.wast ::22): an ALIAS
                        ;; declarator (the sunk implicit outer alias of
-                       ;; an eq-ref'd outer type) resolves through the
-                       ;; OWNER-QUALIFIED ring. The old form read
-                       ;; (%outer-state-at nil (1- count)) — the
-                       ;; *OUTER-STATES* chain ambient AT REMAP TIME:
-                       ;; count 1 fell out NIL (the declaring
-                       ;; component was never in that chain) and
-                       ;; count 2+ landed on whatever nesting the
-                       ;; caller happened to be in. Count 1 is now the
-                       ;; space that DECLARED the instance type, from
-                       ;; the recorded provenance.
+                       ;; an eq-ref'd outer type) resolves THROUGH the
+                       ;; outer chain to the target ct — the old NIL
+                       ;; left the raw (:idx . k) and %needs-memory-p
+                       ;; read a declarator index against the
+                       ;; component space ('type index out of bounds').
+                       ;; The declarator's count N maps to the ambient
+                       ;; chain as N-1 (the declarator's own INNER
+                       ;; scope is skipped): %outer-state-at count
+                       ;; 1 = the first ambient entry (the ENCLOSING
+                       ;; component, pushed by the nested :component
+                       ;; arm).
                        (let* ((a (typedecl-payload td))
-                              (dv (decl-view))
-                              (raw (and (eq (aliasrec-kind a) :outer)
-                                        ;; a count past the recorded
-                                        ;; ring leaves the ref raw
-                                        ;; (this is a shape recovery
-                                        ;; pass, not the validator)
-                                        (<= (aliasrec-count a)
-                                            (length (type-view-outers dv)))
-                                        (handler-case
-                                            (%declarator-alias-ct dv a)
-                                          (wasmdown:validation-error ()
-                                            nil)))))
+                              (tgt (and (eq (aliasrec-kind a) :outer)
+                                        (%outer-state-at
+                                         nil (1- (aliasrec-count a)))))
+                             (raw (and tgt
+                                       (< (aliasrec-target a)
+                                          (length (cval-types tgt)))
+                                       (aref (cval-types tgt)
+                                             (aliasrec-target a)))))
                          ;; (values lane) the SAME resource-substitution
                          ;; rule as %check-outer-alias: a TYPE alias
                          ;; crossing a boundary may not target a type
                          ;; that transitively refers to resources
-                         ;; (outer-alias.wast ::6). Only a count > 1
-                         ;; alias LEAVES the declaring component —
-                         ;; count 1 is the legal import flow.
+                         ;; (outer-alias.wast ::6: the resource $R
+                         ;; sunk through a doubly-nested component
+                         ;; type's declarators)
                          (when (and raw (ct-p raw)
-                                    (> (aliasrec-count a) 1)
                                     (%ct-transitively-resources-p
-                                     raw
-                                     (type-view-ct
-                                      (%declarator-owner
-                                       dv (aliasrec-count a)))
-                                     (make-hash-table)))
+                                     raw tgt (make-hash-table)))
                            (%verr "transitively refers to resources"))
                          (return-from entry-at raw))))
                     (:export
@@ -7365,13 +7094,6 @@ version tripped the compiler's cross-arm payload type derivation."
                         (cdr hit))))))
      (cval-func-types state))
     (when ict
-      ;; owner-qualified type layers: an instance ct that entered the
-      ;; type space through a path that did not record provenance
-      ;; (a projected/bag instance) still gets the DECLARING space's
-      ;; view here — the moment the aliased func is resolved is the
-      ;; right time to know who declared it, unlike the later remap.
-      (unless (gethash ict *ct-owner-view*)
-        (setf (gethash ict *ct-owner-view*) (%current-type-view state)))
       (setf (gethash (1- (cval-funcs state))
                      *func-arg-ids*)
             (%instance-ct-ids
@@ -7398,11 +7120,7 @@ the number of enclosing component/type scopes (outer aliases)."
       ;; M9 (linking ::90/::169)
       (clrhash *inst-alias-typeidx*)
       (clrhash *func-alias-origin*)
-      (clrhash *alias-component-source*)
-      ;; owner-qualified type layers (plan step 1): provenance is
-      ;; per-validation-run, like the stashes above
-      (clrhash *ct-owner-view*)
-      (clrhash *instance-ct-type-space*))
+      (clrhash *alias-component-source*))
   (let ((state (make-cval
                 :types (make-array 16 :fill-pointer 0 :adjustable t)
                 :core-types (make-array 16 :fill-pointer 0 :adjustable t)
@@ -7427,11 +7145,6 @@ the number of enclosing component/type scopes (outer aliases)."
         ;; type-declarator arms push in %check-defvaltype.
         (*outer-states* *outer-states*))
     (declare (ignorable core-funcs memories tables globals))
-    ;; owner-qualified type layers: record the enclosing-component
-    ;; RING on the space as it is entered — every later walk
-    ;; (%vis-check, the declarator remaps) reads this instead of the
-    ;; *OUTER-STATES* chain ambient at that later moment.
-    (setf (cval-outers state) (%view-ring *outer-states*))
     (loop for d across (comp-defs comp)
           do (let ((payload (compdef-payload d)))
                (case (compdef-kind d)
@@ -8670,12 +8383,6 @@ the number of enclosing component/type scopes (outer aliases)."
                                                          child-state)
                                                  :func-types (cval-func-types
                                                               child-state)
-                                                 ;; the child's recorded
-                                                 ;; ring drives shape
-                                                 ;; resolution; the parent's
-                                                 ;; vis tables judge names
-                                                 :outers (cval-outers
-                                                          child-state)
                                                  :vis-imports (cval-vis-imports
                                                                state)
                                                  :vis-exports (cval-vis-exports
@@ -8726,7 +8433,6 @@ the number of enclosing component/type scopes (outer aliases)."
                                                       state)
                                          :instance-types
                                           (cval-instance-types state)
-                                         :outers (cval-outers state)
                                          :vis-imports
                                           (cval-vis-imports state)
                                          :vis-exports bag-vis)))

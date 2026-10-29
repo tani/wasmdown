@@ -2777,117 +2777,6 @@ repo root, as a string — the pin runs a fixture row VERBATIM."
                   (eq (wasmdown.wast:wast-result-outcome r) :pass))
                 results))))
 
-(test component/type-view-owner-pins
-  ;; WASI 0.3.2 residuals, plan step 1: a type space is resolved through
-  ;; an OWNER-QUALIFIED VIEW (ct, types, identities, outers). A
-  ;; reference SWITCHES OWNER as it crosses an instance/component
-  ;; boundary and NEVER resolves another scope's type at the same
-  ;; numeric index; an unresolvable reference is a validation error.
-  (labels ((mk-ct (kind payload)
-           (wasmdown.component::make-ct :kind kind :payload payload
-                                        :offset 0))
-         (mk-decl (kind payload)
-           (wasmdown.component::make-typedecl :kind kind :payload payload))
-         (mk-alias (count target)
-           (wasmdown.component::make-aliasrec
-            :kind :outer :sort :type :count count :target target
-            :name "" :offset 0))
-         (mk-view (ct types &optional (outers nil))
-           (wasmdown.component::make-type-view
-            :ct ct :types types :identities #() :outers outers))
-         (mk-state (types)
-           (wasmdown.component::make-cval :types types))
-         (rec (label vt)
-           (mk-ct :record (vector (cons label vt))))
-         (ct-payload (c)
-           (wasmdown.component::ct-payload c))
-         (decl-payload (c i)
-           (wasmdown.component::typedecl-payload
-            (aref (wasmdown.component::ct-payload c) i)))
-         (expect-invalid (src)
-           (block nil
-             (handler-case
-                 (wasmdown.component:validate-component
-                  (wasmdown.component.text::parse-component-text src))
-               (wasmdown:validation-error (c) (return c)))
-             (error "expected wasmdown:validation-error"))))
-    (let* ((u32 (mk-ct :prim :u32))
-           ;; two UNRELATED spaces, each with a COMPOUND type at index 0
-           (near-type (rec "a" :u32))
-           (deep-type (rec "b" :u64))
-           (near (mk-state (vector near-type)))
-           (deep (mk-state (vector deep-type)))
-           (near-view (mk-view near (wasmdown.component::cval-types near)))
-           ;; the ring: count 1 = NEAR (the declaring space), count 2 =
-           ;; DEEP — two boundaries out, so the SAME numeric index 0
-           ;; must resolve in a DIFFERENT space
-           (owner (mk-view near (wasmdown.component::cval-types near)
-                           (list (mk-view
-                                  deep
-                                  (wasmdown.component::cval-types deep)))))
-           ;; the DECLARATOR space: 0 a local type, 1 an outer alias at
-           ;; count 1, 2 the same target index at count 2
-           (ict (mk-ct :instance
-                       (vector
-                        (mk-decl :type u32)
-                        (mk-decl :alias (mk-alias 1 0))
-                        (mk-decl :alias (mk-alias 2 0))))))
-      ;; a local reference resolves in the instance's OWN space ...
-      (is (eq (wasmdown.component::resolve-declarator-type ict 0 owner) u32))
-      ;; ... and the outer alias's reference resolves in the space it
-      ;; CROSSED INTO (count 1 = the declaring component, count 2 = its
-      ;; outer) — never index 0 of whatever space is current
-      (is (eq (wasmdown.component::resolve-declarator-type ict 1 owner)
-              near-type))
-      (is (eq (wasmdown.component::resolve-declarator-type ict 2 owner)
-              deep-type))
-      ;; resolve-valtype resolves in-space refs and rejects an
-      ;; out-of-range index (no substitution from the ring)
-      (is (eq (wasmdown.component::resolve-valtype '(:idx . 0) near-view)
-              near-type))
-      (is (handler-case
-              (progn (wasmdown.component::resolve-valtype '(:idx . 1)
-                                                          near-view)
-                     nil)
-            (wasmdown:validation-error () t)))
-      ;; the REMAP used by the canon/link checks reads the recorded
-      ;; provenance (*CT-OWNER-VIEW*) instead of the ambient
-      ;; *OUTER-STATES*: the same declarator ref resolves in the space
-      ;; that DECLARED the ct
-      (let ((remap-ict
-              (mk-ct :instance
-                     (vector
-                      (mk-decl :alias (mk-alias 1 0))
-                      (mk-decl :type
-                               (mk-ct :func (list #() (cons :idx 0) nil)))))))
-        (setf (gethash remap-ict wasmdown.component::*ct-owner-view*)
-              (mk-view near (wasmdown.component::cval-types near)))
-        (is (eq (wasmdown.component::resolve-declarator-type remap-ict 0
-                                                            (mk-view near (wasmdown.component::cval-types near)))
-                near-type))
-        (remhash remap-ict wasmdown.component::*ct-owner-view*))
-      ;; a MISSING alias target (a count past the recorded ring) is a
-      ;; validation error, never a raw index left for a later reader
-      (is (handler-case
-              (progn
-                (wasmdown.component::resolve-declarator-type
-                 (mk-ct :instance (vector (mk-decl :alias (mk-alias 3 0))))
-                 0 owner)
-                nil)
-            (wasmdown:validation-error () t))))
-    ;; resource own/borrow disagreement is rejected (the instantiation
-    ;; matcher must not accept a borrow where the import demands own)
-    (let ((c (expect-invalid
-              "(component
-  (import \"T\" (type $T (sub resource)))
-  (import \"f\" (func $f (param \"x\" (borrow $T))))
-  (component $c
-    (import \"T\" (type $T (sub resource)))
-    (import \"g\" (func (param \"x\" (own $T)))))
-  (instance (instantiate $c (with \"T\" (type $T)) (with \"g\" (func $f)))))")))
-      (is (search "type mismatch in function parameter"
-                  (wasmdown:wasmdown-error-message c))))))
-
 (test component/async-lower-result-two-spaces-pins
   ;; M15 MECHANISM 8 — THE ASYNC LOWER'S RESULT STORE: the result's
   ;; VALTYPE resolves in the CALLEE's type space, the new stream
@@ -2985,8 +2874,7 @@ repo root, as a string — the pin runs a fixture row VERBATIM."
                       component/cancel-eager-resolve-pins
                       component/granted-park-quantum-pins
                       component/async-lower-result-two-spaces-pins
-                      component/cancel-window-fire-gate-pins
-                      component/type-view-owner-pins)))
+                      component/cancel-window-fire-gate-pins)))
           wasmdown.test::*tests*)))
     (multiple-value-bind (passed failed)
         (wasmdown.test:run-all-tests)
