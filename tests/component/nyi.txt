@@ -1,3 +1,31 @@
+# M17 SESSION 3 ADDENDUM — a content audit that reprioritises step 3, plus two
+# methodology items and one honest status for the reactor.
+# THE VENDORED WIT USES NONE OF THE PARSER CONSTRUCTS STEP 3 NAMES AS MISSING.
+# `grep` over specs/wasi/wasi-wit-0.3.2 (15 .wit files): `include` 0 (the only
+# hits are prose in doc comments), `... with { ... }` rename 0, `external-id` 0,
+# and every world item is a PLAIN PATH (`import wasi:clocks/types@0.3.2;` etc.) -
+# which %parse-world already handles. So the selection core landed in 354e2f2
+# covers 100% of the constructs any vendored package actually contains, and
+# world include / rename / named-inline interface bindings / positional
+# @external-id are SPEC-COMPLETENESS work that no provider composition needs.
+# PRIORITY CONSEQUENCE: schedule that parser half AFTER steps 5/6/7/8, and treat
+# it as conformance coverage rather than a blocker. Do not read "step 3" as
+# complete in the plan's sense - it is complete for the vendored corpus only.
+# METHODOLOGY (both items cost a false reading this week):
+#  - Record the WALL TIME of every metered run. Normal is 8-13 s. A batch whose
+#    walls drift >2x is CONTAMINATED: discard it unmeasured, do not compare it.
+#  - Before a meter, check `pgrep -c sbcl` is 0. A previous session's probe
+#    (/tmp/m14-standalone.lisp) ran 1 day 02:38 undetected and poisoned every
+#    rate recorded in sessions 1-2 (see the correction above).
+# THE REACTOR IS REGISTERED BUT NOT YET PROVEN BY THE LANE: d766632 lands the
+# backend with 6 unit tests (deadlines, fd order, status/EINTR, cancel/close,
+# real loopback, self-pipe wake). No component-lane fixture drives it, and no
+# WASI provider is wired to it yet. Treat reactor-step's real poll paths as
+# not-yet-proven until step 7's HTTP wiring exercises them end to end.
+# WATCH ROWS in the branch's 30-run table: acs::1 8/30 (the mover, see above) and
+# cancel-delivery::1 1/30 - the latter carries the ledger's OWN rare signature
+# ("The value NIL is not of type NUMBER", historically ~1/46); a real fix for it
+# belongs to the descriptor/scope lifetime work, not to this diff.
 # M17 SESSION 3 — THE 30-RUN ACCEPTANCE, BOTH TREES (the plan's own gate; serial,
 # quiet machine, 30 x 1631 commands = 48,930 command executions per tree):
 #   master c960ef7          13 red runs, 16 fail commands
