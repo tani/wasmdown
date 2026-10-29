@@ -1,3 +1,12 @@
+# M17 HTTP REMOVAL LEDGER. WASI HTTP (`wasi:http`, M16 slice 5) was REMOVED
+# at user direction in M17: the provider, its public surface, its unit tests
+# (WASI/HTTP-* and WASI/E2E-HTTP-CLIENT-COMPONENT) and tests/http-client-component.wat
+# are gone (recoverable from git history); the vendored `specs/wasi/.../http/*.wit`
+# remain reference data only. This also RETIRES the unattributed WASI HTTP-loopback
+# unit flake recorded further below (`(EQ :OK (CAR RES))` on
+# WASI/HTTP-LOOPBACK-CONTENT-LENGTH x3-4 per 30 dense runs) - that row can never
+# recur because its tests no longer exist. The `cancel-delivery::1`-class watch
+# lines stay as they are (unrelated to HTTP). NO WASI-HTTP acceptance remains.
 # M17 SESSION 3 ADDENDUM 5 — WHAT THE acs::1 "REGRESSION" ACTUALLY WAS.
 # Three measured statements, in the order the evidence arrived:
 #  1. acs::1 at 8/30 was PIECE (i), not the ABI work: reverting only 3edd099 took
