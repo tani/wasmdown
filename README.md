@@ -328,7 +328,7 @@ memory. With `host` NIL the flat core path is unchanged. Providers are
 supplied through instantiation `:with-args` under the exact WIT names.
 The exported surface includes `make-wasi-context`, the per-package
 provider constructors, `cli-provider`, `command-provider`,
-`run-component`, `parse-wasi-endpoint`, and `open/close-wasi-preopen`.
+`run-component`, `parse-wasi-endpoint`, and `open/close-wasi-preopen`. Descriptor lifetime (M17): a descriptor carries a reference count (the handle plus every stream it handed out) and `closed-p`; the fd closes exactly once, at zero references, and only when the descriptor owns it. Each stream takes its own hold with an idempotent released marker, so EOF / error / cancel / drop each release once. A preopen's root fd belongs to the embedder (a guest drop never closes it), and closing a preopen invalidates its cached descriptor so `open-at` returns `bad-descriptor` rather than reaching a reused fd number.
 Host resources register finalizers in
 `wasmdown.component.runtime:*host-resource-dtor-table*`, so
 `canon resource.drop` deterministically closes owned OS handles; a
