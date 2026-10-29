@@ -2043,6 +2043,7 @@ thread) to bind on the executor."
          (task (progn (%tok-stamp-task task) task))
          (th (make-async-thread :task task)))
     (setf (async-task-implicit-thread task) th)
+    (%thread-birth th)
     (setf (async-task-gate-parked task) t) ; inhibit the enter gate's backpressure park
     (unless (%task-enter-implicit-thread task)
       (error 'wasmdown:wasm-trap :kind :generic
@@ -2064,6 +2065,10 @@ remove is a no-op; a trap mid-call still unwinds through here)."
     (when (eq *sync-lift-owner* task)
       (setf *sync-lift-owner* nil))))
 
+(declaim (special *right-self* *right-driver* *store-right*
+                  *right-ticket* *right-owner*
+                  *driver-records* *current-task* *current-thread*))
+
 (defun %sync-thunk-run (entry)
   "M13-tok9: the nested-sync route's executor entry — run ENTRY
 (a component-level closure: lifted-func-call + its lift/transfer)
@@ -2076,17 +2081,29 @@ value."
          (done-p nil)
          (result nil)
          (failure nil)
+         ;; STEP 4: this executor is a HOST thread running a nested
+         ;; component call — it takes a synthetic ticket under the
+         ;; CREATOR's path (a driver record sorts before guest roots,
+         ;; a child path sorts after its creator), so the call tree
+         ;; order is preserved on both sides of the boundary.
+         (self (make-async-thread
+                :task (make-async-task
+                       :seq (let ((p (%ticket-path *right-self*)))
+                              (if p (append p (list 0)) (list 0))))))
          (executor
            (sb-thread:make-thread
             (lambda ()
-              (unwind-protect
-                   (multiple-value-bind (r e)
-                       (ignore-errors (funcall entry))
-                     (setf (car cell) r)
-                     (when e (setf (cdr cell) e)))
-                (sb-thread:with-recursive-lock (dmu)
-                  (setf done-p t)
-                  (sb-thread:condition-broadcast done))))
+              (let ((*right-self* self))
+                (%right-acquire self)
+                (unwind-protect
+                     (multiple-value-bind (r e)
+                         (ignore-errors (funcall entry))
+                       (setf (car cell) r)
+                       (when e (setf (cdr cell) e)))
+                  (sb-thread:with-recursive-lock (dmu)
+                    (setf done-p t)
+                    (sb-thread:condition-broadcast done))
+                  (%right-release-on-exit self))))
             :name "sync-lift-executor")))
     (declare (ignore done))
     (unwind-protect
@@ -2098,7 +2115,10 @@ value."
              do (async-thread-resume-all)
                 (sb-thread:with-recursive-lock (dmu)
                   (when done-p (return)))
-                (unless done-p (sleep 0.001))
+                ;; STEP 4 PARK SITE 10 (main-thread drain): the poll
+                ;; slice releases the right so the executor can run.
+                (unless done-p
+                  (%right-stall (%driver-self) :seconds 0.001))
                 (if (> *async-progress* before)
                     (setf idle-cycles 0)
                     (incf idle-cycles))
@@ -2108,13 +2128,19 @@ value."
                          "deadlock detected: event loop cannot make further progress")))
           (t
            (loop
-             until (progn
-                     (sb-thread:with-recursive-lock (dmu) done-p)
-                     (prog1 done-p (unless done-p (sleep 0.001)))))))
+             (let ((finished (sb-thread:with-recursive-lock (dmu) done-p)))
+               (when finished (return))
+               ;; STEP 4 PARK SITE 10 (nested caller): release the
+               ;; right for the poll slice.
+               (%right-stall (or *right-self* (%driver-self))
+                            :seconds 0.001)))))
       ;; capture the outcome OUTSIDE the cleanup: the unwind-
       ;; protect's cleanup values are DISCARDED (the earlier
       ;; shape's (car cell) in the cleanup returned NIL always)
-      (setf result (car cell) failure (cdr cell)))
+      (setf result (car cell) failure (cdr cell))
+      ;; STEP 4: the drain loop may have acquired the right on its
+      ;; last poll — a driver that returns must not keep it.
+      (%right-drop (%driver-self)))
     (when failure (error failure))
     result))
 
@@ -2146,7 +2172,10 @@ reentrance phase checks). The CALLER then waits:
              (sb-thread:make-thread
               (lambda ()
                 (let ((*current-task* task)
-                      (*current-thread* th))
+                      (*current-thread* th)
+                      (*right-self* th))
+                  ;; STEP 4: the guest body runs only under the right.
+                  (%right-acquire th)
                   (unwind-protect
                        (multiple-value-bind (r e)
                            (ignore-errors
@@ -2156,7 +2185,8 @@ reentrance phase checks). The CALLER then waits:
                          (when e (setf (cdr cell) e)))
                     (sb-thread:with-recursive-lock (dmu)
                       (setf done-p t)
-                      (sb-thread:condition-broadcast done)))))
+                      (sb-thread:condition-broadcast done))
+                    (%right-release-on-exit th))))
               :name "sync-lift-executor")))
       (unwind-protect
            (cond
@@ -2172,7 +2202,13 @@ reentrance phase checks). The CALLER then waits:
                do (async-thread-resume-all)
                   (sb-thread:with-recursive-lock (dmu)
                     (when done-p (return)))
-                  (unless done-p (sleep 0.001))
+                  ;; STEP 4 PARK SITE 11: the poll slice releases the
+                  ;; right so the executor can make progress (the
+                  ;; pre-change 1 ms cadence: the during-sync rows ride
+                  ;; on the driver's tick now landing between the
+                  ;; guest's yields, not on when it lands).
+                  (unless done-p
+                    (%right-stall (%driver-self) :seconds 0.001))
                   (if (> *async-progress* before)
                       (setf idle-cycles 0)
                       (incf idle-cycles))
@@ -2182,14 +2218,21 @@ reentrance phase checks). The CALLER then waits:
                            :message
                            "deadlock detected: event loop cannot make further progress")))
             (t
-             (let ((ct *current-thread*))
+             ;; a NON-main caller: a guest thread (its own record) or
+             ;; a host executor with no *current-thread* (a synthetic
+             ;; driver ticket) — never NIL, or the stall would not
+             ;; release anything.
+             (let ((ct (or *current-thread* (%driver-self))))
                (%block-enter ct)
                (unwind-protect
                     (loop
-                      until (prog1 (sb-thread:with-recursive-lock (dmu)
-                                     done-p)
-                              (prog1 done-p
-                                (unless done-p (sleep 0.001)))))
+                      (let ((finished
+                              (sb-thread:with-recursive-lock (dmu)
+                                done-p)))
+                        (when finished (return))
+                        ;; STEP 4 PARK SITE 11 (nested caller): the
+                        ;; poll slice releases the right.
+                        (%right-stall ct :seconds 0.001)))
                  (%block-exit ct)))))
         ;; THE ORACLE-TRAP TEARDOWN (§3552: "trap and tear down the
         ;; whole store"): a deadlocked executor stays parked in the
@@ -2215,9 +2258,16 @@ reentrance phase checks). The CALLER then waits:
             (sb-thread:condition-broadcast
              (async-thread-suspend-waitqueue th))
             (sb-thread:condition-broadcast (async-thread-waitqueue th)))
-          (ignore-errors (sb-thread:join-thread executor)))
+          (ignore-errors
+            (sb-thread:join-thread executor :timeout 0.25
+                                          :default :timeout)))
         (unless oracled
-          (%sync-lift-exit task th)))
+          (%sync-lift-exit task th))
+        ;; STEP 4: a driver that returns must not keep the right; the
+        ;; oracle-teardown JOIN above is only reached when the right
+        ;; is already gone (the trap unwound the loop), so it adds no
+        ;; new blocking. A nested guest caller keeps its right.
+        (%right-drop (%driver-self)))
       (when (cdr cell) (error (cdr cell)))
       (car cell))))
 
@@ -4031,7 +4081,18 @@ wrong-index probe: one transfer produced index 3)."
   ;; bookkeeping here — no behaviour changes.
   (block-depth 0 :type (unsigned-byte 64))
   (io-parked nil)
-  (native nil))
+  (native nil)
+  ;; STEP 4 — THE STORE RIGHT's per-ticket state (see the
+  ;; "THE STORE RIGHT" section below): the per-slice HOP BUDGET (a
+  ;; yield wakes its successor only while the budget lasts — a
+  ;; rotation of false-positive contenders then costs one bounded
+  ;; slice instead of a tight wake loop), and the CONTENDER mark.
+  (right-hops 0 :type fixnum)
+  ;; TRUE while this thread is CONTENDING for the store right (it is
+  ;; inside %right-acquire). Only active contenders are eligible
+  ;; handoff targets, which is what keeps a park from rotating
+  ;; through parked sleepers.
+  (right-waiting nil))
 
 (defun %block-enter (th) (when th (sb-ext:atomic-incf (async-thread-block-depth th))))
 (defun %block-exit (th) (when th (sb-ext:atomic-decf (async-thread-block-depth th))))
@@ -4119,6 +4180,376 @@ nudge+wait cycle passes with NO progress and the task unresolved,
 no candidate thread can ever make progress — the deadlock trap.")
 
 ;;; ---------------------------------------------------------------
+;;; STEP 4 — THE STORE RIGHT: ONE GUEST THREAD EXECUTES AT A TIME.
+;;;
+;;; THE INVARIANT. A guest thread runs guest code only while it holds
+;;; *STORE-RIGHT* (an ordinary SBCL mutex). Every blocking primitive
+;;; in this runtime is one of two shapes, and both release the right
+;;; across their wait:
+;;;
+;;;   %park   (self mutex queue)      — release, bounded wait on
+;;;                                     QUEUE/MUTEX, re-acquire.
+;;;   %right-stall (self)             — release, bounded sleep of
+;;;                                     one poll slice, re-acquire.
+;;;
+;;; THE ORDER. Re-acquisition is not a mutex race: *RIGHT-TICKET*
+;;; names the ONE ticket allowed to run next, chosen in the call
+;;; tree's order (the async-task-seq PATH — the key that already
+;;; pins the fixtures' interleaves, minted by %tok-stamp-task at
+;;; CREATION by the creator, which holds the right at that moment).
+;;; %right-acquire blocks on *store-right*, checks the ticket, and
+;;; hands the ticket on when it is not its turn. A dead/exited
+;;; thread's ticket is dropped by %right-release-on-exit, which is
+;;; called from %task-exit-implicit-thread — the single exit path
+;;; every native factory, trap handler, abandon sweep and the
+;;; teardown funnel through.
+;;;
+;;; THE THREE MEASURED FACTS OF THE M17 LEDGER, and why they cannot
+;;; recur here:
+;;;  a. SBCL 2.6.4's (condition-wait q m :timeout t) returns with M
+;;;     RELEASED on timeout. THE WHOLE RUNTIME NOW HAS EXACTLY ONE
+;;;     condition-wait: inside %bounded-wait, which unconditionally
+;;;     re-grabs unless the caller already owns the mutex. No site
+;;;     can observe a wait's return without the mutex.
+;;;  b. A release "for the park" is not enough when the park is a
+;;;     LOOP. Here the release is not a statement at park entry: it
+;;;     is %park's first act, and %park is the only way to reach the
+;;;     wait — so every iteration of every loop releases (the
+;;;     release and the wait are welded together in one function).
+;;;  c. %task-return / %task-exit-implicit-thread call
+;;;     async-thread-resume-all, whose fan-out takes OTHER threads'
+;;;     mutexes. Every such call is wrapped in %without-right: the
+;;;     fan-out runs with the right RELEASED, and the right is
+;;;     re-acquired only after the fan-out has returned and dropped
+;;;     every peer mutex. The reverse order (a peer mutex held across
+;;;     an acquisition of the right) cannot occur either: no mutex
+;;;     section in this runtime spans a wait — every wait goes
+;;;     through %park/%right-stall, both of which are called with no
+;;;     mutex but the parked one, and %right-acquire is never called
+;;;     from inside a lock.
+;;;
+;;; THE LOCK ORDER (depth 1 + short leaves):
+;;;   *store-right*  ->  *scheduler-mutex*  ->  a thread/task/wset
+;;;   mutex, never the other way, and never across a wait. The
+;;;   per-thread/task/wset mutexes now protect ONLY the host-side
+;;;   registration fields a PEER writes (wake-count, granted,
+;;;   ready-p, spawn-thunk, the wset waiter list); every field a
+;;;   parked thread's PREDICATE reads is written under the right
+;;;   (task state / resolved-p / result, end state / pending-event,
+;;;   subtask state / flat-results, the instance's async fields), so
+;;;   a predicate needs no foreign mutex — it reads under the right.
+;;;
+;;; THE EXITS. %right-release-on-exit drops the ticket and, when the
+;;; leaving thread owns the right, hands it to the earliest runnable
+;;; candidate and releases. It NEVER waits and NEVER joins: the
+;;; store teardown must not block at a script boundary (the
+;;; piece-(i) measurement: a script-boundary block changed the
+;;; timing the next fixture inherits and cost 5 extra acs::1 per 30
+;;; runs).
+;;;
+;;; THE SLICES. +PARK-SLICE+ is the backstop for a park whose wake
+;;; was lost or whose waiter is not broadcast-woken; parks are
+;;; bridge-woken by their own queues, so the slice only bounds the
+;;; damage. +POLL-SLICE+ is the cadence of the five poll loops
+;;; (the oracle drains and the STARTED spin) whose predicate is
+;;; tested by polling rather than by a broadcast — the same 2 ms
+;;; the M15/M17 oracles already use, so their idle-cycle budgets
+;;; keep their meaning.
+
+(defparameter *store-right* (sb-thread:make-mutex :name "store-right"))
+
+(defparameter *right-owner* nil
+  "The thread record holding the right (informational: ownership is
+the mutex itself; this names it for the watchdog dump).")
+
+(defparameter *right-ticket* nil
+  "The ONE ticket allowed to run next — an async-thread record whose
+async-task-seq is the creation path. Written only under
+*STORE-RIGHT*.")
+
+(defparameter *right-owner-os* nil
+  "The OS thread of *RIGHT-OWNER* (diagnostics only).")
+
+(defparameter *right-self* nil
+  "The thread record of THIS native thread (bound in every guest
+body and every driver loop). NIL outside the store.")
+
+(defparameter *right-driver* nil
+  "The driver ticket currently polling (the runner/drain thread). It
+is ALWAYS a runnable candidate so that a park hands the right back
+to the tick engine, exactly as the pre-permit runtime expected.")
+
+(defparameter *driver-records* (make-hash-table :test #'eq)
+  "Per-OS-thread synthetic ticket for a driver (the runner or a
+nested sync executor): an async-thread whose task's seq is (0), so
+it sorts before every guest path (roots are (1), (2), ...).")
+
+(defparameter +park-slice+ 0.05
+  "The bounded condition-wait slice for the broadcast-woken park
+sites (1-7): they are woken by name, so the slice is a backstop.")
+
+(defparameter +poll-slice+ 0.002
+  "The bounded slice of the five ORACLE/POLL sites (8-12): their
+predicate is polled, and 2 ms is the cadence the oracles' 50/200
+idle-cycle budgets were calibrated on.")
+
+(defun %bounded-wait (queue mutex timeout)
+  "THE ONLY condition-wait in this runtime. Called holding MUTEX;
+returns holding MUTEX. Fact (a) of the ledger: SBCL 2.6.4 returns
+from a TIMED-OUT wait with the mutex RELEASED — re-grab unless this
+thread already owns it. Every park site goes through here, so no
+site can observe a wait's return without the mutex."
+  (sb-thread:condition-wait queue mutex :timeout timeout)
+  (unless (sb-thread:holding-mutex-p mutex)
+    (sb-thread:grab-mutex mutex))
+  t)
+
+(defun %ticket-path (tk)
+  (let ((task (and tk (async-thread-task tk))))
+    (and task (async-task-seq task))))
+
+(defun %ticket< (a b)
+  "The ticket order: the async-task-seq PATH (the call tree's order),
+with a pathless record last."
+  (let ((pa (%ticket-path a))
+        (pb (%ticket-path b)))
+    (cond ((and pa pb) (%tok-path-earlier-p pa pb))
+          (pa t)
+          (pb nil)
+          (t nil))))
+
+(defun %right-candidates ()
+  "Every record that may hold the right, in ticket order.
+READ WITHOUT *SCHEDULER-MUTEX*: the registry is a persistent list
+(push / remove cons new lists), so a stale read costs at most one
+wasted handoff, while TAKING the scheduler lock here would build the
+own-park-mutex -> scheduler-mutex edge that completes a cycle with
+resume-all's scheduler-mutex -> peer-park-mutex order (measured:
+SBCL's deadlock detector fired on exactly that pair)."
+  (let ((all *scheduler-threads*))
+    (when (and *right-driver* (not (member *right-driver* all)))
+      (setf all (cons *right-driver* all)))
+    (sort (copy-list all) #'%ticket<)))
+
+(defun %right-runnable-p (th)
+  "Is TH a legitimate handoff target? Only a thread that is ACTIVE-
+LY CONTENDING for the right (inside %right-acquire) is: a thread
+that parks with a false predicate waits on its OWN queue and needs
+the right only once its own wake arrives, so handing it the ticket
+early would rotate the right through sleepers."
+  (and th
+       (not (async-thread-abandoned th))
+       (async-thread-right-waiting th)))
+
+(defun %right-successor (self)
+  "The earliest RUNNABLE candidate other than SELF, or NIL."
+  (find-if (lambda (th)
+             (and (not (eq th self))
+                  (%right-runnable-p th)))
+           (%right-candidates)))
+
+(defun %right-acquire (self)
+  "Block until SELF is the ticket holder; return holding the right.
+IDEMPOTENT on the owning thread: a thread that already holds the
+right (a nested component call on one thread) gets it back without
+a second grab and without any depth bookkeeping — the right is
+either held or not, and the only release is %right-yield / the exit
+handoff. SELF is a CONTENDER while it waits, which is what lets a
+yielding thread name it as the next ticket."
+  (when (null self)
+    (return-from %right-acquire nil))
+  (when (sb-thread:holding-mutex-p *store-right*)
+    (return-from %right-acquire t))
+  (setf (async-thread-right-waiting self) t)
+  (unwind-protect
+       (loop
+         (sb-thread:grab-mutex *store-right*)
+         (cond
+          ((or (eq *right-ticket* self)
+               ;; no other contender: the right is free in the sense
+               ;; that nobody named a successor — take it (the
+               ;; creator may already have yielded before this
+               ;; thread registered as a contender)
+               (null (%right-successor self)))
+           (setf *right-ticket* self
+                 *right-owner* self
+                 *right-owner-os* sb-thread:*current-thread*
+                 (async-thread-right-hops self) 0)
+           ;; NOTE: the durable WAKE COUNT is the park machinery's
+           ;; (each site consumes its own); acquiring the right must
+           ;; never eat it — doing so swallowed the very wake that
+           ;; told the site its predicate now holds (measured: an
+           ;; endless acquire/park oscillation).
+           (return t))
+          (t
+           (%right-wait-turn self))))
+    (setf (async-thread-right-waiting self) nil)))
+
+(defun %right-wait-turn (self)
+  "Called holding the right, by SELF which is not the ticket holder.
+Hands the ticket to the earliest runnable candidate (itself when it
+is the only one, so a single-runnable store behaves exactly as
+before), releases the right, and waits (bounded) on SELF's OWN
+queue for the named wake. Returns with neither the right nor any
+mutex held; the caller loops back to %right-acquire."
+  (let ((m (async-thread-mutex self))
+        (q (async-thread-waitqueue self))
+        (next (or (%right-successor self) self)))
+    (setf *right-ticket* next)
+    (cond
+     ((not (eq next self))
+      (sb-thread:release-mutex *store-right*)
+      (when (< (async-thread-right-hops self) 8)
+        (incf (async-thread-right-hops self))
+        (%async-thread-wake next)))
+     (t
+      ;; nobody else can run: hand nothing on, but STILL release the
+      ;; right across the wait (fact b) — a peer may become runnable
+      ;; from a host thread while we sleep, and it must not need us
+      ;; to release a mutex we are not using.
+      (sb-thread:release-mutex *store-right*)))
+    (setf *right-owner* nil)
+    ;; The TURN wait is a bounded poll: its predicate (the ticket)
+    ;; is re-tested under the mutex by %right-acquire's loop, so no
+    ;; wake bookkeeping is needed — and the durable count is LEFT
+    ;; ALONE (it belongs to the park site).
+    (sb-thread:with-recursive-lock (m)
+      (when (zerop (async-thread-wake-count self))
+        (%bounded-wait q m +poll-slice+)))
+    nil))
+
+(defun %right-yield (self)
+  "SELF holds the right and is about to wait: name the next ticket
+(the earliest runnable candidate, else SELF) and RELEASE the right.
+Returns NIL (the caller re-acquires after its wait; the release is
+paired with the wait, never with the park)."
+  (when (or (null self) (not (sb-thread:holding-mutex-p *store-right*)))
+    (return-from %right-yield nil))
+  (let ((next (%right-successor self)))
+    (setf *right-ticket* (or next self)
+          *right-owner* nil)
+    (sb-thread:release-mutex *store-right*)
+    (when (and next (< (async-thread-right-hops self) 8))
+      (incf (async-thread-right-hops self))
+      (%async-thread-wake next))
+    t))
+
+(defun %park (self mutex queue &key (timeout +park-slice+))
+  "SELF holds the right and MUTEX. Release the right, wait bounded on
+QUEUE/MUTEX (the wait leaves MUTEX released, and fact (a)'s re-grab
+is inside %bounded-wait), release MUTEX, re-acquire the right.
+Returns with the right held and MUTEX not held."
+  (%right-yield self)
+  (%bounded-wait queue mutex timeout)
+  (sb-thread:release-mutex mutex)
+  (%right-acquire self))
+
+(defun %right-stall (self &key (seconds +poll-slice+))
+  "The five POLL sites' wait: release the right, sleep one bounded
+slice, re-acquire. Same cadence as the M15/M17 sleep-polls (their
+oracles' idle budgets are calibrated on it)."
+  (%right-yield self)
+  (sleep seconds)
+  (%right-acquire self))
+
+(defun %right-handoff-to (self target &key (seconds 0.0002))
+  "Release the right NAMING TARGET as the next ticket — a targeted
+handoff for one very short bounded slice (the caller's pack window:
+the callee's FIRST TURN must happen, but its later turns must not —
+the fixtures pin STARTED at the pack, before the callback's
+resolution). Then sleep the slice and re-acquire."
+  (when (and self target (sb-thread:holding-mutex-p *store-right*))
+    (setf *right-ticket* target
+          *right-owner* nil)
+    (sb-thread:release-mutex *store-right*))
+  (sleep seconds)
+  (%right-acquire self))
+
+(defun %without-right (self thunk)
+  "Run THUNK with the right released (fact (c): a peer-mutex fan-out —
+async-thread-resume-all, %subtask-resolve's waiters, the nudge spawn
+fires — must never run with the right held), then re-acquire it."
+  (if (and self (sb-thread:holding-mutex-p *store-right*))
+      (unwind-protect
+           (progn (%right-yield self) (funcall thunk))
+        (%right-acquire self))
+      (funcall thunk)))
+
+(defun %right-drop (self)
+  "Release the right if THIS thread holds it (a driver loop's exit).
+Hands the ticket to the earliest contender first, so a waiting guest
+is named while the driver stops polling. NO wait."
+  (when (and self (sb-thread:holding-mutex-p *store-right*))
+    (setf *right-ticket* (%right-successor self)
+          *right-owner* nil)
+    (sb-thread:release-mutex *store-right*))
+  nil)
+
+(defun %right-release-on-exit (self)
+  "SELF is leaving the store: drop its ticket and, when it owns the
+right, hand it to the earliest runnable candidate and release.
+NEVER waits, NEVER joins (the piece-(i) lesson: the teardown must not
+block at a script boundary)."
+  (when (and self
+             ;; ONLY the exiting thread itself may hand the right on:
+             ;; a sweep from another thread (teardown, an oracle
+             ;; abandon) must not release a right it does not own —
+             ;; and A3: the teardown never touches the right at all.
+             (eq self *right-self*)
+             (sb-thread:holding-mutex-p *store-right*))
+    (setf *right-ticket* (%right-successor self)
+          *right-owner* nil)
+    (sb-thread:release-mutex *store-right*))
+  (when (and self (eq self *right-self*))
+    (sb-thread:with-recursive-lock (*scheduler-mutex*)
+      (remhash self *driver-records*)))
+  nil)
+
+(defun %right-thread-death (self)
+  "THE exit gate of a native thread (every factory's unwind-protect
+calls this AFTER %task-exit-implicit-thread): drop the ticket from
+the registry and, if THIS thread still holds the right, hand it to
+the earliest contender and release. This is what makes a dead
+thread's ticket unable to become the head, on EVERY exit path —
+normal return, trap, abandoned park, cancellation — even when the
+thread died somewhere that skipped the task-exit helper. Idempotent
+and NEVER waits."
+  (when self
+    (sb-thread:with-recursive-lock (*scheduler-mutex*)
+      (setf *scheduler-threads*
+            (remove self *scheduler-threads* :test #'eq))
+      (remhash self *driver-records*))
+    (setf (async-thread-right-waiting self) nil)
+    (when (sb-thread:holding-mutex-p *store-right*)
+      (setf *right-ticket* (%right-successor self)
+            *right-owner* nil
+            *right-owner-os* nil)
+      (sb-thread:release-mutex *store-right*)))
+  nil)
+
+(defun %thread-birth (th)
+  "Reserve TH's ticket in the registry AT CREATION. The CREATOR calls
+this while it holds the right (every native factory runs on a thread
+that holds it), so the ticket — the key the handoff order is taken
+from (async-task-seq, stamped by %tok-stamp-task in the same
+creator) — exists before the new thread can contend. %task-enter-
+implicit-thread's own pushnew is the idempotent second registration."
+  (sb-thread:with-recursive-lock (*scheduler-mutex*)
+    (pushnew th *scheduler-threads* :test #'eq))
+  th)
+
+(defun %driver-self ()
+  "The right ticket of THIS OS thread when it is not a guest thread
+(the runner and the nested-sync executors): a per-thread synthetic
+record whose path is (0), i.e. before every guest root (1)."
+  (or *right-self*
+      (sb-thread:with-recursive-lock (*scheduler-mutex*)
+        (or (gethash sb-thread:*current-thread* *driver-records*)
+            (setf (gethash sb-thread:*current-thread* *driver-records*)
+                  (make-async-thread
+                   :task (make-async-task :seq (list 0))))))))
+
+;;; ---------------------------------------------------------------
 ;;; The thread primitives (CanonicalABI.md 447-566).
 
 (declaim (notinline async-thread-wait-until async-thread-resume
@@ -4173,18 +4604,32 @@ exactly once; the wake itself is the mutex-free %async-thread-wake)."
 holds, re-testing on each wakeup. M13-4: the count is cleared with
 the wake — a resume posted during THIS park is THIS park's, never
 the next one's (a count leaking into a later park is a spurious
-early return)."
+early return).
+STEP 4 PARK SITE 1 (also the backpressure gate's and %wset-wait's
+wait): the store right is released for EACH wait and re-acquired
+after it — the release lives in %park, in the loop body, so no
+iteration can re-wait while holding the right (ledger fact b)."
   (%block-enter thread)
   (unwind-protect
        (loop
-         (sb-thread:with-recursive-lock ((async-thread-mutex thread))
-           (async-thread-check-abandoned thread)
-           (when (funcall ready-fn)
+         (async-thread-check-abandoned thread)
+         (%right-acquire thread)
+         (let ((m (async-thread-mutex thread))
+               (ready nil))
+           (sb-thread:grab-mutex m)
+           (setf ready (funcall ready-fn))
+           (cond
+            (ready
+             (sb-thread:release-mutex m)
+             (setf (async-thread-wake-count thread) 0)
              (incf *async-progress*)
              (return))
-           (sb-thread:condition-wait (async-thread-waitqueue thread)
-                                     (async-thread-mutex thread))
-           (setf (async-thread-wake-count thread) 0)))
+            (t
+             ;; m is STILL held here: %park performs the bounded
+             ;; wait on it (fact (a)'s re-grab is inside
+             ;; %bounded-wait), leaves it released, and returns with
+             ;; the right re-acquired.
+             (%park thread m (async-thread-waitqueue thread))))))
     (%block-exit thread)))
 
 (defun async-thread-suspend (thread)
@@ -4197,31 +4642,45 @@ M13-4: the park posts the HANDOFF (§242-273 — this park IS the
 switcher's wake; the post is durable), re-checks the count after
 the post (the switcher's resume can land between the post and the
 wait's registration — its broadcast would be lost, its COUNT is
-durable), and clears the count on the returning wake."
+durable), and clears the count on the returning wake.
+STEP 4 PARK SITE 2: one bounded wait per park iteration, with the
+store right released across it by %park (the post-handoff runs with
+the right held but takes only the SWITCHER's mutex for a two-line
+critical section — right -> short peer section is the declared
+order; the reverse cannot occur because no peer holds a mutex across
+a right acquisition)."
   (setf (async-thread-suspended-p thread) t)
   (%block-enter thread)
   (unwind-protect
        (loop
-         (sb-thread:with-recursive-lock ((async-thread-mutex thread))
-           (async-thread-check-abandoned thread)
+         (async-thread-check-abandoned thread)
+         (%right-acquire thread)
+         (let ((m (async-thread-mutex thread))
+               (woke nil))
+           ;; 1. a durable count already present is THIS park's wake
+           (sb-thread:grab-mutex m)
            (when (> (async-thread-wake-count thread) 0)
              (setf (async-thread-wake-count thread) 0)
-             (return))
+             (setf woke t))
+           (sb-thread:release-mutex m)
+           (when woke (return))
+           ;; 2. the HANDOFF post (§242-273) — a two-line peer
+           ;; section, then the durable re-check (a resume landing
+           ;; between the post and the wait registration)
            (%async-thread-post-handoff thread)
-           ;; RE-CHECK after the post: the switcher's resume can
-           ;; land between the post and the wait's registration
-           ;; (the caller was woken BY the post — it resumes us
-           ;; immediately); its broadcast would be lost to the
-           ;; not-yet-registered wait, but its COUNT is durable —
-           ;; consume it here and return without parking
+           (sb-thread:grab-mutex m)
            (when (> (async-thread-wake-count thread) 0)
              (setf (async-thread-wake-count thread) 0)
+             (setf woke t))
+           (cond
+            (woke
+             (sb-thread:release-mutex m)
              (return))
-           (sb-thread:condition-wait (async-thread-suspend-waitqueue
-                                      thread)
-                                     (async-thread-mutex thread))
-           (setf (async-thread-wake-count thread) 0)
-           (return)))
+            (t
+             (%park thread m
+                    (async-thread-suspend-waitqueue thread))
+             (setf (async-thread-wake-count thread) 0)
+             (return)))))
     (setf (async-thread-suspended-p thread) nil)
     (%block-exit thread)))
 
@@ -4339,6 +4798,17 @@ oracle first (the candidates' row 11 measured exactly this race:
 the callee's age crossed the oracle's 50 before the 64 escape).")
 
 (defun async-thread-resume-all ()
+  "STEP 4 (ledger fact c): async-thread-resume-all's fan-out takes
+OTHER threads' mutexes (the nudge's claim section, the armed-park
+wake). It therefore runs with the STORE RIGHT RELEASED — %without-
+right hands the right on and re-acquires it only after the fan-out
+has returned and dropped every peer mutex, so the AB-BA of
+%task-return / %task-exit-implicit-thread -> resume-all cannot
+exist. The quantum itself is %resume-all-body, unchanged."
+  (%without-right *right-self*
+                  (lambda () (%resume-all-body))))
+
+(defun %resume-all-body ()
   "M13-tok9 THE QUANTUM (CanonicalABI.md 922-941): ONE grant per
 tick — the reference tick allows a SINGLE THREAD one quantum,
 granted in the CREATION-ORDER path sort (the pinned interleave
@@ -4519,19 +4989,28 @@ CONTINUE; its post woke a switcher mid-round, suspend-vs-yield's
 (0)). A pending durable wake is honored (a resume posted before
 the park registered), and the count is cleared with the wake — a
 count arriving with the wake is THIS park's, never the next's."
-  (sb-thread:with-recursive-lock ((async-thread-mutex thread))
-    (async-thread-check-abandoned thread)
+  (async-thread-check-abandoned thread)
+  (%right-acquire thread)
+  (let ((m (async-thread-mutex thread)))
+    (sb-thread:grab-mutex m)
     (setf (async-thread-yield-parked thread) t)
     (%block-enter thread)
     ;; M14 the PARK READINESS (§523: a yield is ALWAYS ready — the
     ;; park's ready-fn, per the spec's start_waiting(ready_func))
     (setf (async-thread-ready-fn thread) (lambda () t))
-    (unless (> (async-thread-wake-count thread) 0)
-      (sb-thread:condition-wait (async-thread-waitqueue thread)
-                                (async-thread-mutex thread)))
-    (setf (async-thread-wake-count thread) 0)
-    (setf (async-thread-ready-fn thread) nil)
-    (setf (async-thread-yield-parked thread) nil)
+    (cond
+     ((> (async-thread-wake-count thread) 0)
+      (setf (async-thread-wake-count thread) 0)
+      (sb-thread:release-mutex m))
+     (t
+      ;; STEP 4 PARK SITE 3: one bounded wait, the right released
+      ;; across it by %park (fact b: welded to THIS wait).
+      (%park thread m (async-thread-waitqueue thread))))
+    (sb-thread:grab-mutex m)
+    (setf (async-thread-wake-count thread) 0
+          (async-thread-ready-fn thread) nil
+          (async-thread-yield-parked thread) nil)
+    (sb-thread:release-mutex m)
     (%block-exit thread)))
 
 ;;; ---- the ComponentInstance concurrency fields (§133-150) ----
@@ -4660,7 +5139,12 @@ does not exist)."
 (defun %task-exit-implicit-thread (task)
   "Task.exit_implicit_thread (CanonicalABI.md 730): release the
 exclusive lock and unregister the thread (the FIELDS local, like
-the enter gate: getf-setf through the shared plist)."
+the enter gate: getf-setf through the shared plist).
+STEP 4: this is THE exit path — the ticket is dropped here (the
+registry removal) and the right is handed to the earliest runnable
+candidate if the leaving thread owned it. Every native factory, the
+trap handlers, the oracle abandon sweeps and the teardown funnel
+through this function, so no dead ticket can ever be the head."
   (let* ((th (async-task-implicit-thread task))
          (inst (async-task-inst task))
          (fields (%inst-async-fields inst)))
@@ -4687,7 +5171,9 @@ the enter gate: getf-setf through the shared plist)."
       ;; worker) in the caller's observation window)
       (if *defer-resume-all*
           (push task *deferred-resume-all-tasks*)
-          (async-thread-resume-all)))))
+          (async-thread-resume-all)))
+    ;; STEP 4: drop the ticket / hand the right on. NEVER waits.
+    (%right-release-on-exit th)))
 
 (defun %task-has-pending-cancel (task)
   (eq (async-task-state task) :pending-cancel))
@@ -4749,10 +5235,31 @@ legacy nudge and the caller observes the unresolved state."
     (setf (async-task-state task) :pending-cancel)
     (when (async-task-implicit-thread task)
       (async-thread-resume (async-task-implicit-thread task)))
-    (sb-thread:with-recursive-lock ((async-task-mutex task))
-      (loop until (async-task-resolved-p task)
-            do (sb-thread:condition-wait (async-task-waitqueue task)
-                                         (async-task-mutex task)))))
+    ;; STEP 4 PARK SITE 7 — the ledger's UNBOUNDED condition-wait:
+    ;; now the shared bounded park. The right is released across the
+    ;; wait and re-acquired after it; the wait's own queue is the
+    ;; TASK's (the resolution broadcasts it), and its slice is the
+    ;; poll slice because a resolution cannot always shoot the
+    ;; count.
+    (let ((self *current-thread*))
+      (loop
+        (%right-acquire self)
+        (let ((m (async-task-mutex task))
+              (done nil))
+          (sb-thread:grab-mutex m)
+          (setf done (async-task-resolved-p task))
+          (cond
+           (done
+            (sb-thread:release-mutex m)
+            (return))
+           (t
+            (if self
+                (%park self m (async-task-waitqueue task)
+                       :timeout +poll-slice+)
+                (progn
+                  (%bounded-wait (async-task-waitqueue task) m
+                                 +poll-slice+)
+                  (sb-thread:release-mutex m)))))))))
    (t
     (setf (async-task-state task) :pending-cancel)
     (let* ((th (async-task-implicit-thread task))
@@ -4799,20 +5306,24 @@ legacy nudge and the caller observes the unresolved state."
           ;; in the caller's observation window). Drain on exit.
           (setf *defer-resume-all* t)
           (unwind-protect
-               (loop
-                 until (or (async-task-resolved-p task)
-                           (> (async-task-turns task) sampled)
-                           (and (or (async-thread-suspended-p th)
-                                    (async-thread-yield-parked th))
-                                ;; the RE-PARK only: the callee's own
-                                ;; park flags are set at the arm's
-                                ;; entry — the resume consumed the
-                                ;; wait; the flags at THIS point are
-                                ;; the turn's NEW park (the initial
-                                ;; park's flags were cleared at its
-                                ;; wake)
-                                t))
-                 do (sleep 0.001))
+               (let ((self *current-thread*))
+                 (loop
+                   ;; STEP 4 PARK SITE 8: the spin's slice is a
+                   ;; %right-stall — the right is released across
+                   ;; every poll so the resumed callee's turn can
+                   ;; actually run (this loop OBSERVES that turn).
+                   (%right-acquire self)
+                   (when (or (async-task-resolved-p task)
+                             (> (async-task-turns task) sampled)
+                             (async-thread-suspended-p th)
+                             (async-thread-yield-parked th))
+                     (return))
+                   ;; the RE-PARK only: the callee's own park flags
+                   ;; are set at the arm's entry — the resume consumed
+                   ;; the wait; the flags at THIS point are the turn's
+                   ;; NEW park (the initial park's flags were cleared
+                   ;; at its wake)
+                   (%right-stall self :seconds 0.001)))
             (setf *defer-resume-all* nil
                   *cancel-window-inst* nil)
             ;; M14: NO DRAIN — the deferred propagations' RESOLVES
@@ -5034,23 +5545,29 @@ computes the tuple at delivery time)."
            ;; inside the cancel window on its future's readiness
            ;; alone.
            (loop
-             do (sb-thread:with-recursive-lock
-                    ((async-thread-mutex thread))
-                  (async-thread-check-abandoned thread)
-                  (let ((g (async-thread-granted thread)))
-                    (cond
-                     (g
-                      (setf (async-thread-granted thread) nil)
-                      (setf (async-thread-wake-count thread) 0)
-                      (when (funcall readiness)
-                        (incf *async-progress*)
-                        (return)))
-                     (t
-                      (when (> (async-thread-wake-count thread) 0)
-                        (setf (async-thread-wake-count thread) 0)))))
-                  (sb-thread:condition-wait
-                   (async-thread-waitqueue thread)
-                   (async-thread-mutex thread))))
+             (async-thread-check-abandoned thread)
+             (%right-acquire thread)
+             (let ((m (async-thread-mutex thread))
+                   (done nil))
+               (sb-thread:grab-mutex m)
+               (let ((g (async-thread-granted thread)))
+                 (cond
+                  (g
+                   (setf (async-thread-granted thread) nil)
+                   (setf (async-thread-wake-count thread) 0)
+                   (setf done (funcall readiness)))
+                  (t
+                   (when (> (async-thread-wake-count thread) 0)
+                     (setf (async-thread-wake-count thread) 0)))))
+               (cond
+                (done
+                 (sb-thread:release-mutex m)
+                 (incf *async-progress*)
+                 (return))
+                (t
+                 ;; STEP 4 PARK SITE 4: the grant/readiness test runs
+                 ;; under the right; the wait releases it (fact b).
+                 (%park thread m (async-thread-waitqueue thread))))))
            (if (%task-deliver-pending-cancel task)
                (list 6 0 0)             ; EventCode.TASK_CANCELLED
                (%wset-get-pending-event wset)))
@@ -5425,6 +5942,7 @@ drop-readable must return index 1 again)."
               :inst inst))
          (cell (cons nil nil)))
     (setf (async-task-implicit-thread task) th)
+    (%thread-birth th)
     (setf (async-task-on-resolve task)
           (lambda (result)
             (setf (car cell) t (cdr cell) result)))
@@ -5433,10 +5951,26 @@ drop-readable must return index 1 again)."
              (lambda ()
                (let ((*current-task* task)
                      (*current-thread* th)
+                     (*right-self* th)
                      (*handle-caller-inst* inst))
-                 (handler-case
-                     (%async-lift-guest-body task lf cx)
+                 ;; STEP 4: guest code runs only under the right.
+                 (%right-acquire th)
+                 (unwind-protect
+                     (handler-case
+                         (%async-lift-guest-body task lf cx)
                  (error (c)
+                   ;; PUBLISH the failure FIRST (the write happens
+                   ;; under the right, so the runner's poll reads a
+                   ;; field no one else can be writing), THEN exit —
+                   ;; %task-exit-implicit-thread drops the ticket and
+                   ;; hands the right on.
+                   (setf (car cell) :trap
+                         (cdr cell) c)
+                   (sb-thread:with-recursive-lock
+                       ((async-task-mutex task))
+                     (setf (async-task-resolved-p task) t)
+                     (sb-thread:condition-broadcast
+                      (async-task-waitqueue task)))
                    ;; The trap path MUST run Task.exit_implicit_thread
                    ;; FIRST: the guest body died mid-turn, so the
                    ;; exclusive lock + scheduler registration may
@@ -5448,50 +5982,51 @@ drop-readable must return index 1 again)."
                    (handler-case
                        (%task-exit-implicit-thread task)
                      (error () nil))
-                   ;; a guest trap/abort records the failure for
-                    ;; the caller (the trap re-signals at the
-                    ;; component boundary)
-                    (setf (car cell) :trap
-                          (cdr cell) c)
-                     (sb-thread:with-recursive-lock
-                         ((async-task-mutex task))
-                       (setf (async-task-resolved-p task) t)
-                       (sb-thread:condition-broadcast
-                        (async-task-waitqueue task)))
                      ;; M11a wake propagation: a trapped task may
                      ;; be the waker sibling parked tasks awaited
                      ;; (Store.tick, §932)
-                     (async-thread-resume-all))))))))
+                     (async-thread-resume-all))))
+                   ;; STEP 4: every exit path drops the ticket and
+                   ;; hands the right on.
+                   (%right-thread-death th))))))
       (declare (ignore guest))
-      (sb-thread:grab-mutex (async-task-mutex task))
-      (let ((nested (and (boundp '*current-thread*) *current-thread*)))
-        (%block-enter nested))
-      (unwind-protect
-           (loop
-             with idle-cycles = 0
-             when (async-task-resolved-p task)
-               do (return)
-             ;; nudge every live thread, then give them a slice of
-             ;; CPU — the deadlock oracle (§3539-3542) must OBSERVE
-             ;; whether any thread made progress, so a bare
-             ;; condition-wait (sleeping until this task's own
-             ;; resolution) would hang exactly when it must trap
-             do (let* ((before *async-progress*)
-                       (spent (%drain-tick-needed-p th)))
-                  (when spent
-                    (async-thread-resume-all))
-                  (sb-thread:release-mutex (async-task-mutex task))
-                  (sleep 0.002)
-                  (sb-thread:grab-mutex (async-task-mutex task))
-                  ;; THE ORACLE'S QUISCENCE RULE: a tick SPENT with
-                  ;; no progress is a quiescent cycle (the deadlock
-                  ;; fixtures' oracle); a cycle with NO tick spent
-                  ;; cannot judge progress (the guest is mid-turn).
-                  (if (> *async-progress* before)
-                      (setf idle-cycles 0)
-                      (if spent
-                          (incf idle-cycles)
-                          (setf idle-cycles 0))))
+      (let* ((self (%driver-self))
+             (*right-self* self)
+             (*right-driver* self))
+        (%right-acquire self)
+        (let ((nested (and (boundp '*current-thread*) *current-thread*)))
+          (%block-enter nested))
+        (unwind-protect
+             (loop
+               with idle-cycles = 0
+               ;; STEP 4: the runner is a right PARTICIPANT with the
+               ;; synthetic ticket (0) — it sorts before every guest
+               ;; root, so a parked guest hands the right back to the
+               ;; tick engine exactly as the pre-permit runtime's
+               ;; drain loops expected.
+               do (%right-acquire self)
+               when (async-task-resolved-p task)
+                 do (return)
+               ;; spend one tick (the M11a propagation) then release
+               ;; the right for one bounded poll slice — the guest
+               ;; threads are the only parties that can resolve the
+               ;; task, and they can only run while the right is
+               ;; released
+               do (let* ((before *async-progress*)
+                         (spent (%drain-tick-needed-p th)))
+                    (when spent
+                      (async-thread-resume-all))
+                    (unless (async-task-resolved-p task)
+                      (%right-stall self))
+                    ;; THE ORACLE'S QUISCENCE RULE: a tick SPENT with
+                    ;; no progress is a quiescent cycle (the deadlock
+                    ;; fixtures' oracle); a cycle with NO tick spent
+                    ;; cannot judge progress (the guest is mid-turn).
+                    (if (> *async-progress* before)
+                        (setf idle-cycles 0)
+                        (if spent
+                            (incf idle-cycles)
+                            (setf idle-cycles 0))))
              ;; THE DEADLOCK TRAP (§3539-3542): enough consecutive
              ;; quiescent cycles with the task unresolved = no ready
              ;; candidate can ever make progress
@@ -5549,8 +6084,8 @@ drop-readable must return index 1 again)."
                (error 'wasmdown:wasm-trap :kind :generic
                       :message
                       "deadlock detected: event loop cannot make further progress"))
-        (sb-thread:release-mutex (async-task-mutex task))
-        (%block-exit (and (boundp '*current-thread*) *current-thread*)))
+          (%block-exit (and (boundp '*current-thread*) *current-thread*))
+          (%right-release-on-exit self)))
       (etypecase (car cell)
         ((eql t)
          (let ((r (cdr cell)))
@@ -5988,26 +6523,38 @@ is the valtype."
                                  (setf (async-thread-granted th) nil)
                                  (setf (async-thread-wake-count th) 0))
                                (loop
-                                 (sb-thread:with-recursive-lock
-                                     ((async-thread-mutex th))
-                                   (async-thread-check-abandoned th)
+                                 (async-thread-check-abandoned th)
+                                 (%right-acquire th)
+                                 (let ((m (async-thread-mutex th))
+                                       (done nil))
+                                   (sb-thread:grab-mutex m)
                                    (let ((g (async-thread-granted th)))
                                      (cond
                                       (g
                                        (setf (async-thread-granted th) nil)
                                        (setf (async-thread-wake-count th) 0)
-                                       (when (async-waitable-pending-event
-                                              end)
-                                         (incf *async-progress*)
-                                         (return)))
+                                       (setf done
+                                             (not (null
+                                                   (async-waitable-pending-event
+                                                    end)))))
                                       (t
                                        (when (> (async-thread-wake-count th)
                                                 0)
                                          (setf (async-thread-wake-count
-                                                th) 0))))
-                                     (sb-thread:condition-wait
-                                      (async-thread-waitqueue th)
-                                      (async-thread-mutex th)))))
+                                                th) 0)))))
+                                   (cond
+                                    (done
+                                     (sb-thread:release-mutex m)
+                                     (incf *async-progress*)
+                                     (return))
+                                    (t
+                                     ;; STEP 4 PARK SITE 5 (the sync
+                                     ;; read/write rendezvous): the
+                                     ;; grant/event test runs under the
+                                     ;; right; the wait releases it.
+                                     (%park th m
+                                            (async-thread-waitqueue
+                                             th))))))
                                (setf (async-thread-ready-fn th) nil)
                                (%block-exit th))
                           (setf (async-thread-io-parked *current-thread*) nil)
@@ -6267,14 +6814,23 @@ is the valtype."
             (let* ((fields (%inst-async-fields inst))
                    (th (make-async-thread :task task))
                    (c (second args)))
+              (%thread-birth th)
               (setf (async-thread-spawn-thunk th)
                     (lambda ()
                       (sb-thread:make-thread
                        (lambda ()
                          (let* ((*current-task* task)
-                                (*current-thread* th))
+                                (*current-thread* th)
+                                (*right-self* th))
                            (setf (async-thread-native th)
                                  sb-thread:*current-thread*)
+                           ;; STEP 4: guest code runs only under the
+                           ;; right. The spawn fires from another
+                           ;; thread's tick, which has already
+                           ;; released the right (resume-all runs
+                           ;; under %without-right), so the grab here
+                           ;; never blocks it.
+                                    (%right-acquire th)
                            ;; §4587's call_and_trap_on_throw: the
                            ;; thread body's trap ENDS the thread
                            ;; (an unhandled trap on a guest thread
@@ -6319,6 +6875,9 @@ is the valtype."
                                          (remove th
                                                  *scheduler-threads*
                                                  :test #'eq)))
+                                 ;; STEP 4: drop the ticket and hand
+                                 ;; the right on (never waits).
+                                 (%right-release-on-exit th)
                                  (%async-thread-post-handoff th))
                              (wasmdown:wasm-trap () nil))))
                        :name "new-indirect-thread")))
@@ -6508,6 +7067,15 @@ is the valtype."
                                      (async-thread-ready-p target)
                                      (async-thread-suspended-p target)
                                      (async-thread-yield-parked
+                                      target)
+                                     ;; STEP 4: a thread CONTENDING for
+                                     ;; the store right is not running
+                                     ;; — it is parked at %right-acquire
+                                     ;; and will continue when named.
+                                     ;; Without this a legal switch
+                                     ;; target reads as "not suspended"
+                                     ;; (measured: during-sync rows).
+                                     (async-thread-right-waiting
                                       target)))))
               (error 'wasmdown:wasm-trap :kind :generic
                      :message
@@ -6524,7 +7092,8 @@ is the valtype."
                                              target))
                                  (async-thread-ready-p target)
                                  (async-thread-suspended-p target)
-                                 (async-thread-yield-parked target)))
+                                 (async-thread-yield-parked target)
+                                 (async-thread-right-waiting target)))
                         target
                         (if promote-p nil target))))
               ;; M13-4 THE ONE-LOCK HANDOFF (§242-273's discipline,
@@ -6538,97 +7107,66 @@ is the valtype."
               ;; DURABLE, so no interleaving of the three parties
               ;; loses a wake.
               (async-thread-resume-all)
-              (let ((mu (async-thread-mutex *current-thread*)))
-                (sb-thread:with-recursive-lock (mu)
-                  (async-thread-check-abandoned *current-thread*)
-                  ;; M13-tok34 THE INTER-ROUND DRAIN (no-sibling-
-                  ;; resume ::2's window: the capture's tail (:RES
-                  ;; (71) NIL) (:SUSP (72)) — the caller WOKE from
-                  ;; its round wait BEFORE the target's post: the
-                  ;; PREVIOUS round's late post (the target's
-                  ;; exit-post landing in the inter-round gap)
-                  ;; survived the M13-9 no-arm-clear shape and was
-                  ;; absorbed by THIS round's wait as its own wake —
-                  ;; the caller proceeded early, the target stranded
-                  ;; mid-round). Drain the surviving count UNDER THE
-                  ;; MUTEX before arming: a stale count is consumed
-                  ;; here (a REAL post for THIS round cannot exist
-                  ;; yet — the target has not been resumed; the
-                  ;; resume happens below, after the arm).
-                  (setf (async-thread-wake-count *current-thread*)
-                        0)
+              (let ((mu (async-thread-mutex *current-thread*))
+                    (ct *current-thread*))
+                (sb-thread:grab-mutex mu)
+                (async-thread-check-abandoned ct)
+                ;; M13-tok34 THE INTER-ROUND DRAIN (see the note
+                ;; below): drain a surviving count under the mutex
+                ;; before arming.
+                (setf (async-thread-wake-count ct) 0)
+                (if yield-p
+                    (setf (async-thread-yield-parked ct) t)
+                    (setf (async-thread-suspended-p ct) t))
+                (%block-enter ct)
+                (unwind-protect
+                     (progn
+                       ;; the resume takes the TARGET's mutex; drop our
+                       ;; own first (no lock cycle: neither side takes
+                       ;; the other's while holding its own)
+                       (sb-thread:release-mutex mu)
+                       (when resumable-target
+                         ;; §242-273: BOTH pairs switch — the
+                         ;; then-resume pair unconditionally
+                         ;; (§531/§536's block(switch_to=other)),
+                         ;; the promote pair on its ready branch
+                         ;; (§549: stop_waiting +
+                         ;; yield_then_resume(other)) — and the
+                         ;; caller proceeds only at the target's
+                         ;; NEXT park/exit. The POST-TO rides the
+                         ;; resume's locked section: atomic against
+                         ;; the target's own handoff claim, no lock
+                         ;; cycle (the far-side wake is mutex-free).
+                         (async-thread-resume resumable-target ct))
+                       ;; M13-9 WAIT-FIRST + CHECK-AFTER (no arm-time
+                       ;; return): the switch is a ROUND BARRIER — the
+                       ;; caller hands the CPU over ONCE, so a
+                       ;; yield-then-promote proceeds only at the
+                       ;; target's next park/exit/exit-post, never at
+                       ;; its own arm. STEP 4: each of those waits is
+                       ;; %park, which releases the store right (fact
+                       ;; b: welded to THIS wait, every iteration).
+                       (loop
+                         (sb-thread:grab-mutex mu)
+                         (%park ct mu
+                                (if yield-p
+                                    (async-thread-waitqueue ct)
+                                    (async-thread-suspend-waitqueue ct)))
+                         (sb-thread:grab-mutex mu)
+                         (let ((done (if yield-p
+                                         t
+                                         (> (async-thread-wake-count ct)
+                                            0))))
+                           (setf (async-thread-wake-count ct) 0)
+                           (sb-thread:release-mutex mu)
+                           (when done (return)))))
+                  (sb-thread:grab-mutex mu)
                   (if yield-p
-                      (setf (async-thread-yield-parked *current-thread*)
-                            t)
-                      (setf (async-thread-suspended-p *current-thread*)
-                            t))
-                  (%block-enter *current-thread*)
-                  (unwind-protect
-                       (progn
-                         ;; M13-9 NO ARM-TIME CLEAR + WAIT-THEN-CHECK:
-                         ;; a count present here arrived while we
-                         ;; were RUNNING — a REAL wake (the target's
-                         ;; exit-post landing between an earlier
-                         ;; fire and this arm; the parks clear their
-                         ;; own counts on exit, so a surviving count
-                         ;; is fresh). The clear was the lost-
-                         ;; handoff killer: it wiped an exit-post
-                         ;; that had already fired, and the park then
-                         ;; waited on a body that would never post
-                         ;; again — the SYNC-LIFT oracle fired
-                         ;; (::34's ~20% residual, 7/30 all
-                         ;; SYNC-LIFT). The loop WAITS FIRST and
-                         ;; checks AFTER (no entry check): the pre-set
-                         ;; count is absorbed by the first wait's
-                         ;; wake check — the round BARRIER holds (the
-                         ;; caller still hands the CPU over once;
-                         ;; the immediate-return-on-entry shape was
-                         ;; session-5's 5/20 regression, a different
-                         ;; change). A spurious wake loops (the
-                         ;; check re-tests on every wake): the
-                         ;; durable count is the suspend pair's only
-                         ;; exit (§494 — the drain's nudges are
-                         ;; ignored BY DESIGN), any wake the yield
-                         ;; pair's (§536).
-                         (when resumable-target
-                           ;; §242-273: BOTH pairs switch — the
-                           ;; then-resume pair unconditionally
-                           ;; (§531/§536's block(switch_to=other)),
-                           ;; the promote pair on its ready branch
-                           ;; (§549: stop_waiting +
-                           ;; yield_then_resume(other)) — and the
-                           ;; caller proceeds only at the target's
-                           ;; NEXT park/exit. The POST-TO rides the
-                           ;; resume's locked section: atomic against
-                           ;; the target's own handoff claim, no lock
-                           ;; cycle (the far-side wake is mutex-free).
-                           (async-thread-resume resumable-target
-                                                *current-thread*))
-                         (loop
-                           (sb-thread:condition-wait
-                            (if yield-p
-                                (async-thread-waitqueue *current-thread*)
-                                (async-thread-suspend-waitqueue
-                                 *current-thread*))
-                            mu)
-                           (async-thread-check-abandoned
-                            *current-thread*)
-                           (when (or yield-p
-                                     (> (async-thread-wake-count
-                                         *current-thread*)
-                                        0))
-                             (setf (async-thread-wake-count
-                                    *current-thread*)
-                                   0)
-                             (return))))
-                    (if yield-p
-                        (setf (async-thread-yield-parked *current-thread*)
-                              nil)
-                        (setf (async-thread-suspended-p *current-thread*)
-                              nil))
-                    (%block-exit *current-thread*)
-                    (setf (async-thread-wake-count *current-thread*)
-                          0)))))
+                      (setf (async-thread-yield-parked ct) nil)
+                      (setf (async-thread-suspended-p ct) nil))
+                  (setf (async-thread-wake-count ct) 0)
+                  (sb-thread:release-mutex mu)
+                  (%block-exit ct))))
             (list 0))))))
     ;; the still-opaque kinds: the slot exists, the call traps
     ((:thread-new-indirect
@@ -6985,8 +7523,21 @@ is the valtype."
               ;; SYNCHRONOUS resume (§3530's thread.resume — no
               ;; tick at all); the callee's own thread is the only
               ;; grant the wait needs.
-              do (%task-grant-callee (async-subtask-task subtask))
-                 (sleep 0.001))
+              ;; STEP 4 PARK SITE 12: the spin's wait is a TARGETED
+              ;; handoff — the right goes to the callee alone for one
+              ;; very short slice, so the callee's FIRST TURN (its
+              ;; OnStart, which flips STARTING -> STARTED) happens
+              ;; while its later turns do not: the pack must report
+              ;; STARTED (and the fixtures pin it), never the
+              ;; callback's resolution.
+              do (%right-acquire *current-thread*)
+                 (%task-grant-callee (async-subtask-task subtask))
+                 (unless (or (%subtask-resolved-p subtask)
+                             (/= (async-subtask-state subtask) 0))
+                   (%right-handoff-to *current-thread*
+                                      (async-task-implicit-thread
+                                       (async-subtask-task subtask))
+                                      :seconds 0.0002)))
              ;; THE ATOMIC EXIT (session-11's refined candidate): the
              ;; loop's exit and the state read were TWO steps — the
              ;; callee could RESOLVE between them, and the pack then
@@ -7069,7 +7620,8 @@ is the valtype."
                (task (progn (%tok-stamp-task task) task))
                (th (make-async-thread :task task)))
           (setf (async-task-implicit-thread task) th)
-          (setf (async-task-on-resolve task)
+          (%thread-birth th)
+                (setf (async-task-on-resolve task)
                 (lambda (result)
                   (funcall on-resolve
                            (if (eq result :cancelled)
@@ -7079,28 +7631,23 @@ is the valtype."
            (lambda ()
              (let ((*current-task* task)
                    (*current-thread* th)
+                   (*right-self* th)
                    (*handle-caller-inst* (lifted-func-inst f)))
-               (handler-case
-                   (%async-lift-guest-body
-                    task f
+               ;; STEP 4: guest code runs only under the right.
+               (%right-acquire th)
+               (unwind-protect
+                   (handler-case
+                       (%async-lift-guest-body
+                        task f
                     (make-abi-cx
                      :memory (lifted-func-memory f)
                      :realloc (lifted-func-realloc f)
                      :inst (lifted-func-inst f)))
                  (error (c)
-                   ;; Like the invoke-side trap handler: the guest
-                   ;; body died mid-turn holding the exclusive lock
-                   ;; + scheduler registration — release FIRST
-                   ;; (Task.exit_implicit_thread) or the leaked
-                   ;; lock starves every needs-exclusive peer.
-                   (handler-case
-                       (%task-exit-implicit-thread task)
-                     (error () nil))
-                   ;; a trapped callee resolves as (:trap . c) — the
-                   ;; trap PROPAGATES at the boundary (§3584): the
-                   ;; caller observes it (the sync lower's caller
-                   ;; loop re-signs; the async lower's delivery
-                   ;; closure re-signs at the caller's wait/poll)
+                   ;; Like the invoke-side trap handler: publish the
+                   ;; resolution under the right FIRST, then exit —
+                   ;; Task.exit_implicit_thread releases the
+                   ;; exclusive lock and hands the store right on.
                    (unless (async-task-resolved-p task)
                      (funcall on-resolve (cons :trap c)))
                    (sb-thread:with-recursive-lock
@@ -7108,8 +7655,14 @@ is the valtype."
                      (setf (async-task-resolved-p task) t)
                      (sb-thread:condition-broadcast
                       (async-task-waitqueue task)))
+                   (handler-case
+                       (%task-exit-implicit-thread task)
+                     (error () nil))
                    ;; M11a wake propagation: the trapped-callee case
-                   (async-thread-resume-all)))))
+                   (async-thread-resume-all)))
+                 ;; STEP 4: every exit path drops the ticket and
+                 ;; hands the right on.
+                 (%right-thread-death th))))
            :name "async-lower-callee")
           ;; the OnCancel: request the task's cancellation (the
           ;; TASK is the second value — the lower stores it in the
@@ -7134,7 +7687,18 @@ registered in the global scheduler after the last command; the
 NEXT script's rounds then compete with them for each tick's
 single grant (empty-wait::1 deadlocked only in the LANE — its
 predecessor's leftovers consumed every grant; alone it passes).
-Abandon + unblock + unregister every still-registered thread."
+Abandon + unblock + unregister every still-registered thread.
+
+STEP 4 / A3 — THE TEARDOWN RULE: this function sets flags and
+broadcasts under *SCHEDULER-MUTEX* and NEVER acquires the store
+right and NEVER waits unboundedly (the join below is BOUNDED).
+The abandoned parks unwind on their own threads, each dropping its
+ticket through %task-exit-implicit-thread -> %right-release-on-exit
+(which refuses to act for a thread that is not the caller), so the
+next script starts on an empty registry. A script-boundary block
+would change the timing the next fixture inherits — the piece-(i)
+measurement: an unbounded join there cost 5 extra acs::1 per 30
+runs, and the ledger's rule is that this boundary may not block."
   (let ((threads-to-join nil))
     (sb-thread:with-recursive-lock (*scheduler-mutex*)
       (dolist (th (copy-list *scheduler-threads*))
@@ -7155,15 +7719,17 @@ Abandon + unblock + unregister every still-registered thread."
                    (not (eq sb-thread:*current-thread*
                             (async-thread-native th))))
           (push (async-thread-native th) threads-to-join)))
-      (setf *scheduler-threads* nil))
-    ;; M13-tok19 THE TEARDOWN JOIN: the abandoned threads'
-    ;; unwinds run CONCURRENTLY with the next fixture's flow
-    ;; otherwise (the unwind storm — cancel-resumed-callback-
-    ;; switch's lane-only ~3-in-6 single-fail class: 20/20
-    ;; standalone; the predecessors' dying threads stole its
-    ;; ticks). JOIN them so the next script starts clean.
+      (setf *scheduler-threads* nil)
+      ;; STEP 4: no ticket survives a teardown (a recycled thread
+      ;; object must not alias a dead entry)
+      (clrhash *driver-records*))
+    ;; M13-tok19 THE TEARDOWN JOIN — BOUNDED (A3): the abandoned
+    ;; threads' unwinds run concurrently with the next fixture's flow
+    ;; otherwise (the unwind storm), so give each a bounded grace and
+    ;; move on; NEVER block this boundary indefinitely.
     (dolist (n threads-to-join)
-      (ignore-errors (sb-thread:join-thread n)))))
+      (ignore-errors
+        (sb-thread:join-thread n :timeout 0.25 :default :timeout)))))
 
 (setf wasmdown.wast:*store-teardown-hook* #'%store-teardown)
 
