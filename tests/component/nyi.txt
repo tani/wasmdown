@@ -1,3 +1,303 @@
+# M17 HTTP REMOVAL LEDGER. WASI HTTP (`wasi:http`, M16 slice 5) was REMOVED
+# at user direction in M17: the provider, its public surface, its unit tests
+# (WASI/HTTP-* and WASI/E2E-HTTP-CLIENT-COMPONENT) and tests/http-client-component.wat
+# are gone (recoverable from git history); the vendored `specs/wasi/.../http/*.wit`
+# remain reference data only. This also RETIRES the unattributed WASI HTTP-loopback
+# unit flake recorded further below (`(EQ :OK (CAR RES))` on
+# WASI/HTTP-LOOPBACK-CONTENT-LENGTH x3-4 per 30 dense runs) - that row can never
+# recur because its tests no longer exist. The `cancel-delivery::1`-class watch
+# lines stay as they are (unrelated to HTTP). NO WASI-HTTP acceptance remains.
+# M17 SESSION 3 ADDENDUM 5 — WHAT THE acs::1 "REGRESSION" ACTUALLY WAS.
+# Three measured statements, in the order the evidence arrived:
+#  1. acs::1 at 8/30 was PIECE (i), not the ABI work: reverting only 3edd099 took
+#     it to 3/30 with the total 16 -> 12. (Re-measured separately: the ABI/wit
+#     half alone was never shown to move acs::1.)
+#  2. The lane's extra acs sensitivity vs standalone (~1/300) came from the
+#     runner's DISCARDED warm-up pass (~1000 commands into the same store before
+#     the first measured file). Removing it moved acs::1 3 -> 2/30 - inside noise,
+#     and it cost totals (12 -> 15) so it was restored per the pre-declared rule.
+#  3. THE SHIPPED CONFIGURATION THEREFORE CARRIES acs::1 AT 3/30 AGAINST MASTER'S
+#     1/30 AT n=30 - not separable, and NOT a regression introduced by the diff
+#     being shipped. The exact sentence for a reader of this ledger: the acs::1
+#     elevation was piece (i) plus lane-harness state; the ABI/handle, WIT and
+#     reactor work has never been shown to move that row.
+# The only row the shipped diff still owns is the unattributed WASI HTTP-loopback
+# unit flake (4-6/30 in dense batches, 0 in an interleaved 10+10, 0-1/30 at
+# master) - next bisect is branch minus 99c7e23 on the unit lane alone.
+# M17 SESSION 3 ADDENDUM 4 — acs::1 IS NOT PREDECESSOR INTERFERENCE FROM A
+# MEASURED FILE, and the runner's discarded warm-up pass was TESTED.
+# `async-calls-sync` is the FIRST file in *FILES* (verified: the jsonl's file order
+# starts with component/async-calls-sync.wast), so no measured fixture precedes it.
+# The only thing that ran before it was `tools/run-component-suite.lisp`'s opening
+# `(run-directory ... "tests/component/binary/*.wast")` whose RESULT IS DISCARDED —
+# ~1000 commands executed into the same store, invisible in the output. That made
+# the lane's acs rate incomparable with standalone (~1/300) by construction.
+# TESTED: removing that pass (each run then starts from a genuinely fresh store).
+# 30 dense runs, machine quiet: 12 red runs / 15 fail commands, acs::1 2/30,
+# ctr::9 5/30, reentrance::14 2/30, cancel-delivery::1 3/30.
+# AGAINST the same branch with the pass (11 red / 12 fails, acs::1 3/30,
+# ctr::9 5/30, reentrance 1/30, cd::1 0/30): the removal is WITHIN NOISE on
+# acs::1 and WORSE on totals and on cancel-delivery::1. Reverted — the metric is
+# the arbiter — but the finding is kept: the discarded pass must not be
+# reintroduced as a "warm-up", and if the lane is ever made store-fresh per file
+# the acs rate has to be re-baselined, not compared.
+# THE FOUR 30-RUN CONFIGURATIONS (dense, quiet machine, 1631 commands each):
+#   config                              red/30  fails  acs::1  ctr::9  reent  cd::1
+#   master c960ef7                       14      14     1       7      2      0
+#   branch + piece (i) + warm-up         13      16     8       4      0      1
+#   branch - piece (i) + warm-up         11      12     3       5      1      0
+#   branch - piece (i) - warm-up         12      15     2       5      2      3
+# THE SHIP CONFIGURATION IS ROW 3 (branch HEAD after 16d529d): best red-run count
+# and best total of any tree measured, with acs::1 at 3/30 against master's 1/30
+# (n=30: not separable) and reentrance::14 at 1/30 against master's 2/30.
+# NO FURTHER LOCAL PATCHING ON acs::1 IS JUSTIFIED: its standalone rate is ~1/300,
+# its in-lane rate is 1-3/30 in every configuration measured, and the only
+# predecessor it ever had was the discarded warm-up pass. The remaining lever is
+# the step-4 store scheduler (the 12-site park table + the three measured facts in
+# this ledger), not a fifth local change.
+# M17 SESSION 3 ADDENDUM 3 — PIECE (i) REVERTED: IT WAS THE acs::1 REGRESSION VECTOR.
+# The bisect (worktree at d111f61 with commit 3edd099 reverted, i.e. "branch minus
+# piece (i)", machine quiet, 30 dense runs each):
+#                         acs::1   lane red runs   lane fail commands   unit fail runs
+#   master c960ef7         1/30     14/30           14                  1/30
+#   branch + piece (i)     8/30     13/30           16                  4-6/30
+#   branch - piece (i)     3/30     11/30           12                  5/30
+# READING: piece (i) is WORSE on the plan's own metric by every count that matters
+# (acs::1 8 vs 3, total 16 vs 12) and does not move the HTTP unit row (4-6/30 both
+# ways, so it is EXONERATED for that row). Reverted in 16d529d.
+# WHY, MECHANICALLY (the likely reason, to verify before anyone re-lands it): the
+# teardown now JOINS every guest native thread, so a script boundary BLOCKS until
+# the previous fixture's parked-by-design callbacks actually unwind. That changes
+# the timing the NEXT fixture inherits — which is exactly the axis acs::1 is
+# sensitive to. A future version must use a BOUNDED join (timeout, no hang) and be
+# measured the same way; "join the leak" is not free.
+# THE UNIT HTTP ROW STAYS UNATTRIBUTED and is not piece (i): `(EQ :OK (CAR RES))`
+# on WASI/HTTP-LOOPBACK-CONTENT-LENGTH x3-4 per 30 dense runs, 0 in an interleaved
+# 10+10, and 0-1/30 at master across two batches. The remaining candidate set is
+# the ABI/type-inst or WIT-selection diff; the next bisect is branch minus the ABI
+# commit (99c7e23) on the unit lane only.
+# M17 SESSION 3 ADDENDUM 2 — THE UNIT SUITE IS NOT DETERMINISTIC, AND ONE FLAKE IS
+# STILL UNATTRIBUTED. All counts are "runs with a unit FAIL" out of 30 dense serial
+# runs unless stated; the same command, the same machine, the same SBCL.
+#   master c960ef7                 1/30 (component/async-lower-result-two-spaces-pins)
+#                                  then 0/30
+#   branch, load arms present      4/30 (WASI/E2E-HTTP-CLIENT-COMPONENT x2,
+#                                  WASI/HTTP-LOOPBACK-CHUNKED-TRAILERS x2)
+#   branch, load arms REVERTED     4/30 (HTTP-LOOPBACK-CONTENT-LENGTH x2,
+#                                  CHUNKED-TRAILERS x1, async pin x1) then 6/30
+#                                  (HTTP loopbacks x5, async pin x1)
+#   branch in an isolated worktree
+#     (same code, load arms off)   0/30
+#   master vs branch INTERLEAVED, 10 + 10            0 on both
+# THE LOAD ARMS ARE NOT THE CAUSE: reverting them did not change the HTTP row rate,
+# so they are reverted anyway (HEAD's arm was unreachable, and a CORRECT
+# memory-path lift transfers the end - which then needs every %abi-load call site
+# classified as transfer-or-read. That is its own slice; do not re-land it as a
+# two-line move).
+# THE HTTP-LOOPBACK FLAKE IS UNATTRIBUTED. Signature: `(EQ :OK (CAR RES))` /
+# `unreachable` inside the component, i.e. the request/response did not complete.
+# It appears in DENSE 30-run batches (4-6/30) and not at all in an interleaved
+# 10+10 - so batch density or machine state participates. THE PRIME REMAINING
+# SUSPECT is piece (i)'s teardown join (unitA, which had component-runtime from
+# c52a38e i.e. piece (i) OFF, showed NO HTTP flake in 12 runs in a dense batch).
+# NEXT BISECT: branch minus piece (i), 30 dense runs, HTTP row count. If it goes
+# to 0, the teardown join is over-reaching (an in-flight provider thread joined or
+# abandoned mid-exchange) and the join must skip threads owned by a live task.
+# CONSEQUENCE FOR THE GATE: "497 passed, 0 failed" is a SINGLE-RUN statement. The
+# unit lane needs its own rate recorded the way the component lane's is, and the
+# plan's 0-fail framing must be read as 0-in-a-run, not deterministic.
+# M17 SESSION 3 ADDENDUM — a content audit that reprioritises step 3, plus two
+# methodology items and one honest status for the reactor.
+# THE VENDORED WIT USES NONE OF THE PARSER CONSTRUCTS STEP 3 NAMES AS MISSING.
+# `grep` over specs/wasi/wasi-wit-0.3.2 (15 .wit files): `include` 0 (the only
+# hits are prose in doc comments), `... with { ... }` rename 0, `external-id` 0,
+# and every world item is a PLAIN PATH (`import wasi:clocks/types@0.3.2;` etc.) -
+# which %parse-world already handles. So the selection core landed in 354e2f2
+# covers 100% of the constructs any vendored package actually contains, and
+# world include / rename / named-inline interface bindings / positional
+# @external-id are SPEC-COMPLETENESS work that no provider composition needs.
+# PRIORITY CONSEQUENCE: schedule that parser half AFTER steps 5/6/7/8, and treat
+# it as conformance coverage rather than a blocker. Do not read "step 3" as
+# complete in the plan's sense - it is complete for the vendored corpus only.
+# METHODOLOGY (both items cost a false reading this week):
+#  - Record the WALL TIME of every metered run. Normal is 8-13 s. A batch whose
+#    walls drift >2x is CONTAMINATED: discard it unmeasured, do not compare it.
+#  - Before a meter, check `pgrep -c sbcl` is 0. A previous session's probe
+#    (/tmp/m14-standalone.lisp) ran 1 day 02:38 undetected and poisoned every
+#    rate recorded in sessions 1-2 (see the correction above).
+# THE REACTOR IS REGISTERED BUT NOT YET PROVEN BY THE LANE: d766632 lands the
+# backend with 6 unit tests (deadlines, fd order, status/EINTR, cancel/close,
+# real loopback, self-pipe wake). No component-lane fixture drives it, and no
+# WASI provider is wired to it yet. Treat reactor-step's real poll paths as
+# not-yet-proven until step 7's HTTP wiring exercises them end to end.
+# WATCH ROWS in the branch's 30-run table: acs::1 8/30 (the mover, see above) and
+# cancel-delivery::1 1/30 - the latter carries the ledger's OWN rare signature
+# ("The value NIL is not of type NUMBER", historically ~1/46); a real fix for it
+# belongs to the descriptor/scope lifetime work, not to this diff.
+# M17 SESSION 3 — THE 30-RUN ACCEPTANCE, BOTH TREES (the plan's own gate; serial,
+# quiet machine, 30 x 1631 commands = 48,930 command executions per tree):
+#   master c960ef7            14 red runs, 14 fail commands
+#   branch wip/abi-type-space 13 red runs, 16 fail commands
+# (An earlier revision of this ledger transposed those two rows. The measured
+# truth is: the branch is BETTER on red-run count by one, WORSE on total fail
+# commands by two, and materially worse on one row - see the per-row block.)
+# (Both numbers are ABOVE the plan's 0 fail x 30: the acceptance is UNMET on
+# master too, so it remains the step-4 target and not a property of any diff.)
+# PER-ROW (master -> branch):
+#   cancel-targeted-resume::9      7 -> 4
+#   reentrance::14                 2 -> 0
+#   async-calls-sync::2            1 -> 0
+#   async-calls-sync::1            1 -> 8   <-- THE ROW THAT MOVED AGAINST US
+#   sync-streams::1                1 -> 2
+#   partial-stream-copies::1       1 -> 0
+#   cancel-targeted-resume::7      1 -> 0
+#   cancel-delivery::1             0 -> 1
+#   cross-abi-calls::38            0 -> 1
+#   cancel-targeted-resume::3      0 -> 1
+# THE READING: acs::1 and acs::2 are the SAME fixture's two scripts (run1 uses
+# two $SyncMiddle instances, run2 two $AsyncMiddle ones). The branch closes ::2
+# and reentrance::14 and halves ctr::9, but ::1 moved from 1/30 to 8/30 - the
+# interference path shifted with the code, it was not removed. Name it that way:
+# "same fixture, different assertion, different mechanism", NOT "acs fixed".
+# ACS::1 IS THE NEXT TARGET, and it is the cheaper one to attack now: the lane is
+# a gate, the machine is quiet, the watchdog probe dumps permit/store state, and
+# the 12-site park table above is the map.
+# WHAT THE BRANCH DOES CARRY (all measured, none of it the lane metric):
+#   steps 1-3 (ABI type/value space split, resource-handle records + the split
+#   lend ledger, WIT selection core) with units 497/0 and the lane's resource /
+#   borrow fixtures green; step 4 piece (i) (native-thread join + fresh-store
+#   reset); step 6 backend (the reactor). The ABI/wit/reactor work is what the
+#   remaining plan steps (5, 7, 8) sit on.
+# M17 SESSION 3: STEP 4 PIECE (i) KEPT, THE PERMIT REJECTED (dump-backed); STEP 6
+# BACKEND LANDED. MEASUREMENT INTEGRITY CORRECTION: an SBCL probe from the M14
+# session (/tmp/m14-standalone.lisp) was found still running with 1 day 02:38
+# elapsed and was killed. EVERY rate in sessions 1-2 above was taken with it
+# pegging the box, so those "HEAD-parity" claims are measurement artifacts, not
+# batch properties. On the quiet machine (isolated worktree at c52a38e, serial
+# 6 runs): batch-baseline 7 fail commands / 6 runs (acs::2 x5, reentrance::14,
+# ctr::9), walls 8.1-13.1 s.
+# PIECE (i) — MEASURED, KEPT (commit 3edd099): guest threads from
+# %canon-lift-async / %call-async-funcinst / %sync-lift-run record
+# ASYNC-THREAD-NATIVE (only thread.new-indirect did), so %store-teardown's join
+# covers them; the teardown also clrhash's *tok-skip-age* (EQ keys on THREAD
+# objects: a recycled object can alias a dead entry) and resets
+# *tok-path-counter* / *async-progress*. METER: 6 fail commands / 6 runs
+# (acs::2 x5, reentrance::14), no new signature, no rc=124 — parity-or-better.
+# THE 12-SITE PARK TABLE (the deliverable that outlives the permit): every site
+# below released NOTHING before this work and is entered at permit depth 1
+# except the drains, which are depth 0 on the runner thread:
+#   1 async-thread-wait-until (also the backpressure gate, %wset-wait)
+#   2 async-thread-suspend    3 async-thread-yield
+#   4 %wset-wait-from-callback  5 sync read/write rendezvous  6 switch park
+#   7 %task-request-cancellation :initial (UNBOUNDED condition-wait)
+#   8 %task-request-cancellation :started (sleep spin)
+#   9 %canon-lift-async oracle drain  10 %sync-thunk-run  11 %sync-lift-run
+#  12 canon-lower pack's STARTED wait
+# THE PERMIT: IMPLEMENTED, MEASURED, DROPPED — not parked behind a toggle.
+#  v1 release-per-park + timed waits: every run died in <2.5 s.
+#  v2 with a mutex-re-grabbing bounded wait: acs::1/::2 trap "deadlock detected";
+#     the watchdog dump shows a LIVE owner that is neither parked nor
+#     progressing.
+#  v3 the permit code kept with the switch OFF: rc=124 x6 — THE BOUNDED-WAIT
+#     SHAPES ALONE BREAK LIVENESS. So "normalise the waits to bounded ones and
+#     defer the permit" is OFF THE TABLE; any step-4 attempt must land the two
+#     together.
+# THREE REUSABLE FACTS (each cost a measurement cycle):
+#  a. SBCL 2.6.4's (condition-wait q m :timeout t) returns with the mutex
+#     RELEASED on timeout — a second wait inside the same with-mutex errors
+#     ("not holding MUTEX"). Re-grab unless already owner.
+#  b. Releasing the right "for the park" is not enough when the park is a LOOP:
+#     later iterations re-wait holding it. The release must pair with EACH wait.
+#  c. %task-return / %task-exit-implicit-thread call async-thread-resume-all,
+#     which takes OTHER threads' mutexes — a permit holder that parks then
+#     re-acquires behind a thread whose mutex another thread holds while it
+#     waits for the permit (AB-BA). Any permit design must make resume-all
+#     not take peer mutexes while a waiter needs the permit.
+# STEP 6 BACKEND LANDED (commit d766632): wasi-reactor with reactor-step
+# (progress-p / pending-p), reactor-watch-fd (keyed by (fd registration-id
+# direction) so a reused fd cannot inherit an old registration),
+# reactor-watch-deadline, reactor-wake (O_NONBLOCK|O_CLOEXEC self-pipe, safe
+# cross-thread), reactor-close (idempotent, defers the read-end close until no
+# poller holds it). Injectable clock-fn/poll-fn; NVAL > ERR > HUP > direction
+# status precedence; one pump per step with a floored ms budget; EINTR re-poll;
+# callbacks outside the mutex in registration order. NOT yet wired into the
+# scheduler (that is the step-4 store driver's job). 6 wasi/reactor-* tests.
+# UNITS: 497 passed / 0 failed (481 + 10 wit/selection-* + 6 wasi/reactor-*).
+# NEXT: step 4 with facts (a)-(c) as hard constraints; then step 3's remainder
+# (world include/rename, named/inline interface bindings, positional
+# @external-id — %parse-world is still path-only); then step 5 (host-pending +
+# resumable stream copy) on top of the reactor, then steps 7-8.
+# M17 SESSION 2 (same plan, resumed on branch wip/abi-type-space): STEPS 1-3 LANDED.
+# THE ABI/HANDLE REWORK IS BACK IN THE TREE (commit 99c7e23) and the earlier
+# "reverted, not preserved" note below is superseded: abi-cx carries TYPE-INST
+# beside the value/handle INST (%abi-type-inst), handles are resource-handle
+# records again (rt rep own-p num-lends borrow-scope; %handle-add stays
+# APPEND-only), and the lend ledger is split (subtask.LENDERS = lent handle
+# records, subtask.LENDING-TASKS = the lending tasks; deliver_resolve clears
+# both FIRST then returns each num-lends once).
+# THE SELECTION CORE OF STEP 3 IS IN (commit 354e2f2): make-wit-selection /
+# validate-wit-package / select-wit-package / resolve-wit-world over the
+# existing WIT AST, SemVer ordering reusing component::%semver-parse, @since /
+# @unstable / @deprecated gating with container inheritance, member-gate
+# exclusion signalled instead of silently changing layout. 10 wit/selection-*
+# tests. NOT YET DONE in step 3: world include/rename, named/inline interface
+# bindings, positional @external-id, provider/link-time enforcement.
+# THE MEASUREMENTS (serial, same meter as the HEAD row above):
+#   units 491 passed / 0 failed (481 + the 10 new WIT tests).
+#   component lane, integrated tree, 6 runs: fails 0,0,1,0,1,2 -> 4 fail
+#   commands over 6 runs = PARITY with the HEAD meter's 4/6, and the
+#   async-calls-sync class (::1 and ::2, which failed 10/10 in one earlier
+#   batch and 1-2/6 at HEAD) did NOT recur in any of the 6 runs.
+#   The residual rows are the recorded structural flakes: reentrance::14
+#   (drift), cancel-targeted-resume::9, and cancel-delivery::1 (the
+#   "NIL is not of type NUMBER" signature, which the HEAD baseline also shows
+#   on a different row - cancel-resumed-callback-switch::3).
+# NEXT: step 4 (the single-permit store scheduler) is the only remaining
+# blocker to a green lane; steps 5-8 all sit on it.
+# M17 session (WASI 0.3.2 residuals, plan steps 1-4): MEASURED, MOSTLY NOT LANDED.
+# THE LANE IS NOW A GATE: tools/run-component-suite.lisp exits NON-ZERO on
+# fail/harness-error/timeout/skip/census-problem and prints the executed
+# denominator, so the plan's "0 fail x 30" acceptance is enforceable (it was not).
+# SERIAL 6-RUN METER AT HEAD (c960ef7, isolated /tmp/basewt worktree): fails
+# 1,0,0,1,2 - classes reentrance::14, ctr::9, ctr::3 (NIL/NUMBER), acs::1+::2.
+# THE LANE IS RED IN 4 RUNS OF 6 AT HEAD (4 fail commands over 6 runs; 6 x 1631
+# commands executed, denominator printed by the gate): none of the rows in this
+# file is a regression, and the plan's acceptance ("0 fail x 30") is UNMET at
+# HEAD - that is the step-4 target, not a property of any one diff.
+# THE FINAL TREE OF THIS SESSION (HEAD + the gate runner + the %abi-load arm fix;
+# the ABI/scheduler work reverted) MEASURED: 7 fail commands over 5 runs of the
+# same serial meter, same class distribution (acs::2, ctr::9, ctr::3, reentrance
+# ::14) - i.e. NO systematic per-class elevation vs the HEAD meter above, and
+# still no green run. Wall time per lane run 8-11 s throughout.
+# THE MEASURED, THEN REVERTED (src/component-runtime.lisp restored to HEAD; the
+# diff was NOT kept in a branch - redo from this record):
+#  (a) an abi-cx TYPE-INST / value-inst split (%abi-type-inst): a canon-lower
+#      wrapper resolves valtype refs in the CALLEE's type space and HANDLES in the
+#      CALLER's table, which removes the positional stream/future/borrow arms;
+#  (b) a resource-handle RECORD (rt/rep/own-p/num-lends/borrow-scope) replacing the
+#      cons shape; %handle-lend records the 2412 lend on the Subtask and
+#      deliver_resolve returns it exactly once.
+# THE METER ON (a)+(b): units 481/0 GREEN; the lane's TOTAL fail count stayed within
+# noise of HEAD (4/6 vs 6/6), and one batch put acs::2 at 5/6 vs HEAD's 1/6.
+# THAT ELEVATION DID NOT REPRODUCE: the SAME row measures 1/6, 2/6 and 6/6 on
+# byte-identical trees across batches (HEAD-and-load-fix alone measured 6/6 once),
+# so the row's in-lane rate is BATCH-DEPENDENT (machine/CPU state), not a property
+# of the diff. Do not chase it on a 6-run meter; measure the row SOLO (99% green)
+# and in-lane as a distribution. What IS reproducible: the partial scheduler fixes
+# below both close the acs window solo AND break the lane. Reverted rather than
+# shipped:
+#  - the 3530 first-turn boundary (%await-first-turn) in the lower and nested lift;
+#  - a creation-path ORDERED GATE EXIT driven outside *scheduler-mutex*;
+#  - a single guest PERMIT (recursive, FIFO by task path) released at %block-enter:
+#    it CLOSED the acs window (1/300 solo) but DEADLOCKED the lane within 15 runs -
+#    a park that never broadcasts strands a permit holder only a tick could release.
+# LANDED TODAY: the gate runner (tools/run-component-suite.lisp) and the %abi-load
+# arm fix (the stream/future arm sat inside the PRIMITIVE-payload case, so only a
+# :stream/:future prim payload could ever reach it - a genuine defect).
+# THE BISECT HARNESS: tools/probe-async-interleave.lisp, tools/probe-async-watchdog
+# .lisp, tools/probe-async-perfile.sh - per-fixture interleave logs, permit/state
+# dumps on a hang, per-file hang attribution. SERIAL RUNS ONLY: a concurrent lane
+# distorts the rates by CPU contention (this cost the session two false readings).
 # See README.md
 # M15 CLOSE-OUT (2026-10-28): THE FINAL LADDER — NO ASYNC FILE
 # REMAINS IN THIS LIST. The async suite is COMPLETE: 45 of 45 files

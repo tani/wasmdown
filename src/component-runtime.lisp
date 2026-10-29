@@ -1121,11 +1121,25 @@ lesson)."
 (defstruct abi-cx
   "LiftLowerContext (CanonicalABI.md 1038): the lift/lower ambient
 state — the memory, the realloc core func, the string encoding and
-the defining comp-instance (the handle transfers)."
+the defining comp-instance (the handle transfers).
+
+TYPE-INST is the TYPE-space owner (the CALLEE's defining instance,
+whose declarator indices the walkers' (:idx . n) valtypes resolve
+against); INST stays the VALUE-space owner (the LOWERING CALLER,
+whose handle table the stream/future/own/borrow transfers enter).
+The two spaces coincide in every same-instance context, so TYPE-INST
+defaults to NIL and %ABI-TYPE-INST falls back to INST."
   (memory nil)
   (realloc nil)
   (encoding :utf8)
-  (inst nil))
+  (inst nil)
+  (type-inst nil))
+
+(defun %abi-type-inst (cx)
+  "The TYPE-space instance: the explicit TYPE-INST when a lower/lift
+crosses spaces (canon-lower: callee types, caller handles), else the
+value-space INST."
+  (or (abi-cx-type-inst cx) (abi-cx-inst cx)))
 
 (defun %abi-reallocate (cx old old-size alignment new-size)
   "LiftLowerContext.reallocate (CanonicalABI.md 1057): call the
@@ -1313,9 +1327,9 @@ with the TAGGED code-unit count under CX's encoding. Traps on OOB
 
 (defun %abi-store (cx v vt ptr)
   "store (CanonicalABI.md 2458): write V of valtype VT at PTR."
-  (%abi-check-align cx ptr (%abi-alignment vt (abi-cx-inst cx)) "store")
-  (%abi-check-span cx ptr (%abi-elem-size vt (abi-cx-inst cx)) "value")
-  (let ((c (%abi-ct vt (abi-cx-inst cx))))
+  (%abi-check-align cx ptr (%abi-alignment vt (%abi-type-inst cx)) "store")
+  (%abi-check-span cx ptr (%abi-elem-size vt (%abi-type-inst cx)) "value")
+  (let ((c (%abi-ct vt (%abi-type-inst cx))))
     (case (wasmdown.component:ct-kind c)
       (:prim
        (case (wasmdown.component:ct-payload c)
@@ -1342,7 +1356,7 @@ with the TAGGED code-unit count under CX's encoding. Traps on OOB
        (let ((elem (car (wasmdown.component:ct-payload c)))
              (fixed (cdr (wasmdown.component:ct-payload c))))
          (if fixed
-             (let ((es (%abi-elem-size elem (abi-cx-inst cx))))
+             (let ((es (%abi-elem-size elem (%abi-type-inst cx))))
                (loop for e in v
                      for i from 0
                      do (%abi-store cx e elem (+ ptr (* i es)))))
@@ -1355,18 +1369,18 @@ with the TAGGED code-unit count under CX's encoding. Traps on OOB
                for (nil . fv) in v
                do (setf off (%abi-align-to off
                                            (%abi-alignment
-                                            fvt (abi-cx-inst cx))))
+                                            fvt (%abi-type-inst cx))))
                   (%abi-store cx fv fvt off)
-                  (incf off (%abi-elem-size fvt (abi-cx-inst cx))))))
+                  (incf off (%abi-elem-size fvt (%abi-type-inst cx))))))
       (:tuple
        (let ((off ptr))
          (loop for t_ across (wasmdown.component:ct-payload c)
                for tv in v
                do (setf off (%abi-align-to off
                                            (%abi-alignment
-                                            t_ (abi-cx-inst cx))))
+                                            t_ (%abi-type-inst cx))))
                   (%abi-store cx tv t_ off)
-                  (incf off (%abi-elem-size t_ (abi-cx-inst cx))))))
+                  (incf off (%abi-elem-size t_ (%abi-type-inst cx))))))
       (:variant
        (%abi-store-variant cx v c ptr))
       (:flags
@@ -1383,7 +1397,7 @@ with the TAGGED code-unit count under CX's encoding. Traps on OOB
                  when (member l set :test #'string=)
                    do (setf bits (logior bits (ash 1 i))))
            (%abi-store-int cx bits ptr
-                           (%abi-elem-size vt (abi-cx-inst cx))))))
+                           (%abi-elem-size vt (%abi-type-inst cx))))))
       (:enum
        (let ((labels (coerce (wasmdown.component:ct-payload c) 'list)))
          (let ((idx (or (position v labels :test #'string=) 0)))
@@ -1438,9 +1452,9 @@ with the TAGGED code-unit count under CX's encoding. Traps on OOB
   "store_list_into_range (CanonicalABI.md 2761): realloc the elements,
 store each, return (ptr . length)."
   (let* ((n (length v))
-         (es (%abi-elem-size elem-type (abi-cx-inst cx)))
+         (es (%abi-elem-size elem-type (%abi-type-inst cx)))
          (ptr (%abi-allocate cx
-                              (%abi-alignment elem-type (abi-cx-inst cx))
+                              (%abi-alignment elem-type (%abi-type-inst cx))
                               (* n es))))
     (loop for e in v
           for i from 0
@@ -1459,7 +1473,7 @@ payload at the join-aligned offset."
          (ds (%abi-discriminant-size cases))
          (ma (max 1 (or (loop for (nil . cvt) in cases
                               when cvt maximize
-                              (%abi-alignment cvt (abi-cx-inst cx)))
+                              (%abi-alignment cvt (%abi-type-inst cx)))
                         1))))
     (%abi-store-int cx idx ptr ds)
     (when payload
@@ -1468,9 +1482,9 @@ payload at the join-aligned offset."
 
 (defun %abi-load (cx vt ptr)
   "load (CanonicalABI.md 2140): read a value of valtype VT at PTR."
-  (%abi-check-align cx ptr (%abi-alignment vt (abi-cx-inst cx)) "load")
-  (%abi-check-span cx ptr (%abi-elem-size vt (abi-cx-inst cx)) "value")
-  (let ((c (%abi-ct vt (abi-cx-inst cx))))
+  (%abi-check-align cx ptr (%abi-alignment vt (%abi-type-inst cx)) "load")
+  (%abi-check-span cx ptr (%abi-elem-size vt (%abi-type-inst cx)) "value")
+  (let ((c (%abi-ct vt (%abi-type-inst cx))))
     (case (wasmdown.component:ct-kind c)
       (:prim
        (case (wasmdown.component:ct-payload c)
@@ -1500,11 +1514,7 @@ payload at the join-aligned offset."
           (let ((sp (%abi-load-int cx ptr 4))
                 (sl (%abi-load-int cx (+ ptr 4) 4)))
             (%abi-load-string cx sp sl)))
-         ((:stream :future)
-        ;; lift_async_value's load side: the i32 indexes this
-        ;; table; the END itself is the loaded value
-        (%lift-async-end cx (%abi-load-int cx ptr 4)))
-       (t (%abi-load-int cx ptr 4))))
+         (t (%abi-load-int cx ptr 4))))
       (:list
        (let ((elem (car (wasmdown.component:ct-payload c)))
              (fixed (cdr (wasmdown.component:ct-payload c))))
@@ -1514,7 +1524,7 @@ payload at the join-aligned offset."
                    collect (%abi-load cx elem
                                       (+ ptr (* i
                                                 (%abi-elem-size
-                                                 elem (abi-cx-inst cx))))))
+                                                 elem (%abi-type-inst cx))))))
              (let ((lp (%abi-load-int cx ptr 4))
                    (ln (%abi-load-int cx (+ ptr 4) 4)))
                (%abi-load-list cx lp ln elem)))))
@@ -1524,18 +1534,18 @@ payload at the join-aligned offset."
              (out '()))
          (loop for (label . fvt) in fields
                do (setf off (%abi-align-to
-                             off (%abi-alignment fvt (abi-cx-inst cx))))
+                             off (%abi-alignment fvt (%abi-type-inst cx))))
                   (push (cons label (%abi-load cx fvt off)) out)
-                  (incf off (%abi-elem-size fvt (abi-cx-inst cx))))
+                  (incf off (%abi-elem-size fvt (%abi-type-inst cx))))
          (nreverse out)))
       (:tuple
        (let ((off ptr)
              (out '()))
          (loop for t_ across (wasmdown.component:ct-payload c)
                do (setf off (%abi-align-to
-                             off (%abi-alignment t_ (abi-cx-inst cx))))
+                             off (%abi-alignment t_ (%abi-type-inst cx))))
                   (push (%abi-load cx t_ off) out)
-                  (incf off (%abi-elem-size t_ (abi-cx-inst cx))))
+                  (incf off (%abi-elem-size t_ (%abi-type-inst cx))))
          (nreverse out)))
       (:variant
        (let* ((cases (coerce (wasmdown.component:ct-payload c) 'list))
@@ -1549,7 +1559,7 @@ payload at the join-aligned offset."
                 (payload (cdr case))
                 (ma (max 1 (or (loop for (nil . cvt) in cases
                                      when cvt maximize
-                                     (%abi-alignment cvt (abi-cx-inst cx)))
+                                     (%abi-alignment cvt (%abi-type-inst cx)))
                            1))))
            (if payload
                (cons (car case)
@@ -1560,7 +1570,7 @@ payload at the join-aligned offset."
        (let ((labels (coerce (wasmdown.component:ct-payload c) 'list)))
          (let ((bits (%abi-load-int cx ptr
                                      (%abi-elem-size vt
-                                                     (abi-cx-inst cx)))))
+                                                     (%abi-type-inst cx)))))
            (loop for l in labels
                  for i from 0
                  when (logbitp i bits)
@@ -1599,8 +1609,8 @@ payload at the join-aligned offset."
 (defun %abi-load-list (cx ptr length elem-type)
   "load_list_from_range (CanonicalABI.md 2323): bounds-check the
 span then load each element."
-  (let ((es (%abi-elem-size elem-type (abi-cx-inst cx))))
-    (%abi-check-align cx ptr (%abi-alignment elem-type (abi-cx-inst cx))
+  (let ((es (%abi-elem-size elem-type (%abi-type-inst cx))))
+    (%abi-check-align cx ptr (%abi-alignment elem-type (%abi-type-inst cx))
                       "list")
     (%abi-check-span cx ptr (* length es) "list")
     (loop for i below length
@@ -1613,7 +1623,7 @@ span then load each element."
 core value list. JOINED-TYPES is the variant join's flat types (the
 CoerceValueIter pairs) — NIL outside variants."
   (declare (ignore joined-types))
-  (let ((c (%abi-ct vt (abi-cx-inst cx))))
+  (let ((c (%abi-ct vt (%abi-type-inst cx))))
     (case (wasmdown.component:ct-kind c)
       (:prim
        (case (wasmdown.component:ct-payload c)
@@ -1672,9 +1682,9 @@ CoerceValueIter pairs) — NIL outside variants."
               (payload (cdr case))
               ;; the JOINED flat slot types (flatten_variant minus the
               ;; discriminant) and the payload's own flat types
-              (want (cdr (%flat-type-of c (abi-cx-inst cx))))
+              (want (cdr (%flat-type-of c (%abi-type-inst cx))))
               (have (and payload
-                         (%flat-type-of payload (abi-cx-inst cx))))
+                         (%flat-type-of payload (%abi-type-inst cx))))
               (raw (if payload (%abi-lower cx (cdr v) payload) '()))
               (coerced
                 (loop for rv in raw
@@ -1794,7 +1804,7 @@ pairs consumed in order)."
                                       (cdr pair) want))
                (car pair))))
        (lift (vt)
-         (let ((c (%abi-ct vt (abi-cx-inst cx))))
+         (let ((c (%abi-ct vt (%abi-type-inst cx))))
            (case (wasmdown.component:ct-kind c)
              (:prim
               (case (wasmdown.component:ct-payload c)
@@ -1860,14 +1870,14 @@ pairs consumed in order)."
                 (let* ((case (nth idx cases))
                        (payload (cdr case))
                        ;; the JOINED flat types minus the discriminant
-                       (want (cdr (%flat-type-of c (abi-cx-inst cx))))
+                       (want (cdr (%flat-type-of c (%abi-type-inst cx))))
                        ;; consume EXACTLY the joined slots
                        (slots
                          (loop repeat (length want)
                                collect (vector-pop vi)))
                        (have (and payload
                                   (%flat-type-of payload
-                                                 (abi-cx-inst cx)))))
+                                                 (%abi-type-inst cx)))))
                   (when payload
                     ;; coerce each slot to the payload's own type and
                     ;; re-push for the recursive lift. VI is a LIFO
@@ -1951,22 +1961,22 @@ pairs consumed in order)."
 the flat core arg list, with the MAX_FLAT fallthrough: >MAX-FLAT
 spills the TUPLE through realloc into a single [ptr]."
   (let* ((flat-types (loop for vt in ts
-                           append (%flat-type-of vt (abi-cx-inst cx)))))
+                           append (%flat-type-of vt (%abi-type-inst cx)))))
     (if (> (length flat-types) max-flat)
         ;; the tuple in memory via realloc: (type i, ...) — the
         ;; runtime's tuple is a TUPLE ct of TS
         (let* ((tuple (make-ct* :tuple (coerce ts 'vector)))
-               (size (%abi-elem-size tuple (abi-cx-inst cx)))
-               (align (%abi-alignment tuple (abi-cx-inst cx)))
+               (size (%abi-elem-size tuple (%abi-type-inst cx)))
+               (align (%abi-alignment tuple (%abi-type-inst cx)))
                (ptr (%abi-allocate cx align size))
                ;; the record-style store: field i at its aligned slot
                (off ptr))
           (loop for vt in ts
                 for v in vs
                 do (setf off (%abi-align-to
-                              off (%abi-alignment vt (abi-cx-inst cx))))
+                              off (%abi-alignment vt (%abi-type-inst cx))))
                    (%abi-store cx v vt off)
-                   (incf off (%abi-elem-size vt (abi-cx-inst cx))))
+                   (incf off (%abi-elem-size vt (%abi-type-inst cx))))
           (list ptr))
         (loop for v in vs
               for vt in ts
@@ -1986,7 +1996,7 @@ of flat arguments)."
           do (vector-push-extend (aref vi i) scratch))
     (setf vi scratch))
   (let* ((flat-types (loop for vt in ts
-                           append (%flat-type-of vt (abi-cx-inst cx)))))
+                           append (%flat-type-of vt (%abi-type-inst cx)))))
     (if (> (length flat-types) max-flat)
         ;; the spilled results read the TUPLE back out of memory —
         ;; for the SINGLE-result case (lift_flat_values with one type
@@ -2291,7 +2301,7 @@ reentrance phase checks). The CALLER then waits:
                                   (wasmdown.component:ct-resourcetype-p rt)
                                   (%handle-remove caller rt a))))
                          (if h
-                             (%handle-add self rt (cdar h) t)
+                             (%handle-add self rt (resource-handle-rep h) t)
                              a))
                        (if (and ty
                                 (eq (wasmdown.component:ct-kind ty)
@@ -2411,7 +2421,8 @@ reentrance phase checks). The CALLER then waits:
                                  :message
                                  "own result references an unknown type"))
                         (setf lifted
-                              (list (list :own-handle rt (cdar h))))))))
+                              (list (list :own-handle rt
+                                          (resource-handle-rep h))))))))
                 ;; post-return runs with the SAME flat results
                 (let ((pr (wasmdown.component:canon-opt
                            opts :post-return)))
@@ -2442,7 +2453,7 @@ value for valtype VT."
   (labels
       ((prim-of (c) (wasmdown.component:ct-payload c))
        (cnv (a vt)
-         (let ((c (%abi-ct vt (abi-cx-inst cx))))
+         (let ((c (%abi-ct vt (%abi-type-inst cx))))
            (case (first a)
              ((:num :float :bool :char :str)
               (case (prim-of c)
@@ -2533,6 +2544,22 @@ value for valtype VT."
 ;;; its index; drop removes it (running the dtor when it owns); rep
 ;;; extracts the representation.
 
+(defstruct (resource-handle
+             (:constructor make-resource-handle
+                 (rt rep own-p &optional (num-lends 0) borrow-scope)))
+  "The explicit RESOURCE handle record (CanonicalABI.md 1146's
+Table entries for resources): the resource identity RT, the
+representation REP, the ownership flag OWN-P, the live borrow count
+NUM-LENDS (§1446: a borrow of this handle lends it to a subtask
+until its deliver_resolve) and the BORROW-SCOPE the lend belongs to.
+Replaces the old (cons (cons rt rep) own-p) shape — every caller
+reads through the accessors, never the cons cells."
+  (rt nil)
+  (rep nil)
+  (own-p nil)
+  (num-lends 0)
+  (borrow-scope nil))
+
 (defun %inst-handles (inst)
   "The comp-instance's handle table (lazily built): a vector of
 ResourceHandle records — (rt . rep) pairs plus the own flag —
@@ -2546,13 +2573,45 @@ per-instance handle-index allocation)."
 
 (defun %handle-add (inst rt rep own-p)
   "Table.add (CanonicalABI.md 3762): append an owning handle; the
-index handed to wasm is the 1-based slot."
-  (let ((h (cons (cons rt rep) own-p))
-        (tab (gethash :handles (comp-instance-imports inst))))
-    (declare (ignore tab))
-    (let ((v (%inst-handles inst)))
-      (vector-push-extend h v)
-      (length v))))
+index handed to wasm is the 1-based slot. APPEND-ONLY: the fixtures
+pin absolute handle indices, so a freed slot is never reused for a
+resource (the free list belongs to the shared waitable/subtask
+namespace — %HANDLE-ADD-ANY)."
+  (let ((v (%inst-handles inst)))
+    (vector-push-extend (make-resource-handle rt rep own-p) v)
+    (length v)))
+
+(defun %handle-resource (inst rt i)
+  "The RESOURCE handle record at slot I when it names RT, else NIL
+(the non-trapping LOOKUP: a borrow deref of an index that names no
+resource passes the raw value through)."
+  (let ((v (%inst-handles inst)))
+    (when (and (integerp i) (> i 0) (<= i (length v)))
+      (let ((h (aref v (1- i))))
+        (when (and (resource-handle-p h)
+                   (eql (resource-handle-rt h) rt))
+          h)))))
+
+(defun %handle-resource-at (inst i &optional rt)
+  "Table.get for a RESOURCE handle, TYPE-CHECKED: the 1-based slot I
+must hold a resource-handle (and, when RT is non-NIL, one naming
+RT). An empty slot traps 'invalid handle index'; another class (the
+single-namespace table's waitable/subtask records) traps 'wrong
+resource type' — never a raw accessor crash on a struct."
+  (let* ((v (%inst-handles inst))
+         (present (and (integerp i) (> i 0) (<= i (length v))
+                       (aref v (1- i)))))
+    (unless present
+      (error 'wasmdown:wasm-trap
+             :kind :generic
+             :message (format nil "invalid handle index ~a" i)))
+    (let ((h present))
+      (unless (and (resource-handle-p h)
+                   (or (null rt) (eql (resource-handle-rt h) rt)))
+        (error 'wasmdown:wasm-trap
+               :kind :generic
+               :message (format nil "handle ~a has the wrong resource type" i)))
+      h)))
 
 (defun %handle-remove (inst rt i)
   "Table.remove (lift_own / canon_resource_drop): the handle at slot
@@ -2562,40 +2621,53 @@ CLASS GUARD (M13-lad): the handle table is SINGLE-NAMESPACE
 the slots, and a FREED index is legitimately REUSABLE by another
 class. A resource op on a stale index (freed by an earlier drop,
 reallocated as a waitable set — drop-cross-task-borrow's shape)
-must TRAP, never reach the record accessors: (caar h) on a
-non-resource struct signals a raw TYPE-ERROR whose datum is the
-whole record (the observed crash). Guard the SHAPE: only a cons
-whose car is a cons eql RT passes; everything else traps."
-  (let ((v (%inst-handles inst)))
-    (unless (and (integerp i) (> i 0) (<= i (length v))
-                 (aref v (1- i)))
-      (error 'wasmdown:wasm-trap
-             :kind :generic
-             :message (format nil "invalid handle index ~a" i)))
-    (let ((h (aref v (1- i))))
-      (unless (and (consp h) (consp (car h)) (eql (caar h) rt))
-        (error 'wasmdown:wasm-trap
-               :kind :generic
-               :message (format nil "handle ~a has the wrong resource type" i)))
-      (setf (aref v (1- i)) nil)
-      (%handle-free-slot inst i)
-      h)))
+must TRAP, never reach the record accessors: the type check in
+%HANDLE-RESOURCE-AT rejects a non-resource record with the clean
+'wrong resource type' trap."
+  (let* ((v (%inst-handles inst))
+         (h (%handle-resource-at inst i rt)))
+    (setf (aref v (1- i)) nil)
+    (%handle-free-slot inst i)
+    h))
 
 (defun %handle-rep (inst rt i)
   "M9 (linking ::110): Table.get for a BORROW lift — the handle's REP
 at slot I of the CALLER's table, type-checked against RT, WITHOUT
 removing it (a borrow holds no ownership; the handle stays). NIL when
 the slot is empty or out of range (the caller passes the raw value
-through). CLASS GUARD (M13-lad): the single-namespace table may hold
-ANY record at a reused index — only a resource-shaped record (a cons
-whose car is a cons eql RT) yields a rep; a stale index reused by
-another class reads as no-resource (NIL — the raw value passes
-through), never as a raw accessor crash."
+through). CLASS GUARD (M13-lad): only a resource-handle naming RT
+yields a rep; a stale index reused by another class reads as
+no-resource (NIL — the raw value passes through), never as an
+accessor crash."
+  (let ((h (%handle-resource inst rt i)))
+    (and h (resource-handle-rep h))))
+
+(defun %handle-hit-by-rep (inst rt rep)
+  "The 1-based slot of the resource-handle naming RT with REP, else
+NIL (the borrow miss-walk: a callee's core received the REP for a
+borrowed param and passes it back as an index)."
   (let ((v (%inst-handles inst)))
-    (when (and (integerp i) (> i 0) (<= i (length v)))
-      (let ((h (aref v (1- i))))
-        (when (and (consp h) (consp (car h)) (eql (caar h) rt))
-          (cdar h))))))
+    (loop for k from 0 below (length v)
+          for h = (aref v k)
+          when (and (resource-handle-p h)
+                    (eql (resource-handle-rt h) rt)
+                    (eql (resource-handle-rep h) rep))
+            do (return (1+ k)))))
+
+(defun %handle-lend (inst rt i scope)
+  "lift_borrow (§2406/§2412): lend the resource handle at slot I of
+the SOURCE table INST to SCOPE (the Subtask) — the source handle's
+NUM-LENDS rises (the source may not be dropped out from under the
+borrower), the lend is recorded on the subtask's ledger (its
+deliver_resolve returns the count), and the REP is returned for the
+callee's core. NIL when I names no RT resource (the caller's (or bi
+rep a) fallback)."
+  (let ((h (%handle-resource inst rt i)))
+    (when h
+      (incf (resource-handle-num-lends h))
+      (setf (resource-handle-borrow-scope h) scope)
+      (when scope (%subtask-record-lend scope h))
+      (resource-handle-rep h))))
 
 (defun host-resource-rep (rt index)
   "M16 slice 3: the REP of the RESOURCE handle at INDEX on the
@@ -2832,12 +2904,16 @@ TARGET's space."
               ;; in THIS component's space; resolving them here
               ;; produced an own-wrapper's integer payload where a
               ;; variant ct was expected — variants.wast's
-              ;; take-variant param)
+              ;; take-variant param). THE SINGLE CONTEXT separates the
+              ;; two spaces (§step-1): TYPE-INST = FT-INST resolves the
+              ;; valtypes, INST (the lowering caller) owns the handle
+              ;; table the stream/future/own transfers enter.
               (cx (make-abi-cx
                    :memory memory
                    :realloc realloc
                    :encoding (%abi-encoding-of enc-opt)
-                   :inst ft-inst))
+                   :inst inst
+                   :type-inst ft-inst))
               (ts (loop for p in (or params '()) collect (cdr p)))
               (flat-types (loop for vt in ts
                                 append (%flat-type-of vt ft-inst)))
@@ -2845,39 +2921,35 @@ TARGET's space."
               ;; from the CALLER's table (lift_async_value §2438: the
               ;; end LEAVES the caller) while the TYPE resolves
               ;; against the TARGET (the values-lane convention:
-              ;; both sides needed — one cx can't do both). The
-              ;; POSITIONAL walk mirrors the async lower's: each
-              ;; param consumes its flat slots; async-value params
-              ;; pre-resolve their ct (target-side) and lift the
-              ;; single i32 with a CALLER-side transfer cx.
+              ;; both sides needed — now carried by one cx's two
+              ;; instance slots). The POSITIONAL walk mirrors the
+              ;; async lower's: each param consumes its flat slots;
+              ;; async-value params pre-resolve their ct (target-side)
+              ;; and lift the single i32 with the CALLER-side handle
+              ;; transfer.
               (component-args
-                (let ((acx (make-abi-cx
-                            :memory memory
-                            :realloc realloc
-                            :encoding (%abi-encoding-of enc-opt)
-                            :inst inst)))
-                  (if (> (length flat-types) 16)
-                      (let* ((ptr (first args))
-                             (tuple (make-ct* :tuple
-                                             (coerce
-                                              (loop for vt in ts
-                                                    collect
-                                                    (%abi-ct vt
-                                                             ft-inst))
-                                              'vector)))
-                             (vals (%abi-load acx tuple ptr)))
-                        (coerce vals 'list))
-                      (let ((vals '())
-                            (ai 0))
-                        (loop for vt in ts
-                              do (let ((c (%abi-ct vt ft-inst)))
-                                   (cond
-                                    ((and (wasmdown.component:ct-p c)
-                                          (member (wasmdown.component:ct-kind c)
-                                                  '(:stream :future)))
-                                     (push (%lift-async-end acx (nth ai args))
-                                           vals)
-                                     (incf ai))
+                (if (> (length flat-types) 16)
+                    (let* ((ptr (first args))
+                           (tuple (make-ct* :tuple
+                                           (coerce
+                                            (loop for vt in ts
+                                                  collect
+                                                  (%abi-ct vt
+                                                           ft-inst))
+                                            'vector)))
+                           (vals (%abi-load cx tuple ptr)))
+                      (coerce vals 'list))
+                    (let ((vals '())
+                          (ai 0))
+                      (loop for vt in ts
+                            do (let ((c (%abi-ct vt ft-inst)))
+                                 (cond
+                                  ((and (wasmdown.component:ct-p c)
+                                        (member (wasmdown.component:ct-kind c)
+                                                '(:stream :future)))
+                                   (push (%lift-async-end cx (nth ai args))
+                                         vals)
+                                   (incf ai))
                                     ;; M13-lad §2834/§3690: the (borrow $R)
                                     ;; param LENDS — resolve the index on
                                     ;; the CALLER's table (INST: the
@@ -2939,7 +3011,7 @@ TARGET's space."
                                                 (incf ai))
                                        (push (first (%abi-lift-values cx 16 vi (list vt)))
                                              vals))))))
-                        (nreverse vals)))))
+                        (nreverse vals))))
               ;; NOTE: no APPLY — %call-component-func-list takes the
               ;; args LIST as its third parameter (an EMPTY list
               ;; would be swallowed by apply's spread)
@@ -2991,31 +3063,15 @@ TARGET's space."
                   (if result
                       ;; lower_flat_values: FLAT when <= 1 flat slot,
                       ;; else the result STORED at the [ptr] out-param
-                      ;; (the last core arg). M11b: the RESULT's
-                      ;; lower/store context is the CALLER (THIS
-                      ;; instance) — the arg-lift cx's inst is the
-                      ;; TARGET's ($C), so a stream/future result
-                      ;; would re-enter the CALLEE's table (the
-                      ;; wrong-index bug: the end landed in $C at 3
-                      ;; while $D read the index expecting its own
-                      ;; table). A caller-side cx for the result.
-                      (let* ((rcx (make-abi-cx
-                                   :memory memory
-                                   :realloc realloc
-                                   :encoding (%abi-encoding-of enc-opt)
-                                   :inst inst))
-                             (rflat (%flat-type-of result ft-inst)))
-                        ;; the RESULT TYPE resolves against the
-                        ;; TARGET (ft-inst): an (:idx . n) ref is in
-                        ;; the CALLEE's type space — resolving it
-                        ;; against the CALLER (the rcx's inst, which
-                        ;; the TABLE ops need) yields a WRONG ct and
-                        ;; the stream result falls to the (mod ...)
-                        ;; prim arm (zero-length's FLOOR-on-END type
-                        ;; error). Pre-resolve the ct; %abi-lower
-                        ;; passes a ct through unchanged.
+                      ;; (the last core arg). The SAME cx serves both
+                      ;; spaces: its INST (the caller) owns the handle
+                      ;; table a stream/future/own result enters, its
+                      ;; TYPE-INST (FT-INST) resolves the result's
+                      ;; (:idx . n) refs — the two-space split made the
+                      ;; old second rcx redundant.
+                      (let ((rflat (%flat-type-of result ft-inst)))
                         (let ((result-ct
-                                (%abi-ct result ft-inst)))
+                                (%abi-ct result (%abi-type-inst cx))))
                           (if (> (length rflat) 1)
                               ;; the SPILLED result: store at the
                               ;; [ptr] out-param (the LAST core
@@ -3025,9 +3081,9 @@ TARGET's space."
                               ;; entirely and the caller read an
                               ;; empty retptr)
                               (let ((ptr (first (last args))))
-                                (%abi-store rcx res result-ct ptr)
+                                (%abi-store cx res result-ct ptr)
                                 nil)
-                              (first (%abi-lower rcx res
+                              (first (%abi-lower cx res
                                                  result-ct)))))
                       res)))
              '()))))))
@@ -3082,7 +3138,7 @@ resource.drop (param handle), [i32] -> [i32] for resource.rep."
         (let* ((h (ignore-errors
                    (%handle-remove (%resource-current-inst inst)
                                    rt (first args))))
-               (rep (and h (cdar h))))
+               (rep (and h (resource-handle-rep h))))
           ;; M13-tok29 THE BORROW MISS-WALK (the own-transfer
           ;; chain's companion to the guest-body conversion):
           ;; when the index misses the local table (the callee's
@@ -3096,25 +3152,17 @@ resource.drop (param handle), [i32] -> [i32] for resource.rep."
           ;; fixture's cross-task drop works through the
           ;; borrowed record.
           (unless h
-            (let* ((tab (%inst-handles (%resource-current-inst inst)))
-                   (hit (loop for k from 0 below (length tab)
-                              for v = (aref tab k)
-                              when (and (consp v)
-                                        (consp (car v))
-                                        (eql (caar v) rt)
-                                        (eql (cdar v)
-                                             (first args)))
-                              do (return-from nil (1+ k)))))
+            (let* ((cur (%resource-current-inst inst))
+                   (hit (%handle-hit-by-rep cur rt (first args))))
               (when hit
-                (setf h (%handle-remove (%resource-current-inst inst)
-                                        rt hit)
+                (setf h (%handle-remove cur rt hit)
                       rep (first args)))))
           ;; an OWNING handle's drop runs the resource's dtor with
           ;; the rep (canon_resource_drop, CanonicalABI.md 3782).
           ;; M16 slice 3: a HOST-provided resource has no guest dtor
           ;; func-instance — its host finalizer (keyed by the ct,
           ;; the handle's rt) releases the capability instead.
-          (when (cdr h)
+          (when (and h (resource-handle-own-p h))
             (cond
               (dtor (apply #'wasmdown.runtime:wasm-call dtor (list rep)))
               (t (let ((hdtor (gethash rt *host-resource-dtor-table*)))
@@ -3125,8 +3173,9 @@ resource.drop (param handle), [i32] -> [i32] for resource.rep."
       (wasmdown.types:make-wasm-func-type '(:i32) '(:i32))
       (lambda (args)
         ;; §3783: the handle resolves on the dynamic-context table
-        (let ((v (%inst-handles (%resource-current-inst inst))))
-          (list (cdar (aref v (1- (first args)))))))))))
+        (let ((h (%handle-resource-at (%resource-current-inst inst)
+                                      (first args))))
+          (list (resource-handle-rep h))))))))
 
 ;;; ---------------------------------------------------------------
 ;;; ---------------------------------------------------------------
@@ -3253,7 +3302,8 @@ the opts plist, guarded by the scheduler mutex)."
   (state 0)  ; 0=STARTING 1=STARTED 2=RETURNED
              ; 3=CANCELLED-BEFORE-STARTED 4=CANCELLED-BEFORE-RETURNED
   (on-cancel nil)                    ; the callee's OnCancel
-  (lenders nil)
+  (lenders nil)                      ; the LENT resource-handle records
+  (lending-tasks nil)                ; the lending async-tasks
   (cancellation-requested nil)
   (flat-results nil)
   (resolve-delivered-p nil)
@@ -3469,7 +3519,7 @@ returned; the %buffer-put re-adds at the dest. A failed remove
                   (aref (comp-instance-types inst)
                         (wasmdown.component:ct-payload t-ct))))
          (h (and rt (ignore-errors (%handle-remove inst rt idx)))))
-    (if h (list :own-handle rt (cdar h)) idx)))
+    (if h (list :own-handle rt (resource-handle-rep h)) idx)))
 
 (defun %buffer-take (buf n t-ct inst)
   "ReadableGuestBuffer.read(n) (§1567-1575): load N elements from
@@ -3744,7 +3794,7 @@ direct CL call passes the rep itself)."
   (let* ((inst (or *handle-caller-inst* *host-provider-inst*))
          (h (and inst (integerp index)
                  (ignore-errors (%handle-remove inst rt index)))))
-    (if h (values (cdar h) t) (values nil nil))))
+    (if h (values (resource-handle-rep h) t) (values nil nil))))
 
 ;;; ---- End.copy (CanonicalABI.md 1687-1711): the 5 cases ----
 
@@ -5059,20 +5109,45 @@ computes the tuple at delivery time)."
         (push s *deferred-resume-all-tasks*)
         (async-thread-resume-all))))
 
+(defun %subtask-record-lend (s h)
+  "Record the LEND of the resource-handle H on the subtask S (the
+§1446 accounting home): H joins the subtask's LENDERS and, on a
+CURRENT-TASK, that task joins LENDING-TASKS (pushnew) — the FIRST
+lend to this subtask raises the task's NUM-BORROWS by one, so the
+count and deliver_resolve's per-task decrement stay balanced even
+when one task lends several handles to the same subtask."
+  (push h (async-subtask-lenders s))
+  (when *current-task*
+    (unless (member *current-task* (async-subtask-lending-tasks s)
+                    :test #'eq)
+      (incf (async-task-num-borrows *current-task*))
+      (push *current-task* (async-subtask-lending-tasks s))))
+  h)
+
 (defun %subtask-deliver-resolve (s)
   "Subtask.deliver_resolve (CanonicalABI.md 1467): the delivered
   mark + §1446-1456's num_lends accounting: all the borrowed
   handles are logically returned to the caller at this point —
-  every LENDING task's num-borrows decrements (the async lower's
-  (borrow $R) branch recorded each lend's lender on the subtask's
-  LENDERS list, §2838/§1446; without the decrement the lending
-  task's own resolution traps 'outstanding borrows' —
-  drop-cross-task-borrow ::2's decoded layer)."
+  every lent handle's NUM-LENDS decrements and every LENDING task's
+  NUM-BORROWS decrements (the async lower's (borrow $R) branch
+  recorded each lend through %HANDLE-LEND, §2838/§1446; without the
+  return the lending task's own resolution traps 'outstanding
+  borrows' — drop-cross-task-borrow ::2's decoded layer). The
+  ledger is CLEARED FIRST so a second delivery is a NO-OP."
   (setf (async-subtask-resolve-delivered-p s) t)
-  (dolist (lender (async-subtask-lenders s))
-    (when (> (async-task-num-borrows lender) 0)
-      (decf (async-task-num-borrows lender))))
-  (setf (async-subtask-lenders s) nil))
+  (let ((lent (async-subtask-lenders s))
+        (tasks (async-subtask-lending-tasks s)))
+    (setf (async-subtask-lenders s) nil
+          (async-subtask-lending-tasks s) nil)
+    (dolist (h lent)
+      (when (and (resource-handle-p h)
+                 (> (resource-handle-num-lends h) 0))
+        (decf (resource-handle-num-lends h))
+        (when (zerop (resource-handle-num-lends h))
+          (setf (resource-handle-borrow-scope h) nil))))
+    (dolist (task tasks)
+      (when (> (async-task-num-borrows task) 0)
+        (decf (async-task-num-borrows task))))))
 
 (defun %subtask-drop (s)
   "Subtask.drop (CanonicalABI.md 1485): trap when the resolve has
@@ -6611,7 +6686,12 @@ is the valtype."
                    :memory memory
                    :realloc realloc
                    :encoding (%abi-encoding-of enc-opt)
-                   :inst ft-inst))
+                   ;; the two spaces: INST (the lowering caller) owns
+                   ;; the handle table the async-param transfers and
+                   ;; lent borrows use; TYPE-INST (FT-INST, the callee)
+                   ;; resolves the valtypes' (:idx . n) refs.
+                   :inst inst
+                   :type-inst ft-inst))
               (ts (loop for p in (or params '())
                         collect (cdr p)))
               (flat-types (loop for vt in ts
@@ -6637,10 +6717,8 @@ is the valtype."
                                         (member
                                          (wasmdown.component:ct-kind c)
                                          '(:stream :future)))
-                                   (push (%lift-async-end
-                                          (make-abi-cx :memory memory
-                                                       :inst inst)
-                                          (nth ai args))
+                                   (push (%lift-async-end cx
+                                                          (nth ai args))
                                          vals)
                                    (incf ai))
                                   ;; M13-LADDER §2406 lift_borrow: the
@@ -6702,23 +6780,24 @@ is the valtype."
                                           ;; shape (the spec's 3648
                                           ;; cx.inst = the caller is
                                           ;; the upstream shape our
-                                          ;; 5337 diverged from). The
-                                          ;; rep still derefs from the
+                                          ;; 5337 diverged from).
+                                          ;;
+                                          ;; %HANDLE-LEND is the ONE
+                                          ;; lend record (§2838/§1446):
+                                          ;; it derefs the rep from the
                                           ;; LOWERING CALLER's table
                                           ;; (INST — the source handle
-                                          ;; lives there); the task's
-                                          ;; num-borrows counts the
-                                          ;; lend (§2838) until the
-                                          ;; subtask's resolution
-                                          ;; The rep still derefs from the
-                                          ;; LOWERING CALLER's table
-                                          ;; (INST — the source handle
-                                          ;; lives there); the task's
-                                          ;; num-borrows counts the
-                                          ;; lend (§2838) until the
-                                          ;; subtask's resolution
-                                          (rep (%handle-rep inst rt
-                                                            (nth ai args)))
+                                          ;; lives there), raises that
+                                          ;; source handle's NUM-LENDS,
+                                          ;; and records the lend on
+                                          ;; the SUBTASK — its
+                                          ;; deliver_resolve returns the
+                                          ;; count and decrements the
+                                          ;; lending task's
+                                          ;; NUM-BORROWS.
+                                          (rep (%handle-lend inst rt
+                                                             (nth ai args)
+                                                             subtask))
                                           ;; M16 slice 3b: the same
                                           ;; host-callee rule as the
                                           ;; sync lower — the provider
@@ -6729,22 +6808,6 @@ is the valtype."
                                                     (if (lifted-func-host f)
                                                         inst ft-inst)
                                                     rt rep nil))))
-                                     (when bi
-                                       ;; §2838/§1446: the LENDING
-                                       ;; task's borrow count + the
-                                       ;; lender recorded on the
-                                       ;; subtask — deliver_resolve
-                                       ;; decrements every lender
-                                       ;; (the count is what the
-                                       ;; lender's own resolution
-                                       ;; checks; the subtask's
-                                       ;; LENDERS list is the
-                                       ;; §1446 accounting home)
-                                       (incf (async-task-num-borrows
-                                              *current-task*))
-                                       (push *current-task*
-                                             (async-subtask-lenders
-                                              subtask)))
                                      (push bi vals)
                                      (incf ai)))
                                   (t

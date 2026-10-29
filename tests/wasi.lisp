@@ -2559,492 +2559,6 @@ caller closes FD."
         (wasmdown.wasi::%close-fd listen-fd)))))
 
 ;;; ===============================================================
-;;; M16 SLICE 5 — wasi:http: the types resources (fields semantics,
-;;; request/response/request-options), client.send over HTTP/1.1 on a
-;;; loopback server, the pluggable transport, and an e2e component.
-;;; ===============================================================
-
-(defun http-net (&key (outbound :any) (dns :none))
-  (wasmdown.wasi:make-wasi-network :outbound outbound :dns dns))
-
-(defun http-ctx (&key (net (http-net)))
-  (wasmdown.wasi:make-wasi-context :networks (list net)))
-
-(defun http-fields (&rest entries)
-  (let ((f (wasmdown.wasi:make-wasi-fields)))
-    (loop for (name value) on entries by #'cddr
-          do (wasmdown.wasi:fields-append f name value))
-    f))
-
-(defun http-request (&key (port 80) (path "/x") (method (cons "get" nil))
-                          headers (options nil) (scheme :none))
-  "A request rep built directly (the CL side of request.new)."
-  (let* ((f (or headers (wasmdown.wasi:make-wasi-fields)))
-         (req (third (first (wasmdown.wasi:http-request-new
-                             f :none :none :none)))))
-    (setf (wasmdown.wasi::wasi-http-request-authority req)
-          (cons :some (format nil "127.0.0.1:~d" port))
-          (wasmdown.wasi::wasi-http-request-path-with-query req)
-          (cons :some path)
-          (wasmdown.wasi::wasi-http-request-method req) method
-          (wasmdown.wasi::wasi-http-request-scheme req) scheme
-          (wasmdown.wasi::wasi-http-request-options req) options)
-    req))
-
-(defun http-serve-once (response)
-  "A block loopback server emitting RESPONSE after reading the
-request head: (values port listen-fd thread got-cell)."
-  (multiple-value-bind (port fd) (sock-host-listener)
-    (let ((got (list nil)))
-      (values port fd
-              (sb-thread:make-thread
-               (lambda ()
-                 (let ((cfd (wasmdown.wasi::%libc-accept4
-                             fd (sb-sys:int-sap 0) (sb-sys:int-sap 0) 0)))
-                   (unwind-protect
-                        (let ((buf (make-array 0 :element-type '(unsigned-byte 8)
-                                                 :adjustable t :fill-pointer 0))
-                              (done nil))
-                          (loop while (not done)
-                                do (let ((tmp (sb-alien:make-alien
-                                               sb-alien:unsigned-char 4096)))
-                                     (unwind-protect
-                                          (let ((n (wasmdown.wasi::%libc-recv
-                                                    cfd (sb-alien:alien-sap tmp)
-                                                    4096 0)))
-                                            (loop for i below n
-                                                  do (vector-push-extend
-                                                      (sb-sys:sap-ref-8
-                                                       (sb-alien:alien-sap tmp) i)
-                                                      buf)))
-                                       (sb-alien:free-alien tmp)))
-                                   (let ((s (map 'string #'code-char buf)))
-                                     (when (search (format nil "~c~c~c~c"
-                                                           #\Return #\Newline
-                                                           #\Return #\Newline)
-                                                   s)
-                                       (setf done t))))
-                          (setf (car got) (map 'string #'code-char buf))
-                          (let* ((bytes (map 'list #'char-code response))
-                                 (abuf (wasmdown.wasi::%byte-list->alien bytes)))
-                            (unwind-protect
-                                 (wasmdown.wasi::%libc-send
-                                  cfd (sb-alien:alien-sap abuf) (length bytes) 0)
-                              (sb-alien:free-alien abuf))))
-                     (wasmdown.wasi::%close-fd cfd))))
-               :name "http-serve")
-              got))))
-
-(defmacro with-http-server ((port response got) &body body)
-  `(multiple-value-bind (,port fd thread ,got)
-       (http-serve-once ,response)
-     (declare (ignorable thread))
-     (unwind-protect (progn ,@body)
-       (ignore-errors (sb-thread:join-thread thread :timeout 2))
-       (wasmdown.wasi::%close-fd fd))))
-
-(defun http-drain (reader)
-  "Copy READER's values until no progress is left (the body source
-yields every chunk the framing decodes, then EOF)."
-  (let ((out '()))
-    (loop
-      (let* ((buf (wasmdown.component.runtime:make-host-buffer 4096))
-             (vals (progn (rtcall "%END-COPY" reader buf t)
-                          (wasmdown.component.runtime:host-buffer-values buf))))
-        (when (null vals) (return out))
-        (setf out (append out vals))))))
-
-(defun http-body-text (resp)
-  "consume-body + drain the stream through the copy protocol."
-  (let* ((pair (wasmdown.wasi:http-response-consume-body resp :none))
-         (reader (first pair))
-         (bytes (http-drain reader))
-         (future (sock-future (second pair))))
-    (values (map 'string #'code-char bytes) future)))
-
-;;; ---------------------------------------------------------------
-;;; fields: case-insensitive names, ordered values, append vs set,
-;;; the validation errors, copy-all/clone.
-
-(test wasi/http-fields-semantics
-  (let* ((f (wasmdown.wasi:make-wasi-fields)))
-    (is (eq :ok (car (wasmdown.wasi:fields-set f "X-Test" (list (list 104 105))))))
-    (is (eq :ok (car (wasmdown.wasi:fields-append f "x-test" (list 33)))))
-    ;; case-insensitive lookup keeps the ORIGINAL casing and order
-    (is (equal '((104 105) (33)) (wasmdown.wasi:fields-get f "X-TEST")))
-    (is (equal '(("X-Test" (104 105)) ("x-test" (33)))
-               (wasmdown.wasi:fields-copy-all f)))
-    (is (wasmdown.wasi:fields-has f "x-Test"))
-    (is (not (wasmdown.wasi:fields-has f "bad name")))
-    (is (equal '() (wasmdown.wasi:fields-get f "absent")))
-    ;; set replaces every value; the original position is kept
-    (is (eq :ok (car (wasmdown.wasi:fields-set f "x-test" (list (list 49))))))
-    (is (equal '((49)) (wasmdown.wasi:fields-get f "X-Test")))
-    (is (equal '(("x-test" (49))) (wasmdown.wasi:fields-copy-all f)))
-    ;; get-and-delete
-    (let ((del (wasmdown.wasi:fields-get-and-delete f "X-Test")))
-      (is (eq :ok (car del)))
-      (is (equal '((49)) (cdr del)))
-      (is (equal '() (cdr (wasmdown.wasi:fields-get-and-delete f "never")))))
-    (is (not (wasmdown.wasi:fields-has f "x-test")))
-    ;; clone is a DEEP, MUTABLE copy
-    (let* ((g (http-fields "A" (list 49)))
-           (c (third (wasmdown.wasi:fields-clone g))))
-      (is (eq :ok (car (wasmdown.wasi:fields-set c "A" (list (list 50))))))
-      (is (equal '((49)) (wasmdown.wasi:fields-get g "A")))
-      (is (equal '((50)) (wasmdown.wasi:fields-get c "A"))))
-    ;; validation: forbidden names, invalid syntax, immutability
-    (is (equal "forbidden"
-               (second (wasmdown.wasi:fields-set f "Host" (list (list 49))))))
-    (is (equal "invalid-syntax"
-               (second (wasmdown.wasi:fields-set f "X Y" (list (list 49))))))
-    (is (equal "invalid-syntax"
-               (second (wasmdown.wasi:fields-set f "X" (list (list 13 10 65))))))
-    (is (equal "forbidden"
-               (second (wasmdown.wasi:fields-append f "content-length"
-                                                    (list 48)))))
-    (let ((im (third (wasmdown.wasi::%fields-immutable-view f))))
-      (is (equal "immutable"
-                 (second (wasmdown.wasi:fields-set im "A" (list (list 49))))))
-      (is (equal "immutable"
-                 (second (wasmdown.wasi:fields-delete im "A")))))
-    ;; from-list validates the whole list
-    (is (equal "invalid-syntax"
-               (second (wasmdown.wasi:fields-from-list
-                        (list (list "A" (list 49))
-                              (list "bad name" (list 49)))))))
-    (is (equal "forbidden"
-               (second (wasmdown.wasi:fields-from-list
-                        (list (list "transfer-encoding" (list 49)))))))
-    ;; the size limit is header-error.size-exceeded
-    (is (equal "size-exceeded"
-               (second (wasmdown.wasi:fields-set
-                        f "X" (list (make-list 70000
-                                               :initial-element 97))))))))
-
-;;; ---------------------------------------------------------------
-;;; request: method/scheme/authority/path round-trips + validation,
-;;; the immutable header/options views.
-
-(test wasi/http-request-surface
-  (let ((req (http-request)))
-    (is (equal (cons "get" nil) (wasmdown.wasi:http-request-get-method req)))
-    (is (eq :ok (car (wasmdown.wasi:http-request-set-method
-                      req (cons "other" "PURGE")))))
-    (is (equal (cons "other" "PURGE")
-               (wasmdown.wasi:http-request-get-method req)))
-    (is (eq :err (car (wasmdown.wasi:http-request-set-method
-                       req (cons "other" "BAD METHOD")))))
-    (is (eq :ok (car (wasmdown.wasi:http-request-set-scheme
-                      req (cons :some (cons "HTTPS" nil))))))
-    (is (equal (cons :some (cons "HTTPS" nil))
-               (wasmdown.wasi:http-request-get-scheme req)))
-    (is (eq :err (car (wasmdown.wasi:http-request-set-scheme
-                       req (cons :some (cons "other" "1bad"))))))
-    (is (eq :ok (car (wasmdown.wasi:http-request-set-authority
-                      req (cons :some "example.test:8080")))))
-    (is (equal (cons :some "example.test:8080")
-               (wasmdown.wasi:http-request-get-authority req)))
-    (is (eq :err (car (wasmdown.wasi:http-request-set-authority
-                       req (cons :some "exa mple")))))
-    (is (eq :ok (car (wasmdown.wasi:http-request-set-path-with-query
-                      req (cons :some "/a/b?c=d")))))
-    (is (equal (cons :some "/a/b?c=d")
-               (wasmdown.wasi:http-request-get-path-with-query req)))
-    (is (eq :err (car (wasmdown.wasi:http-request-set-path-with-query
-                       req (cons :some "no-slash")))))
-    ;; the headers/options accessors hand out IMMUTABLE handles
-    (let ((h (third (wasmdown.wasi:http-request-get-headers req))))
-      (is (equal "immutable"
-                 (second (wasmdown.wasi:fields-set h "A" (list (list 49)))))))
-    (is (eq :none (wasmdown.wasi:http-request-get-options req)))
-    (let ((opt (wasmdown.wasi:make-wasi-http-options)))
-      (wasmdown.wasi:request-options-set-connect-timeout opt (cons :some 5))
-      (setf (wasmdown.wasi::wasi-http-request-options req) opt)
-      (let ((view (third (wasmdown.wasi:http-request-get-options req))))
-        (is (equal "immutable"
-                   (second (wasmdown.wasi:request-options-set-first-byte-timeout
-                            view (cons :some 5)))))))))
-
-(test wasi/http-request-options
-  (let ((o (wasmdown.wasi:make-wasi-http-options)))
-    (is (eq :none (wasmdown.wasi:request-options-get-connect-timeout o)))
-    (is (eq :none (wasmdown.wasi:request-options-get-first-byte-timeout o)))
-    (is (eq :none (wasmdown.wasi:request-options-get-between-bytes-timeout o)))
-    (is (eq :ok (car (wasmdown.wasi:request-options-set-connect-timeout
-                      o (cons :some 1000000)))))
-    (is (equal (cons :some 1000000)
-               (wasmdown.wasi:request-options-get-connect-timeout o)))
-    ;; a ZERO duration is not-supported (the WIT's request-options-error)
-    (is (equal '(:err "not-supported")
-               (wasmdown.wasi:request-options-set-first-byte-timeout
-                o (cons :some 0))))
-    (is (equal '(:err "not-supported")
-               (wasmdown.wasi:request-options-set-between-bytes-timeout o 0)))
-    ;; a clone is mutable even when the source was made immutable
-    (let ((im (third (wasmdown.wasi:request-options-clone o))))
-      (setf (wasmdown.wasi::wasi-http-options-mutable-p im) nil)
-      (is (equal "immutable"
-                 (second (wasmdown.wasi:request-options-set-connect-timeout
-                          im (cons :some 5)))))
-      (let ((c (third (wasmdown.wasi:request-options-clone im))))
-        (is (eq :ok (car (wasmdown.wasi:request-options-set-connect-timeout
-                          c (cons :some 7)))))
-        (is (equal (cons :some 7)
-                   (wasmdown.wasi:request-options-get-connect-timeout c)))))))
-
-(test wasi/http-response-surface
-  (let ((r (wasmdown.wasi::make-wasi-http-response
-            :headers (http-fields "A" (list 49)))))
-    (is (= 200 (wasmdown.wasi:http-response-get-status-code r)))
-    (is (eq :ok (car (wasmdown.wasi:http-response-set-status-code r 404))))
-    (is (= 404 (wasmdown.wasi:http-response-get-status-code r)))
-    (is (eq :err (car (wasmdown.wasi:http-response-set-status-code r 99))))
-    (is (equal '(("A" (49)))
-               (wasmdown.wasi:fields-copy-all
-                (third (wasmdown.wasi:http-response-get-headers r)))))))
-
-;;; ---------------------------------------------------------------
-;;; The loopback round trips: content-length and chunked+trailers.
-
-(test wasi/http-loopback-content-length
-  (with-http-server
-      (port
-       (format nil "HTTP/1.1 200 OK~c~cContent-Length: 5~c~cX-Reply: yes~c~c~c~chello"
-               #\Return #\Newline #\Return #\Newline #\Return #\Newline
-               #\Return #\Newline)
-       got)
-    (let* ((net (http-net))
-           (ctx (http-ctx :net net))
-           (req (http-request :port port :path "/hi?x=1"
-                              :headers (http-fields "x-test" (list 104))))
-           (res (wasmdown.wasi:http-client-send ctx req :network net)))
-      (is (eq :ok (car res)))
-      (let* ((resp (fourth res))
-             (head (car got)))
-        (is (= 200 (wasmdown.wasi:http-response-get-status-code resp)))
-        (is (equal '((121 101 115))
-                   (wasmdown.wasi:fields-get
-                    (wasmdown.wasi::wasi-http-response-headers resp) "x-reply")))
-        (multiple-value-bind (body future) (http-body-text resp)
-          (is (string= "hello" body))
-          (is (equal (cons :ok :none) future)))
-        (is (search "GET /hi?x=1 HTTP/1.1" head))
-        (is (search "x-test: h" head))
-        (is (search (format nil "Host: 127.0.0.1:~d" port) head))))))
-
-(test wasi/http-loopback-chunked-trailers
-  (with-http-server
-      (port
-       (format nil "HTTP/1.1 200 OK~c~cTransfer-Encoding: chunked~c~c~c~c2~c~cab~c~c2~c~ccd~c~c0~c~cX-Trail: t~c~c~c~c"
-               #\Return #\Newline #\Return #\Newline #\Return #\Newline
-               #\Return #\Newline #\Return #\Newline #\Return #\Newline
-               #\Return #\Newline #\Return #\Newline #\Return #\Newline
-               #\Return #\Newline #\Return #\Newline)
-       got)
-    (let* ((net (http-net))
-           (ctx (http-ctx :net net))
-           (req (http-request :port port))
-           (res (wasmdown.wasi:http-client-send ctx req :network net)))
-      (is (eq :ok (car res)))
-      (let ((resp (fourth res)))
-        (is (= 200 (wasmdown.wasi:http-response-get-status-code resp)))
-        (multiple-value-bind (body future) (http-body-text resp)
-          (is (string= "abcd" body))
-          ;; the trailers arrive only with the body's completion
-          (is (eq :ok (car future)))
-          (let ((opt (cdr future)))
-            (is (consp opt))
-            (is (eq :some (car opt)))
-            (let ((trailers (third (cdr opt))))
-              (is (equal '((116))
-                         (wasmdown.wasi:fields-get trailers "x-trail"))))))))))
-
-;;; ---------------------------------------------------------------
-;;; The refusals: https-without-transport, the outbound/DNS policy,
-;;; and header injection.
-
-(test wasi/http-transport-refusals
-  ;; https without a registered TLS transport is configuration-error
-  (let* ((net (http-net))
-         (ctx (http-ctx :net net))
-         (req (http-request :port 443
-                            :scheme (cons :some (cons "HTTPS" nil)))))
-    (is (equal '("configuration-error")
-               (cdr (wasmdown.wasi:http-client-send ctx req :network net)))))
-  ;; an undeclared destination is destination-IP-prohibited
-  (let* ((net (http-net :outbound (list (wasmdown.wasi:make-wasi-endpoint
-                                          :address '(10 9 9 9)))))
-         (ctx (http-ctx :net net))
-         (req (http-request :port 80)))
-    (is (equal '("destination-IP-prohibited")
-               (cdr (wasmdown.wasi:http-client-send ctx req :network net)))))
-  ;; a DNS-denied host is HTTP-request-denied (no outbound traffic)
-  (let* ((net (http-net))
-         (ctx (http-ctx :net net))
-         (req (third (first (wasmdown.wasi:http-request-new
-                             (wasmdown.wasi:make-wasi-fields)
-                             :none :none :none)))))
-    (setf (wasmdown.wasi::wasi-http-request-authority req)
-          (cons :some "example.test:80"))
-    (is (equal '("HTTP-request-denied")
-               (cdr (wasmdown.wasi:http-client-send ctx req :network net)))))
-  ;; a fields value carrying CRLF can never be serialized (defence in
-  ;; depth behind the fields validation)
-  (let ((f (wasmdown.wasi:make-wasi-fields)))
-    (setf (wasmdown.wasi::wasi-fields-entries f)
-          (list (cons "X" (list 49 13 10 88))))
-    (is (handler-case
-            (progn (wasmdown.wasi::%http-serialize-request-head
-                    "GET" "/" "h" f '())
-                   nil)
-          (wasmdown.wasi:wasi-http-error (c)
-            (wasmdown.wasi:http-error-code
-             (wasmdown.wasi:wasi-http-error-code c)))))))
-
-;;; ---------------------------------------------------------------
-;;; THE PLUGGABLE TRANSPORT: an embedder-supplied in-memory transport
-;;; serves the request without any socket.
-
-(test wasi/http-pluggable-transport
-  (let* ((response
-           (map 'list #'char-code
-                 (format nil "HTTP/1.1 204 No Content~c~cX-Fake: 1~c~c~c~c"
-                         #\Return #\Newline #\Return #\Newline
-                         #\Return #\Newline)))
-         (written (list nil))
-         (read-state (list response 0))
-         (transport
-           (wasmdown.wasi:make-wasi-http-transport
-            :scheme "https" :tls-p t
-            :connect
-            (lambda (host port destination timeout)
-              (declare (ignore host port destination timeout))
-              (wasmdown.wasi:make-wasi-http-connection
-               :read-fn (lambda (max timeout)
-                          (declare (ignore timeout))
-                          (let* ((bytes (first read-state))
-                                 (pos (second read-state))
-                                 (n (min max (- (length bytes) pos))))
-                            (if (zerop n)
-                                (values nil :eof)
-                                (let ((chunk (subseq bytes pos (+ pos n))))
-                                  (incf (second read-state) n)
-                                  (values chunk :ok)))))
-               :write-fn (lambda (bytes)
-                           (setf (car written)
-                                 (append (car written) bytes))
-                           nil)
-               :close-fn (lambda () t)))))
-         (net (http-net))
-         (ctx (wasmdown.wasi:make-wasi-context
-                 :networks (list net)
-                 :http-transports (list transport)))
-         (req (http-request :port 443
-                            :scheme (cons :some (cons "HTTPS" nil)))))
-    (let ((res (wasmdown.wasi:http-client-send ctx req :network net)))
-      (is (eq :ok (car res)))
-      (let ((resp (fourth res)))
-        (is (= 204 (wasmdown.wasi:http-response-get-status-code resp)))
-        (is (equal '((49))
-                   (wasmdown.wasi:fields-get
-                    (wasmdown.wasi::wasi-http-response-headers resp) "x-fake")))
-        (multiple-value-bind (body future) (http-body-text resp)
-          (is (string= "" body))
-          (is (equal (cons :ok :none) future))))
-      ;; the bytes went through the EMBEDDER's write hook
-      (is (search "GET /x HTTP/1.1"
-                  (map 'string #'code-char (car written)))))))
-
-;;; ---------------------------------------------------------------
-;;; The provider surface.
-
-(test wasi/http-provider-surface
-  (let* ((ctx (http-ctx))
-         (inst (wasmdown.wasi:http-types-instance ctx))
-         (prov (wasmdown.wasi:http-provider ctx)))
-    (dolist (name '("fields" "request" "request-options" "response"))
-      (is (eq :type (car (gethash name
-                                  (wasmdown.component.runtime:comp-instance-exports
-                                   inst))))))
-    (dolist (name '("[constructor]fields" "[static]fields.from-list"
-                    "[method]fields.get" "[method]fields.set"
-                    "[method]fields.delete" "[method]fields.get-and-delete"
-                    "[method]fields.append" "[method]fields.copy-all"
-                    "[method]fields.clone"
-                    "[static]request.new" "[method]request.get-method"
-                    "[method]request.set-method"
-                    "[method]request.set-authority"
-                    "[method]request.get-headers"
-                    "[method]request.get-options"
-                    "[static]request.consume-body"
-                    "[constructor]request-options"
-                    "[method]request-options.set-connect-timeout"
-                    "[method]request-options.clone"
-                    "[method]response.get-status-code"
-                    "[method]response.set-status-code"
-                    "[static]response.consume-body"))
-      (is (wasmdown.wasi:provider-instance-function inst name)))
-    (is (= 2 (length prov)))
-    (is (assoc "wasi:http/types@0.3.2" prov :test #'string=))
-    (is (assoc "wasi:http/client@0.3.2" prov :test #'string=))
-    ;; the constructor is callable through the lifted-func boundary
-    (let ((v (wasmdown.component.runtime:lifted-func-call
-              (wasmdown.wasi:provider-instance-function
-               inst "[constructor]fields"))))
-      (is (eq :own-handle (car v)))
-      (is (wasmdown.wasi:wasi-fields-p (third v))))))
-
-;;; ---------------------------------------------------------------
-;;; THE END-TO-END COMPONENT: imports wasi:http/types + client, builds
-;;; a GET (a header, the authority, the path), sends it over the
-;;; loopback transport, reads the status and the first body byte.
-
-(defun http-fixture-text (port)
-  (let ((text
-          (with-open-file (s (asdf:system-relative-pathname
-                              :wasmdown "tests/http-client-component.wat"))
-            (with-output-to-string (out)
-              (loop for line = (read-line s nil nil)
-                    while line
-                    unless (and (>= (length line) 2)
-                                (string= (subseq line 0 2) ";;"))
-                      do (format out "~a " line)))))
-        (alen (+ 10 (length (princ-to-string port)))))
-    (flet ((%http-subst (needle replacement string)
-             (with-output-to-string (out)
-               (loop with n = (length needle)
-                     for start = 0 then (+ pos n)
-                     for pos = (search needle string :start2 start)
-                     do (write-string string out :start start
-                                      :end (or pos (length string)))
-                     while pos
-                     do (write-string replacement out)))))
-      (%http-subst "@@ALEN@@" (princ-to-string alen)
-                   (%http-subst "@@PORT@@" (princ-to-string port) text)))))
-
-(test wasi/e2e-http-client-component
-  (with-http-server
-      (port
-       (format nil "HTTP/1.1 200 OK~c~cContent-Length: 5~c~c~c~chello"
-               #\Return #\Newline #\Return #\Newline #\Return #\Newline)
-       got)
-    (let* ((net (http-net))
-           (ctx (http-ctx :net net))
-           (comp (wasmdown.component.text::parse-component-text
-                  (http-fixture-text port))))
-      (wasmdown.component:validate-component comp)
-      (let* ((inst (wasmdown.component.runtime:instantiate-component
-                    comp :with-args (wasmdown.wasi:http-provider ctx)))
-             (f (wasmdown.component.runtime:runtime-export-value inst "f"))
-             (value (wasmdown.component.runtime:lifted-func-call f)))
-        ;; status<<8 | the first body byte ('h' = 104)
-        (is (= 200 (ash value -8)))
-        (is (= 104 (logand value #xff))))
-      (is (search "GET /hi HTTP/1.1" (car got)))
-      (is (search "x-test: h" (car got))))))
-
-;;; ===============================================================
 ;;; M16 SLICE 6 — THE COMMAND WORLD, THE TERMINALS, THE RUNNER.
 ;;; ===============================================================
 
@@ -3402,3 +2916,320 @@ ok, and exports `run' (the runner's direct-export fallback)."
   (is (block nil
         (handler-case (progn (wasmdown.wasi:parse-wasi-endpoint "nonsense") nil)
           (wasmdown:host-error () t)))))
+
+;;; ---------------------------------------------------------------
+;;; The reactor backend (plan step 6): poll(2) + the monotonic clock +
+;;; the self-pipe wake channel. Every test here injects its clock and
+;;; readiness (or uses real loopback readiness that is already there),
+;;; so nothing sleeps and nothing polls in a loop.
+
+(defun reactor-fake (clock-fn poll-fn)
+  "A reactor with the injected CLOCK-FN/POLL-FN and no self-pipe:
+STEP never blocks, so a fake clock fully determines the outcome."
+  (wasmdown.wasi:make-wasi-reactor :clock-fn clock-fn :poll-fn poll-fn
+                                   :wake-p nil))
+
+(test wasi/reactor-deadlines
+  (let* ((now 1000000000)
+         (reactor (reactor-fake (lambda () now) nil))
+         (fired '()))
+    (unwind-protect
+         (progn
+           ;; a zero deadline fires on the next step (no pollable fd, no
+           ;; pipe: the step returns immediately and the clock decides)
+           (wasmdown.wasi:reactor-watch-deadline
+            reactor 0 (lambda () (push :zero fired)))
+           (multiple-value-bind (progress pending)
+               (wasmdown.wasi:reactor-step reactor 0)
+             (is progress)
+             (is (not pending))
+             (is (equal '(:zero) fired)))
+           ;; a past deadline fires, a future one does not; a future
+           ;; registration leaves PENDING-P true
+           (setf now 5000)
+           (wasmdown.wasi:reactor-watch-deadline
+            reactor 4000 (lambda () (push :past fired)))
+           (let ((future (wasmdown.wasi:reactor-watch-deadline
+                          reactor 9000 (lambda () (push :future fired)))))
+             (multiple-value-bind (progress pending)
+                 (wasmdown.wasi:reactor-step reactor 0)
+               (is progress)
+               (is pending)
+               (is (equal '(:past :zero) fired)))
+             (multiple-value-bind (progress pending)
+                 (wasmdown.wasi:reactor-step reactor 0)
+               (is (not progress))
+               (is pending)
+               (is (equal '(:past :zero) fired)))
+             ;; cancel is idempotent and removes the pending deadline
+             (funcall future)
+             (funcall future)
+             (multiple-value-bind (progress pending)
+                 (wasmdown.wasi:reactor-step reactor 0)
+               (is (not progress))
+               (is (not pending))
+               (is (equal '(:past :zero) fired))))
+           ;; due deadlines fire in (deadline, registration) order
+           (setf now 20000)
+           (let ((order '()))
+             (wasmdown.wasi:reactor-watch-deadline
+              reactor 10000 (lambda () (push :a order)))
+             (wasmdown.wasi:reactor-watch-deadline
+              reactor 10000 (lambda () (push :b order)))
+             (wasmdown.wasi:reactor-watch-deadline
+              reactor 9000 (lambda () (push :c order)))
+             (multiple-value-bind (progress pending)
+                 (wasmdown.wasi:reactor-step reactor 0)
+               (is progress)
+               (is (not pending))
+               (is (equal (list :c :a :b) (reverse order))))))
+      (wasmdown.wasi:reactor-close reactor))))
+
+(test wasi/reactor-fd-order
+  ;; one pump = one callback per ready registration; readiness is
+  ;; delivered in registration order, and each step repeats it
+  ;; (level-triggered) until the cancel-fn runs
+  (let* ((calls 0)
+         (requests-seen '())
+         (poll-fn (lambda (requests timeout)
+                    (declare (ignore timeout))
+                    (incf calls)
+                    (push (mapcar (lambda (request) (getf request :fd))
+                                  requests)
+                          requests-seen)
+                    (mapcar (lambda (request)
+                              (if (member (getf request :fd) '(7 9)) 1 0))
+                            requests)))
+         (reactor (reactor-fake (constantly 0) poll-fn))
+         (events '()))
+    (unwind-protect
+         (let ((seven (wasmdown.wasi:reactor-watch-fd
+                       reactor 7 :read 'conn-7
+                       (lambda (status) (push (cons 7 status) events))))
+               (nine (wasmdown.wasi:reactor-watch-fd
+                      reactor 9 :read 'conn-9
+                      (lambda (status) (push (cons 9 status) events)))))
+           (multiple-value-bind (progress pending)
+               (wasmdown.wasi:reactor-step reactor 5000000)
+             (is progress)
+             (is pending)
+             (is (= 1 calls))
+             ;; both ready fds were polled in registration order and
+             ;; both callbacks ran within the one step
+             (is (equal '((7 9)) requests-seen))
+             (is (equal '((7 . :read) (9 . :read)) (reverse events))))
+           ;; the second step pumps once more: one callback each, in order
+           (multiple-value-bind (progress pending)
+               (wasmdown.wasi:reactor-step reactor 0)
+             (is progress)
+             (is pending)
+             (is (= 2 calls))
+             (is (= 4 (length events)))
+             (is (equal '((7 . :read) (9 . :read))
+                        (subseq (reverse events) 2 4))))
+           ;; cancelled watch is skipped, the other one still fires
+           (funcall seven)
+           (multiple-value-bind (progress pending)
+               (wasmdown.wasi:reactor-step reactor 0)
+             (is progress)
+             (is pending)
+             (is (= 5 (length events)))
+             (is (equal '(9 . :read) (first events))))
+           (funcall nine)
+           (multiple-value-bind (progress pending)
+               (wasmdown.wasi:reactor-step reactor 0)
+             (is (not progress))
+             (is (not pending))))
+      (wasmdown.wasi:reactor-close reactor))))
+
+(test wasi/reactor-fd-status-and-eintr
+  ;; POLLERR / POLLHUP / POLLNVAL reach the callback as :error / :hup /
+  ;; :nval, taking precedence over a plain readiness
+  (let* ((revents-of (lambda (fd)
+                       (cond ((= fd 11) 16)     ; POLLHUP
+                             ((= fd 13) 8)      ; POLLERR
+                             ((= fd 15) 32)     ; POLLNVAL
+                             ((= fd 17) 4)      ; POLLOUT
+                             (t 0))))
+         (poll-fn (lambda (requests timeout)
+                    (declare (ignore timeout))
+                    (mapcar (lambda (request)
+                              (funcall revents-of (getf request :fd)))
+                            requests)))
+         (reactor (reactor-fake (constantly 0) poll-fn))
+         (seen '()))
+    (unwind-protect
+         (progn
+           (wasmdown.wasi:reactor-watch-fd
+            reactor 11 :read 'hup-fd (lambda (status) (push (cons :hup status) seen)))
+           (wasmdown.wasi:reactor-watch-fd
+            reactor 13 :read 'err-fd (lambda (status) (push (cons :err status) seen)))
+           (wasmdown.wasi:reactor-watch-fd
+            reactor 15 :read 'nval-fd (lambda (status) (push (cons :nval status) seen)))
+           (wasmdown.wasi:reactor-watch-fd
+            reactor 17 :write 'write-fd
+            (lambda (status) (push (cons :write status) seen)))
+           (wasmdown.wasi:reactor-step reactor 1000000)
+           (is (equal '((:hup . :hup) (:err . :error)
+                        (:nval . :nval) (:write . :write))
+                      (reverse seen))))
+      (wasmdown.wasi:reactor-close reactor)))
+  ;; the same fd, the same direction, DIFFERENT registration ids: two
+  ;; separate poll entries -> two callbacks (never coalesced)
+  (let* ((poll-fn (lambda (requests timeout)
+                    (declare (ignore timeout))
+                    (mapcar (constantly 1) requests)))
+         (reactor (reactor-fake (constantly 0) poll-fn))
+         (seen '()))
+    (unwind-protect
+         (progn
+           (wasmdown.wasi:reactor-watch-fd
+            reactor 5 :read 'conn-a
+            (lambda (status) (push (list 'a status) seen)))
+           (wasmdown.wasi:reactor-watch-fd
+            reactor 5 :read 'conn-b
+            (lambda (status) (push (list 'b status) seen)))
+           (multiple-value-bind (progress pending)
+               (wasmdown.wasi:reactor-step reactor 1000000)
+             (is progress)
+             (is pending)
+             (is (= 2 (length seen)))
+             (is (equal '((a :read) (b :read)) (reverse seen)))))
+      (wasmdown.wasi:reactor-close reactor)))
+  ;; EINTR re-polls within the same bounded step and then dispatches
+  (let* ((calls 0)
+         (poll-fn (lambda (requests timeout)
+                    (declare (ignore requests timeout))
+                    (if (= (incf calls) 1) :eintr (list 1))))
+         (reactor (reactor-fake (constantly 0) poll-fn))
+         (seen '()))
+    (unwind-protect
+         (progn
+           (wasmdown.wasi:reactor-watch-fd
+            reactor 21 :read 'eintr-fd
+            (lambda (status) (push status seen)))
+           (multiple-value-bind (progress pending)
+               (wasmdown.wasi:reactor-step reactor 2000000)
+             (is (= 2 calls))
+             (is progress)
+             (is pending)
+             (is (equal '(:read) seen))))
+      (wasmdown.wasi:reactor-close reactor))))
+
+(test wasi/reactor-cancel-close
+  (let* ((poll-fn (lambda (requests timeout)
+                    (declare (ignore timeout))
+                    (mapcar (constantly 1) requests)))
+         (reactor (reactor-fake (constantly 0) poll-fn))
+         (fired '()))
+    (unwind-protect
+         (progn
+           ;; cancel is idempotent and no callback runs afterwards
+           (let ((cancel (wasmdown.wasi:reactor-watch-fd
+                          reactor 3 :read 'cancelled
+                          (lambda (status) (push status fired)))))
+             (funcall cancel)
+             (funcall cancel)
+             (multiple-value-bind (progress pending)
+                 (wasmdown.wasi:reactor-step reactor 1000000)
+               (is (not progress))
+               (is (not pending))
+               (is (null fired))))
+           ;; a callback cancelling itself does not deadlock and stops
+           ;; the watch after exactly one delivery
+           (let ((cancel nil)
+                 (count 0))
+             (setf cancel
+                   (wasmdown.wasi:reactor-watch-fd
+                    reactor 4 :read 'self-cancel
+                    (lambda (status)
+                      (declare (ignore status))
+                      (incf count)
+                      (funcall cancel))))
+             (wasmdown.wasi:reactor-step reactor 1000000)
+             (multiple-value-bind (progress pending)
+                 (wasmdown.wasi:reactor-step reactor 1000000)
+               (is (not progress))
+               (is (not pending)))
+             (is (= 1 count)))
+           ;; close cancels every registration, is idempotent, and the
+           ;; reactor refuses new watches
+           (let ((nothing '()))
+             (wasmdown.wasi:reactor-watch-fd
+              reactor 5 :read 'closed-fd
+              (lambda (status) (push status nothing)))
+             (wasmdown.wasi:reactor-watch-deadline
+              reactor 0 (lambda () (push :deadline nothing)))
+             (wasmdown.wasi:reactor-close reactor)
+             (wasmdown.wasi:reactor-close reactor)
+             (multiple-value-bind (progress pending)
+                 (wasmdown.wasi:reactor-step reactor 0)
+               (is (not progress))
+               (is (not pending)))
+             (is (null nothing))
+             (is (handler-case
+                     (progn (wasmdown.wasi:reactor-watch-fd
+                             reactor 6 :read 'after-close
+                             (lambda (status) (declare (ignore status))))
+                            nil)
+                   (error () t)))
+             (is (handler-case
+                     (progn (wasmdown.wasi:reactor-watch-deadline
+                             reactor 0 (lambda () nil))
+                            nil)
+                   (error () t)))))
+      (wasmdown.wasi:reactor-close reactor))))
+
+(test wasi/reactor-tcp-loopback
+  ;; the real backend: a listening TCP socket becomes readable after a
+  ;; loopback connect; one bounded step reports it (no polling loop and
+  ;; no sleep in the test)
+  (let* ((net (sock-network))
+         (server (sock-rep (wasmdown.wasi:tcp-create
+                            nil net (cons :enum "ipv4"))))
+         (client (sock-rep (wasmdown.wasi:tcp-create
+                            nil net (cons :enum "ipv4"))))
+         (reactor (wasmdown.wasi:make-wasi-reactor))
+         (seen '()))
+    (unwind-protect
+         (progn
+           (is (equal '(:ok)
+                      (wasmdown.wasi:tcp-bind nil net server (sock-addr 0))))
+           (let ((port (sock-value-port
+                        (sock-ok (wasmdown.wasi:tcp-get-local-address
+                                  nil net server)))))
+             (is (eq :ok (car (wasmdown.wasi:tcp-listen nil net server))))
+             (is (equal '(:ok)
+                        (wasmdown.wasi:tcp-connect nil net client
+                                                   (sock-addr port))))
+             (let* ((fd (wasmdown.wasi:wasi-tcp-socket-fd server))
+                    (cancel (wasmdown.wasi:reactor-watch-fd
+                             reactor fd :read 'listener
+                             (lambda (status) (push status seen)))))
+               (declare (ignore cancel))
+               (multiple-value-bind (progress pending)
+                   (wasmdown.wasi:reactor-step
+                    reactor (* 2 1000 1000 1000))
+                 (is progress)
+                 (is pending)
+                 (is (equal '(:read) seen))))))
+      (wasmdown.wasi:reactor-close reactor)
+      (wasmdown.wasi:close-wasi-tcp-socket client)
+      (wasmdown.wasi:close-wasi-tcp-socket server))))
+
+(test wasi/reactor-wake-self-pipe
+  ;; an external producer's wake byte interrupts a blocked step
+  (let ((reactor (wasmdown.wasi:make-wasi-reactor)))
+    (unwind-protect
+         (let* ((result nil)
+                (thread
+                  (sb-thread:make-thread
+                   (lambda ()
+                     (multiple-value-bind (progress pending)
+                         (wasmdown.wasi:reactor-step
+                          reactor (* 5 1000 1000 1000))
+                       (setf result (list progress pending)))))))
+           (is (wasmdown.wasi:reactor-wake reactor))
+           (sb-thread:join-thread thread)
+           (is (equal '(t nil) result)))
+      (wasmdown.wasi:reactor-close reactor))))

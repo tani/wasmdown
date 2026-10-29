@@ -345,3 +345,252 @@
     ;; interface import names carry the version suffix
     (is (string= (wasmdown.wit:interface-import-name mono)
                  "wasi:clocks/monotonic-clock@0.3.2"))))
+
+;;; ---------------------------------------------------------------
+;;; Version selection (plan step 3).
+
+(defun selected-type-names (pkg &optional selection)
+  (let* ((selected (wasmdown.wit:select-wit-package pkg selection))
+         (types (wasmdown.wit:package-interface selected "types")))
+    (mapcar #'wasmdown.wit:wit-type-name
+            (wasmdown.wit:wit-interface-items types))))
+
+(test wit/selection-semver-ordering
+  (is (wasmdown.wit:wit-version< "1.0.0-alpha.1" "1.0.0-alpha.2"))
+  (is (wasmdown.wit:wit-version< "1.0.0-alpha.2" "1.0.0-beta"))
+  (is (wasmdown.wit:wit-version< "1.0.0-beta" "1.0.0"))
+  ;; a prefix tie goes to the longer identifier list
+  (is (wasmdown.wit:wit-version< "1.0.0-alpha" "1.0.0-alpha.1"))
+  ;; numeric prerelease identifiers sort before alphanumeric ones
+  (is (wasmdown.wit:wit-version< "1.0.0-1" "1.0.0-alpha"))
+  ;; numeric identifiers compare numerically, not lexically
+  (is (wasmdown.wit:wit-version< "1.0.0-alpha.9" "1.0.0-alpha.10"))
+  (is (not (wasmdown.wit:wit-version< "1.0.0-alpha.10" "1.0.0-alpha.9")))
+  ;; build metadata is not compared
+  (is (wasmdown.wit:wit-version= "1.0.0+build.9" "1.0.0"))
+  (is (wasmdown.wit:wit-version= "1.0.0-rc.1+sha.1" "1.0.0-rc.1+sha.2"))
+  (is (wasmdown.wit:wit-version<= "1.0.0" "1.0.0"))
+  (is (not (wasmdown.wit:wit-version<= "1.0.1" "1.0.0"))))
+
+(test wit/selection-since-boundary
+  (let ((pkg (wasmdown.wit:parse-wit-string
+              "package test:gated@0.4.0;
+
+interface types {
+  @since(version = 0.3.0)
+  type old = u32;
+  @since(version = 0.4.0)
+  type new = u32;
+}
+")))
+    ;; default target = the package's own version: 0.4.0 == 0.4.0 is kept
+    (is (equal (selected-type-names pkg) '("old" "new")))
+    ;; an explicit equal version is still included
+    (is (equal (selected-type-names
+                pkg (wasmdown.wit:make-wit-selection
+                     :target-versions '(("test:gated" . "0.4.0"))))
+               '("old" "new")))
+    (is (equal (selected-type-names
+                pkg (wasmdown.wit:make-wit-selection
+                     :target-versions '(("test:gated" . "0.3.0"))))
+               '("old")))
+    ;; the patch just before the item's version excludes it
+    (is (equal (selected-type-names
+                pkg (wasmdown.wit:make-wit-selection
+                     :target-versions '(("test:gated" . "0.3.9"))))
+               '("old")))
+    (is (equal (selected-type-names
+                pkg (wasmdown.wit:make-wit-selection
+                     :target-versions '(("test:gated" . "0.4.1"))))
+               '("old" "new")))))
+
+(test wit/selection-unstable-opt-in
+  (let ((pkg (wasmdown.wit:parse-wit-string
+              "package test:feat@0.1.0;
+
+interface types {
+  @unstable(feature = experimental)
+  type hidden = u32;
+  type shown = u32;
+}
+")))
+    ;; disabled by default
+    (is (equal (selected-type-names pkg) '("shown")))
+    ;; named opt-in
+    (is (equal (selected-type-names
+                pkg (wasmdown.wit:make-wit-selection
+                     :enabled-features '("experimental")))
+               '("hidden" "shown")))
+    ;; a different feature does not enable it
+    (is (equal (selected-type-names
+                pkg (wasmdown.wit:make-wit-selection
+                     :enabled-features '("other")))
+               '("shown")))))
+
+(test wit/selection-deprecated-kept
+  (let ((pkg (wasmdown.wit:parse-wit-string
+              "package test:dep@0.1.0;
+
+interface types {
+  @deprecated(version = 0.1.0)
+  type old = u32;
+}
+")))
+    (is (equal (selected-type-names pkg) '("old")))
+    (is (equal (selected-type-names
+                pkg (wasmdown.wit:make-wit-selection
+                     :target-versions '(("test:dep" . "0.1.0"))))
+               '("old")))))
+
+(test wit/selection-unknown-package
+  (let* ((pkg (wasmdown.wit:parse-wit-string
+               "package test:ref@0.1.0;
+
+interface types {
+  use other:pkg/types@1.0.0.{thing};
+  type x = thing;
+}
+"))
+         (problems (wasmdown.wit:validate-wit-package pkg)))
+    (is problems)
+    (let ((hit (find-if (lambda (p) (search "other:pkg" p)) problems)))
+      (is hit)
+      (is (search "unknown package reference" hit)))))
+
+(test wit/selection-member-gate-error
+  (let ((pkg (wasmdown.wit:parse-wit-string
+              "package test:member@0.1.0;
+
+interface types {
+  record r {
+    @since(version = 9.0.0)
+    a: u32,
+    b: u32,
+  }
+}
+"))
+        (message nil))
+    (handler-case (wasmdown.wit:select-wit-package
+                   pkg (wasmdown.wit:make-wit-selection))
+      (wasmdown.wit:wit-error (c)
+        (setf message (wasmdown:wasmdown-error-message c))))
+    (is message)
+    (is (search "a" message))
+    (is (search "r" message))))
+
+(test wit/selection-world-gate-inheritance
+  (let* ((pkg (wasmdown.wit:parse-wit-string
+               "package test:world@0.1.0;
+
+@unstable(feature = exp)
+world w {
+  import y;
+}
+
+interface y {
+  type t = u32;
+}
+"))
+         (hidden (wasmdown.wit:resolve-wit-world pkg "w"))
+         (shown (wasmdown.wit:resolve-wit-world
+                 pkg "w"
+                 :selection (wasmdown.wit:make-wit-selection
+                             :enabled-features '("exp")))))
+    ;; the ungated import inherits the world's @unstable gate
+    (is (null (wasmdown.wit:wit-world-imports hidden)))
+    (is (= 1 (length (wasmdown.wit:wit-world-imports shown))))
+    (is (string= (wasmdown.wit:wit-world-item-interface
+                  (first (wasmdown.wit:wit-world-imports shown)))
+                 "y"))
+    ;; an explicit weaker child gate is rejected
+    (let ((weak (wasmdown.wit:parse-wit-string
+                 "package test:weak@0.1.0;
+
+@since(version = 0.5.0)
+world w {
+  @since(version = 0.1.0)
+  import y;
+}
+
+interface y {
+  type t = u32;
+}
+"))
+          (message nil))
+      (handler-case (wasmdown.wit:resolve-wit-world weak "w")
+        (wasmdown.wit:wit-error (c)
+          (setf message (wasmdown:wasmdown-error-message c))))
+      (is message)
+      (is (search "weaker gate" message)))))
+
+(test wit/selection-vendored-packages-validate
+  (let ((pkgs (mapcar #'parse-pkg
+                      '("clocks/clocks.wit" "random/random.wit"
+                        "cli/cli.wit" "filesystem/filesystem.wit"
+                        "sockets/sockets.wit" "http/http.wit"))))
+    (dolist (pkg pkgs)
+      (is (null (wasmdown.wit:validate-wit-package pkg :packages pkgs))))
+    ;; the unstable timezone interface is selected out by default and
+    ;; back in by its feature (timezone is declared by wasi:clocks)
+    (let* ((clocks (first pkgs))
+           (clocks-off (wasmdown.wit:select-wit-package clocks nil))
+           (clocks-on (wasmdown.wit:select-wit-package
+                       clocks (wasmdown.wit:make-wit-selection
+                               :enabled-features '("clocks-timezone"))))
+           (cli (third pkgs))
+           (off (wasmdown.wit:select-wit-package cli nil))
+           (on (wasmdown.wit:select-wit-package
+                cli (wasmdown.wit:make-wit-selection
+                     :enabled-features '("clocks-timezone")))))
+      (is (null (wasmdown.wit:package-interface clocks-off "timezone")))
+      (is (wasmdown.wit:package-interface clocks-on "timezone"))
+      ;; the command world loses the timezone import without the feature
+      (is (null (find "timezone"
+                      (wasmdown.wit:wit-world-imports
+                       (wasmdown.wit:resolve-wit-world off "command"))
+                      :key #'wasmdown.wit:wit-world-item-interface
+                      :test #'string=)))
+      (is (find "timezone"
+                (wasmdown.wit:wit-world-imports
+                 (wasmdown.wit:resolve-wit-world
+                  on "command"
+                  :selection (wasmdown.wit:make-wit-selection
+                              :enabled-features '("clocks-timezone"))))
+                :key #'wasmdown.wit:wit-world-item-interface
+                :test #'string=)))))
+
+(test wit/selection-validate-since-exceeds-container
+  (let* ((pkg (wasmdown.wit:parse-wit-string
+               "package test:since@0.1.0;
+
+@since(version = 0.1.0)
+interface types {
+  @since(version = 0.2.0)
+  type a = u32;
+}
+"))
+         (problems (wasmdown.wit:validate-wit-package pkg)))
+    (is problems)
+    (let ((hit (find-if (lambda (p) (search "exceeds its container" p))
+                        problems)))
+      (is hit)
+      (is (search "0.2.0" hit))
+      (is (search "0.1.0" hit)))))
+
+(test wit/selection-validate-duplicate-and-unstable-reference
+  (let ((problems (wasmdown.wit:validate-wit-package
+                   (wasmdown.wit:parse-wit-string
+                    "package test:dup@0.1.0;
+
+interface types {
+  type a = u32;
+  type a = u64;
+  @unstable(feature = exp)
+  type hidden = u32;
+  type exposed = list<hidden>;
+}
+"))))
+    (is (find-if (lambda (p) (search "duplicate binding `a`" p)) problems))
+    (is (find-if (lambda (p) (and (search "references @unstable `hidden`" p)
+                                  (search "not itself @unstable" p)))
+                 problems))))

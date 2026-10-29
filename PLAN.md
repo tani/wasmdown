@@ -136,7 +136,7 @@ Expose documented ceilings for module/code sizes, memory allocation, instance co
 | `wasmdown.runtime` | Module instances, functions, globals, tables, memories, tags, heap refs, host calls. | WASI interface naming. |
 | `wasmdown.component` | Component types, linking, resources, canonical lift/lower, async state machines. | Concrete Linux syscalls. |
 | `wasmdown.wasi` | WASI 0.3.2 providers, separate 0.2/0.1 providers and world entry points. | Compiler or IR rewriting. |
-| `wasmdown.host` | Capabilities, filesystem handles, sockets, clocks, RNG, TLS/HTTP adapters, reactor. | Guest-invented ambient privileges. |
+| `wasmdown.host` | Capabilities, filesystem handles, sockets, clocks, RNG, TLS adapters, reactor. | Guest-invented ambient privileges. |
 
 All cross-subsystem interfaces are explicit. A core module never acquires a host capability by symbol lookup, dynamic variable access, FFI or parsing a guest-supplied name. Module instantiation injects a finite import table with checked types and capabilities.
 
@@ -300,7 +300,7 @@ WASI 0.2 keeps its own canonical interfaces and `wasi:io` resource semantics, ma
 | `wasi:random` | Secure random bytes via OS entropy, well-specified insecure variants, host resource/length handling; never substitute `CL:RANDOM` for cryptographic randomness. |
 | `wasi:filesystem` | Preopened descriptor authorities, relative paths, file and directory operations, metadata, symlink restrictions, stream reads/writes, rights, deletion/rename, resource closing. |
 | `wasi:sockets` | IP lookup, TCP/UDP creation and connection/binding/listening, address-family and errors, async stream and network capability restrictions. |
-| `wasi:http` | HTTP outgoing client and incoming service/middleware worlds, header/body/trailer semantics, backpressure, status/errors; TLS/HTTPS via an explicit host transport abstraction. |
+| `wasi:http` | **REMOVED at user direction in M17** (M16 slice 5). The outgoing client and incoming service/middleware worlds, header/body/trailer semantics, backpressure and status/errors are no longer a deliverable; the implementation is recoverable from git history and the vendored `specs/wasi/wasi-wit-0.3.2/http/*.wit` remain as reference data only. |
 | Other versioned stable interfaces | Generate required-interface inventory from vendored WASI 0.3.2 release WIT and implement every interface exposed by the selected stable worlds; experimental proposals are feature-gated. |
 
 > **Implementation status (M16, 2026-10-28): implemented, slice-scoped.**
@@ -311,17 +311,21 @@ WASI 0.2 keeps its own canonical interfaces and `wasi:io` resource semantics, ma
 > the `clocks`, `random`, `cli` (environment/exit/stdio/terminals/`run`),
 > `filesystem` (the `*at` capability model + streams + `read-directory`),
 > `sockets` (the `wasi-network` authority + tcp/udp + `ip-name-lookup`)
-> and `http` (the `types` resources + `client.send` over HTTP/1.1 with a
-> pluggable transport) providers, all under an explicit `wasi-context`.
+> providers, all under an explicit `wasi-context`. M16 slice 5
+> (`wasi:http`, the `types` resources + `client.send` over HTTP/1.1 with
+> a pluggable transport) was **REMOVED at user direction in M17**; the
+> implementation is recoverable from git history and the vendored
+> `specs/wasi/wasi-wit-0.3.2/http/*.wit` remain reference data only.
 > Measured: units 481/0, core 21,187/0/73, the component lane
 > 1,631/0/0/0 (the lane metric; the probe metric retains the pre-existing,
-> machine-load-dependent async flake class). **Residuals:** the
-> `wasi:http` handler/service/middleware (guest-exported) worlds;
-> streaming request uploads; no socket/timer reactor (`wait-until`/
-> `wait-for` unsupported); the nested `option<stream<u8>>` host lower;
-> descriptor-dtor/lend accumulation; `%abi-lower`'s top-level
-> error-result discriminant; pre-existing text/validator limits;
-> unenforced `@unstable` gating; and the WASI 0.1/0.2 facades (§8.4).
+> machine-load-dependent async flake class). **Residuals:** no
+> socket/timer reactor (`wait-until`/`wait-for` unsupported); the nested
+> `option<stream<u8>>` host lower; descriptor-dtor/lend accumulation;
+> `%abi-lower`'s top-level error-result discriminant; pre-existing
+> text/validator limits; unenforced `@unstable` gating; and the
+> WASI 0.1/0.2 facades (§8.4). The former HTTP residuals (outgoing
+> streaming uploads, incoming service/middleware worlds,
+> keep-alive/pipelining/trailers) are **out of scope, not pending**.
 > See `README.md`'s *WASI 0.3.2 host providers (M16)* and ADR-003.
 > `declared_support` stays `partial`.
 
@@ -331,9 +335,9 @@ Default capabilities are empty except explicitly configured CLI streams/argument
 
 ### 9.2 OS integration and the minimal-dependency boundary
 
-**Core/compiler:** ANSI Common Lisp plus selected SBCL facilities; no mandatory ASDF ecosystem libraries. **Host layer:** SBCL's bundled facilities and thin, audited, optional OS ABI bindings (e.g. libc/system calls through `SB-ALIEN`). **HTTP/TLS:** pluggable system TLS providers or embedder-supplied transport services. Do not write custom cryptographic TLS merely to satisfy a “pure Lisp” slogan.
+**Core/compiler:** ANSI Common Lisp plus selected SBCL facilities; no mandatory ASDF ecosystem libraries. **Host layer:** SBCL's bundled facilities and thin, audited, optional OS ABI bindings (e.g. libc/system calls through `SB-ALIEN`). **TLS:** WASI HTTP (`wasi:http`) was REMOVED at user direction in M17, so the runtime ships no HTTP/TLS adapter; an embedder-supplied transport remains an out-of-tree service, and no custom cryptographic TLS is written merely to satisfy a “pure Lisp” slogan.
 
-Important feasibility condition: zero external Lisp packages is realistic; zero operating-system or cryptographic libraries for a general-purpose secure HTTPS/socket/filesystem implementation is not. A no-TLS installation may be conformant as a core Wasm engine, but must not claim a complete turnkey WASI HTTP host implementation. An embedder can still inject a fully conforming HTTP provider.
+Important feasibility condition: zero external Lisp packages is realistic; zero operating-system or cryptographic libraries for a general-purpose secure socket/filesystem implementation is not. A no-TLS installation may be conformant as a core Wasm engine; WASI HTTP is out of scope after its M17 removal (recoverable from git history; the vendored WIT stays reference data only).
 
 ---
 
@@ -438,7 +442,7 @@ wasmdown/
 | WIT/component tooling | [`wasm-tools`](https://github.com/bytecodealliance/wasm-tools) and versioned WIT corpus | Valid/invalid WIT syntax, resolve, type checking, component decode/validate and encode/decode round trips | Compatibility and differential agreement for the pinned feature set; this is an external development oracle, not a production dependency |
 | WASI Preview 1 / 0.1 | [`WebAssembly/wasi-testsuite`](https://github.com/WebAssembly/wasi-testsuite) | Prepared guest programs, filesystem, CLI, stdio, exit status and OS behavior | Pass every applicable P1 case on supported hosts |
 | WASI Preview 3 / 0.3 | Same `wasi-testsuite`, using its [`prod/testsuite-base`](https://github.com/WebAssembly/wasi-testsuite/tree/prod/testsuite-base) branch | Precompiled WASI 0.3 programs and operation-based test specifications; includes async-related coverage | Pass all version-compatible cases; implement untested stable interfaces with internal integration tests |
-| WASI 0.2 compatibility | Pinned WIT from the WASI 0.2 release and WASMDOWN integration corpus | Component imports/exports, `wasi:io` legacy resource semantics, filesystem and HTTP compatibility | Independent, explicit 0.2 support claim and green matrix; do not infer 0.2 compliance from 0.3 tests |
+| WASI 0.2 compatibility | Pinned WIT from the WASI 0.2 release and WASMDOWN integration corpus | Component imports/exports, `wasi:io` legacy resource semantics and filesystem compatibility (WASI HTTP was removed in M17, so no HTTP compatibility claim is made) | Independent, explicit 0.2 support claim and green matrix; do not infer 0.2 compliance from 0.3 tests |
 | Extensions | Individual proposal source repositories | Threads/atomics and other explicitly enabled, non-Core-3.0 proposals | Separate opt-in conformance report; never required for the unextended Core 3.0 claim |
 
 Use the primary [`WebAssembly/spec`](https://github.com/WebAssembly/spec) revision as the source of truth for core tests. The convenient aggregated [`WebAssembly/testsuite`](https://github.com/WebAssembly/testsuite) may also contain proposal cases outside the target; those cases must be identified by provenance and never silently conflated with core requirements. The Component Model repository currently describes its WAST suite as growing; there is **no assumption that it constitutes a complete normative reference implementation**. Supplement it with end-to-end component fixtures and manual feature coverage.
@@ -529,12 +533,12 @@ Each WASI test must run with a clean, per-test capability set and scratch direct
 Additional compulsory fixtures, even when absent from upstream:
 
 - **WASI 0.1:** `proc_exit`, preopens, `fd_*`, argument/environment transfer, rights, clock and random error paths, directory/path traversal, and large file offsets.
-- **WASI 0.2:** `wasi:io` streams and pollables, resource lifecycle, component-mediated CLI/HTTP, and behavior of a 0.2 adapter hosted internally by the 0.3 environment.
-- **WASI 0.3.2:** command world `async run`, streaming stdin/stdout, correct completion futures, system/monotonic clocks, random-byte length constraints, filesystem descriptors, DNS, TCP, UDP, HTTP outgoing/incoming service and middleware worlds.
+- **WASI 0.2:** `wasi:io` streams and pollables, resource lifecycle, component-mediated CLI, and behavior of a 0.2 adapter hosted internally by the 0.3 environment.
+- **WASI 0.3.2:** command world `async run`, streaming stdin/stdout, correct completion futures, system/monotonic clocks, random-byte length constraints, filesystem descriptors, DNS, TCP and UDP. WASI HTTP was REMOVED at user direction in M17 (M16 slice 5), so no HTTP fixtures or worlds are mandatory; its vendored WIT remains reference data only.
 - **Async composition:** A → B → C → host, futures whose completion is delayed, producer/consumer backpressure, zero-byte streams, early close, reader/writer cancellation, dropped owner resources, and error propagation after partial output.
 - **Security:** denied root/network access, symlink/TOCTOU attempts, capability inheritance boundaries, resource quotas, and correct rejection of unsupported providers instead of accidental fallback to ambient host authority.
 
-The normative test matrix includes **each stable WIT package/interface/function in the pinned WASI release**. A suite that covers only CLI filesystem functions is not evidence that sockets or HTTP have been completed. Generate an interface-function checklist automatically from vendored WIT and map every item to executable tests or a reviewed manual conformance argument.
+The normative test matrix includes **each stable WIT package/interface/function in the pinned WASI release, except the M17-removed WASI HTTP surface**. A suite that covers only CLI filesystem functions is not evidence that sockets have been completed. Generate an interface-function checklist automatically from vendored WIT and map every item to executable tests or a reviewed manual conformance argument.
 
 ### 12.6 Property-based, differential and fuzz testing
 
@@ -637,7 +641,7 @@ Define \(F\) as the **normative inventory** of opcode semantics, type rules, bin
 | G2 — Core 3.0 | `SuitePass(core) = 1` for all applicable cases; zero unreviewed skip/unsupported/xfail; `C = F` for every normative Core 3.0 family; legal limits documented |
 | G3 — Optimizer equivalence | Baseline vs optimized vs interpreter match on all pinned deterministic core tests and differential corpus; zero known semantic regressions; performance results published |
 | G4 — Component Model | All pinned applicable Component Model tests pass and all WASI-adopted Canonical ABI features have positive/negative test coverage, including async resource life cycles |
-| G5 — WASI 0.3.2 | All applicable pinned official P3 tests pass plus `C = F` for every declared stable 0.3.2 interface/world; CLI, filesystem, sockets, HTTP, stream/future and nested-async tests pass; P1/P2 claims audited separately |
+| G5 — WASI 0.3.2 | All applicable pinned official P3 tests pass plus `C = F` for every declared stable 0.3.2 interface/world; CLI, filesystem, sockets, stream/future and nested-async tests pass; WASI HTTP is excluded (REMOVED at user direction in M17, recoverable from git history); P1/P2 claims audited separately |
 | G6 — Release | G2–G5 green on declared platforms; no untriaged critical security defects; isolated hostile-input tests; signed/checksummed reproducible binaries and reports; explicit platform/resource-limit matrix |
 
 An operational **1.0 release** claiming full WebAssembly Core 3.0 + selected published WASI 0.3.2 stable worlds requires **G2, G3, G4, G5 and G6**, with the advertised scope enumerated precisely. If any world/interface/function is omitted, the WASI claim must instead be labeled **partial**. A full *WASI 0.3.2* claim requires all mandatory adopted stable interfaces in the intended standard worlds, not a handpicked CLI subset. Passing these suites documents strong conformance evidence but does not provide a mathematical proof of an implementation's correctness.
@@ -656,7 +660,7 @@ An operational **1.0 release** claiming full WebAssembly Core 3.0 + selected pub
 | M7 | Component suite adapter, exhaustive Canonical ABI matrix and borrow/own lifetime invariants; G4 as soon as async coverage completes |
 | M8 | WASI 0.1 official adapter + explicit WASI 0.2 compatibility suite |
 | M9 | Async state-machine, composition, cancellation and backpressure property suites |
-| M10 | WASI 0.3 official adapter, complete stable WIT-function coverage, world-level integration and network/HTTP fixtures; G5 |
+| M10 | WASI 0.3 official adapter, complete stable WIT-function coverage, world-level integration and network fixtures (WASI HTTP excluded after its M17 removal); G5 |
 | M11 | Hostile-input fuzz budget, capability audit, portability, reproducible artifact/release report; G6 |
 
 At each release tag, archive `CONFORMANCE.md`, machine-readable assertion reports, suite/WIT lockfiles and license notices. This prevents later changes in a floating official suite from retroactively changing the meaning of an earlier published compliance claim.
@@ -676,7 +680,7 @@ At each release tag, archive `CONFORMANCE.md`, machine-readable assertion report
 
 ### 13.2 Benchmarks
 
-Measure the full matrix for interpreter, baseline Lisp, optimized Lisp, and a fixed Wasmtime version. Run single-threaded, warmed functions under matched inputs on Linux x86-64 first, then AArch64; include startup separately. Use parser/CRC, integer hashing, tree/GC allocation, memory copy, irregular control flow, SIMD workloads, numerical kernels, a real Rust WASI CLI, and an asynchronous HTTP/component pipeline.
+Measure the full matrix for interpreter, baseline Lisp, optimized Lisp, and a fixed Wasmtime version. Run single-threaded, warmed functions under matched inputs on Linux x86-64 first, then AArch64; include startup separately. Use parser/CRC, integer hashing, tree/GC allocation, memory copy, irregular control flow, SIMD workloads, numerical kernels, a real Rust WASI CLI, and an asynchronous component pipeline.
 
 Publish median, p95 and confidence intervals for throughput, plus compilation time, RSS, cache hit/miss, binary size, allocations/op and GC time. For benchmark \(b\), measure \(r_b=T_{\mathrm{Wasmtime},b}/T_{\mathrm{CL},b}\) for runtime duration (larger is better), and report geometric mean over a frozen suite:
 
@@ -702,7 +706,7 @@ Effort is a planning estimate for *one experienced, full-time implementer* with 
 | M7 | 8–12 wk | Component decoder/linker/type system; WIT parser, canonical ABI and resources. | Baseline component samples compose; ownership and ABI tests pass. |
 | M8 | 6–10 wk | WASI 0.1 and 0.2 facades; capability-aware filesystem, clocks, random and stdio. | Legacy official suites and own 0.2 compatibility cases pass. |
 | M9 | 10–16 wk | WASI 0.3.2 async component ABI: task state machine, future/stream, backpressure and wake propagation. | Cross-component suspension/cancellation and async Canonical ABI parity. |
-| M10 | 8–14 wk | Complete 0.3.2 stable world providers, sockets, HTTP and host TLS adapters. | **G5:** applicable pinned WASI 0.3 suites and component-world tests pass. |
+| M10 | 8–14 wk | Complete 0.3.2 stable world providers, sockets and host adapters (WASI HTTP and its TLS adapter were REMOVED at user direction in M17). | **G5:** applicable pinned WASI 0.3 suites and component-world tests pass. |
 | M11 | 6–10 wk | Security hardening, quotas, fuzzing, 2nd-architecture portability, documentation/release. | **G6:** all gates; no open critical defects; reproducible release and support matrix. |
 | M12 (optional) | 8–16 wk | Threads/atomics proposal compatibility, shared memory and atomic backend. | Separate proposal-suite compliance; Core 3.0 label unchanged. |
 

@@ -339,7 +339,22 @@
    #:resolve-wit-type
    #:wit-type->ct
    #:wit-func->ct
-   #:interface-import-name))
+   #:interface-import-name
+   ;; version selection (plan step 3)
+   #:wit-version
+   #:wit-version-p
+   #:parse-wit-version
+   #:wit-version<
+   #:wit-version=
+   #:wit-version<=
+   #:wit-selection
+   #:wit-selection-p
+   #:make-wit-selection
+   #:wit-selection-target-versions
+   #:wit-selection-enabled-features
+   #:validate-wit-package
+   #:select-wit-package
+   #:resolve-wit-world))
 
 (defpackage #:wasmdown.wasi
   (:use #:cl)
@@ -357,7 +372,6 @@
    #:wasi-context-stderr
    #:wasi-context-preopens
    #:wasi-context-networks
-   #:wasi-context-http-transports
    ;; host exit
    #:wasi-exit
    #:wasi-exit-p
@@ -472,67 +486,13 @@
    #:sockets-provider
    #:ip-socket-address->sockaddr
    #:sockaddr->ip-socket-address
-   ;; http (M16 slice 5): the types resources + client.send over a
-   ;; pluggable transport
-   #:wasi-fields
-   #:wasi-fields-p
-   #:make-wasi-fields
-   #:wasi-http-request
-   #:wasi-http-request-p
-   #:wasi-http-response
-   #:wasi-http-response-p
-   #:wasi-http-options
-   #:wasi-http-options-p
-   #:make-wasi-http-options
-   #:wasi-http-transport
-   #:wasi-http-transport-p
-   #:make-wasi-http-transport
-   #:wasi-http-transport-scheme
-   #:wasi-http-transport-connect
-   #:wasi-http-connection
-   #:wasi-http-connection-p
-   #:make-wasi-http-connection
-   #:wasi-http-error
-   #:wasi-http-error-code
-   #:http-error-code
-   #:wasi-context-http-transports
-   #:http-resource-ct
-   #:fields-constructor
-   #:fields-from-list
-   #:fields-get
-   #:fields-has
-   #:fields-set
-   #:fields-delete
-   #:fields-get-and-delete
-   #:fields-append
-   #:fields-copy-all
-   #:fields-clone
-   #:request-options-constructor
-   #:request-options-get-connect-timeout
-   #:request-options-set-connect-timeout
-   #:request-options-get-first-byte-timeout
-   #:request-options-set-first-byte-timeout
-   #:request-options-get-between-bytes-timeout
-   #:request-options-set-between-bytes-timeout
-   #:request-options-clone
-   #:http-request-new
-   #:http-request-get-method
-   #:http-request-set-method
-   #:http-request-get-path-with-query
-   #:http-request-set-path-with-query
-   #:http-request-get-scheme
-   #:http-request-set-scheme
-   #:http-request-get-authority
-   #:http-request-set-authority
-   #:http-request-get-options
-   #:http-request-get-headers
-   #:http-request-consume-body
-   #:http-response-new
-   #:http-response-get-status-code
-   #:http-response-set-status-code
-   #:http-response-get-headers
-   #:http-response-consume-body
-   #:http-client-send
-   #:http-types-instance
-   #:http-client-instance
-   #:http-provider))
+   ;; reactor backend (plan step 6): poll(2) + the monotonic clock +
+   ;; the self-pipe wake channel, with injectable time/readiness
+   #:wasi-reactor
+   #:wasi-reactor-p
+   #:make-wasi-reactor
+   #:reactor-step
+   #:reactor-watch-fd
+   #:reactor-watch-deadline
+   #:reactor-close
+   #:reactor-wake))

@@ -13,7 +13,7 @@
 ;;;; func/type/resource/use structs); it does NOT validate the WIT or
 ;;;; resolve cross-package references (wit-type->ct does that on
 ;;;; demand). The node graph is deliberately boring so the later
-;;;; filesystem/sockets/http slices can extend it without rewriting.
+;;;; filesystem/sockets slices can extend it without rewriting.
 
 (in-package #:wasmdown.wit)
 
@@ -377,7 +377,12 @@ sigil and is not part of the name."
 (defstruct wit-type
   (name "" :type string)
   (expr nil)
-  (annotations nil))
+  (annotations nil)
+  ;; member-name -> the member's own annotations (alist), for record
+  ;; fields, enum/flags labels and variant cases. A member gate must
+  ;; never be silently dropped (that would change the layout), so the
+  ;; selection layer inspects this table instead of re-reading source.
+  (member-annotations nil))
 
 (defstruct wit-func
   (name "" :type string)
@@ -459,45 +464,58 @@ interface version). A bare name has NIL namespace/package."
                     :annotations annotations))))
 
 (defun %parse-record-fields (r)
-  (let ((fields '()))
+  "Parse a record body. Returns (values FIELDS MEMBER-ANNOTATIONS):
+FIELDS is (name . type) in declaration order, MEMBER-ANNOTATIONS maps
+a field name to its own annotations (only when it has any)."
+  (let ((fields '())
+        (member-annotations '()))
     (%expect-punct r "{")
     (loop until (%punct-p (%peek r) "}")
-          do (%parse-annotations r)     ; field annotations recorded nowhere
-             (let ((name (%expect-ident r)))
-               (%expect-punct r ":")
-               (push (cons name (%parse-type r)) fields))
+          do (let ((as (%parse-annotations r)))
+               (let ((name (%expect-ident r)))
+                 (%expect-punct r ":")
+                 (push (cons name (%parse-type r)) fields)
+                 (when as (push (cons name as) member-annotations))))
              (%expect-punct r ","))
     (%expect-punct r "}")
-    (nreverse fields)))
+    (values (nreverse fields) (nreverse member-annotations))))
 
 (defun %parse-labels (r)
-  "An enum/flags body: labels separated by commas."
-  (let ((labels '()))
+  "An enum/flags body: labels separated by commas. Returns (values
+LABELS MEMBER-ANNOTATIONS); see %PARSE-RECORD-FIELDS."
+  (let ((labels '())
+        (member-annotations '()))
     (%expect-punct r "{")
     (loop until (%punct-p (%peek r) "}")
-          do (%parse-annotations r)
-             (push (%expect-ident r) labels)
+          do (let ((as (%parse-annotations r)))
+               (let ((label (%expect-ident r)))
+                 (push label labels)
+                 (when as (push (cons label as) member-annotations))))
              (unless (%punct-p (%peek r) "}")
                (%expect-punct r ",")))
     (%expect-punct r "}")
-    (nreverse labels)))
+    (values (nreverse labels) (nreverse member-annotations))))
 
 (defun %parse-variant-cases (r)
-  (let ((cases '()))
+  "A variant body. Returns (values CASES MEMBER-ANNOTATIONS); CASES is
+(name . payload-or-nil) in declaration order."
+  (let ((cases '())
+        (member-annotations '()))
     (%expect-punct r "{")
     (loop until (%punct-p (%peek r) "}")
-          do (%parse-annotations r)
-             (let ((name (%expect-ident r))
-                   (payload nil))
-               (when (%punct-p (%peek r) "(")
-                 (%next r)
-                 (setf payload (%parse-type r))
-                 (%expect-punct r ")"))
-               (push (cons name payload) cases))
+          do (let ((as (%parse-annotations r)))
+               (let ((name (%expect-ident r))
+                     (payload nil))
+                 (when (%punct-p (%peek r) "(")
+                   (%next r)
+                   (setf payload (%parse-type r))
+                   (%expect-punct r ")"))
+                 (push (cons name payload) cases)
+                 (when as (push (cons name as) member-annotations))))
              (unless (%punct-p (%peek r) "}")
                (%expect-punct r ",")))
     (%expect-punct r "}")
-    (nreverse cases)))
+    (values (nreverse cases) (nreverse member-annotations))))
 
 (defun %parse-func-signature (r name annotations &key (constructor-p nil))
   (let ((async-p nil) (static-p nil))
@@ -591,42 +609,53 @@ interface version). A bare name has NIL namespace/package."
                ty))
             ((%keyword-p r "record")
              (%next r)
-             (let* ((name (%expect-ident r))
-                    (ty (make-wit-type
-                         :name name
-                         :expr (cons :record (%parse-record-fields r))
-                         :annotations annotations)))
-               (setf (gethash name (wit-interface-types iface)) ty)
-               (push ty (wit-interface-items iface))
-               ty))
+             (let ((name (%expect-ident r)))
+               (multiple-value-bind (fields member-annotations)
+                   (%parse-record-fields r)
+                 (let ((ty (make-wit-type
+                            :name name
+                            :expr (cons :record fields)
+                            :annotations annotations
+                            :member-annotations member-annotations)))
+                   (setf (gethash name (wit-interface-types iface)) ty)
+                   (push ty (wit-interface-items iface))
+                   ty))))
             ((%keyword-p r "enum")
              (%next r)
-             (let* ((name (%expect-ident r))
-                    (ty (make-wit-type
-                         :name name :expr (cons :enum (%parse-labels r))
-                         :annotations annotations)))
-               (setf (gethash name (wit-interface-types iface)) ty)
-               (push ty (wit-interface-items iface))
-               ty))
+             (let ((name (%expect-ident r)))
+               (multiple-value-bind (labels member-annotations)
+                   (%parse-labels r)
+                 (let ((ty (make-wit-type
+                            :name name :expr (cons :enum labels)
+                            :annotations annotations
+                            :member-annotations member-annotations)))
+                   (setf (gethash name (wit-interface-types iface)) ty)
+                   (push ty (wit-interface-items iface))
+                   ty))))
             ((%keyword-p r "flags")
              (%next r)
-             (let* ((name (%expect-ident r))
-                    (ty (make-wit-type
-                         :name name :expr (cons :flags (%parse-labels r))
-                         :annotations annotations)))
-               (setf (gethash name (wit-interface-types iface)) ty)
-               (push ty (wit-interface-items iface))
-               ty))
+             (let ((name (%expect-ident r)))
+               (multiple-value-bind (labels member-annotations)
+                   (%parse-labels r)
+                 (let ((ty (make-wit-type
+                            :name name :expr (cons :flags labels)
+                            :annotations annotations
+                            :member-annotations member-annotations)))
+                   (setf (gethash name (wit-interface-types iface)) ty)
+                   (push ty (wit-interface-items iface))
+                   ty))))
             ((%keyword-p r "variant")
              (%next r)
-             (let* ((name (%expect-ident r))
-                    (ty (make-wit-type
-                         :name name
-                         :expr (cons :variant (%parse-variant-cases r))
-                         :annotations annotations)))
-               (setf (gethash name (wit-interface-types iface)) ty)
-               (push ty (wit-interface-items iface))
-               ty))
+             (let ((name (%expect-ident r)))
+               (multiple-value-bind (cases member-annotations)
+                   (%parse-variant-cases r)
+                 (let ((ty (make-wit-type
+                            :name name :expr (cons :variant cases)
+                            :annotations annotations
+                            :member-annotations member-annotations)))
+                   (setf (gethash name (wit-interface-types iface)) ty)
+                   (push ty (wit-interface-items iface))
+                   ty))))
             ((%keyword-p r "resource")
              (%next r)
              (let* ((name (%expect-ident r))
@@ -950,3 +979,634 @@ from the WIT and the async flag recorded in the payload's third slot."
     (wasmdown.component:make-ct
      :kind :func
      :payload (list params result (wit-func-async-p func)))))
+
+;;; ---------------------------------------------------------------
+;;; Version selection (plan step 3).
+;;;
+;;; The reader above records @since / @unstable / @deprecated
+;;; annotations but does not interpret them: every package is the full
+;;; declared surface. This section turns those annotations into a
+;;; selectable contract. A `wit-selection' carries the target SemVer
+;;; per package plus the enabled @unstable feature names; gating keeps
+;;; an item when its @since version is <= the target and (for
+;;; @unstable) its feature is enabled. Deprecated items are always
+;;; kept. Nothing here filters members of a record/variant/enum/flags:
+;;; dropping one would silently change the layout, so an excluded
+;;; member is a `wit-error' instead.
+;;;
+;;; The strict semver syntax check is the component layer's
+;;; %SEMVER-PARSE (src/component.lisp, same BNF); only the ordering
+;;; relation lives here.
+
+(defstruct (wit-version (:constructor %make-wit-version
+                                      (major minor patch prerelease build
+                                             source)))
+  (major 0 :type integer)
+  (minor 0 :type integer)
+  (patch 0 :type integer)
+  (prerelease nil)                       ; list of identifier strings
+  (build nil)                            ; list of identifier strings
+  (source "" :type string))
+
+(defun %split-dotted (string)
+  (loop with start = 0
+        for i from 0 to (length string)
+        when (or (= i (length string)) (char= (char string i) #\.))
+          collect (prog1 (subseq string start i)
+                    (setf start (1+ i)))))
+
+(defun parse-wit-version (version)
+  "Parse VERSION (a string `a.b.c[-pre][+build]') into a wit-version.
+Signals `wit-error' when it is not a strict SemVer 2.0.0 version (the
+component layer's parser supplies the syntax check)."
+  (unless (stringp version)
+    (error 'wit-error
+           :message (format nil "invalid WIT version ~s: not a string"
+                            version)))
+  (let ((detail (wasmdown.component::%semver-parse version)))
+    (when detail
+      (error 'wit-error
+             :message (format nil "invalid WIT version ~s: ~a"
+                              version detail))))
+  (let* ((plus (position #\+ version))
+         (without-build (if plus (subseq version 0 plus) version))
+         (build (and plus (subseq version (1+ plus))))
+         (dash (position #\- without-build))
+         (core (if dash (subseq without-build 0 dash) without-build))
+         (prerelease (and dash (subseq without-build (1+ dash))))
+         (numbers (mapcar #'parse-integer (%split-dotted core))))
+    (%make-wit-version (first numbers) (second numbers) (third numbers)
+                       (and prerelease (%split-dotted prerelease))
+                       (and build (%split-dotted build))
+                       version)))
+
+(defun %ensure-wit-version (v)
+  (cond ((wit-version-p v) v)
+        ((stringp v) (parse-wit-version v))
+        (t (error 'wit-error
+                  :message (format nil "invalid WIT version designator ~s" v)))))
+
+(defun wit-version-string (v)
+  (let ((v (%ensure-wit-version v)))
+    (wit-version-source v)))
+
+(defun %compare-numeric-identifier (a b)
+  "Compare two no-leading-zero digit strings numerically (length first,
+so arbitrarily large identifiers work)."
+  (cond ((< (length a) (length b)) -1)
+        ((> (length a) (length b)) 1)
+        ((string= a b) 0)
+        ((string< a b) -1)
+        (t 1)))
+
+(defun %compare-prerelease-identifier (a b)
+  "SemVer 2.0.0 11.4: numeric identifiers compare numerically and are
+always lower than alphanumeric ones; alphanumeric ones compare in
+ASCII lexical order."
+  (let ((na (every #'digit-char-p a))
+        (nb (every #'digit-char-p b)))
+    (cond ((and na nb) (%compare-numeric-identifier a b))
+          (na -1)
+          (nb 1)
+          ((string= a b) 0)
+          ((string< a b) -1)
+          (t 1))))
+
+(defun %compare-prerelease (a b)
+  "Compare two prerelease identifier lists (NIL = no prerelease)."
+  (cond
+    ((and (null a) (null b)) 0)
+    ((null a) 1)                         ; a release outranks a prerelease
+    ((null b) -1)
+    (t (loop for x in a
+             for y in b
+             do (let ((c (%compare-prerelease-identifier x y)))
+                  (when (/= c 0) (return c)))
+             finally (return (cond ((< (length a) (length b)) -1)
+                                   ((> (length a) (length b)) 1)
+                                   (t 0)))))))
+
+(defun wit-version-compare (a b)
+  "Three-way compare of two version designators (strings or
+wit-versions). Build metadata is not part of the order."
+  (let* ((a (%ensure-wit-version a))
+         (b (%ensure-wit-version b)))
+    (flet ((cmp (x y) (cond ((< x y) -1) ((> x y) 1) (t 0))))
+      (or (let ((c (cmp (wit-version-major a) (wit-version-major b))))
+            (and (/= c 0) c))
+          (let ((c (cmp (wit-version-minor a) (wit-version-minor b))))
+            (and (/= c 0) c))
+          (let ((c (cmp (wit-version-patch a) (wit-version-patch b))))
+            (and (/= c 0) c))
+          (%compare-prerelease (wit-version-prerelease a)
+                               (wit-version-prerelease b))))))
+
+(defun wit-version< (a b)
+  (minusp (wit-version-compare a b)))
+
+(defun wit-version= (a b)
+  (zerop (wit-version-compare a b)))
+
+(defun wit-version<= (a b)
+  (not (plusp (wit-version-compare a b))))
+
+;;; ---------------------------------------------------------------
+;;; The selection record + annotation gates.
+
+(defstruct wit-selection
+  ;; package name (or basename) -> a version designator
+  (target-versions nil)
+  ;; the enabled @unstable feature names
+  (enabled-features nil))
+
+(defparameter *default-wit-selection* (make-wit-selection)
+  "The selection with no version overrides and no enabled features: a
+package's own declared version is its target.")
+
+(defun %annotation-of (annotations name)
+  (find name annotations :key #'wit-annotation-name :test #'string=))
+
+(defun %annotation-arg (annotation key)
+  (and annotation
+       (cdr (assoc key (wit-annotation-args annotation) :test #'string=))))
+
+(defun %gate-since (annotations)
+  "The @since version string of ANNOTATIONS, or NIL."
+  (%annotation-arg (%annotation-of annotations "since") "version"))
+
+(defun %gate-feature (annotations)
+  "The @unstable feature of ANNOTATIONS: a string, :unstable when the
+annotation carries no feature argument, or NIL when not unstable."
+  (let ((a (%annotation-of annotations "unstable")))
+    (and a (or (%annotation-arg a "feature") :unstable))))
+
+(defun %selection-target-version (package selection)
+  "The selected target version of PACKAGE: the selection's override,
+else the package's own declared version (a wit-version or NIL)."
+  (let* ((selection (or selection *default-wit-selection*))
+         (versions (wit-selection-target-versions selection))
+         (hit (or (assoc (wit-package-name package) versions :test #'string=)
+                  (assoc (wit-package-basename package) versions
+                         :test #'string=)))
+         (version (if hit (cdr hit) (wit-package-version package))))
+    (and version (%ensure-wit-version version))))
+
+(defun %gate-kept-fields-p (since feature selection target-version)
+  "The field-level gate rule: @since is kept iff its version <=
+TARGET-VERSION; @unstable is kept iff its feature is enabled.
+@deprecated never removes an item, so it has no field here."
+  (and (or (null since)
+           (null target-version)
+           (not (wit-version< target-version since)))
+       (or (null feature)
+           (member feature (wit-selection-enabled-features selection)
+                   :test #'string=))))
+
+(defun %gate-kept-p (annotations selection target-version)
+  "Is an item carrying ANNOTATIONS part of the selected surface? See
+%GATE-KEPT-FIELDS-P."
+  (%gate-kept-fields-p (%gate-since annotations) (%gate-feature annotations)
+                       selection target-version))
+
+(defun %gate-at-least-as-strict-p (child parent)
+  "May an item whose own gate is CHILD live inside a container gated
+by PARENT? Availability and feature gates are independent dimensions:
+an omitted dimension inherits the container's, and an explicit one may
+not be weaker (earlier @since, or a different unstable feature)."
+  (let ((c-since (%gate-since child))
+        (p-since (%gate-since parent))
+        (c-feature (%gate-feature child))
+        (p-feature (%gate-feature parent)))
+    (and (or (null c-since) (null p-since)
+             (not (wit-version< c-since p-since)))
+         (or (null c-feature) (null p-feature)
+             (eq p-feature :unstable) (eq c-feature :unstable)
+             (string= c-feature p-feature)))))
+
+(defun %container-version (package annotations-list)
+  "The nearest @since in ANNOTATIONS-LIST (innermost first), else the
+package's declared version. A wit-version or NIL."
+  (or (loop for annotations in annotations-list
+            for since = (%gate-since annotations)
+            when since return (%ensure-wit-version since))
+      (and (wit-package-version package)
+           (%ensure-wit-version (wit-package-version package)))))
+
+;;; ---------------------------------------------------------------
+;;; Item introspection shared by validation and selection.
+
+(defun %item-annotations (item)
+  (cond ((wit-type-p item) (wit-type-annotations item))
+        ((wit-func-p item) (wit-func-annotations item))
+        ((wit-resource-p item) (wit-resource-annotations item))
+        ((wit-use-p item) (wit-use-annotations item))
+        (t nil)))
+
+(defun %item-binding-names (item)
+  "The plain names ITEM binds in its interface scope."
+  (cond ((wit-type-p item) (list (wit-type-name item)))
+        ((wit-func-p item) (list (wit-func-name item)))
+        ((wit-resource-p item) (list (wit-resource-name item)))
+        ((wit-use-p item) (wit-use-items item))
+        (t nil)))
+
+(defun %item-display-name (item)
+  (cond ((wit-type-p item) (wit-type-name item))
+        ((wit-func-p item) (wit-func-name item))
+        ((wit-resource-p item) (wit-resource-name item))
+        ((wit-use-p item) (format nil "use ~a" (wit-use-interface item)))
+        (t "?")))
+
+(defun %collect-type-refs (expr)
+  "Every named type reference in the type expression EXPR."
+  (cond
+    ((not (consp expr)) nil)
+    (t
+     (case (car expr)
+       (:name (list (second expr)))
+       ((:own :borrow)
+        (if (stringp (second expr))
+            (list (second expr))
+            (%collect-type-refs (second expr))))
+       ((:record :variant)
+        (loop for entry in (cdr expr)
+              append (%collect-type-refs (cdr entry))))
+       ((:enum :flags) nil)
+       ((:list :option :stream :future)
+        (%collect-type-refs (second expr)))
+       ((:result :map)
+        (append (%collect-type-refs (second expr))
+                (%collect-type-refs (third expr))))
+       (:tuple
+        (loop for e in (cdr expr) append (%collect-type-refs e)))
+       (t
+        ;; a bare sequence of type expressions (params, tuple-less lists)
+        (loop for e in expr append (%collect-type-refs e)))))))
+
+(defun %func-type-refs (func)
+  (append (loop for (nil . te) in (wit-func-params func)
+                append (%collect-type-refs te))
+          (%collect-type-refs (wit-func-result func))))
+
+(defun %item-type-refs (item)
+  (cond
+    ((wit-type-p item) (%collect-type-refs (wit-type-expr item)))
+    ((wit-func-p item) (%func-type-refs item))
+    ((wit-resource-p item)
+     (loop for m in (wit-resource-methods item)
+           append (%func-type-refs m)))
+    ;; a use's imported names are checked against the target interface
+    ;; separately; they are not references into this interface's scope
+    (t nil)))
+
+(defun %type-feature (type-node target-interface)
+  "The @unstable feature guarding TYPE-NODE, including the gate of the
+interface that declares it."
+  (or (%gate-feature (wit-type-annotations type-node))
+      (%gate-feature (wit-interface-annotations target-interface))))
+
+;;; ---------------------------------------------------------------
+;;; Validation.
+
+(defun %check-gated-reference (feature ref-feature problem context ref)
+  "An @unstable REF may only be used by an item gated at least as
+strictly."
+  (when ref-feature
+    (cond
+      ((null feature)
+       (funcall problem
+                "~a references @unstable `~a` but is not itself @unstable"
+                context ref))
+      ((and (not (eq feature :unstable))
+            (not (eq ref-feature :unstable))
+            (not (string= feature ref-feature)))
+       (funcall problem
+                "~a is gated by @unstable(feature = ~a) but references `~a` gated by feature ~a"
+                context feature ref ref-feature)))))
+
+(defun %validate-refs (iface refs feature problem context packages)
+  (dolist (ref refs)
+    (multiple-value-bind (ty target) (%lookup-type iface ref packages)
+      (cond
+        ((null ty)
+         (funcall problem "unresolvable type reference `~a` in ~a of interface `~a`"
+                  ref context (wit-interface-name iface)))
+        (t
+         (%check-gated-reference feature (%type-feature ty target)
+                                 problem context ref))))))
+
+(defun %validate-interface (iface package packages problem)
+  (let ((dupes (make-hash-table :test #'equal))
+        (container (wit-interface-annotations iface))
+        (container-version (%container-version package (list (wit-interface-annotations iface))))
+        (name (wit-interface-name iface)))
+    ;; uses: the referenced package/interface must exist and every
+    ;; imported name must be a type in it.
+    (dolist (use (wit-interface-uses iface))
+      (when (wit-use-package use)
+        (unless (%find-package (wit-use-namespace use) (wit-use-package use)
+                               (wit-use-version use) packages)
+          (funcall problem "unknown package reference `~a:~a~@[@~a~]` in interface `~a`"
+                   (or (wit-use-namespace use) "")
+                   (wit-use-package use) (wit-use-version use) name)))
+      (let ((target (%used-interface use iface packages)))
+        (if (null target)
+            (funcall problem "unresolvable interface reference `~a` in interface `~a`"
+                     (wit-use-interface use) name)
+            (dolist (item (wit-use-items use))
+              (let ((ty (gethash item (wit-interface-types target))))
+                (if (null ty)
+                    (funcall problem "unresolvable type reference `~a` imported by interface `~a`"
+                             item name)
+                    (%check-gated-reference
+                     (or (%gate-feature (wit-use-annotations use))
+                         (%gate-feature container))
+                     (%type-feature ty target)
+                     problem (format nil "`use ~a` in interface `~a`"
+                                     (wit-use-interface use) name)
+                     item)))))))
+    (dolist (item (wit-interface-items iface))
+      (let ((annotations (%item-annotations item)))
+        ;; duplicate plain-name bindings
+        (dolist (binding (%item-binding-names item))
+          (if (gethash binding dupes)
+              (funcall problem "duplicate binding `~a` in interface `~a`"
+                       binding name)
+              (setf (gethash binding dupes) t)))
+        ;; @since may not exceed the container's version
+        (let ((since (%gate-since annotations)))
+          (when (and since container-version
+                     (wit-version< container-version (%ensure-wit-version since)))
+            (funcall problem "@since(~a) on `~a` in interface `~a` exceeds its container's version ~a"
+                     since (%item-display-name item) name
+                     (wit-version-string container-version))))
+        (unless (wit-use-p item)
+          (let ((feature (or (%gate-feature annotations)
+                             (%gate-feature container))))
+            (cond
+              ((wit-resource-p item)
+               ;; methods inherit the resource's gate when they have none
+               (let ((method-container (%container-version
+                                        package
+                                        (list (wit-resource-annotations item)
+                                              (wit-interface-annotations iface))))
+                     (resource-feature (or (%gate-feature (wit-resource-annotations item))
+                                           (%gate-feature container))))
+                 (dolist (method (wit-resource-methods item))
+                   (let ((m-since (%gate-since (wit-func-annotations method))))
+                     (when (and m-since method-container
+                                (wit-version< method-container
+                                              (%ensure-wit-version m-since)))
+                       (funcall problem "@since(~a) on method `~a` of resource `~a` in interface `~a` exceeds its container's version ~a"
+                                m-since (wit-func-name method)
+                                (wit-resource-name item) name
+                                (wit-version-string method-container))))
+                   (%validate-refs iface (%func-type-refs method)
+                                   (or (%gate-feature (wit-func-annotations method))
+                                       resource-feature)
+                                   problem
+                                   (format nil "method `~a` of resource `~a`"
+                                           (wit-func-name method)
+                                           (wit-resource-name item))
+                                   packages))))
+              (t
+               (%validate-refs iface (%item-type-refs item) feature
+                               problem
+                               (format nil "`~a`" (%item-display-name item))
+                               packages)))))))))
+
+(defun %world-item-reference (item)
+  (if (wit-world-item-package item)
+      (format nil "~a:~a/~a~@[@~a~]"
+              (or (wit-world-item-namespace item) "")
+              (wit-world-item-package item)
+              (wit-world-item-interface item)
+              (wit-world-item-version item))
+      (wit-world-item-interface item)))
+
+(defun %validate-world (world package packages problem)
+  (let ((container (wit-world-annotations world))
+        (container-version (%container-version package (list (wit-world-annotations world))))
+        (name (wit-world-name world)))
+    (dolist (sort '(:import :export))
+      (let ((seen (make-hash-table :test #'equal))
+            (items (if (eq sort :import)
+                       (wit-world-imports world)
+                       (wit-world-exports world))))
+        (dolist (item items)
+          (let* ((key (%world-item-reference item))
+                 (annotations (wit-world-item-annotations item)))
+            (if (gethash key seen)
+                (funcall problem "duplicate world binding `~a` in world `~a`"
+                         key name)
+                (setf (gethash key seen) t))
+            (let ((since (%gate-since annotations)))
+              (when (and since container-version
+                         (wit-version< container-version
+                                       (%ensure-wit-version since)))
+                (funcall problem "@since(~a) on `~a ~a` in world `~a` exceeds its container's version ~a"
+                         since (string-downcase (symbol-name sort)) key name
+                         (wit-version-string container-version))))
+            (let ((pkg (if (wit-world-item-package item)
+                           (%find-package (wit-world-item-namespace item)
+                                          (wit-world-item-package item)
+                                          (wit-world-item-version item)
+                                          packages)
+                           package)))
+              (cond
+                ((null pkg)
+                 (funcall problem "unknown package reference `~a` in world `~a`"
+                          key name))
+                (t
+                 (let ((target (package-interface
+                                pkg (wit-world-item-interface item))))
+                   (if (null target)
+                       (funcall problem "unresolvable interface reference `~a` in world `~a`"
+                                key name)
+                       (%check-gated-reference
+                        (or (%gate-feature annotations)
+                            (%gate-feature container))
+                        (%gate-feature (wit-interface-annotations target))
+                        problem (format nil "world item `~a ~a`" sort key)
+                        (wit-world-item-interface item)))))))))))))
+
+(defun validate-wit-package (package &key packages)
+  "Validate PACKAGE (with PACKAGES as the resolvable package set) and
+return a list of problem strings; an empty list means valid. Checks
+unknown package references, unresolvable type references, duplicate
+plain-name bindings, @since gates that exceed their container's
+version, and @unstable items referenced by items that are not gated at
+least as strictly."
+  (let ((problems '())
+        (all (cons package packages)))
+    (flet ((problem (control &rest args)
+             (push (apply #'format nil control args) problems)))
+      (dolist (iface (wit-package-interface-list package))
+        (%validate-interface iface package all #'problem))
+      (let ((worlds '()))
+        (maphash (lambda (name world)
+                   (declare (ignore name))
+                   (push world worlds))
+                 (wit-package-worlds package))
+        (dolist (world (nreverse worlds))
+          (%validate-world world package all #'problem))))
+    (nreverse problems)))
+
+;;; ---------------------------------------------------------------
+;;; Selection.
+
+(defun %check-member-gates (type selection target)
+  "A record/variant/enum/flags member that falls outside the selection
+would change the layout if dropped; refuse instead of dropping it."
+  (dolist (entry (wit-type-member-annotations type))
+    (unless (%gate-kept-p (cdr entry) selection target)
+      (error 'wit-error
+             :message
+             (format nil "cannot exclude gated member `~a` of `~a`: dropping a member would change its layout"
+                     (car entry) (wit-type-name type))))))
+
+(defun %select-item (item selection target)
+  (cond
+    ((wit-type-p item)
+     (%check-member-gates item selection target)
+     item)
+    ((wit-resource-p item)
+     (let ((resource (copy-wit-resource item)))
+       (setf (wit-resource-methods resource)
+             (remove-if-not
+              (lambda (method)
+                (%gate-kept-p (wit-func-annotations method)
+                              selection target))
+              (wit-resource-methods item)))
+       resource))
+    (t item)))
+
+(defun %select-interface (iface selection target)
+  (let ((out (make-wit-interface
+              :name (wit-interface-name iface)
+              :package (wit-interface-package iface)
+              :annotations (wit-interface-annotations iface)
+              ;; sharing the memo keeps one resource ct identity per
+              ;; resource name across the selected and original graph
+              :resource-cts (wit-interface-resource-cts iface))))
+    (dolist (item (wit-interface-items iface))
+      (when (%gate-kept-p (%item-annotations item) selection target)
+        (let ((item (%select-item item selection target)))
+          (typecase item
+            (wit-type
+             (setf (gethash (wit-type-name item)
+                            (wit-interface-types out))
+                   item)
+             (push item (wit-interface-items out)))
+            (wit-func
+             (setf (gethash (wit-func-name item)
+                            (wit-interface-funcs out))
+                   item)
+             (push item (wit-interface-func-list out))
+             (push item (wit-interface-items out)))
+            (wit-resource
+             (setf (gethash (wit-resource-name item)
+                            (wit-interface-resources out))
+                   item)
+             (push item (wit-interface-resource-list out))
+             (push item (wit-interface-items out)))
+            (wit-use
+             (push item (wit-interface-uses out))
+             (push item (wit-interface-items out)))))))
+    (setf (wit-interface-items out) (nreverse (wit-interface-items out))
+          (wit-interface-func-list out) (nreverse (wit-interface-func-list out))
+          (wit-interface-resource-list out)
+          (nreverse (wit-interface-resource-list out))
+          (wit-interface-uses out) (nreverse (wit-interface-uses out)))
+    out))
+
+(defun %select-world (world selection target)
+  (let ((out (copy-wit-world world)))
+    (flet ((keep (items)
+             (remove-if-not (lambda (item)
+                              (%gate-kept-p (wit-world-item-annotations item)
+                                            selection target))
+                            items)))
+      (setf (wit-world-imports out) (keep (wit-world-imports world))
+            (wit-world-exports out) (keep (wit-world-exports world))))
+    out))
+
+(defun select-wit-package (package selection &key packages)
+  "The PACKAGE surface selected by SELECTION (default: the package's
+declared version, no features): @since items newer than the target and
+@unstable items whose feature is not enabled are removed from the item
+lists, resources lose excluded methods, and worlds lose excluded
+items. Deprecated items are kept. PACKAGES is accepted for symmetry
+with VALIDATE-WIT-PACKAGE; selection is purely local to PACKAGE."
+  (declare (ignore packages))
+  (let* ((selection (or selection *default-wit-selection*))
+         (target (%selection-target-version package selection))
+         (out (make-wit-package
+               :namespace (wit-package-namespace package)
+               :basename (wit-package-basename package)
+               :name (wit-package-name package)
+               :version (wit-package-version package)
+               :path (wit-package-path package)
+               :annotations (wit-package-annotations package))))
+    (dolist (iface (wit-package-interface-list package))
+      (when (%gate-kept-p (wit-interface-annotations iface) selection target)
+        (let ((selected (%select-interface iface selection target)))
+          (setf (gethash (wit-interface-name selected)
+                         (wit-package-interfaces out))
+                selected)
+          (push selected (wit-package-interface-list out)))))
+    (setf (wit-package-interface-list out)
+          (nreverse (wit-package-interface-list out)))
+    (maphash (lambda (name world)
+               (when (%gate-kept-p (wit-world-annotations world)
+                                   selection target)
+                 (setf (gethash name (wit-package-worlds out))
+                       (%select-world world selection target))))
+             (wit-package-worlds package))
+    out))
+
+;;; ---------------------------------------------------------------
+;;; World resolution.
+
+(defun %resolve-world-items (items container selection target sort world-name)
+  "Filter world items, inheriting the world's gate per dimension for an
+item with no gate of its own and rejecting an explicitly weaker gate."
+  (let ((kept '()))
+    (dolist (item items)
+      (let* ((own (wit-world-item-annotations item))
+             (since (or (%gate-since own) (%gate-since container)))
+             (feature (or (%gate-feature own) (%gate-feature container))))
+        (when (and own container
+                   (not (%gate-at-least-as-strict-p own container)))
+          (error 'wit-error
+                 :message
+                 (format nil "world `~a`: ~a `~a` carries a weaker gate than its world"
+                         world-name sort (%world-item-reference item))))
+        (when (%gate-kept-fields-p since feature selection target)
+          (push item kept))))
+    (nreverse kept)))
+
+(defun resolve-wit-world (package name &key packages selection)
+  "Resolve world NAME in PACKAGE under SELECTION: the world's imports
+and exports filtered by the same gate rules, with the world's own
+annotations inherited by items that carry no gate. An item whose
+explicit gate is weaker than the world's is a `wit-error'.
+PACKAGES is accepted for symmetry with the link-time API; a world's
+item references are not resolved here."
+  (declare (ignore packages))
+  (let ((world (gethash name (wit-package-worlds package))))
+    (unless world
+      (error 'wit-error
+             :message (format nil "unknown world ~s in package ~a"
+                              name (wit-package-name package))))
+    (let* ((selection (or selection *default-wit-selection*))
+           (target (%selection-target-version package selection))
+           (container (wit-world-annotations world))
+           (out (copy-wit-world world)))
+      (setf (wit-world-imports out)
+            (%resolve-world-items (wit-world-imports world) container
+                                  selection target "import" name)
+            (wit-world-exports out)
+            (%resolve-world-items (wit-world-exports world) container
+                                  selection target "export" name))
+      out)))

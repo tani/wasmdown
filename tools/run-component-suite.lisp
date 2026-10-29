@@ -7,8 +7,9 @@
 ;;;; minus nyi.txt — the M7/M8/M9/M10 acceptance surface. The async/
 ;;;; resources suites need the task state machine (future slices) and
 ;;;; are NOT run here.
-;;;; Exit code is ALWAYS 0: a baseline MEASUREMENT, not a gate; the
-;;;; classification is honest per command (:pass/:fail/:unsupported).
+;;;; The run is a GATE: a fail, harness error, timeout, skip, or a
+;;;; census mismatch (a planned file with no commands, a duplicate
+;;;; case-id, an unknown outcome) exits NON-ZERO.
 
 (require :asdf)
 
@@ -338,7 +339,81 @@ parent dir), not the first (the grandparent 'component' — the old
                 (+ (%fmt ft :skip) (%fmt ft :timeout)
                    (%fmt ft :harness-error)))))))
 
-(format t "~&CONFORMANCE-COMPONENT.md + tests/component-results.jsonl written.~%")
-(let ((table (outcome-counts *results*)))
-  (dolist (o '(:pass :fail :unsupported :harness-error))
-    (format t "  ~a: ~d~%" o (or (gethash o table) 0))))
+;;; ---- the census + the gate ----
+;;; The run is a GATE (PLAN.md §12.7): a fail, a harness error, a
+;;; timeout, a silent skip or a census mismatch exits NON-ZERO. The
+;;; denominator is the number of commands actually executed, and the
+;;; census proves every planned file contributed and no command was
+;;; silently dropped or doubly counted.
+
+(defun %file-key (f)
+  (format nil "~a/~a" (car (last (pathname-directory f) 2))
+          (file-namestring f)))
+
+(let* ((table (outcome-counts *results*))
+       (fail (%fmt table :fail))
+       (herr (%fmt table :harness-error))
+       (tout (%fmt table :timeout))
+       (skip (%fmt table :skip))
+       (census-problems '()))
+  ;; every planned file must contribute at least one command
+  (let ((by-file (make-hash-table :test #'equal)))
+    (dolist (r *results*)
+      (incf (gethash (wasmdown.wast:wast-result-file r) by-file 0)))
+    (dolist (f *files*)
+      (let ((k (%file-key f)))
+        (unless (plusp (gethash k by-file 0))
+          (push (format nil "no commands executed from ~a" k)
+                census-problems)))))
+  ;; every case-id appears exactly once (a duplicate = a double run)
+  (let ((ids (make-hash-table :test #'equal)))
+    (dolist (r *results*)
+      (let ((id (list (wasmdown.wast:wast-result-file r)
+                      (wasmdown.wast:wast-result-command-index r))))
+        (incf (gethash id ids 0))))
+    (maphash (lambda (id n)
+               (when (> n 1)
+                 (push (format nil "duplicate command ~a::~a (x~a)"
+                               (first id) (second id) n)
+                       census-problems)))
+             ids))
+  ;; any planned file with a skip/fail-free but EMPTY body is caught by
+  ;; the per-file rule above; an outcome outside the known set is not
+  (dolist (r *results*)
+    (unless (member (wasmdown.wast:wast-result-outcome r)
+                    '(:pass :fail :skip :unsupported :timeout
+                      :harness-error))
+      (push (format nil "unknown outcome ~a at ~a::~a"
+                    (wasmdown.wast:wast-result-outcome r)
+                    (wasmdown.wast:wast-result-file r)
+                    (wasmdown.wast:wast-result-command-index r))
+            census-problems)))
+  (format t "~&CONFORMANCE-COMPONENT.md + tests/component-results.jsonl written.~%")
+  (format t "  files: ~d planned, ~d contributed~%"
+          (length *files*)
+          (let ((seen (make-hash-table :test #'equal)))
+            (dolist (f *files*) (setf (gethash (%file-key f) seen) t))
+            (let ((n 0))
+              (maphash (lambda (k v) (declare (ignore v))
+                         (when (gethash k seen) (incf n)))
+                       (let ((m (make-hash-table :test #'equal)))
+                         (dolist (r *results*)
+                           (setf (gethash (wasmdown.wast:wast-result-file r) m) t))
+                         m))
+              n)))
+  (dolist (o '(:pass :fail :unsupported :skip :timeout :harness-error))
+    (format t "  ~a: ~d~%" o (or (gethash o table) 0)))
+  (format t "  executed (denominator): ~d~%" (length *results*))
+  (when census-problems
+    (format t "~&CENSUS PROBLEMS:~%")
+    (dolist (c census-problems) (format t "  - ~a~%" c)))
+  (if (or (plusp fail) (plusp herr) (plusp tout) (plusp skip)
+          census-problems)
+      (progn
+        (format t "~&GATE: RED (~d fail, ~d harness-error, ~d timeout, ~
+                   ~d skip, ~d census problem~:p)~%"
+                fail herr tout skip (length census-problems))
+        (sb-ext:exit :code 1))
+      (progn
+        (format t "~&GATE: GREEN~%")
+        (sb-ext:exit :code 0))))
