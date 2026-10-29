@@ -1,3 +1,29 @@
+# M17 SESSION 4 WAVE 3 — `wip/reactor-wiring` RE-MEASURED ON TYPE-VIEW-FREE MASTER:
+# IT IS AN acs::2 VECTOR ON ITS OWN. Both parked branches share one signature.
+# THE MEASUREMENTS (adjacent in time, same machine, serial, 1631 commands/run):
+#   tree                                     runs  acs::2  fails  other rows
+#   master (control, immediately BEFORE)      6     0/6     1     sync-streams::1 x1
+#   master + reactor wiring                   6     6/6     8     acs::1 x1, cancel-resumed::3 x1
+#   master (control, immediately AFTER)       6     0/6     1     sync-streams::1 x1
+# So the wiring alone (no type-view in the tree) moves acs::2 from 0/6 to 6/6 while
+# its own unit tests pass and its walls stay in band. NOT MERGED.
+# CONSEQUENCE FOR THE LEDGER'S ATTRIBUTION: `wip/type-view` (d864d1a) and
+# `wip/reactor-wiring` (9f8dfb0) are BOTH acs::2 vectors with INDISTINGUISHABLE
+# signatures (each 6/6 against a 0-1/6 control). The earlier conclusion "type-view
+# caused it" was measured in trees where the two were confounded; do not read this
+# record as exonerating the wiring, and do not read it as "type-view caused it all".
+# WORKING HYPOTHESIS (unverified, and the ONLY attribution experiment worth
+# running next): acs::2 sits on a TIMING MARGIN, so any change that adds per-command
+# work flips it — the two branches add allocation/instantiation work (type-view:
+# provenance capture + memoized declarator spaces; wiring: a reactor per run +
+# nonblocking socket plumbing), and the control batches show the margin is a
+# knife-edge (the same content measured 1 fail/6 and 4 fails/6 today).
+# THE EXPERIMENT THAT WOULD SETTLE IT (~15 min, one meter each): a NULL-DIFF with a
+# forced per-command delay in the harness. If acs::2 flips to ~5/6 with ZERO
+# semantic change, the margin hypothesis is confirmed and the re-landing time for
+# BOTH parked branches becomes "after step 4 stabilises the acs window" — not
+# "after someone shrinks their overhead". If it does not flip, the margin account
+# is dead and the attribution needs a real bisect of the two diffs.
 # M17 SESSION 4 — TWO METHOD NOTES FOR WHOEVER READS THE BATCH METERS.
 # (i) THE SAME TREE MEASURED DIFFERENTLY IN TWO BATCHES: master's content produced
 #   1 fail command / 6 runs in one batch (bg_155) and 4 fail commands / 6 runs in
