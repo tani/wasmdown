@@ -1,3 +1,41 @@
+# M17 SESSION 5b — TYPE-VIEW BISECT: THREE CUTS, ALL NEGATIVE. Per-cut line format
+# (the fixing cut will quote ONE line of this table, not prose):
+#   cut | reverted symbol / mechanism                        | acs::2 | other classes      | units
+#   1   | %parse-instancedecl type-branch sink drain         | 3/3    | unchanged          | 493/0
+#   2   | %current-type-view's recorded outer ring           | 3/3    | reentrance::14 x1  | 492/1*
+#   3   | %check-defvaltype's eager (%view-ring *outer-states*)| 3/3   | ctr::9 x1          | 493/0
+#   (*cut 2 broke component/type-view-owner-pins, which confirms that mechanism is
+#    semantically load-bearing — it is just not the acs::2 vector.)
+# Cut cost: 3 lane runs each (~30 s) — sufficient at this effect size (29/30 vs
+# 2/30) to separate "fixed" from "still pinned"; do NOT generalise that to marginal
+# rows, and do not spend 30-run batches on individual cuts.
+# WALLS AS THE MECHANISM HINT (this is why THIS delta survived the noise model
+# while the wiring's did not): tv-A's walls spread 7.92-12.19 s against m-A's tight
+# 7.98-8.43 s — some type-view lane runs cost ~50% more wall per command, i.e. real
+# per-command work, not batch noise. The wiring batch had no such spread. So the
+# account to look for is "resolution does extra work per command", not "resolution
+# computes the wrong thing" — every resolution-CORRECTNESS pin passes on the
+# branch. WORDING GUARD for whoever writes this up next: the evidence is (a) the
+# row class, (b) the fattened walls, (c) that type-view changes instance/type
+# resolution. That is CONSISTENT WITH instantiation-path cost; it is NOT PROVEN
+# that the async-lift-with-callback instantiation is the failing path.
+# REMAINING CANDIDATES, RANKED (uniq the next session's order, do not go
+# alphabetically):
+#   1. %remap-decl-functype's alias branch -> %declarator-alias-ct, and
+#      %resolve-aliased-func's provenance registration: the two places that REBUILD
+#      an aliased functype, which is the only thing the acs::2 fixture's
+#      $AsyncMiddle instantiation does differently from acs::1's $SyncMiddle;
+#   2. %instance-ct-type-space / %declarator-view / %resolve-declarator-in: the new
+#      MEMOIZED declarator space (allocation churn is the wall-spread suspect);
+#   3. %vis-check's OOB fallback and %vis-check-type-use's alias resource push;
+#   4. the plain view threading in %deindex-functype / %remap-ct-refs /
+#      %instance-ct-export-functype / %vis-decl-functype-at (least likely: those
+#      should be behaviour-preserving, and cut 1 already showed the cheapest
+#      ordering hunk is not it).
+# DELTA ARITHMETIC, for reuse:
+#   grep fail_commands tests/lane-batches/m-A/summary.txt
+#   grep fail_commands tests/lane-batches/tv-A/summary.txt
+#   <= 22 apart = unresolved at this instrument; > 22 = attributed.
 # M17 SESSION 5 — THE FIRST ADJACENT PAIR TAKEN WITH THE COMMITTED METER, AND IT
 # SETTLES `wip/type-view`: CONFIRMED VECTOR, ON ONE ROW, BY 14.5x.
 # Batch pair, strictly adjacent (master block immediately followed by the branch
