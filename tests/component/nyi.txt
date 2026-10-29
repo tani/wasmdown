@@ -128,6 +128,26 @@
 # walls in the 8-13 s band.
 # MASTER AFTER RESTORATION (6 runs): 4 green, 4 fail commands total
 # (acs::1, acs::2, ctr::9 x2) — the recorded distribution, restored.
+# M17 SESSION 4 WAVE 3c — `wip/reactor-wiring`'s acs::2 VECTOR: TWO OF FOUR PIECES
+# EXONERATED BY MEASUREMENT. Each cut ran on the branch itself (6 or 3 serial lane
+# runs, 1631 commands each, adjacent to a master control that measured acs::2 0/6
+# twice in the same window):
+#   cut                                      acs::2   verdict
+#   branch as committed                       6/6     vector present
+#   driver pump disabled (3 call sites ->     6/6     PUMP EXONERATED
+#     the original (sleep ...))
+#   context-reactor attachment disabled       3/3     ATTACHMENT EXONERATED
+#     (call-with-context-reactor -> (funcall thunk))
+#   NOT YET CUT: the socket/UDP nonblocking plumbing, the clock
+#   wait-until/wait-for implementations, and the wasi-context struct slot itself.
+# Note the shape of the result: acs::2 uses no sockets and no clocks, so those two
+# are the LEAST plausible remaining causes — which means the most likely remaining
+# candidate is the STRUCTURAL one (the wasi-context slot / the per-run reactor
+# object), and that is a one-line cut for the next session (delete the slot and the
+# reactor creation, keep everything else, measure).
+# METHOD NOTE, recorded because it cost three rounds: every one of these cuts was
+# cheap (3-6 lane runs, ~30-50 s) and each one removed a named suspect. Do the same
+# for `wip/type-view`'s three functions — same cost, same discriminative power.
 # M17 SESSION 4 — STEP 4, ATTEMPT 3: THE SINGLE STORE RIGHT. CLOSES THE acs CLASS
 # COMPLETELY, REJECTED ON THE INTERLEAVE BUDGET. Preserved at branch
 # `wip/store-right` (commit 41cd3b4); master stays at the best-measured state.
