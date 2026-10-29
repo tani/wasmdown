@@ -781,6 +781,7 @@ three link-time authorities) as a with-args alist."
                     "MAKE-WASI-DESCRIPTOR" "WASI-DESCRIPTOR-FD"
                     "WASI-DESCRIPTOR-FLAGS" "WASI-DESCRIPTOR-PREOPEN"
                     "WASI-DESCRIPTOR-DIR-P" "WASI-DESCRIPTOR-OWNED-P"
+                    "WASI-DESCRIPTOR-REFS" "WASI-DESCRIPTOR-CLOSED-P"
                     "CLOSE-WASI-DESCRIPTOR"
                     "WASI-FS-ERROR" "WASI-FS-ERROR-CODE"
                     "ERRNO->ERROR-CODE"
@@ -1019,26 +1020,79 @@ on it is handle-relative; there is no path-prefix check to bypass."
   "One open descriptor (the `descriptor' resource's rep): the host fd,
 the preopen it is confined to, the guest-visible descriptor-flags
 labels, whether the fd belongs to the descriptor (a preopen's does
-not — dropping the guest's handle must not close the root), and
-whether it names a directory."
+not — dropping the guest's handle must not close the root), whether
+it names a directory, and the live REFERENCE COUNT.
+
+REFS counts every holder of the fd: the descriptor handle's own
+reference (its initial one) plus one per live stream end. The fd is
+closed exactly once, when the last holder releases it. CLOSED-P says
+no new holder may be taken: the handle was released, or the embedder
+closed the preopen root."
   (fd -1)
   (preopen nil)
   (flags nil)
   (owned-p t)
-  (dir-p nil))
+  (dir-p nil)
+  (refs 1)
+  (closed-p nil))
+
+(defstruct (wasi-fd-hold (:constructor %make-wasi-fd-hold (descriptor)))
+  "One holder's reference to a descriptor's fd (a stream end). The
+RELEASED-P marker makes the release idempotent: a stream's EOF,
+error, cancel and drop paths may each run, and the count moves once."
+  (descriptor nil)
+  (released-p nil))
 
 (defun %close-fd (fd)
   (when (and (integerp fd) (not (minusp fd)))
     (sb-unix:unix-close fd)))
 
+(defun %descriptor-release (descriptor)
+  "Drop one reference to DESCRIPTOR and return the remaining count.
+At zero the fd is closed once (only when the descriptor owns it) and
+the fd slot is invalidated, so a closed fd number can never be
+reached again. A release on an already-zero descriptor is a no-op."
+  (let ((refs (wasi-descriptor-refs descriptor)))
+    (when (plusp refs)
+      (decf refs)
+      (setf (wasi-descriptor-refs descriptor) refs)
+      (when (zerop refs)
+        (setf (wasi-descriptor-closed-p descriptor) t)
+        (let ((fd (wasi-descriptor-fd descriptor)))
+          (setf (wasi-descriptor-fd descriptor) -1)
+          (when (and (wasi-descriptor-owned-p descriptor)
+                     (integerp fd) (not (minusp fd)))
+            (%close-fd fd)))))
+    refs))
+
+(defun %descriptor-hold (descriptor)
+  "Take a reference on DESCRIPTOR's fd for one stream end."
+  (incf (wasi-descriptor-refs descriptor))
+  (%make-wasi-fd-hold descriptor))
+
+(defun %fd-hold-release (hold)
+  "Release HOLD once (a second release is a no-op) and return the
+descriptor's remaining reference count."
+  (let ((descriptor (wasi-fd-hold-descriptor hold)))
+    (when (and descriptor (not (wasi-fd-hold-released-p hold)))
+      (setf (wasi-fd-hold-released-p hold) t)
+      (%descriptor-release descriptor))
+    (and descriptor (wasi-descriptor-refs descriptor))))
+
 (defun close-wasi-descriptor (descriptor)
-  "Release DESCRIPTOR's fd when the descriptor owns it. Idempotent."
+  "Release DESCRIPTOR's own handle reference: the fd closes when the
+last live stream end has released its reference too. Idempotent.
+Only an owned descriptor is released; a preopen root's descriptor is
+embedder-owned (close-wasi-preopen releases it), so dropping the
+guest's handle must not close the root."
   (when (wasi-descriptor-p descriptor)
-    (let ((fd (wasi-descriptor-fd descriptor)))
-      (when (and (wasi-descriptor-owned-p descriptor)
-                 (integerp fd) (not (minusp fd)))
-        (setf (wasi-descriptor-fd descriptor) -1)
-        (%close-fd fd)))))
+    (when (and (wasi-descriptor-owned-p descriptor)
+               (not (wasi-descriptor-closed-p descriptor)))
+      ;; the handle names nothing any more, even while a live stream
+      ;; keeps the fd itself open
+      (setf (wasi-descriptor-closed-p descriptor) t)
+      (%descriptor-release descriptor))
+    descriptor))
 
 (defun %open-host-directory (path)
   "Open PATH as a directory fd (the capability's root handle)."
@@ -1067,10 +1121,20 @@ The caller owns the preopen; close-wasi-preopen releases the fd."
     pre))
 
 (defun close-wasi-preopen (preopen)
-  "Release the preopen's host directory handle."
+  "Release the preopen's host directory handle and INVALIDATE the
+cached descriptor, so a later open-at/stat through that preopen is a
+bad-descriptor instead of reaching a file through a closed (and
+possibly reused) fd number. Idempotent."
   (when (wasi-preopen-p preopen)
-    (%close-fd (wasi-preopen-fd preopen))
-    (setf (wasi-preopen-fd preopen) -1)))
+    (let ((fd (wasi-preopen-fd preopen)))
+      (when (and (integerp fd) (not (minusp fd)))
+        (setf (wasi-preopen-fd preopen) -1)
+        (%close-fd fd)))
+    (let ((descriptor (wasi-preopen-descriptor preopen)))
+      (when (wasi-descriptor-p descriptor)
+        (setf (wasi-descriptor-closed-p descriptor) t
+              (wasi-descriptor-fd descriptor) -1))))
+  preopen)
 
 (defun descriptor-resource-ct (&key (package (wasi-package "filesystem")))
   "The `descriptor' resource's ct for PACKAGE — the handle table's
@@ -1111,6 +1175,10 @@ dynamic CALLER's handle table through the resource ct."
             (t (%fs-error "invalid")))))
     (unless (wasi-descriptor-p desc)
       (%fs-error "bad-descriptor"))
+    ;; a released handle (or a preopen root the embedder closed) names
+    ;; no live fd any more — never hand out an authority through it
+    (when (wasi-descriptor-closed-p desc)
+      (%fs-error "bad-descriptor"))
     ;; the authority check: the descriptor must belong to a preopen
     ;; of THIS provider's context — descriptors never travel between
     ;; differently-authorized providers.
@@ -1120,6 +1188,8 @@ dynamic CALLER's handle table through the resource ct."
     desc))
 
 (defun %descriptor-fd (desc)
+  (when (wasi-descriptor-closed-p desc)
+    (%fs-error "bad-descriptor"))
   (let ((fd (wasi-descriptor-fd desc)))
     (unless (and (integerp fd) (not (minusp fd)))
       (%fs-error "bad-descriptor"))
@@ -1884,17 +1954,31 @@ the REFUSED shape: a dropped stream + a future with the error-code."
               (wasmdown.component.runtime:make-host-stream-pair elem-ct)
             (multiple-value-bind (future-reader future-writer)
                 (wasmdown.component.runtime:make-host-future-pair future-ct)
-              (let ((settled nil))
+              ;; the stream end holds its OWN reference to the fd: the
+              ;; guest may drop the descriptor handle while the stream
+              ;; is still live, and the fd closes only when the last
+              ;; holder (EOF/error/drop, once) has released it
+              (let ((hold (%descriptor-hold desc))
+                    (settled nil))
                 (flet ((settle (value)
-                         (%fs-settle-once settled future-writer value)))
-                  (wasmdown.component.runtime:host-end-set-source
-                   stream-writer (%fd-pread-source fd offset #'settle))
-                  (wasmdown.component.runtime:host-end-set-on-drop
-                   stream-writer
-                   (lambda (dropped error)
-                     (declare (ignore dropped))
-                     (settle (if error (cons :err error) (cons :ok nil)))))
-                  (list stream-reader future-reader))))))
+                         (unless settled
+                           (setf settled t)
+                           (%fd-hold-release hold)
+                           (wasmdown.component.runtime:host-future-resolve
+                            future-writer value))))
+                  (handler-case
+                      (progn
+                        (wasmdown.component.runtime:host-end-set-source
+                         stream-writer (%fd-pread-source fd offset #'settle))
+                        (wasmdown.component.runtime:host-end-set-on-drop
+                         stream-writer
+                         (lambda (dropped error)
+                           (declare (ignore dropped))
+                           (settle (if error (cons :err error) (cons :ok nil)))))
+                        (list stream-reader future-reader))
+                    (error (c)
+                      (%fd-hold-release hold)
+                      (error c))))))))
       (wasi-fs-error (c)
         (%fs-dropped-stream-and-future elem-ct future-ct
                                        (wasi-fs-error-code c))))))
@@ -1916,19 +2000,31 @@ to the error-code."
             (%fs-error "invalid"))
           (multiple-value-bind (future-reader future-writer)
               (wasmdown.component.runtime:make-host-future-pair future-ct)
-            (let ((settled nil))
+            ;; same reference discipline as the read stream: the sink
+            ;; end keeps the fd alive independently of the handle
+            (let ((hold (%descriptor-hold desc))
+                  (settled nil))
               (flet ((settle (value)
-                       (%fs-settle-once settled future-writer value)))
-                (wasmdown.component.runtime:host-end-set-sink
-                 data (%fd-pwrite-sink fd position-fn advance-fn))
-                (wasmdown.component.runtime:host-end-set-on-drop
-                 data
-                 (lambda (dropped error)
-                   (declare (ignore dropped))
-                   (settle (if error (cons :err error) (cons :ok nil)))))
-                ;; the guest may have staged a write before the call
-                (wasmdown.component.runtime:host-end-drain data)
-                future-reader))))
+                       (unless settled
+                         (setf settled t)
+                         (%fd-hold-release hold)
+                         (wasmdown.component.runtime:host-future-resolve
+                          future-writer value))))
+                (handler-case
+                    (progn
+                      (wasmdown.component.runtime:host-end-set-sink
+                       data (%fd-pwrite-sink fd position-fn advance-fn))
+                      (wasmdown.component.runtime:host-end-set-on-drop
+                       data
+                       (lambda (dropped error)
+                         (declare (ignore dropped))
+                         (settle (if error (cons :err error) (cons :ok nil)))))
+                      ;; the guest may have staged a write before the call
+                      (wasmdown.component.runtime:host-end-drain data)
+                      future-reader)
+                  (error (c)
+                    (%fd-hold-release hold)
+                    (error c)))))))
       (wasi-fs-error (c)
         ;; the refused write: the guest's end learns DROPPED on its
         ;; next write, the future carries the code

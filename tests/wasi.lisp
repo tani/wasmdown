@@ -1446,6 +1446,231 @@ accumulated u8 values."
         (wasmdown.wasi:close-wasi-preopen pre)))))
 
 ;;; ---------------------------------------------------------------
+;;; DESCRIPTOR / HOST-RESOURCE LIFETIME: the descriptor handle and
+;;; each stream end hold independent references to the fd; the fd is
+;;; closed exactly once, when the last holder releases it.
+
+(test wasi/fs-descriptor-refcount-stream-outlives-handle
+  ;; dropping the descriptor handle while a stream is live must not
+  ;; close the fd under the stream; the fd closes once, at the
+  ;; stream's EOF (the last holder's release)
+  (with-fs-root (root "fs-ref1" '("data.txt"))
+    (fs-write! (fs-p root "data.txt") "abcdef")
+    (let* ((pre (wasmdown.wasi:open-wasi-preopen root :name "/r"))
+           (ctx (wasmdown.wasi:make-wasi-context :preopens (list pre)))
+           (d (wasmdown.wasi:wasi-preopen-descriptor pre)))
+      (unwind-protect
+           (let* ((desc (fs-open-file ctx d "data.txt" nil
+                                      (cons :flags '("read"))))
+                  (fd (wasmdown.wasi:wasi-descriptor-fd desc))
+                  (pair (wasmdown.wasi:fs-read-via-stream ctx desc 0))
+                  (stream (first pair))
+                  (future (second pair)))
+             ;; the handle's own reference + the stream's
+             (is (= 2 (wasmdown.wasi:wasi-descriptor-refs desc)))
+             (wasmdown.wasi:close-wasi-descriptor desc)
+             (is (= 1 (wasmdown.wasi:wasi-descriptor-refs desc)))
+             (is (wasmdown.wasi:wasi-descriptor-closed-p desc))
+             (is (plusp fd))
+             ;; the fd is STILL open: the stream keeps it alive
+             (is (not (null (sb-unix:unix-fstat fd))))
+             (is (equal '(97 98 99) (fs-drain-3 stream)))
+             (is (equal '(100 101 102) (fs-drain-3 stream)))
+             (is (null (fs-drain-3 stream)))
+             (is (equal '(:ok) (fs-future-value future)))
+             ;; the last holder released: closed exactly once
+             (is (zerop (wasmdown.wasi:wasi-descriptor-refs desc)))
+             (is (eql -1 (wasmdown.wasi:wasi-descriptor-fd desc)))
+             (is (wasmdown.wasi:wasi-descriptor-closed-p desc))
+             (is (null (sb-unix:unix-fstat fd)))
+             ;; a redundant handle release cannot decrement again
+             (wasmdown.wasi:close-wasi-descriptor desc)
+             (is (zerop (wasmdown.wasi:wasi-descriptor-refs desc)))
+             (is (eql -1 (wasmdown.wasi:wasi-descriptor-fd desc))))
+        (wasmdown.wasi:close-wasi-preopen pre)))))
+
+(test wasi/fs-stream-reference-released-once
+  ;; the stream's reference is released on its terminal event: the
+  ;; read-error path and the guest's own drop
+  (with-fs-root (root "fs-ref2" '("dir" "f.txt"))
+    (fs-mkdir! (fs-p root "dir"))
+    (fs-write! (fs-p root "f.txt") "xy")
+    (let* ((pre (wasmdown.wasi:open-wasi-preopen root :name "/r"))
+           (ctx (wasmdown.wasi:make-wasi-context :preopens (list pre)))
+           (d (wasmdown.wasi:wasi-preopen-descriptor pre)))
+      (unwind-protect
+           (progn
+             ;; an OS error (pread on a directory) ends the read and
+             ;; releases the stream's reference
+             (let* ((sub (fs-open-file ctx d "dir"
+                                       (cons :flags '("directory"))
+                                       (cons :flags '("read"))))
+                    (fd (wasmdown.wasi:wasi-descriptor-fd sub))
+                    (entry (wasmdown.wasi:fs-read-via-stream ctx sub 0)))
+               (is (= 2 (wasmdown.wasi:wasi-descriptor-refs sub)))
+               (is (null (fs-drain-3 (first entry))))
+               (is (equal '(:err . "is-directory")
+                          (fs-future-value (second entry))))
+               (is (= 1 (wasmdown.wasi:wasi-descriptor-refs sub)))
+               (is (not (null (sb-unix:unix-fstat fd))))
+               (wasmdown.wasi:close-wasi-descriptor sub)
+               (is (zerop (wasmdown.wasi:wasi-descriptor-refs sub)))
+               (is (null (sb-unix:unix-fstat fd))))
+             ;; the guest dropping its own end (the cancel path)
+             ;; releases the same single reference
+             (let* ((desc (fs-open-file ctx d "f.txt" nil
+                                        (cons :flags '("read"))))
+                    (fd (wasmdown.wasi:wasi-descriptor-fd desc))
+                    (pair (wasmdown.wasi:fs-read-via-stream ctx desc 0)))
+               (is (= 2 (wasmdown.wasi:wasi-descriptor-refs desc)))
+               (fs-drop-end (first pair))
+               (is (= 1 (wasmdown.wasi:wasi-descriptor-refs desc)))
+               (is (equal '(:ok) (fs-future-value (second pair))))
+               (wasmdown.wasi:close-wasi-descriptor desc)
+               (is (zerop (wasmdown.wasi:wasi-descriptor-refs desc)))
+               (is (null (sb-unix:unix-fstat fd))))
+             ;; a WRITE stream outlives its handle too: the bytes still
+             ;; land, and the fd closes at the guest's drop
+             (let* ((desc (fs-open-file ctx d "f.txt" nil
+                                        (cons :flags '("read" "write"))))
+                    (fd (wasmdown.wasi:wasi-descriptor-fd desc)))
+               (multiple-value-bind (reader writer) (fs-fresh-stream)
+                 (let ((future (wasmdown.wasi:fs-write-via-stream
+                                ctx desc reader 1)))
+                   (is (= 2 (wasmdown.wasi:wasi-descriptor-refs desc)))
+                   (wasmdown.wasi:close-wasi-descriptor desc)
+                   (is (= 1 (wasmdown.wasi:wasi-descriptor-refs desc)))
+                   (is (not (null (sb-unix:unix-fstat fd))))
+                   (is (eql (%completed 1) (fs-stage-write writer '(90))))
+                   (fs-drop-end writer)
+                   (is (equal '(:ok) (fs-future-value future)))
+                   (is (zerop (wasmdown.wasi:wasi-descriptor-refs desc)))
+                   (is (null (sb-unix:unix-fstat fd)))
+                   ;; "xy" with 'Z' pwritten at offset 1
+                   (is (equal '(120 90) (fs-bytes (fs-p root "f.txt"))))))))
+        (wasmdown.wasi:close-wasi-preopen pre)))))
+
+(test wasi/fs-descriptor-release-marker-idempotent
+  ;; the hold's released marker makes a second release a no-op, and a
+  ;; release below zero can never happen
+  (with-fs-root (root "fs-ref3" '("a.txt"))
+    (fs-write! (fs-p root "a.txt") "z")
+    (let* ((pre (wasmdown.wasi:open-wasi-preopen root :name "/r"))
+           (ctx (wasmdown.wasi:make-wasi-context :preopens (list pre)))
+           (d (wasmdown.wasi:wasi-preopen-descriptor pre)))
+      (unwind-protect
+           (let* ((desc (fs-open-file ctx d "a.txt" nil
+                                      (cons :flags '("read"))))
+                  (fd (wasmdown.wasi:wasi-descriptor-fd desc))
+                  (hold (wasmdown.wasi::%descriptor-hold desc)))
+             (is (= 2 (wasmdown.wasi:wasi-descriptor-refs desc)))
+             (is (= 1 (wasmdown.wasi::%fd-hold-release hold)))
+             (is (not (null (sb-unix:unix-fstat fd))))
+             ;; second release: the marker swallows it
+             (is (= 1 (wasmdown.wasi::%fd-hold-release hold)))
+             (is (= 1 (wasmdown.wasi:wasi-descriptor-refs desc)))
+             (is (not (null (sb-unix:unix-fstat fd))))
+             ;; the handle's release is the last one
+             (wasmdown.wasi:close-wasi-descriptor desc)
+             (is (zerop (wasmdown.wasi:wasi-descriptor-refs desc)))
+             (is (null (sb-unix:unix-fstat fd)))
+             ;; releasing an already-zero descriptor is a no-op
+             (is (zerop (wasmdown.wasi::%descriptor-release desc)))
+             (is (zerop (wasmdown.wasi:wasi-descriptor-refs desc)))
+             (is (eql -1 (wasmdown.wasi:wasi-descriptor-fd desc))))
+        (wasmdown.wasi:close-wasi-preopen pre)))))
+
+(test wasi/fs-preopen-drop-by-guest-keeps-root
+  ;; a guest resource.drop of the preopen's own descriptor handle must
+  ;; not close the embedder's root fd, and the root keeps working
+  (with-fs-root (root "fs-ref4" '("a.txt"))
+    (fs-write! (fs-p root "a.txt") "q")
+    (let* ((pre (wasmdown.wasi:open-wasi-preopen root :name "/r"))
+           (ctx (wasmdown.wasi:make-wasi-context :preopens (list pre)))
+           (d (wasmdown.wasi:wasi-preopen-descriptor pre))
+           (fd (wasmdown.wasi:wasi-preopen-fd pre)))
+      (unwind-protect
+           (progn
+             (wasmdown.wasi:close-wasi-descriptor d)
+             (is (not (wasmdown.wasi:wasi-descriptor-closed-p d)))
+             (is (eql fd (wasmdown.wasi:wasi-descriptor-fd d)))
+             (is (plusp (wasmdown.wasi:wasi-preopen-fd pre)))
+             (is (not (null (sb-unix:unix-fstat fd))))
+             ;; the root still resolves through the guest's handle
+             (=> "regular-file"
+                 (fs-type-name (fs-ok-value
+                                (wasmdown.wasi:fs-stat-at ctx d nil "a.txt"))))
+             ;; only the embedder's close releases it, exactly once
+             (wasmdown.wasi:close-wasi-preopen pre)
+             (is (eql -1 (wasmdown.wasi:wasi-preopen-fd pre)))
+             (is (null (sb-unix:unix-fstat fd))))
+        (wasmdown.wasi:close-wasi-preopen pre)))))
+
+(test wasi/fs-preopen-close-invalidates-descriptor
+  ;; closing the root invalidates the cached descriptor: open-at/stat
+  ;; through it is the WIT error, and a reused fd NUMBER (the freed
+  ;; number, handed to an unrelated file) grants no authority
+  (with-fs-root (root "fs-ref5" '("a.txt" "b.txt"))
+    (fs-write! (fs-p root "a.txt") "hello")
+    (fs-write! (fs-p root "b.txt") "x")
+    (let* ((pre (wasmdown.wasi:open-wasi-preopen root :name "/r"))
+           (ctx (wasmdown.wasi:make-wasi-context :preopens (list pre)))
+           (d (wasmdown.wasi:wasi-preopen-descriptor pre))
+           (fd (wasmdown.wasi:wasi-preopen-fd pre)))
+      (unwind-protect
+           (progn
+             (is (plusp fd))
+             ;; the root works before the close
+             (let ((opened (fs-open-file ctx d "a.txt" nil
+                                         (cons :flags '("read")))))
+               (is (plusp (wasmdown.wasi:wasi-descriptor-fd opened)))
+               (wasmdown.wasi:close-wasi-descriptor opened))
+             (wasmdown.wasi:close-wasi-preopen pre)
+             (is (eql -1 (wasmdown.wasi:wasi-preopen-fd pre)))
+             (is (eql -1 (wasmdown.wasi:wasi-descriptor-fd d)))
+             (is (wasmdown.wasi:wasi-descriptor-closed-p d))
+             (is (null (sb-unix:unix-fstat fd)))
+             ;; the guest's cached descriptor handle names nothing
+             (=> "bad-descriptor"
+                 (fs-error-code-of
+                  (wasmdown.wasi:fs-open-at ctx d nil "b.txt" nil
+                                            (cons :flags '("read")))))
+             (=> "bad-descriptor"
+                 (fs-error-code-of (wasmdown.wasi:fs-stat ctx d)))
+             ;; Linux hands out the lowest free fd, so this open takes
+             ;; the freed preopen NUMBER and keeps it live — yet the
+             ;; closed descriptor still reaches nothing through it
+             (let ((reused (sb-unix:unix-open
+                            (fs-p root "b.txt")
+                            (logior wasmdown.wasi::+o-rdonly+
+                                    wasmdown.wasi::+o-cloexec+)
+                            0)))
+               (unwind-protect
+                    (progn
+                      (is (eql fd reused))
+                      (is (not (null (sb-unix:unix-fstat reused))))
+                      (=> "bad-descriptor"
+                          (fs-error-code-of
+                           (wasmdown.wasi:fs-open-at ctx d nil "b.txt" nil
+                                                     (cons :flags '("read"))))))
+                 (wasmdown.wasi::%close-fd reused)))
+             ;; a live root opened after the close is unaffected
+             (let* ((pre2 (wasmdown.wasi:open-wasi-preopen root :name "/r2"))
+                    (ctx2 (wasmdown.wasi:make-wasi-context
+                           :preopens (list pre2)))
+                    (d2 (wasmdown.wasi:wasi-preopen-descriptor pre2)))
+               (unwind-protect
+                    (=> "regular-file"
+                        (fs-type-name (fs-ok-value
+                                       (wasmdown.wasi:fs-stat-at
+                                        ctx2 d2 nil "a.txt"))))
+                 (wasmdown.wasi:close-wasi-preopen pre2)))
+             ;; closing twice is a no-op
+             (wasmdown.wasi:close-wasi-preopen pre)
+             (is (eql -1 (wasmdown.wasi:wasi-preopen-fd pre))))
+        (wasmdown.wasi:close-wasi-preopen pre)))))
+
+;;; ---------------------------------------------------------------
 ;;; THE END-TO-END STREAM FIXTURE: a component writes "hello" through
 ;;; write-via-stream at offset 0, appends "!" through
 ;;; append-via-stream, reads the whole file back through
