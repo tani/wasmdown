@@ -13,7 +13,7 @@
 ;;;; func/type/resource/use structs); it does NOT validate the WIT or
 ;;;; resolve cross-package references (wit-type->ct does that on
 ;;;; demand). The node graph is deliberately boring so the later
-;;;; filesystem/sockets/http slices can extend it without rewriting.
+;;;; filesystem/sockets slices can extend it without rewriting.
 
 (in-package #:wasmdown.wit)
 

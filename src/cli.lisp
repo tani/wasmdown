@@ -15,9 +15,8 @@
 ;;;; M16 slice 6: `run' accepts BOTH layers — a component binary is
 ;;;; driven through the WASI command runner (`--wasi', `--dir',
 ;;;; `--env', `--net', `--listen', `--dns' and guest arguments), a
-;;;; core module keeps the `--invoke' path. No --mapdir / --profile-
-;;;; conditional / artifact ABI checks yet; --http-transport is
-;;;; embedder-only (documented at the run command).
+;;;; core module keeps the `--invoke' path. No --mapdir /
+;;;; --profile-conditional / artifact ABI checks yet.
 
 (in-package #:wasmdown.cli)
 
@@ -242,11 +241,9 @@ functions first)."
 ;;;   --listen ADDR:PORT declare a listen address
 ;;;   --dns NAME         allow a name (or `*' for any)
 ;;;
-;;; There is no --http-transport: HTTP transports are EMBEDDER-only
-;;; (PLAN.md §9.2 — pluggable TLS/transport services are CL objects on
-;;; the wasi-context, not a CLI capability; the built-in plain TCP
-;;; transport is what a guest gets, and https without an embedder
-;;; transport is the WIT's configuration-error).
+;;; HTTP is not supported in this runtime: there is no `wasi:http'
+;;; provider and no transport option (the `wasi:http' surface was
+;;; removed at user direction in M17).
 
 (defun %parse-run-args (argv)
   "Return (values file invokes options guest-args). INVOKES is a list
@@ -273,9 +270,6 @@ order); GUEST-ARGS are the positional tokens AFTER the input file."
                   (unless value
                     (%usage-error "run: ~a requires a value" tok))
                   (push (cons tok value) options)))
-               ((string= tok "--http-transport")
-                (%usage-error
-                 "run: --http-transport is embedder-only; configure :http-transports on the wasi-context in the embedder"))
                ((%flagp tok) (%usage-error "unknown option ~a" tok))
                (file (push tok guest))
                (t (setf file tok))))
