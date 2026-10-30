@@ -1,3 +1,43 @@
+# M17 SESSION 23 — THE BORROW SIDE OF STEP 2 IS CLOSED (merge 851ad60): a real defect
+# found by a pin that failed first.
+# PIN 1 (component/live-borrow-blocks-task-return-pin) FAILED on master — run-live
+# returned (:OK (42)) with captured=NIL, i.e. NO task.return ever observed
+# num_borrows>0 — and PASSES after: (:TRAP "cannot return with outstanding borrows")
+# with captured=((1)). The pin also proves the SOURCE handle's num_lends was 1 at the
+# guard's instant and 0 after delivery (no leak), and that ret-dropped (the callee
+# dropping through the real canon resource.drop first) returns normally, so the guard is
+# a COUNT and not a permanent flag.
+# THE DEFECT: two spec accounts were conflated. A lend raised the LENDING task's
+# num_borrows (via %subtask-record-lend) while the CALLEE's num_borrows — §2832/§2838's
+# account, the one §802/§820 guard — was never raised. Fix: lower_borrow accounting
+# lands on the CALLEE Task (*pending-borrow-handles* staged by the lowers,
+# %adopt-borrow-handles applied at Task creation in %call-async-funcinst and
+# %canon-lift-async: num_borrows++, borrow_scope = task); canon resource.drop on a
+# non-own handle performs §3798's borrow_scope.num_borrows -= 1 paired with the
+# adoption; %subtask-record-lend / deliver_resolve keep ONLY the §1447 num_lends ledger
+# on the source, and the lending-tasks slot plus its per-task num_borrows
+# increment/decrement are DELETED (grep 0 references).
+# §2834's same-implementor shortcut had to be added — discovered because the fix
+# reddened passing-resources::1: when the callee's type space DECLARED the resource (the
+# slot was not alias-projected, tested per instance/slot via
+# (gethash (cons ft-inst rt-idx) *ct-defining-inst*)) lower_borrow yields the REP and
+# creates no handle, hence no num_borrows and no owed drop. THAT is also why the pin's
+# callee must be an IMPORTER, not the definer — a fixture-design rule worth keeping.
+# PIN 2 (component/borrowed-handle-not-joinable-pin) PASSED already and needed no source
+# change: §4125's trap_if(not isinstance(w, Waitable)) already rejects resource handles
+# (borrowed AND own) with `invalid waitable index`, while a real readable future end
+# joins/leaves normally, and a rejected join leaves the handle in place.
+# Measured: units 533/0 twice; 12-fixture superset 225/0 twice; drop-cross-task-borrow
+# 7/7; per-file probe no hang/no FAIL; adjacent n=30 pair master 0/30 0-fail vs this
+# tree 0/30 0-fail = ZERO measured cost (the bar while the lane is green).
+# REMAINING (unchanged list, now one item shorter):
+#   1. Provider-side step 5/6: DNS and blocking-stdio bounded executors; socket
+#      accept/recv/send registering a reactor watch instead of reporting would-block.
+#   2. Step 1's last item: the two canon-lower wrappers' positional
+#      stream/future/borrow arms (needs the plan's verification-set fixtures in the
+#      probe set first; %abi-load's memory-path arms stay out — measured negative).
+#   3. wip/reactor-wiring's verdict (adjacent pair at an unpinned window; the bar is now
+#      "no measured cost" because master is green).
 # M17 SESSION 22 — THE TYPE-VIEW VERDICT, MEASURED IN A CLEAN WINDOW: ITS HISTORICAL
 # BLOCKER IS GONE AND IT IS AT PARITY, BUT IT COSTS TWO ONE-OFF ROWS AGAINST A GREEN
 # MASTER, SO IT STAYS PARKED.
