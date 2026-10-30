@@ -9071,8 +9071,36 @@ is the valtype."
                                     ;; yield-parked caller while the
                                     ;; target had not yet taken its
                                     ;; first turn.
+                                    ;;
+                                    ;; §474-484's chain also ends when
+                                    ;; the target RETURNS. The exit
+                                    ;; post normally carries that
+                                    ;; release, but the post is not
+                                    ;; atomic with the resume COUNT
+                                    ;; this term reads: a post landing
+                                    ;; between the read and the
+                                    ;; per-iteration clear was lost
+                                    ;; (reentrance::20: the captured
+                                    ;; caller sat with rc=0/wc=0 and
+                                    ;; sample=1 while its target was
+                                    ;; :done and unregistered — the
+                                    ;; exit-side post had fired into
+                                    ;; the per-iteration clear, and
+                                    ;; an exit does not bump
+                                    ;; park-count, so neither term
+                                    ;; could fire). The target's :done
+                                    ;; mark IS the chain end
+                                    ;; %SWITCH-CHAIN-ENDED-P already
+                                    ;; uses for the outer resumer, and
+                                    ;; it makes "released only by its
+                                    ;; target's park/exit" true by
+                                    ;; construction rather than by a
+                                    ;; count race.
                                     (or (> (async-thread-resume-count ct)
                                            0)
+                                        (eq (async-thread-spawn-thunk
+                                             resumable-target)
+                                            :done)
                                         (and yield-p
                                              (> (async-thread-park-count
                                                  resumable-target)
@@ -9093,8 +9121,24 @@ is the valtype."
                                     ;; as thread.suspend itself.
                                     (> (async-thread-resume-count ct)
                                        0)))))
-                           (setf (async-thread-wake-count ct) 0
-                                 (async-thread-resume-count ct) 0)
+                           ;; M13-tok34 THE CLEAR: only a count this
+                           ;; iteration OBSERVED (done) may be spent.
+                           ;; The old unconditional clear could eat a
+                           ;; resume the target posted between the
+                           ;; read above and the setf — the poster's
+                           ;; %ASYNC-THREAD-WAKE increments the count
+                           ;; WITHOUT this thread's mutex, so holding
+                           ;; MU across read+clear never excluded it.
+                           ;; A count that arrives after a 'not done'
+                           ;; read must stay for the next iteration's
+                           ;; check (the same "only clear what you
+                           ;; observed" rule the suspend park uses).
+                           ;; A bare nudge (WAKE-COUNT) stays
+                           ;; transient: it only ever re-tests.
+                           (if done
+                               (setf (async-thread-wake-count ct) 0
+                                     (async-thread-resume-count ct) 0)
+                               (setf (async-thread-wake-count ct) 0))
                            (sb-thread:release-mutex mu)
                            (when done (return)))))
                   (sb-thread:grab-mutex mu)
