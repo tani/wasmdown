@@ -1,3 +1,44 @@
+# M17 SESSION 34 — THE LAST OPEN FINDING IS CLOSED (56d7b83): ONE DOCUMENTED LOCK ORDER.
+# The incidental 3-thread `scheduler <-> thread <-> store-right` cycle is now enumerated, the
+# order is documented at the head of the scheduler section, and the ONE violating site is
+# fixed. Nothing is left open in this project.
+# THE ORDER: *store-right* -> { sync-lift DMU, host-store mutex } -> *scheduler-mutex* ->
+# { wset, task, host-pending, future-watch } -> async-thread mutex (THE ONLY LEAF), plus
+# *scheduler-mutex* -> any peer/leaf mutex and NEVER back. The de-facto order was confirmed
+# from source and extended with the two sibling tiers and the leaf-ward edges
+# (WSET->THREAD in %subtask-resolve, PENDING->THREAD via %park's boundary). Instance async
+# fields (sync-window depth, thread index, credits) are NOT a lock: atomic/right-guarded,
+# verified — the %sync-call-window-* builtins take none.
+# THE VIOLATION: %store-teardown held *scheduler-mutex* across
+# %task-exit-implicit-thread, which on an async-exclusive task runs the M11a resume-all ->
+# %without-right -> %right-acquire; the scheduler mutex is RECURSIVE, so the outer frame
+# still held it across that right grab, and with the legal RIGHT->SCHED direction that is an
+# AB-BA. A machine-checked call-graph analysis over all 65 lock forms / 267 defuns found
+# exactly ONE such site and ZERO after the fix.
+# FIX: %store-teardown split into two phases — phase 1 under the scheduler mutex only
+# (snapshot threads, set abandoned/flags, snapshot natives, clear registry/handoff/driver
+# state); phase 2 with it RELEASED (exit calls, per-thread broadcasts, bounded joins). No new
+# lock; the scheduler section got SHORTER.
+# PINS: component/lock-order-no-scheduler-held-across-store-right-pin (source-level rule
+# check over the whole runtime with two negative controls) and
+# component/store-teardown-runs-with-right-held-pin (real %store-teardown with 48
+# async-exclusive tasks against a right-holding competitor that takes the scheduler mutex;
+# semaphore handshake, bounded grab so a broken shape REPORTS instead of wedging; the
+# competitor always acquires the right so the assertion is not vacuous). Out-of-tree negative
+# control: pre-fix sched-ok NIL 3/3, fixed sched-ok T 2/2.
+# Measured: units 552/0 twice (550 + 2 pins); adjacent n=30 pair master first, BOTH 0/30 and
+# 0 fail commands (master mean 10.282 s, this tree 10.238 s, delta -0.044 s = zero cost);
+# probe-async-perfile prints only `done`.
+# ALSO FIXED, small but real: the stream/future "12-fixture set" is now ENUMERATED in this
+# ledger's terms (forward, idle-drop, cancel-stream, big-interleaving-test, trap-if-done,
+# same-component-stream-future, partial-stream-copies, trap-if-sync-and-waitable-set,
+# futures-must-write, sync-streams, zero-length, cancel-targeted-resume) and reads 336 rows /
+# 336 PASS / 0 fail. The earlier "225 rows" figure came from a different, never-enumerated
+# selection — quote 336 with this list, or enumerate your own.
+# FINAL STATE: master 56d7b83, units 552/0, one branch (master), no open item, no parked
+# delta. Carry-overs that are correctly LEFT as standing notes rather than work:
+#   - `sync-streams::1` watch row (1/30 twice today) — measure in a PAIRED window next time;
+#   - the 0-fail x 30 lane acceptance is window-locked; the PINS are the guarantee.
 # M17 SESSION 33 — CLOSING NOTES: THE ONE-OFFS NAMED, THE EVIDENCE DISPOSITION, AND THE
 # STANDING SENTRY RULE.
 # 1. `sync-streams.wast::1` is now a WATCH ROW: it appeared 1/30 in TWO separate blocks
