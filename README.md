@@ -575,7 +575,27 @@ the component TEXT parser (M7 slice 2) parses + validates the whole
 validation suite's text grammar; the 280 fails are the
 instantiation/arg-matching, version-suffix, external-visibility and
 annotated-name-shape validator-extension families (the next slice).
-What remains, per milestone:
+**M17 update:** the paragraph above is the M7-era measurement and is
+kept for history; the lane is now 1631 pass / 0 fail / 0 unsupported /
+0 harness-error, green in 30 consecutive runs. The remaining work is
+NOT in the lane:
+
+1. **Provider-side step 5/6**: DNS and blocking-stdio bounded executors,
+   and socket accept/recv/send registering a reactor watch instead of
+   reporting would-block to a caller that then waits.
+2. **Step 1's last item**: the two canon-lower wrappers' positional
+   stream/future/borrow arms (deletion needs the plan's verification-set
+   fixtures in the probe set first; `%abi-load`'s memory-path transfer
+   arms stay out — a measured negative).
+3. **Borrow-side lifetime pins**: a live borrow held across task.return
+   must trap; borrow-in-awaitable-set. The guest-drop pin's shape is the
+   vector to reuse.
+4. **Two parked deltas with measured verdicts**: `wip/type-view` (at
+   parity in a clean window; not landed because a green lane's bar is
+   "no measured cost") and `wip/reactor-wiring` (unresolved; needs the
+   adjacent pair at an unpinned window, then sub-element bisection).
+
+What remains, per milestone (M7-era, historical):
 
 1. **M7 rest**: the validator-extension families (instantiation
    arg/type matching, version-suffix semver, external-visibility,
