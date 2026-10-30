@@ -6853,11 +6853,23 @@ is the valtype."
                    :message
                    (format nil "unknown thread index ~a"
                            (first args))))
-          (unless (or (functionp (async-thread-spawn-thunk target))
-                      (async-thread-suspended-p target)
-                      (async-thread-yield-parked target))
-            (error 'wasmdown:wasm-trap :kind :generic
-                   :message "cannot resume thread which is not suspended"))
+          ;; §458-465 / canon thread.resume-later: the spec's
+          ;; `suspended()` trap tests a CONTINUATION state, not a
+          ;; native thread's mid-turn. In this runtime a peer can be
+          ;; LIVE with no park recorded (an async-typed invoke
+          ;; returned to the host while its callee thread was still
+          ;; mid-turn; or the peer is contending at %right-acquire)
+          ;; — the during-sync family's "cannot resume thread which
+          ;; is not suspended" on a RUNNING target. resume_later =
+          ;; start_waiting(ready=True) is a MARK, so a live target is
+          ;; legal: the mark is recorded below and takes effect at
+          ;; the target's next park. (The spec's
+          ;; assert(current_thread() is not other_thread) is an
+          ;; assert — UB — and is NOT reproduced as a trap: this
+          ;; runtime may hand the CALLER and the INDEXED thread the
+          ;; same Thread record when an instance's implicit thread
+          ;; is reused across calls, so a trap here would refuse a
+          ;; resume the fixture requires.)
           (sb-thread:with-recursive-lock
               ((async-thread-mutex target))
             (cond
@@ -6888,11 +6900,24 @@ is the valtype."
               (setf (async-thread-ready-p target) t)
               (setf (async-thread-post-to target) *current-thread*)
               (setf (async-thread-wake-count target) 0))
-             ;; otherwise (a yield park): the any-nudge wake
-             (t
+             ;; a YIELD park: the any-nudge wake
+             ((async-thread-yield-parked target)
               (setf (async-thread-ready-p target) t)
               (sb-thread:condition-broadcast
-               (async-thread-waitqueue target))))))
+               (async-thread-waitqueue target)))
+             ;; §458-465 THE LIVE TARGET (mid-turn, or contending at
+             ;; %right-acquire): record start_waiting(ready=True) —
+             ;; the mark is CONSUMED AT THE TARGET'S NEXT PARK, never
+             ;; a direct fire and never an execution grant (the
+             ;; running quantum finishes: the same discipline as the
+             ;; switch arms' right-waiting exemption). The durable
+             ;; wake-count is the mark's park-time half (both park
+             ;; sites honor it — suspend's step 1 and wait-until's
+             ;; count) and READY-P is the tick-time half (the nudge's
+             ;; ready-grant sees it once suspended-p is set).
+             (t
+              (setf (async-thread-ready-p target) t)
+              (%async-thread-wake target)))))
         '())))
     ;; thread.new-indirect (§4555-4596): read the funcref from the
     ;; canon's core TABLE (trap OOB/null), create a SUSPENDED
