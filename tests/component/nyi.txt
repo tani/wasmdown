@@ -1,3 +1,31 @@
+# M17 SESSION 11 — STEP 3's PARSER HALF LANDED (0f81ad5); STEP 3 IS NOW COMPLETE FOR
+# EVERY CONSTRUCT THAT EXISTS IN THIS TREE, WITH ITS LIMITS STATED.
+# LANDED: world `include` (+ `with { a as b }` renames), named and inline interface
+# bindings, world-level `use`/`type`/`func`, world-item kind/name/target/implements/
+# external-id/annotations, and positional `@external-id("...")`. Include expansion
+# happens in the RESOLVER in declaration order (the raw AST is never mutated); every
+# failure is a wit-error naming world + binding: include cycle, missing/duplicate/
+# ambiguous rename source, rename-target collision, duplicate binding, unknown
+# package version, non-world target, unresolvable interface/type, and own/borrow of an
+# unknown or non-resource name (no raw string survives in a payload). Identity rules
+# hold: same resource declaration through two paths shares one identity, two
+# independent imports of one interface under different plain names do not.
+# ANNOUNCED DIVERGENCES (each pinned, none hidden):
+#   1. specs/WIT.md:434 calls `include ... with { a as b }` INVALID when `a` is an
+#      interface name; the assignment made bare-name bindings renameable and a
+#      fixture pins it as equivalent to `import my-types: types;`. If the spec's
+#      reading is authoritative, this is ONE fixture and ONE resolver branch to
+#      remove — it is the only place we knowingly differ from the vendored text.
+#   2. `a:b` vs `a: b` is decided by TOKEN ADJACENCY (the tokenizer discards blanks),
+#      which is the spec's lexing rule recovered, not approximated.
+#   3. Inline interfaces take no trailing `;` per the grammar; `... };` is rejected.
+# VERIFICATION IS WORLD-LEVEL BY CONSTRUCTION: nine wit/parser-* tests parse a
+# fixture, run resolve-wit-world and compare the resolved import/export shape
+# (sort kind name ns pkg iface version implements external-id target-interface)
+# against the hand-expanded world. Vendored stability proves nothing here — the audit
+# found zero occurrences of every construct this slice implements.
+# Measured: units 514/0 twice; `asdf:compile-system :wasmdown :force t` warns nothing
+# for src/wit.lisp; specs/ untouched.
 # M17 SESSION 10b — THE TYPE-VIEW REAPPLY IS DONE AND VERIFIED; ONLY THE LANE PAIR IS
 # PENDING. Branch `rerun/type-view` (db880be), cut from master 8f28251.
 # HOW IT WAS REAPPLIED: the production half and the pin half as SEPARATE patches
