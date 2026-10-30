@@ -2802,6 +2802,128 @@ repo root, as a string — the pin runs a fixture row VERBATIM."
                    613 699)
        "cancel-fire-gate-pin.wast")))
 
+(test component/reentrance-14-pin
+  ;; THE TARGETED HANDOFF IS A RESERVED WINDOW (reentrance ::14, the
+  ;; drift row). The async lower's STARTED-wait releases the store
+  ;; right to ONE callee thread for its first turn, then observes the
+  ;; packed state. Before this pin, the window was not reserved: the
+  ;; release named the callee as the ticket, but when the callee's OS
+  ;; thread lost the schedule, a THIRD party (the outer caller's next
+  ;; turn) took the right under the `null successor' fallback, ran the
+  ;; outer task's callback WAIT arm, released the instance's exclusive
+  ;; lock, and the callee — still un-started at the lower — then
+  ;; STARTED and even RESOLVED inside the pack. The lower packed an
+  ;; eager RETURNED (2) where the fixture pins STARTING (0), and the
+  ;; guest's `(i32.ne (i32.and $packed 0xf) STARTING)' check trapped
+  ;; `unreachable' (5/20 standalone runs; 14/30 in the clean window).
+  ;;
+  ;; (a) drives the REAL right builtins: while a handoff frame is on
+  ;; top, a peer's %RIGHT-ACQUIRE must NOT take the right (it defers
+  ;; without renaming the ticket), and the caller takes it back; the
+  ;; target's park/exit names the caller as the next ticket.
+  ;; (b) runs the fixture row VERBATIM, repeatedly: the drift window
+  ;; is an OS scheduling lottery, so one run would not pin it.
+  (let* ((c (wasmdown.component.runtime::make-async-thread
+             :task (wasmdown.component.runtime::make-async-task
+                    :seq '(1))))
+         (tg (wasmdown.component.runtime::make-async-thread
+              :task (wasmdown.component.runtime::make-async-task
+                     :seq '(1 1))))
+         (p (wasmdown.component.runtime::make-async-thread
+             :task (wasmdown.component.runtime::make-async-task
+                    :seq '(2))))
+         (old-threads wasmdown.component.runtime::*scheduler-threads*)
+         (old-ticket wasmdown.component.runtime::*right-ticket*)
+         (old-frames wasmdown.component.runtime::*right-handoffs*)
+         (old-owner wasmdown.component.runtime::*right-owner*)
+         (violation nil)
+         (peer-took nil))
+    (unwind-protect
+         (progn
+           ;; ---- (a1) a third party may not take the handoff window
+           (setf wasmdown.component.runtime::*scheduler-threads*
+                 (list c tg p)
+                 wasmdown.component.runtime::*right-ticket* nil
+                 wasmdown.component.runtime::*right-handoffs* nil
+                 wasmdown.component.runtime::*right-owner* nil)
+           (let ((peer
+                   (sb-thread:make-thread
+                    (lambda ()
+                      (let ((wasmdown.component.runtime::*right-self* p))
+                        (unwind-protect
+                             (progn
+                               (wasmdown.component.runtime::%right-acquire p)
+                               ;; acquiring while a frame is on top is
+                               ;; the defect this pin forbids
+                               (when wasmdown.component.runtime::*right-handoffs*
+                                 (setf violation t))
+                               (setf peer-took t))
+                          (wasmdown.component.runtime::%right-drop p))))
+                    :name "pin-handoff-peer")))
+             ;; the caller opens the window exactly as
+             ;; %RIGHT-HANDOFF-TO does: ticket=target, frame=(caller
+             ;; . target), right released
+             (sb-thread:grab-mutex wasmdown.component.runtime::*store-right*)
+             (wasmdown.component.runtime::%right-take c)
+             (setf wasmdown.component.runtime::*right-ticket* tg
+                   wasmdown.component.runtime::*right-handoffs*
+                   (list (cons c tg))
+                   wasmdown.component.runtime::*right-owner* nil)
+             (sb-thread:release-mutex
+              wasmdown.component.runtime::*store-right*)
+             (sleep 0.05)
+             (is (not peer-took))       ; the window is not a turn
+             ;; the caller takes the right back and closes the window
+             (wasmdown.component.runtime::%right-acquire c)
+             (is (sb-thread:holding-mutex-p
+                  wasmdown.component.runtime::*store-right*))
+             (is (eq wasmdown.component.runtime::*right-ticket* c))
+             (pop wasmdown.component.runtime::*right-handoffs*)
+             (is (null wasmdown.component.runtime::*right-handoffs*))
+             (wasmdown.component.runtime::%right-drop c)
+             (sb-thread:join-thread peer :timeout 5.0)
+             (is peer-took)
+             (is (not violation)))
+           ;; ---- (a2) the target's PARK names the handoff caller
+           (setf wasmdown.component.runtime::*right-handoffs*
+                 (list (cons c tg))
+                 wasmdown.component.runtime::*right-ticket* tg
+                 wasmdown.component.runtime::*scheduler-threads*
+                 (list c tg))
+           (sb-thread:grab-mutex wasmdown.component.runtime::*store-right*)
+           (let ((wasmdown.component.runtime::*right-self* tg))
+             (wasmdown.component.runtime::%right-take tg)
+             (wasmdown.component.runtime::%right-yield tg))
+           (is (eq wasmdown.component.runtime::*right-ticket* c))
+           (is (plusp (wasmdown.component.runtime::async-thread-wake-count
+                       c)))
+           ;; ---- (a3) the target's EXIT names the handoff caller
+           (setf wasmdown.component.runtime::*right-handoffs*
+                 (list (cons c tg))
+                 wasmdown.component.runtime::*right-ticket* tg
+                 wasmdown.component.runtime::*scheduler-threads*
+                 (list c tg))
+           (sb-thread:grab-mutex wasmdown.component.runtime::*store-right*)
+           (let ((wasmdown.component.runtime::*right-self* tg))
+             (wasmdown.component.runtime::%right-take tg)
+             (wasmdown.component.runtime::%right-release-on-exit tg))
+           (is (eq wasmdown.component.runtime::*right-ticket* c)))
+      ;; never leave the store right or the frames to the next test
+      (when (sb-thread:holding-mutex-p
+             wasmdown.component.runtime::*store-right*)
+        (sb-thread:release-mutex
+         wasmdown.component.runtime::*store-right*))
+      (setf wasmdown.component.runtime::*scheduler-threads* old-threads
+            wasmdown.component.runtime::*right-ticket* old-ticket
+            wasmdown.component.runtime::*right-handoffs* old-frames
+            wasmdown.component.runtime::*right-owner* old-owner))
+    ;; ---- (b) the fixture row VERBATIM (component + assert_return)
+    (let ((wast (%pin-slice "tests/component/async/reentrance.wast"
+                            239 346)))
+      (dotimes (i 20)
+        (is (%pin-rows-pass-p
+             wast (format nil "reentrance-14-pin-~d.wast" i)))))))
+
 (test component/host-resource-dtor-registry-pins
   ;; M17 — THE PER-INSTANCE HOST-RESOURCE DESTRUCTOR REGISTRY: a
   ;; host-provided resource's release hook belongs to the INSTANCE
@@ -4406,6 +4528,7 @@ waits unbounded)."
                       component/explicit-resume-requires-parked-peer-pin
                       component/thread-index-identity-pin
                       component/premature-park-release-pin
+                      component/reentrance-14-pin
                       component/switch-caller-is-not-grantable-pin)))
           wasmdown.test::*tests*)))
     (multiple-value-bind (passed failed)

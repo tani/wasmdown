@@ -5464,6 +5464,24 @@ async-task-seq is the creation path. Written only under
 (defparameter *right-owner-os* nil
   "The OS thread of *RIGHT-OWNER* (diagnostics only).")
 
+(defparameter *right-handoffs* nil
+  "The IN-FLIGHT targeted handoffs (%RIGHT-HANDOFF-TO), innermost
+first: a list of (CALLER . TARGET) thread records. The pack's
+STARTED-wait releases the right to ONE callee thread for its first
+turn while the caller observes; the window is NOT a turn for anyone
+else. While a frame is on top: only its TARGET may take the right,
+its TARGET's park/exit names its CALLER as the next ticket
+(%RIGHT-YIELD / %RIGHT-RELEASE-ON-EXIT), and only its CALLER takes
+the right back (after the bounded slice). Every other thread —
+including an OUTER handoff's caller, since the inner pack's
+observation must not be interleaved — defers without renaming the
+ticket. Without this reservation the target's OS thread could lose
+the slice, an outer caller's next turn could release the instance's
+exclusive lock, and the target then STARTED where the reference's
+synchronous start had observed it blocked on backpressure
+(reentrance ::14: an eager RETURNED packed where the fixture pins
+STARTING).")
+
 (defparameter *right-self* nil
   "The thread record of THIS native thread (bound in every guest
 body and every driver loop). NIL outside the store.")
@@ -5600,6 +5618,21 @@ THE THREE ACQUISITION RULES (the quantum, enforced HERE):
           ;; a turn the running quantum has not finished).
           ((%right-reserved-p *right-ticket* self)
            (%right-wait-reserved self))
+          ;; (1b) THE TARGETED HANDOFF WINDOW (%RIGHT-HANDOFF-TO):
+          ;; the pack released the right to ONE callee so its first
+          ;; turn runs while the caller observes. The window is NOT
+          ;; a turn for anyone else — a third party that grabs the
+          ;; mutex here must defer (and never rename the ticket). The
+          ;; CALLER takes the right back when the target parks/
+          ;; returns (its park/exit names the caller, see
+          ;; %RIGHT-YIELD) or when its bounded slice expires.
+          ((and (consp *right-handoffs*)
+                (eq self (caar *right-handoffs*)))
+           (%right-take self)
+           (return t))
+          ((and (consp *right-handoffs*)
+                (not (eq self (cdar *right-handoffs*))))
+           (%right-wait-reserved self))
           ;; (2) SELF's quantum is still in progress (it released the
           ;; right only for its own %without-right fan-out): take it
           ;; back, whatever the ticket order says. While mid-turn the
@@ -5673,7 +5706,11 @@ re-acquires after its wait; the release is paired with the wait,
 never with the park)."
   (when (or (null self) (not (sb-thread:holding-mutex-p *store-right*)))
     (return-from %right-yield nil))
-  (let ((next (%right-successor self)))
+  (let ((next (if (and (consp *right-handoffs*)
+                       (eq self (cdar *right-handoffs*)))
+                  (or (caar *right-handoffs*)
+                      (%right-successor self))
+                  (%right-successor self))))
     (setf *right-ticket* (or next self)
           *right-owner* nil
           (async-thread-right-turn-p self) nil)
@@ -5724,14 +5761,34 @@ host-completion boundary too (see %park)."
 handoff for one very short bounded slice (the caller's pack window:
 the callee's FIRST TURN must happen, but its later turns must not —
 the fixtures pin STARTED at the pack, before the callback's
-resolution). Then sleep the slice and re-acquire."
+resolution). Then sleep the slice and re-acquire.
+
+THE WINDOW IS RESERVED (§474-484's synchronous switch shape): the
+release records SELF as the handoff caller and TARGET as its target
+(*RIGHT-HANDOFFS*). While a frame is on top, no other thread may
+take the right, the target's park/exit names SELF as the next
+ticket (%RIGHT-YIELD / %RIGHT-RELEASE-ON-EXIT), and
+SELF takes the right back on its retry. This is what makes the pack
+observation deterministic: without it, the target's OS thread could
+lose the slice, the outer caller's next turn could release the
+instance's exclusive lock, and the target then STARTED where the
+reference's synchronous start observed it blocked on backpressure."
   (when (and self target (sb-thread:holding-mutex-p *store-right*))
     (setf *right-ticket* target
+          *right-handoffs* (acons self target *right-handoffs*)
           *right-owner* nil
           (async-thread-right-turn-p self) nil)
     (sb-thread:release-mutex *store-right*))
-  (sleep seconds)
-  (%right-acquire self))
+  (unwind-protect
+       (progn (sleep seconds)
+              (%right-acquire self))
+    ;; the window closes when the caller holds the right again (the
+    ;; normal path); an abandoned caller leaves it to teardown, which
+    ;; abandons every thread anyway
+    (when (sb-thread:holding-mutex-p *store-right*)
+      (when (and (consp *right-handoffs*)
+                 (eq (caar *right-handoffs*) self))
+        (pop *right-handoffs*)))))
 
 (defun %right-reserve-self (self)
   "Release the right WITHOUT ending SELF's quantum: name SELF (the
@@ -5838,7 +5895,12 @@ block at a script boundary)."
              ;; and A3: the teardown never touches the right at all.
              (eq self *right-self*)
              (sb-thread:holding-mutex-p *store-right*))
-    (setf *right-ticket* (%right-successor self)
+    (setf *right-ticket*
+          (if (and (consp *right-handoffs*)
+                   (eq self (cdar *right-handoffs*)))
+              (or (caar *right-handoffs*)
+                  (%right-successor self))
+              (%right-successor self))
           *right-owner* nil)
     (sb-thread:release-mutex *store-right*))
   (when (and self (eq self *right-self*))
@@ -9378,6 +9440,10 @@ runs, and the ledger's rule is that this boundary may not block."
                             (async-thread-native th))))
           (push (async-thread-native th) threads-to-join)))
       (setf *scheduler-threads* nil)
+      ;; a targeted handoff frame must not outlive the store either:
+      ;; its caller is being abandoned, and a stale frame would make
+      ;; every later thread defer the right forever
+      (setf *right-handoffs* nil)
       ;; STEP 4: no ticket survives a teardown (a recycled thread
       ;; object must not alias a dead entry)
       (clrhash *driver-records*))
