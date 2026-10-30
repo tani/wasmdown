@@ -1,3 +1,26 @@
+# M17 SESSION 35 — TEARDOWN SPLIT VERIFIED BY HAND, AND THE CLOSING BLOCK.
+# HAND-AUDIT of %store-teardown (requested before closing, and worth recording because a
+# leaked resume-all in phase 2 would reintroduce the cycle): the definition at
+# src/component-runtime.lisp:9847 is in two clearly marked phases —
+#   phase 1 (line ~9885) is the ONLY place taking *scheduler-mutex*: snapshot threads, set
+#     abandoned/flags, snapshot natives, clear registry/handoff/driver state — no
+#     store-right touch;
+#   phase 2 (line ~9907 onward) is OUTSIDE the scheduler mutex and is where
+#     %task-exit-implicit-thread is called (line ~9915) and where the bounded joins run
+#     (:timeout 0.25).
+# No *scheduler-mutex* occurrence exists in phase 2. The structural pin
+# component/lock-order-no-scheduler-held-across-store-right-pin additionally scans the whole
+# runtime for the violating shape, so this is checked twice: by reading and by machine.
+# THE CLOSING LANE BLOCK (master d2a2008, quiet box): red_runs=0/30, fail_commands=0,
+# walls 9.96-10.32 s. That is the sixth 0-fail block recorded in this session, and the
+# tightest band.
+# PROJECT STATE AT CLOSE: master d2a2008, units 552/0, ONE branch (master), working tree clean
+# except the user's .envrc, plan steps 1-6 implemented, step 7/8 out of scope by user
+# direction, NO parked delta, NO open item. The two standing notes are not work:
+#   - `sync-streams::1` watch row (1/30 twice today) -> measure in a PAIRED window next time;
+#   - the 0-fail x 30 lane acceptance is WINDOW-LOCKED (the same tree measured 0, 1, 2, 9, 18
+#     and 41 fail commands in different windows today); the PINS, each with a negative
+#     control that fails when its rule is re-broken, are the guarantee.
 # M17 SESSION 34 — THE LAST OPEN FINDING IS CLOSED (56d7b83): ONE DOCUMENTED LOCK ORDER.
 # The incidental 3-thread `scheduler <-> thread <-> store-right` cycle is now enumerated, the
 # order is documented at the head of the scheduler section, and the ONE violating site is
