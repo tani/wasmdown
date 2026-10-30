@@ -121,6 +121,40 @@ wast runner's string-to-bytes decoder (same grammar as the suite)."
     ;; and it validates (elem_size < 2^28 for every defined type)
     (wasmdown.component:validate-component comp)))
 
+(test component/binary-declarator-numbering-pin
+  ;; A BINARY instance type numbers only its TYPE-SORT declarators into
+  ;; its own type space (Binary.md line 274), so a func-sort export
+  ;; between two type declarations must not shift the later reference.
+  ;; Witness bytes: wasm-tools 1.262 `wasm-tools parse` of
+  ;;   (component (type $T (instance
+  ;;     (type (func)) (export "f" (func (type 0)))
+  ;;     (type (func (param "x" u32))) (export "g" (func (type 1))))))
+  ;; minus the custom name section. Reference validators accept it; the
+  ;; pre-fix numbering pushed a phantom slot for the func export and
+  ;; rejected it with 'type index out of bounds'.
+  (let* ((bin (%hexb
+                "\\00\\61\\73\\6d\\0d\\00\\01\\00\\07\\1c\\01\\42"
+                "\\04\\01\\40\\00\\01\\00\\04\\00\\01\\66\\01\\00"
+                "\\01\\40\\01\\01\\78\\79\\01\\00\\04\\00\\01\\67"
+                "\\01\\01"))
+         (comp (wasmdown.component:decode-component bin)))
+    (wasmdown.component:validate-component comp)
+    ;; negative control: the same shape with "g" shifted onto the phantom
+    ;; slot index (type 2) must be rejected
+    (let* ((shifted (copy-seq bin))
+           (pos (loop for i below (- (length shifted) 5)
+                      when (and (= (aref shifted i) #x04)
+                                (= (aref shifted (1+ i)) 0)
+                                (= (aref shifted (+ i 2)) 1)
+                                (= (aref shifted (+ i 3)) (char-code #\g)))
+                        return (+ i 5))))
+      (is (integerp pos))
+      (setf (aref shifted pos) 2)
+      (let ((bad (wasmdown.component:decode-component shifted)))
+        (is (handler-case
+                (progn (wasmdown.component:validate-component bad) nil)
+              (wasmdown:validation-error () t)))))))
+
 (test component/section-positive-and-malformed
   ;; one positive + one malformed from the early sections (preamble,
   ;; customs, section ids, type, alias, instance, core instance).

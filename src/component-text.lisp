@@ -1970,7 +1970,8 @@ position)."
               (%flush-interned inner)
               (let ((comp (make-comp
                            :defs (coerce (nreverse *defs*)
-                                         'vector))))
+                                         'vector)
+                           :source :text)))
                 (setf *defs* saved)
                 (setf *intern-scope* saved-intern)
                 (%flush-interned scope)
@@ -2631,7 +2632,8 @@ wasmdown:decode-error on malformed text."
               (%parse-defs rest scope)
               (%flush-interned scope)
               (make-comp
-               :defs (coerce (nreverse *defs*) 'vector)))))))))
+               :defs (coerce (nreverse *defs*) 'vector)
+               :source :text))))))))
 
 ;;; Install the entry point into the runner's hook (src/wast.lisp
 ;;; loads first and calls through *COMPONENT-TEXT-PARSER*).

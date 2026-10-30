@@ -218,7 +218,16 @@ of an interface name use this stricter form (kebab.wast: `A:b/c`,
 
 (defstruct comp
   (defs #() :type vector)                ; flat definition sequence
-  (customs #() :type vector))            ; (name . bytes)
+  (customs #() :type vector)             ; (name . bytes)
+  ;; where the IR came from: :BINARY (the decoder) or :TEXT (the text
+  ;; parser). It picks the DECLARATOR-NUMBERING convention inside a
+  ;; component/instance type (see %check-defvaltype's push): a binary
+  ;; declarator introduces a type index only when its extern type is of
+  ;; sort `type` (Binary.md line 274), whereas the text parser interns a
+  ;; declarator's INLINE type into the enclosing space and numbers the
+  ;; declarators sequentially, so there every import/export declarator
+  ;; occupies a slot.
+  (source :binary :type keyword))
 
 ;;; One definition. KIND is one of :core-module :core-instance :core-type
 ;;; :component :instance :alias :type :canon :start :import :export
@@ -2316,6 +2325,13 @@ is the CURRENT state (Explainer 408-412).")
 ;;; must not leak into each other)
 (defvar *validate-depth* 0)
 
+(defvar *component-def-source* :binary
+  "The IR provenance of the component under validation (COMP's :SOURCE):
+:BINARY from the decoder, :TEXT from the text parser. It picks the
+declarator-numbering convention inside component/instance types
+\(%CHECK-DEFVALTYPE's push). VALIDATE-COMPONENT binds it to the COMP it
+walks, so a nested component carries its own provenance.")
+
 (defun %check-defvaltype (c state &optional (type-depth 1) (outer state))
   "Validate one defined (value) type: label rules, non-emptiness, the
 32-flag limit, type-index bounds + defined-ness, own/borrow resource
@@ -2685,11 +2701,13 @@ type's own declarators stay against STATE, the inner space)."
                ;; annotated-name resource rules read it inside types;
                ;; the pre-push length IS the index the declarator's
                ;; ct is about to occupy)
-               (setf (gethash (length (cval-types inner))
-                              (if (eq (typedecl-kind d) :import)
-                                  (cval-vis-imports inner)
-                                  (cval-vis-exports inner)))
-                     name)
+               (when (or (eq *component-def-source* :text)
+                         (eq (car et) :type))
+                 (setf (gethash (length (cval-types inner))
+                                (if (eq (typedecl-kind d) :import)
+                                    (cval-vis-imports inner)
+                                    (cval-vis-exports inner)))
+                       name))
                ;; slice 5k (annotated-names ::31): the [constructor]/
                ;; [method]/[static] resource-NAME rules inside
                ;; component/instance TYPE declarators -- AFTER the
@@ -2711,6 +2729,18 @@ type's own declarators stay against STATE, the inner space)."
                ;; resource (own/borrow must accept it — resources.wast
                ;; ::27/::28's instance types); an (eq i) bound is an
                ;; alias of i (kept opaque here).
+               ;; A BINARY declarator introduces a type index only
+               ;; when its extern type is of sort `type` (Binary.md
+               ;; line 274; binary.wast ::826's import (type (eq 0))
+               ;; sits at 1 between the string at 0 and the (func) at
+               ;; 2). Func/instance/component-sort declarators name an
+               ;; EXTERN index and must not shift the type space
+               ;; (measured on wasm-tools' output for
+               ;; wasi:io/streams@0.2.12: 15 type indices across 29
+               ;; declarators). The TEXT parser's convention (see
+               ;; COMP-SOURCE) occupies a slot per declarator.
+               (when (or (eq *component-def-source* :text)
+                         (eq (car et) :type))
                (vector-push-extend
                 (if (and (eq (car et) :type)
                          (eq (cdr et) :sub-resource))
@@ -2736,7 +2766,7 @@ type's own declarators stay against STATE, the inner space)."
                                  :offset 0)
                         (make-ct :kind :prim
                                  :payload :imported-or-exported-type)))
-                (cval-types inner)))))))))
+                (cval-types inner))))))))))
        ;; owner-qualified type layers (plan step 1): record, at the
        ;; moment the ct is validated, the view of the space that
        ;; DECLARED it — count 1 = OUTER (this declaring space), 2+ =
@@ -5301,7 +5331,7 @@ yields a resource ct (the canon resource.* target checks read it)."
              (%alias-exported-type-shape-from-hash payload state ent))
         (and (ct-p ent) (eq (ct-kind ent) :instance)
              (%instance-ct-exported-type-shape
-              (aliasrec-name payload) ent)))))
+              (aliasrec-name payload) ent state)))))
 
 (defun %alias-exported-type-shape-from-hash (payload state ent)
   "The HASH-table branch of %alias-exported-type-shape (a bag or an
@@ -5353,11 +5383,16 @@ instantiated instance's export table)."
                             (and pt (cons (cdr hit2) pt))))
             (%inst-export-copy-remap child-comp src-idx))))
          (t nil))))))
-(defun %instance-ct-exported-type-shape (name ct)
+(defun %instance-ct-exported-type-shape (name ct &optional state)
   "The declared SHAPE of an IMPORTED instance's exported TYPE name —
 the instance ct's (export \"n\" (type <bound>)) declarator: a (sub
 resource) bound is a resource ct; an (eq i) bound follows the ct's
-own declarator chain; anything else has no local shape (NIL)."
+own declarator chain (through an alias declarator too — a re-exported
+\"(export \"error\" (type (eq 0)))\" over an \"(alias outer 1 …)\" is the
+wasi:io/streams shape wasm-tools emits, and its shape is the aliased
+RESOURCE); anything else has no local shape (NIL). STATE is the
+enclosing component's validator state — the space an outer alias
+inside the instance type resolves against."
   (let ((d (find name (coerce (ct-payload ct) 'list)
                 :key (lambda (x)
                        (and (eq (typedecl-kind x) :export)
@@ -5381,6 +5416,30 @@ own declarator chain; anything else has no local shape (NIL)."
                                       (return
                                        (case (typedecl-kind x)
                                          (:type (typedecl-payload x))
+                                         (:alias
+                                          ;; the target is itself an
+                                          ;; alias declarator: resolve
+                                          ;; the outer/export alias to
+                                          ;; the ct it names (a
+                                          ;; re-exported resource is
+                                          ;; the case wasm-tools emits)
+                                          (let ((a (typedecl-payload x)))
+                                            (cond
+                                             ((and state
+                                                   (eq (aliasrec-kind a)
+                                                       :outer)
+                                                   (eq (aliasrec-sort a)
+                                                       :type)
+                                                   (< (aliasrec-target a)
+                                                      (length (cval-types
+                                                               state))))
+                                              (aref (cval-types state)
+                                                    (aliasrec-target a)))
+                                             ((eq (aliasrec-kind a)
+                                                  :export)
+                                              (%alias-exported-type-shape
+                                               a state))
+                                             (t nil))))
                                          (t nil)))))
                                    (t nil))
                               finally (return nil))))
@@ -7430,7 +7489,8 @@ the number of enclosing component/type scopes (outer aliases)."
         ;; per Explainer 408-412). The :component arm below pushes
         ;; THIS state around each nested validate-component; the
         ;; type-declarator arms push in %check-defvaltype.
-        (*outer-states* *outer-states*))
+        (*outer-states* *outer-states*)
+        (*component-def-source* (comp-source comp)))
     (declare (ignorable core-funcs memories tables globals))
     ;; owner-qualified type layers: record the enclosing-component
     ;; RING on the space as it is entered — every later walk
