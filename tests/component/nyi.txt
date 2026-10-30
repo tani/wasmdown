@@ -1,3 +1,31 @@
+# M17 SESSION 27 — TYPE-VIEW LANDED (merge ccfa333) AND THE FINAL LANE READS
+# 0 fail x 30 WITH IT IN. Step 1 is now fully complete; no parked branch remains.
+# THE THIRD (AND DECIDING) VERDICT: reapplied on master 57d54ae with the pins merged by
+# name, the type-view tree measured red 0/30, fail_commands 0, walls 10.01-10.35 s —
+# the same green as master's own blocks (0/30 twice today). Its earlier readings were
+# 2/30 (sync-streams::1 + reentrance::20 = window one-offs) and, before the acs fixes,
+# 29/30 (the acs mechanism, not this feature). So the historical blocker was never the
+# type-view work; it was the row underneath it, which is now fixed and pinned.
+# PROBE EVIDENCE, personally run on the landing tree: the four named fixtures 59/59 and
+# the 12-fixture superset 225/225; units 544/0 twice (543 + component/type-view-owner-
+# pins with its five assertions).
+# THE FINAL LANE BLOCK AFTER THE MERGE: red_runs=0/30, fail_commands=0, walls 10.00-10.45
+# (master ccfa333). Four independent 0-fail blocks on this tree across this session.
+# THE PIN-MERGE TRAP, recorded one last time because it cost two attempts: the type-view
+# pin half conflicts with every later pin only in the REGISTRATION LIST; it must be
+# merged BY NAME (master's full list plus component/type-view-owner-pins). A side-pick
+# silently drops twelve regression pins. Correct merge = master's unit count + 1.
+# BRANCH LEDGER, final state: every wip/ branch, rerun/type-view, verdict/* and the
+# lane/* measurement branches are DELETED — their content is on master or their question
+# is answered and recorded here. NOTHING IS LEFT PARKED.
+# THE PLAN, FINAL DISPOSITION:
+#   step 1 COMPLETE  step 2 COMPLETE  step 3 COMPLETE (provider composition from the
+#   resolved world is the one recorded deferral)  step 4 COMPLETE AS MECHANISM
+#   step 5 COMPLETE  step 6 COMPLETE (send-direction resume test limitation recorded)
+#   step 7/8 OUT OF SCOPE (WASI HTTP removed at user direction)
+# THE NUMBERS: units 544 passed / 0 failed; component lane 0 fail x 30 (four blocks, the
+# last one with every change in); core lane 21,187 pass / 73 unsupported / 0 fail,
+# unchanged from its pinned baseline.
 # M17 SESSION 26 — THE FOUR-ROW ANTI-LAND FACT, THE WALL BANDS, AND THE BRANCH LEDGER.
 # 1. THE BORROW ARM LIVES BECAUSE FOUR ROWS PROVE IT. With the borrow lend arms deleted
 #    (stream/future arms deleted only, correctly), the probe set reads exactly:
