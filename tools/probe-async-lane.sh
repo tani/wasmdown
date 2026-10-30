@@ -28,6 +28,11 @@
 # Usage:
 #   tools/probe-async-lane.sh --branch master --runs 30 --label master-A
 #   tools/probe-async-lane.sh --branch wip/type-view --runs 30 --label tv-A
+#   tools/probe-async-lane.sh --branch master --runs 6 --label wip-diff --allow-dirty
+#     (--allow-dirty meters an UNLANDED diff and prints its sha256 prefix, so a
+#      subagent's working tree can be measured before it is committed. It is the
+#      only way to measure work in progress; never use it to compare a landed
+#      branch against a dirty tree.)
 # then compare the two labels' fail-command totals. A difference smaller than
 # ~22 fails/30 is not a result; it is the instrument's width.
 #
@@ -39,6 +44,7 @@ ROOT=$(pwd)
 
 BRANCH=""
 RUNS=30
+ALLOW_DIRTY=0
 LABEL=""
 TIMEOUT=200
 GENERATED="tests/component-results.jsonl CONFORMANCE-COMPONENT.md"
@@ -49,6 +55,7 @@ while [ $# -gt 0 ]; do
     --runs)   RUNS=$2; shift 2 ;;
     --label)  LABEL=$2; shift 2 ;;
     --timeout) TIMEOUT=$2; shift 2 ;;
+    --allow-dirty) ALLOW_DIRTY=1; shift ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
 done
@@ -69,12 +76,17 @@ DIRTY=$(git status --porcelain \
           | grep -v '^ M \.envrc$' \
           | grep -v '^?? tools/probe-async-lane.sh$' \
           | grep -v '^?? tests/lane-batches/' || true)
-if [ -n "$DIRTY" ]; then
+if [ -n "$DIRTY" ] && [ "$ALLOW_DIRTY" = "0" ]; then
   echo "REFUSING: working tree is not clean (only .envrc may be modified):" >&2
   echo "$DIRTY" >&2
   echo "Check out generated artifacts with:" >&2
   echo "  git checkout -- $GENERATED" >&2
   exit 2
+fi
+if [ -n "$DIRTY" ] && [ "$ALLOW_DIRTY" = "1" ]; then
+  echo "NOTE: metering an UNLANDED diff (--allow-dirty): the batch describes this"
+  echo "      working tree, not the branch tip. Record the diff hash with the result:"
+  git diff | sha256sum | cut -c1-16
 fi
 
 # ---- guard 3: machine quietness --------------------------------------------
