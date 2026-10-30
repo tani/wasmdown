@@ -2,13 +2,15 @@
 # SESSION DOES NOT RECOMPUTE THEM.
 # `git diff master wip/type-view -- src/component.lisp` = 24 hunks. Their NEW-side
 # start lines, in order:
-#   1686 2456 2738 2753 2781 4977 5118 5139 5149 6112 6196 6205 6227 6540 6562
-#   6982 7062 7082 7140 7310 7361 7373 7395 7420
+#   1680 2450 2732 2747 2775 4971 5112 5134 5144 6106 6190 6199 6221 6534 6556
+#   6976 7056 7066 7105 7365 7398 7427 8670 8726
+#   (measured, not estimated: `git diff master wip/type-view -- src/component.lisp
+#    | grep '^@@' | sed 's/@@ -[0-9,]* +\([0-9,]*\) @@.*/\1/' | cut -d, -f1`)
 # Composition rule for the halving (so "the offending half again" needs no
 # recomputation): define cut A = hunks whose start line is < 5000 and cut B = the
 # rest. Apply A alone on a scratch branch, 3 lane runs; if acs::2 is 3/3 the vector
 # is inside A, else inside B; then halve the winning side by the same rule using
-# its own line anchors (A is 6 hunks: 1686..4977; B is 18 hunks: 5118..7420).
+# its own line anchors (A is 6 hunks: 1680..4971; B is 18 hunks: 5112..8726).
 # Every probe is 3 lane runs because the effect size is 29/30 vs 2/30.
 # M17 SESSION 5d — THE NEXT ATTRIBUTION PASS IS HUNK-RANGE BISECTION, AND THE
 # FAILURE OF FIVE FUNCTION-LEVEL CUTS IS ITSELF THE EVIDENCE.
