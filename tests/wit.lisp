@@ -594,3 +594,378 @@ interface types {
     (is (find-if (lambda (p) (and (search "references @unstable `hidden`" p)
                                   (search "not itself @unstable" p)))
                  problems))))
+
+;;; ---------------------------------------------------------------
+;;; Plan step 3, parser half: the world constructs the vendored
+;;; corpus does not use (include/rename, named and inline interface
+;;; bindings, world-level use/type/func, positional @external-id).
+;;;
+;;; These are WORLD-LEVEL EQUIVALENCE tests: every fixture is parsed,
+;;; resolve-wit-world is run, and the resolved import/export set is
+;;; compared against the equivalent hand-expanded world. Vendored
+;;; stability says nothing about these constructs.
+
+(defun w-error (thunk)
+  "The message of the wit-error THUNK signals, or NIL."
+  (handler-case (progn (funcall thunk) nil)
+    (wasmdown.wit:wit-error (c) (wasmdown:wasmdown-error-message c))))
+
+(defun item-shape (item)
+  "Everything the resolved world must agree on for two worlds to be
+equivalent, plus the resolved target's interface name."
+  (list (wasmdown.wit:wit-world-item-sort item)
+        (wasmdown.wit:wit-world-item-kind item)
+        (wasmdown.wit:wit-world-item-name item)
+        (wasmdown.wit:wit-world-item-namespace item)
+        (wasmdown.wit:wit-world-item-package item)
+        (wasmdown.wit:wit-world-item-interface item)
+        (wasmdown.wit:wit-world-item-version item)
+        (wasmdown.wit:wit-world-item-implements item)
+        (wasmdown.wit:wit-world-item-external-id item)
+        (let ((target (wasmdown.wit:wit-world-item-target item)))
+          (and (wasmdown.wit:wit-interface-p target)
+               (wasmdown.wit:wit-interface-name target)))))
+
+(defun world-shape (world)
+  (list (mapcar #'item-shape (wasmdown.wit:wit-world-imports world))
+        (mapcar #'item-shape (wasmdown.wit:wit-world-exports world))))
+
+(defun find-item (world name sort)
+  (find name
+        (if (eq sort :export)
+            (wasmdown.wit:wit-world-exports world)
+            (wasmdown.wit:wit-world-imports world))
+        :key #'wasmdown.wit:wit-world-item-name :test #'string=))
+
+(test wit/parser-include-rename-equivalence
+  (let* ((pkg (wasmdown.wit:parse-wit-string
+               "package test:inc@0.1.0;
+
+interface store {
+  get: func(key: string) -> option<string>;
+}
+
+world base {
+  import cache: store;
+  export handler: store;
+}
+
+world extended {
+  import cache: func();
+  include base with { cache as my-cache, handler as my-handler };
+}
+
+world flat {
+  import cache: func();
+  import my-cache: store;
+  export my-handler: store;
+}
+"))
+         (extended (wasmdown.wit:resolve-wit-world pkg "extended"
+                                                   :packages (list pkg)))
+         (flat (wasmdown.wit:resolve-wit-world pkg "flat"
+                                               :packages (list pkg))))
+    ;; the raw AST keeps the include verbatim ...
+    (let ((base (gethash "base" (wasmdown.wit:wit-package-worlds pkg))))
+      (is (= 1 (length (wasmdown.wit:wit-world-includes
+                        (gethash "extended"
+                                 (wasmdown.wit:wit-package-worlds pkg))))))
+      (is (equal (wasmdown.wit:wit-world-include-renames
+                  (first (wasmdown.wit:wit-world-includes
+                          (gethash "extended"
+                                   (wasmdown.wit:wit-package-worlds pkg)))))
+                 '(("cache" . "my-cache") ("handler" . "my-handler"))))
+      ;; ... and the included world is not mutated
+      (is (null (wasmdown.wit:wit-world-includes base)))
+      (is (string= (wasmdown.wit:wit-world-item-name
+                    (first (wasmdown.wit:wit-world-imports base)))
+                   "cache")))
+    ;; the resolved union is the hand-expanded world, element for element
+    (is (equal (world-shape extended) (world-shape flat)))
+    ;; a rename rewrites the label only: the target and implements
+    ;; value still name the store interface
+    (let ((renamed (find-item extended "my-cache" :import)))
+      (is (string= (wasmdown.wit:wit-world-item-implements renamed)
+                   "test:inc/store"))
+      (is (eq (wasmdown.wit:wit-world-item-target renamed)
+              (iface pkg "store"))))))
+
+(test wit/parser-include-bare-name-rename
+  (let* ((pkg (wasmdown.wit:parse-wit-string
+               "package test:bare@0.1.0;
+
+interface types {
+  type t = u32;
+}
+
+world base {
+  import types;
+}
+
+world w {
+  include base with { types as my-types };
+}
+
+world flat {
+  import my-types: types;
+}
+"))
+         (w (wasmdown.wit:resolve-wit-world pkg "w" :packages (list pkg)))
+         (flat (wasmdown.wit:resolve-wit-world pkg "flat"
+                                               :packages (list pkg))))
+    ;; a bare interface binding is renameable by its final path segment;
+    ;; the rename turns it into a named binding with the implements value
+    (is (equal (world-shape w) (world-shape flat)))
+    (let ((item (find-item w "my-types" :import)))
+      (is (string= (wasmdown.wit:wit-world-item-interface item) "types"))
+      (is (string= (wasmdown.wit:wit-world-item-implements item)
+                   "test:bare/types")))))
+
+(test wit/parser-include-cycle
+  (let* ((pkg (wasmdown.wit:parse-wit-string
+               "package test:cycle@0.1.0;
+
+world a { include b; }
+world b { include a; }
+"))
+         (message (w-error (lambda ()
+                             (wasmdown.wit:resolve-wit-world
+                              pkg "a" :packages (list pkg))))))
+    (is message)
+    (is (search "include cycle" message))
+    ;; the error names the world whose include closed the cycle
+    (is (search "world `b`" message))
+    ;; and the full chain, oldest ancestor first
+    (is (search "a -> b -> a" message))))
+
+(test wit/parser-rename-missing-source
+  (let* ((pkg (wasmdown.wit:parse-wit-string
+               "package test:rename@0.1.0;
+
+world base { import a: func(); }
+
+world w {
+  include base with { nope as x };
+}
+"))
+         (message (w-error (lambda ()
+                             (wasmdown.wit:resolve-wit-world
+                              pkg "w" :packages (list pkg))))))
+    (is message)
+    (is (search "rename source `nope` does not exist" message))
+    (is (search "world `w`" message))
+    (is (search "world `base`" message))))
+
+(test wit/parser-rename-target-collision
+  (let* ((pkg (wasmdown.wit:parse-wit-string
+               "package test:collide@0.1.0;
+
+world base { import a: func(); }
+
+world w {
+  import b: func();
+  include base with { a as b };
+}
+"))
+         (message (w-error (lambda ()
+                             (wasmdown.wit:resolve-wit-world
+                              pkg "w" :packages (list pkg))))))
+    (is message)
+    (is (search "renamed binding `b` collides" message))
+    (is (search "world `w`" message))))
+
+(test wit/parser-inline-and-named-bindings
+  (let* ((pkg (wasmdown.wit:parse-wit-string
+               "package test:bind@0.1.0;
+
+world w {
+  import local: interface {
+    ping: func() -> u32;
+  }
+  import primary: wasi:kv/store;
+  @external-id(\"catalog-db-prod:region-a\")
+  import catalog: wasi:kv/store;
+  export my-handler: wasi:kv/store;
+}
+"))
+         (kv (wasmdown.wit:parse-wit-string
+              "package wasi:kv@1.0.0;
+
+interface store {
+  get: func(key: string) -> option<string>;
+}
+"))
+         (resolved (wasmdown.wit:resolve-wit-world pkg "w"
+                                                   :packages (list kv)))
+         (local (find-item resolved "local" :import))
+         (primary (find-item resolved "primary" :import))
+         (catalog (find-item resolved "catalog" :import))
+         (handler (find-item resolved "my-handler" :export)))
+    ;; the inline interface binds its own body
+    (is (eq (wasmdown.wit:wit-world-item-kind local) :inline-interface))
+    (is (wasmdown.wit:wit-interface-p
+         (wasmdown.wit:wit-world-item-target local)))
+    (is (func (wasmdown.wit:wit-world-item-target local) "ping"))
+    (is (null (wasmdown.wit:wit-world-item-implements local)))
+    ;; named interface bindings carry the (implements "...") value in
+    ;; the component layer's own attribute shape
+    (is (string= (wasmdown.wit:wit-world-item-implements primary)
+                 "wasi:kv/store"))
+    (is (equal (wasmdown.wit:wit-world-item-attributes primary)
+               '((:implements . "wasi:kv/store"))))
+    (is (string= (wasmdown.component::%attr-of-kind
+                  (wasmdown.wit:wit-world-item-attributes primary)
+                  :implements)
+                 "wasi:kv/store"))
+    ;; both named bindings target the SAME interface identity but are
+    ;; DISTINCT bindings (not de-duplicated)
+    (is (eq (wasmdown.wit:wit-world-item-target primary)
+            (wasmdown.wit:wit-world-item-target catalog)))
+    (is (eq (wasmdown.wit:wit-world-item-target primary)
+            (wasmdown.wit:wit-world-item-target handler)))
+    (is (not (eq primary catalog)))
+    (is (string= (wasmdown.wit:wit-world-item-name primary) "primary"))
+    (is (string= (wasmdown.wit:wit-world-item-name catalog) "catalog"))
+    ;; the positional external-id is carried onto the resolved item and
+    ;; stays in the raw annotation list
+    (is (string= (wasmdown.wit:wit-world-item-external-id catalog)
+                 "catalog-db-prod:region-a"))
+    (is (equal (wasmdown.wit:wit-world-item-attributes catalog)
+               '((:implements . "wasi:kv/store")
+                 (:external-id . "catalog-db-prod:region-a"))))
+    (is (find "external-id" (wasmdown.wit:wit-world-item-annotations catalog)
+              :key #'wasmdown.wit:wit-annotation-name :test #'string=))
+    (is (null (wasmdown.wit:wit-world-item-external-id primary)))))
+
+(test wit/parser-own-borrow-resolution
+  (let* ((pkg (wasmdown.wit:parse-wit-string
+               "package test:res@0.1.0;
+
+interface types {
+  resource r;
+  type n = u32;
+}
+
+world ok {
+  use types.{r};
+  type h = own<r>;
+  type b = borrow<r>;
+}
+
+world unknown {
+  type h = own<missing>;
+}
+
+world nonresource {
+  use types.{n};
+  type h = borrow<n>;
+}
+"))
+         (iface (iface pkg "types")))
+    ;; success through the resolved world scope
+    (let* ((resolved (wasmdown.wit:resolve-wit-world pkg "ok"
+                                                     :packages (list pkg)))
+           (h (gethash "h" (wasmdown.wit:wit-world-types resolved))))
+      (is h)
+      (is (equal (wasmdown.wit:wit-type-expr h) '(:own "r"))))
+    ;; success through the ct conversion, with the resource identity
+    (is (eq (wasmdown.component:ct-kind
+             (wasmdown.wit:wit-type->ct iface '(:own "r")))
+            :own))
+    (is (eq (wasmdown.component:ct-kind
+             (wasmdown.component:ct-payload
+              (wasmdown.wit:wit-type->ct iface '(:borrow "r"))))
+            :resource))
+    ;; failure mode 1: an unknown name is a wit-error, never a raw string
+    (let ((message (w-error (lambda ()
+                              (wasmdown.wit:wit-type->ct iface '(:own "missing"))))))
+      (is message)
+      (is (search "unknown resource type `missing`" message)))
+    ;; failure mode 2: a non-resource name is a wit-error
+    (let ((message (w-error (lambda ()
+                              (wasmdown.wit:wit-type->ct iface '(:borrow "n"))))))
+      (is message)
+      (is (search "does not name a resource" message)))
+    ;; the resolver reports the same two failures against a world scope
+    (let ((message (w-error (lambda ()
+                              (wasmdown.wit:resolve-wit-world
+                               pkg "unknown" :packages (list pkg))))))
+      (is message)
+      (is (search "world `unknown`" message))
+      (is (search "unresolvable type reference `missing`" message)))
+    (let ((message (w-error (lambda ()
+                              (wasmdown.wit:resolve-wit-world
+                               pkg "nonresource" :packages (list pkg))))))
+      (is message)
+      (is (search "does not name a resource" message))
+      (is (search "`n`" message)))))
+
+(test wit/parser-resource-identity
+  (let* ((pkg (wasmdown.wit:parse-wit-string
+               "package test:ident@0.1.0;
+
+interface shared {
+  resource r;
+}
+
+world w {
+  use shared.{r};
+  use shared.{r as r2};
+  import primary: shared;
+  import secondary: shared;
+}
+"))
+         (resolved (wasmdown.wit:resolve-wit-world pkg "w"
+                                                   :packages (list pkg)))
+         (r-ct (wasmdown.component:ct-payload
+                (wasmdown.wit:wit-type->ct resolved '(:own "r"))))
+         (r2-ct (wasmdown.component:ct-payload
+                 (wasmdown.wit:wit-type->ct resolved '(:own "r2")))))
+    ;; two use paths that alias ONE resource declaration share the ct
+    (is (eq r-ct r2-ct))
+    (is (eq (wasmdown.component:ct-kind r-ct) :resource))
+    (let ((primary (find-item resolved "primary" :import))
+          (secondary (find-item resolved "secondary" :import)))
+      ;; two independent imports of the same interface are two
+      ;; bindings over one interface identity
+      (is (not (eq primary secondary)))
+      (is (eq (wasmdown.wit:wit-world-item-target primary)
+              (wasmdown.wit:wit-world-item-target secondary)))
+      (is (eq (wasmdown.wit:wit-world-item-target primary)
+              (iface pkg "shared"))))))
+
+(test wit/parser-unresolved-version-and-type
+  (let* ((pkg (wasmdown.wit:parse-wit-string
+               "package test:unres@0.1.0;
+
+interface types { type t = u32; }
+
+world w {
+  use types.{nope};
+}
+"))
+         (message (w-error (lambda ()
+                             (wasmdown.wit:resolve-wit-world
+                              pkg "w" :packages (list pkg))))))
+    (is message)
+    (is (search "world `w`" message))
+    (is (search "unresolvable type reference `nope`" message)))
+  (let* ((pkg (wasmdown.wit:parse-wit-string
+               "package test:unres2@0.1.0;
+
+world w {
+  import wasi:kv/store@9.9.9;
+}
+"))
+         (kv (wasmdown.wit:parse-wit-string
+              "package wasi:kv@1.0.0;
+
+interface store { get: func() -> u32; }
+"))
+         (message (w-error (lambda ()
+                             (wasmdown.wit:resolve-wit-world
+                              pkg "w" :packages (list kv))))))
+    (is message)
+    (is (search "world `w`" message))
+    (is (search "unresolved package version" message))
+    (is (search "9.9.9" message))))

@@ -315,6 +315,7 @@
    #:wit-use-interface
    #:wit-use-version
    #:wit-use-items
+   #:wit-use-renames
    #:wit-use-annotations
    #:wit-world
    #:wit-world-p
@@ -323,18 +324,35 @@
    #:wit-world-imports
    #:wit-world-exports
    #:wit-world-annotations
+   #:wit-world-items
+   #:wit-world-includes
+   #:wit-world-uses
+   #:wit-world-types
+   #:wit-world-resource-cts
    #:wit-world-item
    #:wit-world-item-p
    #:wit-world-item-sort
+   #:wit-world-item-kind
+   #:wit-world-item-name
    #:wit-world-item-namespace
    #:wit-world-item-package
    #:wit-world-item-interface
    #:wit-world-item-version
+   #:wit-world-item-target
+   #:wit-world-item-implements
+   #:wit-world-item-external-id
+   #:wit-world-item-attributes
    #:wit-world-item-annotations
+   #:wit-world-include
+   #:wit-world-include-p
+   #:wit-world-include-target
+   #:wit-world-include-renames
+   #:wit-world-include-annotations
    #:wit-annotation
    #:wit-annotation-p
    #:wit-annotation-name
    #:wit-annotation-args
+   #:wit-annotation-values
    ;; type resolution / conversion
    #:resolve-wit-type
    #:wit-type->ct

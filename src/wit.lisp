@@ -222,28 +222,44 @@ sigil and is not part of the name."
                     (wit-token-text tk))))))
 
 (defun %parse-annotations (r)
+  "Read the `@name(...)` forms at the reader position. Both the named
+form `@since(version = 0.2.0)` and the positional form
+`@external-id(\"https://...\")` are accepted; NAMED arguments go to the
+annotation's ARGS alist and positional ones to its VALUES list. One
+annotation may not mix the two spellings."
   (let ((out '()))
     (loop while (%punct-p (%peek r) "@")
           do (%next r)
              (let ((name (%expect-ident r))
-                   (args '()))
+                   (args '())
+                   (values '()))
                (%expect-punct r "(")
                (unless (%punct-p (%peek r) ")")
                  (loop
-                   (let ((key (%expect-ident r)))
-                     (%expect-punct r "=")
-                     (push (cons key (%parse-annotation-value r)) args))
+                   (let ((tk (%peek r)))
+                     (if (and (eq (and tk (wit-token-kind tk)) :ident)
+                              (%punct-p (wit-reader-peek r 1) "="))
+                         (let ((key (%expect-ident r)))
+                           (%expect-punct r "=")
+                           (push (cons key (%parse-annotation-value r)) args))
+                         (push (%parse-annotation-value r) values)))
                    (if (%punct-p (%peek r) ",")
                        (%next r)
                        (return))))
                (%expect-punct r ")")
-               (push (make-wit-annotation :name name :args (nreverse args))
+               (when (and args values)
+                 (%werr r "annotation `@~a` mixes positional and named arguments"
+                        name))
+               (push (make-wit-annotation :name name
+                                          :args (nreverse args)
+                                          :values (nreverse values))
                      out)))
     (nreverse out)))
 
 (defstruct wit-annotation
   (name "" :type string)
-  (args nil))                            ; alist (key . value) strings
+  (args nil)                             ; alist (key . value) strings
+  (values nil))                          ; positional argument strings
 
 ;;; ---------------------------------------------------------------
 ;;; Type expressions.
@@ -403,7 +419,8 @@ sigil and is not part of the name."
   (package nil)
   (interface "" :type string)
   (version nil)
-  (items nil)                            ; list of imported names
+  (items nil)                            ; list of imported SOURCE names
+  (renames nil)                          ; alist (source . local)
   (annotations nil))
 
 (defstruct wit-world
@@ -411,14 +428,50 @@ sigil and is not part of the name."
   (package nil)
   (annotations nil)
   (imports nil)
-  (exports nil))
+  (exports nil)
+  ;; declaration order over every world definition: wit-world-item and
+  ;; wit-world-include nodes, interleaved. INCLUDES holds just the
+  ;; include nodes (for callers that want the raw union declarations).
+  (items nil)
+  (includes nil)
+  (uses nil)                             ; list of wit-use
+  ;; world-level typedefs share the interface scope operations (see
+  ;; %SCOPE-TYPES), so a world is a type-resolution scope too
+  (types (make-hash-table :test #'equal))
+  (resource-cts (make-hash-table :test #'equal)))
 
 (defstruct wit-world-item
-  (sort :import :type keyword)           ; :import | :export
+  (sort :import :type keyword)           ; :import | :export | :use | :type
+  ;; :interface         a path import/export (bare or `name: path')
+  ;; :inline-interface  `import name: interface { ... }'
+  ;; :func              `import name: func(...)'
+  ;; :type / :resource  a world-level typedef
+  ;; :use               a world-level `use'
+  (kind :interface :type keyword)
+  ;; the explicit plain binding name (`name:' prefix), NIL for a bare
+  ;; interface-path binding
+  (name nil)
   (namespace nil)
   (package nil)
   (interface "" :type string)            ; the interface/world name
   (version nil)
+  ;; after resolution: the resolved wit-interface / wit-func / wit-type
+  ;; / wit-resource / wit-use node; at parse time only the inline
+  ;; (self-contained) kinds carry it
+  (target nil)
+  ;; for `name: use-path' the component-level (implements "...") value,
+  ;; in the same string shape %ATTR-OF / %CHECK-NAME-ATTRS carry
+  (implements nil)
+  ;; the positional @external-id("...") string
+  (external-id nil)
+  (annotations nil))
+
+(defstruct wit-world-include
+  ;; (namespace package interface version), the world being included
+  (target nil)
+  ;; (source . local) pairs; a rename rewrites only the included
+  ;; world's plain binding labels
+  (renames nil)
   (annotations nil))
 
 (defun %parse-version-opt (r)
@@ -446,14 +499,21 @@ interface version). A bare name has NIL namespace/package."
       (t (values nil nil first nil)))))
 
 (defun %parse-use (r annotations)
+  "Parse `use <path>.{a, b as c};`. ITEMS keeps the source names (so
+existing lookups keep working); RENAMES records (source . local)."
   (multiple-value-bind (ns pkg iname version)
       (progn (%expect-keyword r "use") (%parse-path r))
     (%expect-punct r ".")
     (%expect-punct r "{")
-    (let ((items '()))
+    (let ((items '())
+          (renames '()))
       (unless (%punct-p (%peek r) "}")
         (loop
-          (push (%expect-ident r) items)
+          (let ((item (%expect-ident r)))
+            (push item items)
+            (when (%keyword-p r "as")
+              (%next r)
+              (push (cons item (%expect-ident r)) renames)))
           (if (%punct-p (%peek r) ",")
               (%next r)
               (return))))
@@ -461,6 +521,7 @@ interface version). A bare name has NIL namespace/package."
       (%expect-punct r ";")
       (make-wit-use :namespace ns :package pkg :interface iname
                     :version version :items (nreverse items)
+                    :renames (nreverse renames)
                     :annotations annotations))))
 
 (defun %parse-record-fields (r)
@@ -679,6 +740,17 @@ LABELS MEMBER-ANNOTATIONS); see %PARSE-RECORD-FIELDS."
                fn)))))
     item))
 
+(defun %finalize-interface (iface)
+  (setf (wit-interface-func-list iface)
+        (nreverse (wit-interface-func-list iface)))
+  (setf (wit-interface-resource-list iface)
+        (nreverse (wit-interface-resource-list iface)))
+  (setf (wit-interface-items iface)
+        (nreverse (wit-interface-items iface)))
+  (setf (wit-interface-uses iface)
+        (nreverse (wit-interface-uses iface)))
+  iface)
+
 (defun %parse-interface (r package annotations)
   (%expect-keyword r "interface")
   (let* ((name (%expect-ident r))
@@ -688,46 +760,215 @@ LABELS MEMBER-ANNOTATIONS); see %PARSE-RECORD-FIELDS."
     (loop until (%punct-p (%peek r) "}")
           do (%parse-interface-item r iface (%parse-annotations r)))
     (%expect-punct r "}")
-    (setf (wit-interface-func-list iface)
-          (nreverse (wit-interface-func-list iface)))
-    (setf (wit-interface-resource-list iface)
-          (nreverse (wit-interface-resource-list iface)))
-    (setf (wit-interface-items iface)
-          (nreverse (wit-interface-items iface)))
-    (setf (wit-interface-uses iface)
-          (nreverse (wit-interface-uses iface)))
+    (%finalize-interface iface)
     (setf (gethash name (wit-package-interfaces package)) iface)
     (push iface (wit-package-interface-list package))
     iface))
+
+;;; ---------------------------------------------------------------
+;;; Worlds.
+;;;
+;;; The world grammar (specs/WIT.md, "Item: world") is wider than the
+;;; vendored WASI snapshot uses. The raw AST records every definition
+;;; verbatim:
+;;;
+;;;   import <path>;                     a bare interface-name binding
+;;;   import name: <path>;               a named interface binding
+;;;   import name: interface { ... };    an inline interface
+;;;   import name: func(...) -> T;       a world function
+;;;   export ...                         the same three
+;;;   use <path>.{a, b as c};            a world-level type import
+;;;   type/record/enum/flags/variant/resource ...
+;;;   include <path> [with { a as b, ... }];
+;;;
+;;; `implements' is NOT a WIT keyword: a named interface binding yields
+;;; one, exactly the attribute %ATTR-OF/%CHECK-NAME-ATTRS already
+;;; carry, so the item stores its value directly.
+
+(defun %token-adjacent-p (a b)
+  "Do tokens A and B touch in the source (no blank between them)?"
+  (and a b (= (wit-token-start b)
+              (+ (wit-token-start a) (length (wit-token-text a))))))
+
+(defun %world-named-binding-p (r)
+  "After `import'/'export', is the next form `name: <extern-type>'?
+The spec's lexing rule distinguishes `a:b' (a package path) from
+`a: b' (a named binding) by the blank AFTER the colon."
+  (let ((tk (%peek r))
+        (colon (wit-reader-peek r 1))
+        (after (wit-reader-peek r 2)))
+    (and (%ident-p tk)
+         (%punct-p colon ":")
+         (or (null after) (not (%token-adjacent-p colon after))))))
+
+(defun %world-external-id (r annotations)
+  "The positional @external-id(\"...\") value in ANNOTATIONS, or NIL.
+The annotation itself stays in the raw list."
+  (let ((a (find "external-id" annotations
+                 :key #'wit-annotation-name :test #'string=)))
+    (cond
+      ((null a) nil)
+      ((or (wit-annotation-args a)
+           (not (eql 1 (length (wit-annotation-values a)))))
+       (%werr r "@external-id takes exactly one positional string argument"))
+      (t (first (wit-annotation-values a))))))
+
+(defun %interface-reference-string (package ns pkg iface version)
+  "The interface name of a path: ns:pkg/iface@version. A same-package
+reference gets the package's own name (specs/WIT.md: `a' is short for
+`local:demo/a')."
+  (if (or ns pkg)
+      (format nil "~@[~a:~]~a/~a~@[@~a~]" ns pkg iface version)
+      (format nil "~a/~a~@[@~a~]" (wit-package-name package) iface version)))
+
+(defun %parse-inline-interface (r package name annotations)
+  (%expect-keyword r "interface")
+  (let ((iface (make-wit-interface :name name :package package
+                                   :annotations annotations)))
+    (%expect-punct r "{")
+    (loop until (%punct-p (%peek r) "}")
+          do (%parse-interface-item r iface (%parse-annotations r)))
+    (%expect-punct r "}")
+    (%finalize-interface iface)))
+
+(defun %parse-include (r annotations)
+  (%expect-keyword r "include")
+  (multiple-value-bind (ns pkg iname version) (%parse-path r)
+    (let ((renames '()))
+      (when (%keyword-p r "with")
+        (%next r)
+        (%expect-punct r "{")
+        (loop until (%punct-p (%peek r) "}")
+              do (let ((source (%expect-ident r)))
+                   (%expect-keyword r "as")
+                   (push (cons source (%expect-ident r)) renames))
+                 (unless (%punct-p (%peek r) "}")
+                   (%expect-punct r ",")))
+        (%expect-punct r "}"))
+      (%expect-punct r ";")
+      (make-wit-world-include
+       :target (list ns pkg iname version)
+       :renames (nreverse renames)
+       :annotations annotations))))
+
+(defun %parse-world-extern (r world sort annotations)
+  "Parse the body of an `import'/'export' after its keyword."
+  (%next r)
+  (let ((external-id (%world-external-id r annotations)))
+    (if (%world-named-binding-p r)
+        (let ((binding (%expect-ident r)))
+          (%expect-punct r ":")
+          (cond
+            ((%keyword-p r "func")
+             (let ((fn (%parse-func-signature r binding annotations)))
+               (%world-add-item world
+                                (make-wit-world-item
+                                 :sort sort :kind :func :name binding
+                                 :target fn :external-id external-id
+                                 :annotations annotations))))
+            ((%keyword-p r "interface")
+             (let ((iface (%parse-inline-interface r
+                                                   (wit-world-package world)
+                                                   binding annotations)))
+               (%world-add-item world
+                                (make-wit-world-item
+                                 :sort sort :kind :inline-interface
+                                 :name binding :target iface
+                                 :external-id external-id
+                                 :annotations annotations))))
+            (t
+             (multiple-value-bind (ns pkg iname version) (%parse-path r)
+               (%expect-punct r ";")
+               (%world-add-item world
+                                (make-wit-world-item
+                                 :sort sort :kind :interface :name binding
+                                 :namespace ns :package pkg
+                                 :interface iname :version version
+                                 :implements
+                                 (%interface-reference-string
+                                  (wit-world-package world)
+                                  ns pkg iname version)
+                                 :external-id external-id
+                                 :annotations annotations))))))
+        (multiple-value-bind (ns pkg iname version) (%parse-path r)
+          (%expect-punct r ";")
+          (%world-add-item world
+                           (make-wit-world-item
+                            :sort sort :kind :interface
+                            :namespace ns :package pkg
+                            :interface iname :version version
+                            :external-id external-id
+                            :annotations annotations))))))
+
+(defun %world-add-item (world item)
+  "Append ITEM to WORLD's per-sort list and to its declaration-order
+ITEMS list."
+  (push item (wit-world-items world))
+  (case (wit-world-item-sort item)
+    (:import (push item (wit-world-imports world)))
+    (:export (push item (wit-world-exports world))))
+  item)
 
 (defun %parse-world (r package annotations)
   (%expect-keyword r "world")
   (let* ((name (%expect-ident r))
          (world (make-wit-world :name name :package package
-                                :annotations annotations)))
+                                :annotations annotations))
+         ;; world-level typedefs reuse the interface-item reader; the
+         ;; scratch scope only collects the parsed nodes
+         (scratch (make-wit-interface :name name :package package)))
     (%expect-punct r "{")
     (loop until (%punct-p (%peek r) "}")
           do (let ((as (%parse-annotations r)))
-               (let ((sort (cond ((%keyword-p r "import") :import)
-                                 ((%keyword-p r "export") :export)
-                                 (t nil))))
-                 (unless sort
-                   (%werr r "expected `import` or `export` in world ~a"
-                          name))
-                 (%next r)
-                 (multiple-value-bind (ns pkg iname version)
-                     (%parse-path r)
-                   (%expect-punct r ";")
-                   (let ((item (make-wit-world-item
-                                :sort sort :namespace ns :package pkg
-                                :interface iname :version version
-                                :annotations as)))
-                     (if (eq sort :import)
-                         (push item (wit-world-imports world))
-                         (push item (wit-world-exports world))))))))
+               (cond
+                 ((%keyword-p r "include")
+                  (let ((inc (%parse-include r as)))
+                    (push inc (wit-world-items world))
+                    (push inc (wit-world-includes world))))
+                 ((%keyword-p r "use")
+                  (let ((u (%parse-use r as)))
+                    (push u (wit-world-uses world))
+                    (push (make-wit-world-item :sort :use :kind :use
+                                               :target u :annotations as)
+                          (wit-world-items world))))
+                 ((or (%keyword-p r "type") (%keyword-p r "record")
+                      (%keyword-p r "enum") (%keyword-p r "flags")
+                      (%keyword-p r "variant") (%keyword-p r "resource"))
+                  (let ((node (%parse-interface-item r scratch as)))
+                    (typecase node
+                      (wit-resource
+                       (let ((ty (gethash (wit-resource-name node)
+                                          (wit-interface-types scratch))))
+                         (setf (gethash (wit-resource-name node)
+                                        (wit-world-types world))
+                               ty)
+                         (push (make-wit-world-item
+                                :sort :type :kind :resource
+                                :name (wit-resource-name node)
+                                :target node :annotations as)
+                               (wit-world-items world))))
+                      (t
+                       (setf (gethash (wit-type-name node)
+                                      (wit-world-types world))
+                             node)
+                       (push (make-wit-world-item
+                              :sort :type :kind :type
+                              :name (wit-type-name node)
+                              :target node :annotations as)
+                             (wit-world-items world))))))
+                 ((%keyword-p r "import")
+                  (%parse-world-extern r world :import as))
+                 ((%keyword-p r "export")
+                  (%parse-world-extern r world :export as))
+                 (t
+                  (%werr r "expected a world definition in world ~a~@[ (found ~a)~]"
+                         name (and (%peek r) (wit-token-text (%peek r))))))))
     (%expect-punct r "}")
-    (setf (wit-world-imports world) (nreverse (wit-world-imports world)))
-    (setf (wit-world-exports world) (nreverse (wit-world-exports world)))
+    (setf (wit-world-items world) (nreverse (wit-world-items world))
+          (wit-world-imports world) (nreverse (wit-world-imports world))
+          (wit-world-exports world) (nreverse (wit-world-exports world))
+          (wit-world-includes world) (nreverse (wit-world-includes world))
+          (wit-world-uses world) (nreverse (wit-world-uses world)))
     (setf (gethash name (wit-package-worlds package)) world)
     world))
 
@@ -819,10 +1060,43 @@ LABELS MEMBER-ANNOTATIONS); see %PARSE-RECORD-FIELDS."
                       (equal (wit-package-version p) version))))
            packages))
 
+;;; A world is a type-resolution scope as well as an interface: a
+;;; world-level `use' and world-level typedefs live in the same tables
+;;; the interface reader fills. These accessors keep %LOOKUP-TYPE and
+;;; friends scope-polymorphic without duplicating the resolution code.
+
+(defun %scope-package (scope)
+  (if (wit-world-p scope)
+      (wit-world-package scope)
+      (wit-interface-package scope)))
+
+(defun %scope-name (scope)
+  (if (wit-world-p scope)
+      (wit-world-name scope)
+      (wit-interface-name scope)))
+
+(defun %scope-kind (scope)
+  (if (wit-world-p scope) "world" "interface"))
+
+(defun %scope-types (scope)
+  (if (wit-world-p scope)
+      (wit-world-types scope)
+      (wit-interface-types scope)))
+
+(defun %scope-uses (scope)
+  (if (wit-world-p scope)
+      (wit-world-uses scope)
+      (wit-interface-uses scope)))
+
+(defun %scope-resource-cts (scope)
+  (if (wit-world-p scope)
+      (wit-world-resource-cts scope)
+      (wit-interface-resource-cts scope)))
+
 (defun %used-interface (use scope packages)
   (if (null (wit-use-package use))
       ;; same package
-      (package-interface (wit-interface-package scope)
+      (package-interface (%scope-package scope)
                          (wit-use-interface use))
       (let ((pkg (%find-package (wit-use-namespace use)
                                 (wit-use-package use)
@@ -830,18 +1104,26 @@ LABELS MEMBER-ANNOTATIONS); see %PARSE-RECORD-FIELDS."
                                 packages)))
         (and pkg (package-interface pkg (wit-use-interface use))))))
 
+(defun %use-source-name (use name)
+  "The SOURCE name a `use' imports under the local alias NAME, or NIL.
+A plain import binds its own name; `a as b' binds B locally to A."
+  (or (car (find name (wit-use-renames use) :key #'cdr :test #'string=))
+      (and (member name (wit-use-items use) :test #'string=) name)))
+
 (defun %lookup-type (scope name packages)
-  "Resolve NAME in SCOPE (an interface): (values type-node interface).
-Follows `use` imports; NIL when unknown."
-  (let ((ty (gethash name (wit-interface-types scope))))
+  "Resolve NAME in SCOPE (a wit-interface or a wit-world): (values
+type-node declaring-scope). Follows `use' imports, including their
+`as' aliases; NIL when unknown."
+  (let ((ty (gethash name (%scope-types scope))))
     (if ty
         (values ty scope)
-        (dolist (use (wit-interface-uses scope) (values nil nil))
-          (when (member name (wit-use-items use) :test #'string=)
-            (let ((target (%used-interface use scope packages)))
-              (when target
-                (let ((hit (gethash name (wit-interface-types target))))
-                  (when hit (return (values hit target)))))))))))
+        (dolist (use (%scope-uses scope) (values nil nil))
+          (let ((source (%use-source-name use name)))
+            (when source
+              (let ((target (%used-interface use scope packages)))
+                (when target
+                  (let ((hit (gethash source (wit-interface-types target))))
+                    (when hit (return (values hit target))))))))))))
 
 (defun resolve-wit-type (interface name &key packages)
   "The wit-type node NAMED by NAME in INTERFACE (or NIL)."
@@ -854,20 +1136,49 @@ Follows `use` imports; NIL when unknown."
   (multiple-value-bind (ty target) (%lookup-type scope name packages)
     (unless ty
       (error 'wit-error
-             :message (format nil "unknown WIT type ~a in interface ~a"
-                              name (wit-interface-name scope))))
+             :message (format nil "unknown WIT type ~a in ~a ~a"
+                              name (%scope-kind scope) (%scope-name scope))))
     (values (wit-type-expr ty) target)))
 
-(defun %resource-ct (interface name)
-  "The single ct object naming the resource NAME in INTERFACE (M16
-slice 3: nominal identity per interface, so every WIT occurrence of
+(defun %resource-ct (scope name)
+  "The single ct object naming the resource NAME in SCOPE (M16 slice
+3: nominal identity per declaring scope, so every WIT occurrence of
 the resource — and every method's self borrow — shares one handle
 type identity)."
-  (let ((h (wit-interface-resource-cts interface)))
+  (let ((h (%scope-resource-cts scope)))
     (or (gethash name h)
         (setf (gethash name h)
               (wasmdown.component:make-ct :kind :resource
                                           :payload name)))))
+
+(defun %resolve-resource-ct (scope expr packages seen)
+  "Resolve the payload of `own<...>' / `borrow<...>' to the declaring
+resource's ct. EXPR is a string type name or an already-typed resource
+expression; a name that does not resolve, or that resolves to a
+non-resource, is a `wit-error' (never a raw string payload)."
+  (cond
+    ((stringp expr)
+     (when (member expr seen :test #'string=)
+       (error 'wit-error
+              :message (format nil "recursive WIT type reference ~a" expr)))
+     (multiple-value-bind (ty target) (%lookup-type scope expr packages)
+       (unless ty
+         (error 'wit-error
+                :message (format nil "unknown resource type `~a` in ~a ~a"
+                                 expr (%scope-kind scope)
+                                 (%scope-name scope))))
+       (let ((inner (wit-type-expr ty)))
+         (unless (and (consp inner) (eq (car inner) :resource))
+           (error 'wit-error
+                  :message (format nil "`~a` in ~a ~a does not name a resource"
+                                   expr (%scope-kind scope)
+                                   (%scope-name scope))))
+         (%resource-ct target (second inner)))))
+    ((and (consp expr) (eq (car expr) :resource))
+     (%resource-ct scope (second expr)))
+    (t
+     (error 'wit-error
+            :message (format nil "~s is not a resource reference" expr)))))
 
 (defun wit-type->ct (interface expr &key packages)
   "Convert the WIT type EXPR (resolved in INTERFACE) to a
@@ -946,16 +1257,14 @@ the runtime's handle table has a stable type identity."
                           'vector)))
               ((:own :borrow)
                ;; the payload is the resource's ct (M16 slice 3) — the
-               ;; handle table's type identity; an unknown name keeps
-               ;; the bare name (the pre-resource shape).
-               (let ((inner (conv (second expr) scope seen)))
-                 (wasmdown.component:make-ct
-                  :kind (car expr)
-                  :payload (if (and (wasmdown.component:ct-p inner)
-                                    (eq (wasmdown.component:ct-kind inner)
-                                        :resource))
-                               inner
-                               (second expr)))))
+               ;; handle table's type identity. A string name goes
+               ;; through the scope's type resolution; an unknown name
+               ;; or a non-resource type is a WIT error, never a raw
+               ;; string payload.
+               (wasmdown.component:make-ct
+                :kind (car expr)
+                :payload (%resolve-resource-ct scope (second expr) packages
+                                               seen)))
               (:resource
                (%resource-ct scope (second expr)))
               (t
@@ -1376,13 +1685,29 @@ strictly."
                                packages)))))))))
 
 (defun %world-item-reference (item)
-  (if (wit-world-item-package item)
-      (format nil "~a:~a/~a~@[@~a~]"
-              (or (wit-world-item-namespace item) "")
-              (wit-world-item-package item)
-              (wit-world-item-interface item)
-              (wit-world-item-version item))
-      (wit-world-item-interface item)))
+  "The component-level binding reference of ITEM: the plain binding
+name when it has one (a named interface binding, a func, a typedef),
+else the full interface name of a bare path binding."
+  (or (wit-world-item-name item)
+      (if (wit-world-item-package item)
+          (format nil "~a:~a/~a~@[@~a~]"
+                  (or (wit-world-item-namespace item) "")
+                  (wit-world-item-package item)
+                  (wit-world-item-interface item)
+                  (wit-world-item-version item))
+          (wit-world-item-interface item))))
+
+(defun wit-world-item-attributes (item)
+  "The component import/export attributes of ITEM, in the exact
+(kind . value) shape %ATTR-OF and %CHECK-NAME-ATTRS consume: the
+`implements' value of a named interface binding and the positional
+`@external-id'. Reusing the representation keeps a second
+attribute vocabulary out of the WIT layer."
+  (remove nil
+          (list (and (wit-world-item-implements item)
+                     (cons :implements (wit-world-item-implements item)))
+                (and (wit-world-item-external-id item)
+                     (cons :external-id (wit-world-item-external-id item))))))
 
 (defun %validate-world (world package packages problem)
   (let ((container (wit-world-annotations world))
@@ -1395,6 +1720,7 @@ strictly."
                        (wit-world-exports world))))
         (dolist (item items)
           (let* ((key (%world-item-reference item))
+                 (kind (wit-world-item-kind item))
                  (annotations (wit-world-item-annotations item)))
             (if (gethash key seen)
                 (funcall problem "duplicate world binding `~a` in world `~a`"
@@ -1407,28 +1733,32 @@ strictly."
                 (funcall problem "@since(~a) on `~a ~a` in world `~a` exceeds its container's version ~a"
                          since (string-downcase (symbol-name sort)) key name
                          (wit-version-string container-version))))
-            (let ((pkg (if (wit-world-item-package item)
-                           (%find-package (wit-world-item-namespace item)
-                                          (wit-world-item-package item)
-                                          (wit-world-item-version item)
-                                          packages)
-                           package)))
-              (cond
-                ((null pkg)
-                 (funcall problem "unknown package reference `~a` in world `~a`"
-                          key name))
-                (t
-                 (let ((target (package-interface
-                                pkg (wit-world-item-interface item))))
-                   (if (null target)
-                       (funcall problem "unresolvable interface reference `~a` in world `~a`"
-                                key name)
-                       (%check-gated-reference
-                        (or (%gate-feature annotations)
-                            (%gate-feature container))
-                        (%gate-feature (wit-interface-annotations target))
-                        problem (format nil "world item `~a ~a`" sort key)
-                        (wit-world-item-interface item)))))))))))))
+            ;; only a path interface binding has a package/interface
+            ;; reference to check; inline interfaces and world
+            ;; functions are self-contained
+            (when (eq kind :interface)
+              (let ((pkg (if (wit-world-item-package item)
+                             (%find-package (wit-world-item-namespace item)
+                                            (wit-world-item-package item)
+                                            (wit-world-item-version item)
+                                            packages)
+                             package)))
+                (cond
+                  ((null pkg)
+                   (funcall problem "unknown package reference `~a` in world `~a`"
+                            key name))
+                  (t
+                   (let ((target (package-interface
+                                  pkg (wit-world-item-interface item))))
+                     (if (null target)
+                         (funcall problem "unresolvable interface reference `~a` in world `~a`"
+                                  key name)
+                         (%check-gated-reference
+                          (or (%gate-feature annotations)
+                              (%gate-feature container))
+                          (%gate-feature (wit-interface-annotations target))
+                          problem (format nil "world item `~a ~a`" sort key)
+                          (wit-world-item-interface item))))))))))))))
 
 (defun validate-wit-package (package &key packages)
   "Validate PACKAGE (with PACKAGES as the resolvable package set) and
@@ -1520,15 +1850,54 @@ would change the layout if dropped; refuse instead of dropping it."
           (wit-interface-uses out) (nreverse (wit-interface-uses out)))
     out))
 
+(defun %world-source-entries (world)
+  "The world's definitions in declaration order. A world read by this
+reader always carries ITEMS; a world assembled by hand may not, so
+fall back to the per-sort lists plus includes and uses."
+  (or (wit-world-items world)
+      (append (wit-world-includes world)
+              (wit-world-uses world)
+              (wit-world-imports world)
+              (wit-world-exports world))))
+
 (defun %select-world (world selection target)
-  (let ((out (copy-wit-world world)))
-    (flet ((keep (items)
-             (remove-if-not (lambda (item)
-                              (%gate-kept-p (wit-world-item-annotations item)
-                                            selection target))
-                            items)))
-      (setf (wit-world-imports out) (keep (wit-world-imports world))
-            (wit-world-exports out) (keep (wit-world-exports world))))
+  (let ((out (copy-wit-world world))
+        (kept '()))
+    (dolist (entry (%world-source-entries world))
+      (let ((annotations (typecase entry
+                           (wit-world-include
+                            (wit-world-include-annotations entry))
+                           (t (wit-world-item-annotations entry)))))
+        (when (%gate-kept-p annotations selection target)
+          (push entry kept))))
+    (setf kept (nreverse kept))
+    (setf (wit-world-items out) kept
+          (wit-world-includes out)
+          (remove-if-not #'wit-world-include-p kept)
+          (wit-world-imports out)
+          (remove-if-not (lambda (e)
+                           (and (wit-world-item-p e)
+                                (eq (wit-world-item-sort e) :import)))
+                         kept)
+          (wit-world-exports out)
+          (remove-if-not (lambda (e)
+                           (and (wit-world-item-p e)
+                                (eq (wit-world-item-sort e) :export)))
+                         kept)
+          (wit-world-uses out)
+          (loop for e in kept
+                when (and (wit-world-item-p e)
+                          (eq (wit-world-item-kind e) :use))
+                  collect (wit-world-item-target e)))
+    ;; the world's own typedefs gate too; resource cts keep the shared
+    ;; memo so resource identity survives selection
+    (let ((types (make-hash-table :test #'equal)))
+      (maphash (lambda (name ty)
+                 (when (%gate-kept-p (wit-type-annotations ty)
+                                     selection target)
+                   (setf (gethash name types) ty)))
+               (wit-world-types world))
+      (setf (wit-world-types out) types))
     out))
 
 (defun select-wit-package (package selection &key packages)
@@ -1566,47 +1935,463 @@ with VALIDATE-WIT-PACKAGE; selection is purely local to PACKAGE."
     out))
 
 ;;; ---------------------------------------------------------------
-;;; World resolution.
+;;; World resolution (plan step 3, parser half).
+;;;
+;;; The raw AST keeps includes, renames and positional external-ids
+;;; verbatim; resolution builds a NEW world graph without touching it:
+;;;
+;;;  * includes expand in declaration order, so the union is the
+;;;    textual order of definitions (`include' fills the position of
+;;;    the include statement itself);
+;;;  * a rename rewrites only an included item's plain binding LABEL —
+;;;    never its interface target or a nested type name;
+;;;  * every interface/type reference is resolved against the package
+;;;    set: an unresolved package version, interface or type is a
+;;;    `wit-error' naming the world and the binding;
+;;;  * an identical bare interface binding arriving from an include is
+;;;    de-duplicated (specs/WIT.md "De-duplication of interfaces"),
+;;;    while a plain-name collision is an error;
+;;;  * two named bindings of the same interface stay two distinct
+;;;    bindings, and paths that alias ONE resource declaration yield
+;;;    one resource ct (see %RESOURCE-CT's per-scope memo).
 
-(defun %resolve-world-items (items container selection target sort world-name)
-  "Filter world items, inheriting the world's gate per dimension for an
-item with no gate of its own and rejecting an explicitly weaker gate."
-  (let ((kept '()))
-    (dolist (item items)
-      (let* ((own (wit-world-item-annotations item))
-             (since (or (%gate-since own) (%gate-since container)))
-             (feature (or (%gate-feature own) (%gate-feature container))))
-        (when (and own container
-                   (not (%gate-at-least-as-strict-p own container)))
-          (error 'wit-error
-                 :message
-                 (format nil "world `~a`: ~a `~a` carries a weaker gate than its world"
-                         world-name sort (%world-item-reference item))))
-        (when (%gate-kept-fields-p since feature selection target)
-          (push item kept))))
-    (nreverse kept)))
+(defun %world-binding-name (item)
+  "The plain label a rename may rewrite: the explicit `name:' prefix,
+else a bare binding's final path segment."
+  (or (wit-world-item-name item)
+      (wit-world-item-interface item)))
+
+(defun %resolve-world-gate-check (annotations container selection target
+                                  world-name sort reference)
+  "Inherit the world's gate for an item with no gate of its own;
+reject an explicitly weaker one. Returns whether the item is kept."
+  (when (and annotations container
+             (not (%gate-at-least-as-strict-p annotations container)))
+    (error 'wit-error
+           :message
+           (format nil "world `~a`: ~a `~a` carries a weaker gate than its world"
+                   world-name sort reference)))
+  (%gate-kept-fields-p (or (%gate-since annotations) (%gate-since container))
+                       (or (%gate-feature annotations) (%gate-feature container))
+                       selection target))
+
+(defun %resolve-world-declared-target (package item all strict world-name)
+  "Resolve a path binding's target: (values package interface).
+PACKAGE and INTERFACE are NIL only for a non-strict resolve of a
+target whose package is not supplied. The reference is exact-version:
+there is no nearest-version fallback."
+  (let ((ns (wit-world-item-namespace item))
+        (pkgn (wit-world-item-package item))
+        (iname (wit-world-item-interface item))
+        (version (wit-world-item-version item))
+        (ref (%world-item-reference item)))
+    (cond
+      ((or ns pkgn)
+       (let ((pkg (%find-package ns pkgn version all)))
+         (if (null pkg)
+             (if strict
+                 (error 'wit-error
+                        :message
+                        (format nil "world `~a`: unresolved package version `~a` in binding `~a`"
+                                world-name
+                                (or version "any")
+                                ref))
+                 (values nil nil))
+             (let ((iface (package-interface pkg iname)))
+               (unless iface
+                 (error 'wit-error
+                        :message
+                        (format nil "world `~a`: unresolvable interface reference `~a`"
+                                world-name ref)))
+               (values pkg iface)))))
+      (t
+       (when (and version
+                  (not (equal version (wit-package-version package))))
+         (error 'wit-error
+                :message
+                (format nil "world `~a`: unresolved version `~a` in binding `~a`"
+                        world-name version ref)))
+       (let ((iface (package-interface package iname)))
+         (unless iface
+           (error 'wit-error
+                  :message
+                  (format nil "world `~a`: unresolvable interface reference `~a`"
+                          world-name ref)))
+         (values package iface))))))
+
+(defun %check-world-type-expr (expr scope packages world-name what)
+  "Resolve every named reference in EXPR against SCOPE. An `own' /
+`borrow' name must resolve to a resource. Every error names the world
+and WHAT."
+  (labels
+      ((ref (name resource-p)
+         (multiple-value-bind (ty target) (%lookup-type scope name packages)
+           (declare (ignore target))
+           (unless ty
+             (error 'wit-error
+                    :message
+                    (format nil "world `~a`: unresolvable type reference `~a` in ~a"
+                            world-name name what)))
+           (when resource-p
+             (let ((e (wit-type-expr ty)))
+               (unless (and (consp e) (eq (car e) :resource))
+                 (error 'wit-error
+                        :message
+                        (format nil "world `~a`: `own'/`borrow' of `~a` in ~a does not name a resource"
+                                world-name name what)))))
+           ty))
+       (walk (e)
+         (cond
+           ((not (consp e)) nil)
+           (t
+            (case (car e)
+              (:name (ref (second e) nil))
+              ((:own :borrow)
+               (if (stringp (second e))
+                   (ref (second e) t)
+                   (walk (second e))))
+              ((:list :option :stream :future) (walk (second e)))
+              ((:result :map) (walk (second e)) (walk (third e)))
+              (:tuple (dolist (x (cdr e)) (walk x)))
+              ((:record :variant)
+               (dolist (entry (cdr e)) (walk (cdr entry))))
+              ((:enum :flags :resource) nil)
+              (t (dolist (x (cdr e)) (walk x))))))))
+    (walk expr)))
+
+(defun %validate-world-use (world use all strict world-name)
+  "A world-level `use' must name a reachable interface and import types
+that interface actually declares."
+  (let ((target (%used-interface use world all)))
+    (cond
+      ((null target)
+       (when (or strict (null (wit-use-package use)))
+         (error 'wit-error
+                :message
+                (format nil "world `~a`: unresolvable interface reference `~a` in `use`"
+                        world-name (wit-use-interface use)))))
+      (t
+       (dolist (item (wit-use-items use))
+         (unless (gethash item (wit-interface-types target))
+           (error 'wit-error
+                  :message
+                  (format nil "world `~a`: unresolvable type reference `~a` imported by `use`"
+                          world-name item))))))))
+
+(defun %world-include-reference (package include)
+  "The textual reference of an include target."
+  (destructuring-bind (ns pkg iname version)
+      (wit-world-include-target include)
+    (format nil "~@[~a:~]~a/~a~@[@~a~]"
+            ns (or pkg (wit-package-name package)) iname version)))
+
+(defun %world-include-target-world (package include all strict world-name)
+  "The world an include names (a wit-world), or NIL when a non-strict
+resolve cannot reach its package."
+  (destructuring-bind (ns pkg iname version)
+      (wit-world-include-target include)
+    (let* ((target-package (if (or ns pkg)
+                               (%find-package ns pkg version all)
+                               package))
+           (ref (%world-include-reference package include)))
+      (cond
+        ((null target-package)
+         (if strict
+             (error 'wit-error
+                    :message
+                    (format nil "world `~a`: include target `~a` names an unknown package version"
+                            world-name ref))
+             nil))
+        (t
+         (or (gethash iname (wit-package-worlds target-package))
+             (error 'wit-error
+                    :message
+                    (format nil "world `~a`: include target `~a` is not a world"
+                            world-name ref))))))))
+
+(defun %rename-world-binding (item local package)
+  "A renamed copy of ITEM whose plain label is LOCAL. A renamed BARE
+path binding becomes a named interface binding, so it gains the
+`implements' value the component layer records."
+  (let ((copy (copy-wit-world-item item)))
+    (setf (wit-world-item-name copy) local)
+    (when (and (eq (wit-world-item-kind copy) :interface)
+               (null (wit-world-item-implements copy)))
+      (setf (wit-world-item-implements copy)
+            (%interface-reference-string
+             package
+             (wit-world-item-namespace copy)
+             (wit-world-item-package copy)
+             (wit-world-item-interface copy)
+             (wit-world-item-version copy))))
+    copy))
+
+(defun %apply-include-renames (items renames included-package
+                               world-name included-name)
+  "Rewrite only the plain binding labels RENAMES names. Returns
+(values ITEMS RENAMED-ITEMS); every rename source must exist and name
+exactly one plain binding."
+  (let ((seen '()))
+    (dolist (pair renames)
+      (when (member (car pair) seen :test #'string=)
+        (error 'wit-error
+               :message
+               (format nil "world `~a`: include of world `~a`: rename source `~a` is listed more than once"
+                       world-name included-name (car pair))))
+      (push (car pair) seen)))
+  (let ((renamed '()))
+    (dolist (pair renames)
+      (let* ((source (car pair))
+             (hits (remove-if-not
+                    (lambda (item)
+                      (string= source (%world-binding-name item)))
+                    items)))
+        (cond
+          ((null hits)
+           (error 'wit-error
+                  :message
+                  (format nil "world `~a`: include of world `~a`: rename source `~a` does not exist"
+                          world-name included-name source)))
+          ((rest hits)
+           (error 'wit-error
+                  :message
+                  (format nil "world `~a`: include of world `~a`: rename source `~a` is ambiguous"
+                          world-name included-name source)))))
+      (let* ((source (car pair))
+             (hit (find source items :key #'%world-binding-name
+                                     :test #'string=))
+             (copy (%rename-world-binding hit (cdr pair) included-package)))
+        (push (cons hit copy) renamed)))
+    (values (loop for item in items
+                  for pair = (assoc item renamed)
+                  collect (if pair (cdr pair) item))
+            (mapcar #'cdr renamed))))
+
+(defun %resolve-world (package world all strict selection stack)
+  "Resolve WORLD (declared in PACKAGE) into a fresh world. ALL is the
+package set, STRICT says every external reference must resolve, and
+STACK is the include chain used for cycle detection."
+  (let* ((name (wit-world-name world))
+         (container (wit-world-annotations world))
+         (target (%selection-target-version package selection))
+         (entries (%world-source-entries world))
+         (out (make-wit-world :name name
+                              :package (wit-world-package world)
+                              :annotations (wit-world-annotations world)))
+         (bindings (list (cons :import nil) (cons :export nil)))
+         (imports '())
+         (exports '())
+         (out-items '())
+         (out-includes '()))
+    (flet ((kept-p (annotations sort reference)
+             (%resolve-world-gate-check annotations container selection
+                                        target name sort reference))
+           (node-type (entry)
+             (let ((node (wit-world-item-target entry)))
+               (if (eq (wit-world-item-kind entry) :resource)
+                   (or (gethash (wit-resource-name node)
+                                (wit-world-types world))
+                       node)
+                   node)))
+           (add (item explicit-p origin renamed-p)
+             "Add ITEM to OUT, de-duplicating identical bare interface
+bindings that an include introduced and rejecting every other
+collision."
+             (let* ((sort (wit-world-item-sort item))
+                    (ref (%world-item-reference item))
+                    (bucket (cdr (assoc sort bindings)))
+                    (existing (find ref bucket
+                                    :key (lambda (e)
+                                           (%world-item-reference
+                                            (getf e :item)))
+                                    :test #'string=)))
+               (cond
+                 ((null existing)
+                  (push (list :item item :explicit explicit-p
+                              :origin origin)
+                        bucket)
+                  (setf (cdr (assoc sort bindings)) bucket)
+                  (push item out-items)
+                  (ecase sort
+                    (:import (push item imports))
+                    (:export (push item exports))))
+                 ((and (eq (wit-world-item-kind item) :interface)
+                       (eq (wit-world-item-kind (getf existing :item))
+                           :interface)
+                       (null (wit-world-item-name item))
+                       (null (wit-world-item-name
+                              (getf existing :item)))
+                       (let ((a (wit-world-item-target item))
+                             (b (wit-world-item-target
+                                 (getf existing :item))))
+                         (or (and a b (eq a b))
+                             (string= ref (%world-item-reference
+                                           (getf existing :item)))))
+                       (or (not explicit-p)
+                           (not (getf existing :explicit))))
+                  ;; specs/WIT.md "De-duplication of interfaces": two
+                  ;; included worlds sharing an interface name keep one
+                  ;; copy. Explicit duplicates of a world's own items
+                  ;; stay errors.
+                  nil)
+                 (renamed-p
+                  (error 'wit-error
+                         :message
+                         (format nil "world `~a`: include of world `~a`: renamed binding `~a` collides with another binding"
+                                 name (or origin "?") ref)))
+                 (t
+                  (error 'wit-error
+                         :message
+                         (format nil "world `~a`: duplicate binding `~a`~@[ (from include of world `~a`)~]"
+                                 name ref origin)))))))
+      ;; -- pass 1: the world-level type scope ------------------------
+      (dolist (entry entries)
+        (when (and (wit-world-item-p entry)
+                   (member (wit-world-item-kind entry)
+                           '(:use :type :resource)))
+          (when (kept-p (wit-world-item-annotations entry)
+                        (string-downcase
+                         (symbol-name (wit-world-item-kind entry)))
+                        (%world-item-reference entry))
+            (if (eq (wit-world-item-kind entry) :use)
+                (progn
+                  (%validate-world-use out (wit-world-item-target entry)
+                                       all strict name)
+                  (push (wit-world-item-target entry)
+                        (wit-world-uses out)))
+                (let ((ty (node-type entry)))
+                  (when ty
+                    (setf (gethash (wit-type-name ty)
+                                   (wit-world-types out))
+                          ty)))))))
+      (setf (wit-world-uses out) (nreverse (wit-world-uses out)))
+      ;; -- pass 1b: type references, now that the scope is whole ----
+      (dolist (entry entries)
+        (when (and (wit-world-item-p entry)
+                   (member (wit-world-item-kind entry)
+                           '(:type :resource :func)))
+          (when (kept-p (wit-world-item-annotations entry)
+                        (string-downcase
+                         (symbol-name (wit-world-item-kind entry)))
+                        (%world-item-reference entry))
+            (let ((node (wit-world-item-target entry)))
+              (cond
+                ((eq (wit-world-item-kind entry) :func)
+                 (dolist (param (wit-func-params node))
+                   (%check-world-type-expr
+                    (cdr param) out all name
+                    (format nil "function `~a'" (wit-func-name node))))
+                 (when (wit-func-result node)
+                   (%check-world-type-expr
+                    (wit-func-result node) out all name
+                    (format nil "function `~a'" (wit-func-name node)))))
+                ((eq (wit-world-item-kind entry) :resource)
+                 (dolist (method (wit-resource-methods node))
+                   (dolist (param (wit-func-params method))
+                     (%check-world-type-expr
+                      (cdr param) out all name
+                      (format nil "method `~a' of resource `~a'"
+                              (wit-func-name method)
+                              (wit-resource-name node))))
+                   (when (wit-func-result method)
+                     (%check-world-type-expr
+                      (wit-func-result method) out all name
+                      (format nil "method `~a' of resource `~a'"
+                              (wit-func-name method)
+                              (wit-resource-name node))))))
+                (t
+                 (%check-world-type-expr
+                  (wit-type-expr node) out all name
+                  (format nil "type `~a'" (wit-type-name node)))))))))
+      ;; -- pass 2: includes and extern bindings, declaration order --
+      (dolist (entry entries)
+        (typecase entry
+          (wit-world-include
+           (let ((ref (%world-include-reference package entry)))
+             (when (kept-p (wit-world-include-annotations entry)
+                           "include" ref)
+               (let ((included (%world-include-target-world
+                                package entry all strict name)))
+                 (when included
+                   (when (member included stack :test #'eq)
+                     (error 'wit-error
+                            :message
+                            (format nil "world `~a`: include cycle: ~{~a~^ -> ~}"
+                                    name
+                                    (mapcar #'wit-world-name
+                                            (reverse (cons included
+                                                           (cons world
+                                                                 stack)))))))
+                   (let* ((included-package (wit-world-package included))
+                          (resolved (%resolve-world included-package included
+                                                    all strict selection
+                                                    (cons world stack)))
+                          (items (remove-if-not
+                                  (lambda (it)
+                                    (and (wit-world-item-p it)
+                                         (member (wit-world-item-sort it)
+                                                 '(:import :export))))
+                                  (wit-world-items resolved))))
+                     (multiple-value-bind (renamed renamed-set)
+                         (%apply-include-renames
+                          items (wit-world-include-renames entry)
+                          included-package name (wit-world-name included))
+                       (dolist (item renamed)
+                         (add item nil (wit-world-name included)
+                              (member item renamed-set :test #'eq)))))))))
+           (push entry out-includes))
+          (wit-world-item
+           (let ((sort (wit-world-item-sort entry)))
+             (cond
+               ((member sort '(:import :export))
+                (when (kept-p (wit-world-item-annotations entry)
+                              (string-downcase (symbol-name sort))
+                              (%world-item-reference entry))
+                  (add (%resolve-world-item package entry all strict name)
+                       t nil nil)))
+               ((member (wit-world-item-kind entry) '(:use :type :resource))
+                (when (kept-p (wit-world-item-annotations entry)
+                              (string-downcase
+                               (symbol-name (wit-world-item-kind entry)))
+                              (%world-item-reference entry))
+                  (push (copy-wit-world-item entry) out-items))))))))
+      (setf (wit-world-items out) (nreverse out-items)
+            (wit-world-imports out) (nreverse imports)
+            (wit-world-exports out) (nreverse exports)
+            (wit-world-includes out) (nreverse out-includes))
+      out)))
+
+(defun %resolve-world-item (package item all strict world-name)
+  "A resolved copy of ITEM: a path binding gains its target interface."
+  (let ((copy (copy-wit-world-item item)))
+    (when (eq (wit-world-item-kind item) :interface)
+      (multiple-value-bind (target-package iface)
+          (%resolve-world-declared-target package copy all strict world-name)
+        (declare (ignore target-package))
+        (when iface
+          (setf (wit-world-item-target copy) iface))))
+    copy))
 
 (defun resolve-wit-world (package name &key packages selection)
-  "Resolve world NAME in PACKAGE under SELECTION: the world's imports
-and exports filtered by the same gate rules, with the world's own
-annotations inherited by items that carry no gate. An item whose
-explicit gate is weaker than the world's is a `wit-error'.
-PACKAGES is accepted for symmetry with the link-time API; a world's
-item references are not resolved here."
-  (declare (ignore packages))
+  "Resolve world NAME in PACKAGE under SELECTION: gate the world's
+definitions with the world's own annotations inherited, expand every
+`include' in declaration order (applying its `with { a as b }'
+renames to the included world's plain bindings), and resolve each
+interface/type reference against PACKAGE and PACKAGES.
+
+The raw AST is never mutated; the result is a fresh world whose
+imports/exports carry resolved targets, `implements' and
+external-id values. A same-package reference is always checked; a
+reference into another package is checked when PACKAGES is supplied
+(then an unresolved package version, interface or type is a
+`wit-error' naming the world and the binding), and otherwise left
+unresolved for a later link step."
   (let ((world (gethash name (wit-package-worlds package))))
     (unless world
       (error 'wit-error
              :message (format nil "unknown world ~s in package ~a"
                               name (wit-package-name package))))
-    (let* ((selection (or selection *default-wit-selection*))
-           (target (%selection-target-version package selection))
-           (container (wit-world-annotations world))
-           (out (copy-wit-world world)))
-      (setf (wit-world-imports out)
-            (%resolve-world-items (wit-world-imports world) container
-                                  selection target "import" name)
-            (wit-world-exports out)
-            (%resolve-world-items (wit-world-exports world) container
-                                  selection target "export" name))
-      out)))
+    (%resolve-world package world (cons package packages)
+                    (and packages t)
+                    (or selection *default-wit-selection*)
+                    nil)))
