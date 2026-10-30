@@ -399,6 +399,19 @@ host provider that is its own instance — so a provider resolving
 the raw index (host-resource-rep) falls back to this table when the
 dynamic caller's table does not hold it.")
 
+(defvar *pending-borrow-handles* nil
+  "M17 step 2: the borrow handles a lowering JUST added to the
+callee's Table (CanonicalABI.md 2832's lower_borrow), awaiting the
+callee Task that must own them. The spec's lookup happens with
+`cx.borrow_scope' = the CALLEE Task already alive; this runtime
+lowers the args before the Task exists, so the lower records the
+records here and %ADOPT-BORROW-HANDLES moves them onto the Task at
+its creation: num_borrows rises (§2838) once per handle and each
+handle's borrow_scope becomes the Task, which is exactly what
+§3798's resource.drop decrements and §802/§820's return/cancel
+trap on. Bound (and drained) per lowering; never inherited across
+calls.")
+
 
 (declaim (notinline instantiate-component %exec-core-instance
                     %exec-instance %exec-alias %exec-canon
@@ -2388,7 +2401,14 @@ reentrance phase checks). The CALLER then waits:
              (*current-component-store*
                (or *current-component-store*
                    (%inst-host-store (lifted-func-inst lf))))
-             (val (funcall (lifted-func-host lf) args)))
+             ;; a host callee has no Task to adopt this call's borrow
+             ;; handles (§2838) — drain them so a NESTED guest call
+             ;; made by the provider cannot inherit the account
+             (ignored-borrows *pending-borrow-handles*)
+             (val (progn
+                    (setf *pending-borrow-handles* nil)
+                    (funcall (lifted-func-host lf) args))))
+        (declare (ignore ignored-borrows))
         (return-from lifted-func-call
           (cond
             ((not (host-pending-p val)) val)
@@ -3049,6 +3069,11 @@ TARGET's space."
      (wasmdown.types:make-wasm-func-type core-params core-results)
      (lambda (args)
        (let* ((*handle-caller-inst* inst)
+              ;; M17 step 2: the borrow handles this lowering adds to
+              ;; the callee's table are adopted by the callee Task
+              ;; (%ADOPT-BORROW-HANDLES) — one list per call, never
+              ;; inherited across calls.
+              (*pending-borrow-handles* nil)
               ;; (values lane) the ARG LIFT resolves the functype's
               ;; (:idx . n) refs against the TARGET LIFTED FUNC's own
               ;; instance (the declarator-space indices are meaningless
@@ -3137,19 +3162,59 @@ TARGET's space."
                                      (let* ((rt-idx (wasmdown.component:ct-payload c))
                                             (rt (aref (comp-instance-types ft-inst) rt-idx))
                                             (rep (%handle-rep inst rt (nth ai args)))
+                                            ;; §2834's SAME-IMPLEMENTOR
+                                            ;; shortcut: when the
+                                            ;; CALLEE's type space
+                                            ;; DEFINED the resource (its
+                                            ;; slot came from the
+                                            ;; component's own type
+                                            ;; declaration, not an
+                                            ;; alias projection) the
+                                            ;; only use of the handle is
+                                            ;; `resource.rep', so
+                                            ;; lower_borrow yields the
+                                            ;; REP and creates NO
+                                            ;; handle — and therefore no
+                                            ;; num_borrows: the callee
+                                            ;; may return without
+                                            ;; dropping anything.
+                                            (impl-p
+                                              (null (gethash (cons ft-inst rt-idx)
+                                                             *ct-defining-inst*)))
                                             ;; M16 slice 3b: a HOST callee's
                                             ;; provider resolves the index
                                             ;; through the dynamic caller's
                                             ;; table, so the lend goes THERE
                                             ;; (the guest-callee local shape
                                             ;; keeps the callee-defining table)
-                                            (bi (and rep (%handle-add
-                                                          (if (lifted-func-host f)
-                                                              inst ft-inst)
-                                                          rt rep nil))))
+                                            (bi (and rep
+                                                     (or (lifted-func-host f)
+                                                         (not impl-p))
+                                                     (%handle-add
+                                                      (if (lifted-func-host f)
+                                                          inst ft-inst)
+                                                      rt rep nil))))
+                                       ;; §2832's lower_borrow: the
+                                       ;; borrow handle belongs to the
+                                       ;; CALLEE's Task (num_borrows,
+                                       ;; §2838) — the Task does not
+                                       ;; exist yet, so record it for
+                                       ;; %ADOPT-BORROW-HANDLES at the
+                                       ;; callee's creation. The lend
+                                       ;; was NEVER the caller's
+                                       ;; num_borrows (that is §1447's
+                                       ;; num_lends, on the source).
                                        (when bi
-                                         (incf (async-task-num-borrows *current-task*)))
-                                       (push bi vals)
+                                         (push (%handle-resource-at
+                                                (if (lifted-func-host f)
+                                                    inst ft-inst)
+                                                bi rt)
+                                               *pending-borrow-handles*))
+                                       ;; the callee's core gets the
+                                       ;; handle INDEX (lower_borrow),
+                                       ;; or the REP under §2834's
+                                       ;; same-implementor shortcut
+                                       (push (or bi rep) vals)
                                        (incf ai)))
                                     (t
                                      (let* ((pflat (%flat-type-of vt ft-inst))
@@ -3166,9 +3231,8 @@ TARGET's space."
               ;; NOTE: no APPLY — %call-component-func-list takes the
               ;; args LIST as its third parameter (an EMPTY list
               ;; would be swallowed by apply's spread)
-              (res (unwind-protect
-                        (let ((lf2 (aref (comp-instance-funcs inst)
-                                         fidx)))
+              (res (let ((lf2 (aref (comp-instance-funcs inst)
+                                    fidx)))
                           (if (ignore-errors
                                (and *current-thread*
                                     (lifted-func-p lf2)
@@ -3199,12 +3263,7 @@ TARGET's space."
                                  (apply #'lifted-func-call lf2
                                         component-args)))
                               (%call-component-func-list
-                               inst fidx component-args)))
-                     ;; §3690: the sync case's lent borrows are logically
-                     ;; returned when the call returns
-                     (when (and *current-task*
-                                (> (async-task-num-borrows *current-task*) 0))
-                       (decf (async-task-num-borrows *current-task*))))))
+                               inst fidx component-args)))))
          (if (or core-result result)
              (list
               (if (and (consp res) (eq (first res) :own-handle))
@@ -3390,6 +3449,16 @@ resource.drop (param handle), [i32] -> [i32] for resource.rep."
               (when hit
                 (setf h (%handle-remove cur rt hit)
                       rep (first args)))))
+          ;; §3798: dropping a BORROW handle returns the borrow to the
+          ;; Task that lowered it — `h.borrow_scope.num_borrows -= 1'.
+          ;; This is the SINGLE decrement paired with lower_borrow's
+          ;; increment (%ADOPT-BORROW-HANDLES); an owning handle has no
+          ;; borrow scope (§3790's assert).
+          (when (and h (not (resource-handle-own-p h)))
+            (let ((scope (resource-handle-borrow-scope h)))
+              (when (and (async-task-p scope)
+                         (plusp (async-task-num-borrows scope)))
+                (decf (async-task-num-borrows scope)))))
           ;; an OWNING handle's drop runs the resource's dtor with
           ;; the rep (canon_resource_drop, CanonicalABI.md 3782).
           ;; M16 slice 3: a HOST-provided resource has no guest dtor
@@ -3542,8 +3611,9 @@ the opts plist, guarded by the scheduler mutex)."
   (state 0)  ; 0=STARTING 1=STARTED 2=RETURNED
              ; 3=CANCELLED-BEFORE-STARTED 4=CANCELLED-BEFORE-RETURNED
   (on-cancel nil)                    ; the callee's OnCancel
-  (lenders nil)                      ; the LENT resource-handle records
-  (lending-tasks nil)                ; the lending async-tasks
+  (lenders nil)                      ; the LENT SOURCE resource-handle
+                                     ; records (§1446; num_lends is
+                                     ; their account)
   (cancellation-requested nil)
   (flat-results nil)
   (resolve-delivered-p nil)
@@ -6968,6 +7038,22 @@ arm's own suspension: the blocks arm therefore also requires
         ;; unresolved state (BLOCKED) per the spec's own else-arm
         (async-thread-resume th)))))))
 
+(defun %adopt-borrow-handles (task handles)
+  "CanonicalABI.md 2832/§2838's lower_borrow accounting, DEFERRED to
+the callee Task's creation (the lower runs before the Task exists in
+this runtime): every borrow handle the lowering added to the
+callee's Table becomes a live borrow OF THIS TASK — num_borrows
+rises once per handle and the handle's borrow_scope is the Task, so
+§802/§820's task.return/task.cancel trap while any of them is
+undropped and §3798's resource.drop is the one decrement. The
+SOURCE handles' num_lends stays the separate §1447 ledger on the
+Subtask."
+  (dolist (h handles)
+    (when h
+      (incf (async-task-num-borrows task))
+      (setf (resource-handle-borrow-scope h) task)))
+  task)
+
 (defun %task-return (task result)
   "Task.return_ (CanonicalABI.md 802): resolve with a value."
   (when (eq (async-task-state task) :resolved)
@@ -7251,44 +7337,33 @@ computes the tuple at delivery time)."
         (async-thread-resume-all))))
 
 (defun %subtask-record-lend (s h)
-  "Record the LEND of the resource-handle H on the subtask S (the
-§1446 accounting home): H joins the subtask's LENDERS and, on a
-CURRENT-TASK, that task joins LENDING-TASKS (pushnew) — the FIRST
-lend to this subtask raises the task's NUM-BORROWS by one, so the
-count and deliver_resolve's per-task decrement stay balanced even
-when one task lends several handles to the same subtask."
+  "Record the LEND of the resource-handle H on the subtask S — the
+§1446/§1447 accounting home: H joins the subtask's LENDERS so its
+NUM-LENDS stays raised until this subtask's deliver_resolve returns
+it. The SUBTASK is a Subtask, not a Task: the count of borrow
+handles the CALLEE holds is the callee Task's own NUM-BORROWS
+(§2838, adopted by %ADOPT-BORROW-HANDLES), a different account from
+the SOURCE handle's num_lends — the two are never conflated."
   (push h (async-subtask-lenders s))
-  (when *current-task*
-    (unless (member *current-task* (async-subtask-lending-tasks s)
-                    :test #'eq)
-      (incf (async-task-num-borrows *current-task*))
-      (push *current-task* (async-subtask-lending-tasks s))))
   h)
 
 (defun %subtask-deliver-resolve (s)
   "Subtask.deliver_resolve (CanonicalABI.md 1467): the delivered
-  mark + §1446-1456's num_lends accounting: all the borrowed
-  handles are logically returned to the caller at this point —
-  every lent handle's NUM-LENDS decrements and every LENDING task's
-  NUM-BORROWS decrements (the async lower's (borrow $R) branch
-  recorded each lend through %HANDLE-LEND, §2838/§1446; without the
-  return the lending task's own resolution traps 'outstanding
-  borrows' — drop-cross-task-borrow ::2's decoded layer). The
-  ledger is CLEARED FIRST so a second delivery is a NO-OP."
+mark + §1446-1456's num_lends accounting: all the borrowed SOURCE
+handles are logically returned to the caller at this point — every
+lent handle's NUM-LENDS decrements. The callee's own borrow handles
+are already gone (its task.return would have trapped otherwise,
+§802). The ledger is CLEARED FIRST so a second delivery is a
+NO-OP."
   (setf (async-subtask-resolve-delivered-p s) t)
-  (let ((lent (async-subtask-lenders s))
-        (tasks (async-subtask-lending-tasks s)))
-    (setf (async-subtask-lenders s) nil
-          (async-subtask-lending-tasks s) nil)
+  (let ((lent (async-subtask-lenders s)))
+    (setf (async-subtask-lenders s) nil)
     (dolist (h lent)
       (when (and (resource-handle-p h)
                  (> (resource-handle-num-lends h) 0))
         (decf (resource-handle-num-lends h))
         (when (zerop (resource-handle-num-lends h))
-          (setf (resource-handle-borrow-scope h) nil))))
-    (dolist (task tasks)
-      (when (> (async-task-num-borrows task) 0)
-        (decf (async-task-num-borrows task))))))
+          (setf (resource-handle-borrow-scope h) nil))))))
 
 (defun %subtask-drop (s)
   "Subtask.drop (CanonicalABI.md 1485): trap when the resolve has
@@ -7553,6 +7628,11 @@ drop-readable must return index 1 again)."
   (let* ((ft (lifted-func-type lf))
          (opts (lifted-func-opts lf))
          (inst (lifted-func-inst lf))
+         ;; M17 step 2: the borrow handles this call's lowering added
+         ;; to THIS callee's table (a sync-typed component-level call
+         ;; of an async-typed callee takes the sync lower's lend), now
+         ;; the callee Task's account (§2838)
+         (borrow-handles *pending-borrow-handles*)
          (task (make-async-task
                 :ft ft :opts opts :inst inst
                 :on-start (lambda () args)))
@@ -7565,6 +7645,10 @@ drop-readable must return index 1 again)."
               :encoding (%abi-encoding-of enc-opt)
               :inst inst))
          (cell (cons nil nil)))
+    ;; drain BEFORE the guest thread exists: the records are this
+    ;; call's, and no nested callee may adopt them
+    (setf *pending-borrow-handles* nil)
+    (%adopt-borrow-handles task borrow-handles)
     (setf (async-task-implicit-thread task) th)
     (%thread-birth th)
     (setf (async-task-on-resolve task)
@@ -8975,6 +9059,10 @@ is the valtype."
      (wasmdown.types:make-wasm-func-type core-params '(:i32))
      (lambda (args)
        (let* ((*handle-caller-inst* inst)
+              ;; M17 step 2: the borrow handles this lowering adds to
+              ;; the callee's table are adopted by the callee Task
+              ;; (%ADOPT-BORROW-HANDLES) — one list per call.
+              (*pending-borrow-handles* nil)
               (subtask (make-async-subtask))
               (cx (make-abi-cx
                    :memory memory
@@ -9086,23 +9174,47 @@ is the valtype."
                                           ;; and records the lend on
                                           ;; the SUBTASK — its
                                           ;; deliver_resolve returns the
-                                          ;; count and decrements the
-                                          ;; lending task's
-                                          ;; NUM-BORROWS.
+                                          ;; count (the SOURCE's
+                                          ;; num_lends ledger, §1447).
                                           (rep (%handle-lend inst rt
                                                              (nth ai args)
                                                              subtask))
+                                          ;; §2834's SAME-IMPLEMENTOR
+                                          ;; shortcut — identical to the
+                                          ;; sync lower's: a locally
+                                          ;; DECLARED resource type (its
+                                          ;; slot was not alias-projected
+                                          ;; into the callee) yields the
+                                          ;; REP and no borrow handle, so
+                                          ;; the callee owes no drop
+                                          (impl-p
+                                            (null (gethash (cons ft-inst rt-idx)
+                                                           *ct-defining-inst*)))
                                           ;; M16 slice 3b: the same
                                           ;; host-callee rule as the
                                           ;; sync lower — the provider
                                           ;; reads the index off the
                                           ;; dynamic caller's table
                                           (bi (and rep
+                                                   (or (lifted-func-host f)
+                                                       (not impl-p))
                                                    (%handle-add
                                                     (if (lifted-func-host f)
                                                         inst ft-inst)
                                                     rt rep nil))))
-                                     (push bi vals)
+                                     ;; §2838: the borrow handle's
+                                     ;; num_borrows home is the CALLEE
+                                     ;; Task (created just below) —
+                                     ;; never the lending task's
+                                     ;; count (that is the source's
+                                     ;; num_lends above)
+                                     (when bi
+                                       (push (%handle-resource-at
+                                              (if (lifted-func-host f)
+                                                  inst ft-inst)
+                                              bi rt)
+                                             *pending-borrow-handles*))
+                                     (push (or bi rep) vals)
                                      (incf ai)))
                                   (t
                                    (let* ((pflat (%flat-type-of vt
@@ -9354,7 +9466,12 @@ is the valtype."
   SYNC-typed callee runs inline and resolves before returning.
   Returns the OnCancel closure (the subtask's cancel hook)."
   (let ((ft (and (lifted-func-p f)
-                 (lifted-func-type f))))
+                 (lifted-func-type f)))
+        ;; M17 step 2: the borrow handles this call's lowering added
+        ;; to the callee's table, drained HERE so no other Task (a
+        ;; nested callee) can adopt them.
+        (borrow-handles *pending-borrow-handles*))
+    (setf *pending-borrow-handles* nil)
     (when (and (lifted-func-p f) (lifted-func-host f))
       ;; M16 slice 3b: a HOST provider is a CL closure. M17 step 5:
       ;; an ASYNC-typed one may return a HOST-PENDING instead of a
@@ -9412,6 +9529,9 @@ is the valtype."
                                   component-args)))
                (task (progn (%tok-stamp-task task) task))
                (th (make-async-thread :task task)))
+          ;; §2838: the borrow handles this call lowered become THIS
+          ;; task's num_borrows account
+          (%adopt-borrow-handles task borrow-handles)
           (setf (async-task-implicit-thread task) th)
           (%thread-birth th)
                 (setf (async-task-on-resolve task)
