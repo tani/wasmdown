@@ -1,3 +1,24 @@
+# M17 SESSION 19 — THE FIRST CLEAN-WINDOW n=30 ON MASTER AFTER ALL THE FIXES:
+# 18 fail commands / 30 runs, and the row composition has COLLAPSED TO TWO ROWS.
+#   red_runs=17/30  fail_commands=18  walls 9.96-10.59 s (tightest band recorded)
+#   reentrance::14                     14
+#   cancel-resumed-callback-switch::1   4
+#   EVERY OTHER HISTORICAL ROW IS 0: async-calls-sync::1/::2, ctr::9, dssc::2,
+#   dssc::19, dssc::22, may-block::8, excl-resume::2, cd::1, crcc::3,
+#   partial-stream-copies::1, sync-streams::1.
+# For scale: master measured 14-41 fail commands with acs-dominant rows earlier in this
+# same effort, and the plan's acceptance was never reachable. It is now TWO rows away
+# from a green lane, and both are quantified:
+#   reentrance::14 — the drift row the ledger has carried since M13. Not decoded.
+#   cancel-resumed-callback-switch::1 — appeared at 4-6/30 once the interrupt arm
+#     started nudging instead of resuming; crcc::3 (the resume-later family) stays 0.
+# The next slice chases reentrance::14 (the 14/30 one) with the same discipline every
+# row fix this session used: reproduce, quote the in-guest check, instrument the wake
+# provenance, fix the identity/credit rule rather than the guest's expectation, pin it.
+# NOTE ON THE INSTRUMENT: this block is the first n=30 taken on a QUIET box in this
+# whole effort (the user's benchmark owned the machine all session); the walls' 0.6 s
+# spread is the cleanest signal the meter has produced, and it is the number any
+# future comparison must be paired against.
 # M17 SESSION 18 — dssc::2 CLOSED: EXPLICIT SWITCHES ARE TARGET-LIMITED HANDOFFS
 # (e6dcd30). The last during-sync row is gone.
 # THE IN-GUEST CHECK: (drop (call $thread.yield-then-promote worker)) then
