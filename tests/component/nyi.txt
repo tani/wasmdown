@@ -1,3 +1,38 @@
+# M17 SESSION 6 — WAVE A: STEP 2's DTOR API LANDED, STEP 3's LINK-TIME CHECK PARKED,
+# AND acs::2's SIGNATURE IS NOW SEEN IN THREE INDEPENDENT SLICES.
+# 1. LANDED (98075dd): host-register-resource-dtor / host-resource-finalizer —
+#    a per-instance finalizer registry stored with the instance's provenance under
+#    the reserved key :host-resource-dtors (eq-keyed resource-ct -> finalizer, so
+#    two instances of one provider ct keep independent hooks); registration is
+#    idempotent per (instance, ct) and returns the first finalizer; :resource-drop
+#    resolves guest dtor -> per-instance -> canon-defining instance -> the global
+#    table as a fallback for this wave. Units 493/0 twice. The wasi migration
+#    (retiring *descriptor-dtor-installed* / *socket-dtor-installed* and the two
+#    global tables) is the NEXT wave and must be a SEPARATE wave: it needs both
+#    src/component-runtime.lisp and src/wasi.lisp, and this week showed what two
+#    files mid-edit costs.
+# 2. PARKED (wip/link-contracts, 06fbf05): check-import-binding, called from
+#    %exec-import for the :func and :value sorts. Units 499/0 twice and the gate
+#    GREEN once, but parked because of the third signature below. The gating is a
+#    measured decision, not caution: unconditional coverage turned every WASI
+#    end-to-end fixture into a link error (`import "wasi:cli/stdout@0.3.2"
+#    "error-code": found no export` — the providers build PARTIAL types instances
+#    whose exports resolve through aliases), and three fixtures still supply
+#    shrunk substitutes, which is plan item 1's migration. Coverage goes
+#    default-on only after that.
+# 3. THE PATTERN THAT NOW DECIDES STEP 4: async-calls-sync::2 was perturbed to
+#    29/30 by wip/type-view, and to 6/6 in 6-run probes by BOTH wip/reactor-wiring
+#    and wip/link-contracts — three slices with nothing in common except that each
+#    adds work to the INSTANTIATION path. A verified null-diff (69 full GCs per
+#    run, manipulation confirmed by wall) did NOT perturb it, so it is not raw
+#    overhead: it is the instantiation path's shape. Conclusion: stop treating each
+#    slice as a suspect. The row's robustness IS step 4's acquisition-side quantum,
+#    and every future slice needs the adjacent n=30 pair to be judged, with this
+#    entry as the standing prior that an instantiation-path change will show up
+#    here first.
+# The instrument gained --allow-dirty (0a8aad8) so an unlanded diff can be metered;
+# it prints the diff's sha256 prefix with the batch and keeps the clean guard as
+# the default.
 # M17 SESSION 5e — HUNK-RANGE BISECT: THE LINE ANCHORS, RECORDED SO THE NEXT
 # SESSION DOES NOT RECOMPUTE THEM.
 # `git diff master wip/type-view -- src/component.lisp` = 24 hunks. Their NEW-side
