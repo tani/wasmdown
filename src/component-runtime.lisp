@@ -75,9 +75,9 @@
            ;; record and whose drop runs a host finalizer)
            #:host-resource-rep
            #:host-resource-take
-           #:*host-resource-dtor-table*
-           ;; M17 — the PER-INSTANCE host-resource destructor
-           ;; registry (the WASI providers migrate to it next wave)
+           ;; M17 — the PER-INSTANCE host-resource destructor registry
+           ;; (the WASI providers register here) + the ct -> owning
+           ;; instance resolution the guest-drop path uses to reach it
            #:host-register-resource-dtor
            #:host-resource-finalizer
            ;; M16 slice 6 — the RUNNER's store-boundary teardown: a host
@@ -312,16 +312,6 @@ func-instance, resolved at the TYPE def walk in the DEFINING
 instance's core-func space. A consumer's resource.drop canon reads
 the ORIGIN's dtor — the ct's payload dtor index is meaningful only
 there.")
-
-(defvar *host-resource-dtor-table* (make-hash-table :test #'eq)
-  "M16 slice 3: resource-ct -> (lambda (rep) ...) for a HOST-provided
-resource (wasi:filesystem's descriptor). Such a resource has no guest
-dtor func-instance; canon resource.drop calls this finalizer with the
-rep so the host capability (the fd) is released deterministically.
-FALLBACK ONLY (M17): the per-instance registry below is the contract;
-this global is keyed by the ct alone, so two instances of the same
-provider ct cannot keep distinct finalizers in it. Removed by the
-WASI migration wave once every provider registers per instance.")
 
 ;;; ---- M17: the PER-INSTANCE host-resource destructor registry ----
 ;;; A host capability adopted by an instance is released by THAT
@@ -3189,16 +3179,87 @@ callers (the M9/M10 lanes: the defining instance's own tasks —
 top-level runner) are a NO-OP."
   (or *handle-caller-inst* inst))
 
+(defun %host-resource-graph-successors (inst)
+  "The comp-instances INST directly links, in a deterministic order:
+the INSTANCES index vector (the import/alias projection order, i.e.
+exactly where %EXEC-IMPORT and %EXEC-ALIAS put an imported provider),
+then its :instance exports by name, then a with-args pre-bound
+provider instance by import name. This is the STRUCTURAL half of the
+ct -> owning-instance provenance: a provider is visible only to the
+instances that actually linked it."
+  (let ((out '()))
+    (loop for v across (comp-instance-instances inst)
+          when (comp-instance-p v) do (push v out))
+    (flet ((reachable-by-name (table extract)
+             (let ((names '()))
+               (maphash (lambda (k v)
+                          (when (and (stringp k) (funcall extract v))
+                            (push k names)))
+                        table)
+               (dolist (k (sort names #'string<))
+                 (push (funcall extract (gethash k table)) out)))))
+      (reachable-by-name (comp-instance-exports inst)
+                         (lambda (v)
+                           (and (consp v) (eq (car v) :instance)
+                                (comp-instance-p (cdr v))
+                                (cdr v))))
+      (reachable-by-name (comp-instance-imports inst)
+                         (lambda (v) (and (comp-instance-p v) v))))
+    (nreverse out)))
+
+(defun %host-resource-owner (insts rt)
+  "The ct -> OWNING-INSTANCE resolution for a host-provided resource
+CT: the first comp-instance reachable from INSTS — the INSTS
+themselves first, then breadth-first over
+%HOST-RESOURCE-GRAPH-SUCCESSORS, ties broken deterministically — whose
+per-instance registry holds a finalizer for RT. Returns (values
+finalizer instance), or (values NIL NIL).
+
+The owner record IS the provider's own registry entry
+(HOST-REGISTER-RESOURCE-DTOR on the adopting instance), so the
+provenance is per instance by construction: there is no ct-keyed
+global, and two independent graphs (a second guest, a second store)
+that both built providers from the same WIT package cannot see each
+other's release. A guest's canon resource.drop only knows the ct and
+the rep — its DYNAMIC and canon instances are the guest — so this
+graph is what turns the ct into the provider that owns it.
+
+NOTE the one ambiguity the ct cannot resolve: a resource ct is a
+WIT-PACKAGE-level identity, so several providers built from the same
+parsed package and all reachable from one guest register the SAME ct.
+The nearest one (breadth-first, ties in successor order) answers; such
+co-registrants must therefore agree on the release. The WASI ones do
+(every owner of the descriptor ct registers CLOSE-WASI-DESCRIPTOR)."
+  (let ((seen (make-hash-table :test #'eq))
+        (queue (copy-list insts)))
+    (loop while queue
+          for i = (pop queue)
+          when (and (comp-instance-p i) (not (gethash i seen)))
+            do (setf (gethash i seen) t)
+               (let ((f (host-resource-finalizer i rt)))
+                 (when f (return-from %host-resource-owner (values f i))))
+               (dolist (s (%host-resource-graph-successors i))
+                 (unless (gethash s seen)
+                   (setf queue (nconc queue (list s)))))
+          finally (return (values nil nil)))))
+
 (defun %host-resource-finalizer-at (inst rt)
-  "The host finalizer for a drop of RT: the DYNAMIC resource
-instance's per-instance registry first (the table the handle lives on
-— that instance's capability is the one being released), then the
-canon-DEFINING INSTANCE's, then the M16 global table (fallback only:
-the provider still installs ct-keyed). NIL when nothing registered
-RT, i.e. the resource has no host release hook at all."
+  "The host finalizer for a drop of RT, in the plan's ORDER:
+(1) the DYNAMIC resource instance's per-instance registry (the table
+the handle lives on — its capability is the one being released),
+(2) the canon-DEFINING instance's (INST, the instance the drop canon
+belongs to),
+(3) the ct's OWNING instance — the provider that registered RT,
+found through the instance graph reachable from those two
+(%HOST-RESOURCE-OWNER; a guest drop reaches the provider exactly the
+way %EXEC-IMPORT linked it).
+NIL when nothing in the graph registered RT, i.e. the resource has no
+host release hook at all."
   (or (host-resource-finalizer (%resource-current-inst inst) rt)
       (host-resource-finalizer inst rt)
-      (gethash rt *host-resource-dtor-table*)))
+      (nth-value 0 (%host-resource-owner
+                    (list (%resource-current-inst inst) inst)
+                    rt))))
 
 (defun %resource-builtin-host-func (inst kind rt &optional dtor)
   "The canon resource built-in's core wrapper: [i32] -> [i32] for
@@ -3251,10 +3312,11 @@ resource.drop (param handle), [i32] -> [i32] for resource.rep."
             (cond
               (dtor (apply #'wasmdown.runtime:wasm-call dtor (list rep)))
               ;; M17: a HOST-provided resource's release hook comes from
-              ;; the per-instance registry whose provenance adopted the
-              ;; provider (two instances of the same provider ct each
-              ;; release their own capability); the ct-keyed global is
-              ;; the fallback until the WASI migration registers there.
+              ;; the per-instance registry: the handle's own instance,
+              ;; the canon instance, or — for a GUEST-initiated drop,
+              ;; where both of those are the guest — the ct's OWNING
+              ;; provider found through the instance graph the import
+              ;; linked. No ct-keyed global remains.
               (t (let ((hdtor (%host-resource-finalizer-at inst rt)))
                    (when hdtor (funcall hdtor rep))))))
           '()))))

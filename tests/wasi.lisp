@@ -1031,9 +1031,6 @@ removes NAMES (an evaluated list, so callers quote it) and the root."
                             types dtor-ct)))
                (is (eq (symbol-function 'wasmdown.wasi:close-wasi-descriptor)
                        hdtor))
-               (is (null (gethash
-                          dtor-ct
-                          wasmdown.component.runtime:*host-resource-dtor-table*)))
                (is (plusp (wasmdown.wasi:wasi-descriptor-fd opened)))
                (funcall hdtor opened)
                (is (eql -1 (wasmdown.wasi:wasi-descriptor-fd opened)))
@@ -3499,7 +3496,9 @@ STEP never blocks, so a fake clock fully determines the outcome."
            (tcp-ct (wasmdown.wasi:tcp-socket-resource-ct))
            (udp-ct (wasmdown.wasi:udp-socket-resource-ct))
            (guest (wasmdown.component.runtime:make-comp-instance))
-           (global wasmdown.component.runtime:*host-resource-dtor-table*)
+           (resolve-at (lambda (inst ct)
+                         (wasmdown.component.runtime::%host-resource-finalizer-at
+                          inst ct)))
            (fin (lambda (inst ct)
                   (wasmdown.component.runtime:host-resource-finalizer
                    inst ct))))
@@ -3530,11 +3529,20 @@ STEP never blocks, so a fake clock fully determines the outcome."
              (is (null (gethash :host-resource-dtors
                                 (wasmdown.component.runtime:comp-instance-imports
                                  guest))))
-             ;; (d) the retired ct-keyed global holds NONE of them: the
-             ;; provider instances are the only registration
-             (is (null (gethash desc-ct global)))
-             (is (null (gethash tcp-ct global)))
-             (is (null (gethash udp-ct global)))
+             ;; (d) the DROP path's provenance: the provider instances
+             ;; are the ONLY registration (no ct-keyed global exists any
+             ;; more), so a guest resolves nothing until it LINKED the
+             ;; provider — and then resolves the provider's own hook,
+             ;; not some global one
+             (let ((wasmdown.component.runtime::*handle-caller-inst* nil))
+               (is (null (funcall resolve-at guest desc-ct)))
+               (is (null (funcall resolve-at guest tcp-ct)))
+               (wasmdown.component.runtime::%push-instance guest fs-types)
+               (wasmdown.component.runtime::%push-instance guest sock-types)
+               (is (eq (funcall fin fs-types desc-ct)
+                       (funcall resolve-at guest desc-ct)))
+               (is (eq (funcall fin sock-types tcp-ct)
+                       (funcall resolve-at guest tcp-ct))))
              ;; (e) the registered hooks are LIVE for resources created
              ;; THROUGH the provider: the preopen's own own<descriptor>
              ;; releases as a no-op (the embedder keeps the root fd),

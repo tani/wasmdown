@@ -2809,8 +2809,10 @@ repo root, as a string — the pin runs a fixture row VERBATIM."
   ;; registry lives in the instance's provenance (:HOST-RESOURCE-DTORS
   ;; of the imports table), host-register-resource-dtor is idempotent
   ;; per (instance, ct) and returns the first-registered finalizer,
-  ;; and the :resource-drop built-in resolves through it before the
-  ;; M16 ct-keyed global (the fallback this wave still honors).
+  ;; and the :resource-drop built-in resolves the hook in the plan's
+  ;; order: the handle's instance, the canon instance, then the ct's
+  ;; owning provider found through the instance graph. No ct-keyed
+  ;; global remains (see the guest-drop acceptance pin below).
   (labels ((host-ct (name)
              (wasmdown.component:make-ct :kind :resource :payload name))
            (drop (inst ct rep)
@@ -2865,32 +2867,37 @@ repo root, as a string — the pin runs a fixture row VERBATIM."
       ;; a non-function finalizer is rejected outright
       (is (handler-case (progn (reg i1 ct 42) nil)
             (type-error () t))))
-    ;; (c) the drop path PREFERS the per-instance hook and still FALLS
-    ;; BACK to the M16 global table for this wave
+    ;; (c) the drop path's ORDER — the handle's own instance registry
+    ;; first, the canon instance's second, then the ct's OWNING
+    ;; instance reached through the instance graph. The M16 ct-keyed
+    ;; global is GONE: no registration outside a provider instance can
+    ;; make a hook appear, and a guest has no path to a provider it
+    ;; never linked.
     (let ((wasmdown.component.runtime::*handle-caller-inst* nil)
           (ct (host-ct "descriptor"))
           (inst (wasmdown.component.runtime:make-comp-instance))
+          (provider (wasmdown.component.runtime:make-comp-instance))
           (got '()))
-      (setf (gethash ct
-                     wasmdown.component.runtime:*host-resource-dtor-table*)
-            (lambda (rep) (push (cons :global rep) got)))
-      (unwind-protect
-           (progn
-             ;; no per-instance registration -> the global fallback runs
-             (drop inst ct :g1)
-             (is (equal '((:global . :g1)) got))
-             ;; per-instance registration SHADOWS the global
-             (reg inst ct (lambda (rep) (push (cons :local rep) got)))
-             (drop inst ct :g2)
-             (is (equal '((:local . :g2) (:global . :g1)) got))
-             ;; another instance of the same ct still uses the global
-             (drop (wasmdown.component.runtime:make-comp-instance) ct :g3)
-             (is (equal '((:global . :g3) (:local . :g2) (:global . :g1))
-                        got)))
-        (remhash ct
-                 wasmdown.component.runtime:*host-resource-dtor-table*))
-      ;; an instance that never registered the ct leaves the global as
-      ;; the ONLY hook (no per-instance table got created)
+      ;; nothing in inst's graph registered the ct -> no hook at all
+      (drop inst ct :g0)
+      (is (null got))
+      (reg provider ct (lambda (rep) (push (cons :owner rep) got)))
+      ;; the owner is invisible while unlinked (graph-scoped provenance)
+      (drop inst ct :g1)
+      (is (null got))
+      ;; the ABI's import binding links it; its hook now runs for the
+      ;; GUEST-initiated drop
+      (wasmdown.component.runtime::%push-instance inst provider)
+      (drop inst ct :g2)
+      (is (equal '((:owner . :g2)) got))
+      ;; the handle's OWN instance registry shadows the ct's owner
+      (reg inst ct (lambda (rep) (push (cons :local rep) got)))
+      (drop inst ct :g3)
+      (is (equal '((:local . :g3) (:owner . :g2)) got))
+      ;; an unrelated guest has no path to that provider
+      (drop (wasmdown.component.runtime:make-comp-instance) ct :g4)
+      (is (equal '((:local . :g3) (:owner . :g2)) got))
+      ;; an instance that never registered the ct has no hook
       (is (null (fin inst (host-ct "never-registered")))))))
 
 
@@ -3110,6 +3117,107 @@ they use no type aliases or type imports)."
     (is (eq good
             (wasmdown.component:check-import-binding imprec good types)))))
 
+(test component/guest-drop-reaches-provider-finalizer-pin
+  ;; M17 STEP 2's ACCEPTANCE MEASUREMENT — the migration probe, as a
+  ;; pin. A GUEST-initiated `canon resource.drop` of a PROVIDER
+  ;; resource: the ABI adds the OWNED handle to the GUEST's table (the
+  ;; dynamic instance) and the drop now runs with
+  ;; *HANDLE-CALLER-INST* NIL, so BOTH the dynamic and the canon
+  ;; instance are the guest and neither per-instance registry arm can
+  ;; hold the hook. The ct is the provider's own WIT resource ct and
+  ;; the guest reached the provider the way %EXEC-IMPORT does (the
+  ;; provider instance is one of the guest's INSTANCES indices), so
+  ;; the ct -> owning-instance arm must find it THROUGH THAT GRAPH —
+  ;; there is no ct-keyed global to save it.
+  ;;
+  ;; MEASURED BEFORE the owner arm (pre-change runtime): the probe
+  ;; read fd-before 5, fd-after 5, closed-p NIL — the finalizer never
+  ;; ran and all four assertions below failed. AFTER: the fd closes.
+  (let* ((ctx (wasmdown.wasi:make-wasi-context))
+         (provider (wasmdown.wasi:filesystem-types-instance ctx))
+         (ct (wasmdown.wasi:descriptor-resource-ct))
+         (guest (wasmdown.component.runtime:make-comp-instance))
+         (desc (wasmdown.wasi::make-wasi-descriptor
+                :fd (sb-unix:unix-open "/dev/null" sb-unix:o_rdonly 0)
+                :owned-p t))
+         (wasmdown.component.runtime::*handle-caller-inst* nil))
+    (unwind-protect
+         (progn
+           ;; the provider registered its finalizer on ITSELF; the guest
+           ;; holds none, and has not linked the provider yet
+           (is (eq (symbol-function 'wasmdown.wasi:close-wasi-descriptor)
+                   (wasmdown.component.runtime:host-resource-finalizer
+                    provider ct)))
+           (is (null (wasmdown.component.runtime:host-resource-finalizer
+                      guest ct)))
+           ;; the import binding: %EXEC-IMPORT pushes the provider
+           ;; instance at an INSTANCES index of the guest
+           (wasmdown.component.runtime::%push-instance guest provider)
+           ;; the ABI's own handle: OWNED, on the GUEST table, keyed by
+           ;; the provider's ct (1-based slot 1)
+           (let* ((idx (wasmdown.component.runtime::%handle-add
+                        guest ct desc t))
+                  (drop (wasmdown.component.runtime::%resource-builtin-host-func
+                         guest :resource-drop ct nil)))
+             (is (eql 1 idx))
+             (is (plusp (wasmdown.wasi:wasi-descriptor-fd desc)))
+             (is (not (wasmdown.wasi:wasi-descriptor-closed-p desc)))
+             (wasmdown.runtime:wasm-call drop idx)
+             ;; the PROVIDER's finalizer ran: release exactly once,
+             ;; fd invalidated, handle consumed from the guest table
+             (is (wasmdown.wasi:wasi-descriptor-closed-p desc))
+             (is (eql -1 (wasmdown.wasi:wasi-descriptor-fd desc)))
+             (is (null (wasmdown.component.runtime::%handle-rep
+                        guest ct idx))))
+           ;; the same path for a SOCKET rep: create through the
+           ;; provider, own handle on the guest, drop -> fd -1/:closed
+           (let* ((sock-provider (wasmdown.wasi:sockets-types-instance ctx))
+                  (tcp-ct (wasmdown.wasi:tcp-socket-resource-ct))
+                  (created (wasmdown.wasi::tcp-create
+                            ctx nil (cons :enum "ipv4")))
+                  (sock (fourth created)))
+             (is (eq tcp-ct (third created)))
+             (is (plusp (wasmdown.wasi:wasi-tcp-socket-fd sock)))
+             (wasmdown.component.runtime::%push-instance guest sock-provider)
+             (let* ((idx (wasmdown.component.runtime::%handle-add
+                          guest tcp-ct sock t))
+                    (drop (wasmdown.component.runtime::%resource-builtin-host-func
+                           guest :resource-drop tcp-ct nil)))
+               (wasmdown.runtime:wasm-call drop idx)
+               (is (eql -1 (wasmdown.wasi:wasi-tcp-socket-fd sock)))
+                (is (eq :closed (wasmdown.wasi:wasi-tcp-socket-state sock))))))
+      (let ((fd (wasmdown.wasi:wasi-descriptor-fd desc)))
+        (when (and (integerp fd) (not (minusp fd)))
+          (sb-unix:unix-close fd))))))
+
+(test component/host-resource-owner-is-graph-scoped-pin
+  ;; The ct -> owning-instance provenance is the PROVIDER instance's own
+  ;; registry (no ct-keyed global): the owner is found only through the
+  ;; instance graph the requester linked. A provider that no one linked
+  ;; is invisible even though it registered the same ct.
+  (let* ((ct (wasmdown.component:make-ct :kind :resource :payload "scoped"))
+         (p1 (wasmdown.component.runtime:make-comp-instance))
+         (p2 (wasmdown.component.runtime:make-comp-instance))
+         (guest (wasmdown.component.runtime:make-comp-instance))
+         (g1 (lambda (rep) (declare (ignore rep))))
+         (g2 (lambda (rep) (declare (ignore rep))))
+         (wasmdown.component.runtime::*handle-caller-inst* nil))
+    (wasmdown.component.runtime:host-register-resource-dtor p1 ct g1)
+    (wasmdown.component.runtime:host-register-resource-dtor p2 ct g2)
+    (wasmdown.component.runtime::%push-instance guest p1)
+    (multiple-value-bind (fin owner)
+        (wasmdown.component.runtime::%host-resource-owner
+         (list guest) ct)
+      (is (eq g1 fin))
+      (is (eq p1 owner)))
+    ;; an unlinked provider is NOT reachable
+    (is (null (wasmdown.component.runtime::%host-resource-owner
+               (list (wasmdown.component.runtime:make-comp-instance)) ct)))
+    ;; an unregistered ct resolves to nothing at all
+    (is (null (wasmdown.component.runtime::%host-resource-owner
+               (list guest) (wasmdown.component:make-ct
+                             :kind :resource :payload "absent"))))))
+
 (defun run-component-pins ()
   "Run the component pins (registered via TEST; returns T)."
   (let ((wasmdown.test::*tests*
@@ -3189,7 +3297,9 @@ they use no type aliases or type imports)."
                       component/import-binding-missing-pins
                       component/import-binding-accepts-pins
                       component/import-binding-type-bound-pins
-                      component/import-binding-instance-coverage-pins)))
+                      component/import-binding-instance-coverage-pins
+                      component/guest-drop-reaches-provider-finalizer-pin
+                      component/host-resource-owner-is-graph-scoped-pin)))
           wasmdown.test::*tests*)))
     (multiple-value-bind (passed failed)
         (wasmdown.test:run-all-tests)
