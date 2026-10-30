@@ -5,6 +5,11 @@ This is a **baseline measurement, not a release gate** per PLAN.md §12.8;
 `unsupported` counts are out-of-scope features
 (SIMD/GC/EH/tail-calls and the unadopted-annotations proposal); this runner
 reports and does not fail the build, so read the counts, not the exit code.
+PINNED NUMBERS to compare against: pass 21,187 / fail 0 / unsupported 73 at
+the revision below. A regression or an accidental widening of the
+out-of-scope set shows up as a CHANGED count here; the totals are steady
+across the baselines recorded in this repo, and any movement must be
+explained in the same change that moves them.
 Historical note, kept for provenance: an earlier classification pass moved
 277 -> 725 such commands out of `harness-error` and into honest
 :unsupported`; the pinned baseline now records its own numbers above.
