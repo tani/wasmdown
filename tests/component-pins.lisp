@@ -3130,6 +3130,13 @@ they use no type aliases or type imports)."
   ;; the ct -> owning-instance arm must find it THROUGH THAT GRAPH —
   ;; there is no ct-keyed global to save it.
   ;;
+  ;; REUSE VECTOR for the plan's task.return / cancel
+  ;; lifetime-ownership pins: this exact shape (a guest instance
+  ;; carrying an OWN handle for a provider ct, *HANDLE-CALLER-INST*
+  ;; NIL, the :resource-drop built-in, then the resource's released
+  ;; state) is the vector to copy — swap the drop for task.return or a
+  ;; cancellation and assert what is still live.
+  ;;
   ;; MEASURED BEFORE the owner arm (pre-change runtime): the probe
   ;; read fd-before 5, fd-after 5, closed-p NIL — the finalizer never
   ;; ran and all four assertions below failed. AFTER: the fd closes.
@@ -3218,6 +3225,124 @@ they use no type aliases or type imports)."
                (list guest) (wasmdown.component:make-ct
                              :kind :resource :payload "absent"))))))
 
+(test component/two-providers-drop-own-finalizers-pin
+  ;; TWO filesystem providers, DIFFERENT capability contexts, BOTH
+  ;; linked into ONE guest: each owns its own descriptor reps and its
+  ;; own registry entry for the descriptor ct. Dropping a rep releases
+  ;; THAT rep's fd and leaves the other provider's fd alone — the
+  ;; owner arm never lets one provider's registry release the other's
+  ;; resource.
+  ;;
+  ;; RECORDED LIMITATION (measured here, not assumed): both providers
+  ;; are built from the same WIT package, and a resource ct is a
+  ;; PACKAGE-level identity (`wit-interface-resource-cts` memo), so
+  ;; the two registrations share ONE ct object and both hooks are the
+  ;; same function (CLOSE-WASI-DESCRIPTOR). The ct therefore cannot
+  ;; name WHICH provider owns a given rep: %HOST-RESOURCE-OWNER applies
+  ;; its documented "nearest (breadth-first, successor order) answers"
+  ;; rule, which is the first-linked provider for both drops. What IS
+  ;; distinguishable — and what this pin asserts — is the REP: the
+  ;; release is applied to the dropped handle's rep only, so each
+  ;; provider's fd closes exactly once and the other stays open. The
+  ;; second half of the pin shows the same graph become unambiguous
+  ;; once the two providers come from DISTINCT package parses (distinct
+  ;; cts): then each ct resolves to ITS OWN instance.
+  (let* ((pre1 (wasmdown.wasi:open-wasi-preopen "/tmp" :name "/one"))
+         (pre2 (wasmdown.wasi:open-wasi-preopen "/tmp" :name "/two"))
+         (ctx1 (wasmdown.wasi:make-wasi-context :preopens (list pre1)))
+         (ctx2 (wasmdown.wasi:make-wasi-context :preopens (list pre2)))
+         (p1 (wasmdown.wasi:filesystem-types-instance ctx1))
+         (p2 (wasmdown.wasi:filesystem-types-instance ctx2))
+         (pp1 (wasmdown.wasi:filesystem-preopens-instance ctx1))
+         (pp2 (wasmdown.wasi:filesystem-preopens-instance ctx2))
+         (ct (wasmdown.wasi:descriptor-resource-ct))
+         (hook (symbol-function 'wasmdown.wasi:close-wasi-descriptor))
+         (guest (wasmdown.component.runtime:make-comp-instance))
+         (wasmdown.component.runtime::*handle-caller-inst* nil)
+         (d1 (wasmdown.wasi::make-wasi-descriptor
+              :fd (sb-unix:unix-open "/dev/null" sb-unix:o_rdonly 0)
+              :preopen pre1 :owned-p t))
+         (d2 (wasmdown.wasi::make-wasi-descriptor
+              :fd (sb-unix:unix-open "/dev/null" sb-unix:o_rdonly 0)
+              :preopen pre2 :owned-p t))
+         (d3 (wasmdown.wasi::make-wasi-descriptor
+              :fd (sb-unix:unix-open "/dev/null" sb-unix:o_rdonly 0)
+              :preopen pre2 :owned-p t)))
+    (unwind-protect
+         (progn
+           ;; each provider owns its OWN registry table, and each table
+           ;; holds the shared package ct under its own hook
+           (is (not (eq (wasmdown.component.runtime::%inst-host-resource-dtors p1)
+                        (wasmdown.component.runtime::%inst-host-resource-dtors p2))))
+           (is (eq hook (wasmdown.component.runtime:host-resource-finalizer p1 ct)))
+           (is (eq hook (wasmdown.component.runtime:host-resource-finalizer p2 ct)))
+           ;; both provider pairs linked into the same guest (the ABI
+           ;; import bindings)
+           (dolist (i (list p1 p2 pp1 pp2))
+             (wasmdown.component.runtime::%push-instance guest i))
+           ;; the shared ct: the nearest linked provider answers —
+           ;; documented, and the same release either way
+           (multiple-value-bind (fin owner)
+               (wasmdown.component.runtime::%host-resource-owner
+                (list guest) ct)
+             (is (eq hook fin))
+             (is (eq p1 owner)))
+           ;; one drop per provider: each rep's own fd closes, the
+           ;; other provider's rep is untouched
+           (let* ((i1 (wasmdown.component.runtime::%handle-add guest ct d1 t))
+                  (i2 (wasmdown.component.runtime::%handle-add guest ct d2 t))
+                  (drop (wasmdown.component.runtime::%resource-builtin-host-func
+                         guest :resource-drop ct nil)))
+             (is (plusp (wasmdown.wasi:wasi-descriptor-fd d1)))
+             (is (plusp (wasmdown.wasi:wasi-descriptor-fd d2)))
+             (wasmdown.runtime:wasm-call drop i1)
+             (is (wasmdown.wasi:wasi-descriptor-closed-p d1))
+             (is (eql -1 (wasmdown.wasi:wasi-descriptor-fd d1)))
+             (is (zerop (wasmdown.wasi:wasi-descriptor-refs d1)))
+             (is (not (wasmdown.wasi:wasi-descriptor-closed-p d2)))
+             (is (plusp (wasmdown.wasi:wasi-descriptor-fd d2)))
+             (wasmdown.runtime:wasm-call drop i2)
+             (is (wasmdown.wasi:wasi-descriptor-closed-p d2))
+             (is (eql -1 (wasmdown.wasi:wasi-descriptor-fd d2)))
+             (is (zerop (wasmdown.wasi:wasi-descriptor-refs d2))))
+           ;; DISTINCT package parses => distinct cts => the owner arm
+           ;; discriminates: ct2 resolves to p3, the original ct keeps
+           ;; resolving to p1, and each drop again releases its own rep
+           (let* ((pkg2 (wasmdown.wit:parse-wit-file
+                         (wasmdown.wasi:wasi-package-file "filesystem")))
+                  (ct2 (wasmdown.wasi:descriptor-resource-ct :package pkg2))
+                  (p3 (wasmdown.wasi:filesystem-types-instance ctx2
+                                                               :package pkg2)))
+             (is (not (eq ct2 ct)))
+             (is (eq hook (wasmdown.component.runtime:host-resource-finalizer
+                           p3 ct2)))
+             (wasmdown.component.runtime::%push-instance guest p3)
+             (multiple-value-bind (fin owner)
+                 (wasmdown.component.runtime::%host-resource-owner
+                  (list guest) ct2)
+               (is (eq hook fin))
+               (is (eq p3 owner)))
+             (multiple-value-bind (fin owner)
+                 (wasmdown.component.runtime::%host-resource-owner
+                  (list guest) ct)
+               (declare (ignore fin))
+               (is (eq p1 owner)))
+             (let* ((i3 (wasmdown.component.runtime::%handle-add
+                         guest ct2 d3 t))
+                    (drop (wasmdown.component.runtime::%resource-builtin-host-func
+                           guest :resource-drop ct2 nil)))
+               (is (plusp (wasmdown.wasi:wasi-descriptor-fd d3)))
+               (wasmdown.runtime:wasm-call drop i3)
+               (is (wasmdown.wasi:wasi-descriptor-closed-p d3))
+               (is (eql -1 (wasmdown.wasi:wasi-descriptor-fd d3)))
+               (is (zerop (wasmdown.wasi:wasi-descriptor-refs d3))))))
+      (dolist (d (list d1 d2 d3))
+        (let ((fd (wasmdown.wasi:wasi-descriptor-fd d)))
+          (when (and (integerp fd) (not (minusp fd)))
+            (sb-unix:unix-close fd))))
+      (wasmdown.wasi:close-wasi-preopen pre1)
+      (wasmdown.wasi:close-wasi-preopen pre2))))
+
 (defun run-component-pins ()
   "Run the component pins (registered via TEST; returns T)."
   (let ((wasmdown.test::*tests*
@@ -3299,7 +3424,8 @@ they use no type aliases or type imports)."
                       component/import-binding-type-bound-pins
                       component/import-binding-instance-coverage-pins
                       component/guest-drop-reaches-provider-finalizer-pin
-                      component/host-resource-owner-is-graph-scoped-pin)))
+                      component/host-resource-owner-is-graph-scoped-pin
+                      component/two-providers-drop-own-finalizers-pin)))
           wasmdown.test::*tests*)))
     (multiple-value-bind (passed failed)
         (wasmdown.test:run-all-tests)
