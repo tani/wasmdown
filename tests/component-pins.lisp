@@ -3727,6 +3727,156 @@ waits unbounded)."
           (is (search "cannot resume thread which is not suspended"
                       (wasmdown:wasmdown-error-message o))))))))
 
+(test component/thread-index-identity-pin
+  ;; THE THREAD INDEX IS AN IDENTITY, NOT A POSITION (CanonicalABI.md
+  ;; 391-407, 625-626, 701-744, 4535-4551, 4700-4770; Table at
+  ;; 1111-1147). The spec's contract has THREE parts and this pin
+  ;; pins all three, because conflating them is what let dssc::19
+  ;; report "cannot switch to the current thread":
+  ;;
+  ;;  (1) register_thread (§701-706) assigns a FRESH index:
+  ;;      `assert(thread.index is None)' — so while N threads are
+  ;;      LIVE in one instance, no index is shared. The scan-and-add
+  ;;      must be ONE atomic step; two concurrent registrations that
+  ;;      both read `1 + max' would alias, and §513/§4550's
+  ;;      threads.get(i) would then return the WRONG record.
+  ;;  (2) an index is released at unregister (§737-744 ->
+  ;;      Table.remove, §1142-1146), and Table.add REUSES the hole
+  ;;      (§1131-1140). So "index 5 still names MY thread after it
+  ;;      exited" is NOT a spec guarantee — the index may name a
+  ;;      NEW live thread. What must hold is that it never resolves
+  ;;      to the DEAD record (the §1126-1129 hole check), and that
+  ;;      every LIVE index resolves to exactly its live record.
+  ;;  (3) a switch to the CALLER's own index is the GUEST's error:
+  ;;      canon_thread_{suspend,yield}_then_promote trap it
+  ;;      explicitly (§4728-4737, §4737's `trap_if(i == thread.index)').
+  ;;      That trap is KEPT — it is the spec's rule, not a symptom —
+  ;;      and (5) below pins the other half of it: a suspension may
+  ;;      only be ended by a real resume (§407/§494/§936), so a guest
+  ;;      cannot reach the trap through a runtime-side alias.
+  ;;
+  ;; (1) and (2) drive the PRODUCTION registration/unregistration
+  ;; (%REGISTER-THREAD-INDEX is the §705 step shared by
+  ;; Task.enter_implicit_thread and thread.new-indirect, §4591).
+  (%pin-with-store
+    (let* ((inst (%pin-inst))
+           (fields (wasmdown.component.runtime::%inst-async-fields inst))
+           (register (lambda (th)
+                       (wasmdown.component.runtime::%register-thread-index
+                        inst th)))
+           (live (lambda ()
+                   (remove-if (lambda (th)
+                                (eq (wasmdown.component.runtime::
+                                     async-thread-spawn-thunk th)
+                                    :done))
+                              (copy-list (getf fields :threads)))))
+           (index (lambda (th)
+                    (wasmdown.component.runtime::async-thread-index th)))
+           (a (%pin-thread inst nil '(1)))
+           (b (%pin-thread inst nil '(1 0)))
+           (c (%pin-thread inst nil '(1 1))))
+      (dolist (th (list a b c)) (funcall register th))
+      ;; ---- (1) pairwise-distinct indices among LIVE records
+      (is (= 3 (length (funcall live))))
+      (is (= 3 (length (remove-duplicates
+                        (mapcar index (funcall live))))))
+      ;; every live index resolves to ITS OWN record
+      (dolist (th (funcall live))
+        (is (eq th (find (funcall index th) (funcall live) :key index))))
+      ;; re-registration is idempotent — never a second entry and
+      ;; never a second index for one record (§705's assert)
+      (let ((before (funcall index a)))
+        (funcall register a)
+        (is (= before (funcall index a)))
+        (is (= 1 (count a (funcall live) :test #'eq))))
+      ;; ---- (2) unregister releases the slot; the hole may be reused
+      ;; by a NEW record but never resolves to the DEAD one
+      (let ((b-index (funcall index b)))
+        (wasmdown.component.runtime::%task-exit-implicit-thread
+         (wasmdown.component.runtime::async-thread-task b))
+        (is (not (member b (getf fields :threads) :test #'eq)))
+        (is (eq :done (wasmdown.component.runtime::async-thread-spawn-thunk
+                       b)))
+        (let ((d (%pin-thread inst nil '(1 2))))
+          (funcall register d)
+          ;; the fresh index is not one a LIVE thread holds
+          (dolist (th (remove d (funcall live) :test #'eq))
+            (is (/= (funcall index d) (funcall index th))))
+          ;; and no live index names b
+          (is (not (eq b (find b-index (funcall live) :key index))))
+          ;; every live index still resolves to its own record
+          (dolist (th (funcall live))
+            (is (eq th (find (funcall index th) (funcall live)
+                             :key index))))
+          ;; the dead record is not a switch target either: the
+          ;; lookup walks the LIVE table, and §1126-1129's Table.get
+          ;; traps on a HOLE exactly as it does out of bounds
+          (let ((wasmdown.component.runtime::*current-thread* c)
+                (wasmdown.component.runtime::*current-task*
+                  (wasmdown.component.runtime::async-thread-task c)))
+            (dolist (kind (list :thread-yield-then-promote
+                                :thread-suspend-then-promote
+                                :thread-yield-then-resume))
+              (let ((o (%pin-arm-outcome inst kind c b-index)))
+                (is (typep o 'wasmdown:wasm-trap))
+                (is (search "unknown thread index"
+                            (wasmdown:wasmdown-error-message o))))))
+          (wasmdown.component.runtime::%task-exit-implicit-thread
+           (wasmdown.component.runtime::async-thread-task d))))
+      ;; ---- (3) the CALLER's own index is the guest's own fault:
+      ;; §4737/§4763 `trap_if(i == thread.index)' — KEPT as a trap.
+      ;; the two PROMOTE builtins: §4737/§4763's explicit
+      ;; `trap_if(i == thread.index)'
+      (dolist (kind (list :thread-yield-then-promote
+                          :thread-suspend-then-promote))
+        (let ((o (%pin-arm-outcome inst kind a (funcall index a))))
+          (is (typep o 'wasmdown:wasm-trap))
+          (is (search "cannot switch to the current thread"
+                      (wasmdown:wasmdown-error-message o)))))
+      ;; the then-RESUME builtins have no self-index trap (§4711/
+      ;; §4716): the running caller is simply not `suspended()', so
+      ;; the same guest error is rejected by that rule instead
+      (let ((o (%pin-arm-outcome inst :thread-yield-then-resume a
+                                 (funcall index a))))
+        (is (typep o 'wasmdown:wasm-trap))
+        (is (search "cannot resume thread which is not suspended"
+                    (wasmdown:wasmdown-error-message o))))
+      ;; ---- (5) THE OTHER HALF OF THE SELF-SWITCH TRAP: only a REAL
+      ;; resume ends a suspension (§407: a SUSPENDED thread has no
+      ;; readiness function; §433-440: it is not in Store.waiting, so
+      ;; §936's tick cannot pick it; §494: `suspend' blocks with no
+      ;; readiness). A durable nudge — an implementation right
+      ;; handoff, a warden's wake, the grant of a tick — must leave
+      ;; the park parked. This is the dssc::19 mechanism: the nudge
+      ;; WAS the resume, the guest's thread finished early, its index
+      ;; was released and reused, and the guest's next switch named
+      ;; the caller. The trap then was the guest's own stale index —
+      ;; correct per (3) — but it was REACHED by a runtime-side
+      ;; unsuspension, which is what this half forbids.
+      (let ((p (%pin-thread inst nil '(1 3))))
+        (funcall register p)
+        (let ((h (%pin-start-park p)))
+          (%pin-wait-parked p)
+          ;; a plain nudge is not a resume
+          (wasmdown.component.runtime::%async-thread-wake p)
+          (sleep 0.15)
+          (is (null (car (getf h :done))))
+          (is (wasmdown.component.runtime::async-thread-suspended-p p))
+          ;; nor is a store tick's grant
+          (wasmdown.component.runtime::async-thread-resume-all)
+          (sleep 0.15)
+          (is (null (car (getf h :done))))
+          (is (wasmdown.component.runtime::async-thread-suspended-p p))
+          ;; a REAL resume ends it — exactly once
+          (wasmdown.component.runtime::async-thread-resume p)
+          (is (%pin-join (getf h :thread)))
+          (is (null (car (getf h :err))))
+          (is (not (wasmdown.component.runtime::async-thread-suspended-p p)))
+          (is (zerop (wasmdown.component.runtime::async-thread-resume-count
+                      p))))
+        (wasmdown.component.runtime::%task-exit-implicit-thread
+         (wasmdown.component.runtime::async-thread-task p))))))
+
 (defun run-component-pins ()
   "Run the component pins (registered via TEST; returns T)."
   (let ((wasmdown.test::*tests*
@@ -3811,7 +3961,8 @@ waits unbounded)."
                       component/host-resource-owner-is-graph-scoped-pin
                       component/two-providers-drop-own-finalizers-pin
                       component/resume-later-marker-lifetime-pin
-                      component/explicit-resume-requires-parked-peer-pin)))
+                      component/explicit-resume-requires-parked-peer-pin
+                      component/thread-index-identity-pin)))
           wasmdown.test::*tests*)))
     (multiple-value-bind (passed failed)
         (wasmdown.test:run-all-tests)

@@ -5148,6 +5148,23 @@ wrong-index probe: one transfer produced index 3)."
                                      ;; are transient (no count): a yield-park retries
                                      ;; on the next tick, a wait-until re-tests its
                                      ;; own readiness.
+  (resume-count 0 :type (unsigned-byte 64))
+                                     ; THE EXPLICIT-RESUME CREDIT (CanonicalABI.md
+                                     ; 391-407/474-498/523): only a §474 Thread.resume
+                                     ; (an explicit switch, the cancellation resume),
+                                     ; a §458-465 resume_later mark, or the §242-273
+                                     ; handoff post back to a switcher increments it.
+                                     ; It is the ONLY credit a SUSPEND park accepts:
+                                     ; a SUSPENDED thread has ready_func None (§407)
+                                     ; and is absent from Store.waiting (§936), so no
+                                     ; §922-940 tick — and no implementation-local
+                                     ; right-handoff nudge — may release it. WAKE-COUNT
+                                     ; stays the generic "re-test your ready-fn"
+                                     ; nudge (yield/WAITING parks); collapsing the
+                                     ; two was the ::19 defect: a nudge posted to a
+                                     ; thread that had not parked yet was consumed as
+                                     ; a resume, releasing a suspension the guest
+                                     ; never asked to end.
   (post-to nil)                      ; M13-4 the HANDOFF slot: the switcher this thread
                                      ; must hand control back to at its NEXT park/exit
                                      ; (§242-273's handler lock — installed through
@@ -5746,6 +5763,7 @@ of the park it was installed during."
     (sb-thread:with-recursive-lock ((async-thread-mutex thread))
       (setf (async-thread-ready-p thread) nil
             (async-thread-wake-count thread) 0
+            (async-thread-resume-count thread) 0
             (async-thread-granted thread) nil))))
 
 (defun %thread-drop-credit-on-exit (thread &key post-to-p)
@@ -5756,6 +5774,7 @@ no §242-273 handoff post left to make)."
     (sb-thread:with-recursive-lock ((async-thread-mutex thread))
       (setf (async-thread-ready-p thread) nil
             (async-thread-wake-count thread) 0
+            (async-thread-resume-count thread) 0
             (async-thread-granted thread) nil)
       (when post-to-p
         (setf (async-thread-post-to thread) nil)))))
@@ -5864,15 +5883,26 @@ task never resolves; the caller already trapped its oracle)."
            :kind :generic
            :message "abandoned by store teardown")))
 
-(defun %async-thread-wake (thread)
-  "M13-4 the DURABLE wake: every REAL wake of a park (an explicit
-resume, a §242-273 handoff post) increments the thread's WAKE-COUNT
-atomically and broadcasts BOTH waitqueues — NO far-side mutex (a
-lock-order inversion otherwise: this thread's park mutex held
-while taking the woken thread's, vs the tick path's scheduler
-mutex -> thread mutexs — the observed SBCL DEADLOCK cycle). The
-count's any-wake semantics make a lost broadcast harmless: the
-count is consumed at the next park."
+(defun %async-thread-wake (thread &key resume)
+  "M13-4 the DURABLE wake: every REAL wake of a park increments the
+thread's WAKE-COUNT atomically and broadcasts BOTH waitqueues — NO
+far-side mutex (a lock-order inversion otherwise: this thread's park
+mutex held while taking the woken thread's, vs the tick path's
+scheduler mutex -> thread mutexs — the observed SBCL DEADLOCK
+cycle). The count's any-wake semantics make a lost broadcast
+harmless: the count is consumed at the next park.
+
+RESUME marks the wake as a SPEC-LEVEL resume (CanonicalABI.md 474:
+Thread.resume; 458-465: resume_later's ready mark; 242-273: the
+handoff post that returns control to a switcher): it increments
+RESUME-COUNT as well, and ONLY that count releases a SUSPEND park
+(§407/§494 — a SUSPENDED thread has no readiness function and is
+not in Store.waiting, so §936's tick can never pick it). A plain
+nudge (the tick's grant, the store right's handoff, a waitable's
+wake) is a READY-func re-test for a WAITING park — yield/WAIT — and
+must never end a suspension."
+  (when resume
+    (sb-ext:atomic-incf (async-thread-resume-count thread)))
   (sb-ext:atomic-incf (async-thread-wake-count thread))
   (sb-thread:condition-broadcast (async-thread-waitqueue thread))
   (sb-thread:condition-broadcast (async-thread-suspend-waitqueue
@@ -5882,13 +5912,15 @@ count is consumed at the next park."
   "M13-4 the HANDOFF post (§242-273's handler-lock release): a
 thread about to park — or exiting — hands control back to its
 switcher (the POST-TO slot, claimed under THIS thread's own mutex
-exactly once; the wake itself is the mutex-free %async-thread-wake)."
+exactly once; the wake itself is the mutex-free %async-thread-wake).
+The post RETURNS the switcher's block — spec `block(switch_to)' —
+so it is a resume, not a nudge."
   (let ((r nil))
     (sb-thread:with-recursive-lock ((async-thread-mutex thread))
       (setf r (async-thread-post-to thread))
       (setf (async-thread-post-to thread) nil))
     (when r
-      (%async-thread-wake r))))
+      (%async-thread-wake r :resume t))))
 
 (defun async-thread-wait-until (thread ready-fn)
   "Thread.wait_until (CanonicalABI.md 505): block until READY-FN
@@ -5912,7 +5944,8 @@ iteration can re-wait while holding the right (ledger fact b)."
            (cond
             (ready
              (sb-thread:release-mutex m)
-             (setf (async-thread-wake-count thread) 0)
+             (setf (async-thread-wake-count thread) 0
+                   (async-thread-resume-count thread) 0)
              (incf *async-progress*)
              (return))
             (t
@@ -5929,11 +5962,30 @@ condition — a SUSPENDED thread is only woken by an EXPLICIT
 async-thread-resume (the switch builtins' target). Store.tick's
 resume-all does NOT touch the suspend waitqueue: a scheduler nudge
 must not un-suspend a thread that only an explicit switch may.
+
+THE RELEASE CONDITION IS THE SPEC'S, NOT A COUNTER'S: a SUSPENDED
+thread has ready_func None (§407) and is absent from Store.waiting
+(§433-440), so §936's `{thread for thread in self.waiting if
+thread.ready()}' can never pick it — no tick, no implementation
+nudge, no waitable wake. Only three events resume it: §474
+Thread.resume (an explicit switch, the cancellation resume), §458-465
+resume_later's ready mark, and the §242-273 handoff post that
+RETURNS a switcher's block. Each of those increments RESUME-COUNT
+(see %ASYNC-THREAD-WAKE's RESUME); WAKE-COUNT — the generic
+`re-test your ready-fn' nudge — is DROPPED here rather than consumed,
+because a nudge posted while this thread runs carries no meaning for
+a thread with no readiness function, and letting it stand in for a
+resume is exactly the ::19 defect (a fresh thread's pre-registration
+right-handoff nudge released its guest's thread.suspend, the thread
+finished, its index was legal-free-list-reused, and the guest's stale
+index then named the caller itself).
+
+A broadcast from a plain nudge still wakes the condition variable:
+the park therefore RE-PARKS (the inner loop) after re-testing
+RESUME-COUNT, instead of returning. The bounded slice only bounds
+how often the abandoned/teardown check runs — never the park itself.
 M13-4: the park posts the HANDOFF (§242-273 — this park IS the
-switcher's wake; the post is durable), re-checks the count after
-the post (the switcher's resume can land between the post and the
-wait's registration — its broadcast would be lost, its COUNT is
-durable), and clears the count on the returning wake.
+switcher's wake; the post is durable).
 STEP 4 PARK SITE 2: one bounded wait per park iteration, with the
 store right released across it by %park (the post-handoff runs with
 the right held but takes only the SWITCHER's mutex for a two-line
@@ -5943,35 +5995,41 @@ a right acquisition)."
   (setf (async-thread-suspended-p thread) t)
   (%block-enter thread)
   (unwind-protect
-       (loop
+       (progn
          (async-thread-check-abandoned thread)
          (%right-acquire thread)
          (let ((m (async-thread-mutex thread))
                (woke nil))
-           ;; 1. a durable count already present is THIS park's wake
+           ;; 1. a RESUME credit already present is THIS park's wake
            (sb-thread:grab-mutex m)
-           (when (> (async-thread-wake-count thread) 0)
-             (setf (async-thread-wake-count thread) 0)
+           (when (> (async-thread-resume-count thread) 0)
+             (setf (async-thread-resume-count thread) 0)
              (setf woke t))
+           ;; a plain nudge cannot release a suspension — drop it
+           (setf (async-thread-wake-count thread) 0)
            (sb-thread:release-mutex m)
-           (when woke (return))
-           ;; 2. the HANDOFF post (§242-273) — a two-line peer
-           ;; section, then the durable re-check (a resume landing
-           ;; between the post and the wait registration)
-           (%async-thread-post-handoff thread)
-           (sb-thread:grab-mutex m)
-           (when (> (async-thread-wake-count thread) 0)
-             (setf (async-thread-wake-count thread) 0)
-             (setf woke t))
-           (cond
-            (woke
-             (sb-thread:release-mutex m)
-             (return))
-            (t
-             (%park thread m
-                    (async-thread-suspend-waitqueue thread))
-             (setf (async-thread-wake-count thread) 0)
-             (return)))))
+           (unless woke
+             ;; 2. the HANDOFF post (§242-273) — a two-line peer
+             ;; section, then the durable re-check (a resume landing
+             ;; between the post and the wait registration)
+             (%async-thread-post-handoff thread)
+             (sb-thread:grab-mutex m)
+             (when (> (async-thread-resume-count thread) 0)
+               (setf (async-thread-resume-count thread) 0)
+               (setf (async-thread-wake-count thread) 0)
+               (setf woke t))
+             ;; 3. PARK UNTIL RESUMED: a non-resume broadcast is not
+             ;; a release (§407/§936) — re-test and park again
+             (loop until woke
+                   do (async-thread-check-abandoned thread)
+                      (%park thread m
+                             (async-thread-suspend-waitqueue thread))
+                      (sb-thread:grab-mutex m)
+                      (when (> (async-thread-resume-count thread) 0)
+                        (setf (async-thread-resume-count thread) 0)
+                        (setf woke t))
+                      (setf (async-thread-wake-count thread) 0))
+             (sb-thread:release-mutex m))))
     (setf (async-thread-suspended-p thread) nil)
     ;; THE PARK SPENT §458-465's CREDIT: clear the ready mark, the
     ;; durable count and the grant. A credit left here would be
@@ -6047,7 +6105,10 @@ TRANSIENT except the ready-grant (a real wake)."
     (when (functionp thunk)
       (funcall thunk))
     (when ready-grant
-      (%async-thread-wake thread))))
+      ;; a resume_later mark on a SUSPENDED thread (§458-465: it stops
+      ;; being suspended and becomes WAITING(ready=True), which the
+      ;; tick may resume) — a resume for the park, not a plain nudge
+      (%async-thread-wake thread :resume t))))
 
 (defun async-thread-resume (thread &optional (post-to nil post-to-p))
   "Thread.resume (CanonicalABI.md 474) — the EXPLICIT switch (the
@@ -6072,6 +6133,7 @@ TRANSIENT except the ready-grant (a real wake)."
       (setf (async-thread-granted thread) t)
       (unless started-p
         (incf (async-thread-wake-count thread))
+        (incf (async-thread-resume-count thread))
         (sb-thread:condition-broadcast
          (async-thread-suspend-waitqueue thread)))
       (sb-thread:condition-broadcast (async-thread-waitqueue thread)))))
@@ -6311,6 +6373,7 @@ count arriving with the wake is THIS park's, never the next's."
     ;; above) — a mark left on a running thread is a later tick's
     ;; spurious grant and the switch builtins' false "suspended".
     (setf (async-thread-wake-count thread) 0
+          (async-thread-resume-count thread) 0
           (async-thread-ready-p thread) nil
           (async-thread-granted thread) nil
           (async-thread-ready-fn thread) nil
@@ -6372,6 +6435,43 @@ count arriving with the wake is THIS park's, never the next's."
   (or (not (%task-opts-async-p task))
       (%task-opts-callback-p task)))
 
+(defun %register-thread-index (inst th)
+  "Task.register_thread / §705-706 (also §4591's thread.new-indirect
+path) — the IDENTITY step, made ATOMIC:
+
+  assert(thread not in self.threads and thread.task is self)
+  thread.index = self.inst.threads.add(thread)
+
+§705's assert(thread.index is None) plus §705-706's add are ONE
+step: the index scan, the assignment and the table entry happen
+under *SCHEDULER-MUTEX*, so two threads registering concurrently in
+one instance can never both read `1 + max' and take the SAME index —
+that alias is exactly what makes an index resolve to the wrong
+record while both records are LIVE (§359: threads.get(i) returns THE
+thread at index i).
+
+The scan skips :DONE marks (§705's live-only reading: a record the
+unregister path has already killed is no longer an element of
+inst.threads). Re-registering a thread that is already in the table
+is a no-op (idempotent) rather than a second entry; a record that
+carries an index but is NOT in the table (it was removed) gets a
+FRESH index, because the old one may already have been handed to a
+live thread by this very scan — §705 forbids ASSUMING an index that
+is no longer yours."
+  (let ((fields (%inst-async-fields inst)))
+    (sb-thread:with-recursive-lock (*scheduler-mutex*)
+      (let ((threads (getf fields :threads)))
+        (if (member th threads :test #'eq)
+            (async-thread-index th)
+            (progn
+              (setf (async-thread-index th)
+                    (1+ (loop for t2 in threads
+                              when (not (eq (async-thread-spawn-thunk t2)
+                                            :done))
+                                maximize (or (async-thread-index t2) 0))))
+              (setf (getf fields :threads) (cons th threads))
+              (async-thread-index th)))))))
+
 (defun %task-enter-implicit-thread (task)
   "Task.enter_implicit_thread (CanonicalABI.md 681): the BACKPRESSURE
 gate — wait until backpressure subsides, then register the thread.
@@ -6423,21 +6523,11 @@ does not exist)."
             (return-from %task-enter-implicit-thread nil)))
         (when (%task-needs-exclusive task)
           (setf (getf fields :exclusive-thread) th))))
-    ;; §705: register_thread assigns the instance's next index
-    (unless (async-thread-index th)
-      (setf (async-thread-index th)
-            ;; M13-tok6 GATE 2: the LIVE-ONLY idx assignment — a
-            ;; stale :done record (a raced unregister window) must
-            ;; not inflate the max; the assignment skips dead marks
-            (1+ (loop for t2 in (getf fields :threads)
-                      when (not (eq (async-thread-spawn-thunk t2)
-                                    :done))
-                        maximize (or (async-thread-index t2)
-                                     0)))))
-    (setf (getf fields :threads)
-          (cons th (getf fields :threads)))
+    ;; §705 register_thread: the FRESH index + the table entry, one
+    ;; atomic step (see %REGISTER-THREAD-INDEX)
+    (%register-thread-index inst th)
     (sb-thread:with-recursive-lock (*scheduler-mutex*)
-      (push th *scheduler-threads*))
+      (pushnew th *scheduler-threads* :test #'eq))
     t))
 
 
@@ -6459,9 +6549,12 @@ through this function, so no dead ticket can ever be the head."
     ;; as a target (the ::34 self-resume was a prior row's caller
     ;; record at a colliding index passing the filter)
     (setf (async-thread-spawn-thunk th) :done)
-    (setf (getf fields :threads)
-          (remove th (getf fields :threads)))
+    ;; the table removal is the SAME critical section as the
+    ;; registration (§737-744's unregister_thread): a concurrent
+    ;; register's live-only scan must never see this record half-gone
     (sb-thread:with-recursive-lock (*scheduler-mutex*)
+      (setf (getf fields :threads)
+            (remove th (getf fields :threads)))
       (setf *scheduler-threads*
             (remove th *scheduler-threads* :test #'eq)))
     (when (and (%task-ft-async-p task)
@@ -6479,9 +6572,15 @@ through this function, so no dead ticket can ever be the head."
           (async-thread-resume-all)))
     ;; STEP 4: drop the ticket / hand the right on. NEVER waits.
     (%right-release-on-exit th)
-    ;; THE EXIT LEAVES NO RESUME CREDIT AT ALL (§458-465): this path
-    ;; makes no §242-273 handoff post afterwards, so POST-TO goes too.
-    (%thread-drop-credit-on-exit th :post-to-p t)))
+    ;; THE EXIT IS THE HANDOFF (§242-273: the target's NEXT park OR
+    ;; EXIT hands control back to its switcher; §531/§536's
+    ;; block(switch_to=other) returns when the target blocks or
+    ;; returns). POST-TO therefore SURVIVES the credit drop and is
+    ;; posted here: dropping it instead stranded a switcher that is
+    ;; parked in a switch arm (its release condition is the resume
+    ;; this post carries).
+    (%thread-drop-credit-on-exit th)
+    (%async-thread-post-handoff th)))
 
 (defun %task-has-pending-cancel (task)
   (eq (async-task-state task) :pending-cancel))
@@ -8093,7 +8192,8 @@ is the valtype."
              ((async-thread-suspended-p target)
               (setf (async-thread-ready-p target) t)
               (setf (async-thread-post-to target) *current-thread*)
-              (setf (async-thread-wake-count target) 0))
+              (setf (async-thread-wake-count target) 0
+                    (async-thread-resume-count target) 0))
              ;; a YIELD park: the any-nudge wake
              ((async-thread-yield-parked target)
               (setf (async-thread-ready-p target) t)
@@ -8105,13 +8205,14 @@ is the valtype."
              ;; a direct fire and never an execution grant (the
              ;; running quantum finishes: the same discipline as the
              ;; switch arms' right-waiting exemption). The durable
-             ;; wake-count is the mark's park-time half (both park
-             ;; sites honor it — suspend's step 1 and wait-until's
-             ;; count) and READY-P is the tick-time half (the nudge's
-             ;; ready-grant sees it once suspended-p is set).
+             ;; RESUME count is the mark's park-time half (a
+             ;; start_waiting(ready=True) on a thread that is not yet
+             ;; parked IS a resume of the park it is about to make,
+             ;; §458-465) and READY-P is the tick-time half (the
+             ;; nudge's ready-grant sees it once suspended-p is set).
              (t
               (setf (async-thread-ready-p target) t)
-              (%async-thread-wake target)))))
+              (%async-thread-wake target :resume t)))))
         '())))
     ;; thread.new-indirect (§4555-4596): read the funcref from the
     ;; canon's core TABLE (trap OOB/null), create a SUSPENDED
@@ -8145,8 +8246,7 @@ is the valtype."
                      :message "undefined element"))
             ;; §4590: the suspended thread calls the funcref with
             ;; the closure param $c, unregisters on return
-            (let* ((fields (%inst-async-fields inst))
-                   (th (make-async-thread :task task))
+            (let* ((th (make-async-thread :task task))
                    (c (second args)))
               (%thread-birth th)
               (setf (async-thread-spawn-thunk th)
@@ -8199,14 +8299,14 @@ is the valtype."
                                  ;; finished thread, and §705's
                                  ;; maximize-index counted it — the
                                  ;; colliding idx 2 in the pin trace)
-                                 (let ((fields (%inst-async-fields
-                                                inst)))
-                                   (setf (getf fields :threads)
-                                         (remove th (getf fields
-                                                          :threads)
-                                                 :test #'eq)))
                                  (sb-thread:with-recursive-lock
                                      (*scheduler-mutex*)
+                                   (let ((fields (%inst-async-fields
+                                                  inst)))
+                                     (setf (getf fields :threads)
+                                           (remove th (getf fields
+                                                            :threads)
+                                                   :test #'eq)))
                                    (setf *scheduler-threads*
                                          (remove th
                                                  *scheduler-threads*
@@ -8219,19 +8319,9 @@ is the valtype."
                        :name "new-indirect-thread")))
               ;; §4591: register_thread (the instance's next
               ;; index assignment, the :threads list + scheduler)
-              (setf (async-thread-index th)
-                    ;; M13-tok6 GATE 2: the live-only idx
-                    ;; assignment (see the enter gate's note)
-                    (1+ (loop for t2 in (getf fields :threads)
-                              when (not (eq (async-thread-spawn-thunk
-                                             t2)
-                                            :done))
-                                maximize (or (async-thread-index t2)
-                                             0))))
-              (setf (getf fields :threads)
-                    (cons th (getf fields :threads)))
+              (%register-thread-index inst th)
               (sb-thread:with-recursive-lock (*scheduler-mutex*)
-                (push th *scheduler-threads*))
+                (pushnew th *scheduler-threads* :test #'eq))
               (list (async-thread-index th))))))))
     ;; M11b: {stream,future}.forward (§4495-4534): the guards
     ;; (the class, the type match, IDLE, not in a wset), both ends
@@ -8377,6 +8467,19 @@ is the valtype."
                          (not (async-thread-abandoned th))
                          (= (async-thread-index th) (first args)))
                 (setf target th)))
+            ;; §1126-1129 Table.get: the index must name a LIVE
+            ;; element — out of bounds AND a freed hole both trap.
+            ;; The spec's switch builtins call
+            ;; `thread.task.inst.threads.get(i)' (§4706/§4721/§4734/
+            ;; §4760), so a stale index whose thread has exited is
+            ;; the GUEST's error, not a silent fallback to a plain
+            ;; yield/suspend (§4737's self-index trap is still
+            ;; checked first above, per §4728/§4763).
+            (unless target
+              (error 'wasmdown:wasm-trap :kind :generic
+                     :message
+                     (format nil "unknown thread index ~a"
+                             (first args))))
             ;; §4688/§4714 (canon_thread_{suspend,yield}_then_resume
             ;; ONLY): trap_if(not other_thread.suspended()) — the
             ;; target must be SUSPENDED (spawn thunk pending or
@@ -8464,7 +8567,8 @@ is the valtype."
                 ;; M13-tok34 THE INTER-ROUND DRAIN (see the note
                 ;; below): drain a surviving count under the mutex
                 ;; before arming.
-                (setf (async-thread-wake-count ct) 0)
+                (setf (async-thread-wake-count ct) 0
+                      (async-thread-resume-count ct) 0)
                 (if yield-p
                     (setf (async-thread-yield-parked ct) t)
                     (setf (async-thread-suspended-p ct) t))
@@ -8503,11 +8607,25 @@ is the valtype."
                                     (async-thread-waitqueue ct)
                                     (async-thread-suspend-waitqueue ct)))
                          (sb-thread:grab-mutex mu)
-                         (let ((done (if yield-p
-                                         t
-                                         (> (async-thread-wake-count ct)
-                                            0))))
-                           (setf (async-thread-wake-count ct) 0)
+                         (let ((done
+                                 (if yield-p
+                                     ;; yield_then_* parks with
+                                     ;; start_waiting(ready=True)
+                                     ;; (§536/§560) — a WAITING
+                                     ;; thread, so any §932 tick may
+                                     ;; resume it; a plain nudge is
+                                     ;; spec-legal here.
+                                     t
+                                     ;; suspend_then_* (§531/§549)
+                                     ;; blocks with NO readiness
+                                     ;; (§494): only an explicit
+                                     ;; resume may release it, never
+                                     ;; a plain nudge — the same rule
+                                     ;; as thread.suspend itself.
+                                     (> (async-thread-resume-count ct)
+                                        0))))
+                           (setf (async-thread-wake-count ct) 0
+                                 (async-thread-resume-count ct) 0)
                            (sb-thread:release-mutex mu)
                            (when done (return)))))
                   (sb-thread:grab-mutex mu)
@@ -8521,6 +8639,7 @@ is the valtype."
                   ;; never reads as suspended to the next arm
                   ;; (§4688/§4714) and no later tick re-grants it.
                   (setf (async-thread-wake-count ct) 0
+                        (async-thread-resume-count ct) 0
                         (async-thread-ready-p ct) nil
                         (async-thread-granted ct) nil)
                   (sb-thread:release-mutex mu)
