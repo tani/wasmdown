@@ -1,3 +1,34 @@
+# M17 SESSION 36 — THE CLOSING RECORD. Nothing remains.
+# (a) THE TEARDOWN SPLIT, VERIFIED END TO END (not just by grep -n): the body of
+#     %store-teardown has exactly ONE `with-recursive-lock (*scheduler-mutex*)`, in phase 1
+#     (marked "PHASE 1: SCHEDULER MUTEX ONLY. No store-right touch here."); phase 2 is marked
+#     "PHASE 2: NO SCHEDULER MUTEX" and contains %task-exit-implicit-thread, the per-thread
+#     `with-recursive-lock ((async-thread-mutex th))` broadcasts and the bounded
+#     `join-thread :timeout 0.25`. NO scheduler-mutex acquisition exists below phase 2.
+# (b) THE TWO PINS, each with an INDEPENDENT negative control:
+#     component/lock-order-no-scheduler-held-across-store-right-pin (source-level rule check
+#       over the whole runtime; two negative controls: the pre-fix nested shapes are flagged,
+#       a legal scheduler section and a docstring mention are not);
+#     component/store-teardown-runs-with-right-held-pin (real %store-teardown, 48
+#       async-exclusive tasks, a right-holding competitor that takes the scheduler mutex; the
+#       competitor always acquires the right so the assertion is not vacuous; out-of-tree
+#       control: pre-fix sched-ok NIL 3/3, fixed T 2/2).
+# (c) BACK-TO-BACK CLOSING BLOCKS IN THE SAME WINDOW: the adjacent pair read master 0/30 with
+#     0 fail commands (mean 10.282 s) and this tree 0/30 with 0 fail commands (mean 10.238 s,
+#     delta -0.044 s = zero cost); the closing block after the ledger merge read 0/30 with 0
+#     fail commands, walls 9.96-10.32 s. Two consecutive clean blocks at the pristine band.
+# (d) THE ONLY REMAINING NOTES, neither of them work:
+#     - `sync-streams::1` — a WATCH ROW (1/30 in two separate blocks today). Next session
+#       measures it in a PAIRED window before calling it open or closed.
+#     - WASI HTTP remains REMOVED at user direction; the vendored http WIT stays reference
+#       data. That is a scope decision, not a residual.
+# THE LOCK-ORDER BLOCK itself (>126 lines of documentation and the two-phase teardown) lives in
+# src/component-runtime.lisp's scheduler section and is cross-referenced from the store-right
+# block, %without-right and async-thread-resume-all — the record of WHY the order is what it
+# is, not just what it is.
+# SESSION CLOSE: master a3cd60b (plus this entry), units 552/0, one branch, working tree clean
+# except the user's .envrc, plan steps 1-6 implemented, steps 7/8 out of scope, no parked
+# branch, no open item.
 # M17 SESSION 35 — TEARDOWN SPLIT VERIFIED BY HAND, AND THE CLOSING BLOCK.
 # HAND-AUDIT of %store-teardown (requested before closing, and worth recording because a
 # leaked resume-all in phase 2 would reintroduce the cycle): the definition at
