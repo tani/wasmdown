@@ -129,7 +129,20 @@ counters) + the import/export tables."
   (instances (make-array 8 :fill-pointer 0 :adjustable t))
   (types (make-array 8 :fill-pointer 0 :adjustable t))
   (imports (make-hash-table :test #'equal)) ; name -> runtime value
-  (exports (make-hash-table :test #'equal))) ; name -> (sort . value)
+  (exports (make-hash-table :test #'equal)) ; name -> (sort . value)
+  ;; M17 THE SYNC-CALL FIRE WINDOW (see %SYNC-CALL-WINDOW-ENTER): the
+  ;; number of in-flight NESTED synchronous calls whose CALLEE is this
+  ;; instance. While it is positive the tick must not FIRE this
+  ;; instance's not-yet-started threads (§3524 runs the sync callee
+  ;; until it returns or blocks; only then may the host switch to
+  ;; another ready thread of the same instance). It lives ON THE
+  ;; INSTANCE, not in a mutex-guarded global: the writers hold the
+  ;; store right, whose release/Acquire orders the write before any
+  ;; tick's read, and each side is a single ATOMIC operation (no
+  ;; lock, so the sync-lift caller never builds a
+  ;; store-right -> *SCHEDULER-MUTEX* edge on top of the tick's
+  ;; *SCHEDULER-MUTEX* -> peer-park-mutex edge).
+  (sync-window-depth 0 :type (unsigned-byte 64)))
 
 (defstruct lifted-func
   "A canon-lifted component function: the wrapped core func-instance,
@@ -2162,12 +2175,18 @@ remove is a no-op; a trap mid-call still unwinds through here)."
                   *right-ticket* *right-owner*
                   *driver-records* *current-task* *current-thread*))
 
-(defun %sync-thunk-run (entry)
+(defun %sync-thunk-run (entry &key inst)
   "M13-tok9: the nested-sync route's executor entry — run ENTRY
 (a component-level closure: lifted-func-call + its lift/transfer)
 on a fresh executor SBCL thread; the caller parks on the cell's
 completion exactly like %sync-lift-run. Returns the closure's
-value."
+value. INST is the CALLEE's instance: the nested caller's wait
+opens its SYNC-CALL FIRE WINDOW (the instance's
+COMP-INSTANCE-SYNC-WINDOW-DEPTH) so no not-yet-started thread of
+that instance takes its first turn before the callee returns or
+blocks (§3524's synchronous transfer — the cancel-targeted-resume
+::9 `ran' probe reaches its instance through THIS route whenever
+the callee module imports blocking built-ins)."
   (let* ((cell (cons nil nil))
          (dmu (sb-thread:make-mutex :name "sync-lift"))
          (done (sb-thread:make-waitqueue :name "sync-lift"))
@@ -2222,13 +2241,17 @@ value."
                          :message
                          "deadlock detected: event loop cannot make further progress")))
           (t
-           (loop
-             (let ((finished (sb-thread:with-recursive-lock (dmu) done-p)))
-               (when finished (return))
-               ;; STEP 4 PARK SITE 10 (nested caller): release the
-               ;; right for the poll slice.
-               (%right-stall (or *right-self* (%driver-self))
-                            :seconds 0.001)))))
+           (when inst (%sync-call-window-enter inst))
+           (unwind-protect
+                (loop
+                  (let ((finished (sb-thread:with-recursive-lock (dmu)
+                                    done-p)))
+                    (when finished (return))
+                    ;; STEP 4 PARK SITE 10 (nested caller): release the
+                    ;; right for the poll slice.
+                    (%right-stall (or *right-self* (%driver-self))
+                                  :seconds 0.001)))
+             (when inst (%sync-call-window-exit inst)))))
       ;; capture the outcome OUTSIDE the cleanup: the unwind-
       ;; protect's cleanup values are DISCARDED (the earlier
       ;; shape's (car cell) in the cleanup returned NIL always)
@@ -2321,6 +2344,14 @@ reentrance phase checks). The CALLER then waits:
              ;; release anything.
              (let ((ct (or *current-thread* (%driver-self))))
                (%block-enter ct)
+               ;; M17 THE SYNC-CALL FIRE WINDOW: §3524's synchronous
+               ;; transfer runs THIS callee until it returns or
+               ;; blocks; a not-yet-started thread of the callee's
+               ;; instance must not take its first turn inside the
+               ;; wait (see %SYNC-CALL-WINDOW-ENTER — the cancellation
+               ;; callback's resume-later'd spawn was fired by the
+               ;; outer drain during the `ran' probe).
+               (%sync-call-window-enter (lifted-func-inst lf))
                (unwind-protect
                     (loop
                       (let ((finished
@@ -2330,6 +2361,7 @@ reentrance phase checks). The CALLER then waits:
                         ;; STEP 4 PARK SITE 11 (nested caller): the
                         ;; poll slice releases the right.
                         (%right-stall ct :seconds 0.001)))
+                 (%sync-call-window-exit (lifted-func-inst lf))
                  (%block-exit ct)))))
         ;; THE ORACLE-TRAP TEARDOWN (§3552: "trap and tear down the
         ;; whole store"): a deadlocked executor stays parked in the
@@ -3262,7 +3294,8 @@ TARGET's space."
                               (%sync-thunk-run
                                (lambda ()
                                  (apply #'lifted-func-call lf2
-                                        component-args)))
+                                        component-args))
+                               :inst (lifted-func-inst lf2))
                               (%call-component-func-list
                                inst fidx component-args)))))
          (if (or core-result result)
@@ -5422,6 +5455,65 @@ the observed acs deadlock).")
 (defparameter *scheduler-mutex* (sb-thread:make-mutex
                                  :name "scheduler"))
 
+(defun %sync-call-window-enter (inst)
+  "Open the SYNC-CALL FIRE WINDOW on INST (its CALLEE instance).
+
+  M17 THE SYNC-CALL FIRE WINDOW (CanonicalABI.md §3524/§3538-3543):
+  `canon_lift' resumes the callee SYNCHRONOUSLY ('jumping to the top
+  of thread_func'; it 'executes until it either returns from
+  thread_func or blocks') and only THEN, if the callee blocked, may
+  switch to another ready thread of the SAME instance. This runtime
+  runs the callee on its own executor SBCL thread and the caller
+  waits with the store right released (a new one can never be
+  avoided in a thread-per-callee design), so an OPPORTUNISTIC drain
+  tick can land inside the wait — that is not such a switch, and
+  giving a not-yet-started thread of the callee's instance its FIRST
+  TURN there is the defect. Measured (cancel-targeted-resume ::9):
+  the cancellation callback's resume-later'd spawn was FIRED by the
+  outer invoke drain while the caller was inside the `ran' sync
+  probe, so `$ran' read 1 where the row pins 0 (the slice alone
+  failed 10/30 runs; every failure trapped `unreachable').
+
+  The window gates the FIRE only — async-thread-nudge's claim of a
+  pending spawn in %RESUME-ALL-BODY's priority pass and no-quantum
+  fallback. Grants to ALREADY-RUNNING peers (a cooperative pthread's
+  yield park inside the sync callee, a suspend-parked ready thread)
+  keep their slices, which §3538-3543 expressly allows once the
+  callee has blocked.
+
+  Counted, because a nested sync call of the SAME instance can
+  itself be in flight (a sync callee calling another sync lower)."
+  (when inst
+    (sb-ext:atomic-incf (comp-instance-sync-window-depth inst)))
+  inst)
+
+(defun %sync-call-window-exit (inst)
+  "Close one level of INST's SYNC-CALL FIRE WINDOW (idempotent: the
+  depth never underflows — an exit with nothing open is a no-op, and
+  the guard's read is the same atomic read the tick uses)."
+  (when (and inst (plusp (%sync-call-window-depth-of inst)))
+    (sb-ext:atomic-decf (comp-instance-sync-window-depth inst)))
+  nil)
+
+(defun %sync-call-window-depth-of (inst)
+  "ATOMIC read of INST's sync-call window depth (the compare-and-swap
+  is a full barrier; it never succeeds on a positive depth because it
+  exchanges 0 for 0 only)."
+  (if inst
+      (sb-ext:compare-and-swap (comp-instance-sync-window-depth inst) 0 0)
+      0))
+
+(defun %sync-call-fire-blocked-p (thread)
+  "Does THREAD's instance sit inside an in-flight NESTED synchronous
+  call? Such a thread may not take its FIRST TURN (be FIRED from its
+  pending spawn) there: the reference's canon_lift runs the sync
+  callee until it returns or blocks and cannot switch to another
+  thread of the instance before that. Only %RESUME-ALL-BODY (the
+  tick's claim of a pending spawn) consults this."
+  (let ((task (and thread (async-thread-task thread))))
+    (and task (plusp (%sync-call-window-depth-of
+                      (async-task-inst task))))))
+
 (defparameter *async-progress* 0
   "M11a liveness counter: bumped on every observable state change
 (a thread waking, a task state transition). The canon_lift caller
@@ -6505,8 +6597,21 @@ the caller's own thread; never a plain suspend-parked thread
                                           *cancel-window-inst*)))
                             (or (async-thread-suspended-p th)
                                 (and (not *suppress-spawn-fire*)
+                                     ;; the CHEAP test first: the
+                                     ;; window read is an atomic RMW
+                                     ;; and must only be paid for an
+                                     ;; actual pending spawn
                                      (functionp
-                                      (async-thread-spawn-thunk th)))))
+                                      (async-thread-spawn-thunk th))
+                                     ;; M17 THE SYNC-CALL FIRE WINDOW:
+                                     ;; a nested synchronous call's
+                                     ;; callee runs until it returns
+                                     ;; or blocks; no other thread of
+                                     ;; its instance takes its first
+                                     ;; turn inside that window
+                                     ;; (cancel-targeted-resume ::9's
+                                     ;; `ran' probe)
+                                     (not (%sync-call-fire-blocked-p th)))))
                    (async-thread-nudge th)
                    (setf granted-thread th)
                    (return)))
@@ -6591,6 +6696,12 @@ the caller's own thread; never a plain suspend-parked thread
             (unless (or (and *suppress-spawn-fire*
                              (async-thread-ready-p th)
                              (functionp (async-thread-spawn-thunk th)))
+                        ;; M17 THE SYNC-CALL FIRE WINDOW's share of
+                        ;; the fire gate (the fallback also FIRES a
+                        ;; ready-marked pending spawn)
+                        (and (async-thread-ready-p th)
+                             (functionp (async-thread-spawn-thunk th))
+                             (%sync-call-fire-blocked-p th))
                         ;; M15 MECHANISM 4 (the fallback's share of
                         ;; the cancel-window fire gate): a nudge
                         ;; FIRES a ready-marked pending spawn

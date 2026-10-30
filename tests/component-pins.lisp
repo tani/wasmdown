@@ -2900,14 +2900,96 @@ repo root, as a string — the pin runs a fixture row VERBATIM."
        "result-two-spaces-pin.wast")))
 
 (test component/cancel-window-fire-gate-pins
-  ;; M15 MECHANISM 4 — THE CANCEL-WINDOW FIRE GATE: while the
-  ;; synchronous-resume wait is open, the drain's ticks (priority
-  ;; pass AND no-quantum fallback) must not FIRE the cancelled
-  ;; instance's ready-marked pending spawns; the async lower's
-  ;; on-resolve is the fifth M11a deferral site. Pinned by
-  ;; cancel-targeted-resume's ::9 row (the callback resume-laters a
-  ;; thread inside the cancellation; $ran must stay 0 until the
-  ;; caller yields).
+  ;; M15 MECHANISM 4 + M17's SYNC-CALL FIRE WINDOW.
+  ;;
+  ;; GUARANTEE (what this pin carries): a thread that a cancellation
+  ;; callback makes ready with thread.resume-later takes its FIRST
+  ;; TURN only where the reference's host could schedule it — not
+  ;; inside the caller's observation. Two windows implement it, and
+  ;; the pin asserts BOTH, one deterministically and one end-to-end:
+  ;;
+  ;;  (1) THE CANCEL WINDOW: while the synchronous-resume wait is
+  ;;      open, the drain's ticks (priority pass AND no-quantum
+  ;;      fallback) must not FIRE the cancelled instance's
+  ;;      ready-marked pending spawns; the async lower's on-resolve
+  ;;      is the fifth M11a deferral site.
+  ;;
+  ;;  (2) THE SYNC-CALL FIRE WINDOW (comp-instance-sync-window-depth,
+  ;;      this pin drove): after subtask.cancel returns, the caller's
+  ;;      `$ran' probe is a NESTED SYNCHRONOUS component call. §3524
+  ;;      resumes that callee synchronously and runs it until it
+  ;;      returns or blocks; no other thread of the callee's instance
+  ;;      may take its first turn inside the wait. Before the fix the
+  ;;      caller released the store right for the callee's executor
+  ;;      and the outer invoke drain used that window to FIRE the
+  ;;      ready spawn (measured on master: the slice run alone failed
+  ;;      10/30 and each failure read $ran = 1 at this probe and
+  ;;      trapped `unreachable'; a 30-run pin-alone of the same tree
+  ;;      read 0/30, because the pin's other work warms the OS thread
+  ;;      pool and the race is a scheduling lottery, not a fixed
+  ;;      interleave — so the deterministic boundary below, not the
+  ;;      row's rate, is what carries this half).
+  ;;
+  ;; (c) below drives the tick itself at the deterministic boundary:
+  ;; a ready-marked pending spawn, one real resume-all with the
+  ;; window OPEN (never fired) and one with it CLOSED (fired exactly
+  ;; once), plus the per-instance scoping. No sleep, no retry budget:
+  ;; a tick inside the window must leave the spawn UNFIRED (the
+  ;; reference cannot switch to another thread of the callee's
+  ;; instance while the sync callee runs), and (b) then runs the
+  ;; fixture row VERBATIM, end to end.
+  (let* ((inst (wasmdown.component.runtime:make-comp-instance))
+         (other-inst (wasmdown.component.runtime:make-comp-instance))
+         (task (wasmdown.component.runtime::make-async-task
+                :inst inst :seq '(1)))
+         (th (wasmdown.component.runtime::make-async-thread :task task))
+         (other-th
+           (wasmdown.component.runtime::make-async-thread
+            :task (wasmdown.component.runtime::make-async-task
+                   :inst other-inst :seq '(2))))
+         (old-threads wasmdown.component.runtime::*scheduler-threads*)
+         (old-depth (wasmdown.component.runtime::comp-instance-sync-window-depth
+                     inst))
+         (fired 0))
+    (unwind-protect
+         (progn
+           (setf wasmdown.component.runtime::*scheduler-threads*
+                 (list th))
+           (setf (wasmdown.component.runtime::async-thread-spawn-thunk th)
+                 (lambda () (incf fired))
+                 (wasmdown.component.runtime::async-thread-ready-p th) t)
+           ;; THE WINDOW OPEN: the tick must not fire the spawn
+           (wasmdown.component.runtime::%sync-call-window-enter inst)
+           (wasmdown.component.runtime::async-thread-resume-all)
+           (is (zerop fired))
+           (is (functionp (wasmdown.component.runtime::async-thread-spawn-thunk
+                           th)))
+           ;; THE WINDOW IS PER-INSTANCE: another instance's thread is
+           ;; not held by it
+           (is (wasmdown.component.runtime::%sync-call-fire-blocked-p th))
+           (is (not (wasmdown.component.runtime::%sync-call-fire-blocked-p
+                     other-th)))
+           ;; THE WINDOW CLOSED: the same tick fires it, once
+           (wasmdown.component.runtime::%sync-call-window-exit inst)
+           (is (zerop (wasmdown.component.runtime::%sync-call-window-depth-of
+                       inst)))
+           (wasmdown.component.runtime::async-thread-resume-all)
+           (is (= 1 fired))
+           (is (not (functionp
+                     (wasmdown.component.runtime::async-thread-spawn-thunk th))))
+           (wasmdown.component.runtime::async-thread-resume-all)
+           (is (= 1 fired)))
+      (setf wasmdown.component.runtime::*scheduler-threads* old-threads
+            (wasmdown.component.runtime::comp-instance-sync-window-depth inst)
+            old-depth)
+      (when (sb-thread:holding-mutex-p
+             wasmdown.component.runtime::*store-right*)
+        (sb-thread:release-mutex
+         wasmdown.component.runtime::*store-right*))))
+  ;; (b) THE ROW, VERBATIM (component + assert_return): the callback
+  ;; resume-laters a spawn inside the cancellation, subtask.cancel
+  ;; returns as soon as the callback is done, and $ran must stay 0
+  ;; until the caller yields.
   (is (%pin-rows-pass-p
        (%pin-slice "tests/component/async/cancel-targeted-resume.wast"
                    613 699)
