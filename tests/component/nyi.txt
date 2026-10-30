@@ -1,3 +1,34 @@
+# M17 SESSION 26 — THE FOUR-ROW ANTI-LAND FACT, THE WALL BANDS, AND THE BRANCH LEDGER.
+# 1. THE BORROW ARM LIVES BECAUSE FOUR ROWS PROVE IT. With the borrow lend arms deleted
+#    (stream/future arms deleted only, correctly), the probe set reads exactly:
+#      passing-resources.wast        ::1  ASSERT_RETURN  unexpected trap: unreachable
+#      drop-cross-task-borrow.wast   ::2  ASSERT_RETURN  unexpected trap: unreachable
+#      drop-cross-task-borrow.wast   ::4  ASSERT_RETURN  unexpected trap: unreachable
+#      drop-cross-task-borrow.wast   ::6  ASSERT_TRAP    expected a trap but the action
+#                                                        returned (borrow handles still
+#                                                        remain at the end of the call)
+#    and restoring ONLY the borrow arms returns 295/295 with the stream/future arms still
+#    deleted. So the split is CORRECT and INDIVIDUALLY MEASURED, not half-done:
+#      stream/future positional arms  DELETED  (295 rows, row text byte-identical)
+#      borrow lend arms               KEPT     (four rows above prove the need; an
+#                                               async-typed callee resolves a borrow
+#                                               index at ITS OWN table, the raw caller
+#                                               index is not substitutable)
+# 2. THE WALL BANDS, which is the same claim at the timing level: pre-deletion a
+#    clean-window n=30 read 9.86-10.53 s; post-deletion it read 10.03-10.29 s — the
+#    tightest band recorded here — so the deletion costs nothing in wall time either.
+#    Both blocks were 0 red / 0 fail.
+# 3. THE BRANCH LEDGER, so nothing looks forgotten. DELETED because their content is in
+#    master (each verified by content, not by name): wip/abi-type-space,
+#    wip/borrow-pins, wip/clock-pending, wip/crcc, wip/executors, wip/link-contracts,
+#    wip/marker-lifetime, wip/no-positional-arms, wip/park-release, wip/provider-sinks,
+#    wip/resume-later, wip/store-quantum, wip/store-right, wip/sync-selection,
+#    wip/reactor-wiring (superseded: both of its concerns landed better), plus the
+#    throwaway lane/master and probe/master-ml measurement branches. KEPT, each for a
+#    recorded reason: rerun/type-view (reapplied on an older master, AT PARITY in a
+#    clean window, not landed because a green lane's bar is "no measured cost") and
+#    wip/type-view (the original work, the archive the reapplied branch was derived
+#    from).
 # M17 SESSION 25 — THE PLAN'S IMPLEMENTATION ITEMS ARE COMPLETE, AND THE LAST PARKED
 # BRANCH IS CLOSED AS SUPERSEDED.
 # 1. STEP 1's LAST ITEM LANDED (merge e4defca): the top-level stream/future positional
