@@ -5454,6 +5454,95 @@ instance is torn down."
                        caller src rt)))))
           (remhash (cons callee 0) store))))))
 
+(test component/switched-target-exit-releases-pin
+  ;; §474-484: the switch_to chain runs the target until it BLOCKS OR
+  ;; RETURNS; its caller is released only at that boundary, and the
+  ;; §242-273 exit post normally carries the release.
+  ;;
+  ;; THE CAPTURE (reentrance::20, the last open row): reproduced 2/30
+  ;; in-lane (batch re20-master-D runs 11/15, both
+  ;; `unexpected trap: deadlock detected: event loop cannot make
+  ;; further progress`) and 4/4 under a repeated battery load. The
+  ;; oracle state was the same every time:
+  ;;   (:idx 1 :seq N :yield T :switch T :sw-tgt 2 :rc 0 :wc 0
+  ;;    :pc 198 :sw-sample 1)
+  ;;   target: (:spawn :done :pc 1 :rc 0 :wc 0 :post NIL
+  ;;            :registered NIL)
+  ;; i.e. the caller was parked in its yield-then-resume switch with
+  ;; ZERO resume credit and its target ALREADY EXITED. The exit post
+  ;; had no switcher to wake, and the caller's only two release terms
+  ;; (resume-count, the yield target's park-count advance) can never
+  ;; fire: the exit does not bump park-count. The rule the spec states
+  ;; ("returns") was simply not among the release terms — the chain-end
+  ;; test %SWITCH-CHAIN-ENDED-P already applies to the OUTER resumer.
+  ;;
+  ;; (a) drives the REAL builtin deterministically: a PENDING SPAWN
+  ;; target whose thunk runs the PRODUCTION exit
+  ;; (%TASK-EXIT-IMPLICIT-THREAD) inside the resume's spawn fire. The
+  ;; resume installs POST-TO only AFTER the start fire, so the exit's
+  ;; handoff post has no switcher to wake — the captured lost post by
+  ;; construction. The caller must still return 0 at that chain end.
+  ;; NEGATIVE CONTROL: with the chain-end term removed (the pre-fix
+  ;; tree) the caller parks forever and this bounded wait fails.
+  (%pin-with-store
+    (let* ((inst (%pin-inst))
+           (target (%pin-thread inst 2 '(1 0)))
+           (caller (%pin-thread inst 1 '(1)))
+           (caller-done (list nil))
+           (caller-result (list nil))
+           (caller-err (list nil)))
+      (%pin-register inst target)
+      (%pin-register inst caller)
+      ;; a suspended PENDING SPAWN (§4590): the promote's readiness
+      ;; accepts it, and the switch resume STARTS it
+      (setf (wasmdown.component.runtime::async-thread-spawn-thunk target)
+            (lambda ()
+              ;; THE PRODUCTION EXIT, before the arm installs POST-TO
+              (wasmdown.component.runtime::%task-exit-implicit-thread
+               (wasmdown.component.runtime::async-thread-task target))))
+      (let ((bc (sb-thread:make-thread
+                 (lambda ()
+                   (let ((wasmdown.component.runtime::*current-thread* caller)
+                         (wasmdown.component.runtime::*current-task*
+                           (wasmdown.component.runtime::async-thread-task
+                            caller))
+                         (wasmdown.component.runtime::*right-self* caller)
+                         (wasmdown.component.runtime::*right-ticket* nil)
+                         (wasmdown.component.runtime::*scheduler-threads*
+                           nil))
+                     (unwind-protect
+                          (handler-case
+                              (progn
+                                (setf (car caller-result)
+                                      (wasmdown.runtime:wasm-call
+                                       (%pin-builtin
+                                        inst :thread-yield-then-promote)
+                                       2)))
+                            (error (c) (setf (car caller-err) c)))
+                       (wasmdown.component.runtime::%right-release-on-exit
+                        caller)
+                       (setf (car caller-done) t))))
+                 :name "pin-target-exit-caller")))
+        (is (%pin-wait-for (lambda () (car caller-done))
+                           :timeout 5
+                           :what "the switch caller's release at its target's EXIT"))
+        (is (null (car caller-err)))
+        (is (equal '(0) (car caller-result)))
+        (is (eq :done
+                (wasmdown.component.runtime::async-thread-spawn-thunk
+                 target)))
+        (is (not (wasmdown.component.runtime::async-thread-switch-parked
+                  caller)))
+        (is (%pin-clean-p caller))
+        (is (%pin-join bc)))))
+  ;; (b) THE ROW, VERBATIM (component + assert_return), repeated: the
+  ;; in-lane failure is a scheduling lottery, so one run is no pin.
+  (let ((wast (%pin-slice "tests/component/async/reentrance.wast"
+                          530 658)))
+    (dotimes (i 20)
+      (is (%pin-rows-pass-p
+           wast (format nil "switched-target-exit-pin-~d.wast" i))))))
+
 (defun run-component-pins ()
   "Run the component pins (registered via TEST; returns T)."
   (let ((wasmdown.test::*tests*
@@ -5547,7 +5636,8 @@ instance is torn down."
                       component/live-borrow-blocks-task-return-pin
                       component/generic-path-five-cases-pin
                       component/type-view-owner-pins
-                      component/borrowed-handle-not-joinable-pin)))          wasmdown.test::*tests*)))
+                      component/borrowed-handle-not-joinable-pin
+                      component/switched-target-exit-releases-pin)))          wasmdown.test::*tests*)))
     (multiple-value-bind (passed failed)
         (wasmdown.test:run-all-tests)
       (declare (ignore passed))
