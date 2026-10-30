@@ -829,6 +829,27 @@ of an instantiation binds the ct)."
          (sort (car et))
          (name (importrec-name payload))
          (value (gethash name (comp-instance-imports inst) nil)))
+    ;; THE LINK-TIME CONTRACT CHECK (plan step 3): the resolved import's
+    ;; external contract is matched against the ACTUAL provider value
+    ;; BEFORE the index grows, so a wrong provider, a sort mismatch, a
+    ;; shrunk signature or a missing value is a link error rather than a
+    ;; runtime surprise after a start or host side effect. The check
+    ;; itself lives in the component package (check-import-binding) so
+    ;; the nominal matcher and the type-view helpers are reused rather
+    ;; than duplicated here.
+    ;; SCOPE, measured: the :func and :value sorts are checked on every
+    ;; import; :instance / :type coverage is NOT enforced here because the
+    ;; WASI providers build deliberately PARTIAL types instances (an export
+    ;; such as "error-code" resolves through an alias rather than being
+    ;; present in the instance's export map), and enforcing coverage turned
+    ;; every WASI end-to-end fixture into a link error
+    ;; (import "wasi:cli/stdout@0.3.2" "error-code": found no export).
+    ;; check-import-binding itself implements all five sorts, so the
+    ;; stricter form can be enabled per world once the provider contract
+    ;; records which exports are REQUIRED.
+    (when (member sort '(:func :value))
+      (wasmdown.component:check-import-binding payload value
+                                              (comp-instance-types inst)))
     (ecase sort
       ;; the externtype grammar: exactly these five sorts
       (:func (%push-func inst value))

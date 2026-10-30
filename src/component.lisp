@@ -104,7 +104,12 @@
            ;; flatten_functype table drives both sides.
            #:flatten-functype
            #:builtin-canon-sig
-           #:ct-at))
+           #:ct-at
+           ;; M17 (plan step 3): the LINK-TIME import contract — the
+           ;; runtime's %EXEC-IMPORT calls this before it pushes a
+           ;; with-arg value, so a wrong provider is a link error
+           ;; before any start or host side effect.
+           #:check-import-binding))
 
 (in-package #:wasmdown.component)
 
@@ -8578,3 +8583,639 @@ the number of enclosing component/type scopes (outer aliases)."
 (defun component-validate (comp)
   "Alias entry: validate a decoded component."
   (validate-component comp))
+
+;;; ---------------------------------------------------------------
+;;; Import binding validation (plan step 3: the runtime's
+;;; %EXEC-IMPORT contract).
+;;;
+;;; The executor walks the defs in file order and used to push the
+;;; with-arg value (or a :missing hole) into the import's index slot
+;;; WITHOUT looking at what the import DECLARES. A provider that is
+;;; absent, of the wrong sort, or that offers a SHRUNK signature
+;;; therefore failed later (inside a call, or never). This section is
+;;; the missing check: it compares the import's resolved external
+;;; type — read through the DEFINING component's type space — against
+;;; the value a provider actually supplied, BEFORE the value is
+;;; pushed, so a mismatch is a `wasmdown:link-error` naming the
+;;; import, the expected signature and what was found, raised before
+;;; any start function or host side effect runs.
+;;;
+;;; Everything here reuses the validator's matcher
+;;; (%TY-MATCH / %TY-MATCH-VALTYPE, the nominal :fresh/:inst-export
+;;; resource leaf and the identity-substitution rules); no second
+;;; resource equality exists. Declarator type indices resolve
+;;; INNER-FIRST with a fall back to the enclosing component's space,
+;;; exactly like %CHECK-EXTERNTYPE's callers.
+
+(defun check-import-binding (import value types &key (required t))
+  "Validate the runtime VALUE bound for IMPORTREC against the external
+type the import declares. TYPES is the defining comp-instance's type
+index vector (comp-instance-types: the cts the def walk has pushed so
+far). Signals wasmdown:link-error when the import is
+required and VALUE is absent, when the value's sort differs from the
+declared sort, or when the value's type does not satisfy the
+declared one. Returns VALUE unchanged."
+  (%check-import-binding (format nil "~s" (importrec-name import))
+                         (car (importrec-type import))
+                         (cdr (importrec-type import))
+                         value types required)
+  value)
+
+;;; ---- the defining component's type space ----
+
+(defun %identity-vector (types)
+  "Wrap the runtime type-index vector TYPES (raw cts) as the
+validator's identity space: a ct entry becomes (:ct . ct) so
+%TY-MATCH dispatches on its kind; an already-normalized identity cons
+passes through."
+  (let ((ids (make-array (length types))))
+    (dotimes (i (length types) ids)
+      (let ((ty (aref types i)))
+        (setf (aref ids i)
+              (cond ((ct-p ty) (cons :ct ty))
+                    ((consp ty) ty)
+                    (t ty)))))))
+
+(defun %ids-ct (i ids)
+  "The ct a type index I names in the identity space IDS, or NIL."
+  (when (and ids (integerp i) (>= i 0) (< i (length ids)))
+    (let ((e (aref ids i)))
+      (cond ((and (consp e) (eq (car e) :ct)) (cdr e))
+            ((ct-p e) e)
+            (t nil)))))
+
+(defun %decl-type-at (i space ids)
+  "The ct a type index I names inside a component/instance TYPE's own
+declarator space SPACE — INNER-FIRST, falling back to the enclosing
+component's identity space IDS (the validator's rule: declarators
+resolve in-sequence, an out-of-line (type i) reference lands in the
+enclosing space)."
+  (or (and space (integerp i) (>= i 0) (< i (length space))
+           (aref space i))
+      (%ids-ct i ids)))
+
+(defun %declarator-space (ct ids)
+  "A vector mapping the type indices a component/instance TYPE CT
+introduces to the ct they name. A :type declarator carries its ct; an
+:import/:export declarator introduces the index its (type i)
+ascription aliases; an (alias outer 1 ...) :alias declarator names
+the ENCLOSING component's type (the text parser desugars the outer
+`(eq $R)' reference that way), so it resolves in IDS; other aliases
+(instance-export projections, deeper outer counts) contribute an
+opaque slot (NIL)."
+  (let* ((decls (ct-payload ct))
+         (space (make-array (length decls) :initial-element nil))
+         (n -1))
+    (loop for td across decls
+          do (when (member (typedecl-kind td) '(:type :alias :import :export))
+               (incf n)
+               (setf (aref space n)
+                     (case (typedecl-kind td)
+                       (:type (typedecl-payload td))
+                       (:alias
+                        (let ((a (typedecl-payload td)))
+                          (and (eq (aliasrec-kind a) :outer)
+                               (eq (aliasrec-sort a) :type)
+                               (eql (aliasrec-count a) 1)
+                               (%ids-ct (aliasrec-target a) ids))))
+                       ((:import :export)
+                        (let ((et (third (typedecl-payload td))))
+                          (and (eq (car et) :type)
+                               (integerp (cdr et))
+                               (%decl-type-at (cdr et) space ids))))
+                       (t nil)))))
+    space))
+
+;;; ---- describing a contract (the message shapes) ----
+
+
+(defun %sort-name (sort)
+  (case sort
+    (:core-module "core module")
+    (:core-instance "core instance")
+    (:core-func "core func")
+    (:core-memory "core memory")
+    (:core-table "core table")
+    (:core-global "core global")
+    (:core-tag "core tag")
+    (:core-type "core type")
+    (t (string-downcase (string sort)))))
+
+(defparameter *describe-max-depth* 4
+  "How deep a contract rendering recurses before eliding. A
+component's type space is a graph (an instance type can export an
+instance of the same shape), and these renderings ride INSIDE error
+messages: they must terminate and stay short.")
+
+(defparameter *describe-max-exports* 6
+  "How many declarators an instance/component contract lists before
+`... N more'. A real interface (wasi:sockets) has dozens.")
+
+(defun %describe-valtype (vt ids &optional (depth 0))
+  "A WAT-ish rendering of VALTYPE in the identity space IDS."
+  (cond
+   ((>= depth *describe-max-depth*) "...")
+   ((null vt) "...")
+   ((keywordp vt) (string-downcase (string vt)))
+   ((ct-p vt) (%describe-ct vt ids (1+ depth)))
+   ((and (consp vt) (eq (car vt) :idx))
+    (let ((c (%ids-ct (cdr vt) ids)))
+      (if c (%describe-ct c ids (1+ depth))
+          (format nil "type ~d" (cdr vt)))))
+   (t "?")))
+
+(defun %describe-ct (ct ids &optional (depth 0))
+  "A WAT-ish rendering of the type CT in the identity space IDS."
+  (if (or (null ct) (not (ct-p ct)) (>= depth *describe-max-depth*))
+      "?"
+      (let ((p (ct-payload ct))
+            (d (1+ depth)))
+        (case (ct-kind ct)
+          (:prim (string-downcase (string p)))
+          (:func (%describe-functype ct ids depth))
+          (:record
+           (with-output-to-string (s)
+             (write-string "(record" s)
+             (loop for (name . vt) across p
+                   do (format s " (field ~s ~a)" name
+                              (%describe-valtype vt ids d)))
+             (write-string ")" s)))
+          (:variant
+           (with-output-to-string (s)
+             (write-string "(variant" s)
+             (loop for (name . vt) across p
+                   do (format s " (case ~s" name)
+                      (when vt (format s " ~a" (%describe-valtype vt ids d)))
+                      (write-string ")" s))
+             (write-string ")" s)))
+          (:list
+           (format nil "(list ~a)" (%describe-valtype (car p) ids d)))
+          (:tuple
+           (with-output-to-string (s)
+             (write-string "(tuple" s)
+             (loop for vt across p
+                   do (format s " ~a" (%describe-valtype vt ids d)))
+             (write-string ")" s)))
+          (:flags
+           (with-output-to-string (s)
+             (write-string "(flags" s)
+             (loop for name across p do (format s " ~s" name))
+             (write-string ")" s)))
+          (:enum
+           (with-output-to-string (s)
+             (write-string "(enum" s)
+             (loop for name across p do (format s " ~s" name))
+             (write-string ")" s)))
+          (:option (format nil "(option ~a)" (%describe-valtype p ids d)))
+          (:result
+           (format nil "(result~@[ ~a~]~@[ (error ~a)~])"
+                   (and (car p) (%describe-valtype (car p) ids d))
+                   (and (cdr p) (%describe-valtype (cdr p) ids d))))
+          ((:own :borrow)
+           (format nil "(~a ~a)" (string-downcase (string (ct-kind ct)))
+                   (let ((c (and (integerp p) (%ids-ct p ids))))
+                     (if c (%describe-ct c ids d)
+                         (format nil "~s" p)))))
+          ((:stream :future)
+           (format nil "(~a~@[ ~a~])"
+                   (string-downcase (string (ct-kind ct)))
+                   (and p (%describe-valtype p ids d))))
+          (:map
+           (format nil "(map ~a ~a)"
+                   (%describe-valtype (car p) ids d)
+                   (%describe-valtype (cdr p) ids d)))
+          (:resource "resource")
+          ((:component :instance)
+           (let ((space (%declarator-space ct ids)))
+             (with-output-to-string (s)
+               (format s "(~a" (string-downcase (string (ct-kind ct))))
+               (let ((n 0) (more 0))
+                 (loop for td across (ct-payload ct)
+                       do (let ((kind (typedecl-kind td)))
+                            (when (member kind '(:import :export))
+                              (if (< n *describe-max-exports*)
+                                  (progn
+                                    (incf n)
+                                    (format s " (~a ~s ~a)"
+                                            (string-downcase (string kind))
+                                            (first (typedecl-payload td))
+                                            (%describe-externtype
+                                             (third (typedecl-payload td))
+                                             space ids d)))
+                                  (incf more)))))
+                 (when (plusp more)
+                   (format s " ... ~d more" more)))
+               (write-string ")" s))))
+          (t (string-downcase (string (ct-kind ct))))))))
+
+(defun %describe-functype (ft ids &optional (depth 0))
+  "The `func (param i32) -> (result i32)' rendering of the functype
+CT FT (its valtype refs read in IDS)."
+  (let* ((p (first (ct-payload ft)))
+         (r (second (ct-payload ft)))
+         (async (third (ct-payload ft)))
+         (d (1+ depth))
+         (params (map 'list (lambda (x) (%describe-valtype (cdr x) ids d)) p))
+         (res (if (null r)
+                  ""
+                  (format nil " -> (result ~a)" (%describe-valtype r ids d)))))
+    (format nil "~@[async ~]func (param~{ ~a~})~a"
+            (and async "async") params res)))
+
+(defun %describe-externtype (et space ids &optional (depth 0))
+  "The contract text of the externtype ET as declared INSIDE a
+component/instance TYPE (SPACE) of the component space IDS."
+  (let ((d (1+ depth)))
+    (case (car et)
+      (:func
+       (let ((c (%decl-type-at (cdr et) space ids)))
+         (if (and c (ct-functype-p c))
+             (format nil "(~a)" (%describe-functype c ids d))
+             "(func)")))
+      (:instance
+       (let ((c (%decl-type-at (cdr et) space ids)))
+         (if (and c (ct-p c) (eq (ct-kind c) :instance))
+             (%describe-ct c ids d)
+             "(instance)")))
+      (:component
+       (let ((c (%decl-type-at (cdr et) space ids)))
+         (if (and c (ct-p c) (eq (ct-kind c) :component))
+             (%describe-ct c ids d)
+             "component")))
+      (:type
+       (let ((b (cdr et)))
+         (cond ((eq b :sub-resource) "resource type")
+               ((and (consp b) (eq (car b) :eq))
+                (let ((c (%decl-type-at (second b) space ids)))
+                  (if c (%describe-ct c ids d) "type")))
+               (t "type"))))
+      (:value "value")
+      (:core-module "core module"))))
+
+;;; ---- inspecting a runtime provider value ----
+
+(defvar *runtime-function-cache* (make-hash-table :test #'equal)
+  "NAME -> the component RUNTIME package's function (src/component-
+runtime.lisp loads after this file, so the value readers are looked up
+by name at first use; NIL-cached when absent).")
+
+(defun %runtime-function (name)
+  "The function NAME in wasmdown.component.runtime, or NIL. The
+runtime layer loads AFTER this file: the binding check runs at
+instantiation time, so the lookup always succeeds there — a missing
+package/function means only 'cannot inspect' (NIL)."
+  (multiple-value-bind (hit found) (gethash name *runtime-function-cache*)
+    (if found
+        hit
+        (let ((pkg (find-package '#:wasmdown.component.runtime)))
+          (setf (gethash name *runtime-function-cache*)
+                (let ((sym (and pkg (find-symbol name pkg))))
+                  (and sym (fboundp sym) (symbol-function sym))))))))
+
+(defun %runtime-p (name value)
+  "Does VALUE satisfy the runtime predicate NAME?"
+  (let ((f (%runtime-function name)))
+    (and f (not (null (funcall f value))))))
+
+(defun %runtime-read (name value)
+  "The runtime accessor NAME applied to VALUE (NIL when unavailable)."
+  (let ((f (%runtime-function name)))
+    (and f (funcall f value))))
+
+(defun %bag-value-p (v)
+  (and (hash-table-p v) (gethash :%bag v)))
+
+(defun %import-value-sort (v)
+  "The runtime SORT VALUE presents (NIL for an absent value)."
+  (cond
+   ((null v) nil)
+   ((%bag-value-p v) :instance)
+   ((%runtime-p "LIFTED-FUNC-P" v) :func)
+   ((%runtime-p "COMP-INSTANCE-P" v) :instance)
+   ((%runtime-p "CLOSED-COMP-P" v) :component)
+   ((%runtime-p "FUNC-INSTANCE-P" v) :core-func)
+   ((%runtime-p "MODULE-INSTANCE-P" v) :core-instance)
+   ((%runtime-p "MEMORY-INSTANCE-P" v) :core-memory)
+   ((%runtime-p "TABLE-INSTANCE-P" v) :core-table)
+   ((%runtime-p "GLOBAL-INSTANCE-P" v) :core-global)
+   ((comp-p v) :component)
+   ((ct-p v) :type)
+   ((and (consp v) (member (car v) '(:fresh :inst-export :ref))) :type)
+   ((wasmdown.types:wasm-module-p v) :core-module)
+   (t :unknown)))
+
+(defun %value-functype (v)
+  "The component functype a func-import VALUE presents, plus the
+identity space its valtype refs resolve in (its DEFINING instance's
+type vector) — (values ct ids), or NIL when the value carries none."
+  (and (%runtime-p "LIFTED-FUNC-P" v)
+       (let ((ft (%runtime-read "LIFTED-FUNC-TYPE" v))
+             (inst (%runtime-read "LIFTED-FUNC-INST" v)))
+         (values ft
+                 (and inst
+                      (%runtime-p "COMP-INSTANCE-P" inst)
+                      (%identity-vector
+                       (%runtime-read "COMP-INSTANCE-TYPES" inst)))))))
+
+(defun %describe-value (v)
+  "What a provider supplied, for the `found ...' half of a message."
+  (let ((sort (%import-value-sort v)))
+    (case sort
+      ((nil) "nothing")
+      (:func
+       (multiple-value-bind (ft ids) (%value-functype v)
+         (if (and ft (ct-functype-p ft))
+             (%describe-functype ft ids)
+             "a func without a component type")))
+      (:type
+       (cond ((ct-p v) (%describe-ct v nil))
+             ((consp v) (format nil "type ~s" v))
+             (t "a type")))
+      (:instance (if (%bag-value-p v) "instance (inline exports)" "instance"))
+      (:component "component")
+      (:core-module "core module")
+      (:core-func "core func")
+      (:core-instance "core instance")
+      (:core-memory "core memory")
+      (:core-table "core table")
+      (:core-global "core global")
+      (t (format nil "~a value" (string-downcase (string sort)))))))
+
+;;; ---- the checks ----
+
+(defun %link-import-error (context control &rest args)
+  (error 'wasmdown:link-error
+         :message (format nil "import ~a: ~a"
+                          context (apply #'format nil control args))))
+
+(defun %functype-match (want want-ids got got-ids)
+  "Structural functype matching (the validator's rules): parameter
+names and ORDER, each parameter/result valtype through
+%TY-MATCH-VALTYPE in its OWN identity space, and the async flag.
+Signals wasmdown:validation-error on a mismatch."
+  (let ((wp (first (ct-payload want))) (rp (second (ct-payload want)))
+        (gp (first (ct-payload got))) (rg (second (ct-payload got))))
+    (unless (= (length wp) (length gp))
+      (%verr "expected ~d parameters, found ~d" (length wp) (length gp)))
+    (loop for a across wp
+          for b across gp
+          do (unless (string= (car a) (car b))
+               (%verr "expected parameter named ~s, found ~s" (car a) (car b)))
+             (%ty-match-valtype (cdr a) (cdr b) want-ids nil got-ids nil))
+    (cond
+     ((and rp (not rg)) (%verr "expected a result, found none"))
+     ((and (not rp) rg) (%verr "expected no result, but found one"))
+     ((and rp rg) (%ty-match-valtype rp rg want-ids nil got-ids nil)))
+    (let ((wa (and (third (ct-payload want)) t))
+          (ga (and (third (ct-payload got)) t)))
+      (unless (eq wa ga)
+        (%verr "expected ~:[a sync~;an async~] function, found ~:[a sync~;an async~] function"
+               wa ga)))))
+
+(defun %require-functype-match (context want want-ids got got-ids)
+  (handler-case (%functype-match want want-ids got got-ids)
+    (wasmdown:validation-error (c)
+      (%link-import-error context "expected ~a, found ~a (~a)"
+                          (%describe-functype want want-ids)
+                          (%describe-functype got got-ids)
+                          (wasmdown:wasmdown-error-message c)))))
+
+(defun %check-func-import (context typearg value ids required)
+  (let ((want (%ids-ct typearg ids)))
+    (cond
+     ((null value)
+      (when required
+        (%link-import-error context "expected ~a, found nothing"
+                            (if (and want (ct-functype-p want))
+                                (%describe-functype want ids)
+                                "func"))))
+     ((not (eq (%import-value-sort value) :func))
+      (%link-import-error context "expected ~a, found ~a"
+                          (if (and want (ct-functype-p want))
+                              (%describe-functype want ids)
+                              "func")
+                          (%describe-value value)))
+     ((and want (ct-functype-p want))
+      (multiple-value-bind (got got-ids) (%value-functype value)
+        ;; an UNTAGGED lift (a `canon lift' with no type ascription, as
+        ;; the async fixtures export) carries no component functype to
+        ;; contradict the import's — it is not a mismatch, only
+        ;; unverifiable. The value still had to be present and of the
+        ;; func sort.
+        (when (and got (ct-functype-p got))
+          (%require-functype-match context want ids got got-ids)))))))
+
+(defun %resource-identity-p (v)
+  "Is V a resource TYPE identity (the `sub resource' import's bound)?"
+  (or (and (ct-p v) (member (ct-kind v) '(:resource)))
+      (and (consp v) (member (car v) '(:fresh :inst-export)))))
+
+(defun %check-type-import (context typearg value ids required)
+  (let ((bound (%declarator-type-bound typearg ids)))
+    (cond
+     ((null value)
+      (when required
+        (%link-import-error context "expected ~a, found nothing"
+                            (if bound (%describe-ct bound ids) "type"))))
+     ((eq typearg :sub-resource)
+      (unless (%resource-identity-p value)
+        (%link-import-error context "expected resource type, found ~a"
+                            (%describe-value value))))
+     (bound
+      (handler-case (%type-object-match bound ids value nil 0)
+        (wasmdown:validation-error (c)
+          (%link-import-error context "expected ~a, found ~a (~a)"
+                              (%describe-ct bound ids)
+                              (%describe-value value)
+                              (wasmdown:wasmdown-error-message c)))))
+     (t nil))))
+
+(defun %declarator-type-bound (bound ids)
+  "The ct a `type' typebound names, or NIL."
+  (and (consp bound) (eq (car bound) :eq)
+       (%ids-ct (second bound) ids)))
+
+(defun %type-object-match (want want-ids got got-ids depth)
+  "Does the provided type identity GOT satisfy the bound WANT?
+Structural, through %TY-MATCH for every kind it knows; the kinds it
+has no arm for (func/instance/stream/future/map) are compared here
+with the same valtype matcher. A resource is the nominal leaf
+(:fresh/:inst-export identities) — no structural resource equality is
+added."
+  (when (>= depth 8) (return-from %type-object-match nil))
+  (let* ((g (cond ((ct-p got) (cons :ct got))
+                  ((and (consp got) (eq (car got) :ct)) got)
+                  ((consp got) got)
+                  (t nil)))
+         (w (cons :ct want)))
+    (when g
+      (let ((wk (and (consp g) (eq (car g) :ct) (ct-kind (cdr g))))
+            (ck (ct-kind want)))
+        (case ck
+          (:func
+           (when (and (eq wk :func) (ct-functype-p want)
+                      (ct-functype-p (cdr g)))
+             (%functype-match want want-ids (cdr g) got-ids))
+           (unless (eq wk :func)
+             (%verr "expected a function type, found ~a" (%describe-value got))))
+          (:instance
+           (if (and (eq wk :instance) (ct-p (cdr g)))
+               (%check-instance-exports "%type" (cdr g) got-ids (cdr g)
+                                        (1+ depth))
+               (unless (eq wk :instance)
+                 (%verr "expected an instance type, found ~a"
+                        (%describe-value got)))))
+          ((:stream :future)
+           (unless (eq wk ck)
+             (%verr "expected ~a, found ~a"
+                    (string-downcase (string ck))
+                    (case wk (t (string-downcase (string (or wk :something)))))))
+           (let ((wp (ct-payload want)) (gp (ct-payload (cdr g))))
+             (when (and wp gp)
+               (%ty-match-valtype wp gp want-ids nil got-ids nil))
+             (when (and wp (null gp))
+               (%verr "expected an element type, found none"))))
+          (:map
+           (unless (eq wk :map)
+             (%verr "expected map, found ~a"
+                    (string-downcase (string (or wk :something)))))
+           (let ((wp (ct-payload want)) (gp (ct-payload (cdr g))))
+             (%ty-match-valtype (car wp) (car gp) want-ids nil got-ids nil)
+             (%ty-match-valtype (cdr wp) (cdr gp) want-ids nil got-ids nil)))
+          (t (%ty-match w g want-ids nil got-ids nil)))))))
+
+(defun %instance-export-hit (value name)
+  "The (SORT . VALUE) an instance-valued provider offers as NAME, or
+NIL when it has no such export."
+  (cond
+   ((%bag-value-p value)
+    (let ((hit (gethash name value :missing)))
+      (and (not (eq hit :missing))
+           (cons (%import-value-sort hit) hit))))
+   (t
+    (let ((tab (%runtime-read "COMP-INSTANCE-EXPORTS" value)))
+      (when (hash-table-p tab)
+        (let ((hit (gethash name tab :missing)))
+          (and (not (eq hit :missing)) hit)))))))
+
+(defun %check-instance-exports (context ct ids value depth)
+  "The provided VALUE must export every export CT declares, with the
+declared sort and a satisfying type. Extra exports are allowed (a
+provider may offer more than the world asks for); a missing export, a
+sort mismatch or an incompatible signature is a link error."
+  (when (>= depth 8) (return-from %check-instance-exports nil))
+  (let ((space (%declarator-space ct ids)))
+    (loop for td across (ct-payload ct)
+          when (eq (typedecl-kind td) :export)
+          do (let* ((name (first (typedecl-payload td)))
+                    (et (third (typedecl-payload td)))
+                    (sub (format nil "~a ~s" context name))
+                    (hit (%instance-export-hit value name)))
+               (unless hit
+                 (%link-import-error sub "expected ~a, found no export"
+                                     (%describe-externtype et space ids)))
+               (let ((asort (car hit)) (avalue (cdr hit)))
+                 (unless (eq asort (car et))
+                   (%link-import-error sub "expected ~a, found ~a"
+                                       (%sort-name (car et))
+                                       (%describe-value avalue)))
+                 (%check-declared-export sub (car et) (cdr et) avalue
+                                         space ids depth))))))
+
+(defun %check-declared-export (context sort payload value space ids depth)
+  "One declared export of an instance contract against the provider's
+value (SORT already matched)."
+  (case sort
+    (:func
+     (let ((want (%decl-type-at payload space ids)))
+       (when (and want (ct-functype-p want))
+         (multiple-value-bind (got got-ids) (%value-functype value)
+           (when (and got (ct-functype-p got))
+             (%require-functype-match context want ids got got-ids))))))
+    (:instance
+     (let ((want (%decl-type-at payload space ids)))
+       (when (and want (ct-p want) (eq (ct-kind want) :instance))
+         (%check-instance-exports context want ids value (1+ depth)))))
+    (:type
+     (let ((bound payload))
+       (cond
+        ((eq bound :sub-resource)
+         (unless (%resource-identity-p value)
+           (%link-import-error context "expected resource type, found ~a"
+                               (%describe-value value))))
+        ((and (consp bound) (eq (car bound) :eq))
+         (let ((want (%decl-type-at (second bound) space ids)))
+           (when want
+             (handler-case (%type-object-match want ids value nil (1+ depth))
+               (wasmdown:validation-error (c)
+                 (%link-import-error context "expected ~a, found ~a (~a)"
+                                     (%describe-ct want ids)
+                                     (%describe-value value)
+                                     (wasmdown:wasmdown-error-message c))))))))))
+    (:component
+     (unless (eq (%import-value-sort value) :component)
+       (%link-import-error context "expected component, found ~a"
+                           (%describe-value value))))
+    (:core-module
+     (unless (eq (%import-value-sort value) :core-module)
+       (%link-import-error context "expected core module, found ~a"
+                           (%describe-value value))))
+    (t nil)))
+
+(defun %check-instance-import (context typearg value ids required)
+  (let ((ct (%ids-ct typearg ids)))
+    (cond
+     ((null value)
+      (when required
+        (%link-import-error context "expected ~a, found nothing"
+                            (if (and ct (ct-p ct) (eq (ct-kind ct) :instance))
+                                (%describe-ct ct ids)
+                                "instance"))))
+     ((not (member (%import-value-sort value) '(:instance)))
+      (%link-import-error context "expected ~a, found ~a"
+                          (if (and ct (ct-p ct) (eq (ct-kind ct) :instance))
+                              (%describe-ct ct ids)
+                              "instance")
+                          (%describe-value value)))
+     ((and ct (ct-p ct) (eq (ct-kind ct) :instance))
+      (%check-instance-exports context ct ids value 1))
+     (t nil))))
+
+(defun %check-core-module-import (context value required)
+  (cond
+   ((null value)
+    (when required
+      (%link-import-error context "expected core module, found nothing")))
+   ((not (eq (%import-value-sort value) :core-module))
+    (%link-import-error context "expected core module, found ~a"
+                        (%describe-value value)))))
+
+(defun %check-value-import (context value required)
+  (when (and (null value) required)
+    (%link-import-error context "expected value, found nothing")))
+
+(defun %check-import-binding (context sort typearg value types required)
+  "Dispatch the binding check for one import of SORT."
+  (let ((ids (%identity-vector types)))
+    (case sort
+      (:func (%check-func-import context typearg value ids required))
+      (:instance (%check-instance-import context typearg value ids required))
+      (:type (%check-type-import context typearg value ids required))
+      (:component
+       (when (and (null value) required)
+         (%link-import-error context "expected component, found nothing")))
+      (:value (%check-value-import context value required))
+      (:core-module (%check-core-module-import context value required))
+      (:core-memory
+       (when (and (null value) required)
+         (%link-import-error context "expected core memory, found nothing")))
+      (:core-table
+       (when (and (null value) required)
+         (%link-import-error context "expected core table, found nothing")))
+      (:core-global
+       (when (and (null value) required)
+         (%link-import-error context "expected core global, found nothing")))
+      (:core-tag
+       (when (and (null value) required)
+         (%link-import-error context "expected core tag, found nothing")))
+      (t nil))))
