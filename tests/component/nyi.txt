@@ -1,3 +1,40 @@
+# M17 SESSION 16 — DEFECT 1 OF 3 CLOSED: THREAD IDENTITY AND THE SUSPEND PARK
+# CREDIT (90715e2). dssc::19 measured 13/30 red on master -> 0/30 here, plus 10/10,
+# 15/15, 10/10 and 5/5 in further batches.
+# THE REAL MECHANISM (instrumented, and it was NOT the two suspicions): a
+# thread.suspend park (§494 = block() with NO readiness function) was released by a
+# plain scheduler nudge — the store-right handoff nudge and the tick's grant posted
+# the generic park wake-count to a thread that had not parked yet. f then returned
+# early, unregistered (§737-744), its index was LEGALLY reused (§705 uses
+# Table.add/remove, a free list), and the guest's captured index named the CALLER —
+# so §4737's trap_if(i == thread.index) fired. The trap was right; the unsuspension
+# was wrong. INDEX REUSE AFTER EXIT IS SPEC-MANDATED: do not "fix" it.
+# THE FOUR FIXES:
+#  1. PARK-CREDIT SPLIT: async-thread.resume-count is bumped ONLY by spec-level
+#     resumes (Thread.resume §474, resume_later's ready mark §458-465, the §242-273
+#     handoff post). wake-count stays the generic re-test nudge for WAITING parks.
+#     async-thread-suspend accepts only resume-count, drops stray nudges, and
+#     RE-PARKS instead of returning on a non-resume broadcast (§407 ready_func is
+#     None; §433-440/§936 a suspended thread is not in Store.waiting).
+#  2. IDENTITY IS ATOMIC: %register-thread-index does the §705 scan+assign+table
+#     entry in ONE *scheduler-mutex* section; both registration sites and both
+#     unregister sites share it.
+#  3. HOLE INDICES TRAP: the switch builtins trap `unknown thread index` on a freed
+#     index per Table.get's bounds+hole check (§1126-1129, called by §4706/§4721/
+#     §4734/§4760).
+#  4. EXIT IS THE HANDOFF: %task-exit-implicit-thread posts the §242-273 handoff
+#     instead of discarding post-to; the switch arm's SUSPEND variant waits for a
+#     resume while the YIELD variant keeps "any nudge" (§536).
+# Traps kept, with citations: trap_if(i == thread.index) for suspend and
+# yield-then-promote (§4728-4737, §4738-4763); then-resume kinds reject a same index
+# through trap_if(not other_thread.suspended()) (§4688/§4714).
+# Measured: units 527/0 twice (526 + component/thread-index-identity-pin); eight
+# stream/future fixtures 151/0; per-file probe no hang.
+# REMAINING, re-measured rather than remembered: dssc::2 (18/30 on master -> 10/30
+# here; a yield-then-promote caller can be re-resumed before the switched-to thread
+# takes its first turn — the spec's SYNCHRONOUS switch_to chain against async native
+# threads, which is step-4 scheduler work, not this fix), may-block::8,
+# excl-resume::2, and component/cancel-window-fire-gate-pins (flaky on BOTH trees).
 # M17 SESSION 15 — THE STORE DRIVER LANDED (b7c846c): steps 5 and 6 are now
 # structurally complete, with only the three named per-row defects left.
 # LANDED: host-store (mutex/entries/count/work/reactor) in the SAME provenance slot as
