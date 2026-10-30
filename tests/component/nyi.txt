@@ -1,3 +1,34 @@
+# M17 SESSION 5c — TYPE-VIEW: FIVE TARGETED CUTS, ALL NEGATIVE, PLUS A VALID
+# NULL-DIFF THAT KILLS THE GENERIC-OVERHEAD ACCOUNT. The bisect of the 486-line
+# diff is exhausted at the cheap end; SPLIT THE FEATURE INTO SLICES INSTEAD.
+# CUT TABLE (3 lane runs each; effect size 29/30 vs 2/30 makes a 3-run sample
+# decisive for "still pinned"):
+#   cut | reverted mechanism                                       | acs::2 | other
+#   1   | %parse-instancedecl type-branch sink drain               | 3/3    | unchanged
+#   2   | %current-type-view's recorded outer ring                 | 3/3    | pins broke (mechanism load-bearing)
+#   3   | %check-defvaltype's eager (%view-ring *outer-states*)     | 3/3    | ctr::9 x1
+#   4   | %remap-decl-functype's alias branch -> master's
+#       |   (%outer-state-at nil (1- count)) + aref form            | 3/3    | ctr::9 x1
+#   5   | %instance-ct-type-space's memo lookup bypassed            | 3/3    | none
+# THE VALID NULL-DIFF (the earlier one was sub-resolution and invalid): master
+# with `(sb-ext:gc :full t)` before every FILE — 69 real full GCs per run, i.e.
+# genuine per-command work, no semantic change. Manipulation ENGAGED and measured
+# by wall: 56.4 s per 6 runs = 9.4 s/run against 8.2 s/run in the control batch.
+# RESULT: acs::2 = 0/6, total 1 fail over 6 runs. So EXTRA PER-COMMAND WORK DOES
+# NOT FLIP acs::2 — the generic-overhead/margin account is dead, this time on a
+# manipulated-and-verified variable. type-view's vector is SPECIFIC to what it
+# computes, not to what it costs.
+# REMAINING CANDIDATES (2 of 5; the other three are cut): %vis-check's OOB fallback
+# and %vis-check-type-use's alias resource push; the plain view threading in
+# %deindex-functype / %remap-ct-refs / %instance-ct-export-functype /
+# %vis-decl-functype-at.
+# RECOMMENDED NEXT STRATEGY — stop cutting, start slicing: 5 negative cuts say the
+# vector is not one hunk but a property of the assembled feature. Rebuild
+# `wip/type-view` as 2-3 landable slices (suggested split: (a) resolve-valtype /
+# type-view plumbing only; (b) the declarator-space + resolve-declarator-type; (c)
+# provenance + the alias branches) and measure each on a 30-run ADJACENT PAIR with
+# tools/probe-async-lane.sh. The first slice that reproduces acs::2 29/30 names the
+# mechanism by construction, and every slice before it can land on its own merits.
 # M17 SESSION 5b — TYPE-VIEW BISECT: THREE CUTS, ALL NEGATIVE. Per-cut line format
 # (the fixing cut will quote ONE line of this table, not prose):
 #   cut | reverted symbol / mechanism                        | acs::2 | other classes      | units
