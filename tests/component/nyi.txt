@@ -1,3 +1,36 @@
+# M17 SESSION 30 — THE TWO CLOSING COMMITS, THE OBSERVED ROW, AND THE REGISTRATION CHECK.
+# 1. THE LAST LANE BLOCK READ 1/30 red, 1 fail command, on ONE row: `reentrance::20`
+#    (walls 9.96-10.53). THAT IS NOT A ZERO-COST CLAIM; the correct record is "1 fail
+#    command in this window, on a row unrelated to the commits being landed".
+#    Checked rather than assumed:
+#      standalone 20 runs of reentrance.wast on CURRENT master      -> ::20 in 0 of 20
+#      standalone 20 runs on the PRE-final-commits tree (e231e03)   -> ::20 in 0 of 20
+#    and the same row appeared once earlier in the type-view VERDICT block (bg_310), i.e.
+#    on a tree that predates the last two commits. Those two commits are a provider-side
+#    composition change (not reached by the lane, which instantiates directly) and a
+#    test-only addition, so they cannot perturb a lane row at all.
+#    CONCLUSION: `reentrance::20` is a LANE-ONLY RARE row (0/20 standalone on both trees,
+#    1/30 in-lane twice, on two different trees). It is a WATCH ROW, not an attribution —
+#    and it is recorded here so the next session measures it in a paired window instead of
+#    reading this session's 0/30 blocks as a standing guarantee.
+# 2. THE REGISTRATION CHECK, done by counting rather than by eye. `tests/wasi.lisp` has NO
+#    separate registration list: the `test` macro (tests/harness.lisp:15) pushes into
+#    *tests* at load time, so the check is that each name appears as exactly one
+#    `(test <name>` form:
+#      wasi/command-provider-composed-from-command-world     1
+#      wasi/world-provider-composition-is-world-driven       1
+#      wasi/world-provider-types-only-import-needs-no-binding 1
+#      wasi/world-provider-unsupported-import-is-construction-error 1
+#      wasi/sockets-send-resume-scripted-readiness           1
+#    i.e. NO duplicate registrations and none swallowed inside another sexp. (The
+#    component pin file, which DOES have an explicit list, was verified the same way at
+#    e231e03: 88 names, zero duplicates, every new pin exactly once.)
+# 3. THE TWO CLOSING COMMITS' SCOPE, stated so the ledger cannot be misread: the
+#    composition change leaves the surface unchanged for any caller that passes an alist
+#    (command-provider is a thin wrapper whose default is the command world), and the
+#    send-resume test drills watch identity and the copy generation rather than re-proving
+#    the send path. Units 549/0 on the combined tree, twice, and the four named fixtures
+#    59/59 with per-file probe printing `done` only.
 # M17 SESSION 29 — THE LAST TWO GAPS CLOSED (merge 286e777), AND ONE OBSERVED ONE-OFF.
 # CLOSED: step 3's provider composition is now WORLD-DRIVEN (command-world +
 # compose-world-providers + command-provider as a thin wrapper; each DECLARED import is
