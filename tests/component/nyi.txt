@@ -1,14 +1,14 @@
 # M17 SESSION 5d — THE NEXT ATTRIBUTION PASS IS HUNK-RANGE BISECTION, AND THE
 # FAILURE OF FIVE FUNCTION-LEVEL CUTS IS ITSELF THE EVIDENCE.
-# `git diff master wip/type-view -- src/component.lisp` is 19 hunks. Five
+# `git diff master wip/type-view -- src/component.lisp` is 24 hunks (measured). Five
 # function-shaped cuts all came back acs::2 3/3, so the vector's footprint is NOT
 # function-shaped — it is PATH-shaped: some resolution path only the assembled
 # feature takes. That rules out the cheap local-fix options and is the reason the
 # next move is step 4's acquisition-side quantum rather than a sixth cut.
 # THE REMAINING ATTRIBUTION PASS (converges in <= 5 probes, 3 lane runs each):
-#   H=$(git diff master wip/type-view -- src/component.lisp | grep -c '^@@')   # 19
+#   H=$(git diff master wip/type-view -- src/component.lisp | grep -c '^@@')   # 24
 #   apply hunks 1..k with `git apply` on a scratch branch, measure acs::2, halve:
-#     1..10 then 11..19, then the offending half again. First half that reproduces
+#     1..12 then 13..24, then the offending half again. First half that reproduces
 #     29/30 (or a 3/3 sample) names the range; the other half lands independently.
 # Hunk-range bisection is the only method left within this instrument's width, and
 # it is cheap: 3 runs per probe because the effect size is 29/30 vs 2/30.
