@@ -2893,6 +2893,223 @@ repo root, as a string — the pin runs a fixture row VERBATIM."
       ;; the ONLY hook (no per-instance table got created)
       (is (null (fin inst (host-ct "never-registered")))))))
 
+
+;;; ---- M17 (plan step 3): the LINK-TIME import contract ------------
+;;;
+;;; %EXEC-IMPORT must compare the import's resolved external type with
+;;; what the provider actually supplies BEFORE it pushes the value: a
+;;; missing value, a wrong sort and a shrunk signature are link errors
+;;; naming the import, the expected contract and what was found —
+;;; raised before any start function or host side effect runs.
+
+(defun %link-provider ()
+  "A comp-instance exporting `f' as a lifted func
+\(param \"x\" u32) -> (result u32)."
+  (%exec-comp
+   "(component
+      (core module $M
+        (func (export \"f\") (param i32) (result i32) (local.get 0)))
+      (core instance $m (instantiate $M))
+      (func $f (param \"x\" u32) (result u32)
+        (canon lift (core func $m \"f\")))
+      (export \"f\" (func $f)))"))
+
+(defun %link-provider-f ()
+  (wasmdown.component.runtime:runtime-export-value (%link-provider) "f"))
+
+(defun %link-provider0 ()
+  "A comp-instance exporting `f' as a lifted func with NO parameters
+and a u32 result (the instance-coverage fixtures' shape)."
+  (%exec-comp
+   "(component
+      (core module $M (func (export \"f\") (result i32) (i32.const 7)))
+      (core instance $m (instantiate $M))
+      (func $f (result u32) (canon lift (core func $m \"f\")))
+      (export \"f\" (func $f)))"))
+
+(defun %link-provider0-f ()
+  (wasmdown.component.runtime:runtime-export-value (%link-provider0) "f"))
+
+(defun %validated (src)
+  (let ((comp (wasmdown.component.text::parse-component-text src)))
+    (wasmdown.component:validate-component comp)
+    comp))
+
+(defun %exec-types (comp)
+  "The type index vector the def walk has built for COMP's `:type'
+definitions (the runtime's comp-instance-types for these fixtures:
+they use no type aliases or type imports)."
+  (coerce (loop for d across (wasmdown.component:comp-defs comp)
+                when (eq (wasmdown.component:compdef-kind d) :type)
+                  collect (wasmdown.component:compdef-payload d))
+          'vector))
+
+(defun %import-record (comp)
+  "The COMP's first importrec."
+  (loop for d across (wasmdown.component:comp-defs comp)
+        when (eq (wasmdown.component:compdef-kind d) :import)
+          return (wasmdown.component:compdef-payload d)))
+
+(defun %link-error-of (thunk)
+  "The wasmdown:link-error THUNK signals, or NIL."
+  (block nil
+    (handler-case (progn (funcall thunk) nil)
+      (wasmdown:link-error (c) (return c)))))
+
+(defun %err-msg (c)
+  (and c (wasmdown:wasmdown-error-message c)))
+
+(defun %bag (&rest pairs)
+  "An inline-exports instance value: a name -> value hash table."
+  (let ((h (make-hash-table :test #'equal)))
+    (setf (gethash :%bag h) t)
+    (loop for (name . value) in pairs
+          do (setf (gethash name h) value))
+    h))
+
+(test component/import-binding-signature-pins
+  ;; a SHRUNK signature: the import declares (param "x" u64) and the
+  ;; provider offers (param "x" u32) — link error before the push
+  (let* ((comp (%validated
+                "(component
+                   (type $FT (func (param \"x\" u64) (result u32)))
+                   (import \"d\" (func $d (type $FT))))"))
+         (err (%link-error-of
+               (lambda ()
+                 (wasmdown.component.runtime:instantiate-component
+                  comp :with-args (list (cons "d" (%link-provider-f)))))))
+         (msg (%err-msg err)))
+    (is err)
+    (is (search "import \"d\"" msg))
+    (is (search "expected func (param u64) -> (result u32)" msg))
+    (is (search "found func (param u32) -> (result u32)" msg))
+    ;; a widened RESULT is rejected just as firmly (the whole
+    ;; signature is compared, not only the parameter widths)
+    (let* ((comp2 (%validated
+                   "(component
+                      (type $FT (func (param \"x\" u32) (result u64)))
+                      (import \"d\" (func $d (type $FT))))"))
+           (err2 (%link-error-of
+                  (lambda ()
+                    (wasmdown.component.runtime:instantiate-component
+                     comp2
+                     :with-args
+                     (list (cons "d" (%link-provider-f))))))))
+      (is (search "expected func (param u32) -> (result u64)"
+                  (%err-msg err2)))
+      (is (search "found func (param u32) -> (result u32)"
+                  (%err-msg err2))))))
+
+(test component/import-binding-sort-pins
+  ;; a value of the WRONG SORT: a type bound where the import declares
+  ;; a function
+  (let* ((comp (%validated
+                "(component (import \"d\" (func $d (result u32))))"))
+         (val (wasmdown.component:make-ct :kind :prim :payload :u32))
+         (err (%link-error-of
+               (lambda ()
+                 (wasmdown.component.runtime:instantiate-component
+                  comp :with-args (list (cons "d" val))))))
+         (msg (%err-msg err)))
+    (is err)
+    (is (search "import \"d\"" msg))
+    (is (search "expected func (param) -> (result u32)" msg))
+    (is (search "found u32" msg))))
+
+(test component/import-binding-missing-pins
+  ;; a MISSING provider: no with-arg at all is a link error (the old
+  ;; :missing hole silently bound NIL and failed later, or never)
+  (let* ((comp (%validated
+                "(component (import \"d\" (func $d (result u32))))"))
+         (err (%link-error-of
+               (lambda ()
+                 (wasmdown.component.runtime:instantiate-component comp))))
+         (msg (%err-msg err)))
+    (is err)
+    (is (search "import \"d\"" msg))
+    (is (search "expected func (param) -> (result u32)" msg))
+    (is (search "found nothing" msg))))
+
+(test component/import-binding-accepts-pins
+  ;; a CORRECT provider still instantiates; the bound import keeps the
+  ;; supplied value's IDENTITY (the check never rewrites the value)
+  (let* ((f (%link-provider-f))
+         (comp (%validated
+                "(component
+                   (type $FT (func (param \"x\" u32) (result u32)))
+                   (import \"d\" (func $d (type $FT))))"))
+         (inst (wasmdown.component.runtime:instantiate-component
+                comp :with-args (list (cons "d" f)))))
+    (is (wasmdown.component.runtime:comp-instance-p inst))
+    (is (eq f (gethash "d" (wasmdown.component.runtime::comp-instance-imports
+                            inst))))))
+
+(test component/import-binding-type-bound-pins
+  ;; a `:type' bound: the checker accepts exactly $U's type for
+  ;; (eq $U) and rejects a different one. The runtime's %EXEC-IMPORT
+  ;; deliberately does not enforce the :type sort yet (the WASI
+  ;; providers bind partial types instances), so the pin drives
+  ;; CHECK-IMPORT-BINDING directly.
+  (let* ((comp (%validated
+                "(component
+                   (type $U (record (field \"a\" u32)))
+                   (import \"t\" (type $T (eq $U))))"))
+         (types (%exec-types comp))
+         (imprec (%import-record comp))
+         (declared (wasmdown.component:compdef-payload
+                    (aref (wasmdown.component:comp-defs comp) 0)))
+         (bad (wasmdown.component:make-ct :kind :prim :payload :u32))
+         (err (%link-error-of
+               (lambda ()
+                 (wasmdown.component:check-import-binding imprec bad types))))
+         (msg (%err-msg err)))
+    (is err)
+    (is (search "import \"t\"" msg))
+    (is (search "expected (record (field \"a\" u32))" msg))
+    (is (search "found u32" msg))
+    ;; a MISSING value is refused by the checker too
+    (is (search "found nothing"
+                (%err-msg (%link-error-of
+                           (lambda ()
+                             (wasmdown.component:check-import-binding
+                              imprec nil types))))))
+    ;; the declared type itself satisfies the bound (identity returned)
+    (is (eq declared
+            (wasmdown.component:check-import-binding imprec declared
+                                                     types)))))
+
+(test component/import-binding-instance-coverage-pins
+  ;; an `:instance' import: the provider must export every declared
+  ;; name with a satisfying signature; extra exports are allowed.
+  ;; Checked through CHECK-IMPORT-BINDING directly (see the :type pin:
+  ;; %EXEC-IMPORT keeps the :instance sort unenforced until the
+  ;; provider contract records which exports are REQUIRED).
+  (let* ((comp (%validated
+                "(component
+                   (import \"i\"
+                     (instance $i (export \"f\" (func (result u32))))))"))
+         (types (%exec-types comp))
+         (imprec (%import-record comp))
+         (f (%link-provider0-f))
+         (missing (%link-error-of
+                   (lambda ()
+                     (wasmdown.component:check-import-binding
+                      imprec (%bag) types))))
+         (wrong (%link-error-of
+                 (lambda ()
+                   (wasmdown.component:check-import-binding
+                    imprec
+                    (%bag (cons "f"
+                                (wasmdown.component:make-ct
+                                 :kind :prim :payload :u32)))
+                    types))))
+         (good (%bag (cons "f" f))))
+    (is (search "import \"i\" \"f\": expected (func (param) -> (result u32)), found no export"
+                (%err-msg missing)))
+    (is (search "expected func, found u32" (%err-msg wrong)))
+    (is (eq good
+            (wasmdown.component:check-import-binding imprec good types)))))
+
 (defun run-component-pins ()
   "Run the component pins (registered via TEST; returns T)."
   (let ((wasmdown.test::*tests*
@@ -2966,7 +3183,13 @@ repo root, as a string — the pin runs a fixture row VERBATIM."
                       component/granted-park-quantum-pins
                       component/async-lower-result-two-spaces-pins
                       component/host-resource-dtor-registry-pins
-                      component/cancel-window-fire-gate-pins)))
+                      component/cancel-window-fire-gate-pins
+                      component/import-binding-signature-pins
+                      component/import-binding-sort-pins
+                      component/import-binding-missing-pins
+                      component/import-binding-accepts-pins
+                      component/import-binding-type-bound-pins
+                      component/import-binding-instance-coverage-pins)))
           wasmdown.test::*tests*)))
     (multiple-value-bind (passed failed)
         (wasmdown.test:run-all-tests)
