@@ -1,3 +1,37 @@
+# M17 SESSION 31 — THE FLAKY PIN WAS RIGHT (merge b22e668) AND THE LANE READS CLEAN AGAIN.
+# CAUSE (b), an honest residual race, named from a state dump rather than guessed: the
+# pin's row (cancel-targeted-resume.wast:613-699) ran 10/30 red with $ran == 1. The M15
+# cancel gate WAS holding (no spawn fire while *cancel-window-inst* was set). The leak was
+# AFTER subtask.cancel returned: the guest's `(call $ran)` probe is a NESTED SYNCHRONOUS
+# component call; on that route (%call-component-func-list -> %sync-thunk-run) the caller
+# waits by RELEASING the store right (%right-stall), and the outer %canon-lift-async drain
+# used that window to fire the ready spawn — which then took its first turn in the callee's
+# instance before the caller's own probe. The reference cannot produce that: §3524/
+# §3538-3543 resumes a sync callee synchronously and runs it until it returns or blocks,
+# and only then may the host switch to another ready thread of that instance.
+# FIX: comp-instance-sync-window-depth, an ATOMIC per-instance slot (no global, no lock —
+# deliberately, to avoid adding a store-right -> *SCHEDULER-MUTEX* edge on top of the
+# tick's existing order), opened by BOTH nested-sync wait routes (%sync-lift-run's
+# non-main caller branch and %sync-thunk-run, which now takes :inst = the callee
+# instance), gated at %resume-all-body's two FIRE sites exactly like the existing
+# *suppress-spawn-fire* / *cancel-window-inst* gates. ONLY the FIRE is deferred: grants to
+# already-RUNNING peers keep their slices, as the spec allows.
+# THE PIN now asserts a deterministic boundary (window open -> a real resume-all fires
+# nothing and the thunk survives; the window is per-instance; after exit the same tick
+# fires EXACTLY once and a further tick fires nothing) plus the fixture row verbatim, with
+# a NEGATIVE CONTROL (gate stubbed to NIL -> red 5/5).
+# Measured: pin alone 0/30 (was 10/30) and 0/100 with the slice; my own check 10 consecutive
+# full unit runs with ZERO pin failures; units 549/0 twice; 12-fixture superset 225/0;
+# per-file probe no hang/no FAIL; adjacent n=30 pair master mean 10.102 s / 29-of-30 green
+# vs this tree mean 10.151 s / 30-of-30 green (delta +0.049 s, Welch t=1.69 = parity);
+# and the LANE BLOCK AFTER THE MERGE: red 0/30, fail_commands 0, walls 9.97-10.47.
+# INCIDENT, recorded because it would have poisoned a measurement: a leaked
+# run-component-suite.lisp SBCL had been alive 28:52 (my own tooling, from a killed
+# parent), so the meter's quiet guard refused — correctly — until it was killed. Check
+# `pgrep -c sbcl` = 0 AND the age of any survivor before concluding a refusal is spurious.
+# REMAINING: `reentrance.wast::20`, the lane-only rare row (0/20 standalone on two trees,
+# 1/30 in-lane twice, on two different trees). It is the LAST recorded item and it needs a
+# paired window to decode; everything else in the plan is implemented, pinned and green.
 # M17 SESSION 30 — THE TWO CLOSING COMMITS, THE OBSERVED ROW, AND THE REGISTRATION CHECK.
 # 1. THE LAST LANE BLOCK READ 1/30 red, 1 fail command, on ONE row: `reentrance::20`
 #    (walls 9.96-10.53). THAT IS NOT A ZERO-COST CLAIM; the correct record is "1 fail
