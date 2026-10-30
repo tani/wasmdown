@@ -1,3 +1,40 @@
+# M17 SESSION 40 — THE STABLE SURFACE IS FULLY COVERED AND THE TRAPPING STUB IS DELETED
+# (28832dc). This closes the last plan-visible gap: "no unimplemented stable API hidden behind
+# a gate".
+# THE AUDIT (programmatic, from the parsed vendored WIT, diffed against each provider's export
+# table AND against the construction-time stub hook, sanity-checked by emptying an alist and
+# firing 4 hits): 20 import names, 89 functions/methods — DECLARED 89, EXPORTED 89,
+# WOULD-STUB 0. Per interface: clocks/types 0, monotonic-clock 4, system-clock 2, random 2,
+# insecure 2, insecure-seed 1, cli/environment 3, cli/exit 2, stdin/stdout/stderr 1 each,
+# terminal-input/-output 0 (type-only), terminal-stdin/-stdout/-stderr 1 each,
+# filesystem/types 25, filesystem/preopens 1, sockets/types 40, ip-name-lookup 1.
+# Every annotation there is @since(0.3.0) = STABLE; the ONLY @unstable names in the whole
+# vendored tree are wasi:clocks/timezone's three.
+# CLASSIFICATION: no missing-though-implemented name, no gap inside a covered interface.
+# Deliberately absent WHOLE interfaces (no provider at all, refused at composition/link rather
+# than stubbed): wasi:clocks/timezone (unstable), wasi:http/types+client+handler (removed by
+# direction), wasi:cli/run (the command world's EXPORT, served by component-run-export).
+# CHANGE: %unsupported-closure DELETED; provider-instance requires an implementation for every
+# declared function/method and a miss is a construction-time host-error naming interface +
+# function ("refusing to export a trapping stub"); the :unsupported alist marker is not an
+# escape hatch. The stub set is EMPTY, and the full table plus the absent-interface list live in
+# a `PROVIDER COMPLETENESS (M17 audit)` block in src/wasi.lisp so a stub cannot reappear as a
+# silent default.
+# Tests: wasi/provider-surface-covers-every-stable-wit-name (all 20 providers build; exports ==
+# declarations exactly, 89/89, no unstable gate, no timezone/http entry) and
+# wasi/provider-instance-refuses-unimplemented-function (missing function, :unsupported value,
+# missing [method]descriptor.* each refused by name).
+# Measured: units 555/0 twice; enumerated 12-fixture set 336/0; per-file probe `done`;
+# make test-component GATE GREEN 1631 executed 10.17 s. The adjacent n=30 pair is NOT
+# APPLICABLE and says so: the change is not lane-observable (the component runner holds no
+# WASI/provider reference and the lanes never construct a provider instance).
+# DOCS: README and PLAN rolled forward to 555 units and to the final mechanism list, so the
+# documentation matches the measured tree.
+# FINAL STATE: master 28832dc, units 555/0, one branch, working tree clean except the user's
+# .envrc. Plan steps 1-6 implemented; step 7/8 out of scope by direction; no open row, no parked
+# branch, no unresolved finding. The single standing caveat is unchanged and is not work: the
+# lane's 0-fail x 30 is window-locked, and the PINS — each with a negative control that fails
+# when its rule is re-broken — are the guarantee.
 # M17 SESSION 39 — THE REGISTRATION CHECK, DONE THE ROBUST WAY, AND WHY THE EARLIER METHOD WAS
 # FRAGILE. This is the last verification; nothing follows it.
 # METHOD NOW: for every pin name in tests/component-pins.lisp, count the `(test <name>` forms.
