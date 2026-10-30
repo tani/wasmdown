@@ -1,3 +1,50 @@
+# M17 SESSION 24 — THE PROVIDER SIDE OF STEPS 5/6 IS DONE (merge 442e0b1): bounded
+# executors and socket readiness through reactor watches. Steps 5 and 6 are now COMPLETE
+# except the named limitation below.
+# EXECUTORS: host-executor with a FIXED worker count set at construction;
+# %executor-submit never runs inline; %executor-close sets closed, DROPS queued jobs and
+# NEVER joins, so a running job finishes into a discarded result — the store can never
+# block on an un-cancellable worker. TWO separate budgets on wasi-context (dns-exec 2,
+# stdio-exec 2) so neither starves the other; close-wasi-context-executors detaches
+# both. Workers never touch guest memory and never call guest code: results travel only
+# through the store's completion queue (a pending's resolve/reject for DNS,
+# host-end-ready for stdio).
+# DNS: getaddrinfo on a DNS worker; the cancel-fn clears the job's target and returns T
+# so the store detaches and acks; %dns-job-run builds its result through
+# %getaddrinfo-chain whose unwind-protect calls freeaddrinfo, and only THEN reads the
+# target — so a detached job's chain is freed and its result discarded. A closed
+# executor rejects the pending with a host error.
+# SOCKETS: with a reactor, EAGAIN registers reactor-watch-fd keyed by
+# (fd, registration-id, direction) where registration-id is the CONNECTION/STREAM
+# IDENTITY (never the bare fd), and the arm captures the COPY GENERATION so the
+# callback's host-end-ready(end, generation) is generation-rejected when stale. A live
+# watch holds one store-work unit through a host-pending gate, so the driver keeps
+# pumping while the guest is parked; %readiness-disarm (success/EOF/error/drop/close)
+# releases it exactly once. Without a reactor %readiness-arm is a no-op and the old
+# nonblocking would-block path is verbatim.
+# Measured: units 542/0 twice (533 + 9 tests, no sleeps); probe-async-perfile prints
+# exactly `done`; the stream/future fixtures it covers are 19 rows / 0 FAIL. NOT
+# lane-observable (every new path is gated on a reactor on the context, and the CLI
+# builds reactor-free contexts), so no n=30 pair applies.
+# NAMED LIMITATION, kept explicit: the SEND-direction resume loop (peer drain ->
+# POLLOUT -> re-send) is NOT asserted — on loopback the client fd did not report
+# POLLOUT inside a bounded sleep-free window after the peer drained, so the test asserts
+# the EAGAIN park and the :write watch key/identity while the queue-resume mechanism
+# itself is covered end to end by the accept and recv tests over the same
+# host-end-ready path. Fix that test (a scripted readiness would do it) before claiming
+# send-resume coverage.
+# WHAT IS LEFT IN THE WHOLE PLAN, after this:
+#   1. Step 1's last item: the two canon-lower wrappers' positional
+#      stream/future/borrow arms. Prerequisite: put the plan's verification-set fixtures
+#      (passing-resources, drop-cross-task-borrow, cross-abi-calls, variants) into the
+#      probe set FIRST, then delete the arms and prove the generic paths carry all five
+#      cases. %abi-load's memory-path arms stay out (measured negative).
+#   2. wip/reactor-wiring's verdict — and note it is now largely SUPERSEDED: its
+#      driver-pump/context-reactor parts landed as the store driver, and its socket
+#      plumbing landed here. Whatever remains of that branch should be diffed against
+#      master before any verdict is spent on it.
+#   3. Docs: already rolled forward at 88659dd/51e8614; re-check the roadmap after the
+#      above two land.
 # M17 SESSION 23 — THE BORROW SIDE OF STEP 2 IS CLOSED (merge 851ad60): a real defect
 # found by a pin that failed first.
 # PIN 1 (component/live-borrow-blocks-task-return-pin) FAILED on master — run-live
