@@ -1,3 +1,37 @@
+# M17 SESSION 21 — THE PLAN'S ACCEPTANCE IS MET: MASTER READS 0 FAIL x 30 RUNS.
+#   batch GREEN-CHECK (merged master 07131e4, quiet box, 1631 commands per run):
+#     red_runs=0/30   fail_commands=0   walls 9.86-10.53 s
+#   units 531/0 (twice). The full component suite also reads 1631 rows / 0 fails.
+# STATEMENT OF THE CLAIM, with its limits: this is 30 consecutive runs at one window on
+# one machine. The lane has historically been bimodal on this box (master measured 18
+# and 9 and 1 fail commands in different windows earlier in this effort), so the claim
+# is "0 fail x 30 at this window", not "deterministic". The distinguishing evidence
+# that this is not luck is the ROW-BY-ROW closure: every historical residual row was
+# decoded to a named mechanism and pinned, and the pins fail deterministically when the
+# rule is re-broken:
+#   acs::1/::2      resume-later on a live thread (90715e2) + marker credit
+#   dssc::19        thread index identity + suspend park credit (90715e2)
+#   may-block::8    ] both closed by the park-credit split; proved differentially by
+#   excl-resume::2  ] re-breaking the split (7/30 and 10/30 red) then restoring it
+#   dssc::2         target-limited switch handoff (e6dcd30)
+#   reentrance::14  reserved handoff windows (*right-handoffs*, 245c13c)
+#   crcc::1         a resumer's boundary is the whole switch_to chain, not the arm (61ca832)
+#   ctr::9          unchanged row, 0 in this window (its historical band was 5-7/30)
+# WHAT REMAINS, complete list:
+#   1. The two deferred BRANCH verdicts, now measurable because the master block is 0:
+#      rerun/type-view (reapplied, pins merged, units 506/0) and wip/reactor-wiring
+#      (unresolved at n=30; next = adjacent pair at an unpinned window, then sub-element
+#      order (2)(1)(3)(4) with the n=6-era exonerations treated as UNPROVED).
+#   2. Step 5/6 leftovers that are provider-side and lane-invisible: DNS and
+#      blocking-stdio bounded executors, and socket accept/recv/send registering a
+#      reactor watch instead of reporting would-block to a caller that then waits.
+#   3. Step 1's remaining item (the two lower wrappers' positional stream/future/borrow
+#      arms) — deletion needs the plan's verification-set fixtures in the probe set
+#      first, and %abi-load's memory-path arms stay reverted (a measured negative).
+#   4. Borrow-side lifetime pins (a live borrow held across task.return must trap;
+#      borrow-in-awaitable-set) — the guest-drop pin's shape is the vector to reuse.
+#   5. Docs rollforward (README/PLAN/CONFORMANCE/ADR) to the measured state.
+# The plan's steps 7-8 (WASI HTTP) remain OUT OF SCOPE by user direction.
 # M17 SESSION 20 — reentrance::14 CLOSED (245c13c). THE LANE IS ONE ROW FROM GREEN.
 # DECODE: the in-guest check is the callback-ABI reentrance row —
 #   (local.set $packed (call $b 0)) then the low nibble must be 0 (STARTING);
