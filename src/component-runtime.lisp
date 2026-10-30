@@ -5149,6 +5149,19 @@ wrong-index probe: one transfer produced index 3)."
                                      ; ends. Cleared on every exit path of the park.
   (switch-target nil)                ; the handoff target of the switch above
                                      ; (diagnostics/the pin; identity only)
+  (switch-target-parks 0 :type (unsigned-byte 64))
+                                     ; THE SWITCH CHAIN'S TURN SAMPLE: the
+                                     ; target's PARK-COUNT at the instant the
+                                     ; arm installed the switch state. The
+                                     ; caller's own suspension is NOT the end
+                                     ; of its turn (CanonicalABI.md 469-484:
+                                     ; Thread.resume runs the switch_to chain
+                                     ; in a loop until a continuation returns
+                                     ; or blocks with NO thread to switch to),
+                                     ; so an outer resumer — the cancellation's
+                                     ; synchronous resume — must observe the
+                                     ; whole chain parked, not just this
+                                     ; caller's arm: see %SWITCH-CHAIN-ENDED-P.
   (park-count 0 :type (unsigned-byte 64))
                                      ; THE TURN-BOUNDARY COUNTER: bumped once at
                                      ; EVERY park boundary (a yield-entry, a WAITING
@@ -6041,6 +6054,48 @@ must never end a suspension."
     (when r
       (%async-thread-wake r))))
 
+(defun %switch-chain-ended-p (thread)
+  "THE OUTER RESUMER'S TURN BOUNDARY (CanonicalABI.md 469-484):
+  `Thread.resume' resumes the switch_to chain in a loop — each
+  continuation runs until it RETURNS or BLOCKS with no thread to
+  switch to — and only then returns to its caller. THREAD's own
+  suspension is therefore NOT the end of its turn: the arm records
+  SWITCH-PARKED/SWITCH-TARGET/SWITCH-TARGET-PARKS and only THEN
+  resumes the target, so a resumer that watches THREAD can catch it
+  'blocked' while the target has not taken its first turn.
+
+  True when THREAD is not in a switch, or the chain it handed
+  control to has reached its block/return: the target is gone
+  (:DONE/abandoned) or its PARK-COUNT advanced past the arm's
+  sample. A target that itself switched is followed (the nested
+  loop), stopping at the first frame that has not ended. The
+  cancel-resumed-callback-switch ::1 race was exactly the missing
+  half: the canceller read the callback's mid-switch SUSPENDED-P,
+  returned BLOCKED, and the guest's `(call $ran)' check trapped
+  before the switched-to worker's first turn. (The sample also
+  makes the caller's own park boundary — which %PARK bumps before
+  the target runs — non-authoritative, as §474-484 requires.)"
+  (let ((th thread) (seen (list thread)))
+    (loop
+      (let ((target (and th (async-thread-switch-target th))))
+        (cond
+         ((null th) (return-from %switch-chain-ended-p t))
+         ((not (async-thread-switch-parked th))
+          (return-from %switch-chain-ended-p t))
+         ((or (null target)
+              ;; a switch cycle has no deepest frame to observe; treat
+              ;; the repeated frame as the chain's end rather than spin
+              (member target seen :test #'eq)
+              (async-thread-abandoned target)
+              (eq (async-thread-spawn-thunk target) :done))
+          (return-from %switch-chain-ended-p t))
+         ((<= (async-thread-park-count target)
+              (async-thread-switch-target-parks th))
+          (return-from %switch-chain-ended-p nil))
+         (t
+          (push target seen)
+          (setf th target)))))))
+
 (defun %async-thread-post-handoff (thread)
   "M13-4 the HANDOFF post (§242-273's handler-lock release): a
 thread about to park — or exiting — hands control back to its
@@ -6783,7 +6838,13 @@ cancel-targeted-resume ::7's hold-lock; a stackful blocked task —
 ::2's stuck, cancellable=NIL; a gone implicit thread — ::1's
 exiter, ready-fn=NIL) is NOT resumed-and-waited (the wait would
 self-deadlock on a callee that cannot take its turn); it keeps the
-legacy nudge and the caller observes the unresolved state."
+legacy nudge and the caller observes the unresolved state.
+
+A mid-switch callee's TURN ends only when its WHOLE switch_to
+chain has blocked or returned (§474-484's resume loop), not at the
+arm's own suspension: the blocks arm therefore also requires
+%SWITCH-CHAIN-ENDED-P. cancel-resumed-callback-switch ::1's
+`(call $ran)' check trapped when the canceller read the arm."
   (cond
    ((eq (async-task-state task) :initial)
     (setf (async-task-state task) :pending-cancel)
@@ -6869,8 +6930,17 @@ legacy nudge and the caller observes the unresolved state."
                    (%right-acquire self)
                    (when (or (async-task-resolved-p task)
                              (> (async-task-turns task) sampled)
-                             (async-thread-suspended-p th)
-                             (async-thread-yield-parked th))
+                             ;; THE BLOCKS CASE IS THE WHOLE CHAIN'S
+                             ;; BLOCK (CanonicalABI.md 469-484): the
+                             ;; resumed callback may park MID-SWITCH;
+                             ;; its own suspension is recorded before
+                             ;; the switch target's first turn, so the
+                             ;; canceller must wait for the target to
+                             ;; park too (%SWITCH-CHAIN-ENDED-P) — the
+                             ;; ::1 race returned BLOCKED with $ran 0.
+                             (and (or (async-thread-suspended-p th)
+                                      (async-thread-yield-parked th))
+                                  (%switch-chain-ended-p th)))
                      (return))
                    ;; the RE-PARK only: the callee's own park flags
                    ;; are set at the arm's entry — the resume consumed
@@ -8740,7 +8810,12 @@ is the valtype."
                     (setf (async-thread-suspended-p ct) t))
                 (when switch-p
                   (setf (async-thread-switch-parked ct) t
-                        (async-thread-switch-target ct) resumable-target))
+                        (async-thread-switch-target ct) resumable-target
+                        ;; the chain-boundary sample: the target's park
+                        ;; count BEFORE its first turn (§474-484's
+                        ;; switch_to loop; see %SWITCH-CHAIN-ENDED-P)
+                        (async-thread-switch-target-parks ct)
+                        (async-thread-park-count resumable-target)))
                 (%block-enter ct)
                 (unwind-protect
                      (progn
