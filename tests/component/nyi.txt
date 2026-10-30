@@ -1,3 +1,30 @@
+# M17 SESSION 6d — STEP 2's DESTRUCTOR WORK: PROVIDER MIGRATION LANDED, PROVENANCE
+# STILL OPEN. Step 2 is NOT complete and must not be reported as such.
+# LANDED (78293c2): the WASI providers register their resource finalizers through
+# host-register-resource-dtor against the PROVIDER's own comp-instance — four
+# (instance, ct) pairs (filesystem/types + filesystem/preopens descriptors,
+# sockets/types tcp-socket and udp-socket; the cli terminal resources borrow their
+# fd and deliberately get no hook). *descriptor-dtor-installed* /
+# *socket-dtor-installed* and their three install-once guards are gone; grep for
+# *host-resource-dtor-table* in src/wasi.lisp is empty. Pin
+# wasi/provider-dtors-are-per-provider-instance proves the instance choice on a real
+# (command-provider ctx) graph: present on the provider, ABSENT on a fresh guest (no
+# table allocated), absent from the retired global, live on resources created
+# through the provider, independent per instance, idempotent, never leaked across
+# instances. Units 500/0, six consecutive clean runs.
+# STILL OPEN — the semantic heart of the plan item, measured not suspected: for a
+# GUEST-initiated resource.drop the dynamic and canon instances are the GUEST, so
+# neither per-instance arm reaches the provider and the finalizer does NOT run
+# (probe: fd-before 5, fd-after 5, closed-p NIL, finalizer-on-provider=T,
+# finalizer-on-guest=NIL). The ct-keyed global is what silently saves it today, and
+# the global is exactly what the plan wants gone. So the remaining work is
+# ct -> OWNING-INSTANCE provenance recorded at registration, with the drop path
+# ordered: current instance -> canon-defining instance -> ct owner -> (then the
+# global disappears). Assigned as its own runtime-only slice, because it needs a pin
+# that reproduces the guest-drop path and fails before the change.
+# NO WASI TEST COVERS THAT PATH TODAY (no fixture in the suite issues a
+# canon resource.drop), which is precisely why the suite is green with the leak
+# present — recorded so nobody reads "units green" as "lifetime closed".
 # M17 SESSION 6c — LEDGER AUDIT: THE VERDICT REVERSALS, TALLIED. Written because the
 # user's trust in this lane is the asset at stake, and because a reader who finds
 # three contradictory entries without this table will trust none of them.
