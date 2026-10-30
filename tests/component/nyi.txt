@@ -1,3 +1,27 @@
+# M17 SESSION 33 — CLOSING NOTES: THE ONE-OFFS NAMED, THE EVIDENCE DISPOSITION, AND THE
+# STANDING SENTRY RULE.
+# 1. `sync-streams.wast::1` is now a WATCH ROW: it appeared 1/30 in TWO separate blocks
+#    today (each on fresh walls, 10.00-10.42), always as a single row, never twice in a
+#    block. It is the row that was closed long ago and has re-appeared at ~1/30 twice; the
+#    next session measures it in a PAIRED window before treating it as either closed or
+#    open. Recording it by name is the point — a 0/30 block does not erase a 1/30 row.
+# 2. `reentrance::20`'s capture evidence (`tests/lane-batches/re20-capture/`, two failing
+#    jsonl + oracle dumps) is DELETED rather than kept: the mechanism is now encoded in a
+#    PIN with a negative control (component/switched-target-exit-releases-pin, red on the
+#    pre-fix tree), and the pin reproduces the case deterministically at zero cost, which
+#    is strictly better evidence than a preserved lottery-run artifact. The lane-batches
+#    directory is generated output and must not become tracked state.
+# 3. THE INCIDENTAL FINDING STAYS OPEN AND SEPARATE: per-event instrumentation exposed a
+#    pre-existing 3-thread `scheduler <-> thread <-> store-right` lock cycle (SBCL's deadlock
+#    detector). It is NOT this session's rows, is NOT fixed here, and the zero-cost
+#    oracle-only capture shape does not touch it. It is the first lead if lock order is ever
+#    revisited, and it must not be mistaken for a regression from the last four merges.
+# 4. THE STANDING SENTRY RULE (the one thing a future session must not forget): the lane's
+#    0-fail x 30 is WINDOW-LOCKED. This project measured the same tree at 0, 1, 2, 9, 18 and
+#    41 fail commands in different windows. Every row closed this session is closed by a PIN
+#    that fails when its rule is re-broken, and that — not a green block — is the guarantee.
+#    Read the pins' negative controls before doubting them, and take the paired block before
+#    believing a new row.
 # M17 SESSION 32 — THE LAST OPEN ROW IS DECODED AND CLOSED (merge 4814fd3), AND THE
 # PROJECT HAS NO UNRESOLVED ITEMS LEFT.
 # `reentrance.wast::20` was a scheduling-lottery DEADLOCK, not an ordering flake: in-lane
