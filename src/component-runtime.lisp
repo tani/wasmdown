@@ -7915,12 +7915,18 @@ drop-readable must return index 1 again)."
       (declare (ignore guest))
       (let* ((self (%driver-self))
              (*right-self* self)
-             (*right-driver* self))
+             (*right-driver* self)
+             ;; A GUEST caller's turn does NOT end at a nested
+             ;; synchronous lower's return: the caller keeps the
+             ;; store right until its own next park/exit (see the
+             ;; cleanup below).
+             (keep-right nil))
         (%right-acquire self)
         (let ((nested (and (boundp '*current-thread*) *current-thread*)))
           (%block-enter nested))
         (unwind-protect
-             (loop
+             (progn
+               (loop
                with idle-cycles = 0
                ;; STEP 4: the runner is a right PARTICIPANT with the
                ;; synthetic ticket (0) — it sorts before every guest
@@ -8008,8 +8014,28 @@ drop-readable must return index 1 again)."
                (error 'wasmdown:wasm-trap :kind :generic
                       :message
                       "deadlock detected: event loop cannot make further progress"))
+               ;; THE CALLER'S TURN CONTINUES. A GUEST caller (an
+               ;; in-core nested sync lower) resumes holding the
+               ;; right: the callee is parked or exited (the loop
+               ;; could only take the right at its park/exit), but a
+               ;; TICK fired while the caller runs must not let the
+               ;; callee's continuation (or any ancestor's leftover)
+               ;; take a turn inside the caller's turn. Releasing
+               ;; here let a granted sibling run mid-turn and, in
+               ;; sync-streams, let $C.get's continuation EXIT and
+               ;; release $C's exclusive lock before the caller's
+               ;; async lower looked at the backpressure gate — the
+               ;; pack then reported STARTED where the fixture pins
+               ;; STARTING. A DRIVER caller (the top-level invoke,
+               ;; a synthetic executor) still releases: it is
+               ;; leaving the store.
+               (setf keep-right
+                     (and (boundp '*current-thread*) *current-thread*
+                          (eq self *current-thread*)
+                          (sb-thread:holding-mutex-p *store-right*))))
           (%block-exit (and (boundp '*current-thread*) *current-thread*))
-          (%right-release-on-exit self)))
+          (unless keep-right
+            (%right-release-on-exit self))))
       (etypecase (car cell)
         ((eql t)
          (let ((r (cdr cell)))
