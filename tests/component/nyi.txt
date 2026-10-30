@@ -1,3 +1,30 @@
+# M17 SESSION 20 — reentrance::14 CLOSED (245c13c). THE LANE IS ONE ROW FROM GREEN.
+# DECODE: the in-guest check is the callback-ABI reentrance row —
+#   (local.set $packed (call $b 0)) then the low nibble must be 0 (STARTING);
+# the lower packed 2 (eager RETURNED). PROVENANCE: the async lower's STARTED-wait
+# NAMED the callee as the next ticket but did not RESERVE the window, so when the
+# callee's OS thread lost the schedule a third party took the right under
+# (null (%right-successor self)), ran a whole turn, released the instance's exclusive
+# lock, and the callee STARTED and RESOLVED inside the pack. The credit triple was
+# fine; a TURN was takeable inside a window that must belong to the target alone.
+# FIX: *right-handoffs*, an innermost-first stack of (caller . target) frames pushed
+# under the right by %right-handoff-to, popped by the caller after re-acquire, cleared
+# at %store-teardown. While a frame is on top only its caller (taking it back) and its
+# target may take; every other thread — INCLUDING an outer handoff's caller, because
+# the inner pack observation must not interleave — defers without renaming the ticket.
+# %right-yield / %right-release-on-exit name the caller as the next ticket when the top
+# target parks or exits.
+# MEASURED, quiet box, ADJACENT PAIR (master block first, nothing between):
+#   master d5d6f7d   red 8/30,  9 fails, walls 9.96-14.76 — reentrance::14 x7, crcc x2
+#   this tree        red 1/30,  1 fail,  walls 9.86-10.60 — crcc::1 ONLY
+#   reentrance::14: 5 FAIL/20 -> 10/10 PASS (and 5/5 in my own re-check)
+# Units 530/0 twice (529 + component/reentrance-14-pin). 12-fixture superset 225/0.
+# Per-file probe: no hang, no FAIL.
+# THE ONE REMAINING ROW: cancel-resumed-callback-switch::1, 4-6/30, ALSO RED ON MASTER.
+# Its sibling ::3 (the resume-later family) is 0. The next slice is the same recipe on
+# that row; after it, the lane has a real chance at the plan's 0-fail acceptance for
+# the first time, and the two deferred verdicts (rerun/type-view, wip/reactor-wiring)
+# become meaningful rather than noise-bound.
 # M17 SESSION 19 — THE FIRST CLEAN-WINDOW n=30 ON MASTER AFTER ALL THE FIXES:
 # 18 fail commands / 30 runs, and the row composition has COLLAPSED TO TWO ROWS.
 #   red_runs=17/30  fail_commands=18  walls 9.96-10.59 s (tightest band recorded)
