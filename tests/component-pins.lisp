@@ -5018,6 +5018,249 @@ instance is torn down."
         (when (and (integerp fd) (not (minusp fd)))
           (sb-unix:unix-close fd))))))
 
+;;; ---- PLAN step 1: the generic handle walkers, five cases -----------
+;;;
+;;; The two canon-lower wrappers (%LOWER-HOST-FUNC,
+;;; %CANON-LOWER-ASYNC-HOST-FUNC) carried POSITION-DEPENDENT arms for a
+;;; top-level stream/future param and a top-level borrow param. Both
+;;; arms are now judged by the probe set (the four named fixtures +
+;;; the 12-fixture stream/future superset, 295 rows):
+;;;
+;;;  - the STREAM/FUTURE arm is REDUNDANT and was DELETED: the flat
+;;;    walk's recursive %ABI-LIFT (:stream/:future -> %LIFT-ASYNC-END)
+;;;    performs the same canonical transfer from the cx's INST (the
+;;;    lowering caller), and no probe row moves without the arm.
+;;;  - the BORROW arm is a MEASURED NEGATIVE and STAYS: without it the
+;;;    async guest body resolves the caller's raw index at the CALLEE's
+;;;    own table, moving passing-resources::1 and
+;;;    drop-cross-task-borrow::2/::4/::6.
+;;;  - an INDIRECT (spilled) handle and a NESTED borrow/own are NOT
+;;;    carried: %ABI-LOAD's catch-all reads the i32 index and leaves
+;;;    the handle in the caller's table. %ABI-LOAD's memory-path
+;;;    (:stream :future) / (:own :borrow :resource) arms are a SECOND
+;;;    measured negative (they moved WASI loopback rows); do not
+;;;    re-add them to close this gap.
+;;;
+;;; The pin drives the real walkers with real handle records, and the
+;;; wrapper parts build the actual lowered host funcs (a flat stream
+;;; crossing, and the borrow lend), so a regression in the recursive
+;;; carriers or in the borrow arm goes red here as well as in the
+;;; fixtures. The ASYNC wrapper's lend arm is covered end-to-end by
+;;; drop-cross-task-borrow (the subtask's num_lends ledger is
+;;; component/borrowed-handle-not-joinable-pin's subject).
+
+(defun %pin-memory ()
+  "A fresh 1-page memory-instance (the indirect cases' linear memory)."
+  (wasmdown.runtime::%make-memory-instance
+   :bytes (make-array 65536 :element-type '(unsigned-byte 8)
+                      :initial-element 0)
+   :pages 1 :max-pages 1 :has-max-p t :i64-p nil))
+
+(defun %pin-async-end ()
+  "A fresh READABLE stream end in its IDLE state (§1598-1621)."
+  (wasmdown.component.runtime::make-async-end
+   :event-code wasmdown.component.runtime::+event-stream-read+
+   :state :idle))
+
+(test component/generic-path-five-cases-pin
+  (let* ((rt (wasmdown.component.runtime::make-ct* :resource nil))
+         (sct (wasmdown.component.runtime::make-ct* :stream :u8))
+         (h* (lambda (inst) (wasmdown.component.runtime::%inst-handles inst)))
+         (cx-of (lambda (inst &optional mem)
+                  (wasmdown.component.runtime::make-abi-cx
+                   :inst inst :type-inst inst :memory mem))))
+    ;; CASE 1 — a stream<u8> in a FLAT position: the recursive lift
+    ;; moves the READABLE end OUT of the caller's table (§2438, the
+    ;; end LEAVES), clears its owner, and yields the END record.
+    (let* ((guest (wasmdown.component.runtime:make-comp-instance))
+           (cx (funcall cx-of guest))
+           (end (%pin-async-end))
+           (idx (wasmdown.component.runtime::%handle-add-any guest end))
+           (vi (make-array 4 :fill-pointer 0 :adjustable t)))
+      (vector-push-extend (cons idx :i32) vi)
+      (is (eq end
+              (first (wasmdown.component.runtime::%abi-lift-values
+                      cx 16 vi (list sct)))))
+      (is (null (aref (funcall h* guest) (1- idx))))
+      (is (null (wasmdown.component.runtime::async-end-owner end))))
+    ;; CASE 1b — the SAME flat stream through the REAL sync wrapper,
+    ;; now that the wrapper's stream/future arm is GONE: the generic
+    ;; walk consumes the caller's slot and the host callee receives the
+    ;; END record (not its index).
+    (let* ((callee (wasmdown.component.runtime:make-comp-instance))
+           (caller (wasmdown.component.runtime:make-comp-instance))
+           (ft (wasmdown.component.runtime::make-ct*
+                :func (list (list (cons "s" sct))
+                            (wasmdown.component.runtime::make-ct*
+                             :prim :u32))))
+           (end (%pin-async-end))
+           (seen nil))
+      (wasmdown.component.runtime::%push-func
+       caller
+       (wasmdown.component.runtime:make-lifted-func
+        :type ft :inst callee
+        :host (lambda (args) (setf seen (copy-list args)) 7)))
+      (let* ((idx (wasmdown.component.runtime::%handle-add-any
+                   caller end))
+             (wrap (wasmdown.component.runtime::%lower-host-func
+                    caller 0 nil)))
+        (is (equal '(7) (wasmdown.runtime:wasm-call wrap idx)))
+        (is (eq end (first seen)))
+        (is (null (aref (funcall h* caller) (1- idx))))
+        (is (null (wasmdown.component.runtime::async-end-owner end)))))
+    ;; CASE 2 — the SAME stream INDIRECTLY (a spilled tuple in the
+    ;; caller's memory): %ABI-LOAD's catch-all reads the i32 and the
+    ;; end STAYS in the caller's table. This is the frozen-%abi-load
+    ;; measured negative: the deletion of the flat arm does not change
+    ;; this path, and its handle arms must not come back.
+    (let* ((guest (wasmdown.component.runtime:make-comp-instance))
+           (mem (%pin-memory))
+           (cx (funcall cx-of guest mem))
+           (end (%pin-async-end))
+           (idx (wasmdown.component.runtime::%handle-add-any guest end))
+           (bytes (wasmdown.runtime:memory-instance-bytes mem)))
+      (loop for k below 4
+            do (setf (aref bytes k)
+                     (ldb (byte 8 (* 8 k)) idx)))
+      (is (eql idx
+               (wasmdown.component.runtime::%abi-load cx sct 0)))
+      (is (eq end (aref (funcall h* guest) (1- idx)))))
+    ;; CASE 3a — a RECORD carrying a stream, an own and a borrow in a
+    ;; FLAT position: the recursion transfers the STREAM field and
+    ;; leaves the own/borrow i32 slots as raw indexes (the wrapper's
+    ;; top-level borrow arm and lifted-func-call's own transfer are the
+    ;; only places those move; neither is a valtype-recursion arm).
+    (let* ((guest (wasmdown.component.runtime:make-comp-instance))
+           (cx (funcall cx-of guest))
+           (uct (wasmdown.component.runtime::make-ct* :own 0))
+           (bct (wasmdown.component.runtime::make-ct* :borrow 0))
+           (rec (wasmdown.component.runtime::make-ct*
+                 :record (vector (cons "s" sct) (cons "o" uct)
+                                 (cons "b" bct)
+                                 (cons "n"
+                                       (wasmdown.component.runtime::make-ct*
+                                        :prim :u32)))))
+           (end (%pin-async-end))
+           (idx (wasmdown.component.runtime::%handle-add-any guest end))
+           ;; %ABI-LIFT-VALUES reverses the scratch, so the pairs are in
+           ;; FLAT order here: the first field is the first pair
+           (vi (vector (cons idx :i32) (cons 9 :i32)
+                       (cons 8 :i32) (cons 5 :i32)))
+           (v (first (wasmdown.component.runtime::%abi-lift-values
+                      cx 16 vi (list rec)))))
+      (flet ((fld (label)
+               (cdr (assoc label v :test #'string=))))
+        (is (eq end (fld "s")))
+        (is (= 9 (fld "o")))            ; raw index, no transfer
+        (is (= 8 (fld "b")))            ; raw index, no lend
+        (is (= 5 (fld "n")))))
+    ;; CASE 3b — a fixed list<stream> lowers INSIDE a result: the
+    ;; recursive lower adds the end to the lowering caller's table and
+    ;; the flat result is (discriminant 0=ok, the new index).
+    (let* ((guest (wasmdown.component.runtime:make-comp-instance))
+           (cx (funcall cx-of guest))
+           (lct (wasmdown.component.runtime::make-ct* :list (cons sct 1)))
+           (rct (wasmdown.component.runtime::make-ct*
+                 :result (cons lct
+                               (wasmdown.component.runtime::make-ct*
+                                :prim :u32))))
+           (end (%pin-async-end))
+           (n0 (length (funcall h* guest)))
+           (flat (wasmdown.component.runtime::%abi-lower
+                  cx (cons :ok (list end)) rct)))
+      (is (equal '(0) (subseq flat 0 1)))
+      (is (= (1+ n0) (length (funcall h* guest))))
+      (is (eq end (aref (funcall h* guest) (1- (second flat))))))
+    ;; CASE 4 — the err tag: the `(:err ...)' domain maps to the
+    ;; "error" CASE 1 of result's two cases (flat), and the stored
+    ;; discriminant byte is 1 with the payload at the join-aligned
+    ;; offset (the HTTP-style authority alternates).
+    (let* ((guest (wasmdown.component.runtime:make-comp-instance))
+           (rct (wasmdown.component.runtime::make-ct*
+                 :result (cons (wasmdown.component.runtime::make-ct*
+                                :prim :u32)
+                               (wasmdown.component.runtime::make-ct*
+                                :prim :u32))))
+           (cx (funcall cx-of guest)))
+      (is (equal '(1 7) (wasmdown.component.runtime::%abi-lower
+                         cx (cons :err 7) rct)))
+      (is (equal '(0 3) (wasmdown.component.runtime::%abi-lower
+                         cx (cons :ok 3) rct)))
+      (let* ((mem (%pin-memory))
+             (scx (funcall cx-of guest mem)))
+        (wasmdown.component.runtime::%abi-store
+         scx (cons :err 7) rct 16)
+        (is (= 1 (wasmdown.component.runtime::%abi-load-int scx 16 1)))
+        (is (= 7 (wasmdown.component.runtime::%abi-load-int scx 20 4)))))
+    ;; CASE 5 — an own handle in a COMPOUND result: lowering the
+    ;; abstract (:own-handle rt rep) adds EXACTLY ONE handle to the
+    ;; lowering caller's table (the free list is not consulted for a
+    ;; resource, so the slot is the fresh append).
+    (let* ((guest (wasmdown.component.runtime:make-comp-instance))
+           (cx (funcall cx-of guest))
+           (ct (wasmdown.component.runtime::make-ct*
+                :list (cons (wasmdown.component.runtime::make-ct*
+                             :own 0)
+                            1)))
+           (n0 (length (funcall h* guest)))
+           (flat (wasmdown.component.runtime::%abi-lower
+                  cx (list (list :own-handle rt 42)) ct))
+           (h (wasmdown.component.runtime::%handle-resource-at
+               guest (first flat) rt)))
+      (is (= 1 (length flat)))
+      (is (= (1+ n0) (length (funcall h* guest))))
+      (is (wasmdown.component.runtime::resource-handle-own-p h))
+      (is (eql 42 (wasmdown.component.runtime::resource-handle-rep h))))
+    ;; CASE 3c/B — the REAL sync wrapper of a (borrow $R) param whose
+    ;; callee is ASYNC-TYPED and NOT the implementor: the arm lends
+    ;; into a fresh borrow handle (a HOST callee's lend goes to the
+    ;; dynamic caller's table) and the callee receives THAT index, not
+    ;; the caller's raw source index. Delete the arm and the closure
+    ;; sees the source index (passing-resources::1's 55-from-5).
+    (let ((store wasmdown.component.runtime::*ct-defining-inst*))
+      (let* ((callee (wasmdown.component.runtime:make-comp-instance))
+             (caller (wasmdown.component.runtime:make-comp-instance))
+             (bct (wasmdown.component.runtime::make-ct* :borrow 0))
+             (ft (wasmdown.component.runtime::make-ct*
+                  :func (list (list (cons "self" bct))
+                              (wasmdown.component.runtime::make-ct*
+                               :prim :u32)
+                              t)))
+             (seen nil))
+        (wasmdown.component.runtime::%push-type callee rt)
+        (unwind-protect
+             (progn
+               ;; the resource ct was ALIAS-PROJECTED into the callee
+               ;; (§2834's same-implementor shortcut must NOT apply)
+               (setf (gethash (cons callee 0) store) :pin-source)
+               (wasmdown.component.runtime::%push-func
+                caller
+                (wasmdown.component.runtime:make-lifted-func
+                 :type ft :inst callee
+                 :host (lambda (args)
+                         (setf seen (copy-list args))
+                         7)))
+               (let* ((src (wasmdown.component.runtime::%handle-add
+                            caller rt 42 t))
+                      (wrap (wasmdown.component.runtime::%lower-host-func
+                             caller 0 nil))
+                      (out (wasmdown.runtime:wasm-call wrap src))
+                      (bi (first seen))
+                      (h (wasmdown.component.runtime::%handle-resource-at
+                          caller bi rt)))
+                 (is (equal '(7) out))
+                 ;; the callee got a NEW index; the source index is
+                 ;; untouched and still OWNS the resource
+                 (is (= 2 bi))
+                 (is (not (wasmdown.component.runtime::resource-handle-own-p
+                           h)))
+                 (is (eql 42
+                          (wasmdown.component.runtime::resource-handle-rep h)))
+                 (is (wasmdown.component.runtime::resource-handle-own-p
+                      (wasmdown.component.runtime::%handle-resource-at
+                       caller src rt)))))
+          (remhash (cons callee 0) store))))))
+
 (defun run-component-pins ()
   "Run the component pins (registered via TEST; returns T)."
   (let ((wasmdown.test::*tests*
@@ -5109,6 +5352,7 @@ instance is torn down."
                       component/switch-caller-is-not-grantable-pin
                       component/crcc-1-pin
                       component/live-borrow-blocks-task-return-pin
+                      component/generic-path-five-cases-pin
                       component/borrowed-handle-not-joinable-pin)))
           wasmdown.test::*tests*)))
     (multiple-value-bind (passed failed)
