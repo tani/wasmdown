@@ -16,6 +16,15 @@
   (apply #'wasmdown.component.runtime:lifted-func-call
          (provider-fn instance name) args))
 
+(defun rt (name)
+  "The runtime's internal function/accessor NAME (the host-end
+machinery is deliberately not part of the public surface)."
+  (or (find-symbol name (find-package '#:wasmdown.component.runtime))
+      (error "no runtime symbol ~a" name)))
+
+(defmacro rtcall (name &rest args)
+  `(funcall (rt ,(string name)) ,@args))
+
 ;;; ---------------------------------------------------------------
 ;;; wasi:random -- OS entropy only.
 
@@ -143,13 +152,21 @@
                            (cdr (assoc "wasi:clocks/types@0.3.2" provider
                                        :test #'string=)))))
             :type))
-    ;; a declared-but-unsupported function is exported and traps with
-    ;; host-error when called
+    ;; the async waits are supported, but need the context's reactor:
+    ;; without one they report the missing capability (never a busy
+    ;; wait, never a silent success)
     (is (block nil
           (handler-case
               (progn (call-provider mono "wait-until" 0) :returned)
             (wasmdown:host-error (c)
-              (search "not implemented" (wasmdown:wasmdown-error-message c))))))
+              (search "no reactor capability"
+                      (wasmdown:wasmdown-error-message c))))))
+    (is (block nil
+          (handler-case
+              (progn (call-provider mono "wait-for" 0) :returned)
+            (wasmdown:host-error (c)
+              (search "no reactor capability"
+                      (wasmdown:wasmdown-error-message c))))))
     ;; direct host calls return the WIT domain values
     (is (integerp (call-provider mono "now")))
     (is (= 1 (call-provider mono "get-resolution")))
@@ -207,18 +224,175 @@
           (is (<= a b)))
         (is (plusp (wasmdown.component.runtime:lifted-func-call res-fn)))))))
 
+;;; ---------------------------------------------------------------
+;;; The ASYNC clock waits: wait-until/wait-for answer with a
+;;; HOST-PENDING armed ONCE on the context's reactor. Every test
+;;; injects a fake clock, so nothing here sleeps or polls in a loop.
+
+(defun clock-pending-call (instance name &rest args)
+  "Call an async clock provider's DOMAIN closure (not the joined
+lifted call), so the test can drive the pending and the reactor
+itself."
+  (funcall (wasmdown.component.runtime:lifted-func-host
+            (provider-fn instance name))
+           args))
+
+(defun clock-deadline-count (reactor)
+  "The reactor's live deadline registrations: the pending count the
+wait tests assert against."
+  (length (wasmdown.wasi::wasi-reactor-deadlines reactor)))
+
+(defun clock-continuation (pending)
+  "Attach the pending's completion continuation, recording the
+delivered OUTCOME in the returned cons's CDR (:UNSET until then)."
+  (let ((seen (cons :unset :unset)))
+    (rtcall "%HOST-PENDING-SET-CONTINUATION"
+            pending (lambda (outcome) (setf (cdr seen) outcome)))
+    seen))
+
+(test wasi/clock-pending-future
+  ;; a future deadline resolves through the reactor STEP and the store's
+  ;; pump: the provider thread never sits in a bounded-step loop
+  (let* ((now 1000)
+         (reactor (reactor-fake (lambda () now) nil))
+         (mono (wasmdown.wasi:monotonic-clock-instance :reactor reactor))
+         (pending (clock-pending-call mono "wait-until" 5000))
+         (seen (clock-continuation pending)))
+    (unwind-protect
+         (progn
+           ;; the call PARKED: the timer is the one-shot registration
+           (is (eq :waiting (rtcall "HOST-PENDING-STATE" pending)))
+           (is (not (rtcall "HOST-PENDING-TERMINAL-P" pending)))
+           (is (= 1 (clock-deadline-count reactor)))
+           ;; a step before the deadline neither fires nor resolves
+           (multiple-value-bind (progress reactor-pending)
+               (wasmdown.wasi:reactor-step reactor 0)
+             (is (not progress))
+             (is reactor-pending))
+           (is (not (rtcall "HOST-PENDING-TERMINAL-P" pending)))
+           (is (eq :unset (cdr seen)))
+           ;; the deadline arrives: the reactor fires the ONE-SHOT timer
+           (setf now 5000)
+           (multiple-value-bind (progress reactor-pending)
+               (wasmdown.wasi:reactor-step reactor 0)
+             (is progress)
+             (is (not reactor-pending)))
+           (is (eq :resolved (rtcall "HOST-PENDING-STATE" pending)))
+           ;; a resolved wait leaves NO timer registered
+           (is (= 0 (clock-deadline-count reactor)))
+           ;; ... and the continuation has not run: delivery belongs to
+           ;; the pump, never to the reactor callback
+           (is (eq :unset (cdr seen)))
+           (rtcall "%HOST-PUMP")
+           (is (equal '(:resolve) (cdr seen))))
+      (wasmdown.wasi:reactor-close reactor))))
+
+(test wasi/clock-pending-future-wait-for
+  ;; wait-for computes NOW + HOW-LONG on the reactor's clock and arms
+  ;; the same one-shot deadline
+  (let* ((now 7000)
+         (reactor (reactor-fake (lambda () now) nil))
+         (mono (wasmdown.wasi:monotonic-clock-instance :reactor reactor))
+         (pending (clock-pending-call mono "wait-for" 3000))
+         (seen (clock-continuation pending)))
+    (unwind-protect
+         (progn
+           (is (eq :waiting (rtcall "HOST-PENDING-STATE" pending)))
+           (is (= 10000
+                  (wasmdown.wasi::reactor-registration-deadline
+                   (first (wasmdown.wasi::wasi-reactor-deadlines reactor)))))
+           (setf now 9999)
+           (multiple-value-bind (progress)
+               (wasmdown.wasi:reactor-step reactor 0)
+             (is (not progress)))
+           (is (eq :waiting (rtcall "HOST-PENDING-STATE" pending)))
+           (setf now 10000)
+           (multiple-value-bind (progress)
+               (wasmdown.wasi:reactor-step reactor 0)
+             (is progress))
+           (is (eq :resolved (rtcall "HOST-PENDING-STATE" pending)))
+           (is (= 0 (clock-deadline-count reactor)))
+           (rtcall "%HOST-PUMP")
+           (is (equal '(:resolve) (cdr seen))))
+      (wasmdown.wasi:reactor-close reactor))))
+
+(test wasi/clock-pending-immediate
+  ;; a past or zero deadline resolves IMMEDIATELY with NO timer
+  ;; registered — the call still has the pending's shape
+  (let* ((now 1000)
+         (reactor (reactor-fake (lambda () now) nil))
+         (mono (wasmdown.wasi:monotonic-clock-instance :reactor reactor)))
+    (unwind-protect
+         (dolist (case (list (cons "wait-until" 1000)
+                             (cons "wait-until" 999)
+                             (cons "wait-for" 0)))
+           (let* ((pending (clock-pending-call mono (car case) (cdr case)))
+                  (seen (clock-continuation pending)))
+             (is (eq :resolved (rtcall "HOST-PENDING-STATE" pending)))
+             (is (equal '(:resolve)
+                        (rtcall "HOST-PENDING-OUTCOME" pending)))
+             ;; the immediate path never touches the reactor
+             (is (= 0 (clock-deadline-count reactor)))
+             (rtcall "%HOST-PUMP")
+             (is (equal '(:resolve) (cdr seen)))))
+      (wasmdown.wasi:reactor-close reactor))))
+
+(test wasi/clock-pending-overflow
+  ;; NOW + HOW-LONG is checked against the u64 mark space: overflow
+  ;; TRAPS, it never wraps into an immediate (or bogus) wait
+  (let* ((now (- #xffffffffffffffff 5))
+         (reactor (reactor-fake (lambda () now) nil))
+         (mono (wasmdown.wasi:monotonic-clock-instance :reactor reactor)))
+    (unwind-protect
+         (progn
+           ;; exactly representable: the deadline IS u64-max, no trap
+           (let ((pending (clock-pending-call mono "wait-for" 5)))
+             (is (eq :waiting (rtcall "HOST-PENDING-STATE" pending)))
+             (is (= #xffffffffffffffff
+                    (wasmdown.wasi::reactor-registration-deadline
+                     (first (wasmdown.wasi::wasi-reactor-deadlines reactor)))))
+             (rtcall "%HOST-PENDING-REQUEST-CANCEL" pending)
+             (rtcall "%HOST-PUMP")
+             (is (= 0 (clock-deadline-count reactor))))
+           ;; one nanosecond past the mark space traps (no wrap)
+           (assert-trap :generic (clock-pending-call mono "wait-for" 6))
+           (is (= 0 (clock-deadline-count reactor))))
+      (wasmdown.wasi:reactor-close reactor))))
+
+(test wasi/clock-pending-cancel
+  ;; cancel removes the one-shot timer EXACTLY once; the cancelled wait
+  ;; can never resolve afterwards
+  (let* ((now 1000)
+         (reactor (reactor-fake (lambda () now) nil))
+         (mono (wasmdown.wasi:monotonic-clock-instance :reactor reactor))
+         (pending (clock-pending-call mono "wait-for" 5000))
+         (seen (clock-continuation pending)))
+    (unwind-protect
+         (progn
+           (is (= 1 (clock-deadline-count reactor)))
+           ;; the runtime's cancel path is QUEUED, then run on the pump
+           (rtcall "%HOST-PENDING-REQUEST-CANCEL" pending)
+           (is (eq :waiting (rtcall "HOST-PENDING-STATE" pending)))
+           (rtcall "%HOST-PUMP")
+           (is (eq :cancelled (rtcall "HOST-PENDING-STATE" pending)))
+           (is (equal '(:cancel)
+                      (rtcall "HOST-PENDING-OUTCOME" pending)))
+           ;; the timer is GONE: the cancel reached the reactor once
+           (is (= 0 (clock-deadline-count reactor)))
+           ;; a deadline that passes later cannot resurrect it
+           (setf now 9000)
+           (multiple-value-bind (progress reactor-pending)
+               (wasmdown.wasi:reactor-step reactor 0)
+             (is (not progress))
+             (is (not reactor-pending)))
+           (rtcall "%HOST-PUMP")
+           (is (eq :cancelled (rtcall "HOST-PENDING-STATE" pending)))
+           (is (equal '(:cancel) (cdr seen))))
+      (wasmdown.wasi:reactor-close reactor))))
+
 ;;; ===============================================================
 ;;; M16 SLICE 2 — THE HOST STREAM/FUTURE ABI + wasi:cli stdio.
 ;;; ===============================================================
-
-(defun rt (name)
-  "The runtime's internal function/accessor NAME (the host-end
-machinery is deliberately not part of the public surface)."
-  (or (find-symbol name (find-package '#:wasmdown.component.runtime))
-      (error "no runtime symbol ~a" name)))
-
-(defmacro rtcall (name &rest args)
-  `(funcall (rt ,(string name)) ,@args))
 
 (defparameter *u8-ct*
   (wasmdown.component:make-ct :kind :prim :payload :u8))
