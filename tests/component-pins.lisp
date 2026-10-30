@@ -3877,6 +3877,183 @@ waits unbounded)."
         (wasmdown.component.runtime::%task-exit-implicit-thread
          (wasmdown.component.runtime::async-thread-task p))))))
 
+(test component/premature-park-release-pin
+  ;; THE SUSPEND PARK IS RELEASED BY A RESUME, NEVER BY A SCHEDULER
+  ;; HANDOFF (§407: a SUSPENDED thread has `ready_func` None; §433-440:
+  ;; it is absent from `Store.waiting`, so §936's tick cannot pick it;
+  ;; §494: `Thread.suspend` is `block()` with NO readiness function).
+  ;; The two during-sync rows are the guest's own assertions of the two
+  ;; consequences, and they are QUOTED here because the guest's check,
+  ;; not the harness, specifies the observable state (the suite lane
+  ;; names them ::2 and ::8, the indices below):
+  ;;
+  ;;  during-sync-call-exclusive-resume.wast ::2, after the sync
+  ;;  thread's `thread.suspend`:
+  ;;      (if (i32.eqz (global.get $pinged)) (then unreachable))
+  ;;  $pinged is set ONLY by the parked event-loop thread's callback,
+  ;;  so a return from that park before the callback ran (and its
+  ;;  `resume-later` marked this thread READY, §458-465) is the defect:
+  ;;  the sync call observed a resume that never happened.
+  ;;
+  ;;  during-sync-call-may-block-if-other-ready-threads.wast ::8, after
+  ;;  the sync thread's `thread.suspend`:
+  ;;      (if (i32.eqz (global.get $worker-ran)) (then unreachable))
+  ;;  $worker-ran is set by the mini-scheduler's ONLY way back (the
+  ;;  worker chain T1-exit -> T3 -> resume-later(T2), §3538-3543), so a
+  ;;  park that returns first again observed an uncaused release.
+  ;;
+  ;; The pre-fix shape released a suspend park on any `wake-count`
+  ;; (the §242-273 right handoff and the tick's nudge), so both rows
+  ;; measured red on a re-broken build (30 standalone runs:
+  ;; exclusive-resume::2 7/30, may-block::8 10/30, each with the
+  ;; in-guest `unreachable` above and the trace line
+  ;; `suspend park RELEASED ... by NUDGE ... wake=1 resume=0');
+  ;; the clean tree measures 0/10 standalone each and 0/30 lane runs.
+  ;; (1) pins the MECHANISM deterministically; (2) and (3) run the
+  ;; fixture rows VERBATIM.
+  (%pin-with-store
+    (let* ((inst (%pin-inst))
+           (sync (%pin-thread inst 1 '(1)))
+           (peer (%pin-thread inst 2 '(1 0))))
+      (%pin-register inst sync)
+      (%pin-register inst peer)
+      ;; the non-async-typed call's implicit thread parks in suspend
+      (let ((h (%pin-start-park sync)))
+        (%pin-wait-parked sync)
+        ;; the same-instance peer is the event loop's READY thread
+        ;; (§523 `yield_` = wait_until(lambda: True)); a plain nudge
+        ;; and any number of ticks must leave the suspension parked
+        (setf (wasmdown.component.runtime::async-thread-yield-parked peer) t)
+        (wasmdown.component.runtime::%async-thread-wake sync)
+        (wasmdown.component.runtime::async-thread-resume-all)
+        (sleep 0.05)
+        (is (null (car (getf h :done))))
+        (is (wasmdown.component.runtime::async-thread-suspended-p sync))
+        ;; THE PEER'S WORK: its callback runs and resume-laters the
+        ;; sync thread (§458-465 start_waiting(ready = True)) — a MARK,
+        ;; delivered as the §242-273 handoff slot, not an inline wake
+        (%pin-resume-later inst peer 1)
+        (is (wasmdown.component.runtime::async-thread-ready-p sync))
+        (is (zerop (wasmdown.component.runtime::async-thread-resume-count
+                    sync)))
+        (sleep 0.05)
+        (is (null (car (getf h :done))))
+        (is (wasmdown.component.runtime::async-thread-suspended-p sync))
+        ;; the tick's READY-GRANT is the marker's delivery (§932): it
+        ;; resumes the thread exactly once, and the park is spent
+        (wasmdown.component.runtime::async-thread-resume-all)
+        (is (%pin-join (getf h :thread)))
+        (is (null (car (getf h :err))))
+        (is (not (wasmdown.component.runtime::async-thread-suspended-p sync)))
+        (is (%pin-clean-p sync)))))
+  ;; THE EXCLUSIVE LOCK'S RELEASE WINDOW IS THE SPEC'S, NOT THE PARK'S
+  ;; (§3495-3508: the CALLBACK event loop releases
+  ;; `ComponentInstance.exclusive_thread` before ITS OWN `YIELD`/`WAIT`
+  ;; arms block, "to allow other needs_exclusive tasks to execute in
+  ;; the interim"; a synchronously-lifted task "only release[s] the
+  ;; exclusive_thread lock after they've returned"). A holder that
+  ;; parks inside its own turn keeps the lock, and a same-instance
+  ;; `needs_exclusive` peer stays at `Task.enter_implicit_thread`'s
+  ;; backpressure gate (§681, the §669-672 residual rule) — the park
+  ;; that the spec keeps out of the window admits nobody.
+  (%pin-with-store
+    (let* ((inst (%pin-inst))
+           (ft (wasmdown.component:make-ct
+                :kind :func
+                :payload (list (make-array 0) nil t))) ; async-typed
+           (holder-task (wasmdown.component.runtime::make-async-task
+                         :ft ft :opts '((:async) (:callback))
+                         :inst inst :seq '(1)))
+           (holder (wasmdown.component.runtime::make-async-thread
+                    :task holder-task)))
+      (setf (wasmdown.component.runtime::async-task-implicit-thread
+             holder-task)
+            holder)
+      (is (wasmdown.component.runtime::%task-enter-implicit-thread
+           holder-task))
+      (is (eq holder
+              (wasmdown.component.runtime::%inst-exclusive-thread inst)))
+      (let ((h (%pin-start-park holder)))
+        (%pin-wait-parked holder)
+        ;; the holder's park has NOT released the exclusive lock
+        (is (eq holder
+                (wasmdown.component.runtime::%inst-exclusive-thread inst)))
+        ;; a same-instance needs_exclusive peer waits at the gate: it
+        ;; is registered nowhere and holds no index
+        (let* ((peer-task (wasmdown.component.runtime::make-async-task
+                           :ft ft :opts '((:async) (:callback))
+                           :inst inst :seq '(1 0)))
+               (peer (wasmdown.component.runtime::make-async-thread
+                      :task peer-task))
+               (started (list nil))
+               (registry wasmdown.component.runtime::*scheduler-threads*)
+               (gate nil))
+          (setf (wasmdown.component.runtime::async-task-implicit-thread
+                 peer-task)
+                peer)
+          (setf gate
+                (sb-thread:make-thread
+                  (lambda ()
+                    (let ((wasmdown.component.runtime::*current-thread* peer)
+                          (wasmdown.component.runtime::*current-task*
+                            peer-task)
+                          (wasmdown.component.runtime::*right-self* peer)
+                          (wasmdown.component.runtime::*right-ticket* nil)
+                          (wasmdown.component.runtime::*scheduler-threads*
+                            registry))
+                      (unwind-protect
+                           (setf (car started)
+                                 (wasmdown.component.runtime::
+                                  %task-enter-implicit-thread peer-task))
+                        (wasmdown.component.runtime::%right-release-on-exit
+                         peer))))
+                  :name "pin-gate"))
+          (%pin-wait-for
+           (lambda ()
+             (plusp (getf (wasmdown.component.runtime::%inst-async-fields
+                           inst)
+                          :num-waiting-to-enter)))
+           :what "the needs_exclusive peer at the gate")
+          (is (null (wasmdown.component.runtime::async-thread-index peer)))
+          (is (eq holder
+                  (wasmdown.component.runtime::%inst-exclusive-thread inst)))
+          ;; the holder's turn ends: the resume returns its park, and
+          ;; only the EXIT releases the lock (§3495) and re-tests the
+          ;; gate
+          (wasmdown.component.runtime::async-thread-resume holder)
+          (is (%pin-join (getf h :thread)))
+          (is (eq holder
+                  (wasmdown.component.runtime::%inst-exclusive-thread inst)))
+          (wasmdown.component.runtime::%task-exit-implicit-thread
+           holder-task)
+          (is (null (wasmdown.component.runtime::%inst-exclusive-thread
+                     inst)))
+          ;; the gate's park is a WAITING park (§681's wait-until): a
+          ;; nudge re-tests it — the production resume-all reaches the
+          ;; real store's registry; this pin's gate thread owns its
+          ;; registry, so the wake is posted directly
+          (wasmdown.component.runtime::%async-thread-wake peer)
+          (is (%pin-join gate))
+          (is (eq t (car started)))
+          (is (numberp
+               (wasmdown.component.runtime::async-thread-index peer)))
+          (wasmdown.component.runtime::%task-exit-implicit-thread
+           peer-task)))))
+  ;; the rows VERBATIM (the guest's own checks are the oracle)
+  (is (%pin-rows-pass-p
+       (%pin-slice "tests/component/async/during-sync-call-exclusive-resume.wast"
+                   9 60)
+       "premature-park-exclusive-resume.wast"))
+  (is (%pin-rows-pass-p
+       (%pin-slice "tests/component/async/during-sync-call-exclusive-resume.wast"
+                   65 103)
+       "premature-park-exclusive-trap.wast"))
+  (is (%pin-rows-pass-p
+       (%pin-slice
+        "tests/component/async/during-sync-call-may-block-if-other-ready-threads.wast"
+        136 207)
+       "premature-park-may-block.wast")))
+
 (defun run-component-pins ()
   "Run the component pins (registered via TEST; returns T)."
   (let ((wasmdown.test::*tests*
@@ -3962,7 +4139,8 @@ waits unbounded)."
                       component/two-providers-drop-own-finalizers-pin
                       component/resume-later-marker-lifetime-pin
                       component/explicit-resume-requires-parked-peer-pin
-                      component/thread-index-identity-pin)))
+                      component/thread-index-identity-pin
+                      component/premature-park-release-pin)))
           wasmdown.test::*tests*)))
     (multiple-value-bind (passed failed)
         (wasmdown.test:run-all-tests)
