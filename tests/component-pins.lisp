@@ -3343,6 +3343,390 @@ they use no type aliases or type imports)."
       (wasmdown.wasi:close-wasi-preopen pre1)
       (wasmdown.wasi:close-wasi-preopen pre2))))
 
+;;; ---- the resume-later mark's LIFETIME, and the explicit-resume
+;;; ---- builtins' "suspended" predicate (CanonicalABI.md 458-465,
+;;; ---- 494, 4688/4714)
+;;;
+;;; The resume-later mark (§458-465 `start_waiting(ready = True)`) is a
+;;; ONE-PARK credit: it may wake exactly the park that follows the
+;;; post, and it must never outlive the thread it was posted to — a
+;;; Thread record may be handed to a later task at the same slot
+;;; (§391-407: the threads table is per instance and §705 reassigns
+;;; the next index). The pins below drive the REAL canon builtins
+;;; (`%builtin-async-host-func`, the production host funcs) and the
+;;; REAL park/tick primitives (`async-thread-suspend`,
+;;; `async-thread-resume-all`) over real `async-thread` records, with
+;;; a private scheduler registry: every assertion is a state or delta
+;;; check on the record, so no sleep is used as an oracle. Every wait
+;;; is bounded (the runtime's own park slice bounds the park itself;
+;;; the joins below carry explicit timeouts).
+
+(defmacro %pin-with-store (&body body)
+  "Run BODY against a PRIVATE scheduler registry and right ticket, so
+the pin neither sees nor leaves the fixtures' threads. On unwind,
+abandon + unblock whatever the pin registered (the park sites check
+the abandoned mark at their loop top and exit)."
+  `(let ((wasmdown.component.runtime::*scheduler-threads* nil)
+         (wasmdown.component.runtime::*right-ticket* nil)
+         (wasmdown.component.runtime::*right-owner* nil)
+         (wasmdown.component.runtime::*right-self* nil)
+         (wasmdown.component.runtime::*current-thread* nil)
+         (wasmdown.component.runtime::*current-task* nil))
+     (unwind-protect
+          (progn ,@body)
+       (dolist (th wasmdown.component.runtime::*scheduler-threads*)
+         (setf (wasmdown.component.runtime::async-thread-abandoned th) t
+               (wasmdown.component.runtime::async-thread-suspended-p th) nil
+               (wasmdown.component.runtime::async-thread-yield-parked th) nil)
+         (sb-thread:with-recursive-lock
+             ((wasmdown.component.runtime::async-thread-mutex th))
+           (sb-thread:condition-broadcast
+            (wasmdown.component.runtime::async-thread-waitqueue th))
+           (sb-thread:condition-broadcast
+            (wasmdown.component.runtime::async-thread-suspend-waitqueue th))))
+       (sb-thread:with-recursive-lock
+           (wasmdown.component.runtime::*scheduler-mutex*)
+         (setf wasmdown.component.runtime::*scheduler-threads* nil)))))
+
+(defun %pin-inst ()
+  "A bare comp-instance: all the thread builtins need from it is the
+:async fields plist (§133-150), lazily created on the imports table."
+  (wasmdown.component.runtime::make-comp-instance))
+
+(defun %pin-task (inst seq)
+  (wasmdown.component.runtime::make-async-task :inst inst :seq seq))
+
+(defun %pin-thread (inst idx seq)
+  "A fresh Thread record at INDEX, with a task whose creation path is
+SEQ (the store-right ticket order), registered as the task's implicit
+thread."
+  (let* ((task (%pin-task inst seq))
+         (th (wasmdown.component.runtime::make-async-thread
+              :task task :index idx)))
+    (setf (wasmdown.component.runtime::async-task-implicit-thread task) th)
+    th))
+
+(defun %pin-register (inst th)
+  "Put TH in the instance's threads table and the scheduler registry."
+  (let ((fields (wasmdown.component.runtime::%inst-async-fields inst)))
+    (setf (getf fields :threads) (adjoin th (getf fields :threads)
+                                       :test #'eq)))
+  (sb-thread:with-recursive-lock
+      (wasmdown.component.runtime::*scheduler-mutex*)
+    (pushnew th wasmdown.component.runtime::*scheduler-threads*
+             :test #'eq))
+  th)
+
+(defun %pin-unregister (inst th)
+  (let ((fields (wasmdown.component.runtime::%inst-async-fields inst)))
+    (setf (getf fields :threads) (remove th (getf fields :threads)
+                                        :test #'eq)))
+  (sb-thread:with-recursive-lock
+      (wasmdown.component.runtime::*scheduler-mutex*)
+    (setf wasmdown.component.runtime::*scheduler-threads*
+          (remove th wasmdown.component.runtime::*scheduler-threads*
+                  :test #'eq))))
+
+(defun %pin-builtin (inst kind)
+  "The REAL production canon-builtin host func (M11b's wrapper)."
+  (wasmdown.component.runtime::%builtin-async-host-func inst kind nil))
+
+(defun %pin-resume-later (inst caller idx)
+  "Post the production thread.resume-later from CALLER onto IDX."
+  (let ((wasmdown.component.runtime::*current-thread* caller)
+        (wasmdown.component.runtime::*current-task*
+          (wasmdown.component.runtime::async-thread-task
+                         caller)))
+    (wasmdown.runtime:wasm-call (%pin-builtin inst :thread-resume-later)
+                                idx)))
+
+(defun %pin-start-park (th)
+  "Park TH with async-thread-suspend on its OWN OS thread (the real
+park site). Returns a handle plist: :thread, :done (a box set when the
+park returned), :err (a box). The thread binds its own private
+registry/right ticket; the shared record is the channel."
+  (let* ((done (list nil))
+         (err (list nil))
+         (bt (sb-thread:make-thread
+              (lambda ()
+                (let ((wasmdown.component.runtime::*current-thread* th)
+                      (wasmdown.component.runtime::*right-self* th)
+                      (wasmdown.component.runtime::*right-ticket* nil)
+                      (wasmdown.component.runtime::*scheduler-threads* nil))
+                  (unwind-protect
+                       (handler-case
+                           (sb-ext:with-timeout
+                               10
+                             (wasmdown.component.runtime::async-thread-suspend
+                              th))
+                         (error (c) (setf (car err) c)))
+                    (wasmdown.component.runtime::%right-release-on-exit th)
+                    (setf (car done) t))))
+              :name "pin-park")))
+    (list :thread bt :done done :err err)))
+
+(defun %pin-wait-parked (th &key (timeout 5))
+  "Block until TH is IN its suspend park. SUSPENDED-P is set at the
+park's entry and cleared only at its exit, so it is the stable
+signal; the deadline keeps the wait bounded."
+  (let ((deadline (+ (get-internal-real-time)
+                     (* timeout internal-time-units-per-second))))
+    (loop
+      (when (wasmdown.component.runtime::async-thread-suspended-p th)
+        (return t))
+      (when (> (get-internal-real-time) deadline)
+        (error "pin: thread ~a never reached its suspend park" th))
+      (sleep 0.001))))
+
+(defun %pin-join (bt &key (timeout 3))
+  "T when the OS thread BT finished within TIMEOUT."
+  (not (eq (sb-thread:join-thread bt :timeout timeout :default :pin-timeout)
+           :pin-timeout)))
+
+(defun %pin-clean-p (th)
+  "No RESUME CREDIT is outstanding on TH: no ready mark, no durable
+wake count. (GRANTED is deliberately NOT part of the invariant: it is
+the tick's blanket bookkeeping — every real Store.tick marks all
+registered threads — not a per-thread credit. POST-TO is the
+§242-273 handoff slot, not the credit: it is spent by the thread's
+NEXT park/exit and is asserted where that matters.)"
+  (and (null (wasmdown.component.runtime::async-thread-ready-p th))
+       (zerop (wasmdown.component.runtime::async-thread-wake-count th))))
+
+(defun %pin-wait-for (thunk &key (timeout 5) (what "condition"))
+  "Block (bounded) until THUNK holds; error past TIMEOUT."
+  (let ((deadline (+ (get-internal-real-time)
+                     (* timeout internal-time-units-per-second))))
+    (loop
+      (when (funcall thunk) (return t))
+      (when (> (get-internal-real-time) deadline)
+        (error "pin: ~a not reached" what))
+      (sleep 0.001))))
+
+(test component/resume-later-marker-lifetime-pin
+  ;; §458-465: resume_later marks the target READY; the mark is the
+  ;; NEXT park's credit and nothing more. Pinned here:
+  ;;  (1) a mark posted to a LIVE thread that never parks again dies
+  ;;      WITH the thread (no residual wake-count/ready/grant for a
+  ;;      later task at the same slot to inherit);
+  ;;  (2) a SECOND task run through the SAME record/index starts
+  ;;      clean: its first park is not returned by the old mark, and
+  ;;      a store tick grants it nothing (no granted-without-readiness);
+  ;;  (3) a mark posted TWICE buys exactly ONE park: the first park
+  ;;      returns, the second waits for a genuine resume.
+  (%pin-with-store
+    (let* ((inst (%pin-inst))
+           (marker (%pin-thread inst 1 '(1)))
+           (target (%pin-thread inst 2 '(1 0))))
+      (%pin-register inst marker)
+      (%pin-register inst target)
+      ;; ---- (1) the mark onto a LIVE thread, which exits un-parked
+      (is (not (wasmdown.component.runtime::async-thread-suspended-p target)))
+      (%pin-resume-later inst marker 2)
+      (is (wasmdown.component.runtime::async-thread-ready-p target))
+      (is (= 1 (wasmdown.component.runtime::async-thread-wake-count target)))
+      ;; the target's quantum finishes and the thread EXITS without
+      ;; parking again (the §4588 unregister path)
+      (wasmdown.component.runtime::%task-exit-implicit-thread
+       (wasmdown.component.runtime::async-thread-task target))
+      (is (not (member target
+                       (getf (wasmdown.component.runtime::%inst-async-fields
+                              inst)
+                             :threads))))
+      (is (null (wasmdown.component.runtime::async-thread-ready-p target)))
+      (is (zerop (wasmdown.component.runtime::async-thread-wake-count target)))
+      (is (null (wasmdown.component.runtime::async-thread-granted target)))
+      ;; a tick after the exit must not resurrect the dead mark
+      (wasmdown.component.runtime::async-thread-resume-all)
+      (is (%pin-clean-p target))
+      ;; and the marker itself carries no credit it did not receive
+      (is (%pin-clean-p marker))
+      ;; ---- (2) a SECOND task through the SAME slot
+      ;; A recycling runtime would hand this record (and its index)
+      ;; to the next task. The exit above is what must have made that
+      ;; safe: the record carries no mark any more.
+      (setf (wasmdown.component.runtime::async-thread-spawn-thunk target) nil)
+      (let ((task (%pin-task inst '(1 1))))
+        (setf (wasmdown.component.runtime::async-thread-task target) task
+              (wasmdown.component.runtime::async-thread-index target) 2)
+        (setf (wasmdown.component.runtime::async-task-implicit-thread task)
+              target))
+      (%pin-register inst target)
+      (let ((h (%pin-start-park target)))
+        (%pin-wait-parked target)
+        ;; the first park of the NEW task: still parked, and a tick
+        ;; grants it NOTHING (no ready mark survived the reuse)
+        (wasmdown.component.runtime::async-thread-resume-all)
+        (is (zerop (wasmdown.component.runtime::async-thread-wake-count target)))
+        (is (null (wasmdown.component.runtime::async-thread-ready-p target)))
+        (is (wasmdown.component.runtime::async-thread-suspended-p target))
+        (is (null (car (getf h :done))))
+        ;; only a REAL resume ends it
+        (wasmdown.component.runtime::async-thread-resume target)
+        (is (%pin-join (getf h :thread)))
+        (is (null (car (getf h :err))))
+        (is (%pin-clean-p target))
+        (%pin-unregister inst target))
+      ;; ---- (3) post TWICE -> ONE park returns, the next waits
+      (let ((p (%pin-thread inst 3 '(1 2))))
+        (%pin-register inst p)
+        (let ((h (%pin-start-park p)))
+          (%pin-wait-parked p)
+          ;; two resume-laters onto the SAME suspend-parked thread:
+          ;; the mark is a READY mark (§458-465), not a count — the
+          ;; second post cannot buy a second park
+          (%pin-resume-later inst marker 3)
+          (%pin-resume-later inst marker 3)
+          (is (wasmdown.component.runtime::async-thread-ready-p p))
+          (is (zerop (wasmdown.component.runtime::async-thread-wake-count p)))
+          (is (eq (wasmdown.component.runtime::async-thread-post-to p) marker))
+          ;; ONE store tick (§932: one quantum per tick) fires the
+          ;; ready mark: exactly ONE credit, and the mark is CONSUMED
+          (wasmdown.component.runtime::async-thread-resume-all)
+          (is (= 1 (wasmdown.component.runtime::async-thread-wake-count p)))
+          (is (null (wasmdown.component.runtime::async-thread-ready-p p)))
+          (is (%pin-join (getf h :thread)))
+          (is (null (car (getf h :err))))
+          ;; the park left no stale state behind
+          (is (not (wasmdown.component.runtime::async-thread-suspended-p p)))
+          (is (%pin-clean-p p))
+          ;; the SECOND park of the same thread must WAIT: a store
+          ;; tick may not grant it from the spent mark
+          (let ((h2 (%pin-start-park p)))
+            (%pin-wait-parked p)
+            ;; the pending §242-273 handoff is spent by THIS park's
+            ;; top (not by the park it was installed during)
+            (%pin-wait-for (lambda ()
+                             (null (wasmdown.component.runtime::async-thread-post-to
+                                    p)))
+                           :what "the second park's handoff post")
+            (is (= 1 (wasmdown.component.runtime::async-thread-wake-count
+                      marker)))
+            (wasmdown.component.runtime::async-thread-resume-all)
+            (is (zerop (wasmdown.component.runtime::async-thread-wake-count p)))
+            (is (null (wasmdown.component.runtime::async-thread-ready-p p)))
+            (is (null (car (getf h2 :done))))
+            (wasmdown.component.runtime::async-thread-resume p)
+            (is (%pin-join (getf h2 :thread)))
+            (is (null (car (getf h2 :err)))))))
+      ;; ---- the marker's own exit leaves it clean too
+      (wasmdown.component.runtime::%task-exit-implicit-thread
+       (wasmdown.component.runtime::async-thread-task marker))
+      (is (%pin-clean-p marker))
+      (is (null (wasmdown.component.runtime::async-thread-post-to marker))))))
+
+(defun %pin-arm-outcome (inst kind caller idx &key (timeout 2))
+  "Call the REAL switch builtin from CALLER on THIS thread. Returns
+:ok, the wasm-trap condition, or :parked when the arm switched/parked
+instead of rejecting (caught by the bounded TIMEOUT — the pin never
+waits unbounded)."
+  (let ((wasmdown.component.runtime::*current-thread* caller)
+        (wasmdown.component.runtime::*current-task*
+          (wasmdown.component.runtime::async-thread-task
+                         caller)))
+    (handler-case
+        (handler-case
+            (progn
+              (sb-ext:with-timeout timeout
+                (wasmdown.runtime:wasm-call (%pin-builtin inst kind) idx))
+              :ok)
+          (wasmdown:wasm-trap (c) c))
+      (sb-ext:timeout () :parked))))
+
+(test component/explicit-resume-requires-parked-peer-pin
+  ;; §4688/§4714 (canon_thread_{suspend,yield}_then_resume): the target
+  ;; must be SUSPENDED — §391-407: blocked with NO readiness function.
+  ;; §494/§4688 make the switch builtins the ONLY explicit resumers, so
+  ;; their predicate is the spec's rule and must not be widened: a
+  ;; RUNNING peer, a READY one (§523 yield: waiting on a readiness
+  ;; condition), and a thread whose mark was already CONSUMED are all
+  ;; non-suspended and must trap. Pinned:
+  ;;  (1) an explicit resume of a genuinely PARKED peer succeeds and
+  ;;      its park's own flag is cleared when the park is left;
+  ;;  (2) a LIVE (not parked, no pending spawn) peer is rejected;
+  ;;  (3) after a park's exit the state is not stale — the same peer
+  ;;      is rejected again, and a consumed resume-later mark does not
+  ;;      make a running thread resumable.
+  (%pin-with-store
+    (let* ((inst (%pin-inst))
+           (caller (%pin-thread inst 1 '(1)))
+           (parked (%pin-thread inst 2 '(1 0)))
+           (live (%pin-thread inst 3 '(1 1))))
+      (%pin-register inst caller)
+      (%pin-register inst parked)
+      (%pin-register inst live)
+      ;; ---- (1) the parked peer: the switch REALLY resumes it
+      (let ((h (%pin-start-park parked)))
+        (%pin-wait-parked parked)
+        (let* ((outcome (list :res :running))
+               (bt (sb-thread:make-thread
+                    (lambda ()
+                      (let ((wasmdown.component.runtime::*current-thread*
+                              caller)
+                            (wasmdown.component.runtime::*current-task*
+                              (wasmdown.component.runtime::async-thread-task
+                               caller))
+                            (wasmdown.component.runtime::*right-self* caller)
+                            (wasmdown.component.runtime::*right-ticket* nil)
+                            (wasmdown.component.runtime::*scheduler-threads*
+                              nil))
+                        (unwind-protect
+                             (handler-case
+                                 (sb-ext:with-timeout
+                                     5
+                                   (setf (getf outcome :res)
+                                         (wasmdown.runtime:wasm-call
+                                          (%pin-builtin
+                                           inst :thread-suspend-then-resume)
+                                          2)))
+                               (error (c) (setf (getf outcome :res) c)))
+                          (wasmdown.component.runtime::%right-release-on-exit
+                           caller))))
+                    :name "pin-switch")))
+          ;; the target's park is resumed by the switch
+          (is (%pin-join (getf h :thread)))
+          (is (null (car (getf h :err))))
+          ;; §242-273: the target's exit hands control back to its
+          ;; switcher (the park's own handoff post)
+          (wasmdown.component.runtime::%async-thread-post-handoff parked)
+          (is (%pin-join bt))
+          (is (equal '(0) (getf outcome :res)))
+          ;; the park CLEARED its own flag on the way out
+          (is (not (wasmdown.component.runtime::async-thread-suspended-p
+                    parked)))
+          (is (not (wasmdown.component.runtime::async-thread-yield-parked
+                    parked)))))
+      ;; ---- (2) a LIVE peer is still rejected (the spec's rule)
+      (let ((o (%pin-arm-outcome inst :thread-suspend-then-resume caller 3)))
+        (is (typep o 'wasmdown:wasm-trap))
+        (is (search "cannot resume thread which is not suspended"
+                    (wasmdown:wasmdown-error-message o))))
+      ;; ---- (3a) the state after a park's exit is not stale: the peer
+      ;; that HAS left its park is rejected again
+      (let ((o (%pin-arm-outcome inst :thread-suspend-then-resume caller 2)))
+        (is (typep o 'wasmdown:wasm-trap))
+        (is (search "cannot resume thread which is not suspended"
+                    (wasmdown:wasmdown-error-message o))))
+      ;; ---- (3b) a CONSUMED resume-later mark is not a suspension:
+      ;; the live peer receives the mark (§458-465 start_waiting), runs
+      ;; its next park (the credit is spent there), and must then be
+      ;; rejected — a mark is a one-park credit, never a state.
+      (let ((marker (%pin-thread inst 4 '(1 2))))
+        (%pin-register inst marker)
+        (%pin-resume-later inst marker 3)
+        (is (wasmdown.component.runtime::async-thread-ready-p live))
+        (let ((h (%pin-start-park live)))
+          ;; the posted credit returns this park exactly once
+          (is (%pin-join (getf h :thread)))
+          (is (null (car (getf h :err)))))
+        (is (not (wasmdown.component.runtime::async-thread-suspended-p live)))
+        (is (null (wasmdown.component.runtime::async-thread-ready-p live)))
+        (is (zerop (wasmdown.component.runtime::async-thread-wake-count live)))
+        (let ((o (%pin-arm-outcome inst :thread-suspend-then-resume caller 3)))
+          (is (typep o 'wasmdown:wasm-trap))
+          (is (search "cannot resume thread which is not suspended"
+                      (wasmdown:wasmdown-error-message o))))))))
+
 (defun run-component-pins ()
   "Run the component pins (registered via TEST; returns T)."
   (let ((wasmdown.test::*tests*
@@ -3425,7 +3809,9 @@ they use no type aliases or type imports)."
                       component/import-binding-instance-coverage-pins
                       component/guest-drop-reaches-provider-finalizer-pin
                       component/host-resource-owner-is-graph-scoped-pin
-                      component/two-providers-drop-own-finalizers-pin)))
+                      component/two-providers-drop-own-finalizers-pin
+                      component/resume-later-marker-lifetime-pin
+                      component/explicit-resume-requires-parked-peer-pin)))
           wasmdown.test::*tests*)))
     (multiple-value-bind (passed failed)
         (wasmdown.test:run-all-tests)

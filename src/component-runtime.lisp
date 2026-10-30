@@ -4749,6 +4749,56 @@ is named while the driver stops polling. NO wait."
     (sb-thread:release-mutex *store-right*))
   nil)
 
+;;; ---- THE RESUME CREDIT'S LIFETIME (§458-465) ----
+;;;
+;;; A resume-later mark is `start_waiting(ready_func = lambda: True)`
+;;; (§453-456): the thread becomes READY, one tick may RESUME it, and
+;;; the readiness condition is then STOPPED (§449-451 stop_waiting).
+;;; The runtime splits that single credit over three fields — READY-P
+;;; (the tick's ready-grant / the spawn fire), WAKE-COUNT (the durable
+;;; park-time half, posted onto a LIVE target and consumed at its next
+;;; park) and GRANTED (the turn grant). None of them is a STATE: they
+;;; are a credit with exactly one consumer. So:
+;;;
+;;;  * a park that returns has SPENT the credit — the park site clears
+;;;    all of it (otherwise the next tick sees READY-P on a thread
+;;;    that is already running and grants it again: a granted-without-
+;;;    readiness spurious wake), and
+;;;  * a thread that EXITS leaves no credit behind (a Thread record is
+;;;    per instance and §705 hands its index to the next task: a mark
+;;;    that outlived its thread would be inherited by a later task).
+;;;
+;;; POST-TO is NOT part of the credit: it is the §242-273 HANDOFF
+;;; slot, posted by the thread's NEXT park/exit (§4888/post-handoff),
+;;; so a park's own exit leaves it alone and only a THREAD EXIT
+;;; clears it — after that exit's own handoff post has fired
+;;; (hence the keyword: %RIGHT-RELEASE-ON-EXIT runs BEFORE the
+;;; new-indirect teardown's post).
+
+(defun %thread-consume-credit (thread)
+  "THREAD's park is returning: drop the resume credit. POST-TO is NOT
+the credit — it is the §242-273 HANDOFF slot, installed by whoever
+resumed this thread and posted by this thread's NEXT park/exit (the
+suspend park posts it at its loop top), so it must survive the exit
+of the park it was installed during."
+  (when thread
+    (sb-thread:with-recursive-lock ((async-thread-mutex thread))
+      (setf (async-thread-ready-p thread) nil
+            (async-thread-wake-count thread) 0
+            (async-thread-granted thread) nil))))
+
+(defun %thread-drop-credit-on-exit (thread &key post-to-p)
+  "THREAD is leaving the store: no resume credit may survive it. The
+POST-TO slot is cleared only when POST-TO-P (an exit path that has
+no §242-273 handoff post left to make)."
+  (when thread
+    (sb-thread:with-recursive-lock ((async-thread-mutex thread))
+      (setf (async-thread-ready-p thread) nil
+            (async-thread-wake-count thread) 0
+            (async-thread-granted thread) nil)
+      (when post-to-p
+        (setf (async-thread-post-to thread) nil)))))
+
 (defun %right-release-on-exit (self)
   "SELF is leaving the store: drop its ticket and, when it owns the
 right, hand it to the earliest runnable candidate and release.
@@ -4769,6 +4819,15 @@ block at a script boundary)."
   (when (and self (eq self *right-self*))
     (sb-thread:with-recursive-lock (*scheduler-mutex*)
       (remhash self *driver-records*)))
+  ;; THE RESUME CREDIT DIES WITH THE THREAD (§458-465): a ready mark
+  ;; or a durable count must never outlive its owner — §705 hands the
+  ;; record's index to the next task, which MUST start clean (the
+  ;; stale-marker class: a later task's first park returning on a
+  ;; credit posted for its predecessor). POST-TO is deliberately left
+  ;; alone: the new-indirect teardown still has its own §242-273
+  ;; handoff post to make after this call (that post claims the slot
+  ;; under the thread's mutex and clears it).
+  (%thread-drop-credit-on-exit self)
   nil)
 
 (defun %right-thread-death (self)
@@ -4791,7 +4850,11 @@ and NEVER waits."
       (setf *right-ticket* (%right-successor self)
             *right-owner* nil
             *right-owner-os* nil)
-      (sb-thread:release-mutex *store-right*)))
+      (sb-thread:release-mutex *store-right*))
+    ;; the factory exits have no §242-273 handoff post left: the whole
+    ;; credit, POST-TO included, dies here (idempotent with
+    ;; %right-release-on-exit / %task-exit-implicit-thread).
+    (%thread-drop-credit-on-exit self :post-to-p t))
   nil)
 
 (defun %thread-birth (th)
@@ -4949,6 +5012,14 @@ a right acquisition)."
              (setf (async-thread-wake-count thread) 0)
              (return)))))
     (setf (async-thread-suspended-p thread) nil)
+    ;; THE PARK SPENT §458-465's CREDIT: clear the ready mark, the
+    ;; durable count and the grant. A credit left here would be
+    ;; re-granted by the next tick on a RUNNING thread, or read as a
+    ;; suspension by the explicit-resume builtins (§4688/§4714). The
+    ;; §242-273 handoff slot is NOT the credit (the thread's NEXT
+    ;; park/exit spends it). Runs on the trap/abandoned unwind too:
+    ;; a park left by ANY path leaves no credit.
+    (%thread-consume-credit thread)
     (%block-exit thread)))
 
 (defun %async-thread-start-spawn (thread)
@@ -5274,7 +5345,13 @@ count arriving with the wake is THIS park's, never the next's."
       ;; across it by %park (fact b: welded to THIS wait).
       (%park thread m (async-thread-waitqueue thread))))
     (sb-thread:grab-mutex m)
+    ;; the yield park SPENDS the resume credit too: the ready mark, the
+    ;; count and the grant are one-park objects (see the lifetime note
+    ;; above) — a mark left on a running thread is a later tick's
+    ;; spurious grant and the switch builtins' false "suspended".
     (setf (async-thread-wake-count thread) 0
+          (async-thread-ready-p thread) nil
+          (async-thread-granted thread) nil
           (async-thread-ready-fn thread) nil
           (async-thread-yield-parked thread) nil)
     (sb-thread:release-mutex m)
@@ -5440,7 +5517,10 @@ through this function, so no dead ticket can ever be the head."
           (push task *deferred-resume-all-tasks*)
           (async-thread-resume-all)))
     ;; STEP 4: drop the ticket / hand the right on. NEVER waits.
-    (%right-release-on-exit th)))
+    (%right-release-on-exit th)
+    ;; THE EXIT LEAVES NO RESUME CREDIT AT ALL (§458-465): this path
+    ;; makes no §242-273 handoff post afterwards, so POST-TO goes too.
+    (%thread-drop-credit-on-exit th :post-to-p t)))
 
 (defun %task-has-pending-cancel (task)
   (eq (async-task-state task) :pending-cancel))
@@ -7352,21 +7432,35 @@ is the valtype."
             ;; outside-task trap satisfied rows expecting the
             ;; switch trap) — the fixture now passes for the real
             ;; reason.]
+            ;; [NYI-NOTE retired: SUSPENDED-P is now TRUTHFUL — set by
+            ;; the suspend park (and by the switch park that leaves
+            ;; the caller suspended) and cleared at that park's exit,
+            ;; on the trap/abandoned unwind as well. The predicate is
+            ;; therefore the spec's own `other_thread.suspended()`
+            ;; (§391-407: blocked with NO readiness function):
+            ;;   * a PENDING SPAWN (cont_new, ready_func None) is
+            ;;     suspended — the func has not started;
+            ;;   * SUSPENDED-P is the parked peer (§494).
+            ;; A READY thread (§523 yield park: ready_func installed,
+            ;; WAITING-not-suspended) and a thread carrying a
+            ;; resume-later mark (READY, §458-465) are NOT suspended
+            ;; and trap here — the ready mark's lifetime (see
+            ;; %THREAD-CONSUME-CREDIT) is what keeps a stale mark from
+            ;; ever reading as a suspension.
             (when (and (not promote-p)
                        (not (and target
                                  (or (functionp (async-thread-spawn-thunk
                                                  target))
-                                     (async-thread-ready-p target)
                                      (async-thread-suspended-p target)
-                                     (async-thread-yield-parked
-                                      target)
-                                     ;; STEP 4: a thread CONTENDING for
-                                     ;; the store right is not running
-                                     ;; — it is parked at %right-acquire
-                                     ;; and will continue when named.
-                                     ;; Without this a legal switch
+                                     ;; The native window of the SAME
+                                     ;; block: the target's quantum HAS
+                                     ;; ended, it is contending for the
+                                     ;; store right and can only
+                                     ;; continue when named — it is not
+                                     ;; running (STEP 4's measurement:
+                                     ;; without this a legal switch
                                      ;; target reads as "not suspended"
-                                     ;; (measured: during-sync rows).
+                                     ;; on the during-sync rows).
                                      (async-thread-right-waiting
                                       target)))))
               (error 'wasmdown:wasm-trap :kind :generic
@@ -7456,7 +7550,15 @@ is the valtype."
                   (if yield-p
                       (setf (async-thread-yield-parked ct) nil)
                       (setf (async-thread-suspended-p ct) nil))
-                  (setf (async-thread-wake-count ct) 0)
+                  ;; the switch park spent the caller's resume credit
+                  ;; (the arm's own wake and any mark a peer posted
+                  ;; onto it): clear it WITH the park flags, on the
+                  ;; trap/abandoned unwind too, so a running thread
+                  ;; never reads as suspended to the next arm
+                  ;; (§4688/§4714) and no later tick re-grants it.
+                  (setf (async-thread-wake-count ct) 0
+                        (async-thread-ready-p ct) nil
+                        (async-thread-granted ct) nil)
                   (sb-thread:release-mutex mu)
                   (%block-exit ct))))
             (list 0))))))
