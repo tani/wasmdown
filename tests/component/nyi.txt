@@ -1,3 +1,26 @@
+# M17 SESSION 10 — THE PARKED-BRANCH RE-RUN ON TODAY'S MASTER: ONE BLOCK OBTAINED,
+# THE OTHER BLOCKED BY THE USER'S OWN BENCHMARK, AND NOTHING POISONED.
+# WHAT WAS MEASURED (adjacent pair attempt for `wip/type-view`, master block first):
+#   master @ 8f28251 (git describe recorded at measurement time):
+#     red_runs=16/30, fail_commands=29, walls 9.37-14.33 s
+# The type-view block could NOT be taken: an SBCL the USER is running elsewhere
+# (benchmarks/prolog/competitive.lisp, a new PID each time it is polled) holds the
+# box, and tools/probe-async-lane.sh's quiet guard refused — correctly. That process
+# is NOT the day-old zombie from earlier; it is live user work, so it must never be
+# killed. THE PAIR IS DEFERRED, not abandoned: the exact command is
+#   tools/probe-async-lane.sh --branch <rerun branch> --runs 30 --label rr-tv --allow-dirty
+# against a master block taken in the same window. Retry when `pgrep -c sbcl` is 0.
+# THE RE-RUN ITSELF IS A REBASE PROBLEM, and that is the durable finding: reapplying
+# `wip/type-view` onto today's master with `git cherry-pick -n d864d1a` CONFLICTS in
+# tests/component-pins.lisp (the link-time pins and the type-view pins are disjoint by
+# NAME but adjacent in the file). The production half applied cleanly (486 + 13 lines,
+# units 505/0 with master's pins), so the branch IS re-measurable — but the pins must
+# be MERGED (keep both sets; expected count = master's + type-view's 5), never
+# resolved by taking one side. A single-side resolution silently drops regression pins;
+# that is why this run was abandoned rather than forced.
+# HOUSEKEEPING: the leftover A/B worktrees (/tmp/base-rl, /tmp/master-rl,
+# /tmp/sliceC/basewt) are pruned; `git worktree list` shows only the main tree.
+# STATE: master 8f28251, units 505/0, working tree clean except .envrc.
 # M17 SESSION 9 — TWO MORE DEFECT FIXES IN ON MASTER, BOTH PROVEN BY PINS THAT
 # FAILED FIRST (merge 7dae179 / ca7590b).
 # 1. THE RESUME-LATER MARK IS A SINGLE-PARK CREDIT, NOT A STATE. The pin failed on
