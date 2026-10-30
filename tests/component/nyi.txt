@@ -1,3 +1,32 @@
+# M17 SESSION 6e — STEP 2 IS NOW CLOSED (destructor lifetime), and the closing is a
+# MEASUREMENT not a claim. Commit ac58168.
+# THE GAP IS GONE: a guest-initiated resource.drop now reaches the provider's
+# finalizer with NO ct-keyed global. Provenance lives where the finalizer already
+# lives — host-register-resource-dtor writes ct -> finalizer into the instance's
+# :host-resource-dtors slot, so the map key's resident IS the owner;
+# %host-resource-owner walks the instance graph reachable from the requester and
+# returns (values finalizer owner). Scoped by graph, not by ct: a ct->instance hash
+# would key by ct alone across independent stores, and this runtime's resource ct
+# carries no owner identity (it is shared per parsed package).
+# DROP-PATH ORDER: guest dtor -> dynamic instance's registry -> canon-defining
+# instance's -> ct owner through the graph. *host-resource-dtor-table* (defvar,
+# export, read) is deleted; grep in src/ and tests/*.lisp is empty.
+# THE PIN THAT PROVES IT: component/guest-drop-reaches-provider-finalizer-pin
+# reproduces the exact probe that exposed the gap — pre-change FAIL (closed-p NIL,
+# fd 5 -> 5), post-change fd 5 -> -1 and closed-p T, plus the socket path (fd -1,
+# :closed). component/host-resource-owner-is-graph-scoped-pin shows the owner
+# resolves only through a LINKED provider. The old global-fallback case in
+# component/host-resource-dtor-registry-pins was reoriented, not deleted.
+# DOCUMENTED RESIDUAL: when several providers built from the SAME parsed package are
+# all reachable from one guest, the nearest (BFS) answers, so co-registrants must
+# agree on the release; the WASI providers do (every descriptor-ct owner registers
+# close-wasi-descriptor).
+# STEP 2 STATUS: complete for the destructor/descriptor lifetime line — the
+# descriptor refcount + stream holds (f6e70c6), the per-instance registry (98075dd),
+# the provider migration (78293c2) and this provenance closure. Units 502/0 twice.
+# What step 2 still does NOT cover is the ledger's borrow-side list (a live borrow
+# held across task.return must trap; borrow-in-awaitable-set), which belongs with
+# step 4's task machinery, not here.
 # M17 SESSION 6d — STEP 2's DESTRUCTOR WORK: PROVIDER MIGRATION LANDED, PROVENANCE
 # STILL OPEN. Step 2 is NOT complete and must not be reported as such.
 # LANDED (78293c2): the WASI providers register their resource finalizers through
