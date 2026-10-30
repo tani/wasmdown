@@ -1,3 +1,22 @@
+# M17 SESSION 39 — THE REGISTRATION CHECK, DONE THE ROBUST WAY, AND WHY THE EARLIER METHOD WAS
+# FRAGILE. This is the last verification; nothing follows it.
+# METHOD NOW: for every pin name in tests/component-pins.lisp, count the `(test <name>` forms.
+# Each pin must have EXACTLY ONE. Result on the closing tree: 93 pin names, ZERO anomalies —
+# the single "anomaly" the naive scan reported was `component/instance`, a PREFIX collision
+# between two differently-named pins, not a duplicate.
+# The new pin `component/nested-sync-lower-keeps-guest-right-pin` occurs exactly TWICE in the
+# file: once as its `(test ...)` definition (line 5972) and once as its registration-list entry
+# (line 6132) — the normal shape for every pin. There is NO duplicate registration.
+# WHY THE EARLIER METHOD WAS FRAGILE, recorded so nobody trusts it again: the previous check
+# extracted a "registration list" by searching backwards for the last `(list` form, which on
+# this file can land BEFORE a pin's own definition and therefore count a name twice (definition
+# + registration) and report a phantom duplicate. The robust check is the per-name `(test ...)`
+# count above, which needs no structural guess about where the list begins. The earlier claim
+# "88 names, zero duplicates" was reached by the fragile method and was nevertheless CORRECT,
+# but it should be re-derived with this method if ever doubted.
+# FINAL STATE (unchanged by this note): master 783f067 + this ledger entry, units 553/0, one
+# branch, working tree clean except the user's .envrc, plan steps 1-6 implemented, steps 7/8
+# out of scope by direction, and NO open row, NO parked branch, NO unresolved finding.
 # M17 SESSION 38 — THE WATCH ROW IS CLOSED (merge 783f067): A GUEST'S NESTED ASYNC-CALLEE
 # LOWER KEEPS THE RIGHT UNTIL ITS OWN NEXT PARK. The project now has NO open row.
 # REPRODUCTION: 0/150 in-lane this window (also 0/30 under 20 CPU hogs), so it was reproduced
