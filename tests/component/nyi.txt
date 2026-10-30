@@ -1,3 +1,42 @@
+# M17 SESSION 41 — THE LAST THREE VERIFICATIONS, DONE BY HAND.
+# 1. THE STUB IS DELETED, not merely unreferenced: `grep -c unsupported-closure src/wasi.lisp`
+#    = 0 and `grep -rn unsupported-closure src/` is EMPTY.
+# 2. THE REFUSAL PATH, driven directly (throwaway script, deleted): with an EMPTY implementation
+#    alist the old code substituted trapping stubs; it now signals
+#      wasmdown: host error: WASI interface monotonic-clock declares now, but this provider
+#      supplies no implementation for it (refusing to export a trapping stub)
+#    so the audit's "0 would-stub" claim is a property of the construction path, not of a table.
+# 3. REGISTRATION DUP-COUNT for the two new tests, counted as `(test <name>` forms:
+#      wasi/provider-surface-covers-every-stable-wit-name      1
+#      wasi/provider-instance-refuses-unimplemented-function    1
+# 4. THE FINAL LANE BLOCK (master 8aada3a, quiet box): red_runs=0/30, fail_commands=0,
+#    walls 10.04-10.49 s.
+# COMPLETE API-SURFACE TABLE, with a COVERED column, as the closing artefact:
+#   interface                 declared  covered  absent?
+#   clocks/types                    0        0  type-only
+#   clocks/monotonic-clock          4        4  -
+#   clocks/system-clock             2        2  -
+#   random/random                   2        2  -
+#   random/insecure                 2        2  -
+#   random/insecure-seed            1        1  -
+#   cli/environment                 3        3  -
+#   cli/exit                        2        2  -
+#   cli/stdin | stdout | stderr     1/1/1    1/1/1  -
+#   cli/terminal-input | -output    0/0      0/0  type-only
+#   cli/terminal-stdin|-stdout|-stderr 1/1/1  1/1/1  -
+#   filesystem/types               25       25  -
+#   filesystem/preopens             1        1  -
+#   sockets/types                  40       40  -
+#   sockets/ip-name-lookup          1        1  -
+#   TOTAL                          89       89  0 would-stub
+#   deliberately absent WHOLE interfaces (refused at composition/link, never stubbed):
+#   clocks/timezone (all @unstable), http/types+client+handler (removed by direction),
+#   cli/run (the command world's export, served by component-run-export).
+# PROJECT CLOSE: master 8aada3a, units 555/0, one branch, working tree clean except the user's
+# .envrc, plan steps 1-6 implemented, steps 7/8 out of scope by direction, no open row, no parked
+# branch, no unresolved finding, and the stable API surface fully covered with the trapping stub
+# gone. The one standing caveat is not work: the lane's 0-fail x 30 is window-locked and the PINS
+# — each with a negative control that fails when its rule is re-broken — are the guarantee.
 # M17 SESSION 40 — THE STABLE SURFACE IS FULLY COVERED AND THE TRAPPING STUB IS DELETED
 # (28832dc). This closes the last plan-visible gap: "no unimplemented stable API hidden behind
 # a gate".
