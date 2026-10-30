@@ -1,3 +1,34 @@
+# M17 SESSION 6b — THE DECISIVE VERSION OF THE SAME QUESTION: MASTER'S OWN acs::2
+# RATE MOVED 2/30 -> 30/30 INSIDE ONE SESSION. CORRECTION TO THE ENTRY BELOW.
+# THE ADJACENT PAIR (same window, nothing between, both through the meter):
+#   label   red/30  fail commands  walls          async-calls-sync::2
+#   m-B     30      41             7.89-8.34 s    30/30
+#   ltc-B   30      35             7.93-12.36 s   29/30
+# Row classes are the same on both sides (acs::2 dominant, then ctr::9, then
+# one-off cross-abi / partial-stream-copies / cancel-not-delivered).
+# SO: step 3's link-time check is AT PARITY (35 vs 41, acs::2 29 vs 30) and it
+# LANDED (merge 0621f0a). And the row's rate is MACHINE-STATE DOMINATED:
+#   acs::2 on master = 2/30 at m-A, 30/30 at m-B, one hour apart, no code change.
+# THE CORRECTION: the previous entry in this file says "acs::2's instantiation-path
+# sensitivity is now seen in three slices". That is WRONG and must not be used. The
+# type-view verdict survives because it came from an ADJACENT pair (m-A 2/30 vs
+# tv-A 29/30 IN THE SAME WINDOW). The wiring and link-contract suspicions came from
+# 6-run probes against controls taken at other times, i.e. the very method this file
+# already retired; both are UNRESOLVED, not confirmed.
+# THE INSTRUMENT'S REAL WIDTH, now measured on master itself: 12, 41 and 22 fail
+# commands / 30 runs across three batches of identical content in one session. That
+# is a width of >= 29, not 22. Anything below ~30 apart is unresolvable.
+# PLAN-ORDER CONSEQUENCE (write it down, it changes every remaining step): while the
+# machine sits in the "acs::2 pinned" state, ANY slice reads red and nothing can be
+# judged; while it sits in the "acs::2 2/30" state, an adjacent pair CAN judge a
+# slice. So the order is not "fewer instantiating slices first" — it is: take the
+# master block, and if it is pinned, STOP MEASURING and come back later. There is no
+# amount of care that makes a pinned window informative.
+# WHAT IS STILL INDEPENDENTLY SHIPPABLE (no lane judgement needed): wasi.lisp
+# provider internals that no lane fixture exercises, tests, docs, and the WIT parser.
+# Everything that touches instantiation (steps 3-remainder, 2-remainder with runtime
+# touches, 1-remainder, 5, and step 4 itself) needs either step 4 to land or an
+# unpinned window.
 # M17 SESSION 6 — WAVE A: STEP 2's DTOR API LANDED, STEP 3's LINK-TIME CHECK PARKED,
 # AND acs::2's SIGNATURE IS NOW SEEN IN THREE INDEPENDENT SLICES.
 # 1. LANDED (98075dd): host-register-resource-dtor / host-resource-finalizer —
