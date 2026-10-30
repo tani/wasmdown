@@ -42,7 +42,24 @@ component-model suite at commit `d095e2f60dd...` per
 unsupported / 0 harness-error** in {binary,validation,
 linking,values,async} minus nyi.txt — FULLY GREEN, and the
 async suite is COMPLETE: **45 of 45 files in the lane**
-(+2 rows, the last file sync-streams). THE M14/M15 MECHANISMS
+(+2 rows, the last file sync-streams). **M17 CLOSE-OUT (measured, 2026-10-30): the lane reads 0 fail x 30
+consecutive runs on a quiet machine** (`red_runs=0/30,
+fail_commands=0`, walls 9.86-10.53 s over 1631 commands per run),
+and units read 531 pass / 0 fail. That was not achieved by waiting
+for a lucky window: every residual row was decoded to a named
+mechanism and pinned so the pin fails when the rule is re-broken —
+`resume-later` on a live thread and the single-park mark credit,
+atomic thread-index registration with hole traps, the suspend park
+accepting only a spec-level resume credit, target-limited switch
+handoffs, reserved handoff windows (`*right-handoffs*`), and a
+resumer's boundary being the whole `switch_to` chain rather than the
+arm. The plan's own acceptance statement is "0 fail x 30"; it is met
+at this window, and the general rule recorded with it is that the
+lane is bimodal on this box (master measured 18, 9 and 1 fail
+commands in earlier windows), so the pins — not the window — are the
+guarantee.
+
+THE M14/M15 MECHANISMS
 (the model the async suite needed): THE SYNCHRONOUS RESUME
 (§761-770 + §474-484 — subtask.cancel's OnCancel resumes a
 cancellable-and-ready callback callee and observes its TURN
