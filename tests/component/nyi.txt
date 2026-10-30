@@ -1,3 +1,27 @@
+# M17 SESSION 8b — TWO AMPLIFICATIONS FOR THE READER OF THAT MERGE.
+# 1. THE MERGE IS A PACKAGE, NOT A NARROW FIX. `9b7f300` changes ~1256 lines of
+#    src/component-runtime.lisp (+981/-275) because `wip/resume-later` was cut from
+#    `wip/store-quantum`, which is cut from `wip/store-right`: the landed chain is
+#    the single right (park-releases-the-mutex, one condition-wait in the runtime),
+#    the reservation arms (mid-turn holder keeps the quantum; self takes it back
+#    after the resume-all fan-out) AND the resume-later change. The evidence quoted
+#    above was measured against that whole chain, so it is the chain that is
+#    justified — do not read the merge commit's size as accidental scope.
+# 2. THE STALE-MARKER CASE IS THE NEXT CORRECTNESS PIN, and it is named here because
+#    the resume-later change makes it reachable: a ready mark/wake posted to a thread
+#    that never parks again must have a LIFETIME — it survives exactly one next park,
+#    not indefinitely, and must never be observed by a LATER task that inherits a
+#    reused Thread record. The test to write: post a resume-later onto a thread that
+#    exits without parking again, then run a second task through the same slot and
+#    assert it does NOT inherit the mark (no spurious early return, no
+#    granted-without-readiness). This is the same stale-wake class the ledger already
+#    records for wake-counts; resume-later is a new producer of it, so it needs its
+#    own pin rather than an argument.
+# 3. SCOPE GUARD for whoever goes next on selection: candidate selection may only be
+#    restricted from the NON-ASYNC call-wait predicate (§3538-3543). Any selection
+#    logic reachable from an async-typed call is scope drift — that leak is exactly
+#    what produced the earlier attempts' noise, and the same-instance filter was
+#    already measured inert (869 comparisons, 2 changed picks).
 # M17 SESSION 8 — MASTER NOW CARRIES THE STEP-4 STACK (single right + reservation +
 # resume-later), MERGED AS BEST-MEASURED STATE, NOT AS "FIXED" (merge 9b7f300).
 # WHAT IS ON MASTER: %right as a mutex whose waits release it by construction (one
