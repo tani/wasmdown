@@ -1,3 +1,39 @@
+# M17 SESSION 15 — THE STORE DRIVER LANDED (b7c846c): steps 5 and 6 are now
+# structurally complete, with only the three named per-row defects left.
+# LANDED: host-store (mutex/entries/count/work/reactor) in the SAME provenance slot as
+# the handle table and async fields; accessors %inst-host-store / %inst-host-events /
+# %inst-reactor, plus *current-component-store* and a *global-host-store* fallback that
+# keeps today's single-FIFO behaviour for a context with no store. instantiate-component
+# installs the inherited store (outer-chain root, else dynamic, else new) so nested
+# instances and every native factory share one. %store-tick gates on ONE lock-free read
+# of host-store-work (queued events + live pendings, each released exactly once when its
+# delivery is consumed), pumps %reactor-step ONCE with a 1 ms clamped budget, then drains
+# the queue with the store bound — an idle store never enters the driver and never calls
+# the reactor. host-end-ready enqueues %host-end-retry instead of retrying on the caller,
+# with the end-AND-copy generation check unchanged; only a call with no store context at
+# all runs inline (the direct host-thread/join case). run-component wires the context's
+# reactor onto the instance's store.
+# Measured: units 526/0 twice (522 + 4 driver tests: idle store = 0 reactor steps;
+# pending work = exactly one bounded clamped step; the continuation runs with the store
+# bound and NOT inline; a stale generation leaves the newer parked copy untouched while
+# the current generation resumes it). Eight stream/future fixtures 151/0. Per-file probe
+# prints only the recorded floor rows (may-block::8, reentrance::14), same rate as an
+# isolated master worktree.
+# WHAT REMAINS, and it is now SHORT and SHARP — three defects plus two deferred verdicts:
+#   1. dssc::19 — the fixture's `f` thread and its caller SHARE ONE Thread record (the
+#      instance's implicit thread is reused). A modelling fix (shared-record /
+#      implicit-thread identity), not a scheduling patch. Its rate is unchanged and its
+#      message changed to "cannot switch to the current thread", which is the pointer.
+#   2. may-block::8 — an in-guest `unreachable` (premature park release), the last
+#      during-sync row besides excl-resume.
+#   3. excl-resume::2 — same class, in-guest check.
+#   4. rerun/type-view — reapplied on today's master, pins merged (112 additions /
+#      0 deletions), units 506/0, awaiting the adjacent lane pair on a quiet box.
+#   5. wip/reactor-wiring — unresolved at n=30 (mean +9/30 against a 22-wide batch);
+#      next = the adjacent pair at an unpinned window, then sub-element order
+#      (2)(1)(3)(4) with the n=6-era exonerations treated as UNPROVED.
+# The vendored-corpus statement stands: no WASI HTTP (removed at user direction), and
+# every remaining stable API either has a provider or a recorded out-of-scope decision.
 # M17 SESSION 14 — MONOTONIC-CLOCK WAITS ARE HOST-PENDING CALLS (merge ea5fa23).
 # They were trapping STUBS in this tree, so the plan's clock item was fresh work, not
 # a conversion: wait-until / wait-for now return make-host-pending, arm ONE
