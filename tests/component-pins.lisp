@@ -5543,6 +5543,258 @@ instance is torn down."
       (is (%pin-rows-pass-p
            wast (format nil "switched-target-exit-pin-~d.wast" i))))))
 
+;;; ---- THE LOCK ORDER (the scheduler <-> thread <-> store-right cycle) ----
+;;;
+;;; The instrumented run exposed a 3-thread cycle between
+;;; *SCHEDULER-MUTEX*, an async-thread's own mutex and *STORE-RIGHT*.
+;;; Its cycle-closing edge is ONE site: %STORE-TEARDOWN called the
+;;; exit path (%TASK-EXIT-IMPLICIT-THREAD -> ASYNC-THREAD-RESUME-ALL ->
+;;; %WITHOUT-RIGHT -> %RIGHT-ACQUIRE) while holding the RECURSIVE
+;;; scheduler mutex, i.e. SCHED -> RIGHT; %RIGHT-RELEASE-ON-EXIT /
+;;; %THREAD-BIRTH / %REGISTER-THREAD-INDEX supply the reverse
+;;; RIGHT -> SCHED edge. The two pins below are the two halves of the
+;;; guarantee: one is EXACT (a source-level pin of the invariant, with
+;;; a negative control proving the detector fires on the pre-fix
+;;; shape), one EXERCISES the path end to end.
+
+(defun %pin-file-text (rel)
+  "The UTF-8 text of REL (a repo-relative source file)."
+  (with-open-file (in rel :direction :input :external-format :utf-8)
+    (let ((buf (make-string (file-length in))))
+      (subseq buf 0 (read-sequence buf in)))))
+
+(defun %pin-skip-string (text open)
+  "Index just past the string literal opening at TEXT[OPEN]."
+  (loop with n = (length text) with i = (1+ open)
+        while (< i n)
+        do (cond ((char= (char text i) #\\)
+                  (incf i 2))
+                 ((char= (char text i) #\")
+                  (return (1+ i)))
+                 (t (incf i)))
+        finally (return n)))
+
+(defun %pin-skip-block-comment (text open)
+  "Index just past the #| ... |# comment opening at TEXT[OPEN]."
+  (loop with n = (length text) with i = (+ open 2)
+        while (< i n)
+        do (if (and (char= (char text i) #\|)
+                    (< (1+ i) n)
+                    (char= (char text (1+ i)) #\#))
+               (return (+ i 2))
+               (incf i))
+        finally (return n)))
+
+(defun %pin-paren-close (text open)
+  "Index of the ')' matching the '(' at TEXT[OPEN], or NIL. Skips
+strings, ; comments, #| |# block comments and #\\ char literals, so a
+docstring inside a body cannot spoof the match."
+  (loop with n = (length text) with i = (1+ open) with depth = 1
+        while (< i n)
+        do (let ((c (char text i)))
+             (cond
+               ((char= c #\") (setf i (%pin-skip-string text i)))
+               ((char= c #\;)
+                (setf i (or (position #\Newline text :start i) n)))
+               ((and (char= c #\#) (< (1+ i) n)
+                     (char= (char text (1+ i)) #\|))
+                (setf i (%pin-skip-block-comment text i)))
+               ((and (char= c #\#) (< (1+ i) n)
+                     (char= (char text (1+ i)) #\\))
+                (incf i 3))             ; #\x (an escaped #\( is skipped)
+               ((char= c #\() (incf depth) (incf i))
+               ((char= c #\)) (decf depth) (incf i)
+                (when (zerop depth) (return (1- i))))
+               (t (incf i))))
+        finally (return nil)))
+
+(defun %pin-scheduler-spans (text)
+  "Every span (START . END) of a (sb-thread:with-recursive-lock
+(*scheduler-mutex*) ...) form in TEXT."
+  (let ((out '()) (from 0))
+    (loop for pos = (search "(sb-thread:with-recursive-lock" text
+                            :start2 from)
+          while pos
+          do (when (search "(*scheduler-mutex*)" text :start2 pos
+                           :end2 (min (length text) (+ pos 64)))
+               (push (cons pos (or (%pin-paren-close text pos)
+                                   (length text)))
+                     out))
+             (setf from (+ pos 2)))
+    (nreverse out)))
+
+(defun %pin-code-only (text)
+  "TEXT with every comment and string literal blanked out (same length,
+same offsets), so only CODE is pattern-matched."
+  (let* ((n (length text))
+         (out (make-string n :initial-element #\Space))
+         (i 0))
+    (loop while (< i n)
+          do (let ((c (char text i)))
+               (cond
+                 ((char= c #\;) (setf i (or (position #\Newline text :start i) n)))
+                 ((char= c #\") (setf i (%pin-skip-string text i)))
+                 ((and (char= c #\#) (< (1+ i) n)
+                       (char= (char text (1+ i)) #\|))
+                  (setf i (%pin-skip-block-comment text i)))
+                 ((and (char= c #\#) (< (1+ i) n)
+                       (char= (char text (1+ i)) #\\))
+                  (setf i (min n (+ i 3))))
+                 (t (setf (char out i) c) (incf i)))))
+    out))
+
+(defun %pin-lock-order-violation-p (text)
+  "Does ANY scheduler-mutex section of TEXT contain the source text of
+a store-right grab, a resume-all, or the exit call that reaches one?
+THE LOCK ORDER rule (b): those are RIGHT acquisitions, and a held
+(recursive) scheduler frame would make them SCHED -> RIGHT."
+  (let ((tokens '("(async-thread-resume-all" "(%without-right"
+                  "(%right-acquire" "(%right-handoff-to"
+                  "(%task-exit-implicit-thread")))
+    (some (lambda (span)
+            (let* ((body (subseq text (car span)
+                                 (min (length text) (1+ (cdr span)))))
+                   (code (%pin-code-only body)))
+              (some (lambda (tk) (and (search tk code) t)) tokens)))
+          (%pin-scheduler-spans text))))
+
+(test component/lock-order-no-scheduler-held-across-store-right-pin
+  ;; EXACT: the source-level invariant, so a revert of the two-phase
+  ;; teardown is red even when no thread happens to hit the window.
+  ;; THE DETECTOR IS NOT VACUOUS: both pre-fix shapes are flagged.
+  (is (%pin-lock-order-violation-p
+       (format nil "(defun bad () (sb-thread:with-recursive-lock (*scheduler-mutex*) ~
+                   (dolist (th ths) (%task-exit-implicit-thread th))))")))
+  (is (%pin-lock-order-violation-p
+       (format nil "(defun bad () (sb-thread:with-recursive-lock (*scheduler-mutex*) ~
+                   (%without-right s (lambda () nil))))")))
+  ;; a LEGAL scheduler section (a leaf/peer section only) is not flagged
+  (is (not (%pin-lock-order-violation-p
+            (format nil "(defun ok () (sb-thread:with-recursive-lock (*scheduler-mutex*) ~
+                        (async-thread-nudge th)))"))))
+  ;; a docstring mentioning the tokens inside the span does not spoof it
+  (is (not (%pin-lock-order-violation-p
+            (format nil "(defun ok () (sb-thread:with-recursive-lock (*scheduler-mutex*) ~
+                        (x) ; (%without-right is documented here~%))"))))
+  (let ((text (%pin-file-text "src/component-runtime.lisp")))
+    ;; positive controls: real text, and the exit call really is there
+    (is (search "(defun %store-teardown" text))
+    (is (search "(%task-exit-implicit-thread" text))
+    (is (search "(defun %without-right" text))
+    (is (not (%pin-lock-order-violation-p text)))))
+
+(test component/store-teardown-runs-with-right-held-pin
+  ;; EXERCISE: the previously cyclic path, end to end. A thread that
+  ;; OWNS the store right (and has *RIGHT-SELF* bound, the shape the
+  ;; incident had) runs the REAL %STORE-TEARDOWN with async exclusive
+  ;; tasks registered (so the exit path reaches resume-all ->
+  ;; %without-right -> %right-acquire); a competitor holds the right
+  ;; and then takes the scheduler mutex (the RIGHT -> SCHED edge that
+  ;; closes the cycle). On the fixed tree the teardown holds no
+  ;; scheduler frame while it re-acquires the right, so the competitor
+  ;; gets the scheduler mutex; on the nested shape the teardown would
+  ;; block on the right while the competitor blocks on the scheduler.
+  ;; The competitor's scheduler grab is BOUNDED: the broken shape
+  ;; reports a failed grab instead of wedging the suite (no sleep).
+  (let* ((inst (wasmdown.component.runtime:make-comp-instance))
+         (ft (wasmdown.component:make-ct
+              :kind :functype :payload (list nil nil t)))
+         (threads
+           (loop repeat 48
+                 collect (let* ((task
+                                  (wasmdown.component.runtime::make-async-task
+                                   :inst inst :ft ft :seq '(1)))
+                                (th
+                                  (wasmdown.component.runtime::make-async-thread
+                                   :task task)))
+                           (setf (wasmdown.component.runtime::async-task-implicit-thread
+                                  task)
+                                 th)
+                           th)))
+         (old-threads wasmdown.component.runtime::*scheduler-threads*)
+         (old-ticket wasmdown.component.runtime::*right-ticket*)
+         (old-frames wasmdown.component.runtime::*right-handoffs*)
+         (old-owner wasmdown.component.runtime::*right-owner*)
+         (self (wasmdown.component.runtime::make-async-thread
+                :task (wasmdown.component.runtime::make-async-task
+                       :seq '(0))))
+         (go (sb-thread:make-semaphore))
+         (armed (sb-thread:make-semaphore))
+         (got-right nil)
+         (sched-ok nil)
+         (teardown-finished nil))
+    (unwind-protect
+         (progn
+           (setf wasmdown.component.runtime::*scheduler-threads* threads
+                 wasmdown.component.runtime::*right-ticket* nil
+                 wasmdown.component.runtime::*right-handoffs* nil
+                 wasmdown.component.runtime::*right-owner* nil)
+           (let* ((competitor
+                    (sb-thread:make-thread
+                     (lambda ()
+                       (sb-thread:wait-on-semaphore go)
+                       ;; ARM, then contend: the signal is posted one
+                       ;; pair of instructions before the mutex wait,
+                       ;; so the teardown enters its (several hundred
+                       ;; writes long) phase 1 with this thread already
+                       ;; queued on the right.
+                       (sb-thread:signal-semaphore armed)
+                       (sb-thread:grab-mutex
+                        wasmdown.component.runtime::*store-right*)
+                       (setf got-right t)
+                       (setf sched-ok
+                             (sb-thread:grab-mutex
+                              wasmdown.component.runtime::*scheduler-mutex*
+                              :timeout 2.0))
+                       (when sched-ok
+                         (sb-thread:release-mutex
+                          wasmdown.component.runtime::*scheduler-mutex*))
+                       (sb-thread:release-mutex
+                        wasmdown.component.runtime::*store-right*))
+                     :name "pin-lock-order-competitor"))
+                  (teardown
+                    (sb-thread:make-thread
+                     (lambda ()
+                       (let ((wasmdown.component.runtime::*right-self* self))
+                         (sb-thread:grab-mutex
+                          wasmdown.component.runtime::*store-right*)
+                         (wasmdown.component.runtime::%right-take self)
+                         ;; the competitor is now contending for the
+                         ;; right (see ARMED above)
+                         (sb-thread:signal-semaphore go)
+                         (sb-thread:wait-on-semaphore armed)
+                         (wasmdown.component.runtime::%store-teardown)
+                         (when (sb-thread:holding-mutex-p
+                                wasmdown.component.runtime::*store-right*)
+                           (sb-thread:release-mutex
+                            wasmdown.component.runtime::*store-right*))
+                         (setf teardown-finished t)))
+                     :name "pin-lock-order-teardown")))
+             (is (not (eq :pin-timeout
+                          (sb-thread:join-thread teardown :timeout 10.0
+                                                 :default :pin-timeout))))
+             (is (not (eq :pin-timeout
+                          (sb-thread:join-thread competitor :timeout 10.0
+                                                 :default :pin-timeout))))
+             (is teardown-finished)
+             (is got-right)
+             ;; THE ORDER ASSERTION: the competitor held the right and
+             ;; still took the scheduler mutex — the teardown did not
+             ;; hold it across its right re-acquisition.
+             (is sched-ok)))
+      (when (sb-thread:holding-mutex-p
+             wasmdown.component.runtime::*store-right*)
+        (sb-thread:release-mutex
+         wasmdown.component.runtime::*store-right*))
+      (setf wasmdown.component.runtime::*scheduler-threads* old-threads
+            wasmdown.component.runtime::*right-ticket* old-ticket
+            wasmdown.component.runtime::*right-handoffs* old-frames
+            wasmdown.component.runtime::*right-owner* old-owner)
+      (dolist (th threads)
+        (setf (wasmdown.component.runtime::async-thread-abandoned th) t
+              (wasmdown.component.runtime::async-thread-spawn-thunk th)
+              :done)))))
+
 (defun run-component-pins ()
   "Run the component pins (registered via TEST; returns T)."
   (let ((wasmdown.test::*tests*
@@ -5637,7 +5889,9 @@ instance is torn down."
                       component/generic-path-five-cases-pin
                       component/type-view-owner-pins
                       component/borrowed-handle-not-joinable-pin
-                      component/switched-target-exit-releases-pin)))          wasmdown.test::*tests*)))
+                      component/switched-target-exit-releases-pin
+                      component/lock-order-no-scheduler-held-across-store-right-pin
+                      component/store-teardown-runs-with-right-held-pin)))          wasmdown.test::*tests*)))
     (multiple-value-bind (passed failed)
         (wasmdown.test:run-all-tests)
       (declare (ignore passed))

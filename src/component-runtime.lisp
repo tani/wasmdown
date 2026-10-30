@@ -5445,6 +5445,92 @@ return + the cancel's BLOCKED read) — the reference's caller
 regains control synchronously (§3530) and the ready spawns run at
 the caller's NEXT blocking op (the fixtures' pinned interleave).")
 
+;;; ---------------------------------------------------------------
+;;; THE LOCK ORDER (the runtime's ONE documented lock discipline).
+;;;
+;;; THE MUTEXES IN PLAY, and what each protects:
+;;;   1. *STORE-RIGHT*        — the store's single execution permit.
+;;;      A guest continuation runs guest code only while holding it.
+;;;      %RIGHT-ACQUIRE is the only take path, %RIGHT-YIELD / the
+;;;      exit handoff the only release paths.
+;;;   2. the SYNC-LIFT DMU     — a per-executor mutex created by
+;;;      %SYNC-THUNK-RUN / %SYNC-LIFT-RUN to publish DONE-P. Never
+;;;      global; never held across a right acquisition.
+;;;   3. *SCHEDULER-MUTEX*     — the registry (*SCHEDULER-THREADS*,
+;;;      *DRIVER-RECORDS*) and the per-instance async FIELDS plist
+;;;      (:threads, the exclusive lock, backpressure counters).
+;;;   4. HOST-STORE-MUTEX (one per store) — the host completion queue.
+;;;   5. peer/leaf mutexes: each ASYNC-THREAD's own mutex, each
+;;;      ASYNC-TASK's, each ASYNC-WAITABLE-SET's, HOST-PENDING's,
+;;;      HOST-FUTURE-WATCH's. They protect ONLY the host-side
+;;;      registration fields a peer writes; every field a parked
+;;;      thread's PREDICATE reads is written under the right.
+;;;
+;;; THE TOTAL ORDER (a thread may take a later lock only while
+;;; holding an earlier one; an edge means "held X, then acquired Y"):
+;;;
+;;;   *store-right*  ->  { sync-lift DMU, host-store mutex }
+;;;                  ->  *scheduler-mutex*
+;;;                  ->  { wset, task, host-pending, future-watch }
+;;;                  ->  async-thread mutex   (THE ONLY LEAF)
+;;;
+;;;   and *scheduler-mutex* -> any peer/leaf mutex, never back.
+;;;   The DMU and the host-store mutex are SIBLINGS under the right:
+;;;   nothing ever holds one and takes the other (%HOST-ENQUEUE takes
+;;;   the host-store mutex and only then *SCHEDULER-MUTEX* to bump
+;;;   the progress counter; HOST-PENDING/HOST-FUTURE-WATCH release
+;;;   their own mutex BEFORE calling %HOST-ENQUEUE, and %HOST-PUMP
+;;;   pops under the host-store mutex and runs the thunk outside it).
+;;;   WSET/TASK/PENDING/FUTWATCH are siblings except for the two
+;;;   documented leaf-ward edges: WSET -> THREAD (%SUBTASK-RESOLVE
+;;;   posts each parked waiter's durable wake) and PENDING -> THREAD
+;;;   (%PARK's boundary takes the parker's own mutex). No site holds
+;;;   THREAD and acquires anything: a readiness closure runs under it
+;;;   and takes no lock, and %ASYNC-THREAD-START-SPAWN's thunk is
+;;;   only ever sb-thread:make-thread.
+;;;
+;;; NO LOCK SECTION SPANS A WAIT: every wait goes through %PARK /
+;;; %RIGHT-STALL, whose first act is %RIGHT-YIELD (release the right)
+;;; and which release the park's own mutex before %RIGHT-ACQUIRE.
+;;;
+;;; THE INSTANCE ASYNC FIELDS ARE NOT A LOCK. The sync-call FIRE
+;;; WINDOW (COMP-INSTANCE-SYNC-WINDOW-DEPTH), the thread index and
+;;; the turn/credit slots are ATOMIC slots read and written only
+;;; under the right (or by atomic ops), deliberately: taking
+;;; *SCHEDULER-MUTEX* there would build a store-right -> scheduler
+;;; edge on top of the tick's scheduler -> peer edge.
+;;;
+;;; THE FOUR RULES THAT KEEP THIS TRUE:
+;;;  a. NEVER acquire the right while holding ANY other mutex.
+;;;     %RIGHT-ACQUIRE is idempotent-only when the caller already
+;;;     owns the right; every fresh grab happens with no lock held.
+;;;  b. NEVER call ASYNC-THREAD-RESUME-ALL with *SCHEDULER-MUTEX*
+;;;     held. It is %WITHOUT-RIGHT: it releases the right mid-turn,
+;;;     runs the fan-out, and RE-ACQUIRES the right. Because the
+;;;     scheduler mutex is RECURSIVE, a resume-all fired inside a
+;;;     held scheduler frame leaves that frame holding the mutex
+;;;     across the right's grab — SCHED -> RIGHT, which closes the
+;;;     cycle with %RIGHT-RELEASE-ON-EXIT / %THREAD-BIRTH /
+;;;     %REGISTER-THREAD-INDEX's RIGHT -> SCHED. %STORE-TEARDOWN is
+;;;     the site that did this; it now runs the exit calls (which
+;;;     reach resume-all) AFTER releasing the scheduler mutex.
+;;;  c. %WITHOUT-RIGHT's THUNK must not wait and must not take the
+;;;     scheduler mutex as an OUTER frame: it is a fan-out of mutex
+;;;     sections and broadcasts whose inner scheduler section is
+;;;     closed before the right comes back.
+;;;  d. A park's boundary (%ASYNC-THREAD-PARK-BOUNDARY) takes the
+;;;     parker's own peer mutex while the right has already been
+;;;     released — leaf-ward, legal.
+;;;
+;;; THE EXITS. %RIGHT-RELEASE-ON-EXIT / %RIGHT-THREAD-DEATH take the
+;;; scheduler mutex and then, if this thread owns the right, RELEASE
+;;; it (a release cannot block, so it adds no edge).
+;;;
+;;; The reverse of every edge above is a bug. When adding a lock,
+;;; place it in the order above and check the four rules; when a new
+;;; leaf is unavoidable, prove no path holds it and then takes an
+;;; earlier one.
+
 (defparameter *scheduler-threads* nil
   "The live async-thread records — Store.tick's nudge-all walks it.
 MUTATED FROM MULTIPLE GUEST THREADS (enter/exit implicit thread):
@@ -5598,7 +5684,9 @@ no candidate thread can ever make progress — the deadlock trap.")
 ;;;     from inside a lock. %without-right's THUNK must therefore not
 ;;;     wait: it is a fan-out of mutex sections and broadcasts.
 ;;;
-;;; THE LOCK ORDER (depth 1 + short leaves):
+;;; THE LOCK ORDER (depth 1 + short leaves) — the canonical statement
+;;; is "THE LOCK ORDER" at the top of the scheduler section; this is
+;;; its store-right half:
 ;;;   *store-right*  ->  *scheduler-mutex*  ->  a thread/task/wset
 ;;;   mutex, never the other way, and never across a wait. The
 ;;;   per-thread/task/wset mutexes now protect ONLY the host-side
@@ -5608,6 +5696,8 @@ no candidate thread can ever make progress — the deadlock trap.")
 ;;;   (task state / resolved-p / result, end state / pending-event,
 ;;;   subtask state / flat-results, the instance's async fields), so
 ;;;   a predicate needs no foreign mutex — it reads under the right.
+;;;   AND NOTHING TAKES THE RIGHT WHILE HOLDING THE SCHEDULER MUTEX:
+;;;   the resume-all re-acquisition is a right grab (rule b there).
 ;;;
 ;;; THE EXITS. %right-release-on-exit drops the ticket and, when the
 ;;; leaving thread owns the right, hands it to the earliest runnable
@@ -5987,7 +6077,13 @@ turn of its own. THUNK must not wait (a fan-out of mutex sections
 and broadcasts only): the reservation lasts exactly as long as the
 fan-out. The rule this enforces is the during-sync family's: the
 callee's continuation after task.return must reach its own next
-block before the thread that resolution woke may run."
+block before the thread that resolution woke may run.
+
+THE LOCK ORDER, RULE (b): the caller MUST NOT hold *SCHEDULER-MUTEX*
+(nor any other mutex) — this function releases the right and
+RE-ACQUIRES it after THUNK, and with a recursive scheduler frame
+still on the stack the caller's frame would hold the scheduler
+mutex across that grab (SCHED -> RIGHT, the cycle edge)."
   (if (and self (sb-thread:holding-mutex-p *store-right*))
       (unwind-protect
            (progn (%right-reserve-self self) (funcall thunk))
@@ -6516,7 +6612,13 @@ wake). It therefore runs with the STORE RIGHT RELEASED — %without-
 right hands the right on and re-acquires it only after the fan-out
 has returned and dropped every peer mutex, so the AB-BA of
 %task-return / %task-exit-implicit-thread -> resume-all cannot
-exist. The quantum itself is %resume-all-body, unchanged."
+exist. The quantum itself is %resume-all-body, unchanged.
+
+THE CALLER CONTRACT (THE LOCK ORDER, rule b): no lock may be held
+across this call — in particular NOT *SCHEDULER-MUTEX*, because
+the re-acquisition after the fan-out is a fresh store-right grab
+and a held (recursive) scheduler frame would make it SCHED ->
+RIGHT. %STORE-TEARDOWN is the one site that used to do this."
   (%without-right *right-self*
                   (lambda () (%resume-all-body))))
 
@@ -9762,21 +9864,31 @@ ticket through %task-exit-implicit-thread -> %right-release-on-exit
 next script starts on an empty registry. A script-boundary block
 would change the timing the next fixture inherits — the piece-(i)
 measurement: an unbounded join there cost 5 extra acs::1 per 30
-runs, and the ledger's rule is that this boundary may not block."
-  (let ((threads-to-join nil))
+runs, and the ledger's rule is that this boundary may not block.
+
+THE TWO PHASES (THE LOCK ORDER's teardown rule): the exit call
+(%task-exit-implicit-thread) is NOT just a scheduler/peer-mutex
+section — on an async exclusive task it runs the M11a
+async-thread-resume-all (see %task-exit-implicit-thread), whose
+%without-right RE-ACQUIRES the store right. Because
+*SCHEDULER-MUTEX* is a RECURSIVE lock, a resume-all fired under a
+held scheduler frame leaves that frame holding the mutex across the
+right's grab: SCHED -> RIGHT, the cycle edge that closes with
+%right-release-on-exit/%thread-birth's RIGHT -> SCHED (the
+instrumented-run finding). So the flags are set, the natives are
+snapshotted and the registry/handoff/driver state cleared in ONE
+scheduler-only phase, and every exit call, peer broadcast and join
+runs AFTER that mutex is released."
+  (let ((threads nil)
+        (threads-to-join nil))
+    ;; ---- PHASE 1: SCHEDULER MUTEX ONLY. No store-right touch here.
     (sb-thread:with-recursive-lock (*scheduler-mutex*)
-      (dolist (th (copy-list *scheduler-threads*))
+      (setf threads (copy-list *scheduler-threads*))
+      (dolist (th threads)
         (setf (async-thread-suspended-p th) nil)
         (setf (async-thread-yield-parked th) nil)
         (setf (async-thread-block-depth th) 0)
         (setf (async-thread-abandoned th) t)
-        (when (async-thread-task th)
-          (ignore-errors
-            (%task-exit-implicit-thread (async-thread-task th))))
-        (sb-thread:with-recursive-lock ((async-thread-mutex th))
-          (sb-thread:condition-broadcast
-           (async-thread-suspend-waitqueue th))
-          (sb-thread:condition-broadcast (async-thread-waitqueue th)))
         (when (and (async-thread-native th)
                    (sb-thread:thread-alive-p
                     (async-thread-native th))
@@ -9791,6 +9903,19 @@ runs, and the ledger's rule is that this boundary may not block."
       ;; STEP 4: no ticket survives a teardown (a recycled thread
       ;; object must not alias a dead entry)
       (clrhash *driver-records*))
+    ;; ---- PHASE 2: NO SCHEDULER MUTEX. The exit call takes the
+    ;; leaving task's peer mutexes AND re-acquires the store right
+    ;; (through the M11a resume-all); the broadcasts are peer
+    ;; sections. All of it is ordered BELOW the right here, never
+    ;; under the scheduler.
+    (dolist (th threads)
+      (when (async-thread-task th)
+        (ignore-errors
+          (%task-exit-implicit-thread (async-thread-task th))))
+      (sb-thread:with-recursive-lock ((async-thread-mutex th))
+        (sb-thread:condition-broadcast
+         (async-thread-suspend-waitqueue th))
+        (sb-thread:condition-broadcast (async-thread-waitqueue th))))
     ;; M13-tok19 THE TEARDOWN JOIN — BOUNDED (A3): the abandoned
     ;; threads' unwinds run concurrently with the next fixture's flow
     ;; otherwise (the unwind storm), so give each a bounded grace and
