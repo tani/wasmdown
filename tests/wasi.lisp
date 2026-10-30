@@ -1024,9 +1024,16 @@ removes NAMES (an evaluated list, so callers quote it) and the root."
                                     (wasmdown.wasi:fs-open-at
                                      ctx pre-desc nil "a.txt" nil
                                      (cons :flags '("read"))))))
-                    (hdtor (gethash dtor-ct
-                                    wasmdown.component.runtime:*host-resource-dtor-table*)))
-               (is (functionp hdtor))
+                    ;; M17: the finalizer is registered on THIS
+                    ;; provider instance (the per-instance registry),
+                    ;; not in the retired ct-keyed global
+                    (hdtor (wasmdown.component.runtime:host-resource-finalizer
+                            types dtor-ct)))
+               (is (eq (symbol-function 'wasmdown.wasi:close-wasi-descriptor)
+                       hdtor))
+               (is (null (gethash
+                          dtor-ct
+                          wasmdown.component.runtime:*host-resource-dtor-table*)))
                (is (plusp (wasmdown.wasi:wasi-descriptor-fd opened)))
                (funcall hdtor opened)
                (is (eql -1 (wasmdown.wasi:wasi-descriptor-fd opened)))
@@ -3458,3 +3465,135 @@ STEP never blocks, so a fake clock fully determines the outcome."
            (sb-thread:join-thread thread)
            (is (equal '(t nil) result)))
       (wasmdown.wasi:reactor-close reactor))))
+
+;;; ---------------------------------------------------------------
+;;; M17: the per-instance host-resource destructor registry, proven on
+;;; a REAL provider graph (command-provider).
+
+(defun %provider-of (providers package interface)
+  "The provider comp-instance PROVIDERS binds for PACKAGE's INTERFACE
+(the same lookup command-provider's alist keys use)."
+  (cdr (assoc (wasmdown.wit:interface-import-name
+               (wasmdown.wit:package-interface package interface))
+              providers :test #'string=)))
+
+(test wasi/provider-dtors-are-per-provider-instance
+  ;; Every host-provided resource finalizer is registered on the
+  ;; PROVIDER comp-instance whose types produced the resource ct (the
+  ;; instance that OWNS the rep) — never on a guest/current instance
+  ;; and never in the retired ct-keyed global. The registry is the
+  ;; instance's :HOST-RESOURCE-DTORS slot, so two providers of the
+  ;; same ct keep distinct releases.
+  (with-fs-root (root "dtor-inst" '("a.txt"))
+    (let* ((pre (wasmdown.wasi:open-wasi-preopen root :name "/sandbox"))
+           (ctx (wasmdown.wasi:make-wasi-context
+                 :preopens (list pre)
+                 :networks (list (sock-network))))
+           (providers (wasmdown.wasi:command-provider ctx))
+           (fs-pkg (wasmdown.wasi:wasi-package "filesystem"))
+           (sock-pkg (wasmdown.wasi:wasi-package "sockets"))
+           (fs-types (%provider-of providers fs-pkg "types"))
+           (fs-preopens (%provider-of providers fs-pkg "preopens"))
+           (sock-types (%provider-of providers sock-pkg "types"))
+           (desc-ct (wasmdown.wasi:descriptor-resource-ct))
+           (tcp-ct (wasmdown.wasi:tcp-socket-resource-ct))
+           (udp-ct (wasmdown.wasi:udp-socket-resource-ct))
+           (guest (wasmdown.component.runtime:make-comp-instance))
+           (global wasmdown.component.runtime:*host-resource-dtor-table*)
+           (fin (lambda (inst ct)
+                  (wasmdown.component.runtime:host-resource-finalizer
+                   inst ct))))
+      (unwind-protect
+           (progn
+             ;; command-provider really handed us the provider instances
+             (is (wasmdown.component.runtime:comp-instance-p fs-types))
+             (is (wasmdown.component.runtime:comp-instance-p fs-preopens))
+             (is (wasmdown.component.runtime:comp-instance-p sock-types))
+             ;; (a) the descriptor finalizer lives on EACH filesystem
+             ;; provider instance (each owns descriptor reps: opened
+             ;; files through `types', the preopen's own descriptor
+             ;; through `preopens')
+             (is (eq (symbol-function 'wasmdown.wasi:close-wasi-descriptor)
+                     (funcall fin fs-types desc-ct)))
+             (is (eq (symbol-function 'wasmdown.wasi:close-wasi-descriptor)
+                     (funcall fin fs-preopens desc-ct)))
+             ;; (b) the sockets provider instance owns both socket cts
+             (is (eq (symbol-function 'wasmdown.wasi:close-wasi-tcp-socket)
+                     (funcall fin sock-types tcp-ct)))
+             (is (eq (symbol-function 'wasmdown.wasi:close-wasi-udp-socket)
+                     (funcall fin sock-types udp-ct)))
+             ;; (c) ABSENT from the guest/current instance — which holds
+             ;; no destructor table at all, so a lookup allocates none
+             (is (null (funcall fin guest desc-ct)))
+             (is (null (funcall fin guest tcp-ct)))
+             (is (null (funcall fin guest udp-ct)))
+             (is (null (gethash :host-resource-dtors
+                                (wasmdown.component.runtime:comp-instance-imports
+                                 guest))))
+             ;; (d) the retired ct-keyed global holds NONE of them: the
+             ;; provider instances are the only registration
+             (is (null (gethash desc-ct global)))
+             (is (null (gethash tcp-ct global)))
+             (is (null (gethash udp-ct global)))
+             ;; (e) the registered hooks are LIVE for resources created
+             ;; THROUGH the provider: the preopen's own own<descriptor>
+             ;; releases as a no-op (the embedder keeps the root fd),
+             ;; and created sockets close their fd exactly once
+             (let* ((dirs (call-provider fs-preopens "get-directories"))
+                    (own (first (first dirs)))
+                    (rep (third own)))
+               (is (eq desc-ct (second own)))
+               (is (eq rep (wasmdown.wasi:wasi-preopen-descriptor pre)))
+               (funcall (funcall fin fs-preopens desc-ct) rep)
+               (is (not (wasmdown.wasi:wasi-descriptor-closed-p rep)))
+               (is (plusp (wasmdown.wasi:wasi-preopen-fd pre))))
+             (let* ((tcp-own (call-provider sock-types
+                                            "[static]tcp-socket.create"
+                                            (cons :enum "ipv4")))
+                    ;; result<own<tcp-socket>, error-code> lowers to
+                    ;; (:ok :own-handle CT REP)
+                    (tcp (fourth tcp-own))
+                    (fd (wasmdown.wasi:wasi-tcp-socket-fd tcp)))
+               (is (eq tcp-ct (third tcp-own)))
+               (is (and (integerp fd) (not (minusp fd))))
+               (funcall (funcall fin sock-types tcp-ct) tcp)
+               (is (eql -1 (wasmdown.wasi:wasi-tcp-socket-fd tcp)))
+               (is (eq :closed (wasmdown.wasi:wasi-tcp-socket-state tcp)))
+               (is (null (sb-unix:unix-fstat fd))))
+             (let* ((udp-own (call-provider sock-types
+                                            "[static]udp-socket.create"
+                                            (cons :enum "ipv4")))
+                    (udp (fourth udp-own))
+                    (fd (wasmdown.wasi:wasi-udp-socket-fd udp)))
+               (is (eq udp-ct (third udp-own)))
+               (is (and (integerp fd) (not (minusp fd))))
+               (funcall (funcall fin sock-types udp-ct) udp)
+               (is (eql -1 (wasmdown.wasi:wasi-udp-socket-fd udp)))
+               (is (null (sb-unix:unix-fstat fd))))
+             ;; (f) a SECOND provider instance is independently
+             ;; registered (a ct-keyed global could hold only one), a
+             ;; RE-registration on the same instance is a no-op that
+             ;; keeps the first hook, and a registration elsewhere
+             ;; never reaches the provider's slot
+             (let* ((ctx2 (wasmdown.wasi:make-wasi-context
+                           :preopens (list pre)
+                           :networks (list (sock-network))))
+                    (fs2 (wasmdown.wasi:filesystem-types-instance ctx2))
+                    (is-close (symbol-function
+                               'wasmdown.wasi:close-wasi-descriptor))
+                    (other (wasmdown.component.runtime:make-comp-instance))
+                    (hook (lambda (rep) (declare (ignore rep)) :other)))
+               (is (not (eq fs2 fs-types)))
+               (is (eq is-close (funcall fin fs2 desc-ct)))
+               (is (eq is-close
+                       (wasmdown.component.runtime:host-register-resource-dtor
+                        fs2 desc-ct hook)))
+               (is (eq is-close (funcall fin fs2 desc-ct)))
+               (is (eq is-close (funcall fin fs-types desc-ct)))
+               (wasmdown.component.runtime:host-register-resource-dtor
+                other desc-ct hook)
+               (is (eq hook (funcall fin other desc-ct)))
+               (is (eq is-close (funcall fin fs2 desc-ct)))
+               (is (eq is-close (funcall fin fs-types desc-ct)))
+               (is (eq is-close (funcall fin fs-preopens desc-ct)))))
+        (wasmdown.wasi:close-wasi-preopen pre)))))

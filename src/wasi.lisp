@@ -1145,18 +1145,13 @@ the exported type and the drop finalizer all share it)."
    (list :resource "descriptor")
    :packages (list package)))
 
-(defparameter *descriptor-dtor-installed* (make-hash-table :test #'eq))
-
-(defun %install-descriptor-dtor (ct)
-  "Register the host finalizer for the descriptor resource: canon
-resource.drop has no guest dtor func-instance for a host-provided
-resource, so it calls this with the rep (the wasi-descriptor)."
-  (unless (gethash ct *descriptor-dtor-installed*)
-    (setf (gethash ct *descriptor-dtor-installed*) t)
-    (setf (gethash ct
-                   wasmdown.component.runtime:*host-resource-dtor-table*)
-          #'close-wasi-descriptor))
-  ct)
+;;; M17: there is NO provider-side "already installed" ledger any more.
+;;; The descriptor's host finalizer (CLOSE-WASI-DESCRIPTOR, run by a
+;;; guest's canon resource.drop with the rep) is registered with
+;;; HOST-REGISTER-RESOURCE-DTOR on each provider instance that owns
+;;; descriptor reps — FILESYSTEM-TYPES-INSTANCE and
+;;; FILESYSTEM-PREOPENS-INSTANCE — so the registry is per (instance,
+;;; ct): two providers of wasi:filesystem keep distinct releases.
 
 ;;; ---------------------------------------------------------------
 ;;; The descriptor domain boundary: own/borrow handles.
@@ -2195,53 +2190,67 @@ stream + a future with the error-code)."
   "The wasi:filesystem/types import: the descriptor resource (its ct
 exported, its methods exported as [method]descriptor.*) bound to
 CONTEXT's preopen authorities."
-  (let ((ct (descriptor-resource-ct :package package)))
-    (%install-descriptor-dtor ct)
-    (provider-instance
-     (wasmdown.wit:package-interface package "types")
-     (list (cons "advise" (%bind-context context #'fs-advise))
-           (cons "sync" (%bind-context context #'fs-sync))
-           (cons "sync-data" (%bind-context context #'fs-sync-data))
-           (cons "get-flags" (%bind-context context #'fs-get-flags))
-           (cons "get-type" (%bind-context context #'fs-get-type))
-           (cons "set-size" (%bind-context context #'fs-set-size))
-           (cons "set-times" (%bind-context context #'fs-set-times))
-           (cons "set-times-at" (%bind-context context #'fs-set-times-at))
-           (cons "stat" (%bind-context context #'fs-stat))
-           (cons "stat-at" (%bind-context context #'fs-stat-at))
-           (cons "create-directory-at"
-                 (%bind-context context #'fs-create-directory-at))
-           (cons "remove-directory-at"
-                 (%bind-context context #'fs-remove-directory-at))
-           (cons "unlink-file-at" (%bind-context context #'fs-unlink-file-at))
-           (cons "rename-at" (%bind-context context #'fs-rename-at))
-           (cons "link-at" (%bind-context context #'fs-link-at))
-           (cons "readlink-at" (%bind-context context #'fs-readlink-at))
-           (cons "symlink-at" (%bind-context context #'fs-symlink-at))
-           (cons "open-at" (%bind-context context #'fs-open-at))
-           (cons "read-via-stream"
-                 (%bind-context context #'fs-read-via-stream))
-           (cons "write-via-stream"
-                 (%bind-context context #'fs-write-via-stream))
-           (cons "append-via-stream"
-                 (%bind-context context #'fs-append-via-stream))
-           (cons "read-directory"
-                 (%bind-context context #'fs-read-directory))
-           (cons "is-same-object" (%bind-context context #'fs-is-same-object))
-           (cons "metadata-hash" (%bind-context context #'fs-metadata-hash))
-           (cons "metadata-hash-at"
-                 (%bind-context context #'fs-metadata-hash-at)))
-     :packages (%filesystem-packages :package package))))
+  (let* ((ct (descriptor-resource-ct :package package))
+         (inst
+          (provider-instance
+           (wasmdown.wit:package-interface package "types")
+           (list (cons "advise" (%bind-context context #'fs-advise))
+                 (cons "sync" (%bind-context context #'fs-sync))
+                 (cons "sync-data" (%bind-context context #'fs-sync-data))
+                 (cons "get-flags" (%bind-context context #'fs-get-flags))
+                 (cons "get-type" (%bind-context context #'fs-get-type))
+                 (cons "set-size" (%bind-context context #'fs-set-size))
+                 (cons "set-times" (%bind-context context #'fs-set-times))
+                 (cons "set-times-at" (%bind-context context #'fs-set-times-at))
+                 (cons "stat" (%bind-context context #'fs-stat))
+                 (cons "stat-at" (%bind-context context #'fs-stat-at))
+                 (cons "create-directory-at"
+                       (%bind-context context #'fs-create-directory-at))
+                 (cons "remove-directory-at"
+                       (%bind-context context #'fs-remove-directory-at))
+                 (cons "unlink-file-at" (%bind-context context #'fs-unlink-file-at))
+                 (cons "rename-at" (%bind-context context #'fs-rename-at))
+                 (cons "link-at" (%bind-context context #'fs-link-at))
+                 (cons "readlink-at" (%bind-context context #'fs-readlink-at))
+                 (cons "symlink-at" (%bind-context context #'fs-symlink-at))
+                 (cons "open-at" (%bind-context context #'fs-open-at))
+                 (cons "read-via-stream"
+                       (%bind-context context #'fs-read-via-stream))
+                 (cons "write-via-stream"
+                       (%bind-context context #'fs-write-via-stream))
+                 (cons "append-via-stream"
+                       (%bind-context context #'fs-append-via-stream))
+                 (cons "read-directory"
+                       (%bind-context context #'fs-read-directory))
+                 (cons "is-same-object" (%bind-context context #'fs-is-same-object))
+                 (cons "metadata-hash" (%bind-context context #'fs-metadata-hash))
+                 (cons "metadata-hash-at"
+                       (%bind-context context #'fs-metadata-hash-at)))
+           :packages (%filesystem-packages :package package))))
+    ;; M17: the finalizer is registered on THIS provider instance (the
+    ;; owner of every descriptor rep it hands out), not in a ct-keyed
+    ;; global.
+    (wasmdown.component.runtime:host-register-resource-dtor
+     inst ct #'close-wasi-descriptor)
+    inst))
 
 (defun filesystem-preopens-instance (context
                                      &key (package (wasi-package "filesystem")))
-  (let ((ct (descriptor-resource-ct :package package)))
-    (%install-descriptor-dtor ct)
-    (provider-instance
-     (wasmdown.wit:package-interface package "preopens")
-     (list (cons "get-directories"
-                 (lambda () (fs-get-directories context ct))))
-     :packages (%filesystem-packages :package package))))
+  ;; M17: the descriptor's host finalizer belongs to THIS provider
+  ;; instance (the one whose types produced the ct, and whose
+  ;; get-directories hands out the preopen's own descriptors), not to a
+  ;; ct-keyed global — so a guest resource.drop releases through the
+  ;; instance that owns the rep.
+  (let* ((ct (descriptor-resource-ct :package package))
+         (inst
+          (provider-instance
+           (wasmdown.wit:package-interface package "preopens")
+           (list (cons "get-directories"
+                       (lambda () (fs-get-directories context ct))))
+           :packages (%filesystem-packages :package package))))
+    (wasmdown.component.runtime:host-register-resource-dtor
+     inst ct #'close-wasi-descriptor)
+    inst))
 
 (defun filesystem-provider (context
                             &key (package (wasi-package "filesystem")))
@@ -3405,20 +3414,13 @@ every derived send/receive/listen stream); the fd closes at zero."
 (defun udp-socket-resource-ct (&key (package (wasi-package "sockets")))
   (%socket-ct "udp-socket" :package package))
 
-(defparameter *socket-dtor-installed* (make-hash-table :test #'eq))
-
-(defun %install-socket-dtors (tcp-ct udp-ct)
-  "Register the host finalizers for the two socket resources: canon
-resource.drop calls them with the rep, releasing the OS fd."
-  (unless (gethash tcp-ct *socket-dtor-installed*)
-    (setf (gethash tcp-ct *socket-dtor-installed*) t)
-    (setf (gethash tcp-ct wasmdown.component.runtime:*host-resource-dtor-table*)
-          #'close-wasi-tcp-socket))
-  (unless (gethash udp-ct *socket-dtor-installed*)
-    (setf (gethash udp-ct *socket-dtor-installed*) t)
-    (setf (gethash udp-ct wasmdown.component.runtime:*host-resource-dtor-table*)
-          #'close-wasi-udp-socket))
-  t)
+;;; M17: there is NO provider-side "already installed" ledger any more.
+;;; The tcp-socket/udp-socket host finalizers (CLOSE-WASI-TCP-SOCKET /
+;;; CLOSE-WASI-UDP-SOCKET, run by a guest's canon resource.drop with
+;;; the rep) are registered with HOST-REGISTER-RESOURCE-DTOR on each
+;;; SOCKETS-TYPES-INSTANCE that adopts them, so the registry is per
+;;; (instance, ct): two providers of wasi:sockets keep distinct
+;;; releases.
 
 (defun %release-tcp (sock &optional shutdown-how)
   "Drop one reference; SHUTDOWN-HOW (when non-NIL) shuts the OS socket
@@ -4561,128 +4563,137 @@ first one). No network authority => every bind/connect is refused."
   (let* ((net (or network (first (wasi-context-networks context))))
          (tcp-ct (tcp-socket-resource-ct :package package))
          (udp-ct (udp-socket-resource-ct :package package))
-         (pkg (%sockets-packages :package package)))
-    (%install-socket-dtors tcp-ct udp-ct)
-    (provider-instance
-     (wasmdown.wit:package-interface package "types")
-     (list
-      (cons "[static]tcp-socket.create"
-            (lambda (fam) (tcp-create context net fam :package package)))
-      (cons "[method]tcp-socket.bind"
-            (lambda (self addr) (tcp-bind context net self addr
-                                          :package package)))
-      (cons "[method]tcp-socket.connect"
-            (lambda (self addr) (tcp-connect context net self addr
-                                             :package package)))
-      (cons "[method]tcp-socket.listen"
-            (lambda (self) (tcp-listen context net self :package package)))
-      (cons "[method]tcp-socket.send"
-            (lambda (self data) (tcp-send context net self data
-                                          :package package)))
-      (cons "[method]tcp-socket.receive"
-            (lambda (self) (tcp-receive context net self :package package)))
-      (cons "[method]tcp-socket.get-local-address"
-            (lambda (self) (tcp-get-local-address context net self
-                                                  :package package)))
-      (cons "[method]tcp-socket.get-remote-address"
-            (lambda (self) (tcp-get-remote-address context net self
+         (pkg (%sockets-packages :package package))
+         (inst
+          (provider-instance
+           (wasmdown.wit:package-interface package "types")
+           (list
+            (cons "[static]tcp-socket.create"
+                  (lambda (fam) (tcp-create context net fam :package package)))
+            (cons "[method]tcp-socket.bind"
+                  (lambda (self addr) (tcp-bind context net self addr
+                                                :package package)))
+            (cons "[method]tcp-socket.connect"
+                  (lambda (self addr) (tcp-connect context net self addr
                                                    :package package)))
-      (cons "[method]tcp-socket.get-is-listening"
-            (lambda (self) (tcp-get-is-listening context net self
-                                                 :package package)))
-      (cons "[method]tcp-socket.get-address-family"
-            (lambda (self) (tcp-get-address-family context net self
-                                                   :package package)))
-      (cons "[method]tcp-socket.set-listen-backlog-size"
-            (lambda (self v) (tcp-set-listen-backlog-size context net self v
-                                                          :package package)))
-      (cons "[method]tcp-socket.get-keep-alive-enabled"
-            (lambda (self) (tcp-get-keep-alive-enabled context net self
+            (cons "[method]tcp-socket.listen"
+                  (lambda (self) (tcp-listen context net self :package package)))
+            (cons "[method]tcp-socket.send"
+                  (lambda (self data) (tcp-send context net self data
+                                                :package package)))
+            (cons "[method]tcp-socket.receive"
+                  (lambda (self) (tcp-receive context net self :package package)))
+            (cons "[method]tcp-socket.get-local-address"
+                  (lambda (self) (tcp-get-local-address context net self
+                                                        :package package)))
+            (cons "[method]tcp-socket.get-remote-address"
+                  (lambda (self) (tcp-get-remote-address context net self
+                                                         :package package)))
+            (cons "[method]tcp-socket.get-is-listening"
+                  (lambda (self) (tcp-get-is-listening context net self
                                                        :package package)))
-      (cons "[method]tcp-socket.set-keep-alive-enabled"
-            (lambda (self v) (tcp-set-keep-alive-enabled context net self v
+            (cons "[method]tcp-socket.get-address-family"
+                  (lambda (self) (tcp-get-address-family context net self
                                                          :package package)))
-      (cons "[method]tcp-socket.get-keep-alive-idle-time"
-            (lambda (self) (tcp-get-keep-alive-idle-time context net self
-                                                         :package package)))
-      (cons "[method]tcp-socket.set-keep-alive-idle-time"
-            (lambda (self v) (tcp-set-keep-alive-idle-time context net self v
+            (cons "[method]tcp-socket.set-listen-backlog-size"
+                  (lambda (self v) (tcp-set-listen-backlog-size context net self v
+                                                                :package package)))
+            (cons "[method]tcp-socket.get-keep-alive-enabled"
+                  (lambda (self) (tcp-get-keep-alive-enabled context net self
+                                                             :package package)))
+            (cons "[method]tcp-socket.set-keep-alive-enabled"
+                  (lambda (self v) (tcp-set-keep-alive-enabled context net self v
+                                                               :package package)))
+            (cons "[method]tcp-socket.get-keep-alive-idle-time"
+                  (lambda (self) (tcp-get-keep-alive-idle-time context net self
+                                                               :package package)))
+            (cons "[method]tcp-socket.set-keep-alive-idle-time"
+                  (lambda (self v) (tcp-set-keep-alive-idle-time context net self v
+                                                                 :package package)))
+            (cons "[method]tcp-socket.get-keep-alive-interval"
+                  (lambda (self) (tcp-get-keep-alive-interval context net self
+                                                              :package package)))
+            (cons "[method]tcp-socket.set-keep-alive-interval"
+                  (lambda (self v) (tcp-set-keep-alive-interval context net self v
+                                                                :package package)))
+            (cons "[method]tcp-socket.get-keep-alive-count"
+                  (lambda (self) (tcp-get-keep-alive-count context net self
                                                            :package package)))
-      (cons "[method]tcp-socket.get-keep-alive-interval"
-            (lambda (self) (tcp-get-keep-alive-interval context net self
-                                                        :package package)))
-      (cons "[method]tcp-socket.set-keep-alive-interval"
-            (lambda (self v) (tcp-set-keep-alive-interval context net self v
-                                                          :package package)))
-      (cons "[method]tcp-socket.get-keep-alive-count"
-            (lambda (self) (tcp-get-keep-alive-count context net self
+            (cons "[method]tcp-socket.set-keep-alive-count"
+                  (lambda (self v) (tcp-set-keep-alive-count context net self v
+                                                             :package package)))
+            (cons "[method]tcp-socket.get-hop-limit"
+                  (lambda (self) (tcp-get-hop-limit context net self
+                                                    :package package)))
+            (cons "[method]tcp-socket.set-hop-limit"
+                  (lambda (self v) (tcp-set-hop-limit context net self v
                                                      :package package)))
-      (cons "[method]tcp-socket.set-keep-alive-count"
-            (lambda (self v) (tcp-set-keep-alive-count context net self v
-                                                       :package package)))
-      (cons "[method]tcp-socket.get-hop-limit"
-            (lambda (self) (tcp-get-hop-limit context net self
-                                              :package package)))
-      (cons "[method]tcp-socket.set-hop-limit"
-            (lambda (self v) (tcp-set-hop-limit context net self v
-                                               :package package)))
-      (cons "[method]tcp-socket.get-receive-buffer-size"
-            (lambda (self) (tcp-get-receive-buffer-size context net self
-                                                        :package package)))
-      (cons "[method]tcp-socket.set-receive-buffer-size"
-            (lambda (self v) (tcp-set-receive-buffer-size context net self v
-                                                          :package package)))
-      (cons "[method]tcp-socket.get-send-buffer-size"
-            (lambda (self) (tcp-get-send-buffer-size context net self
-                                                     :package package)))
-      (cons "[method]tcp-socket.set-send-buffer-size"
-            (lambda (self v) (tcp-set-send-buffer-size context net self v
-                                                       :package package)))
-      ;; udp-socket
-      (cons "[static]udp-socket.create"
-            (lambda (fam) (udp-create context net fam :package package)))
-      (cons "[method]udp-socket.bind"
-            (lambda (self addr) (udp-bind context net self addr
-                                          :package package)))
-      (cons "[method]udp-socket.connect"
-            (lambda (self addr) (udp-connect context net self addr
-                                             :package package)))
-      (cons "[method]udp-socket.disconnect"
-            (lambda (self) (udp-disconnect context net self
-                                           :package package)))
-      (cons "[method]udp-socket.send"
-            (lambda (self data remote) (udp-send context net self data remote
+            (cons "[method]tcp-socket.get-receive-buffer-size"
+                  (lambda (self) (tcp-get-receive-buffer-size context net self
+                                                              :package package)))
+            (cons "[method]tcp-socket.set-receive-buffer-size"
+                  (lambda (self v) (tcp-set-receive-buffer-size context net self v
+                                                                :package package)))
+            (cons "[method]tcp-socket.get-send-buffer-size"
+                  (lambda (self) (tcp-get-send-buffer-size context net self
+                                                           :package package)))
+            (cons "[method]tcp-socket.set-send-buffer-size"
+                  (lambda (self v) (tcp-set-send-buffer-size context net self v
+                                                             :package package)))
+            ;; udp-socket
+            (cons "[static]udp-socket.create"
+                  (lambda (fam) (udp-create context net fam :package package)))
+            (cons "[method]udp-socket.bind"
+                  (lambda (self addr) (udp-bind context net self addr
+                                                :package package)))
+            (cons "[method]udp-socket.connect"
+                  (lambda (self addr) (udp-connect context net self addr
+                                                   :package package)))
+            (cons "[method]udp-socket.disconnect"
+                  (lambda (self) (udp-disconnect context net self
                                                  :package package)))
-      (cons "[method]udp-socket.receive"
-            (lambda (self) (udp-receive context net self :package package)))
-      (cons "[method]udp-socket.get-local-address"
-            (lambda (self) (udp-get-local-address context net self
-                                                  :package package)))
-      (cons "[method]udp-socket.get-remote-address"
-            (lambda (self) (udp-get-remote-address context net self
-                                                   :package package)))
-      (cons "[method]udp-socket.get-address-family"
-            (lambda (self) (udp-get-address-family context net self
-                                                   :package package)))
-      (cons "[method]udp-socket.get-unicast-hop-limit"
-            (lambda (self) (udp-get-unicast-hop-limit context net self
-                                                      :package package)))
-      (cons "[method]udp-socket.set-unicast-hop-limit"
-            (lambda (self v) (udp-set-unicast-hop-limit context net self v
+            (cons "[method]udp-socket.send"
+                  (lambda (self data remote) (udp-send context net self data remote
+                                                       :package package)))
+            (cons "[method]udp-socket.receive"
+                  (lambda (self) (udp-receive context net self :package package)))
+            (cons "[method]udp-socket.get-local-address"
+                  (lambda (self) (udp-get-local-address context net self
                                                         :package package)))
-      (cons "[method]udp-socket.get-receive-buffer-size"
-            (lambda (self) (udp-get-receive-buffer-size context net self
-                                                        :package package)))
-      (cons "[method]udp-socket.set-receive-buffer-size"
-            (lambda (self v) (udp-set-receive-buffer-size context net self v
-                                                          :package package)))
-      (cons "[method]udp-socket.get-send-buffer-size"
-            (lambda (self) (udp-get-send-buffer-size context net self
-                                                     :package package)))
-      (cons "[method]udp-socket.set-send-buffer-size"
-            (lambda (self v) (udp-set-send-buffer-size context net self v
-                                                       :package package))))
-     :packages pkg)))
+            (cons "[method]udp-socket.get-remote-address"
+                  (lambda (self) (udp-get-remote-address context net self
+                                                         :package package)))
+            (cons "[method]udp-socket.get-address-family"
+                  (lambda (self) (udp-get-address-family context net self
+                                                         :package package)))
+            (cons "[method]udp-socket.get-unicast-hop-limit"
+                  (lambda (self) (udp-get-unicast-hop-limit context net self
+                                                            :package package)))
+            (cons "[method]udp-socket.set-unicast-hop-limit"
+                  (lambda (self v) (udp-set-unicast-hop-limit context net self v
+                                                              :package package)))
+            (cons "[method]udp-socket.get-receive-buffer-size"
+                  (lambda (self) (udp-get-receive-buffer-size context net self
+                                                              :package package)))
+            (cons "[method]udp-socket.set-receive-buffer-size"
+                  (lambda (self v) (udp-set-receive-buffer-size context net self v
+                                                                :package package)))
+            (cons "[method]udp-socket.get-send-buffer-size"
+                  (lambda (self) (udp-get-send-buffer-size context net self
+                                                           :package package)))
+            (cons "[method]udp-socket.set-send-buffer-size"
+                  (lambda (self v) (udp-set-send-buffer-size context net self v
+                                                             :package package))))
+           :packages pkg)))
+    ;; M17: the socket resources' release hooks belong to THIS
+    ;; provider instance (the one whose types produced the cts), not
+    ;; to a ct-keyed global: two sockets providers never share a
+    ;; finalizer.
+    (wasmdown.component.runtime:host-register-resource-dtor
+     inst tcp-ct #'close-wasi-tcp-socket)
+    (wasmdown.component.runtime:host-register-resource-dtor
+     inst udp-ct #'close-wasi-udp-socket)
+    inst))
 
 (defun ip-name-lookup-instance (context
                                 &key network
