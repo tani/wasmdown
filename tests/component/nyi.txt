@@ -1,3 +1,27 @@
+# M17 SESSION 22 — THE TYPE-VIEW VERDICT, MEASURED IN A CLEAN WINDOW: ITS HISTORICAL
+# BLOCKER IS GONE AND IT IS AT PARITY, BUT IT COSTS TWO ONE-OFF ROWS AGAINST A GREEN
+# MASTER, SO IT STAYS PARKED.
+# THE ADJACENT PAIR (quiet box, master block second, nothing between):
+#   verdict tree (type-view reapplied on TODAY's master, pins merged)  2/30 red,
+#      2 fail commands, walls 9.83-10.50   rows: sync-streams::1, reentrance::20
+#   master 0452456                                                    0/30 red,
+#      0 fail commands, walls 9.92-15.02
+# WHAT THIS SETTLES: type-view's original verdict was "23/30 acs::2 vs 2/30" — that row
+# does NOT appear at all now, in either tree. The acs mechanism was fixed underneath it
+# (90715e2 + the marker credit), so the feature no longer perturbs the row that blocked
+# it. What is left is +2 one-off rows, far inside the instrument's width.
+# WHY IT IS NOT LANDED ANYWAY: master is GREEN (0 x 30). A change whose measured cost is
+# two rows, when the baseline is zero, would take the only green lane in this project's
+# history off green for a feature nothing currently needs. The policy that follows from
+# that is worth recording as a rule: ONCE A LANE IS GREEN, the bar for landing is "no
+# measured cost in the window", not "inside the instrument's width".
+# rerun/type-view (db880be, on the older master) remains the archived branch; the
+# reapplication recipe is: `git diff 36c11c2 d864d1a -- src/...` then
+# `-- tests/component-pins.lisp`, and the pins MUST be merged by name (a side-pick
+# silently drops regression pins). Its expected unit count is master's + 1 (the
+# type-view pin function bundles five assertions).
+# wip/reactor-wiring keeps its own verdict pending; the same clean-window pair is the
+# method, and the same "no measured cost" bar applies while master is green.
 # M17 SESSION 21 — THE PLAN'S ACCEPTANCE IS MET: MASTER READS 0 FAIL x 30 RUNS.
 #   batch GREEN-CHECK (merged master 07131e4, quiet box, 1631 commands per run):
 #     red_runs=0/30   fail_commands=0   walls 9.86-10.53 s
