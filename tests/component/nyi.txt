@@ -1,3 +1,32 @@
+# M17 SESSION 6f — THE PARK SET IS NOW SELF-DESCRIBING, AND THE PROVIDER-IDENTITY
+# LIMIT IS RECORDED RATHER THAN HIDDEN.
+# wip/reactor-wiring — its standalone next step, written here because it was the one
+#   parked delta without one:
+#     NEXT: take an adjacent n=30 pair AT AN UNPINNED WINDOW (master's own acs::2
+#     must read low first; if it reads ~30/30, stop — the window is informative of
+#     nothing). Then, if it still differs, bisect by sub-element in this order:
+#     (2) the wasi-context reactor slot + per-run reactor creation, (1) the driver
+#     pump, (3) the socket/UDP nonblocking plumbing, (4) clock wait-until/wait-for.
+#     The n=6-era exonerations of (1) and (2) are UNPROVED after this session's
+#     method correction — do not inherit them as facts.
+# STEP 2's PROVIDER-IDENTITY LIMIT, measured (a36edfb): two providers built from the
+# SAME parsed WIT package share the resource ct object, so owner-by-ct cannot tell
+# them apart; %host-resource-owner's nearest-answer rule applies and the
+# distinguishable thing is the REP — component/two-providers-drop-own-finalizers-pin
+# asserts exactly that, and shows the graph becoming unambiguous when the providers
+# come from distinct package parses (distinct cts). If per-instance precision is ever
+# needed for same-package providers, the fix is an owner identity on the ct, which is
+# src/component.lisp work and a plan-visible change — not a local patch.
+# THE PARK SET, one line each (fully self-describing now):
+#   wip/store-right    REJECTED on measurement; design record + the acquisition-side
+#                      quantum lead (during-sync 47/54 of the fail mass).
+#   wip/type-view      CONFIRMED vector at 14.5x by an adjacent pair; 5 function-level
+#                      cuts negative; next = hunk-range bisect (24 anchors in this file;
+#                      cut A = start lines < 5000, then halve).
+#   wip/reactor-wiring UNRESOLVED (mean +9/30 vs a 22-wide batch); next = the adjacent
+#                      unpinned-window pair above, then sub-element order (2)(1)(3)(4).
+#   wip/link-contracts LANDED (0621f0a) at parity; kept only as history.
+#   wip/abi-type-space history (merged at 68cf178).
 # M17 SESSION 6e — STEP 2 IS NOW CLOSED (destructor lifetime), and the closing is a
 # MEASUREMENT not a claim. Commit ac58168.
 # THE GAP IS GONE: a guest-initiated resource.drop now reaches the provider's
