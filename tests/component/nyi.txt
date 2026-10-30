@@ -1,3 +1,50 @@
+# M17 SESSION 8 — MASTER NOW CARRIES THE STEP-4 STACK (single right + reservation +
+# resume-later), MERGED AS BEST-MEASURED STATE, NOT AS "FIXED" (merge 9b7f300).
+# WHAT IS ON MASTER: %right as a mutex whose waits release it by construction (one
+# condition-wait in the whole runtime), the reservation arms (a mid-turn holder keeps
+# the quantum; self takes it back after the resume-all fan-out), and resume-later
+# implementing §458-465 start_waiting(ready=True) on ANY target state — the trap
+# "cannot resume thread which is not suspended" is gone from that builtin.
+# THE EVIDENCE THAT CARRIED THE MERGE (adjacent pair, unpinned window, master acs::2
+# 1/30): master 33 fail commands / 30 runs vs the branch 14 and 31 (identical-content
+# variance on this box is 14<->31); during-sync family aggregated over 60 runs each
+# side 55/60 (27.5 per 30) -> 32/60 (16.0 per 30); dssc::16 13 -> 0; acs::2 16 -> 0;
+# may-block::8 16 -> 9; excl-resume::2 7 -> 5; crcc::3 1/60 on BOTH sides. And a
+# verified single-fixture before/after: dssc::16 trapped 18/30 on the base and 30/30
+# passes after; the whole async suite in one process x12 went 5 occurrences -> 0.
+# POST-MERGE SMOKE ON MASTER (6 runs, this tree): 3 green; fail commands 3,0,0,2,1,1
+# with rows dssc::19, dssc::22, reentrance::14, excl-resume::2 x2, may-block::8 x2 —
+# and ZERO async-calls-sync rows. No hang, no rc=124.
+# STANDING BLOCKERS, named so nobody reads this as a closure:
+#   may-block::8 and excl-resume::2 are in-guest `unreachable` checks (premature park
+#     release), not the resume trap, and they only halved;
+#   dssc::22 is 2/30 on every arm in this window;
+#   dssc::19's rate is unchanged (5.0 -> 5.5/30) and its MESSAGE changed from the
+#     resume trap to "cannot switch to the current thread": that fixture's `f`
+#     thread and the calling thread SHARE ONE Thread record because the instance's
+#     implicit thread is reused. That is a real modelling bug with its own fix
+#     (shared-record / implicit-thread identity), not a scheduling patch.
+# THE LIVE-VS-SUSPENDED GAP, one site left: the message "cannot resume thread which
+# is not suspended" still comes from the suspend-then-resume / yield-then-resume arm
+# (rt:7222), spec-mandated by §4688/§4714. The repair there is to make suspended-p
+# reflect a truly parked peer — NOT to widen the exemption resume-later just widened,
+# because those two builtins are the spec's explicit resume paths.
+# THE PARK SET, one line each (all self-describing):
+#   wip/store-quantum  the reservation arm alone (kept as the A/B base for the above).
+#   wip/store-right    the single right without the reservation.
+#   wip/sync-selection same-instance SELECTION filter: measured inert (869 scoped
+#                      comparisons, 2 changed picks) — it is what DIAGNOSED the real
+#                      cause (resume-later on a live thread), so it stays as evidence.
+#   wip/type-view      CONFIRMED acs::2 vector at 14.5x by an adjacent pair; five
+#                      function-level cuts negative; next = hunk-range bisect (24
+#                      anchors recorded; cut A = start lines < 5000, then halve).
+#   wip/reactor-wiring UNRESOLVED (mean +9/30 against a 22-wide batch); next = adjacent
+#                      pair at an unpinned window, then sub-element order (2)(1)(3)(4).
+#   wip/abi-type-space history (merged at 68cf178).
+# NEXT, in value order: (1) the shared-record/implicit-thread modelling bug behind
+# dssc::19; (2) the live-vs-suspended gap at say rt:7222 for the two explicit resume
+# arms; (3) the in-guest premature-park-release checks behind may-block::8 and
+# excl-resume::2; (4) then the parked branches, each with its recorded next step.
 # M17 SESSION 7 — STEP 4's ACQUISITION-SIDE QUANTUM: MEASURED, PARKED, AND IT
 # EXPOSES THE COUPLING THAT DECIDES THE REST OF THE DESIGN. Branch
 # `wip/store-quantum` (0b81e7c) cut from `wip/store-right`.
