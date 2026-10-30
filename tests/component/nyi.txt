@@ -1,3 +1,45 @@
+# M17 SESSION 12 — STEP 5's RUNTIME HALF LANDED (08c7d2d). The provider migration and
+# the store-owned event queue are the NEXT wave, and they are named below so nobody
+# reads this as step 5 complete.
+# LANDED: host-pending (states :starting/:waiting/:resolved/:cancelled/:rejected plus
+# cancel-requested/installed/fired/queued; resolve/reject/acknowledge-cancel only
+# ENQUEUE an event and are callable from any native thread; a re-entrancy-guarded
+# pump runs the continuation once outside every lock with the caller-captured
+# context; a cancel during :starting is recorded and fired once after the cancel-fn
+# is installed; a cancel request is NOT terminal and a late completion is dropped;
+# only a true cancel-fn return acknowledges; host-future-watch queues even for an
+# already-resolved value, takes the value out of the peer's slot without copying, and
+# a sync-typed host closure returning a pending is a host error).
+# LANDED: the byte-sink contract (octets start end) -> (values consumed error-or-nil)
+# with the 64 KiB span cap, no "n>0 with error", (0 nil) = WOULD-BLOCK consuming
+# nothing, only-accepted-bytes-advance progress, exact on
+# e-notify completion, and accepted progress PLUS the WIT error preserved on a hard
+# error or cancel. Guest stream<u8> buffers hand the provider the LINEAR-MEMORY VECTOR
+# with absolute offsets, re-taken every attempt so memory.grow is honoured — zero
+# copies, no byte-list round trip; a host buffer's queue is packed into a
+# per-generation scratch vector; a non-u8 element type is a host error at
+# registration AND at drain.
+# LANDED: source keeps (max) -> (values sequence eof-p), accepts a u8 vector, and
+# (nil nil) is a temporary would-block, NOT EOF. Generations advance on attempt,
+# cancel and drop on both ends; host-end-ready claims a parked copy only when the
+# generation matches, so a stale fd wake cannot resume a newer copy.
+# MEASURED: units 514/0 twice; the eight stream/future fixtures 151 rows / 0 FAIL
+# twice; probe-async-perfile shows no hang and only the three pre-existing flake
+# files (cancel-targeted-resume, during-sync-scheduling-candidates, reentrance) which
+# fail at 23f2053 as well.
+# NEXT WAVE (step 5 completion), in order:
+#   1. src/wasi.lisp provider migration OFF the one-argument list-sink adapter
+#      (host-end-set-sink currently adapts it, arity probed via sb-introspect):
+#      cl-stream-sink, %fd-pwrite-sink and TCP send move to (octets start end) and
+#      stop allocating a byte list; %fd-pread-source, %directory-source,
+#      %tcp-recv-source and %tcp-accept-source return vectors / use readiness instead
+#      of blocking.
+#   2. Providers that should RETURN a pending: monotonic-clock waits, reactor-driven
+#      socket I/O, DNS and blocking-stdio executors.
+#   3. The completion queue moves from a global FIFO into the STORE's queue, driven
+#      from %store-tick (today host-end-ready retries on the caller's thread).
+#   4. Then step 6's remaining wiring (reactor -> store driver) and step 7/8 are
+#      OUT OF SCOPE (WASI HTTP was removed at user direction).
 # M17 SESSION 11 — STEP 3's PARSER HALF LANDED (0f81ad5); STEP 3 IS NOW COMPLETE FOR
 # EVERY CONSTRUCT THAT EXISTS IN THIS TREE, WITH ITS LIMITS STATED.
 # LANDED: world `include` (+ `with { a as b }` renames), named and inline interface
