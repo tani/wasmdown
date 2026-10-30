@@ -1,3 +1,35 @@
+# M17 SESSION 18 — dssc::2 CLOSED: EXPLICIT SWITCHES ARE TARGET-LIMITED HANDOFFS
+# (e6dcd30). The last during-sync row is gone.
+# THE IN-GUEST CHECK: (drop (call $thread.yield-then-promote worker)) then
+# (if (i32.eqz (global.get $worker-ran)) (then unreachable)) — the promoting caller
+# returned before the worker took its first turn.
+# THE INSTRUMENTED WAKER (not the target): the caller armed the switch, RESUMEd the
+# target with post-to=caller, parked — and async-thread-resume-all's fan-out woke it,
+# because the driver saw the caller as YIELD-PARKED and grantable-p admitted it
+# (trace: rc=0, tgt-done=NIL, the target's handoff line arriving AFTER the caller had
+# returned). The switch arm's yield branch had released on "any wake/timeout".
+# THE FIX, by construction: per-thread switch-parked/switch-target state (set only for
+# a REAL resolvable target; the §549 fallback keeps the old predicates; cleared in the
+# arm's unwind-protect and both teardown sweeps); grantable-p and
+# %drain-tick-needed-p EXCLUDE a switch caller; a switch park is released by
+# resume-count > 0 or, for yield_then_* (caller left READY, §536), by the target's
+# park-count advancing; and %async-thread-park-boundary gives a waiting switcher a
+# bare NUDGE at an ordinary park while only the suspend handoff and a thread EXIT post
+# a RESUME. That nudge-vs-resume distinction is load-bearing: an over-broad "resume at
+# every park" regressed cancel-resumed-callback-switch to 0/10 and was diagnosed and
+# reverted before landing.
+# MEASURED: dssc::2 10/10 standalone (was 6/30; 9/10 in one probe batch) and clean
+# inside the new pin's verbatim run of the whole file; units 529/0 twice (528 + the
+# pin); 12-fixture superset 225/225/0; per-file probe no hang, no FAIL.
+# Informational, same tree: cancel-resumed-callback-switch 10/10 clean,
+# reentrance::14 9/10 clean (baseline 5/10 fail in an isolated HEAD worktree).
+# STATE OF THE HISTORICAL RESIDUALS — this is the first time all four are clean or
+# near-clean simultaneously: acs::1/::2 0, ctr::9 0-5 depending on window,
+# reentrance::14 ~1/10, crcc::3 0, crcc::1 0-6 depending on window, dssc::19 0,
+# dssc::2 0, may-block::8 0, excl-resume::2 0. What is NOT yet done is the measured
+# confirmation at n=30 in ONE window on a QUIET machine (the user's benchmark has held
+# the box all session, so the meter refuses) — and with it the two deferred verdicts
+# (rerun/type-view, wip/reactor-wiring).
 # M17 SESSION 17 — THE TWO "PREMATURE PARK RELEASE" ROWS WERE ALREADY CLOSED BY
 # 90715e2; THIS SLICE PROVED IT DIFFERENTIALLY AND PINNED IT (merge 3ab0d5a).
 # THE PROOF: the credit split was RE-BROKEN in isolation (async-thread-suspend made to
