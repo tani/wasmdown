@@ -1,3 +1,27 @@
+# M17 SESSION 10b — THE TYPE-VIEW REAPPLY IS DONE AND VERIFIED; ONLY THE LANE PAIR IS
+# PENDING. Branch `rerun/type-view` (db880be), cut from master 8f28251.
+# HOW IT WAS REAPPLIED: the production half and the pin half as SEPARATE patches
+# (`git diff 36c11c2 d864d1a -- src/...` and `-- tests/component-pins.lisp`). The
+# production half applied cleanly. The pin half conflicted for one reason only: both
+# sides edit the pin REGISTRATION LIST, not any pin's semantics. Resolved by MERGING
+# the sets — master's full list plus component/type-view-owner-pins — because a
+# single-side resolution silently drops twelve regression pins (that is exactly why
+# the first attempt was abandoned instead of forced).
+# PIN INTEGRITY, checked the only way that cannot hide behind "it parses":
+#   git diff master --numstat tests/component-pins.lisp  ->  112 additions, 0 deletions
+#   units -> 506/0 twice  (505 + the single type-view pin function, which bundles
+#            five assertions — the "505 + 5" expectation was mine and was wrong)
+# WHY THE PAIR IS STILL PENDING: an SBCL the USER is running
+# (benchmarks/prolog/competitive.lisp, a fresh PID each time it is sampled) holds the
+# machine, and tools/probe-async-lane.sh's quiet guard refused — by design. A live
+# user process is NEVER killed for a measurement (unlike the day-old zombie earlier,
+# which was killed because its 26-hour uptime proved it hung). The deferred pair:
+#   master block (already taken at 8f28251: 16 red / 29 fail / walls 9.37-14.33)
+#   then  tools/probe-async-lane.sh --branch rerun/type-view --runs 30 --label rr-tv --allow-dirty
+#   in the SAME window, `pgrep -c sbcl` = 0 first.
+# AND THE MISREADING TO PREVENT: the master block alone says NOTHING about type-view.
+# Yesterday's 29/30-vs-2/30 adjacent pair is the historical verdict; today's pair has
+# one side only, so the question is OPEN until the second block exists.
 # M17 SESSION 10 — THE PARKED-BRANCH RE-RUN ON TODAY'S MASTER: ONE BLOCK OBTAINED,
 # THE OTHER BLOCKED BY THE USER'S OWN BENCHMARK, AND NOTHING POISONED.
 # WHAT WAS MEASURED (adjacent pair attempt for `wip/type-view`, master block first):
