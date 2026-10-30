@@ -2336,6 +2336,7 @@ reentrance phase checks). The CALLER then waits:
           ;; STARTED-wait, ~10/10 deterministic).
           (setf (async-thread-suspended-p th) nil)
           (setf (async-thread-yield-parked th) nil)
+          (setf (async-thread-switch-parked th) nil)
           (setf (async-thread-abandoned th) t)
           (%sync-lift-exit task th)
           (sb-thread:with-recursive-lock ((async-thread-mutex th))
@@ -5132,6 +5133,34 @@ wrong-index probe: one transfer produced index 3)."
   (abandoned nil)                    ; store-teardown mark: parks unwind, the thread exits
   (yield-parked nil)                 ; parked by async-thread-yield (READY)
   (suspended-p nil)                  ; SUSPENDED (§494): only an explicit resume wakes
+  (switch-parked nil)                ; PARKED IN AN EXPLICIT SWITCH (§474-484,
+                                     ; §528-565): the caller of
+                                     ; thread.{suspend,yield}-then-{resume,promote}
+                                     ; with a REAL target handed the CPU. It is NOT
+                                     ; a tick/ready-grant candidate (resume-all's
+                                     ; grantable-p and the drain's tick test read
+                                     ; this) and a plain nudge never releases it: the
+                                     ; only release is the target's own park/exit
+                                     ; handoff post (a §474 resume credit). The spec's
+                                     ; switch is SYNCHRONOUS (§474-484: the resumer
+                                     ; runs the switch_to chain to the target's block
+                                     ; or return), so the caller's post-switch code
+                                     ; may not run before the target's first turn
+                                     ; ends. Cleared on every exit path of the park.
+  (switch-target nil)                ; the handoff target of the switch above
+                                     ; (diagnostics/the pin; identity only)
+  (park-count 0 :type (unsigned-byte 64))
+                                     ; THE TURN-BOUNDARY COUNTER: bumped once at
+                                     ; EVERY park boundary (a yield-entry, a WAITING
+                                     ; park's wait, a suspend park, an exit — the
+                                     ; spec's `block' of §474-484). A switch caller
+                                     ; samples the TARGET's count before the resume:
+                                     ; the target's FIRST TURN has ended exactly when
+                                     ; the count advanced, which is what lets a
+                                     ; yield_then_* caller's post-switch code run
+                                     ; (§536: `block(switch_to=other)' returns after
+                                     ; the target blocks or returns) without ever
+                                     ; observing it before that boundary.
   (ready-p nil)                      ; §458-465 start_waiting(ready=True): resume-later's
                                      ; mark — the next tick (§932) fires the pending
                                      ; spawn / grants a suspend-park, or an explicit
@@ -5240,7 +5269,11 @@ LIVENESS INVARIANT: a hang means this classification missed a site."
         (sb-thread:with-recursive-lock (*scheduler-mutex*)
           (dolist (t2 *scheduler-threads*)
             (unless (or (eq t2 root) (async-thread-abandoned t2))
-              (when (or (async-thread-yield-parked t2)
+              (when (or (and (async-thread-yield-parked t2)
+                             ;; a switch caller's park is not a yield
+                             ;; the tick can release: only the target's
+                             ;; handoff post does (§474-484)
+                             (not (async-thread-switch-parked t2)))
                         (async-thread-ready-p t2)
                         (and (async-thread-ready-fn t2)
                              (not (async-thread-io-parked t2))
@@ -5659,6 +5692,18 @@ wait is a host-completion boundary too — queued host events (a
 pending's resolution, a future watch) run HERE, in the caller's
 captured context, never on the posting thread."
   (%right-yield self)
+  ;; THE BLOCK ITSELF IS THE HANDOFF (§242-273, §474-484): a thread
+  ;; with a SWITCHER waiting in POST-TO ends its turn at EVERY park,
+  ;; so the switcher learns the target BLOCKED (a bare nudge here —
+  ;; the resume that returns a SUSPENDED switcher's block is posted
+  ;; only by the suspend park and the exit, and by an explicit
+  ;; resume; a wset/read block must NOT run a cancelled callback
+  ;; past the canceller's observation: cancel-resumed-callback-
+  ;; switch's control flows out through subtask.cancel, and the
+  ;; callback must stay suspended mid-frame). Side-effect-free for
+  ;; a park with no switcher; a peer-mutex section only (no wait),
+  ;; so the §lock order is unchanged.
+  (%async-thread-park-boundary self)
   (%bounded-wait queue mutex timeout)
   (sb-thread:release-mutex mutex)
   (%right-acquire self)
@@ -5907,6 +5952,32 @@ must never end a suspension."
   (sb-thread:condition-broadcast (async-thread-waitqueue thread))
   (sb-thread:condition-broadcast (async-thread-suspend-waitqueue
                                   thread)))
+
+(defun %async-thread-park-boundary (thread)
+  "THREAD has reached a PARK BOUNDARY — the spec's `block' (§474-484:
+  the continuation ran until it blocked or returned). Bump
+  PARK-COUNT (the turn-boundary observable a switch caller samples)
+  and NUDGE a waiting switcher (POST-TO, slot KEPT).
+
+  This is deliberately a bare nudge, not the §242-273 resume: a
+  switch caller may not run past its target's block. §474-484's
+  `switch_to' chain returns control to the RESUMER (the outermost
+  Thread.resume), not to the switcher: when the target blocks inside
+  the switcher's frame, the switcher stays blocked (the canceller
+  observes it re-parked: cancel-resumed-callback-switch's callback
+  is 'still suspended part-way through'). Only the suspend park's
+  handoff and the EXIT post a resume (plus an explicit resume_later/
+  Thread.resume); a yield_then_* caller (READY, §536 ink) is instead
+  released at a tick once PARK-COUNT advanced — that is the turn
+  boundary it was told to wait for. Letting a yield post a resume
+  regressed suspend-vs-yield-determinism; letting every %park post
+  one regressed cancel-resumed-callback-switch."
+  (let ((r nil))
+    (sb-thread:with-recursive-lock ((async-thread-mutex thread))
+      (incf (async-thread-park-count thread))
+      (setf r (async-thread-post-to thread)))
+    (when r
+      (%async-thread-wake r))))
 
 (defun %async-thread-post-handoff (thread)
   "M13-4 the HANDOFF post (§242-273's handler-lock release): a
@@ -6201,6 +6272,13 @@ the caller's own thread; never a plain suspend-parked thread
              (lambda (th)
                (and (not (async-thread-abandoned th))
                     (not (eq th *current-thread*))
+                    ;; a caller parked in an explicit switch is NOT a
+                    ;; tick/ready-grant candidate: its only waker is
+                    ;; the target's park/exit handoff post (§474-484).
+                    ;; Its yield-parked flag stays set for the
+                    ;; TARGET-side predicates (a peer may promote a
+                    ;; ready thread), but no quantum may be granted.
+                    (not (async-thread-switch-parked th))
                     (or (async-thread-yield-parked th)
                         (and (async-thread-task th)
                              (async-task-gate-parked
@@ -6355,6 +6433,13 @@ count arriving with the wake is THIS park's, never the next's."
   (let ((m (async-thread-mutex thread)))
     (sb-thread:grab-mutex m)
     (setf (async-thread-yield-parked thread) t)
+    ;; §523: this is a READY park — the yielder expects to CONTINUE.
+    ;; The boundary is still a TURN END for a switcher that promoted
+    ;; this thread (dssc::12's callback target spins here), so the
+    ;; count is bumped and the switcher gets a bare nudge; the
+    ;; POST-TO slot is NOT claimed, so a suspended switch caller is
+    ;; not released by a yield (suspend-vs-yield-determinism).
+    (%async-thread-park-boundary thread)
     (%block-enter thread)
     ;; M14 the PARK READINESS (§523: a yield is ALWAYS ready — the
     ;; park's ready-fn, per the spec's start_waiting(ready_func))
@@ -7449,6 +7534,7 @@ drop-readable must return index 1 again)."
                ;; thread exits on its own; the caller traps.
                (setf (async-thread-suspended-p th) nil)
                (setf (async-thread-yield-parked th) nil)
+               (setf (async-thread-switch-parked th) nil)
                (setf (async-thread-block-depth th) 0)
                (setf (async-thread-abandoned th) t)
                (ignore-errors (%task-exit-implicit-thread task))
@@ -8560,8 +8646,26 @@ is the valtype."
               ;; DURABLE, so no interleaving of the three parties
               ;; loses a wake.
               (async-thread-resume-all)
-              (let ((mu (async-thread-mutex *current-thread*))
-                    (ct *current-thread*))
+              (let* ((mu (async-thread-mutex *current-thread*))
+                     (ct *current-thread*)
+                     ;; THE SWITCH IS A TARGET-LIMITED HANDOFF: a
+                     ;; REAL target was named, so the caller parks
+                     ;; as a SWITCH park — not a tick candidate and
+                     ;; releasable only by the §474 resume the
+                     ;; target's own park/exit posts back (§242-273).
+                     ;; With NO target (a promote/`-then-resume`
+                     ;; that fell back, §549) this is the plain
+                     ;; suspend/yield it fell back to: the old
+                     ;; predicates apply unchanged.
+                     (switch-p (not (null resumable-target)))
+                     ;; THE TARGET'S TURN-BOUNDARY SAMPLE: the caller
+                     ;; holds the store right here, so the target
+                     ;; cannot advance past this read before the
+                     ;; resume; the caller may proceed only when the
+                     ;; count has ADVANCED (its first turn ended).
+                     (target-parks (and switch-p
+                                        (async-thread-park-count
+                                         resumable-target))))
                 (sb-thread:grab-mutex mu)
                 (async-thread-check-abandoned ct)
                 ;; M13-tok34 THE INTER-ROUND DRAIN (see the note
@@ -8572,6 +8676,9 @@ is the valtype."
                 (if yield-p
                     (setf (async-thread-yield-parked ct) t)
                     (setf (async-thread-suspended-p ct) t))
+                (when switch-p
+                  (setf (async-thread-switch-parked ct) t
+                        (async-thread-switch-target ct) resumable-target))
                 (%block-enter ct)
                 (unwind-protect
                      (progn
@@ -8608,22 +8715,51 @@ is the valtype."
                                     (async-thread-suspend-waitqueue ct)))
                          (sb-thread:grab-mutex mu)
                          (let ((done
-                                 (if yield-p
-                                     ;; yield_then_* parks with
-                                     ;; start_waiting(ready=True)
-                                     ;; (§536/§560) — a WAITING
-                                     ;; thread, so any §932 tick may
-                                     ;; resume it; a plain nudge is
-                                     ;; spec-legal here.
-                                     t
-                                     ;; suspend_then_* (§531/§549)
-                                     ;; blocks with NO readiness
-                                     ;; (§494): only an explicit
-                                     ;; resume may release it, never
-                                     ;; a plain nudge — the same rule
-                                     ;; as thread.suspend itself.
-                                     (> (async-thread-resume-count ct)
-                                        0))))
+                                 (cond
+                                   (switch-p
+                                    ;; §474-484: the switch's
+                                    ;; `switch_to' chain runs the
+                                    ;; target SYNCHRONOUSLY to its
+                                    ;; block or return; control comes
+                                    ;; back to the caller ONLY then —
+                                    ;; as the target's §242-273
+                                    ;; handoff (a §474 resume from a
+                                    ;; TRUE block/exit) or, for a
+                                    ;; yield_then_* caller (§536: it
+                                    ;; is left READY), when the
+                                    ;; target's first turn ENDED at
+                                    ;; any park (the count advanced).
+                                    ;; A generic nudge or resume-all
+                                    ;; broadcast is NOT either event
+                                    ;; and must not release this park
+                                    ;; on its own — the measured
+                                    ;; dssc::2 early return was exactly
+                                    ;; a resume-all nudge of this
+                                    ;; yield-parked caller while the
+                                    ;; target had not yet taken its
+                                    ;; first turn.
+                                    (or (> (async-thread-resume-count ct)
+                                           0)
+                                        (and yield-p
+                                             (> (async-thread-park-count
+                                                 resumable-target)
+                                                target-parks))))
+                                   (yield-p
+                                    ;; the FALLBACK (§549's else
+                                    ;; arm): yield_ = a WAITING park
+                                    ;; whose ready-fn is True
+                                    ;; (§523) — any nudge re-tests
+                                    ;; it, and it is ready.
+                                    t)
+                                   (t
+                                    ;; suspend_then_* (§531/§549)
+                                    ;; blocks with NO readiness
+                                    ;; (§494): only an explicit
+                                    ;; resume may release it, never
+                                    ;; a plain nudge — the same rule
+                                    ;; as thread.suspend itself.
+                                    (> (async-thread-resume-count ct)
+                                       0)))))
                            (setf (async-thread-wake-count ct) 0
                                  (async-thread-resume-count ct) 0)
                            (sb-thread:release-mutex mu)
@@ -8632,6 +8768,12 @@ is the valtype."
                   (if yield-p
                       (setf (async-thread-yield-parked ct) nil)
                       (setf (async-thread-suspended-p ct) nil))
+                  ;; the switch park's own state dies with the park —
+                  ;; on the trap/abandoned unwind too, so a running
+                  ;; thread is never a non-candidate or a "switcher"
+                  ;; for the next call.
+                  (setf (async-thread-switch-parked ct) nil
+                        (async-thread-switch-target ct) nil)
                   ;; the switch park spent the caller's resume credit
                   ;; (the arm's own wake and any mark a peer posted
                   ;; onto it): clear it WITH the park flags, on the

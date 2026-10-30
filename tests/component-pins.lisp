@@ -3377,7 +3377,9 @@ the abandoned mark at their loop top and exit)."
        (dolist (th wasmdown.component.runtime::*scheduler-threads*)
          (setf (wasmdown.component.runtime::async-thread-abandoned th) t
                (wasmdown.component.runtime::async-thread-suspended-p th) nil
-               (wasmdown.component.runtime::async-thread-yield-parked th) nil)
+               (wasmdown.component.runtime::async-thread-yield-parked th) nil
+               (wasmdown.component.runtime::async-thread-switch-parked th)
+               nil)
          (sb-thread:with-recursive-lock
              ((wasmdown.component.runtime::async-thread-mutex th))
            (sb-thread:condition-broadcast
@@ -4054,6 +4056,269 @@ waits unbounded)."
         136 207)
        "premature-park-may-block.wast")))
 
+(test component/switch-caller-is-not-grantable-pin
+  ;; THE EXPLICIT SWITCH IS A TARGET-LIMITED HANDOFF
+  ;; (CanonicalABI.md 474-484, 528-565; the §242-273 handler
+  ;; discipline). The spec's switch is SYNCHRONOUS: `block(switch_to
+  ;; = other)' hands the CPU to `other' inside the SAME Thread.resume
+  ;; chain, which runs `other' until it blocks or returns
+  ;; (§474-484). Only then does control come back — at the target's
+  ;; PARK/EXIT BOUNDARY (a §474 resume from a true block or the
+  ;; exit; a turn-boundary bump when the target's first turn ends at
+  ;; a READY yield park §523, which hands nothing away), never at a
+  ;; §932 tick. A caller parked in a switch is therefore NOT a
+  ;; tick/ready-grant candidate (§936: only WAITING+ready threads
+  ;; are) and a generic nudge (wake-count) must not release it: it
+  ;; is the same exclusion the suspend park has for its own park.
+  ;;
+  ;; The measured dssc::2 failure was exactly this: a resume-all
+  ;; fan-out nudged the yield-parked switch caller while the
+  ;; promoted worker had not yet taken its first turn, the yield
+  ;; branch of the switch park accepted any wake, and the guest's
+  ;; `run-promote' reached its `unreachable' check with the worker
+  ;; not yet run. Pinned here on a synthetic pair driven through
+  ;; the REAL canon builtin:
+  ;;  (1) the target takes its FIRST TURN before the caller's post-
+  ;;      switch code, and the caller STAYS parked in that window —
+  ;;      a plain nudge AND async-thread-resume-all do not release
+  ;;      it; only the target's next park/exit boundary does;
+  ;;  (2) the target's RETURN (the production exit path) releases
+  ;;      the caller (the exit-side handoff, §4886-4894);
+  ;;  (3) the same-index switch is still the guest's trap
+  ;;      (§4728/§4749) — the switch-park state did not widen it;
+  ;;  (4) the switch-park state is gone on every exit path.
+  ;;
+  ;; The last during-sync row runs VERBATIM too: its `run-promote' end
+  ;; is the guest's own `unreachable' check that the promoted worker
+  ;; has taken its first turn (the in-lane rate this pin keeps at 0).
+  (is (%pin-rows-pass-p
+       (%pin-slice "tests/component/async/during-sync-scheduling-candidates.wast"
+                   1 100000)
+       "during-sync-scheduling-candidates.wast"))
+  (%pin-with-store
+    (let* ((inst (%pin-inst))
+           (lock (sb-thread:make-mutex :name "pin-switch-order"))
+           (order nil)
+           (note (lambda (x)
+                   (sb-thread:with-mutex (lock) (push x order))))
+           (seen-p (lambda (x)
+                     (sb-thread:with-mutex (lock)
+                       (and (member x order) t)))))
+      (labels ((pos (x)
+                 (sb-thread:with-mutex (lock)
+                   (position x (reverse order))))
+               (switch-parked-p (th)
+                 (wasmdown.component.runtime::async-thread-switch-parked th))
+               (kw (name)
+                 (%pin-builtin inst name)))
+        ;; ---- (1) release at the target's park boundary
+        (let* ((target (%pin-thread inst 2 '(1 0)))
+               (caller (%pin-thread inst 1 '(1)))
+               (gate (list nil))
+               (target-done (list nil))
+               (caller-done (list nil))
+               (caller-result (list nil))
+               (caller-err (list nil)))
+          (%pin-register inst target)
+          (%pin-register inst caller)
+          (let ((bt (sb-thread:make-thread
+                     (lambda ()
+                       (let ((wasmdown.component.runtime::*current-thread*
+                               target)
+                             (wasmdown.component.runtime::*right-self*
+                               target)
+                             (wasmdown.component.runtime::*right-ticket*
+                               nil)
+                             (wasmdown.component.runtime::*scheduler-threads*
+                               nil))
+                         (unwind-protect
+                              (handler-case
+                                  (progn
+                                    ;; the target's first turn = this
+                                    ;; yield park being resumed by the
+                                    ;; switch (§536/§560)
+                                    (wasmdown.component.runtime::async-thread-yield
+                                     target)
+                                    (funcall note :target-first-turn)
+                                    ;; end the quantum, then HOLD the
+                                    ;; handoff: the caller must stay
+                                    ;; parked in this window
+                                    (wasmdown.component.runtime::%right-yield
+                                     target)
+                                    (%pin-wait-for
+                                     (lambda () (car gate))
+                                     :timeout 10
+                                     :what "the switch pin's gate")
+                                    (funcall note :target-post)
+                                    ;; THE TURN BOUNDARY: the next park
+                                    ;; ends the target's first turn
+                                    ;; (§474-484) — its READY park
+                                    ;; bumps the turn count and nudges
+                                    ;; the switcher (§523: no resume)
+                                    (wasmdown.component.runtime::async-thread-yield
+                                     target))
+                                (error (c) (funcall note (list :target-err c))))
+                           (wasmdown.component.runtime::%right-release-on-exit
+                            target)
+                           (setf (car target-done) t))))
+                     :name "pin-switch-target")))
+            (%pin-wait-for
+             (lambda ()
+               (wasmdown.component.runtime::async-thread-yield-parked target))
+             :what "the target's yield park")
+            (let ((bc (sb-thread:make-thread
+                       (lambda ()
+                         (let ((wasmdown.component.runtime::*current-thread*
+                                 caller)
+                               (wasmdown.component.runtime::*current-task*
+                                 (wasmdown.component.runtime::async-thread-task
+                                  caller))
+                               (wasmdown.component.runtime::*right-self*
+                                 caller)
+                               (wasmdown.component.runtime::*right-ticket*
+                                 nil)
+                               (wasmdown.component.runtime::*scheduler-threads*
+                                 nil))
+                           (unwind-protect
+                                (handler-case
+                                    (progn
+                                      (setf (car caller-result)
+                                            (wasmdown.runtime:wasm-call
+                                             (kw :thread-yield-then-promote)
+                                             2))
+                                      (funcall note :caller-returned))
+                                  (error (c) (setf (car caller-err) c)))
+                             (wasmdown.component.runtime::%right-release-on-exit
+                              caller)
+                             (setf (car caller-done) t))))
+                       :name "pin-switch-caller")))
+              ;; the caller is PARKED IN THE SWITCH, and the target has
+              ;; already taken its first turn (the switch resumed it)
+              (%pin-wait-for (lambda () (switch-parked-p caller))
+                             :what "the caller's switch park")
+              (%pin-wait-for (lambda () (funcall seen-p :target-first-turn))
+                             :what "the target's first turn")
+              (is (eq (wasmdown.component.runtime::async-thread-switch-target
+                       caller)
+                      target))
+              (is (null (car caller-done)))
+              ;; (1a) a PLAIN NUDGE does not release it and posts no
+              ;; resume credit (§936: not a tick candidate)
+              (wasmdown.component.runtime::async-thread-nudge caller)
+              (sleep 0.05)
+              (is (null (car caller-done)))
+              (is (switch-parked-p caller))
+              (is (zerop
+                   (wasmdown.component.runtime::async-thread-resume-count
+                    caller)))
+              ;; (1b) a whole resume-all fan-out does not either — the
+              ;; switch caller is excluded from the grant set
+              (wasmdown.component.runtime::async-thread-resume-all)
+              (sleep 0.05)
+              (is (null (car caller-done)))
+              (is (switch-parked-p caller))
+              (is (zerop
+                   (wasmdown.component.runtime::async-thread-resume-count
+                    caller)))
+              (is (not (funcall seen-p :caller-returned)))
+              ;; only the target's park/exit BOUNDARY releases it
+              (setf (car gate) t)
+              (is (%pin-wait-for (lambda () (car caller-done))
+                                 :timeout 5
+                                 :what "the caller leaving its switch park"))
+              (is (null (car caller-err)))
+              (is (equal '(0) (car caller-result)))
+              (is (member :target-post order))
+              (is (< (pos :target-first-turn) (pos :caller-returned)))
+              (is (< (pos :target-post) (pos :caller-returned)))
+              ;; the switch state died with the park
+              (is (not (switch-parked-p caller)))
+              (is (null
+                   (wasmdown.component.runtime::async-thread-switch-target
+                    caller)))
+              (is (not (wasmdown.component.runtime::async-thread-yield-parked
+                        caller)))
+              (is (not (wasmdown.component.runtime::async-thread-suspended-p
+                        caller)))
+              (is (%pin-clean-p caller))
+              (is (%pin-join bc))
+              (is (null (car caller-err))))
+            (is (%pin-join bt))
+            (is (car target-done))))
+        ;; ---- (3) the same-index switch is STILL the guest's trap
+        (let* ((trap-target (%pin-thread inst 5 '(1 5)))
+               (trap-caller (%pin-thread inst 6 '(1 6))))
+          (%pin-register inst trap-target)
+          (%pin-register inst trap-caller)
+          (let ((o (%pin-arm-outcome inst :thread-yield-then-promote
+                                     trap-caller 6)))
+            (is (typep o 'wasmdown:wasm-trap))
+            (is (search "cannot switch to the current thread"
+                        (wasmdown:wasmdown-error-message o))))
+          (is (not (switch-parked-p trap-caller)))
+          (is (null
+               (wasmdown.component.runtime::async-thread-switch-target
+                trap-caller)))
+          (%pin-unregister inst trap-target)
+          (%pin-unregister inst trap-caller))
+        ;; ---- (2) the target's RETURN releases the caller too
+        (let* ((target2 (%pin-thread inst 3 '(1 7)))
+               (caller2 (%pin-thread inst 4 '(1 8)))
+               (caller2-done (list nil))
+               (caller2-result (list nil))
+               (caller2-err (list nil)))
+          (%pin-register inst target2)
+          (%pin-register inst caller2)
+          ;; a suspended PENDING SPAWN (§4590): a promote target; the
+          ;; switch's resume STARTS it (the thunk is the no-op body)
+          (setf (wasmdown.component.runtime::async-thread-spawn-thunk
+                 target2)
+                (lambda () nil))
+          (let ((bc (sb-thread:make-thread
+                     (lambda ()
+                       (let ((wasmdown.component.runtime::*current-thread*
+                               caller2)
+                             (wasmdown.component.runtime::*current-task*
+                               (wasmdown.component.runtime::async-thread-task
+                                caller2))
+                             (wasmdown.component.runtime::*right-self*
+                               caller2)
+                             (wasmdown.component.runtime::*right-ticket*
+                               nil)
+                             (wasmdown.component.runtime::*scheduler-threads*
+                               nil))
+                         (unwind-protect
+                              (handler-case
+                                  (progn
+                                    (setf (car caller2-result)
+                                          (wasmdown.runtime:wasm-call
+                                           (kw :thread-yield-then-promote)
+                                           3))
+                                    (funcall note :caller2-returned))
+                                (error (c) (setf (car caller2-err) c)))
+                           (wasmdown.component.runtime::%right-release-on-exit
+                            caller2)
+                           (setf (car caller2-done) t))))
+                     :name "pin-switch-caller2")))
+            (%pin-wait-for (lambda () (switch-parked-p caller2))
+                           :what "caller2's switch park")
+            (is (null (car caller2-done)))
+            (is (eq caller2
+                    (wasmdown.component.runtime::async-thread-post-to
+                     target2)))
+            ;; the TARGET'S RETURN: the production implicit-thread
+            ;; exit posts the handoff (§4886-4894)
+            (wasmdown.component.runtime::%task-exit-implicit-thread
+             (wasmdown.component.runtime::async-thread-task target2))
+            (is (%pin-wait-for (lambda () (car caller2-done))
+                               :timeout 5
+                               :what "caller2 leaving its switch park"))
+            (is (null (car caller2-err)))
+            (is (equal '(0) (car caller2-result)))
+            (is (not (switch-parked-p caller2)))
+            (is (%pin-clean-p caller2))
+            (is (%pin-join bc))))))))
+
 (defun run-component-pins ()
   "Run the component pins (registered via TEST; returns T)."
   (let ((wasmdown.test::*tests*
@@ -4140,7 +4405,8 @@ waits unbounded)."
                       component/resume-later-marker-lifetime-pin
                       component/explicit-resume-requires-parked-peer-pin
                       component/thread-index-identity-pin
-                      component/premature-park-release-pin)))
+                      component/premature-park-release-pin
+                      component/switch-caller-is-not-grantable-pin)))
           wasmdown.test::*tests*)))
     (multiple-value-bind (passed failed)
         (wasmdown.test:run-all-tests)
