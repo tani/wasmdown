@@ -54,7 +54,12 @@ slice 3) — never a path-prefix string."
   ;; M16 slice 4: the network authorities (wasi-network objects). A
   ;; socket provider is built from ONE of them; every bind/connect/
   ;; resolve consults it. NIL = no network authority at all.
-  (networks nil))
+  (networks nil)
+  ;; M17 step 6: the context's REACTOR (a wasi-reactor, or NIL = no
+  ;; clock/time capability). monotonic-clock's wait-until/wait-for arm
+  ;; their one-shot deadline here; the store driver owns when STEP
+  ;; runs, exactly as it owns every other readiness pump.
+  (reactor nil))
 
 ;;; ---------------------------------------------------------------
 ;;; Host exit.
@@ -270,11 +275,119 @@ nanoseconds)."
   "The system clock's practical resolution: 1 microsecond."
   1000)
 
-(defun monotonic-clock-instance (&key (package (wasi-package "clocks")))
+;;; The ASYNC clock waits (WIT: `wait-until: async func` /
+;;; `wait-for: async func`). A bounded-step busy wait would hold the
+;;; calling OS thread — and, for a guest, the store's single execution
+;;; right — for the whole wait. Instead the provider registers ONE-SHOT
+;;; deadline with the context's reactor and answers with a HOST-PENDING:
+;;; the guest's task parks, the reactor's callback only ENQUEUES the
+;;; pending's resolution (a reactor callback never calls guest code),
+;;; and the store's own pump delivers it. No provider thread sleeps.
+
+(defconstant +u64-max+ #xffffffffffffffff
+  "The largest `mark`/`duration` (both are u64 in wasi:clocks).")
+
+(defun %clock-mark (value what)
+  "VALUE as a u64 mark, or a trap: a mark is a u64, so a value outside
+its range cannot be represented (the WIT's representability trap)."
+  (unless (and (integerp value) (<= 0 value +u64-max+))
+    (error 'wasmdown:wasm-trap
+           :message (format nil "~a ~s is not a u64 mark" what value)))
+  value)
+
+(defun %clock-deadline-for (reactor how-long)
+  "NOW + HOW-LONG in monotonic nanoseconds. The sum must stay a u64:
+overflow TRAPS rather than wrapping (a wrapped deadline would be a
+silent no-wait)."
+  (let ((now (%reactor-clock reactor)))
+    (%clock-mark how-long "duration")
+    (when (> how-long (- +u64-max+ now))
+      (error 'wasmdown:wasm-trap
+             :message (format nil
+                              "wait-for ~d ns from ~d overflows the u64 mark space"
+                              how-long now)))
+    (+ now how-long)))
+
+(defstruct (clock-wait (:constructor %make-clock-wait))
+  "One armed deadline. STATE serializes the two possible wins: the
+timer FIRED (the wait resolves, once) or the wait was CANCELLED (its
+timer is removed, once)."
+  (mutex (sb-thread:make-mutex :name "clock-wait"))
+  (state :armed)                       ; :armed | :fired | :cancelled
+  (timer nil))
+
+(defun %clock-arm (reactor deadline resolve)
+  "Arm DEADLINE as a one-shot reactor deadline that calls RESOLVE.
+Returns the pending's cancel-fn: it removes the timer at most once and
+T (stopped) only when it actually won the race against the timer. A
+fired wait never cancels, a cancelled wait never resolves."
+  (let* ((wait (%make-clock-wait))
+         (timer
+           (reactor-watch-deadline
+            reactor deadline
+            (lambda ()
+              (let ((fire nil))
+                (sb-thread:with-recursive-lock ((clock-wait-mutex wait))
+                  (when (eq (clock-wait-state wait) :armed)
+                    (setf (clock-wait-state wait) :fired
+                          (clock-wait-timer wait) nil)
+                    (setf fire t)))
+                (when fire (funcall resolve nil)))))))
+    (sb-thread:with-recursive-lock ((clock-wait-mutex wait))
+      (setf (clock-wait-timer wait) timer))
+    (lambda ()
+      (let ((timer nil) (stopped nil))
+        (sb-thread:with-recursive-lock ((clock-wait-mutex wait))
+          (when (eq (clock-wait-state wait) :armed)
+            (setf (clock-wait-state wait) :cancelled
+                  timer (clock-wait-timer wait)
+                  (clock-wait-timer wait) nil
+                  stopped t)))
+        (when timer (funcall timer))
+        stopped))))
+
+(defun %clock-pending (reactor deadline)
+  "The async answer of wait-until/wait-for. A deadline the clock has
+ALREADY reached resolves immediately with NO timer registered — still
+through the pending, so every path of the call has one shape."
+  (if (<= deadline (%reactor-clock reactor))
+      (wasmdown.component.runtime:make-host-pending
+       :start (lambda (resolve reject acknowledge-cancel)
+                (declare (ignore reject acknowledge-cancel))
+                (funcall resolve nil)
+                ;; already due: nothing is registered, nothing to stop
+                (lambda () nil)))
+      (wasmdown.component.runtime:make-host-pending
+       :start (lambda (resolve reject acknowledge-cancel)
+                (declare (ignore reject acknowledge-cancel))
+                (%clock-arm reactor deadline resolve)))))
+
+(defun monotonic-wait-until (reactor when)
+  "wait-until: park until the monotonic clock reaches WHEN."
+  (unless reactor
+    (error 'wasmdown:host-error
+           :message "no reactor capability for monotonic-clock wait-until"))
+  (%clock-pending reactor (%clock-mark when "deadline")))
+
+(defun monotonic-wait-for (reactor how-long)
+  "wait-for: park for HOW-LONG nanoseconds."
+  (unless reactor
+    (error 'wasmdown:host-error
+           :message "no reactor capability for monotonic-clock wait-for"))
+  (%clock-pending reactor (%clock-deadline-for reactor how-long)))
+
+(defun monotonic-clock-instance (&key (package (wasi-package "clocks"))
+                                      reactor)
+  "The monotonic-clock provider. REACTOR is the context's reactor; the
+async waits need it (NIL: the waits report the missing capability)."
   (provider-instance
    (wasmdown.wit:package-interface package "monotonic-clock")
    (list (cons "now" #'monotonic-now)
-         (cons "get-resolution" #'monotonic-resolution))
+         (cons "get-resolution" #'monotonic-resolution)
+         (cons "wait-until"
+               (lambda (when) (monotonic-wait-until reactor when)))
+         (cons "wait-for"
+               (lambda (how-long) (monotonic-wait-for reactor how-long))))
    :packages (list package)))
 
 (defun system-clock-instance (&key (package (wasi-package "clocks")))
@@ -284,9 +397,10 @@ nanoseconds)."
          (cons "get-resolution" #'system-resolution))
    :packages (list package)))
 
-(defun clocks-provider (&key (package (wasi-package "clocks")))
-  "The wasi:clocks imports as a with-args alist. wait-until/wait-for
-are exported but unsupported in this slice."
+(defun clocks-provider (&key (package (wasi-package "clocks")) reactor)
+  "The wasi:clocks imports as a with-args alist. REACTOR (the
+context's reactor) backs the async wait-until/wait-for; NIL leaves
+them reporting the missing capability."
   (list
    (cons (wasmdown.wit:interface-import-name
           (wasmdown.wit:package-interface package "types"))
@@ -295,7 +409,7 @@ are exported but unsupported in this slice."
           :packages (list package)))
    (cons (wasmdown.wit:interface-import-name
           (wasmdown.wit:package-interface package "monotonic-clock"))
-         (monotonic-clock-instance :package package))
+         (monotonic-clock-instance :package package :reactor reactor))
    (cons (wasmdown.wit:interface-import-name
           (wasmdown.wit:package-interface package "system-clock"))
          (system-clock-instance :package package))))
@@ -4839,7 +4953,7 @@ alist, all bound to one network authority."
 CONTEXT. `wasi:http` is not supported by this runtime and is never
 bound."
   (append (cli-provider context)
-          (clocks-provider)
+          (clocks-provider :reactor (wasi-context-reactor context))
           (random-provider)
           (filesystem-provider context)
           (sockets-provider context)))
