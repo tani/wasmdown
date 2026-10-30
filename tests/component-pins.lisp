@@ -4441,6 +4441,225 @@ waits unbounded)."
             (is (%pin-clean-p caller2))
             (is (%pin-join bc))))))))
 
+(test component/crcc-1-pin
+  ;; THE OUTER RESUMER WAITS FOR THE WHOLE SWITCH CHAIN
+  ;; (CanonicalABI.md 469-484: Thread.resume runs the switch_to chain
+  ;; in a loop until a continuation RETURNS or BLOCKS with no thread
+  ;; to switch to; only then does resume return to its caller).
+  ;; cancel-resumed-callback-switch's guest checks the same boundary:
+  ;;
+  ;;   (if (i32.eqz (call $ran)) (then unreachable))
+  ;;
+  ;; after subtask.cancel returns BLOCKED (-1). $ran is stored by the
+  ;; callback's switched-to explicit thread before that thread blocks,
+  ;; so the canceller's RESUMED callback being SUSPENDED-P/SWITCH-PARKED
+  ;; is NOT enough: the arm records its own switch state BEFORE the
+  ;; target's first turn, and the canceller's spin used to accept that
+  ;; arm-time suspension and return with $ran still 0. The provenance
+  ;; (instrumented, target start deliberately widened): a canceller
+  ;; boundary read with susp=T switch=T target=2 tparks=0 (the target's
+  ;; park count had not advanced past the arm sample) — and the guest
+  ;; check at ::1 trapped; ::3 (the cross-task shape) trapped the same
+  ;; way. THE FIX: switch-target-parks samples the target's park count
+  ;; at the arm, and the canceller's BLOCKS case requires
+  ;; %SWITCH-CHAIN-ENDED-P — the target's park/exit, recursively through
+  ;; a nested switch.
+  ;;
+  ;; (a) drives the REAL cancellation + switch builtins on a synthetic
+  ;; pair: the target's first turn is GATED, so the pre-fix rule returns
+  ;; in the window deterministically (the pin asserts it does not);
+  ;; (b) runs the fixture rows VERBATIM, repeatedly.
+  (%pin-with-store
+    (let* ((inst (%pin-inst))
+           (caller (%pin-thread inst 1 '(1)))
+           (ctask (wasmdown.component.runtime::async-thread-task caller))
+           (target (%pin-thread inst 2 '(1 2)))
+           (canceller (%pin-thread inst 3 '(2)))
+           (gate (list nil))
+           (lock (sb-thread:make-mutex :name "crcc-pin"))
+           (order nil)
+           (note (lambda (x)
+                   (sb-thread:with-mutex (lock) (push x order))))
+           (seen-p (lambda (x)
+                     (sb-thread:with-mutex (lock)
+                       (and (member x order) t))))
+           (pos (lambda (x)
+                  (sb-thread:with-mutex (lock)
+                    (position x (reverse order)))))
+           (caller-done (list nil))
+           (caller-err (list nil))
+           (target-done (list nil))
+           (cancel-done (list nil))
+           (cancel-err (list nil))
+           (bt nil) (bc nil))
+      (%pin-register inst caller)
+      (%pin-register inst target)
+      (%pin-register inst canceller)
+      (setf (wasmdown.component.runtime::async-thread-cancellable caller) t
+            (wasmdown.component.runtime::async-task-state ctask) :started)
+      ;; the target is a SUSPENDED pending spawn whose first turn is
+      ;; gated: the arm's resume creates the OS thread, which does not
+      ;; run until the gate opens
+      (setf (wasmdown.component.runtime::async-thread-spawn-thunk target)
+            (lambda ()
+              (sb-thread:make-thread
+               (lambda ()
+                 (let ((wasmdown.component.runtime::*current-thread* target)
+                       (wasmdown.component.runtime::*current-task*
+                         (wasmdown.component.runtime::async-thread-task
+                          target))
+                       (wasmdown.component.runtime::*right-self* target)
+                       (wasmdown.component.runtime::*right-ticket* nil)
+                       (wasmdown.component.runtime::*scheduler-threads* nil))
+                   (unwind-protect
+                        (handler-case
+                            (progn
+                              (%pin-wait-for
+                               (lambda () (car gate))
+                               :timeout 10
+                               :what "the crcc pin's target gate")
+                              (funcall note :target-first-turn)
+                              ;; the target's first turn ENDS here, at
+                              ;; a real park (§474-484's block)
+                              (wasmdown.component.runtime::async-thread-yield
+                               target))
+                          (error (c) (funcall note (cons :target-err c))))
+                     (wasmdown.component.runtime::%right-release-on-exit
+                      target)
+                     (setf (car target-done) t))))
+               :name "pin-crcc-target")))
+      ;; the caller: the cancelled task's implicit thread parks in a
+      ;; REAL WAITING park whose readiness is the pending-cancel mark,
+      ;; then SWITCHES to the gated target through the REAL canon
+      ;; builtin (suspend_then_resume)
+      (setf bt
+            (sb-thread:make-thread
+             (lambda ()
+               (let ((wasmdown.component.runtime::*current-thread* caller)
+                     (wasmdown.component.runtime::*current-task* ctask)
+                     (wasmdown.component.runtime::*right-self* caller)
+                     (wasmdown.component.runtime::*right-ticket* nil)
+                     (wasmdown.component.runtime::*scheduler-threads* nil))
+                 (unwind-protect
+                      (handler-case
+                          (progn
+                            ;; the §1373-style WAITING park readiness is
+                            ;; also the THREAD slot the cancellation's
+                            ;; ready() gate reads (the callback WAIT
+                            ;; arm installs it the same way)
+                            (setf (wasmdown.component.runtime::async-thread-ready-fn
+                                   caller)
+                                  (lambda ()
+                                    (wasmdown.component.runtime::%task-has-pending-cancel
+                                     ctask)))
+                            (wasmdown.component.runtime::async-thread-wait-until
+                             caller
+                             (wasmdown.component.runtime::async-thread-ready-fn
+                              caller))
+                            (setf (wasmdown.component.runtime::async-thread-ready-fn
+                                   caller)
+                                  nil)
+                            (funcall note :caller-resumed)
+                            (wasmdown.runtime:wasm-call
+                             (%pin-builtin inst
+                                           :thread-suspend-then-resume)
+                             2)
+                            (funcall note :caller-switch-returned))
+                        (error (c) (setf (car caller-err) c)))
+                   (wasmdown.component.runtime::%right-release-on-exit
+                    caller)
+                   (setf (car caller-done) t))))
+             :name "pin-crcc-caller"))
+      (unwind-protect
+           (progn
+             (%pin-wait-for
+              (lambda ()
+                (wasmdown.component.runtime::async-thread-ready-fn caller))
+              :what "the caller's WAITING park")
+             ;; the canceller: the REAL %TASK-REQUEST-CANCELLATION
+             (setf bc
+                   (sb-thread:make-thread
+                    (lambda ()
+                      (let ((wasmdown.component.runtime::*current-thread*
+                              canceller)
+                            (wasmdown.component.runtime::*current-task*
+                              (wasmdown.component.runtime::async-thread-task
+                               canceller))
+                            (wasmdown.component.runtime::*right-self*
+                              canceller)
+                            (wasmdown.component.runtime::*right-ticket* nil)
+                            (wasmdown.component.runtime::*scheduler-threads*
+                              nil))
+                        (unwind-protect
+                             (handler-case
+                                 (progn
+                                   ;; bounded: a rule that never
+                                   ;; accepts the chain cannot hang
+                                   ;; the pin
+                                   (sb-ext:with-timeout
+                                       15
+                                     (wasmdown.component.runtime::
+                                      %task-request-cancellation ctask))
+                                   (funcall note :cancel-returned))
+                               (error (c) (setf (car cancel-err) c)))
+                          ;; the synthetic canceller is not a guest
+                          ;; that continues under the right: hand it on
+                          (wasmdown.component.runtime::%right-release-on-exit
+                           canceller)
+                          (setf (car cancel-done) t))))
+                    :name "pin-crcc-canceller"))
+             ;; the caller is PARKED IN THE SWITCH while the target
+             ;; has not taken its first turn
+             (is (%pin-wait-for
+                  (lambda ()
+                    (wasmdown.component.runtime::async-thread-switch-parked
+                     caller))
+                  :what "the caller's switch park"))
+             (is (funcall seen-p :caller-resumed))
+             (sleep 0.1)
+             ;; (a) THE RULE: no return while the chain has not ended
+             (is (not (funcall seen-p :target-first-turn)))
+             (is (null (car cancel-done)))
+             (funcall note :gate-open)
+             (setf (car gate) t)
+             (is (%pin-wait-for (lambda () (car cancel-done))
+                                :timeout 10
+                                :what "the cancellation after the chain parked"))
+             (is (null (car cancel-err)))
+             (is (funcall seen-p :target-first-turn))
+             (let ((p1 (funcall pos :target-first-turn))
+                   (p2 (funcall pos :cancel-returned)))
+               (is (and p1 p2 (< p1 p2))))
+             ;; the target's ordinary park is a bare nudge: the switch
+             ;; caller stays parked until an EXPLICIT resume (only the
+             ;; target's park/exit hands control on)
+             (is (wasmdown.component.runtime::async-thread-switch-parked
+                  caller))
+             (is (null (car caller-done))))
+        ;; release both threads on every path (bounded)
+        (setf (car gate) t)
+        (ignore-errors
+         (wasmdown.component.runtime::async-thread-resume caller))
+        (ignore-errors
+         (wasmdown.component.runtime::async-thread-nudge target))
+        (when bc (ignore-errors (%pin-join bc)))
+        (when bt (ignore-errors (%pin-join bt)))
+        (is (%pin-wait-for (lambda () (car caller-done))
+                           :timeout 5
+                           :what "the switch caller's exit"))
+        (is (%pin-wait-for (lambda () (car target-done))
+                           :timeout 5
+                           :what "the target's exit"))
+        (is (null (car caller-err)))
+        (is (null (car cancel-err))))))
+  ;; (b) the fixture rows VERBATIM — both components (::1 and ::3)
+  (let ((wast (%pin-slice
+               "tests/component/async/cancel-resumed-callback-switch.wast"
+               1 100000)))
+    (dotimes (i 10)
+      (is (%pin-rows-pass-p
+           wast (format nil "crcc-1-pin-~d.wast" i))))))
+
 (defun run-component-pins ()
   "Run the component pins (registered via TEST; returns T)."
   (let ((wasmdown.test::*tests*
@@ -4529,7 +4748,8 @@ waits unbounded)."
                       component/thread-index-identity-pin
                       component/premature-park-release-pin
                       component/reentrance-14-pin
-                      component/switch-caller-is-not-grantable-pin)))
+                      component/switch-caller-is-not-grantable-pin
+                      component/crcc-1-pin)))
           wasmdown.test::*tests*)))
     (multiple-value-bind (passed failed)
         (wasmdown.test:run-all-tests)
