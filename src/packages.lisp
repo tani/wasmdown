@@ -438,6 +438,8 @@
    #:terminal-stdout-instance
    #:terminal-stderr-instance
    #:cli-terminal-provider
+   #:command-world
+   #:compose-world-providers
    #:command-provider
    #:run-component
    #:component-run-export

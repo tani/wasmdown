@@ -4448,6 +4448,202 @@ copy stays parked and its absent event is simply cleared)."
           (wasmdown.wasi:close-wasi-tcp-socket server)
           (wasmdown.wasi:reactor-close reactor))))))
 
+(test wasi/sockets-send-resume-scripted-readiness
+  ;; THE SEND RESUME LOOP, driven by SCRIPTED readiness: the sink
+  ;; really arms a WRITE watch on the socket after send(2) reports
+  ;; EAGAIN, but POLLOUT comes from the injected POLL-FN (the reactor's
+  ;; SCRIPTED-READY flag), never from the kernel. So the parked copy's
+  ;; exact resume path — reactor callback -> host-end-ready into the
+  ;; store queue -> %STORE-TICK -> retry — is asserted without a real
+  ;; POLLOUT, without a sleep and without a polling loop.
+  ;;
+  ;; The watch accounting is exact: SEQ counts every registration ever
+  ;; made, and one armed watch is delivered exactly once, so SEQ equals
+  ;; the number of deliveries and the registration table returns to its
+  ;; prior value (empty) when the copy completes; a later look must
+  ;; never see two, and a readiness naming an OLD generation must
+  ;; resume nothing while the CURRENT watch stays armed.
+  (let* ((ready-p nil)                ; the poll-fn's SCRIPTED readiness
+         (fd-requests '())            ; fd watches each poll saw, newest first
+         (poll-fn (lambda (requests timeout)
+                    (declare (ignore timeout))
+                    (let ((n 0))
+                      (dolist (request requests)
+                        (when (eq :fd (getf request :kind)) (incf n)))
+                      (push n fd-requests))
+                    (mapcar (lambda (request)
+                              (if (and ready-p
+                                       (eq :fd (getf request :kind)))
+                                  wasmdown.wasi::+pollout+
+                                  0))
+                            requests)))
+         (reactor (wasmdown.wasi:make-wasi-reactor
+                   :wake-p nil :clock-fn (constantly 0) :poll-fn poll-fn))
+         (ctx (wasmdown.wasi:make-wasi-context :reactor reactor))
+         (net (sock-network))
+         (server (sock-rep (wasmdown.wasi:tcp-create
+                            nil net (cons :enum "ipv4"))))
+         (client (sock-rep (wasmdown.wasi:tcp-create
+                            nil net (cons :enum "ipv4"))))
+         (accepted nil)
+         (deliveries 0)
+         (received 0))
+    (multiple-value-bind (inst store) (store-instance :reactor reactor)
+      (declare (ignore inst))
+      (let ((wasmdown.component.runtime::*current-component-store* store))
+        (unwind-protect
+             (progn
+               (is (equal '(:ok) (wasmdown.wasi:tcp-bind
+                                  ctx net server (sock-addr 0))))
+               (let* ((port (sock-value-port
+                             (sock-ok (wasmdown.wasi:tcp-get-local-address
+                                       ctx net server))))
+                      (listening (wasmdown.wasi:tcp-listen ctx net server)))
+                 (is (equal '(:ok) (wasmdown.wasi:tcp-connect
+                                    ctx net client (sock-addr port))))
+                 (setf accepted (sock-accept (cdr listening)))
+                 (is (not (null accepted)))
+                 ;; 32 KiB each: small enough that a 256 KiB payload
+                 ;; cannot all be accepted (so send(2) really reports
+                 ;; EAGAIN) yet above the loopback stall the 4 KiB
+                 ;; settings hit, so draining the peer reopens the
+                 ;; window and the resumed send makes progress
+                 (is (equal '(:ok) (wasmdown.wasi::tcp-set-send-buffer-size
+                                    ctx net client 32768)))
+                 (is (equal '(:ok)
+                            (wasmdown.wasi::tcp-set-receive-buffer-size
+                             ctx net accepted 32768)))
+                 (multiple-value-bind (reader writer) (sock-stream)
+                   (let* ((future (wasmdown.wasi:tcp-send ctx net client reader))
+                          (fd (wasmdown.wasi:wasi-tcp-socket-fd client))
+                          ;; the PEER receive stream is deliberately
+                          ;; created WITHOUT a reactor: its own would-block
+                          ;; must not add a READ watch, so the reactor's
+                          ;; registration table only ever holds the SEND
+                          ;; watch under test (the test drains the peer
+                          ;; explicitly with DRAIN-AVAILABLE)
+                          (peer (first (wasmdown.wasi:tcp-receive
+                                        nil net accepted)))
+                          (payload (make-list 262144 :initial-element 122))
+                          (fd-table (lambda ()
+                                      (wasmdown.wasi::wasi-reactor-fd-table
+                                       reactor)))
+                          (armed (lambda ()
+                                   (hash-table-count (funcall fd-table))))
+                          (parked-p
+                            (lambda ()
+                              (not (null (funcall
+                                          (rsym "async-end-host-copy")
+                                          reader)))))
+                          (resume-until-done
+                            (lambda ()
+                              "Drain the peer, then deliver ONE scripted
+readiness per parked attempt until the copy completes."
+                              (loop
+                                (when (not (funcall parked-p)) (return))
+                                (incf received
+                                      (length (drain-available peer 65536)))
+                                (when (not (funcall parked-p)) (return))
+                                (setf ready-p t)
+                                (funcall (rsym "%store-tick") store)
+                                (setf ready-p nil)
+                                (incf deliveries)
+                                (is (<= (funcall armed) 1))
+                                (is (= 1 (first fd-requests)))
+                                (when (> deliveries 500)
+                                  (error "the send copy never completed"))))))
+                     ;; STAGE the whole payload: send(2) fills the small
+                     ;; kernel buffer, reports EAGAIN, and the sink arms
+                     ;; a WRITE watch keyed by the STREAM identity
+                     (rtcall "%END-COPY" writer
+                             (wasmdown.component.runtime:make-host-buffer
+                              262144 :values payload)
+                             nil)
+                     (is (funcall parked-p))
+                     (is (= 1 (funcall armed)))
+                     (let ((key (first (loop for k being the hash-keys
+                                             of (funcall fd-table)
+                                             collect k))))
+                       (is (eq reader (second key)))
+                       (is (eq :write (third key)))
+                       (is (= fd (first key))))
+                     (let ((gen1 (wasmdown.component.runtime:host-end-generation
+                                  reader)))
+                       ;; SCRIPTED readiness: the parked send resumes and
+                       ;; runs to completion through the store queue
+                       (funcall resume-until-done)
+                       (loop for n = (length (drain-available peer 65536))
+                             while (plusp n) do (incf received n))
+                       ;; the copy completed with the FULL byte count
+                       (is (plusp deliveries)) ; the park really RESUMED
+                       (is (eql (%completed 262144)
+                                (third (rtcall "%WAITABLE-GET-PENDING-EVENT"
+                                               writer))))
+                       (is (= 262144 received))
+                       ;; the watch is released: the registration table
+                       ;; is back to its prior (empty) value, and every
+                       ;; registration made was delivered exactly once
+                       (is (zerop (funcall armed)))
+                       (is (null (wasmdown.wasi::wasi-reactor-fd-order
+                                  reactor)))
+                       (is (= deliveries (wasmdown.wasi::wasi-reactor-seq
+                                          reactor)))
+                       (is (zerop (funcall (rsym "host-store-work") store)))
+                       ;; ---- THE STALE GENERATION ----
+                       ;; a NEWER send parks at a NEW copy generation
+                       (setf ready-p nil)
+                       (let ((gen2 nil))
+                         (rtcall "%END-COPY" writer
+                                 (wasmdown.component.runtime:make-host-buffer
+                                  262144 :values (make-list
+                                                  262144 :initial-element 121))
+                                 nil)
+                         (setf gen2 (wasmdown.component.runtime:host-end-generation
+                                     reader))
+                         (is (not (eql gen1 gen2)))
+                         (is (funcall parked-p))
+                         (is (= 1 (funcall armed)))
+                         ;; the peer's bytes from attempt 1 are gone; a
+                         ;; readiness naming the OLD generation is
+                         ;; delivered and ticked while readiness stays
+                         ;; SCRIPTED OFF. The old watch was one-shot and
+                         ;; already consumed, so the LATE notification is
+                         ;; modelled by the one call such a callback
+                         ;; makes: host-end-ready with the generation it
+                         ;; captured at arm time.
+                         (wasmdown.component.runtime:host-end-ready reader gen1)
+                         (is (integerp (funcall (rsym "%store-tick") store)))
+                         ;; NOTHING resumed: the newer attempt is still
+                         ;; parked and the CURRENT watch is untouched
+                         (is (funcall parked-p))
+                         (is (null (funcall (rsym "async-waitable-pending-event")
+                                            writer)))
+                         (is (= 1 (funcall armed)))
+                         ;; the CURRENT generation is what resumes it
+                         (let ((before deliveries))
+                           (funcall resume-until-done)
+                           (is (> deliveries before)))
+                         (loop for n = (length (drain-available peer 65536))
+                               while (plusp n) do (incf received n))
+                         (is (eql (%completed 262144)
+                                  (third (rtcall "%WAITABLE-GET-PENDING-EVENT"
+                                                 writer))))
+                         (is (= (* 2 262144) received))
+                         (is (zerop (funcall armed)))
+                         (is (null (wasmdown.wasi::wasi-reactor-fd-order
+                                    reactor)))
+                         (is (= deliveries (wasmdown.wasi::wasi-reactor-seq
+                                            reactor)))
+                         (is (zerop (funcall (rsym "host-store-work") store))))
+                       ;; every poll saw at most one fd registration
+                       (is (every (lambda (n) (<= n 1)) fd-requests))
+                       (sock-drop writer)
+                       (is (equal '(:ok) (sock-future future)))))))
+          (when accepted (wasmdown.wasi:close-wasi-tcp-socket accepted))
+          (wasmdown.wasi:close-wasi-tcp-socket client)
+          (wasmdown.wasi:close-wasi-tcp-socket server)
+          (wasmdown.wasi:reactor-close reactor)))))))
+
 (defun pending-drive (pending)
   "Drive PENDING to a terminal outcome on its own store (the test's
 store driver: bounded %STORE-TICK yields — no sleep) and return its
@@ -4462,3 +4658,200 @@ resolved/rejected value (:cancelled for a cancel)."
         (:resolve (cdr outcome))
         (:reject (cdr outcome))
         (:cancel :cancelled)))))
+
+;;; ---------------------------------------------------------------
+;;; M17 plan step 3: the provider set is the RESOLVED WORLD's import
+;;; set. `command-provider' no longer appends a hand-written list;
+;;; `compose-world-providers' walks the imports of a world resolved by
+;;; `wasmdown.wit:resolve-wit-world' (gates applied, references
+;;; resolved, includes expanded) and builds exactly those providers.
+
+(defun %world-import-names (world)
+  "The import names COMPOSE-WORLD-PROVIDERS binds for WORLD."
+  (mapcar #'car (wasmdown.wasi:compose-world-providers
+                 world (wasmdown.wasi:make-wasi-context))))
+
+(defun %sorted (list)
+  (sort (copy-list list) #'string<))
+
+(test wasi/command-provider-composed-from-command-world
+  ;; The resolved `wasi:cli/command' world composes EXACTLY the set the
+  ;; pre-cutover list-driven composition produced (names compared as a
+  ;; set: declaration order is the world's, never a runtime order).
+  (let* ((ctx (wasmdown.wasi:make-wasi-context))
+         (world (wasmdown.wasi:command-world))
+         (today (append (mapcar #'car (wasmdown.wasi:cli-provider ctx))
+                        (mapcar #'car (wasmdown.wasi:clocks-provider))
+                        (mapcar #'car (wasmdown.wasi:random-provider))
+                        (mapcar #'car (wasmdown.wasi:filesystem-provider ctx))
+                        (mapcar #'car (wasmdown.wasi:sockets-provider ctx)))))
+    (multiple-value-bind (providers unbound)
+        (wasmdown.wasi:compose-world-providers world ctx)
+      (is (= 20 (length providers)))
+      (is (= 20 (length today)))
+      (is (equal (%sorted (mapcar #'car providers)) (%sorted today)))
+      (is (every #'wasmdown.component.runtime:comp-instance-p
+                 (mapcar #'cdr providers)))
+      ;; the world declares 21 imports: `wasi:cli/types@0.3.2' is
+      ;; types-only (one enum), so it contributes no host instance and
+      ;; is reported as unbound instead of an invented provider
+      (is (equal '("wasi:cli/types@0.3.2") unbound))
+      (is (member "wasi:cli/types@0.3.2" unbound :test #'string=))
+      (is (not (member "wasi:cli/types@0.3.2" (mapcar #'car providers)
+                       :test #'string=))))
+    ;; COMMAND-PROVIDER is that same composition
+    (is (equal (%sorted (mapcar #'car (wasmdown.wasi:command-provider ctx)))
+               (%sorted today)))
+    ;; and it accepts a caller-resolved world (the selection/packages
+    ;; entry point) rather than resolving behind the caller's back
+    (is (equal (%sorted (mapcar #'car
+                                (wasmdown.wasi:command-provider
+                                 ctx :world world)))
+               (%sorted today)))))
+
+(test wasi/world-provider-composition-is-world-driven
+  ;; Two declared imports give two providers; removing ONE declared
+  ;; import (from the resolved world) removes exactly that provider and
+  ;; nothing else; a one-import world composes exactly one provider.
+  (let* ((ctx (wasmdown.wasi:make-wasi-context))
+         (pkgs (wasmdown.wasi::%wasi-wit-packages))
+         (pkg (wasmdown.wit:parse-wit-string
+               "package test:mini@0.1.0;
+
+world mini {
+  import wasi:clocks/monotonic-clock@0.3.2;
+  import wasi:clocks/system-clock@0.3.2;
+  import wasi:random/insecure@0.3.2;
+}
+"))
+         (world (wasmdown.wit:resolve-wit-world
+                 pkg "mini" :packages pkgs)))
+    (is (equal '("wasi:clocks/monotonic-clock@0.3.2"
+                 "wasi:clocks/system-clock@0.3.2"
+                 "wasi:random/insecure@0.3.2")
+               (%world-import-names world)))
+    ;; exactly one provider disappears, the other two keep their
+    ;; instances (a re-composition, so this proves filtering by world
+    ;; declaration, not a prefix/list slice)
+    (setf (wasmdown.wit:wit-world-imports world)
+          (remove "system-clock" (wasmdown.wit:wit-world-imports world)
+                  :key #'wasmdown.wit:wit-world-item-interface
+                  :test #'string=))
+    (let ((providers (wasmdown.wasi:compose-world-providers world ctx)))
+      (is (equal '("wasi:clocks/monotonic-clock@0.3.2"
+                   "wasi:random/insecure@0.3.2")
+                 (mapcar #'car providers)))
+      (is (every #'wasmdown.component.runtime:comp-instance-p
+                 (mapcar #'cdr providers))))
+    ;; a world with a single declared import composes a single provider
+    (let* ((one (wasmdown.wit:parse-wit-string
+                 "package test:one@0.1.0;
+
+world one {
+  import wasi:sockets/ip-name-lookup@0.3.2;
+}
+"))
+           (w (wasmdown.wit:resolve-wit-world one "one" :packages pkgs)))
+      (is (equal '("wasi:sockets/ip-name-lookup@0.3.2")
+                 (%world-import-names w))))
+    ;; an empty world imports nothing: no provider at all
+    (let* ((none (wasmdown.wit:parse-wit-string
+                  "package test:none@0.1.0;
+
+world none {
+}
+"))
+           (w (wasmdown.wit:resolve-wit-world none "none")))
+      (multiple-value-bind (providers unbound)
+          (wasmdown.wasi:compose-world-providers w ctx)
+        (is (null providers))
+        (is (null unbound))))))
+
+(test wasi/world-provider-types-only-import-needs-no-binding
+  ;; A types-only import the runtime has no entry for needs no host
+  ;; instance: it composes no entry and is reported as unbound. The
+  ;; command world's `wasi:cli/types@0.3.2' is the real case; a
+  ;; synthetic world pins it in isolation. `wasi:clocks/types@0.3.2'
+  ;; IS in the runtime's surface (it has always been in the command
+  ;; provider set), so it still composes its type-only instance.
+  (let* ((ctx (wasmdown.wasi:make-wasi-context))
+         (pkgs (wasmdown.wasi::%wasi-wit-packages))
+         (pkg (wasmdown.wit:parse-wit-string
+               "package test:typesonly@0.1.0;
+
+world t {
+  import wasi:cli/types@0.3.2;
+  import wasi:clocks/types@0.3.2;
+}
+"))
+         (world (wasmdown.wit:resolve-wit-world pkg "t" :packages pkgs)))
+    (multiple-value-bind (providers unbound)
+        (wasmdown.wasi:compose-world-providers world ctx)
+      (is (equal '("wasi:clocks/types@0.3.2") (mapcar #'car providers)))
+      (is (wasmdown.component.runtime:comp-instance-p (cdr (first providers))))
+      (is (equal '("wasi:cli/types@0.3.2") unbound)))
+    ;; cli/types alongside a function-bearing import: the types-only
+    ;; one still composes nothing, the other still composes
+    (let* ((mixed (wasmdown.wit:parse-wit-string
+                   "package test:mixed@0.1.0;
+
+world m {
+  import wasi:cli/types@0.3.2;
+  import wasi:clocks/system-clock@0.3.2;
+}
+"))
+           (w (wasmdown.wit:resolve-wit-world mixed "m" :packages pkgs)))
+      (multiple-value-bind (providers unbound)
+          (wasmdown.wasi:compose-world-providers w ctx)
+        (is (equal '("wasi:clocks/system-clock@0.3.2")
+                   (mapcar #'car providers)))
+        (is (equal '("wasi:cli/types@0.3.2") unbound))))))
+
+(test wasi/world-provider-unsupported-import-is-construction-error
+  ;; A declared import this runtime has no provider for is a
+  ;; CONSTRUCTION-TIME wit-error naming the interface — never a
+  ;; trapping stub installed as a successful binding.
+  (let ((ctx (wasmdown.wasi:make-wasi-context))
+        (feature (wasmdown.wit:make-wit-selection
+                  :enabled-features '("clocks-timezone"))))
+    ;; the real declaration: `wasi:cli/command' imports timezone only
+    ;; under the clocks-timezone feature, and this runtime has no
+    ;; timezone provider
+    (let* ((world (wasmdown.wasi:command-world :selection feature))
+           (item (find "timezone"
+                       (wasmdown.wit:wit-world-imports world)
+                       :key #'wasmdown.wit:wit-world-item-interface
+                       :test #'string=))
+           (message nil))
+      (is item)
+      (handler-case (wasmdown.wasi:compose-world-providers world ctx)
+        (wasmdown.wit:wit-error (c)
+          (setf message (wasmdown:wasmdown-error-message c))))
+      (is message)
+      ;; the message names the world and the exact import
+      (is (search "command" message))
+      (is (search "wasi:clocks/timezone@0.3.2" message))
+      (is (search "no provider" message))
+      ;; and it is raised while COMPOSING: no partial graph escapes,
+      ;; and the providers that WOULD have composed are never bound
+      (is (handler-case
+              (progn (wasmdown.wasi:command-provider ctx :world world) nil)
+            (wasmdown.wit:wit-error () t))))
+    ;; an inline interface import with a function: no provider exists
+    ;; for it either, and the error names the binding
+    (let* ((pkg (wasmdown.wit:parse-wit-string
+                 "package test:inline@0.1.0;
+
+world w {
+  import bogus: interface {
+    ping: func();
+  }
+}
+"))
+           (world (wasmdown.wit:resolve-wit-world pkg "w"))
+           (message nil))
+      (handler-case (wasmdown.wasi:compose-world-providers world ctx)
+        (wasmdown.wit:wit-error (c)
+          (setf message (wasmdown:wasmdown-error-message c))))
+      (is message)
+      (is (search "bogus" message)))))

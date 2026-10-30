@@ -5620,19 +5620,197 @@ alist, all bound to one network authority."
 ;;;      an exit — or a trap — leaves no parked guest thread behind.
 ;;;
 ;;; The provider set is capability-driven: every provider consults the
-;;; explicit WASI-CONTEXT (PLAN.md §9.1), never an ambient global.
+;;; explicit WASI-CONTEXT (PLAN.md §9.1), never an ambient global — and
+;;; (M17, plan step 3) the SET is the resolved world's import set, not
+;;; a hand-written whole-surface list.
 
-(defun command-provider (context)
-  "The full `command' world import set as a with-args alist: cli
-(environment/exit/stdio/terminals), clocks, random, filesystem
-(types + preopens) and sockets (types + ip-name-lookup), all bound to
-CONTEXT. `wasi:http` is not supported by this runtime and is never
-bound."
-  (append (cli-provider context)
-          (clocks-provider :reactor (wasi-context-reactor context))
-          (random-provider)
-          (filesystem-provider context)
-          (sockets-provider context)))
+;;; ---------------------------------------------------------------
+;;; PROVIDER COMPOSITION FROM THE RESOLVED WORLD.
+;;;
+;;; `COMMAND-PROVIDER' walks the imports of the world that
+;;; `WASMDOWN.WIT:RESOLVE-WIT-WORLD' resolved (gates applied, includes
+;;; expanded, references resolved) and builds exactly those providers,
+;;; under exactly the import names the world declares:
+;;;
+;;;   * a declared import this runtime serves gets its provider
+;;;     instance (the builders close over CONTEXT's authorities —
+;;;     streams, preopens, network, reactor — and are invoked LAZILY,
+;;;     so an import the world does not declare builds nothing);
+;;;   * a types-only import (no functions, no resources) for which the
+;;;     runtime has NO entry — `wasi:cli/types@0.3.2' — needs no host
+;;;     instance: a guest resolves its types structurally through
+;;;     `use', so it composes no entry and is reported as unbound
+;;;     rather than invented (`clocks'/`filesystem'/`sockets' `types'
+;;;     ARE in the surface, and compose their (empty-of-functions)
+;;;     instance exactly as before);
+;;;   * any OTHER declared import is a CONSTRUCTION-TIME `WIT-ERROR'
+;;;     naming the interface. A trapping stub (PROVIDER-INSTANCE's
+;;;     unimplemented-function closure) is never installed in place of
+;;;     a provider the runtime does not have.
+;;;
+;;; `wasi:http' is not supported by this runtime: the vendored `http'
+;;; package takes part in resolution (reference data only) so such an
+;;; import resolves to a named interface and is refused HERE, with its
+;;; import name, instead of failing to resolve.
+
+(defun %wasi-wit-packages ()
+  "The packages provider composition resolves against: the five WASI
+0.3.2 packages this runtime serves, plus the vendored `http' package
+as REFERENCE DATA (it parses/validates; no provider is built from
+it), so a world importing `wasi:http' names a real interface and is
+then refused by the provider check."
+  (mapcar #'wasi-package
+          '("clocks" "random" "cli" "filesystem" "sockets" "http")))
+
+(defun %world-import-name (item)
+  "The component-model import name of the world import ITEM: its
+plain binding name when it has one (`import foo: path'), else the
+interface's versioned import name (`ns:pkg/iface@version')."
+  (or (wasmdown.wit:wit-world-item-name item)
+      (let ((target (wasmdown.wit:wit-world-item-target item)))
+        (if (wasmdown.wit:wit-interface-p target)
+            (wasmdown.wit:interface-import-name target)
+            (if (wasmdown.wit:wit-world-item-package item)
+                (format nil "~a:~a/~a~@[@~a~]"
+                        (or (wasmdown.wit:wit-world-item-namespace item) "")
+                        (wasmdown.wit:wit-world-item-package item)
+                        (wasmdown.wit:wit-world-item-interface item)
+                        (wasmdown.wit:wit-world-item-version item))
+                (wasmdown.wit:wit-world-item-interface item))))))
+
+(defun %types-only-world-import-p (item)
+  "T when ITEM's resolved target is an interface with no functions
+and no resources: nothing for a provider instance to bind. Only a
+RESOLVED target qualifies — an unresolved reference is never assumed
+types-only, so it fails the provider check instead of vanishing."
+  (let ((target (wasmdown.wit:wit-world-item-target item)))
+    (and (wasmdown.wit:wit-interface-p target)
+         (null (wasmdown.wit:wit-interface-func-list target))
+         (null (wasmdown.wit:wit-interface-resource-list target)))))
+
+(defun %wasi-provider-builders (context)
+  "An alist import-name -> thunk for every WASI interface this
+runtime serves, each thunk building that interface's provider
+instance for CONTEXT. This is the RUNTIME's capability surface; WHICH
+of these entries a component gets is decided by the world."
+  (let* ((cli (wasi-package "cli"))
+         (clocks (wasi-package "clocks"))
+         (filesystem (wasi-package "filesystem"))
+         (random (wasi-package "random"))
+         (sockets (wasi-package "sockets"))
+         (reactor (wasi-context-reactor context))
+         (network (first (wasi-context-networks context)))
+         (builders '()))
+    (flet ((bind (package interface thunk)
+             (push (cons (wasmdown.wit:interface-import-name
+                          (wasmdown.wit:package-interface package interface))
+                         thunk)
+                   builders))
+           (empty (package interface)
+             ;; a types-only interface's provider: the type exports
+             ;; alone, exactly as clocks/filesystem/sockets `types'
+             ;; have always been built
+             (let ((node (wasmdown.wit:package-interface package interface)))
+               (lambda ()
+                 (provider-instance node nil :packages (list package))))))
+      ;; wasi:clocks
+      (bind clocks "types" (empty clocks "types"))
+      (bind clocks "monotonic-clock"
+            (lambda ()
+              (monotonic-clock-instance :package clocks :reactor reactor)))
+      (bind clocks "system-clock"
+            (lambda () (system-clock-instance :package clocks)))
+      ;; wasi:random
+      (bind random "random"
+            (lambda () (random-instance :package random)))
+      (bind random "insecure"
+            (lambda () (insecure-random-instance :package random)))
+      (bind random "insecure-seed"
+            (lambda () (insecure-seed-instance :package random)))
+      ;; wasi:cli
+      (bind cli "environment"
+            (lambda () (cli-environment-instance context :package cli)))
+      (bind cli "exit"
+            (lambda () (cli-exit-instance :package cli)))
+      (bind cli "stdin"
+            (lambda () (cli-stdin-instance context :package cli)))
+      (bind cli "stdout"
+            (lambda () (cli-stdout-instance context :package cli)))
+      (bind cli "stderr"
+            (lambda () (cli-stderr-instance context :package cli)))
+      (bind cli "terminal-input"
+            (lambda () (terminal-input-instance :package cli)))
+      (bind cli "terminal-output"
+            (lambda () (terminal-output-instance :package cli)))
+      (bind cli "terminal-stdin"
+            (lambda () (terminal-stdin-instance context :package cli)))
+      (bind cli "terminal-stdout"
+            (lambda () (terminal-stdout-instance context :package cli)))
+      (bind cli "terminal-stderr"
+            (lambda () (terminal-stderr-instance context :package cli)))
+      ;; wasi:filesystem
+      (bind filesystem "types"
+            (lambda () (filesystem-types-instance context :package filesystem)))
+      (bind filesystem "preopens"
+            (lambda ()
+              (filesystem-preopens-instance context :package filesystem)))
+      ;; wasi:sockets
+      (bind sockets "types"
+            (lambda ()
+              (sockets-types-instance context :network network
+                                      :package sockets)))
+      (bind sockets "ip-name-lookup"
+            (lambda ()
+              (ip-name-lookup-instance context :network network
+                                       :package sockets)))
+      (nreverse builders))))
+
+(defun compose-world-providers (world context)
+  "Compose the provider graph for the RESOLVED WORLD: exactly the
+imports WORLD declares, in declaration order, each bound under the
+world's own import name. Returns (values ALIST UNBOUND), where ALIST
+is the `:with-args' alist and UNBOUND lists the declared types-only
+imports the runtime has no entry for (they need no host binding).
+Raises `WIT-ERROR' naming the interface for any other declared
+import this runtime has no provider for."
+  (let ((builders (%wasi-provider-builders context))
+        (providers '())
+        (unbound '())
+        (seen (make-hash-table :test #'equal)))
+    (dolist (item (wasmdown.wit:wit-world-imports world))
+      (let ((name (%world-import-name item)))
+        (unless (gethash name seen)
+          (setf (gethash name seen) t)
+          (let ((builder (cdr (assoc name builders :test #'string=))))
+            (cond
+              (builder
+               (push (cons name (funcall builder)) providers))
+              ((%types-only-world-import-p item)
+               (push name unbound))
+              (t
+               (error 'wasmdown.wit:wit-error
+                      :message
+                      (format nil "world `~a` declares import `~a`, for which this runtime has no provider"
+                              (wasmdown.wit:wit-world-name world) name))))))))
+    (values (nreverse providers) (nreverse unbound))))
+
+(defun command-world (&key (packages (%wasi-wit-packages)) selection)
+  "The RESOLVED `command' world of the vendored `wasi:cli' package
+under SELECTION (NIL: the default selection), with the package set
+PACKAGES supplying its cross-package imports."
+  (wasmdown.wit:resolve-wit-world (wasi-package "cli") "command"
+                                  :packages packages
+                                  :selection selection))
+
+(defun command-provider (context &key (world (command-world)))
+  "The provider set of the `command' world as a with-args alist,
+bound to CONTEXT and composed from the resolved WORLD (default: the
+vendored `wasi:cli/command'). Every import the world declares gets
+its provider; a types-only import the runtime has no entry for
+composes no entry; an unsupported one is a construction-time
+`WIT-ERROR'. `wasi:http' is not supported by this runtime and is
+never bound."
+  (compose-world-providers world context))
 
 (defun component-run-export (instance)
   "The `run' function a command-world component exports: the exported
