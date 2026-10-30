@@ -1,3 +1,19 @@
+# M17 SESSION 37 — A FRESH-CHECKOUT VERIFICATION, WHICH IS THE ONE THING A CLOSING RECORD
+# SHOULD ALSO PROVE: the committed tree is SELF-CONTAINED.
+# Run in a clean `git worktree add /tmp/fresh HEAD` (no working-tree state, no untracked
+# helper, no leftover lane artifact):
+#   make load-system                    -> builds; 14 WARNING / 80 STYLE-WARNING conditions
+#                                          (the pre-existing count, unchanged)
+#   tools/run-tests.lisp                -> 552 passed, 0 failed
+#   tools/run-component-suite.lisp      -> GATE: GREEN, executed 1631, 0 timeout,
+#                                          0 harness-error
+# So nothing in this session's work depends on an uncommitted file, a generated artifact, or
+# a worktree-local state: a clean checkout of 0e98230 builds and passes both unit lanes.
+# (The lane's 0-fail here is one block, not the acceptance; the acceptance's window-lock caveat
+# stands as recorded.)
+# THIS IS THE ACTUAL LAST ITEM. There is no further implementation, measurement, or record to
+# produce; the only two things named as "remaining" are a watch row to measure in a future
+# paired window and a scope decision already taken (WASI HTTP removed).
 # M17 SESSION 36 — THE CLOSING RECORD. Nothing remains.
 # (a) THE TEARDOWN SPLIT, VERIFIED END TO END (not just by grep -n): the body of
 #     %store-teardown has exactly ONE `with-recursive-lock (*scheduler-mutex*)`, in phase 1
