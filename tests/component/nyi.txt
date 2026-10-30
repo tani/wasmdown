@@ -1,7 +1,10 @@
 # M17 SESSION 41 — THE LAST THREE VERIFICATIONS, DONE BY HAND.
 # 1. THE STUB IS DELETED, not merely unreferenced: `grep -c unsupported-closure src/wasi.lisp`
 #    = 0 and `grep -rn unsupported-closure src/` is EMPTY.
-# 2. THE REFUSAL PATH, driven directly (throwaway script, deleted): with an EMPTY implementation
+# 2. THE REFUSAL PATH, driven directly (throwaway script, deleted; the interface came from the
+#    real registry accessor `wasmdown.wasi::wasi-package "clocks"` + `package-interface
+#    "monotonic-clock"` — an earlier attempt used a nonexistent `wasmdown.wit::wasi-package` and
+#    was corrected before the proof was accepted): with an EMPTY implementation
 #    alist the old code substituted trapping stubs; it now signals
 #      wasmdown: host error: WASI interface monotonic-clock declares now, but this provider
 #      supplies no implementation for it (refusing to export a trapping stub)
