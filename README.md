@@ -590,10 +590,19 @@ NOT in the lane:
 3. **Borrow-side lifetime pins**: a live borrow held across task.return
    must trap; borrow-in-awaitable-set. The guest-drop pin's shape is the
    vector to reuse.
-4. **Two parked deltas with measured verdicts**: `wip/type-view` (at
+4. **One parked delta with a measured verdict**: `wip/type-view` (at
    parity in a clean window; not landed because a green lane's bar is
-   "no measured cost") and `wip/reactor-wiring` (unresolved; needs the
-   adjacent pair at an unpinned window, then sub-element bisection).
+   "no measured cost"). `wip/reactor-wiring` was CLOSED AS SUPERSEDED —
+   its driver pump and context reactor landed as the store driver, and
+   its socket plumbing landed as the executor slice with a strictly
+   stronger keying scheme, so it was never rebased or re-measured.
+
+M17 also deleted the canon-lower wrappers' position-dependent
+`stream`/`future` arms (probe set: 295 rows, byte-identical before and
+after); the `borrow` lend arms stay, with the regressing rows recorded
+(`passing-resources::1`, `drop-cross-task-borrow::2/::4/::6`) because an
+async-typed callee resolves a borrow index at its OWN table, so the raw
+caller index is not substitutable.
 
 What remains, per milestone (M7-era, historical):
 
