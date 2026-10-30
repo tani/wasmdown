@@ -45,7 +45,8 @@ async suite is COMPLETE: **45 of 45 files in the lane**
 (+2 rows, the last file sync-streams). **M17 CLOSE-OUT (measured, 2026-10-30): the lane reads 0 fail x 30
 consecutive runs on a quiet machine** (`red_runs=0/30,
 fail_commands=0`, walls 9.86-10.53 s over 1631 commands per run),
-and units read 531 pass / 0 fail. That was not achieved by waiting
+and units read 553 pass / 0 fail, with a clean checkout of HEAD
+building and passing both unit lanes. That was not achieved by waiting
 for a lucky window: every residual row was decoded to a named
 mechanism and pinned so the pin fails when the rule is re-broken —
 `resume-later` on a live thread and the single-park mark credit,
@@ -53,7 +54,11 @@ atomic thread-index registration with hole traps, the suspend park
 accepting only a spec-level resume credit, target-limited switch
 handoffs, reserved handoff windows (`*right-handoffs*`), and a
 resumer's boundary being the whole `switch_to` chain rather than the
-arm. The plan's own acceptance statement is "0 fail x 30"; it is met
+arm, the per-instance sync window blocking a pending spawn's first turn, an
+explicit switch being a target-limited handoff whose chain ends at the
+target's EXIT, a guest keeping the store right across a nested async-callee
+lower, and one documented lock order whose single violating site (the store
+teardown) is fixed. The plan's own acceptance statement is "0 fail x 30"; it is met
 at this window, and the general rule recorded with it is that the
 lane is bimodal on this box (master measured 18, 9 and 1 fail
 commands in earlier windows), so the pins — not the window — are the

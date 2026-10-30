@@ -16,9 +16,11 @@
 ;;;;     no provider reads ambient Lisp globals;
 ;;;;   * secure randomness is OS entropy (/dev/urandom), never
 ;;;;     CL:RANDOM;
-;;;;   * unimplemented-but-declared functions are still exported, as
-;;;;     closures that signal host-error (the multi-gate discipline:
-;;;;     the interface surface is complete, the support is honest).
+;;;;   * every function/method a provided interface declares is
+;;;;     implemented: a provider alist that misses one is a
+;;;;     construction-time host-error naming the interface and the
+;;;;     function — never a trapping stub (see PROVIDER COMPLETENESS
+;;;;     below; the deliberately-unserved interfaces are listed there).
 
 (in-package #:wasmdown.wasi)
 
@@ -284,15 +286,61 @@ back-pressure tables even for a host callee."
    :core nil :type functype :opts nil :memory nil :realloc nil
    :inst inst :host host-fn))
 
-(defun %unsupported-closure (interface function-name)
-  (lambda (args)
-    (declare (ignore args))
-    (error 'wasmdown:host-error
-           :message (format nil
-                            "WASI function ~a of interface ~a is declared ~
-                             but not implemented in this slice"
-                            function-name
-                            (wasmdown.wit:wit-interface-name interface)))))
+;;; ---------------------------------------------------------------
+;;; PROVIDER COMPLETENESS (M17 audit).
+;;;
+;;; The audit enumerated, from the vendored 0.3.2 WIT, every function
+;;; and resource METHOD of every interface this runtime provides, and
+;;; compared it with the implementation alist each provider supplies:
+;;; 89 declared, 89 implemented, 0 stubs.
+;;;
+;;;   clocks/monotonic-clock   4    random/random           2
+;;;   clocks/system-clock      2    random/insecure         2
+;;;   cli/environment          3    random/insecure-seed    1
+;;;   cli/exit                 2    filesystem/types       25
+;;;   cli/stdin|stdout|stderr  1+1+1    filesystem/preopens 1
+;;;   cli/terminal-*          1+1+1    sockets/types         40
+;;;                                   sockets/ip-name-lookup 1
+;;;
+;;; (clocks/types, cli/terminal-input and cli/terminal-output declare
+;;; no functions.) Every gate on that surface is
+;;; `@since(version = 0.3.0)', i.e. STABLE in this package — so no
+;;; STABLE function of a provided interface is left unimplemented.
+;;;
+;;; What this runtime DELIBERATELY does not serve is therefore not a
+;;; stub inside a provider instance: it is a whole interface with no
+;;; provider at all, refused when a world asks for it
+;;; (COMPOSE-WORLD-PROVIDERS names the import):
+;;;   * wasi:clocks/timezone — iana-id, utc-offset, to-debug-string;
+;;;     all three are `@unstable(feature = clocks-timezone)';
+;;;   * wasi:http/types (35), wasi:http/client (1), wasi:http/handler
+;;;     (1) — WASI HTTP was removed at user direction;
+;;;   * wasi:cli/run — the command world's EXPORT (served by
+;;;     COMPONENT-RUN-EXPORT), never an import to bind.
+;;;
+;;; PROVIDER-INSTANCE enforces the 89/89: an alist that does not cover
+;;; a declared function is a construction-time HOST-ERROR naming the
+;;; interface and the function. There is no stub factory, so the
+;;; implemented set cannot shrink silently.
+
+(defun %provider-missing (interface function-name)
+  (error 'wasmdown:host-error
+         :message (format nil
+                          "WASI interface ~a declares ~a, but this provider ~
+                           supplies no implementation for it (refusing to ~
+                           export a trapping stub)"
+                          (wasmdown.wit:wit-interface-name interface)
+                          function-name)))
+
+(defun %provider-closure (interface implementations name)
+  "The host closure for declared function NAME over IMPLEMENTATIONS.
+A missing entry is a construction-time error: an unimplemented
+function is never exported as a trapping stub."
+  (let ((impl (cdr (assoc name implementations :test #'string=))))
+    (unless (or (functionp impl)
+                (and (symbolp impl) (fboundp impl)))
+      (%provider-missing interface name))
+    (lambda (args) (apply impl args))))
 
 (defun %resource-method-export-name (resource method)
   "The component-model core export name of a resource METHOD:
@@ -337,10 +385,12 @@ has no self, and its result is the implicit `own<R>' (the WIT's
 (defun provider-instance (interface implementations &key packages)
   "Build a comp-instance for the parsed WIT INTERFACE. IMPLEMENTATIONS
 is an alist ((\"now\" . fn) ...) of CL functions taking the component
-domain arguments; a function absent from the alist (or bound to
-:UNSUPPORTED) is still exported, as a host-error trap. The instance's
-export table also carries the interface's TYPE definitions, so a
-consumer can alias them with the runtime's type-projection path.
+domain arguments. Every function and resource method the INTERFACE
+declares MUST be supplied — an absent entry is a construction-time
+HOST-ERROR naming the interface and the function; it is never
+exported as a trapping stub. The instance's export table also carries
+the interface's TYPE definitions, so a consumer can alias them with
+the runtime's type-projection path.
 
 M16 slice 3: RESOURCE methods are exported under their component
 core names ([method]R.m / [static]R.m / [constructor]R), can be
@@ -352,12 +402,7 @@ of the resource shares (the handle table's type identity)."
       (let* ((fname (wasmdown.wit:wit-func-name fn))
              (ct (wasmdown.wit:wit-func->ct interface fn
                                             :packages packages))
-             (impl (cdr (assoc fname implementations :test #'string=)))
-             (closure
-               (cond
-                 ((and impl (not (eq impl :unsupported)))
-                  (lambda (args) (apply impl args)))
-                 (t (%unsupported-closure interface fname)))))
+             (closure (%provider-closure interface implementations fname)))
         (setf (gethash fname
                        (wasmdown.component.runtime:comp-instance-exports inst))
               (cons :func (make-host-lifted-func ct closure :inst inst)))))
@@ -374,13 +419,12 @@ of the resource shares (the handle table's type identity)."
           (let* ((mname (wasmdown.wit:wit-func-name method))
                  (fname (%resource-method-export-name res method))
                  (ct (%resource-method-ct interface res method packages))
-                 (impl (or (cdr (assoc fname implementations :test #'string=))
-                           (cdr (assoc mname implementations :test #'string=))))
-                 (closure
-                   (cond
-                     ((and impl (not (eq impl :unsupported)))
-                      (lambda (args) (apply impl args)))
-                     (t (%unsupported-closure interface fname)))))
+                 (key (cond ((assoc fname implementations :test #'string=)
+                             fname)
+                            ((assoc mname implementations :test #'string=)
+                             mname)
+                            (t fname)))
+                 (closure (%provider-closure interface implementations key)))
             (setf (gethash fname
                            (wasmdown.component.runtime:comp-instance-exports
                             inst))

@@ -175,6 +175,171 @@ machinery is deliberately not part of the public surface)."
       (is (string= (car (second instant)) "nanoseconds")))))
 
 ;;; ---------------------------------------------------------------
+;;; Provider completeness (the M17 coverage audit, as a test).
+;;;
+;;; `provider-instance' used to export a declared-but-unimplemented
+;;; function as a trapping stub. It now refuses at construction time,
+;;; and the audit below pins the fact that nothing was hiding behind
+;;; the old default: every function/method the vendored 0.3.2 WIT
+;;; declares in an interface this runtime provides is implemented, and
+;;; every gate on that surface is the stable `@since(0.3.0)'.
+
+(defun %wasi-interface-for-import-name (name)
+  "The WIT interface whose versioned import name is NAME, over the
+packages this runtime provides."
+  (dolist (short '("clocks" "random" "cli" "filesystem" "sockets"))
+    (let ((found nil))
+      (maphash (lambda (key interface)
+                 (declare (ignore key))
+                 (when (and (null found)
+                            (string= (wasmdown.wit:interface-import-name
+                                      interface)
+                                     name))
+                   (setf found interface)))
+               (wasmdown.wit:wit-package-interfaces
+                (wasmdown.wasi:wasi-package short)))
+      (when found (return found)))))
+
+(defun %wasi-declared-exports (interface)
+  "Every function/method export name INTERFACE declares, as an alist
+(NAME . ANNOTATIONS) in declaration order."
+  (let (out)
+    (dolist (fn (wasmdown.wit:wit-interface-func-list interface))
+      (push (cons (wasmdown.wit:wit-func-name fn)
+                  (wasmdown.wit:wit-func-annotations fn))
+            out))
+    (dolist (res (wasmdown.wit:wit-interface-resource-list interface))
+      (dolist (m (wasmdown.wit:wit-resource-methods res))
+        (push (cons (wasmdown.wasi::%resource-method-export-name res m)
+                    (wasmdown.wit:wit-func-annotations m))
+              out)))
+    (nreverse out)))
+
+(defun %wasi-exported-func-names (instance)
+  (let (out)
+    (maphash (lambda (key value)
+               (when (eq (car value) :func) (push key out)))
+             (wasmdown.component.runtime:comp-instance-exports instance))
+    out))
+
+(test wasi/provider-surface-covers-every-stable-wit-name
+  ;; Every provider the runtime registers builds — which under the new
+  ;; PROVIDER-INSTANCE contract already proves each declared function
+  ;; has an implementation — and the exported function set is EXACTLY
+  ;; the WIT-declared set, so no name falls to a stub.
+  (flet ((sorted (l) (sort (copy-list l) #'string<)))
+    (let* ((ctx (wasmdown.wasi:make-wasi-context
+                 :arguments '("prog")
+                 :environment '(("K" . "V"))
+                 :cwd "/"
+                 :stdin (make-string-input-stream "")
+                 :stdout (make-string-output-stream)
+                 :stderr (make-string-output-stream)))
+           (builders (wasmdown.wasi::%wasi-provider-builders ctx))
+           (declared-total 0)
+           (exported-total 0))
+      ;; the audited surface: 20 interface imports (19 of them declare
+      ;; functions; clocks/types is type-only)
+      (is (= 20 (length builders)))
+      (dolist (entry builders)
+        (let* ((import-name (car entry))
+               (interface (%wasi-interface-for-import-name import-name))
+               (declared (%wasi-declared-exports interface))
+               (instance (funcall (cdr entry)))
+               (exports (wasmdown.component.runtime:comp-instance-exports
+                         instance))
+               (exported (%wasi-exported-func-names instance)))
+          (is interface)
+          (is (wasmdown.component.runtime:comp-instance-p instance))
+          ;; exported function set == WIT-declared set, exactly
+          (is (equal (sorted (mapcar #'car declared)) (sorted exported)))
+          (is (= (length declared) (length exported)))
+          (dolist (declared-entry declared)
+            (let ((name (car declared-entry))
+                  (annotations (cdr declared-entry)))
+              (incf declared-total)
+              (incf exported-total)
+              ;; every declared name is an exported lifted host function
+              (let ((hit (gethash name exports)))
+                (is (eq (car hit) :func))
+                (is (wasmdown.component.runtime:lifted-func-p (cdr hit))))
+              ;; and nothing on the provided surface is `unstable': the
+              ;; coverage claim is about the STABLE API
+              (is (null (member "unstable" annotations
+                                :key #'wasmdown.wit:wit-annotation-name
+                                :test #'string=)))))))
+      ;; the audit's totals: 89 declared = 89 exported
+      (is (= 89 declared-total))
+      (is (= 89 exported-total))
+      ;; Deliberately-absent names are NOT stubs inside a provider: the
+      ;; whole interfaces are absent from the registry, so no trapping
+      ;; closure can be bound for them. The refusal itself lives in
+      ;; COMPOSE-WORLD-PROVIDERS (wasi/world-provider-unsupported-
+      ;; import-is-construction-error).
+      (let ((names (mapcar #'car
+                           (wasmdown.wasi::%wasi-provider-builders
+                            (wasmdown.wasi:make-wasi-context)))))
+        (is (not (member "wasi:clocks/timezone@0.3.2" names
+                         :test #'string=)))
+        (is (notany (lambda (n) (search "wasi:http/" n)) names))))))
+
+(test wasi/provider-instance-refuses-unimplemented-function
+  ;; A declared function the alist does not cover is a CONSTRUCTION-TIME
+  ;; host-error naming the interface and the function — never an
+  ;; exported trapping stub.
+  (let* ((package (wasmdown.wasi:wasi-package "clocks"))
+         (iface (wasmdown.wit:package-interface package "monotonic-clock")))
+    (flet ((refusal (implementations)
+             (let ((message nil))
+               (handler-case
+                   (progn (wasmdown.wasi:provider-instance
+                           iface implementations :packages (list package))
+                          nil)
+                 (wasmdown:host-error (c)
+                   (setf message (wasmdown:wasmdown-error-message c))))
+               message)))
+      ;; the complete alist still builds
+      (is (wasmdown.component.runtime:comp-instance-p
+           (wasmdown.wasi:provider-instance
+            iface
+            (list (cons "now" #'wasmdown.wasi:monotonic-now)
+                  (cons "get-resolution" #'wasmdown.wasi:monotonic-resolution)
+                  (cons "wait-until" (lambda (when) when))
+                  (cons "wait-for" (lambda (how-long) how-long)))
+            :packages (list package))))
+      ;; one missing function: refused, naming BOTH
+      (let ((message (refusal (list (cons "now" #'wasmdown.wasi:monotonic-now)))))
+        (is message)
+        (is (search "monotonic-clock" message))
+        (is (search "get-resolution" message))
+        (is (search "refusing" message)))
+      ;; the retired :UNSUPPORTED marker is not an escape hatch either
+      (let ((message (refusal
+                      (list (cons "now" :unsupported)
+                            (cons "get-resolution"
+                                  #'wasmdown.wasi:monotonic-resolution)
+                            (cons "wait-until" (lambda (when) when))
+                            (cons "wait-for" (lambda (how-long) how-long))))))
+        (is message)
+        (is (search "now" message)))))
+  ;; a resource METHOD is held to the same rule; the message reports the
+  ;; method's component core name
+  (let* ((package (wasmdown.wasi:wasi-package "filesystem"))
+         (iface (wasmdown.wit:package-interface package "types"))
+         (message
+           (handler-case
+               (progn (wasmdown.wasi:provider-instance
+                       iface nil
+                       :packages (wasmdown.wasi::%filesystem-packages
+                                  :package package))
+                      nil)
+             (wasmdown:host-error (c)
+               (wasmdown:wasmdown-error-message c)))))
+    (is message)
+    (is (search "types" message))
+    (is (search "[method]descriptor." message))))
+
+;;; ---------------------------------------------------------------
 ;;; The end-to-end fixture: a real component text that imports the
 ;;; versioned interface instance, aliases its functions, canon-lowers
 ;;; them for a core module, and lifts a call back out. Supplied through

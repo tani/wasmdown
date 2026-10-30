@@ -307,12 +307,16 @@ WASI 0.2 keeps its own canonical interfaces and `wasi:io` resource semantics, ma
 >
 > **M17 close-out (2026-10-30):** the component lane reads **0 fail x 30
 > consecutive runs** (walls 9.86-10.53 s, 1631 commands/run) and units read
-> **531 pass / 0 fail**. The residual rows this plan carried — `async-calls-sync`,
+> **553 pass / 0 fail** (and a clean checkout of HEAD builds and passes both unit
+> lanes, so nothing depends on uncommitted state). The residual rows this plan carried — `async-calls-sync`,
 > `cancel-targeted-resume`, `during-sync-*`, `reentrance`, `cancel-resumed-callback-
 > switch` — were each decoded to a named mechanism and are now pinned: resume-later on
 > a live thread, the single-park mark credit, atomic thread-index registration with
 > hole traps, the suspend park's resume-only credit, target-limited switch handoffs,
-> reserved handoff windows, and the switch_to chain as a resumer's boundary. WASI HTTP
+> reserved handoff windows, the switch_to chain as a resumer's boundary, the
+> per-instance sync window that blocks a pending spawn's first turn, a guest
+> keeping the right across a nested async-callee lower, and one documented lock
+> order whose single violating site (the store teardown's two-phase split) is fixed. WASI HTTP
 > remains REMOVED at user direction; the vendored `http` WIT stays reference data.
 > The pinned WIT is vendored at `specs/wasi/wasi-wit-0.3.2/` (v0.3.2
 > release asset, 15 files / 2,448 lines, SHA-256 pinned in
