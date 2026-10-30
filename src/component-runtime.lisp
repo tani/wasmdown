@@ -4092,7 +4092,16 @@ wrong-index probe: one transfer produced index 3)."
   ;; inside %right-acquire). Only active contenders are eligible
   ;; handoff targets, which is what keeps a park from rotating
   ;; through parked sleepers.
-  (right-waiting nil))
+  (right-waiting nil)
+  ;; STEP 4-QUANTUM: TRUE while this thread's QUANTUM is in progress
+  ;; — it has taken the right and has not yet parked, stalled,
+  ;; handed off or exited. Its one mid-quantum release is
+  ;; %without-right (the peer-mutex fan-out), which RESERVES the
+  ;; ticket for this thread instead of naming a successor: the
+  ;; release does not end the turn, so no peer may take the window
+  ;; as its own. Set by %right-take, cleared at every real turn
+  ;; boundary.
+  (right-turn-p nil))
 
 (defun %block-enter (th) (when th (sb-ext:atomic-incf (async-thread-block-depth th))))
 (defun %block-exit (th) (when th (sb-ext:atomic-decf (async-thread-block-depth th))))
@@ -4204,6 +4213,32 @@ no candidate thread can ever make progress — the deadlock trap.")
 ;;; every native factory, trap handler, abandon sweep and the
 ;;; teardown funnel through.
 ;;;
+;;; THE QUANTUM IS ENFORCED AT THE ACQUISITION, NOT AT THE PARK.
+;;; The M17 store-right measurement named the cost: during the
+;;; peer-mutex fan-out (task.return -> async-thread-resume-all) the
+;;; right was RELEASED, so the thread that resolution had just woken
+;;; could take it and run — the callee's own continuation was left
+;;; CONTENDING at %right-acquire, neither suspended nor parked, and
+;;; the next command's thread.resume-later trapped ("cannot resume
+;;; thread which is not suspended"). Two rules, both in
+;;; %right-acquire, both keyed on RIGHT-TURN-P:
+;;;   1. RESERVATION. %without-right releases the right only for the
+;;;      fan-out; the quantum is NOT over, so the ticket stays named
+;;;      for that thread and a peer that grabs the mutex waits
+;;;      without renaming it (%right-wait-reserved).
+;;;   2. MID-TURN TAKE-BACK. A thread whose turn is in progress takes
+;;;      the right back after its own fan-out, whatever the ticket
+;;;      order says.
+;;; Together they restore the spec's "a guest continuation runs until
+;;; it blocks": the callee's continuation after task.return reaches
+;;; its own next park before the thread that resolution woke may run.
+;;; Admission stays CONTENDING-ONLY: widening it to the parked/ready
+;;; classes rotates the right through sleepers and HANGS (2 of 2
+;;; runs, rc=124). A boundary-side "prefer a newly-ready peer" rule
+;;; was implemented, measured (adjacent n=30) and REMOVED: it moved
+;;; no row better and made during-sync-call-may-block ::8 and
+;;; during-sync-scheduling-candidates ::19 worse — see the ledger.
+;;;
 ;;; THE THREE MEASURED FACTS OF THE M17 LEDGER, and why they cannot
 ;;; recur here:
 ;;;  a. SBCL 2.6.4's (condition-wait q m :timeout t) returns with M
@@ -4221,12 +4256,14 @@ no candidate thread can ever make progress — the deadlock trap.")
 ;;;     mutexes. Every such call is wrapped in %without-right: the
 ;;;     fan-out runs with the right RELEASED, and the right is
 ;;;     re-acquired only after the fan-out has returned and dropped
-;;;     every peer mutex. The reverse order (a peer mutex held across
+;;;     every peer mutex. That release is a RESERVATION, never a park
+;;;     (rule 1 above). The reverse order (a peer mutex held across
 ;;;     an acquisition of the right) cannot occur either: no mutex
 ;;;     section in this runtime spans a wait — every wait goes
 ;;;     through %park/%right-stall, both of which are called with no
 ;;;     mutex but the parked one, and %right-acquire is never called
-;;;     from inside a lock.
+;;;     from inside a lock. %without-right's THUNK must therefore not
+;;;     wait: it is a fan-out of mutex sections and broadcasts.
 ;;;
 ;;; THE LOCK ORDER (depth 1 + short leaves):
 ;;;   *store-right*  ->  *scheduler-mutex*  ->  a thread/task/wset
@@ -4348,6 +4385,32 @@ early would rotate the right through sleepers."
                   (%right-runnable-p th)))
            (%right-candidates)))
 
+(defun %right-reserved-p (tk self)
+  "Does the TICKET name a holder that is MID-TURN? Such a holder
+released the right only so the peer-mutex fan-out could run
+(%without-right); its quantum is NOT over, so the window is not a
+turn: a peer that grabbed the mutex must not take it (measured: the
+during-sync family's ::16/::19 — the callee lost the acquisition
+race inside its own task.return's fan-out, was left contending at
+%right-acquire instead of reaching thread.suspend, and the next
+command's thread.resume-later trapped 'cannot resume thread which is
+not suspended')."
+  (and tk
+       (not (eq tk self))
+       (not (async-thread-abandoned tk))
+       (async-thread-right-turn-p tk)))
+
+(defun %right-take (self)
+  "Name SELF the ticket holder — the ONLY take path — and mark its
+quantum IN PROGRESS (RIGHT-TURN-P, the mid-turn reservation's key).
+Returns T."
+  (setf *right-ticket* self
+        *right-owner* self
+        *right-owner-os* sb-thread:*current-thread*
+        (async-thread-right-hops self) 0
+        (async-thread-right-turn-p self) t)
+  t)
+
 (defun %right-acquire (self)
   "Block until SELF is the ticket holder; return holding the right.
 IDEMPOTENT on the owning thread: a thread that already holds the
@@ -4355,7 +4418,17 @@ right (a nested component call on one thread) gets it back without
 a second grab and without any depth bookkeeping — the right is
 either held or not, and the only release is %right-yield / the exit
 handoff. SELF is a CONTENDER while it waits, which is what lets a
-yielding thread name it as the next ticket."
+yielding thread name it as the next ticket.
+
+THE THREE ACQUISITION RULES (the quantum, enforced HERE):
+  1. A ticket whose holder is MID-TURN is a reservation, not a
+     turn: SELF waits without renaming it.
+  2. SELF's own quantum in progress (it released only for a
+     %without-right fan-out) is taken back — the fan-out did not
+     end the turn.
+  3. At a real boundary (SELF has parked), a contending peer that
+     became ready AFTER SELF took its turn is preferred over SELF's
+     stale ticket; otherwise the ticket order decides."
   (when (null self)
     (return-from %right-acquire nil))
   (when (sb-thread:holding-mutex-p *store-right*)
@@ -4365,25 +4438,41 @@ yielding thread name it as the next ticket."
        (loop
          (sb-thread:grab-mutex *store-right*)
          (cond
+          ;; (1) THE TICKET IS RESERVED: its holder is mid-turn, so
+          ;; SELF waits WITHOUT renaming it (a rename would hand SELF
+          ;; a turn the running quantum has not finished).
+          ((%right-reserved-p *right-ticket* self)
+           (%right-wait-reserved self))
+          ;; (2) SELF's quantum is still in progress (it released the
+          ;; right only for its own %without-right fan-out): take it
+          ;; back, whatever the ticket order says. While mid-turn the
+          ;; ticket IS self (the reservation), so this cannot preempt
+          ;; a nominated peer.
+          ((async-thread-right-turn-p self)
+           (%right-take self)
+           (return t))
+          ;; (3) THE TICKET ORDER — SELF was named, or nobody else
+          ;; can run (the creator may already have yielded before
+          ;; this thread registered as a contender).
           ((or (eq *right-ticket* self)
-               ;; no other contender: the right is free in the sense
-               ;; that nobody named a successor — take it (the
-               ;; creator may already have yielded before this
-               ;; thread registered as a contender)
                (null (%right-successor self)))
-           (setf *right-ticket* self
-                 *right-owner* self
-                 *right-owner-os* sb-thread:*current-thread*
-                 (async-thread-right-hops self) 0)
-           ;; NOTE: the durable WAKE COUNT is the park machinery's
-           ;; (each site consumes its own); acquiring the right must
-           ;; never eat it — doing so swallowed the very wake that
-           ;; told the site its predicate now holds (measured: an
-           ;; endless acquire/park oscillation).
+           (%right-take self)
            (return t))
           (t
            (%right-wait-turn self))))
     (setf (async-thread-right-waiting self) nil)))
+
+(defun %right-wait-reserved (self)
+  "Called holding the right, by SELF, while the ticket names a
+MID-TURN holder. The ticket is NOT renamed (renaming it would steal
+the reservation and hand SELF a turn the running quantum has not
+finished) and no wake is owed: the holder re-grabs the mutex within
+microseconds. SELF releases the right and takes one short bounded
+sleep before retrying."
+  (setf *right-owner* nil)
+  (sb-thread:release-mutex *store-right*)
+  (sleep 0.0002)
+  nil)
 
 (defun %right-wait-turn (self)
   "Called holding the right, by SELF which is not the ticket holder.
@@ -4395,7 +4484,8 @@ mutex held; the caller loops back to %right-acquire."
   (let ((m (async-thread-mutex self))
         (q (async-thread-waitqueue self))
         (next (or (%right-successor self) self)))
-    (setf *right-ticket* next)
+    (setf *right-ticket* next
+          (async-thread-right-turn-p self) nil)
     (cond
      ((not (eq next self))
       (sb-thread:release-mutex *store-right*)
@@ -4419,15 +4509,17 @@ mutex held; the caller loops back to %right-acquire."
     nil))
 
 (defun %right-yield (self)
-  "SELF holds the right and is about to wait: name the next ticket
-(the earliest runnable candidate, else SELF) and RELEASE the right.
-Returns NIL (the caller re-acquires after its wait; the release is
-paired with the wait, never with the park)."
+  "SELF holds the right and is about to wait: END its quantum (the
+park boundary), name the next ticket (the earliest runnable
+candidate, else SELF) and RELEASE the right. Returns NIL (the caller
+re-acquires after its wait; the release is paired with the wait,
+never with the park)."
   (when (or (null self) (not (sb-thread:holding-mutex-p *store-right*)))
     (return-from %right-yield nil))
   (let ((next (%right-successor self)))
     (setf *right-ticket* (or next self)
-          *right-owner* nil)
+          *right-owner* nil
+          (async-thread-right-turn-p self) nil)
     (sb-thread:release-mutex *store-right*)
     (when (and next (< (async-thread-right-hops self) 8))
       (incf (async-thread-right-hops self))
@@ -4460,18 +4552,37 @@ the fixtures pin STARTED at the pack, before the callback's
 resolution). Then sleep the slice and re-acquire."
   (when (and self target (sb-thread:holding-mutex-p *store-right*))
     (setf *right-ticket* target
-          *right-owner* nil)
+          *right-owner* nil
+          (async-thread-right-turn-p self) nil)
     (sb-thread:release-mutex *store-right*))
   (sleep seconds)
   (%right-acquire self))
 
+(defun %right-reserve-self (self)
+  "Release the right WITHOUT ending SELF's quantum: name SELF (the
+reservation) and KEEP RIGHT-TURN-P, so a peer that grabs the mutex
+in this window defers (%right-reserved-p) instead of taking a turn
+the quantum in progress has not yielded. Used only by
+%without-right."
+  (setf *right-ticket* self
+        *right-owner* nil)
+  (sb-thread:release-mutex *store-right*))
+
 (defun %without-right (self thunk)
   "Run THUNK with the right released (fact (c): a peer-mutex fan-out —
 async-thread-resume-all, %subtask-resolve's waiters, the nudge spawn
-fires — must never run with the right held), then re-acquire it."
+fires — must never run with the right held), then re-acquire it.
+STEP 4-QUANTUM: the release is MID-TURN, never a park — the guest
+frame the caller is in the middle of does not end here, so the
+ticket is RESERVED for SELF and no peer may take the window as a
+turn of its own. THUNK must not wait (a fan-out of mutex sections
+and broadcasts only): the reservation lasts exactly as long as the
+fan-out. The rule this enforces is the during-sync family's: the
+callee's continuation after task.return must reach its own next
+block before the thread that resolution woke may run."
   (if (and self (sb-thread:holding-mutex-p *store-right*))
       (unwind-protect
-           (progn (%right-yield self) (funcall thunk))
+           (progn (%right-reserve-self self) (funcall thunk))
         (%right-acquire self))
       (funcall thunk)))
 
@@ -4481,7 +4592,8 @@ Hands the ticket to the earliest contender first, so a waiting guest
 is named while the driver stops polling. NO wait."
   (when (and self (sb-thread:holding-mutex-p *store-right*))
     (setf *right-ticket* (%right-successor self)
-          *right-owner* nil)
+          *right-owner* nil
+          (async-thread-right-turn-p self) nil)
     (sb-thread:release-mutex *store-right*))
   nil)
 
@@ -4490,6 +4602,8 @@ is named while the driver stops polling. NO wait."
 right, hand it to the earliest runnable candidate and release.
 NEVER waits, NEVER joins (the piece-(i) lesson: the teardown must not
 block at a script boundary)."
+  (when self
+    (setf (async-thread-right-turn-p self) nil))
   (when (and self
              ;; ONLY the exiting thread itself may hand the right on:
              ;; a sweep from another thread (teardown, an oracle
@@ -4520,6 +4634,7 @@ and NEVER waits."
             (remove self *scheduler-threads* :test #'eq))
       (remhash self *driver-records*))
     (setf (async-thread-right-waiting self) nil)
+    (setf (async-thread-right-turn-p self) nil)
     (when (sb-thread:holding-mutex-p *store-right*)
       (setf *right-ticket* (%right-successor self)
             *right-owner* nil
