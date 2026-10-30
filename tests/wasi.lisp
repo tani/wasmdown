@@ -3892,3 +3892,144 @@ STEP never blocks, so a fake clock fully determines the outcome."
                (is (eq is-close (funcall fin fs-types desc-ct)))
                (is (eq is-close (funcall fin fs-preopens desc-ct)))))
         (wasmdown.wasi:close-wasi-preopen pre)))))
+
+;;; ---------------------------------------------------------------
+;;; THE STORE DRIVER (steps 5/6): the store-owned completion queue,
+;;; the lock-free host-work gate, the bounded reactor tick, and the
+;;; queued host-end-ready retry. Every test here injects a SCRIPTED
+;;; reactor, so no clock is read and nothing sleeps.
+
+(defun rsym (name)
+  "The runtime's internal symbol NAME (upcased at lookup)."
+  (or (find-symbol (string-upcase name) '#:wasmdown.component.runtime)
+      (error "no runtime symbol ~a" name)))
+
+(defstruct scripted-reactor
+  (calls 0)                          ; %reactor-step invocations
+  (budgets '())                      ; the max-wait-ns of each step
+  (on-step nil))                     ; a closure a test may fire
+
+(defmethod wasmdown.component.runtime::%reactor-step
+    ((reactor scripted-reactor) max-wait-ns)
+  (incf (scripted-reactor-calls reactor))
+  (push max-wait-ns (scripted-reactor-budgets reactor))
+  (let ((fn (scripted-reactor-on-step reactor)))
+    (when fn (funcall fn)))
+  (values nil nil))
+
+(defun store-instance (&key reactor)
+  "A bare comp-instance whose store has REACTOR installed (installing
+it creates the store). Returns (values INSTANCE STORE)."
+  (let ((inst (wasmdown.component.runtime:make-comp-instance)))
+    (funcall (fdefinition (list 'setf (rsym "%inst-reactor"))) reactor inst)
+    (values inst (funcall (rsym "%inst-host-store") inst))))
+
+(defun store-work (store)
+  (funcall (rsym "host-store-work") store))
+
+(test wasi/store-tick-idle-does-not-step-reactor
+  ;; THE GATE: an idle store pays one word read and performs NO
+  ;; reactor step and NO pump.
+  (let ((reactor (make-scripted-reactor)))
+    (multiple-value-bind (inst store) (store-instance :reactor reactor)
+      (declare (ignore inst))
+      (is (zerop (store-work store)))
+      (is (zerop (funcall (rsym "%store-tick") store)))
+      (is (zerop (scripted-reactor-calls reactor)))
+      (is (null (scripted-reactor-budgets reactor))))))
+
+(test wasi/store-tick-pending-work-pumps-bounded
+  ;; THE ONLY TIME THE REACTOR IS STEPPED: pending host work. The
+  ;; budget is BOUNDED, and a caller's larger request is clamped.
+  (let ((reactor (make-scripted-reactor))
+        (ran nil))
+    (multiple-value-bind (inst store) (store-instance :reactor reactor)
+      (declare (ignore inst))
+      (funcall (rsym "%host-enqueue") (lambda () (setf ran t)) store)
+      (is (funcall (rsym "%host-store-work-pending-p") store))
+      (is (= 1 (funcall (rsym "%store-tick") store)))
+      (is ran)
+      (is (= 1 (scripted-reactor-calls reactor)))
+      (is (= (symbol-value (rsym "+store-tick-max-wait-ns+"))
+             (first (scripted-reactor-budgets reactor))))
+      (is (plusp (first (scripted-reactor-budgets reactor))))
+      ;; the gate closes: nothing pending means no second step
+      (is (zerop (funcall (rsym "%store-tick") store)))
+      (is (= 1 (scripted-reactor-calls reactor)))
+      ;; an unbounded caller request is clamped to the constant
+      (funcall (rsym "%host-enqueue") (lambda () nil) store)
+      (is (integerp (funcall (rsym "%store-tick") store
+                             :max-wait-ns 999999999)))
+      (is (= (symbol-value (rsym "+store-tick-max-wait-ns+"))
+             (first (scripted-reactor-budgets reactor))))
+      (is (= 2 (scripted-reactor-calls reactor))))))
+
+(test wasi/store-tick-completion-runs-on-store-context
+  ;; A completion QUEUED from a poster thread runs on the store's own
+  ;; context: *CURRENT-COMPONENT-STORE* inside the continuation is the
+  ;; store, and it did not run before the tick.
+  (multiple-value-bind (inst store) (store-instance :reactor (make-scripted-reactor))
+    (declare (ignore inst))
+    (let ((sym (rsym "*current-component-store*"))
+          (p nil)
+          (seen :unset)
+          (value :unset))
+      (progv (list sym) (list store)
+        (setf p (wasmdown.component.runtime:make-host-pending
+                 :start (lambda (resolve reject acknowledge)
+                          (declare (ignore reject acknowledge))
+                          (funcall resolve 42)
+                          (lambda () nil)))))
+      (funcall (rsym "%host-pending-set-continuation")
+               p (lambda (outcome)
+                   (setf seen (symbol-value sym)
+                         value (cdr outcome))))
+      (is (eq :unset seen))            ; never inline
+      (is (integerp (funcall (rsym "%store-tick") store)))
+      (is (eq store seen))
+      (is (eql 42 value))
+      ;; the pending's work unit and the delivery event are both gone
+      (is (zerop (store-work store)))
+      (is (zerop (funcall (rsym "%store-tick") store))))))
+
+(test wasi/host-end-ready-queues-and-guards-generation
+  ;; A readiness notification is ENQUEUED on the owning store, not run
+  ;; on the caller's thread; a stale generation cannot resume a newer
+  ;; parked copy.
+  (multiple-value-bind (inst store) (store-instance :reactor (make-scripted-reactor))
+    (let ((calls 0) (accept nil))
+      (multiple-value-bind (reader writer)
+          (wasmdown.component.runtime:make-host-stream-pair :u8 :owner inst)
+        (wasmdown.component.runtime:host-end-set-sink
+         reader (lambda (octets start end)
+                  (declare (ignore octets start end))
+                  (incf calls)
+                  (values (if accept 3 0) nil)))
+        (funcall (fdefinition (list 'setf (rsym "async-end-buffer")))
+                 (wasmdown.component.runtime:make-host-buffer
+                  3 :values '(1 2 3))
+                 writer)
+        ;; park the first attempt (sink (0 nil) = would-block)
+        (funcall (rsym "%host-sink-drain") writer)
+        (let ((gen1 (wasmdown.component.runtime:host-end-generation reader)))
+          (is (= 1 calls))
+          ;; a NEWER attempt, with a new generation, replaces the park
+          (funcall (rsym "%end-advance-generation") reader)
+          (funcall (rsym "%host-sink-drain") writer)
+          (let ((gen2 (wasmdown.component.runtime:host-end-generation reader)))
+            (is (= 2 calls))
+            (is (not (eql gen1 gen2)))
+            ;; STALE: enqueued, ticked, and resumes NOTHING
+            (wasmdown.component.runtime:host-end-ready reader gen1)
+            (is (= 2 calls))           ; not run inline
+            (is (integerp (funcall (rsym "%store-tick") store)))
+            (is (= 2 calls))
+            (is (funcall (rsym "async-end-host-copy") reader))
+            ;; CURRENT: still queued, then resumed on the tick
+            (setf accept t)
+            (wasmdown.component.runtime:host-end-ready reader gen2)
+            (is (= 2 calls))
+            (is (integerp (funcall (rsym "%store-tick") store)))
+            (is (= 3 calls))
+            (is (null (funcall (rsym "async-end-host-copy") reader)))
+            (is (null (funcall (rsym "async-end-buffer") writer)))))))))

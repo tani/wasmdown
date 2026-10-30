@@ -4998,6 +4998,14 @@ propagate to the caller."
                       (wasmdown.component.runtime:instantiate-component
                        comp :with-args providers))
                     (run (component-run-export instance)))
+               ;; THE STORE'S REACTOR (step 5/6 driver): registering the context's
+               ;; reactor on the instance's store is what lets a would-blocked copy
+               ;; or a clock deadline be woken from the store's own tick. Without
+               ;; it the store falls back to the single global FIFO and only
+               ;; direct/fake-reactor paths can be served.
+               (when (wasi-context-reactor context)
+                 (setf (wasmdown.component.runtime::%inst-reactor instance)
+                       (wasi-context-reactor context)))
                (unless run
                  (error 'wasmdown:link-error
                         :message

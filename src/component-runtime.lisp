@@ -101,7 +101,8 @@
 ;;; the guest arms; this was the root cause of the sessions
 ;;; 21-23 "binding-visibility mystery").
 (declaim (special *current-task* *current-thread*
-                 *handle-caller-inst* *sync-lift-owner*))
+                 *handle-caller-inst* *sync-lift-owner*
+                 *current-component-store* *host-pumping-store*))
 
 (declaim (notinline bag-p bag-ref make-lifted-func lifted-func-call
                     runtime-export-value instantiate-component))
@@ -412,6 +413,15 @@ enclosing comp-instance chain (innermost first) for outer aliases.
 Returns the comp-instance."
   (let ((inst (make-comp-instance :comp comp))
         (starts '()))
+    ;; STEP 5/6: the instantiation graph is ONE store. A nested
+    ;; instance (OUTER names the enclosing chain) inherits the root's
+    ;; store; a top-level instantiation inside a store context joins
+    ;; that store; otherwise it opens its own (drain-only until a
+    ;; reactor is installed).
+    (setf (%inst-host-store inst)
+          (or (and outer (%inst-host-store (car (last outer))))
+              *current-component-store*
+              (%make-host-store)))
     ;; with-args pre-bind: an :import def reads the bound value by name
     (dolist (pair with-args)
       (setf (gethash (car pair) (comp-instance-imports inst)) (cdr pair)))
@@ -2160,10 +2170,12 @@ value."
                 :task (make-async-task
                        :seq (let ((p (%ticket-path *right-self*)))
                               (if p (append p (list 0)) (list 0))))))
+         (store (or *current-component-store* *global-host-store*))
          (executor
            (sb-thread:make-thread
             (lambda ()
-              (let ((*right-self* self))
+              (let ((*right-self* self)
+                    (*current-component-store* store))
                 (%right-acquire self)
                 (unwind-protect
                      (multiple-value-bind (r e)
@@ -2243,7 +2255,9 @@ reentrance phase checks). The CALLER then waits:
               (lambda ()
                 (let ((*current-task* task)
                       (*current-thread* th)
-                      (*right-self* th))
+                      (*right-self* th)
+                      (*current-component-store*
+                        (%inst-host-store (lifted-func-inst lf))))
                   ;; STEP 4: the guest body runs only under the right.
                   (%right-acquire th)
                   (unwind-protect
@@ -2370,6 +2384,9 @@ reentrance phase checks). The CALLER then waits:
       ;; host caller has nowhere else to get it). A SYNC-typed closure
       ;; may not: the pending contract belongs to the async canons.
       (let* ((*host-provider-inst* (lifted-func-inst lf))
+             (*current-component-store*
+               (or *current-component-store*
+                   (%inst-host-store (lifted-func-inst lf))))
              (val (funcall (lifted-func-host lf) args)))
         (return-from lifted-func-call
           (cond
@@ -3964,62 +3981,209 @@ the copy itself, as before."
   (let ((c (and t-ct (ignore-errors (%abi-ct t-ct inst)))))
     (and c (not (%u8-element-p c nil)))))
 
-;;; ---- THE HOST EVENT QUEUE ----
+;;; ---- THE STORE'S HOST-WORK MACHINERY ----
 ;;; A pending's resolution (and a future watch's delivery) may land
-;;; on ANY native thread. It is QUEUED there and RUN by the pump on
-;;; the context that owns the call — never on the poster, never
-;;; inside the queue's mutex. The pump runs at the store's host
-;;; boundaries: a pending's own driver, the direct lifted-func-call
-;;; join, and every guest block (%park / %right-stall).
+;;; on ANY native thread. It is QUEUED on the STORE that owns the
+;;; call and RUN by the pump on that store's own context — never on
+;;; the poster, never inside the queue's mutex. The queue and the
+;;; context's reactor live in the SAME provenance place as the
+;;; handle table and the async fields: the instance's imports table,
+;;; under the reserved :HOST-STORE key. A store with no reactor
+;;; still drains exactly as the old global FIFO did.
+;;;
+;;; THE GATE. HOST-STORE-WORK is the store's pending-host-work
+;;; counter: one unit per QUEUED event plus one unit per LIVE host
+;;; pending (released exactly once when its delivery is consumed).
+;;; The driver's tick tests it WITHOUT the store mutex (a word-sized
+;;; slot read), so an idle store pays one word read and NOTHING
+;;; else — in particular it never calls the reactor.
 
-(defstruct (host-event (:constructor %make-host-event (thunk)))
-  thunk)
+(defstruct (host-store (:constructor %make-host-store))
+  "One store's host-work state: the completion queue, its lock-free
+gate (WORK), and the context's reactor (NIL = no time/readiness
+capability, exactly the old drain-only behaviour)."
+  (mutex (sb-thread:make-mutex :name "host-store"))
+  (entries nil)                         ; reversed push order
+  (count 0)                             ; queued events (word read)
+  (work 0)                              ; queued events + live pendings
+  (reactor nil))
 
-(defparameter *host-event-count* 0
-  "The number of QUEUED host events, readable without the queue's
-mutex (word-sized): the wait primitives test it before taking the
-lock, so an idle store pays nothing.")
+(defparameter *global-host-store* (%make-host-store)
+  "The store of a context with NO store binding (a bare host thread,
+a unit test calling a provider directly): today's behaviour — one
+queue, drained at the boundaries, no reactor step.")
 
-(defparameter *host-event-mutex* (sb-thread:make-mutex :name "host-events"))
-(defparameter *host-event-entries* nil)   ; reversed push order
-(defparameter *host-pumping* nil)         ; bound while a pump runs
+(defparameter *current-component-store* nil
+  "The store whose context THIS native thread is executing. Bound in
+every native factory and around a host closure; NIL outside a store.
+The dynamic binding is what routes a pending's completion back to
+the store that owns the call.")
 
-(defun %host-enqueue (thunk)
-  "Queue THUNK for the pump. Never runs it here — callable from any
-native thread."
-  (sb-thread:with-recursive-lock (*host-event-mutex*)
-    (setf *host-event-entries*
-          (cons (%make-host-event thunk) *host-event-entries*))
-    (incf *host-event-count*))
-  (sb-thread:with-recursive-lock (*scheduler-mutex*)
-    (incf *async-progress*))
+(defun %inst-host-store (inst &optional (create nil))
+  "INST's host-store state — the same imports-table provenance slot
+as :HANDLES/:ASYNC/:HANDLE-FREE. NIL for a context with no store
+unless CREATE; a bare NIL instance is the global fallback store."
+  (cond
+    ((null inst) *global-host-store*)
+    (t
+     (or (gethash :host-store (comp-instance-imports inst))
+         (and create
+              (setf (gethash :host-store (comp-instance-imports inst))
+                    (%make-host-store)))))))
+
+(defun (setf %inst-host-store) (store inst)
+  "Install STORE as INST's host state (the store of the instantiation
+graph; nested instances inherit it)."
+  (setf (gethash :host-store (comp-instance-imports inst)) store))
+
+(defun %inst-host-events (inst &optional (create nil))
+  "INST's completion queue (a HOST-STORE), created on demand when
+CREATE."
+  (%inst-host-store inst create))
+
+(defun %inst-reactor (inst)
+  "The reactor of INST's store, or NIL for a drain-only store."
+  (let ((store (%inst-host-store inst)))
+    (and store (host-store-reactor store))))
+
+(defun (setf %inst-reactor) (reactor inst)
+  "Install REACTOR as the reactor of INST's store. This is the ONE
+line the WASI side needs: the store driver then pumps it at the
+store's own boundaries. Installing creates the store when INST had
+none."
+  (setf (host-store-reactor (%inst-host-store inst t)) reactor))
+
+;;; THE REACTOR STEP PROTOCOL. The runtime loads BEFORE the WASI
+;;; backend, so the tick dispatches through this generic; the default
+;;; method calls wasmdown.wasi:reactor-step (resolved at first use,
+;;; once the backend is loaded), and a scripted reactor can specialize
+;;; it without touching the driver.
+(defvar *reactor-step-backend* nil)
+
+(defgeneric %reactor-step (reactor max-wait-ns)
+  (:documentation "Pump REACTOR at most once, waiting no longer than
+MAX-WAIT-NS (bounded; the driver never asks for an unbounded wait).
+Returns (values PROGRESS-P PENDING-P)."))
+
+(defmethod %reactor-step (reactor max-wait-ns)
+  (let ((fn (or *reactor-step-backend*
+                (setf *reactor-step-backend*
+                      (let ((s (and (find-package "WASMDOWN.WASI")
+                                    (find-symbol "REACTOR-STEP"
+                                                 "WASMDOWN.WASI"))))
+                        (and s (fboundp s) (symbol-function s)))))))
+    (unless fn
+      (error 'wasmdown:host-error
+             :message "no reactor backend is loaded for this store"))
+    (funcall fn reactor max-wait-ns)))
+
+(defconstant +store-tick-max-wait-ns+ 1000000
+  "The tick's reactor budget: 1 ms. Bounded work per boundary, and
+the reactor clamps it further to the earliest deadline.")
+
+(defun %host-store-work-add (store delta)
+  "Adjust STORE's host-work counter under its mutex (the READ is
+lock-free; only the mutation needs the lock)."
+  (when store
+    (sb-thread:with-recursive-lock ((host-store-mutex store))
+      (incf (host-store-work store) delta)))
   nil)
 
-(defun %host-pump ()
-  "Run every queued host event, one at a time, outside every lock.
-A re-entrant pump (an event that blocks and parks) is refused; the
-nested site simply returns and the outer pump finishes the queue.
-Returns the number of events run."
-  (when (or *host-pumping* (not (plusp *host-event-count*)))
-    (return-from %host-pump 0))
-  (let ((*host-pumping* t)
-        (n 0))
-    (loop
-      for ev = (sb-thread:with-recursive-lock (*host-event-mutex*)
-                 (let ((e (car *host-event-entries*)))
-                   (when e
-                     (setf *host-event-entries* (cdr *host-event-entries*))
-                     (decf *host-event-count*))
-                   e))
-      while ev
-      do (funcall (host-event-thunk ev))
-         (incf n))
-    n))
+(defun %host-store-work-pending-p (store)
+  "The tick's GATE: does STORE have queued events or a live host
+pending? ONE word-sized slot read, no lock."
+  (and store (plusp (host-store-work store))))
+
+(defun %host-enqueue (thunk &optional store)
+  "Queue THUNK on STORE (default: the current store, else the global
+fallback). Never runs it here — callable from any native thread."
+  (let ((store (or store *current-component-store* *global-host-store*)))
+    (sb-thread:with-recursive-lock ((host-store-mutex store))
+      (setf (host-store-entries store)
+            (cons thunk (host-store-entries store)))
+      (incf (host-store-count store))
+      (incf (host-store-work store)))
+    (sb-thread:with-recursive-lock (*scheduler-mutex*)
+      (incf *async-progress*))
+    nil))
+
+(defparameter *host-pumping-store* nil
+  "The store whose pump is running on this thread — the re-entrancy
+guard (never a global flag: two stores may be pumped concurrently).")
+
+(defun %host-pump (&optional store)
+  "Run every queued host event of STORE, one at a time, outside every
+lock, with *CURRENT-COMPONENT-STORE* bound to STORE so the
+continuation runs IN the store's own context (never the poster's). A
+re-entrant pump of the same store is refused; the nested site returns
+and the outer pump finishes the queue. Returns the number of events
+run."
+  (let ((store (or store *current-component-store* *global-host-store*)))
+    (when (or (eq store *host-pumping-store*)
+              (not (plusp (host-store-count store))))
+      (return-from %host-pump 0))
+    (let ((*host-pumping-store* store)
+          (*current-component-store* store)
+          (n 0))
+      (loop
+        for thunk = (sb-thread:with-recursive-lock ((host-store-mutex store))
+                      (let ((e (car (host-store-entries store))))
+                        (when e
+                          (setf (host-store-entries store)
+                                (cdr (host-store-entries store)))
+                          (decf (host-store-count store))
+                          (decf (host-store-work store)))
+                        e))
+        while thunk
+        do (funcall thunk)
+           (incf n))
+      n)))
+
+(defun %store-tick (store &key (max-wait-ns +store-tick-max-wait-ns+))
+  "One store-driver tick. WHEN AND ONLY WHEN STORE has pending host
+work (the lock-free WORK gate), pump its reactor ONCE with a BOUNDED
+budget, then drain its completion queue on the store's own context.
+An idle store pays one word read and performs no reactor step and no
+pump. Returns the number of events drained. Never blocks beyond
+MAX-WAIT-NS (clamped to +STORE-TICK-MAX-WAIT-NS+)."
+  (let ((store (or store *global-host-store*)))
+    (unless (%host-store-work-pending-p store)
+      (return-from %store-tick 0))
+    (let ((*current-component-store* store)
+          (budget (max 0 (min (or max-wait-ns 0)
+                              +store-tick-max-wait-ns+))))
+      (let ((reactor (host-store-reactor store)))
+        (when reactor
+          (%reactor-step reactor budget)))
+      (%host-pump store))))
 
 (defmacro %pump-if-pending ()
-  "The wait primitives' cheap hook: pump only when an event is
-queued (an empty queue costs one word read)."
-  '(when (plusp *host-event-count*) (%host-pump)))
+  "The wait primitives' store-tick hook, with the gate INLINED: one
+dynamic-variable read plus one word-sized slot read. An idle store
+(today's behaviour) never enters the driver at all; a store with
+pending host work gets one bounded reactor step plus a drain."
+  '(let ((store (or *current-component-store* *global-host-store*)))
+     (when (plusp (host-store-work store))
+       (%store-tick store))))
+
+(defun %host-store-of-context (&optional (inst nil))
+  "The store a completion/notification must land on: the current
+dynamic store, else INST's store, else NIL (no store context — the
+caller then runs the work inline). Unlike %HOST-ENQUEUE this NEVER
+falls back to the global store implicitly: a NIL result is how
+HOST-END-READY's direct host-thread path is chosen."
+  (or *current-component-store*
+      (and inst (%inst-host-store inst))))
+
+(defun %end-store-of-context (end)
+  "The store for a notification about END. A provider owns the HOST
+end, whose owner is NIL until something lowers it; the PAIRED end is
+the guest end whose owner names the instantiation graph, so the
+store is resolved through it as well. A NIL result is the direct
+host-thread (join-style) path: run the work inline."
+  (or (%host-store-of-context (async-end-owner end))
+      (let ((other (and (async-end-p end) (async-end-other end))))
+        (and other (%host-store-of-context (async-end-owner other))))))
 
 ;;; ---- THE HOST PENDING (an asynchronous host call) ----
 ;;;
@@ -4050,6 +4214,15 @@ queued (an empty queue costs one word read)."
   (delivery-queued-p nil)
   (delivered-p nil)
   (delivery-error nil)
+  ;; M17 step 5 — THE STORE THIS CALL BELONGS TO (captured when the
+  ;; pending is created, so a completion from ANY thread lands on the
+  ;; context that owns the call). Its HOST-STORE-WORK unit is added
+  ;; at creation and released exactly once, when the delivery is
+  ;; consumed (a pending with no continuation — the direct join —
+  ;; releases it too).
+  (store nil)
+  (work-counted-p nil)
+  (work-released-p nil)
   (mutex (sb-thread:make-mutex :name "host-pending"))
   (waitqueue (sb-thread:make-waitqueue :name "host-pending")))
 
@@ -4120,7 +4293,8 @@ T when the request was newly recorded."
         (setf (host-pending-cancel-queued-p p) t
               queue t)))
     (when queue
-      (%host-enqueue (lambda () (%host-pending-run-cancel p))))))
+      (%host-enqueue (lambda () (%host-pending-run-cancel p))
+                     (host-pending-store p)))))
 
 (defun %host-pending-run-cancel (p)
   "Run the provider's cancel-fn ONCE, on the pump. T from it means
@@ -4159,22 +4333,40 @@ settled queues its delivery now."
         (setf (host-pending-delivery-queued-p p) t
               queue t)))
     (when queue
-      (%host-enqueue (lambda () (%host-pending-deliver p))))))
+      (%host-enqueue (lambda () (%host-pending-deliver p))
+                     (host-pending-store p)))))
+
+(defun %host-pending-release-work (p)
+  "Release P's ONE host-work unit (its store's tick gate) exactly
+once. Safe from any thread and after a terminal-without-delivery."
+  (let ((release nil))
+    (sb-thread:with-recursive-lock ((host-pending-mutex p))
+      (when (and (host-pending-work-counted-p p)
+                 (not (host-pending-work-released-p p)))
+        (setf (host-pending-work-released-p p) t
+              release t)))
+    (when release
+      (%host-store-work-add (host-pending-store p) -1))
+    release))
 
 (defun %host-pending-deliver (p)
   "Run P's continuation once. The continuation is the runtime's
 result path (lower the result / resolve the subtask); its failure is
-recorded for the driver, never re-signalled on the pump."
+recorded for the driver, never re-signalled on the pump. A pending
+with NO continuation (the direct join) still counts as delivered, so
+its store-work unit is released."
   (let ((fn nil)
-        (outcome nil))
+        (outcome nil)
+        (delivered nil))
     (sb-thread:with-recursive-lock ((host-pending-mutex p))
       (setf (host-pending-delivery-queued-p p) nil)
       (when (and (host-pending-terminal-p p)
-                 (not (host-pending-delivered-p p))
-                 (host-pending-continuation p))
+                 (not (host-pending-delivered-p p)))
         (setf (host-pending-delivered-p p) t
               fn (host-pending-continuation p)
-              outcome (host-pending-outcome p))))
+              outcome (host-pending-outcome p)))
+      (setf delivered (host-pending-delivered-p p)))
+    (when delivered (%host-pending-release-work p))
     (when fn
       (handler-case (funcall fn outcome)
         (error (c) (setf (host-pending-delivery-error p) c))))))
@@ -4187,16 +4379,23 @@ as the provider's domain error value); a cancelled call is a host
 error. The wait is the store's own park (the right is RELEASED
 across it, and queued events run at the boundary), so a guest caller
 never holds the right across a host wait."
-  (loop
+  (let ((*current-component-store*
+          (or (host-pending-store p) *current-component-store*
+              *global-host-store*)))
+   (loop
     with last-state = nil
     with idle = 0
-    do (%host-pump)
+    do (%store-tick (host-pending-store p))
     do (let ((terminal nil) (outcome nil) (state nil))
       (sb-thread:with-recursive-lock ((host-pending-mutex p))
         (setf terminal (host-pending-terminal-p p)
               outcome (host-pending-outcome p)
               state (host-pending-state p)))
       (when terminal
+        ;; drain the queued delivery (it releases the pending's
+        ;; host-work unit and runs the continuation, if any) before
+        ;; returning
+        (%host-pump (host-pending-store p))
         (let ((e (host-pending-delivery-error p)))
           (when e (error e)))
         (case (car outcome)
@@ -4226,7 +4425,7 @@ never holds the right across a host wait."
          (unwind-protect
               (%park self m q)
            (when (sb-thread:holding-mutex-p m)
-             (sb-thread:release-mutex m))))))
+             (sb-thread:release-mutex m)))))))
 
 (defun make-host-pending (&key start)
   "An ASYNCHRONOUS host call. START is
@@ -4245,19 +4444,28 @@ back to the runtime, which attaches the completion continuation."
     (error 'wasmdown:host-error
            :message "make-host-pending requires a start function"))
   (let* ((p (%make-host-pending))
-         (cancel-fn
-           (funcall start
-                    (lambda (&optional value) (%host-pending-resolve p value))
-                    (lambda (failure) (%host-pending-reject p failure))
-                    (lambda () (%host-pending-acknowledge-cancel p)))))
-    (sb-thread:with-recursive-lock ((host-pending-mutex p))
-      (setf (host-pending-cancel-fn p) cancel-fn
-            (host-pending-cancel-installed-p p) t)
-      (when (eq (host-pending-state p) :starting)
-        (setf (host-pending-state p) :waiting)))
-    ;; a cancel that arrived DURING start fires once, now
-    (when (host-pending-cancel-requested p)
-      (%host-pending-queue-cancel p))
+         (store (or *current-component-store*
+                    (and *host-provider-inst*
+                         (%inst-host-store *host-provider-inst*))
+                    *global-host-store*)))
+    (setf (host-pending-store p) store
+          (host-pending-work-counted-p p) t)
+    ;; the pending is LIVE host work from now on: the store's tick
+    ;; gate sees it, and its reactor gets pumped at the next boundary
+    (%host-store-work-add store 1)
+    (let ((cancel-fn
+            (funcall start
+                     (lambda (&optional value) (%host-pending-resolve p value))
+                     (lambda (failure) (%host-pending-reject p failure))
+                     (lambda () (%host-pending-acknowledge-cancel p)))))
+      (sb-thread:with-recursive-lock ((host-pending-mutex p))
+        (setf (host-pending-cancel-fn p) cancel-fn
+              (host-pending-cancel-installed-p p) t)
+        (when (eq (host-pending-state p) :starting)
+          (setf (host-pending-state p) :waiting)))
+      ;; a cancel that arrived DURING start fires once, now
+      (when (host-pending-cancel-requested p)
+        (%host-pending-queue-cancel p)))
     p))
 
 ;;; ---- THE BYTE SPAN AND THE PARTIAL ACCEPT ----
@@ -4319,11 +4527,14 @@ the attempt in progress; taken after a (0 NIL) would-block it names
 the PARKED attempt."
   (async-end-generation end))
 
-(defun host-end-ready (end generation)
-  "Re-run the copy parked on END for GENERATION only. A notification
-from an older attempt (or from a copy that was cancelled, dropped or
-replaced) names a different generation and resumes NOTHING — the
-stale-fd/stale-copy guard. T when a parked copy was resumed."
+(defun %host-end-retry (end generation)
+  "The RETRY BODY: claim the parked copy on END for GENERATION and
+run it. A notification from an older attempt (or from a copy that
+was cancelled, dropped or replaced) names a different generation and
+resumes NOTHING — the stale-fd/stale-copy guard. Runs on the STORE's
+own context (the pump binds *CURRENT-COMPONENT-STORE*), never on a
+poster's thread, unless the caller is the direct host-thread path.
+T when a parked copy was resumed."
   (let ((copy (async-end-host-copy end)))
     (when (and copy
                (eql generation (async-end-generation end))
@@ -4339,6 +4550,26 @@ stale-fd/stale-copy guard. T when a parked copy was resumed."
            (when buf
              (%host-source-fill reader buf end :retry t)
              t)))))))
+
+(defun host-end-ready (end generation)
+  "The provider's READINESS notification: the parked copy on END may
+retry for GENERATION. The retry is ENQUEUED on the store that owns
+the call (the current dynamic store, else the end owner's store) and
+therefore runs on the STORE's own context, with the generation check
+that makes a stale readiness unable to resume a newer copy, and wakes
+a parked guest at the store's next tick boundary.
+
+A DIRECT host-thread call with NO store context (an end with no
+owner and no dynamic store — the join-style path) runs the retry
+INLINE, as before: there is no store whose context could run it.
+
+T when the notification was accepted (enqueued, or resumed inline)."
+  (let ((store (%end-store-of-context end)))
+    (cond
+      (store
+       (%host-enqueue (lambda () (%host-end-retry end generation)) store)
+       t)
+      (t (%host-end-retry end generation)))))
 
 (defun host-end-set-sink (end sink)
   "Make the READABLE end END drain the bytes its guest writer stages
@@ -4562,9 +4793,10 @@ RETRY keeps the parked attempt's generation."
 ;;; never copied), so a later normal read cannot double-consume it.
 
 (defstruct (host-future-watch (:constructor %make-host-future-watch
-                                            (&key end callback)))
+                                            (&key end callback store)))
   (end nil)
   (callback nil)
+  (store nil)                        ; the subscription's store (pump context)
   (state :waiting)   ; :waiting :queued :delivered :cancelled
   (dropped-p nil)
   (value nil)
@@ -4591,7 +4823,10 @@ inline-delivers."
               queue t)
         (%host-watch-take-value w)))
     (when queue
-      (%host-enqueue (lambda () (%host-watch-deliver w))))))
+      (%host-enqueue (lambda () (%host-watch-deliver w))
+                     (or (host-future-watch-store w)
+                         *current-component-store*
+                         *global-host-store*)))))
 
 (defun %host-watch-deliver (w)
   "Deliver W's one shot: (CALLBACK value peer-dropped-p)."
@@ -4628,7 +4863,9 @@ a subscription that has not been queued yet; NIL once queued)."
   (unless (and (async-end-p end) (async-end-future-p end))
     (error 'wasmdown:host-error
            :message "host-future-watch needs a readable future end"))
-  (let ((w (%make-host-future-watch :end end :callback callback))
+  (let ((w (%make-host-future-watch
+            :end end :callback callback
+            :store (%end-store-of-context end)))
         (peer (async-end-other end)))
     (setf (async-end-host-watch end) w)
     (cond
@@ -7023,6 +7260,7 @@ drop-readable must return index 1 again)."
                (let ((*current-task* task)
                      (*current-thread* th)
                      (*right-self* th)
+                     (*current-component-store* (%inst-host-store inst))
                      (*handle-caller-inst* inst))
                  ;; STEP 4: guest code runs only under the right.
                  (%right-acquire th)
@@ -7917,7 +8155,9 @@ is the valtype."
                        (lambda ()
                          (let* ((*current-task* task)
                                 (*current-thread* th)
-                                (*right-self* th))
+                                (*right-self* th)
+                                (*current-component-store*
+                                  (%inst-host-store inst)))
                            (setf (async-thread-native th)
                                  sb-thread:*current-thread*)
                            ;; STEP 4: guest code runs only under the
@@ -8729,6 +8969,9 @@ is the valtype."
       ;; store boundary (a guest wait or the oracle's poll).
       (let* ((host (lifted-func-host f))
              (*host-provider-inst* (lifted-func-inst f))
+             (*current-component-store*
+               (or *current-component-store*
+                   (%inst-host-store (lifted-func-inst f))))
              (async-p (and ft (third (wasmdown.component:ct-payload ft)))))
         (when on-start (funcall on-start))
         (let ((val (funcall host component-args)))
@@ -8750,8 +8993,8 @@ is the valtype."
                                    (funcall on-resolve (cons :trap x))
                                    (funcall on-resolve x)))))))
                ;; an already-settled pending delivers NOW (still
-               ;; through the pump: one code path for both cases)
-               (%host-pump)
+               ;; through the pump, on the pending's store context)
+               (%host-pump (host-pending-store pending))
                (return-from %call-async-funcinst
                  (values (lambda () (%host-pending-request-cancel pending))
                          nil))))
@@ -8784,6 +9027,8 @@ is the valtype."
              (let ((*current-task* task)
                    (*current-thread* th)
                    (*right-self* th)
+                   (*current-component-store*
+                     (%inst-host-store (lifted-func-inst f)))
                    (*handle-caller-inst* (lifted-func-inst f)))
                ;; STEP 4: guest code runs only under the right.
                (%right-acquire th)
