@@ -3093,16 +3093,12 @@ TARGET's space."
               (ts (loop for p in (or params '()) collect (cdr p)))
               (flat-types (loop for vt in ts
                                 append (%flat-type-of vt ft-inst)))
-              ;; M11b: stream/future PARAMS consume their handle
-              ;; from the CALLER's table (lift_async_value §2438: the
-              ;; end LEAVES the caller) while the TYPE resolves
-              ;; against the TARGET (the values-lane convention:
-              ;; both sides needed — now carried by one cx's two
-              ;; instance slots). The POSITIONAL walk mirrors the
-              ;; async lower's: each param consumes its flat slots;
-              ;; async-value params pre-resolve their ct (target-side)
-              ;; and lift the single i32 with the CALLER-side handle
-              ;; transfer.
+              ;; args: FLAT through the recursive lift (each param
+              ;; consumes its flattened slots; a stream/future end's
+              ;; lift_async_value §2438 transfer runs inside the
+              ;; recursion), or SPILLED as one tuple in the CALLER's
+              ;; memory. The ONE remaining positional arm is the borrow
+              ;; lend below (measured negative).
               (component-args
                 (if (> (length flat-types) 16)
                     (let* ((ptr (first args))
@@ -3117,15 +3113,20 @@ TARGET's space."
                       (coerce vals 'list))
                     (let ((vals '())
                           (ai 0))
+                      ;; MEASURED NEGATIVE (§step-1): a TOP-LEVEL
+                      ;; (borrow $R) param of an ASYNC-TYPED callee is
+                      ;; still lent HERE. Deleting this arm (the generic
+                      ;; walk then passes the caller's raw index) moves
+                      ;; passing-resources::1 and
+                      ;; drop-cross-task-borrow::2/::4/::6: the async
+                      ;; guest body resolves the param at the CALLEE's
+                      ;; own table (%ASYNC-LIFT-GUEST-BODY), so the raw
+                      ;; caller index is not substitutable. Nested
+                      ;; borrows, and every spilled (indirect) param,
+                      ;; already take the generic walk.
                       (loop for vt in ts
                             do (let ((c (%abi-ct vt ft-inst)))
                                  (cond
-                                  ((and (wasmdown.component:ct-p c)
-                                        (member (wasmdown.component:ct-kind c)
-                                                '(:stream :future)))
-                                   (push (%lift-async-end cx (nth ai args))
-                                         vals)
-                                   (incf ai))
                                     ;; M13-lad §2834/§3690: the (borrow $R)
                                     ;; param LENDS — resolve the index on
                                     ;; the CALLER's table (INST: the
@@ -9079,13 +9080,14 @@ is the valtype."
               (flat-types (loop for vt in ts
                                 append (%flat-type-of vt ft-inst)))
               (component-args
-                ;; M11b: stream/future PARAMS resolve their i32 against
-                ;; the CALLER's table (INST) — the arg-lift cx resolves
-                ;; valtype refs against the TARGET (the values-lane
-                ;; convention) but the END lives in the caller's
-                ;; handles. The flat walk is POSITIONAL: each param
-                ;; consumes its flat slots from ARGS; async-value
-                ;; params take their single i32 directly.
+                ;; MEASURED NEGATIVE (§step-1): the TOP-LEVEL (borrow
+                ;; $R) param of the ASYNC callee is still lent HERE (the
+                ;; generic walk passes the caller's raw index and the
+                ;; callee's own table then resolves it as a foreign
+                ;; slot). Nested borrows take the generic walk. The
+                ;; stream/future arm that stood beside it is GONE: the
+                ;; flat walk's recursive %ABI-LIFT (:stream/:future) does
+                ;; the same transfer, with zero probe-row movement.
                 (if (> (length flat-types) 4)
                     (let* ((ptr (first args))
                            (tuple (make-ct* :tuple (coerce ts 'vector))))
@@ -9095,14 +9097,6 @@ is the valtype."
                       (loop for vt in ts
                             do (let ((c (%abi-ct vt ft-inst)))
                                  (cond
-                                  ((and (wasmdown.component:ct-p c)
-                                        (member
-                                         (wasmdown.component:ct-kind c)
-                                         '(:stream :future)))
-                                   (push (%lift-async-end cx
-                                                          (nth ai args))
-                                         vals)
-                                   (incf ai))
                                   ;; M13-LADDER §2406 lift_borrow: the
                                   ;; (borrow $R) param's i32 is an index
                                   ;; in the LOWERING CALLER's table
