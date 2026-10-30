@@ -1,3 +1,30 @@
+# M17 SESSION 29 — THE LAST TWO GAPS CLOSED (merge 286e777), AND ONE OBSERVED ONE-OFF.
+# CLOSED: step 3's provider composition is now WORLD-DRIVEN (command-world +
+# compose-world-providers + command-provider as a thin wrapper; each DECLARED import is
+# bound under the world's own import name; a declared import the runtime cannot provide
+# is a construction-time wit-error naming the interface, never a trapping stub; a
+# synthetic 3-import world composes 3, removing one leaves exactly the other two, empty
+# world composes none).
+# CLOSED: step 6's send-direction resume TEST now exists with scripted readiness — real
+# send/EAGAIN/arm/callback/host-end-ready/pump, only the readiness source scripted;
+# asserts the exact completion count, watch release accounting (seq == deliveries,
+# registration count back to 0, store work 0, at most one fd registration per poll) and
+# the STALE-GENERATION case (old generation resumes nothing, current generation completes
+# with its own byte count). The earlier test could never see a resume because Linux
+# loopback deadlocks with 4 KiB SO_SNDBUF/SO_RCVBUF past ~65 KiB; the new test drains the
+# peer explicitly.
+# Measured: units 549/0 twice on the combined tree; four named fixtures 59/59;
+# probe-async-perfile prints `done` only.
+# OBSERVED ONE-OFF, recorded rather than explained away: the lane block right after this
+# merge read red 1/30, finish 1, on ONE row — `reentrance::20` — a row that also appeared
+# once in the type-view verdict block and nowhere else. Master had read 0/30 in three
+# earlier blocks today. A single row in 30, on a row with no mechanism attached to this
+# change (the composition path is not reached by the lane, which instantiates directly),
+# is inside the recorded window noise; it is listed here so the next session sees the row
+# named rather than a clean claim that would hide it.
+# STATE: master 286e777, units 549/0, no parked branch, plan steps 1-6 implemented with
+# two remaining carry-overs (a repeat of the 0x30 acceptance in a future window, and
+# component/cancel-window-fire-gate-pins' known flakiness on every tree measured).
 # M17 SESSION 28 — THE REGISTRATION-LIST VERIFICATION (owed, now done), AND THE CLOSING
 # STATEMENT.
 # DUP-COUNT, measured on the file rather than eyeballed: the pin registration list holds
