@@ -4660,6 +4660,364 @@ waits unbounded)."
       (is (%pin-rows-pass-p
            wast (format nil "crcc-1-pin-~d.wast" i))))))
 
+;;; ---------------------------------------------------------------
+;;; M17 step 2 (borrow-side): the two lifetime rules that had no
+;;; pin. Both reuse the guest-drop pin's construction vector: a
+;;; provider instance, the ABI's own resource handle records on a
+;;; guest table (the provider ct), the real canon built-ins, and the
+;;; released state asserted afterwards.
+
+(defparameter *pin-borrow-return-src*
+  ;; The `drop-cross-task-borrow' shape, narrowed to the
+  ;; return-with-a-live-borrow rule. THREE components, because the
+  ;; callee must NOT be the resource's implementor: $C defines R,
+  ;; $Prov (an importer of R) owns the two async funcs taking
+  ;; `(borrow $R)', and $Caller creates the resource and drives the
+  ;; calls. §2834's same-implementor shortcut (lower_borrow yields
+  ;; the REP and no handle when the CALLEE's type space declared the
+  ;; resource) is exactly why $Prov cannot be the definer here:
+  ;; having imported R by alias, it really owes the drop. The cores
+  ;; stash the lent handle and BLOCK on an empty waitable set (so the
+  ;; caller's pack is deterministically STARTED); $Caller wakes them
+  ;; and waits on the subtask's event. `ret-live' returns WITHOUT
+  ;; dropping the borrow (§802 trap_if(num_borrows > 0));
+  ;; `ret-dropped' calls the real canon resource.drop first (§3798's
+  ;; num_borrows decrement) and must succeed.
+    "(component
+     (component $C
+       (type $R' (resource (rep i32)))
+       (canon resource.new $R' (core func $resource.new))
+       (core module $RepM (func (export \"id\") (param i32) (result i32) (local.get 0)))
+       (core instance $rep (instantiate $RepM))
+       (alias core export $rep \"id\" (core func $resource.rep))
+       (export $R \"R\" (type $R'))
+       (func (export \"R-new\") (param \"rep\" u32) (result (own $R))
+         (canon lift (core func $resource.new)))
+       (func (export \"R-rep\") (param \"self\" (borrow $R)) (result u32)
+         (canon lift (core func $resource.rep))))
+     (component $Prov
+       (import \"c\" (instance $c
+         (export \"R\" (type $R (sub resource)))
+         (export \"R-new\" (func (param \"rep\" u32) (result (own $R))))
+         (export \"R-rep\" (func (param \"self\" (borrow $R)) (result u32)))))
+       (type $FT (future))
+       (alias export $c \"R\" (type $R))
+       (core module $PM
+         (import \"\" \"task.return\" (func $task.return (param i32)))
+         (import \"\" \"R-drop\" (func $R-drop (param i32)))
+         (import \"\" \"waitable-set.new\" (func $wsn (result i32)))
+         (import \"\" \"waitable.join\" (func $join (param i32 i32)))
+         (import \"\" \"future.new\" (func $fnew (result i64)))
+         (import \"\" \"future.read\" (func $fread (param i32 i32) (result i32)))
+         (import \"\" \"future.write\" (func $fwrite (param i32 i32) (result i32)))
+         (global $rep (mut i32) (i32.const 0))
+         (global $ws (mut i32) (i32.const 0))
+         (func (export \"ret-live\") (param $h i32) (result i32)
+           (global.set $rep (local.get $h))
+           (global.set $ws (call $wsn))
+           (i32.or (i32.const 2) (i32.shl (global.get $ws) (i32.const 4))))
+         (func (export \"ret-live-cb\") (param i32 i32 i32) (result i32)
+           (call $task.return (i32.const 7))
+           (i32.const 0))
+         (func (export \"ret-dropped-cb\") (param i32 i32 i32) (result i32)
+           (call $R-drop (global.get $rep))
+           (call $task.return (i32.const 7))
+           (i32.const 0))
+         (func (export \"wake\")
+           (local $r i32) (local $r64 i64) (local $futr i32) (local $futw i32)
+           (local.set $r64 (call $fnew))
+           (local.set $futr (i32.wrap_i64 (local.get $r64)))
+           (local.set $futw (i32.wrap_i64 (i64.shr_u (local.get $r64) (i64.const 32))))
+           (local.set $r (call $fread (local.get $futr) (i32.const 0xdeadbeef)))
+           (if (i32.ne (i32.const -1) (local.get $r)) (then unreachable))
+           (local.set $r (call $fwrite (local.get $futw) (i32.const 0xdeadbeef)))
+           (if (i32.ne (i32.const 0) (local.get $r)) (then unreachable))
+           (call $join (local.get $futr) (global.get $ws))))
+       (canon task.return (result u32) (core func $task.return))
+       (canon resource.drop $R (core func $R-drop))
+       (canon waitable-set.new (core func $wsn))
+       (canon waitable.join (core func $join))
+       (canon future.new $FT (core func $fnew))
+       (canon future.read $FT async (core func $fread))
+       (canon future.write $FT async (core func $fwrite))
+       (core instance $pm (instantiate $PM (with \"\" (instance
+         (export \"task.return\" (func $task.return))
+         (export \"R-drop\" (func $R-drop))
+         (export \"waitable-set.new\" (func $wsn))
+         (export \"waitable.join\" (func $join))
+         (export \"future.new\" (func $fnew))
+         (export \"future.read\" (func $fread))
+         (export \"future.write\" (func $fwrite))))))
+       (func (export \"ret-live\") async (param \"self\" (borrow $R)) (result u32)
+         (canon lift (core func $pm \"ret-live\") async (callback (core func $pm \"ret-live-cb\"))))
+       (func (export \"ret-dropped\") async (param \"self\" (borrow $R)) (result u32)
+         (canon lift (core func $pm \"ret-live\") async (callback (core func $pm \"ret-dropped-cb\"))))
+       (func (export \"wake\") (canon lift (core func $pm \"wake\"))))
+     (component $Caller
+       (import \"c\" (instance $c
+         (export \"R\" (type $R (sub resource)))
+         (export \"R-new\" (func (param \"rep\" u32) (result (own $R))))))
+       (alias export $c \"R\" (type $R))
+       (import \"prov\" (instance $p
+         (export \"ret-live\" (func async (param \"self\" (borrow $R)) (result u32)))
+         (export \"ret-dropped\" (func async (param \"self\" (borrow $R)) (result u32)))
+         (export \"wake\" (func))))
+       (core module $Memory (memory (export \"mem\") 1))
+       (core instance $memory (instantiate $Memory))
+       (core module $EM
+         (import \"\" \"mem\" (memory 1))
+         (import \"\" \"waitable.join\" (func $join (param i32 i32)))
+         (import \"\" \"waitable-set.new\" (func $wsn (result i32)))
+         (import \"\" \"waitable-set.wait\" (func $wsw (param i32 i32) (result i32)))
+         (import \"\" \"R-new\" (func $R-new (param i32) (result i32)))
+         (import \"\" \"ret-live\" (func $ret-live (param i32 i32) (result i32)))
+         (import \"\" \"ret-dropped\" (func $ret-dropped (param i32 i32) (result i32)))
+         (import \"\" \"wake\" (func $wake))
+         (func $run (param $which i32) (result i32)
+           (local $ret i32) (local $h i32) (local $sub i32)
+           (local $ws i32) (local $ev i32)
+           (local.set $h (call $R-new (i32.const 10)))
+           (if (i32.eqz (local.get $which))
+             (then (local.set $ret (call $ret-live (local.get $h) (i32.const 16))))
+             (else (local.set $ret (call $ret-dropped (local.get $h) (i32.const 16)))))
+           (if (i32.ne (i32.const 1) (i32.and (local.get $ret) (i32.const 0xf)))
+             (then unreachable))
+           (local.set $sub (i32.shr_u (local.get $ret) (i32.const 4)))
+           (local.set $ws (call $wsn))
+           (call $join (local.get $sub) (local.get $ws))
+           (call $wake)
+           (local.set $ev (call $wsw (local.get $ws) (i32.const 32)))
+           (if (i32.ne (i32.const 1) (local.get $ev)) (then unreachable))
+           (if (i32.ne (i32.const 2) (i32.load offset=4 (i32.const 32))) (then unreachable))
+           (if (i32.ne (i32.const 7) (i32.load (i32.const 16))) (then unreachable))
+           (i32.const 42))
+         (func (export \"run-live\") (result i32) (call $run (i32.const 0)))
+         (func (export \"run-dropped\") (result i32) (call $run (i32.const 1))))
+       (canon waitable.join (core func $join))
+       (canon waitable-set.new (core func $wsn))
+       (canon waitable-set.wait (memory (core memory $memory \"mem\")) (core func $wsw))
+       (canon lower (func $c \"R-new\") (core func $R-new))
+       (canon lower (func $p \"ret-live\") async (memory (core memory $memory \"mem\")) (core func $ret-live))
+       (canon lower (func $p \"ret-dropped\") async (memory (core memory $memory \"mem\")) (core func $ret-dropped))
+       (canon lower (func $p \"wake\") (core func $wake))
+       (core instance $em (instantiate $EM (with \"\" (instance
+         (export \"mem\" (memory $memory \"mem\"))
+         (export \"waitable.join\" (func $join))
+         (export \"waitable-set.new\" (func $wsn))
+         (export \"waitable-set.wait\" (func $wsw))
+         (export \"R-new\" (func $R-new))
+         (export \"ret-live\" (func $ret-live))
+         (export \"ret-dropped\" (func $ret-dropped))
+         (export \"wake\" (func $wake))))))
+       (func (export \"run-live\") async (result u32) (canon lift (core func $em \"run-live\")))
+       (func (export \"run-dropped\") async (result u32) (canon lift (core func $em \"run-dropped\"))))
+     (instance $c (instantiate $C))
+     (instance $p (instantiate $Prov (with \"c\" (instance $c))))
+     (instance $e (instantiate $Caller (with \"c\" (instance $c)) (with \"prov\" (instance $p))))
+     (func (export \"run-live\") (alias export $e \"run-live\"))
+     (func (export \"run-dropped\") (alias export $e \"run-dropped\")))")
+
+(defun %pin-graph-handles (ci pred)
+  "Every handle record reachable from the comp-instance graph CI
+satisfying PRED — the instance's own Table (where the ABI adds the
+lowered borrows/owns and where the lender's SOURCE handle lives,
+§1146) plus every instance the graph links. Cycle-safe by EQ."
+  (let ((seen (make-hash-table :test #'eq))
+        (out '()))
+    (labels ((walk (i)
+               (when (and (wasmdown.component.runtime:comp-instance-p i)
+                          (not (gethash i seen)))
+                 (setf (gethash i seen) t)
+                 (let ((v (gethash :handles
+                                   (wasmdown.component.runtime:comp-instance-imports
+                                    i))))
+                   (when v
+                     (loop for h across v
+                           when (and h (funcall pred h))
+                             do (push h out))))
+                 (loop for x across (wasmdown.component.runtime::comp-instance-instances
+                                     i)
+                       do (walk x))
+                 (maphash (lambda (k v)
+                            (declare (ignore k))
+                            (walk v))
+                          (wasmdown.component.runtime:comp-instance-imports i)))))
+      (walk ci))
+    out))
+
+(defun %pin-run-borrow-component (name capture-p)
+  "Fresh $Test instance; invoke NAME through the runner's action
+hook. While CAPTURE-P, %TASK-RETURN is wrapped (it is DECLAIMed
+NOTINLINE) to record, at each return ATTEMPT with outstanding
+borrows, the SOURCE handles' NUM-LENDS — the instant the rule is
+supposed to guard. Returns (values result captured ci); the
+instance is torn down."
+  (let* ((ci (%exec-comp *pin-borrow-return-src*))
+         (orig (symbol-function 'wasmdown.component.runtime::%task-return))
+         (captured '())
+         (result nil))
+    (unwind-protect
+         (progn
+           (setf (symbol-function 'wasmdown.component.runtime::%task-return)
+                 (lambda (task r)
+                   (when (and capture-p
+                              (plusp (wasmdown.component.runtime::async-task-num-borrows
+                                      task)))
+                     (push (mapcar
+                            #'wasmdown.component.runtime::resource-handle-num-lends
+                            (%pin-graph-handles
+                             ci
+                             (lambda (h)
+                               (and (wasmdown.component.runtime::resource-handle-p
+                                     h)
+                                    (wasmdown.component.runtime::resource-handle-own-p
+                                     h)
+                                    (eql 10 (wasmdown.component.runtime::resource-handle-rep
+                                             h))))))
+                           captured))
+                   (funcall orig task r)))
+           (setf result
+                 (handler-case
+                     (list :ok
+                           (funcall (wasmdown.wast:component-invoker)
+                                    ci name '()))
+                   (wasmdown:wasm-trap (c) (list :trap c)))))
+      (setf (symbol-function 'wasmdown.component.runtime::%task-return) orig)
+      (wasmdown.component.runtime::%store-teardown))
+    (values result captured ci)))
+
+(test component/live-borrow-blocks-task-return-pin
+  ;; §802/§804 `Task.return_': `trap_if(num_borrows > 0)' — a task
+  ;; that still holds a BORROW handle cannot return, and `num_borrows'
+  ;; is §2838's per-task count of the handles lower_borrow added to
+  ;; ITS instance (the source handle's num_lends, §1447, is the
+  ;; separate ledger that keeps the SOURCE alive). The ABI's real
+  ;; path is driven end to end: $C defines R, $Prov imports it,
+  ;; $Caller creates an R through $C and calls $Prov's async funcs
+  ;; with it; the callee blocks, then its callback returns while its
+  ;; own borrow handle is still in $Prov's table (the callee is NOT
+  ;; the implementor, so §2834's shortcut does not apply and the
+  ;; drop really is owed).
+  ;;
+  ;; MEASURED BEFORE (the pre-change runtime): `run-live' RETURNED
+  ;; 42 — the callee's task.return saw num_borrows 0, because the
+  ;; lower had counted the lend on the LENDING task instead of
+  ;; lowering it with borrow_scope = the callee Task; the subtask
+  ;; resolved RETURNED, the caller's wait delivered it, and only a
+  ;; piggy-backed caller count could ever have traced the rule. The
+  ;; trap is now the CALLEE's own, with the source handle still lent
+  ;; (num_lends 1) at that instant.
+  (multiple-value-bind (result captured ci)
+      (%pin-run-borrow-component "run-live" t)
+    (is (eq :trap (first result)))
+    (is (search "cannot return with outstanding borrows"
+                (wasmdown:wasmdown-error-message (second result))))
+    ;; the guard fired with the SOURCE handle's num_lends still 1 —
+    ;; counted at the moment of the return, not cleared early
+    (is (equal '((1)) captured))
+    ;; the trap is not a permanent flag: the subtask's
+    ;; deliver_resolve (§1469) released the lend on the way to the
+    ;; caller's DELIVERY boundary, so no leak survives the trap
+    (is (every #'zerop
+               (mapcar #'wasmdown.component.runtime::resource-handle-num-lends
+                       (%pin-graph-handles
+                        ci
+                        (lambda (h)
+                          (and (wasmdown.component.runtime::resource-handle-p h)
+                               (wasmdown.component.runtime::resource-handle-own-p h)
+                               (eql 10 (wasmdown.component.runtime::resource-handle-rep
+                                        h)))))))))
+  ;; the SAME callee, dropping the borrow through the real canon
+  ;; resource.drop before returning: §3798's decrement makes the
+  ;; subsequent task.return succeed
+  (multiple-value-bind (result captured)
+      (%pin-run-borrow-component "run-dropped" nil)
+    (declare (ignore captured))
+    (is (equal '(:ok (42)) result))))
+
+(test component/borrowed-handle-not-joinable-pin
+  ;; §4125 `canon_waitable_join': `trap_if(not isinstance(w,
+  ;; Waitable))' — a waitable set holds WAITABLES (stream/future
+  ;; ends, subtasks, sets, §1250-1300); a resource handle is not one,
+  ;; whatever its ownership, so a BORROWED handle (the handle
+  ;; lower_borrow adds, §2832) cannot be made waitable. This is the
+  ;; §1218-1396 rule's join arm. Same construction as the guest-drop
+  ;; pin: a provider ct, the ABI's own handle records on a guest
+  ;; table, and the REAL built-ins.
+  (let* ((ctx (wasmdown.wasi:make-wasi-context))
+         (provider (wasmdown.wasi:filesystem-types-instance ctx))
+         (ct (wasmdown.wasi:descriptor-resource-ct))
+         (guest (wasmdown.component.runtime:make-comp-instance))
+         (desc (wasmdown.wasi::make-wasi-descriptor
+                :fd (sb-unix:unix-open "/dev/null" sb-unix:o_rdonly 0)
+                :owned-p t))
+         (wasmdown.component.runtime::*handle-caller-inst* nil))
+    (unwind-protect
+         (progn
+           ;; the import binding: the provider at an INSTANCES index
+           (wasmdown.component.runtime::%push-instance guest provider)
+           (let* ((own (wasmdown.component.runtime::%handle-add
+                        guest ct desc t))
+                  ;; the REAL lend (§2406/§1447): the source handle's
+                  ;; num_lends rises and the lend joins the subtask's
+                  ;; ledger
+                  (subtask (wasmdown.component.runtime::make-async-subtask))
+                  (rep (wasmdown.component.runtime::%handle-lend
+                        guest ct own subtask))
+                  ;; the borrow handle lower_borrow adds to the
+                  ;; callee's table (§2832)
+                  (bor (wasmdown.component.runtime::%handle-add
+                        guest ct rep nil))
+                  (join (wasmdown.component.runtime::%builtin-async-host-func
+                         guest :waitable-join nil))
+                  (wsn (wasmdown.component.runtime::%builtin-async-host-func
+                        guest :waitable-set-new nil))
+                  (fnew (wasmdown.component.runtime::%builtin-async-host-func
+                         guest :future-new (list nil 0)))
+                  (ws (first (wasmdown.runtime:wasm-call wsn))))
+             (is (= 1 (wasmdown.component.runtime::resource-handle-num-lends
+                       (wasmdown.component.runtime::%handle-resource-at
+                        guest own))))
+             (is (eq desc rep))
+             ;; the BORROWED handle: rejected, and left in the table
+             (let ((err (wasmdown.test::check-trap
+                         (lambda ()
+                           (wasmdown.runtime:wasm-call join bor ws))
+                         :generic)))
+               (is err)
+               (is (search "invalid waitable index"
+                           (wasmdown:wasmdown-error-message err))))
+             (is (eq :borrow
+                     (if (wasmdown.component.runtime::resource-handle-own-p
+                          (wasmdown.component.runtime::%handle-resource-at
+                           guest bor))
+                         :own :borrow)))
+             ;; an OWN RESOURCE handle is equally not a Waitable
+             ;; (§4125's isinstance test is on the RECORD, not the
+             ;; ownership) — join is for ends/subtasks/sets
+             (is (wasmdown.test::check-trap
+                  (lambda ()
+                    (wasmdown.runtime:wasm-call join own ws))
+                  :generic))
+             ;; a real readable END joins, is in the set, and leaves
+             ;; it on join(0) — the set's own element ledger
+             (let* ((pair (first (wasmdown.runtime:wasm-call fnew)))
+                    (ri (logand pair #xffffffff))
+                    (end (aref (wasmdown.component.runtime::%inst-handles guest)
+                               (1- ri))))
+               (is (wasmdown.component.runtime::async-end-p end))
+               (wasmdown.runtime:wasm-call join ri ws)
+               (is (wasmdown.component.runtime::%waitable-in-wset end))
+               (is (member end
+                           (wasmdown.component.runtime::async-waitable-set-elems
+                            (wasmdown.component.runtime::async-waitable-wset end))
+                   :test #'eq))
+               (wasmdown.runtime:wasm-call join ri 0)
+               (is (not (wasmdown.component.runtime::%waitable-in-wset end))))))
+      (let ((fd (wasmdown.wasi:wasi-descriptor-fd desc)))
+        (when (and (integerp fd) (not (minusp fd)))
+          (sb-unix:unix-close fd))))))
+
 (defun run-component-pins ()
   "Run the component pins (registered via TEST; returns T)."
   (let ((wasmdown.test::*tests*
@@ -4749,7 +5107,9 @@ waits unbounded)."
                       component/premature-park-release-pin
                       component/reentrance-14-pin
                       component/switch-caller-is-not-grantable-pin
-                      component/crcc-1-pin)))
+                      component/crcc-1-pin
+                      component/live-borrow-blocks-task-return-pin
+                      component/borrowed-handle-not-joinable-pin)))
           wasmdown.test::*tests*)))
     (multiple-value-bind (passed failed)
         (wasmdown.test:run-all-tests)
