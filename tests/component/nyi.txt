@@ -1,3 +1,44 @@
+# M17 SESSION 9 — TWO MORE DEFECT FIXES IN ON MASTER, BOTH PROVEN BY PINS THAT
+# FAILED FIRST (merge 7dae179 / ca7590b).
+# 1. THE RESUME-LATER MARK IS A SINGLE-PARK CREDIT, NOT A STATE. The pin failed on
+#    the pre-change runtime with "(null (async-thread-ready-p target))" after a DEAD
+#    thread's exit: the mark survived the thread, a tick re-granted it on a LIVE
+#    thread, and it could be inherited through a reused Thread record (the §705
+#    slot). Fixed with %thread-consume-credit (clears ready-p / wake-count /
+#    granted on the park that spends it) and %thread-drop-credit-on-exit (wired into
+#    %right-release-on-exit, %right-thread-death and %task-exit-implicit-thread; the
+#    §242-273 handoff post still follows on new-indirect's teardown).
+# 2. suspended-p STOPPED LYING AT THE EXPLICIT RESUME ARMS. The switch-arm predicate
+#    counted ready-p / yield-parked as "suspended", so a RUNNING thread could be
+#    accepted as a resume target. The predicate is now pending-spawn OR the truthful
+#    suspended-p OR right-waiting (the native window where the peer's quantum ended
+#    and it can only continue when named — removing that arm re-traps the
+#    during-sync rows, so it is kept and documented). The §4688/§4714 rule is NOT
+#    relaxed: a live peer still traps, and a consumed mark never makes a running
+#    thread resumable.
+# Pins (the deliverable): component/resume-later-marker-lifetime-pin and
+# component/explicit-resume-requires-parked-peer-pin — both FAILED before, both PASS
+# after; units 505/0 twice.
+# MEASURED: adjacent 6-run pair, same window — master 6 fail commands / 3 red vs the
+# branch 4 / 3, no floor row worse, no new row, acs::* 0 both sides, no rc=124,
+# walls 9.32-9.61 (branch) vs 9.37-14.59 (master). A POST-MERGE 6-run on master read
+# 4/6 red and 8 fail commands with tight walls (9.33-9.68) and no hang.
+# INCIDENT, recorded because it nearly cost a tool: the marker-lifetime branch's
+# cleanup removed tools/probe-async-lane.sh and the merge carried the deletion. It is
+# restored (commit after the merge) and the lesson is the same one this file keeps
+# repeating — NEVER delete untracked-or-tracked tooling to clean a branch; the meter
+# is part of the repository's evidence chain.
+# NEXT, highest leverage first, and this is a plan-order statement:
+#   (a) RE-RUN THE PARKED BRANCHES' ADJACENT PAIRS ON MERGED MASTER. Their "cannot
+#       merge" verdicts were taken while the canary was on fire; acs::* now reads 0.
+#       Order: wip/type-view (its 29/30 was an adjacent-pair measurement against a
+#       base that no longer exists), then wip/reactor-wiring (unresolved at n=30).
+#   (b) The in-guest premature-park-release checks behind may-block::8 and
+#       excl-resume::2 (the last two during-sync rows that still fire).
+#   (c) dssc::19's shared-record / implicit-thread identity bug (rate unchanged,
+#       message changed: it is a MODELLING bug with its own fix).
+#   (d) then step 5 (host-pending + resumable copy) on this store base, and steps
+#       1/3 remainders.
 # M17 SESSION 8b — TWO AMPLIFICATIONS FOR THE READER OF THAT MERGE.
 # 1. THE MERGE IS A PACKAGE, NOT A NARROW FIX. `9b7f300` changes ~1256 lines of
 #    src/component-runtime.lisp (+981/-275) because `wip/resume-later` was cut from
