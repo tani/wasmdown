@@ -1,3 +1,29 @@
+# M17 SESSION 6c — LEDGER AUDIT: THE VERDICT REVERSALS, TALLIED. Written because the
+# user's trust in this lane is the asset at stake, and because a reader who finds
+# three contradictory entries without this table will trust none of them.
+#   subject                     first verdict                 final verdict (evidence)
+#   piece (i) teardown join     "plan-mandated fix, adopted"   NET-NEGATIVE, reverted (adjacent
+#                                                              n=30: acs::1 8/30 -> 3/30)
+#   type-view                   "caused it all" then           CONFIRMED VECTOR at 14.5x
+#                               "verdict void"                 (adjacent pair, same window:
+#                                                              acs::2 2/30 -> 29/30)
+#   reactor wiring              "vector, 6/6"  then            UNRESOLVED (mean +9/30; its own
+#                               "unresolved at n=30"            batch width 22 > the delta)
+#   link-time contracts         "agent reported green"         AT PARITY, LANDED (adjacent pair:
+#                                                              master 41/acс::2 30 vs 35/29)
+#   master's own acs::2 rate    "1-2/30, the historical floor"  MACHINE-STATE DOMINATED: 2/30
+#                                                              and 30/30 an hour apart, no code
+#                                                              change; the instrument's width is
+#                                                              >= 29 fail commands / 30 runs
+# THE META-LESSON, one line: every reversal above was caused by comparing readings from
+# DIFFERENT windows. The single rule that survives is the adjacent pair, and even it
+# only speaks when master's own block shows the canary is not pinned.
+# REVERSE-DEPENDENCY AUDIT of the landed link-time check (asked for and done): `git show
+# 0621f0a -- src/component.lisp` contains ZERO `%abi-` / `%handle-` / `%lower-` /
+# `%lift-` references, so the link-time path does not call into the ABI layer; and no
+# new matcher was added (no `defun` whose name contains match/compare/equal/subtype) —
+# it reuses `%ty-match` / `%ty-match-valtype` / `%ty-resolve`, as specified. Its glue
+# is `%identity-vector`, `%decl-type-at`, `%declarator-space`, `%check-import-binding`.
 # M17 SESSION 6b — THE DECISIVE VERSION OF THE SAME QUESTION: MASTER'S OWN acs::2
 # RATE MOVED 2/30 -> 30/30 INSIDE ONE SESSION. CORRECTION TO THE ENTRY BELOW.
 # THE ADJACENT PAIR (same window, nothing between, both through the meter):
