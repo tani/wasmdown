@@ -76,6 +76,10 @@
            #:host-resource-rep
            #:host-resource-take
            #:*host-resource-dtor-table*
+           ;; M17 — the PER-INSTANCE host-resource destructor
+           ;; registry (the WASI providers migrate to it next wave)
+           #:host-register-resource-dtor
+           #:host-resource-finalizer
            ;; M16 slice 6 — the RUNNER's store-boundary teardown: a host
            ;; embedder that drives one command to completion (the WASI
            ;; `run' entry) tears the whole store down afterwards, so a
@@ -313,7 +317,55 @@ there.")
   "M16 slice 3: resource-ct -> (lambda (rep) ...) for a HOST-provided
 resource (wasi:filesystem's descriptor). Such a resource has no guest
 dtor func-instance; canon resource.drop calls this finalizer with the
-rep so the host capability (the fd) is released deterministically.")
+rep so the host capability (the fd) is released deterministically.
+FALLBACK ONLY (M17): the per-instance registry below is the contract;
+this global is keyed by the ct alone, so two instances of the same
+provider ct cannot keep distinct finalizers in it. Removed by the
+WASI migration wave once every provider registers per instance.")
+
+;;; ---- M17: the PER-INSTANCE host-resource destructor registry ----
+;;; A host capability adopted by an instance is released by THAT
+;;; instance's finalizer: two instances of the same provider ct each
+;;; own their own fd/socket, so a ct-keyed global leaks the wrong
+;;; instance's release. The registry lives under the reserved
+;;; :HOST-RESOURCE-DTORS key of the instance's imports table — the
+;;; same provenance slot the handle table (:HANDLES), the async
+;;; fields (:ASYNC) and the free list (:HANDLE-FREE) use — so it is
+;;; per instance by construction, with no new global and no keying by
+;;; the ct alone.
+
+(defun %inst-host-resource-dtors (inst &optional (create nil))
+  "The INSTANCE's (resource-ct -> finalizer) table, eq-keyed. Built
+on demand only when CREATE — a drop-path LOOKUP against an instance
+that never registered anything must not allocate a table."
+  (or (gethash :host-resource-dtors (comp-instance-imports inst))
+      (and create
+           (setf (gethash :host-resource-dtors (comp-instance-imports inst))
+                 (make-hash-table :test #'eq)))))
+
+(defun host-register-resource-dtor (instance resource-ct finalizer)
+  "Register FINALIZER (a function of the rep) as the destructor of the
+host-provided RESOURCE-CT adopted by INSTANCE. IDEMPOTENT per
+(instance, resource-ct): a second registration is a NO-OP and does
+NOT replace the hook — a repeated provider install cannot silently
+swap the release. Returns the REGISTERED finalizer: on a repeat
+registration that is the first-registered function, on the first one
+FINALIZER itself."
+  (unless (functionp finalizer)
+    (error 'type-error
+           :datum finalizer
+           :expected-type 'function))
+  (let ((tab (%inst-host-resource-dtors instance t)))
+    (multiple-value-bind (old found) (gethash resource-ct tab)
+      (if found
+          old
+          (setf (gethash resource-ct tab) finalizer)))))
+
+(defun host-resource-finalizer (instance resource-ct)
+  "The finalizer registered on INSTANCE for RESOURCE-CT, or NIL when
+that instance registered none (the drop path then falls back)."
+  (let ((tab (%inst-host-resource-dtors instance)))
+    (and tab (gethash resource-ct tab))))
 
 (defun %fresh-resource-id ()
   (cons :fresh (incf *resource-id-counter*)))
@@ -3116,6 +3168,17 @@ callers (the M9/M10 lanes: the defining instance's own tasks —
 top-level runner) are a NO-OP."
   (or *handle-caller-inst* inst))
 
+(defun %host-resource-finalizer-at (inst rt)
+  "The host finalizer for a drop of RT: the DYNAMIC resource
+instance's per-instance registry first (the table the handle lives on
+— that instance's capability is the one being released), then the
+canon-DEFINING INSTANCE's, then the M16 global table (fallback only:
+the provider still installs ct-keyed). NIL when nothing registered
+RT, i.e. the resource has no host release hook at all."
+  (or (host-resource-finalizer (%resource-current-inst inst) rt)
+      (host-resource-finalizer inst rt)
+      (gethash rt *host-resource-dtor-table*)))
+
 (defun %resource-builtin-host-func (inst kind rt &optional dtor)
   "The canon resource built-in's core wrapper: [i32] -> [i32] for
 resource.new (param rep, result handle), [i32] -> [] for
@@ -3160,12 +3223,18 @@ resource.drop (param handle), [i32] -> [i32] for resource.rep."
           ;; an OWNING handle's drop runs the resource's dtor with
           ;; the rep (canon_resource_drop, CanonicalABI.md 3782).
           ;; M16 slice 3: a HOST-provided resource has no guest dtor
-          ;; func-instance — its host finalizer (keyed by the ct,
-          ;; the handle's rt) releases the capability instead.
+          ;; func-instance — its host finalizer (resolved on the
+          ;; instance's registry, the handle's rt being the key)
+          ;; releases the capability instead.
           (when (and h (resource-handle-own-p h))
             (cond
               (dtor (apply #'wasmdown.runtime:wasm-call dtor (list rep)))
-              (t (let ((hdtor (gethash rt *host-resource-dtor-table*)))
+              ;; M17: a HOST-provided resource's release hook comes from
+              ;; the per-instance registry whose provenance adopted the
+              ;; provider (two instances of the same provider ct each
+              ;; release their own capability); the ct-keyed global is
+              ;; the fallback until the WASI migration registers there.
+              (t (let ((hdtor (%host-resource-finalizer-at inst rt)))
                    (when hdtor (funcall hdtor rep))))))
           '()))))
     (:resource-rep

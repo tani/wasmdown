@@ -2802,6 +2802,97 @@ repo root, as a string — the pin runs a fixture row VERBATIM."
                    613 699)
        "cancel-fire-gate-pin.wast")))
 
+(test component/host-resource-dtor-registry-pins
+  ;; M17 — THE PER-INSTANCE HOST-RESOURCE DESTRUCTOR REGISTRY: a
+  ;; host-provided resource's release hook belongs to the INSTANCE
+  ;; that adopted the provider, not to the (shared) resource ct. The
+  ;; registry lives in the instance's provenance (:HOST-RESOURCE-DTORS
+  ;; of the imports table), host-register-resource-dtor is idempotent
+  ;; per (instance, ct) and returns the first-registered finalizer,
+  ;; and the :resource-drop built-in resolves through it before the
+  ;; M16 ct-keyed global (the fallback this wave still honors).
+  (labels ((host-ct (name)
+             (wasmdown.component:make-ct :kind :resource :payload name))
+           (drop (inst ct rep)
+             ;; the canon built-in's core wrapper with NO guest dtor —
+             ;; the host-resource shape: [i32] -> []
+             (let* ((f (wasmdown.component.runtime::%resource-builtin-host-func
+                        inst :resource-drop ct nil))
+                    (idx (wasmdown.component.runtime::%handle-add
+                          inst ct rep t)))
+               ;; wasm-call is (&rest args): pass the index directly
+               (wasmdown.runtime:wasm-call f idx)))
+           (reg (inst ct fn)
+             (wasmdown.component.runtime:host-register-resource-dtor
+              inst ct fn))
+           (fin (inst ct)
+             (wasmdown.component.runtime:host-resource-finalizer
+              inst ct)))
+    (let ((wasmdown.component.runtime::*handle-caller-inst* nil)
+          (ct (host-ct "descriptor"))
+          (i1 (wasmdown.component.runtime:make-comp-instance))
+          (i2 (wasmdown.component.runtime:make-comp-instance))
+          (seen '()))
+      ;; (a) two instances of the SAME provider ct keep their OWN
+      ;; finalizer: the drop on i1 runs i1's hook, i2's runs i2's —
+      ;; a ct-keyed global could only hold one of them
+      (let ((f1 (lambda (rep) (push (cons :i1 rep) seen)))
+            (f2 (lambda (rep) (push (cons :i2 rep) seen))))
+        (is (eq f1 (reg i1 ct f1)))
+        (is (eq f2 (reg i2 ct f2)))
+        (is (eq f1 (fin i1 ct)))
+        (is (eq f2 (fin i2 ct)))
+        (drop i1 ct :rep-1)
+        (drop i2 ct :rep-2)
+        (is (equal '((:i2 . :rep-2) (:i1 . :rep-1)) seen))
+        ;; (b) a REPEAT registration is a no-op that returns the FIRST
+        ;; finalizer and never swaps the hook
+        (let ((f3 (lambda (rep) (push (cons :swapped rep) seen))))
+          (is (eq f1 (reg i1 ct f3)))
+          (is (eq f1 (fin i1 ct)))
+          (drop i1 ct :rep-3)
+          (is (equal '((:i1 . :rep-3) (:i2 . :rep-2) (:i1 . :rep-1))
+                     seen))))
+      ;; the registry is per (instance, CT), and an unregistered lookup
+      ;; neither invents a hook nor allocates a table
+      (let* ((other (host-ct "socket"))
+             (fresh (wasmdown.component.runtime:make-comp-instance)))
+        (is (null (fin i1 other)))
+        (is (null (fin fresh ct)))
+        (is (null (gethash :host-resource-dtors
+                           (wasmdown.component.runtime:comp-instance-imports
+                            fresh)))))
+      ;; a non-function finalizer is rejected outright
+      (is (handler-case (progn (reg i1 ct 42) nil)
+            (type-error () t))))
+    ;; (c) the drop path PREFERS the per-instance hook and still FALLS
+    ;; BACK to the M16 global table for this wave
+    (let ((wasmdown.component.runtime::*handle-caller-inst* nil)
+          (ct (host-ct "descriptor"))
+          (inst (wasmdown.component.runtime:make-comp-instance))
+          (got '()))
+      (setf (gethash ct
+                     wasmdown.component.runtime:*host-resource-dtor-table*)
+            (lambda (rep) (push (cons :global rep) got)))
+      (unwind-protect
+           (progn
+             ;; no per-instance registration -> the global fallback runs
+             (drop inst ct :g1)
+             (is (equal '((:global . :g1)) got))
+             ;; per-instance registration SHADOWS the global
+             (reg inst ct (lambda (rep) (push (cons :local rep) got)))
+             (drop inst ct :g2)
+             (is (equal '((:local . :g2) (:global . :g1)) got))
+             ;; another instance of the same ct still uses the global
+             (drop (wasmdown.component.runtime:make-comp-instance) ct :g3)
+             (is (equal '((:global . :g3) (:local . :g2) (:global . :g1))
+                        got)))
+        (remhash ct
+                 wasmdown.component.runtime:*host-resource-dtor-table*))
+      ;; an instance that never registered the ct leaves the global as
+      ;; the ONLY hook (no per-instance table got created)
+      (is (null (fin inst (host-ct "never-registered")))))))
+
 (defun run-component-pins ()
   "Run the component pins (registered via TEST; returns T)."
   (let ((wasmdown.test::*tests*
@@ -2874,6 +2965,7 @@ repo root, as a string — the pin runs a fixture row VERBATIM."
                       component/cancel-eager-resolve-pins
                       component/granted-park-quantum-pins
                       component/async-lower-result-two-spaces-pins
+                      component/host-resource-dtor-registry-pins
                       component/cancel-window-fire-gate-pins)))
           wasmdown.test::*tests*)))
     (multiple-value-bind (passed failed)
