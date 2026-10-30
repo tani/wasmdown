@@ -1,3 +1,53 @@
+# M17 SESSION 25 — THE PLAN'S IMPLEMENTATION ITEMS ARE COMPLETE, AND THE LAST PARKED
+# BRANCH IS CLOSED AS SUPERSEDED.
+# 1. STEP 1's LAST ITEM LANDED (merge e4defca): the top-level stream/future positional
+#    arms are DELETED from both canon-lower wrappers (probe set 295 rows, 295 PASS, and
+#    the delivered row lines are BYTE-IDENTICAL to the baseline). The BORROW lend arms
+#    stay, with the measured negative named in place: deleting them too reads exactly
+#    passing-resources::1, drop-cross-task-borrow::2/::4 (unreachable) and ::6
+#    ("expected a trap but the action returned"), and restoring ONLY the borrow arms
+#    returns 295/295 with the stream/future arms still deleted. Cause: an async-typed
+#    callee's arg reaches %async-lift-guest-body, which resolves a borrow index AT THE
+#    CALLEE'S OWN TABLE — the raw caller index is not substitutable.
+#    %abi-load is byte-identical to master and the pin records why (the indirect-stream
+#    case would need its arms re-added there — the SECOND measured negative).
+#    NEW PIN component/generic-path-five-cases-pin covers the plan's five cases, with a
+#    negative control (disabling the sync borrow-arm gate makes it fail).
+#    Measured: units 543/0 twice; the four named fixtures 59/59 rows; per-file probe
+#    15/15 rc 0, every row PASS, no hang; and the landing bar — a clean-window n=30 on
+#    master AFTER the deletion reads 0 red / 0 fail, walls 10.03-10.29 s (the tightest
+#    band this project has recorded).
+# 2. wip/reactor-wiring IS CLOSED AS SUPERSEDED, not rebased and not re-measured:
+#    `git diff --stat master wip/reactor-wiring` shows the branch is far BEHIND master
+#    (11,315 deletions / 1,745 insertions, i.e. it lacks every later session), and its
+#    two substantive parts both landed in better form — the driver pump and the
+#    context-reactor plumbing as the STORE DRIVER, and the socket plumbing as the
+#    EXECUTOR slice, where readiness is keyed by (fd, host-end identity, direction)
+#    with a captured COPY GENERATION, a strict superset of the branch's
+#    (fd, socket-object, direction) scheme. Re-measuring an incompatible port would
+#    have been wasted work; the branch is deleted and this entry is its record.
+# THE WHOLE PLAN, DISPOSED:
+#   step 1  COMPLETE (type/view split, handle records, type-view deferred as at-parity,
+#           positional stream/future arms gone, borrow arms kept with the measured
+#           negative documented, %abi-load frozen).
+#   step 2  COMPLETE (descriptor refcount + preopen invalidation, per-instance dtor
+#           registry + provenance, provider migration, borrow-side pins).
+#   step 3  COMPLETE (selection core; parser half; link-time import-binding check landed
+#           at parity). Provider composition from the resolved world remains the one
+#           deferral, recorded.
+#   step 4  COMPLETE AS MECHANISM (single right, reservation, resume-later, marker
+#           credit, target-limited switch handoffs, reserved handoff windows, the
+#           switch_to chain boundary) with every historical row closed and pinned.
+#   step 5  COMPLETE (pending contract, span sinks, generation-guarded readiness,
+#           store-owned queue + tick, executors, DNS detach/free, socket watches).
+#   step 6  COMPLETE (reactor backend, driver pump, clock waits as pending, socket
+#           readiness). One test limitation kept explicit: the send-direction resume
+#           loop is not asserted (loopback never reported POLLOUT inside a bounded
+#           sleep-free window); the mechanism itself is covered by the accept and recv
+#           tests over the same host-end-ready path.
+#   step 7/8 OUT OF SCOPE (WASI HTTP removed at user direction).
+# THE LANE: 0 fail x 30 on master, twice in this session (pre- and post-deletion), units
+# 543/0.
 # M17 SESSION 24 — THE PROVIDER SIDE OF STEPS 5/6 IS DONE (merge 442e0b1): bounded
 # executors and socket readiness through reactor watches. Steps 5 and 6 are now COMPLETE
 # except the named limitation below.
