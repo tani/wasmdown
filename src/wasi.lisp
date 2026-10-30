@@ -438,6 +438,17 @@ fewer bytes than requested; a bounded read also bounds the host).")
   "The host source's per-call read bound (a stream read may return
 fewer bytes than the guest asked for; the canonical ABI allows it).")
 
+;;; The poll(2)/errno values the HOST-BACKED stream providers need
+;;; before the libc section below defines its socket surface (the
+;;; sockets section reuses these).
+(defparameter +eintr+ 4)
+(defparameter +eagain+ 11)
+(defparameter +pollin+ 1)
+(defparameter +pollout+ 4)
+(defparameter +pollhup+ #x10)
+(defparameter +pollerr+ #x8)
+(defparameter +pollnval+ #x20)
+
 (defun %cli-u8-ct ()
   "The stream<u8>'s element ct."
   (wasmdown.component:make-ct :kind :prim :payload :u8))
@@ -473,42 +484,93 @@ read-via-stream)."
 (defun %byte-stream-p (stream)
   (subtypep (stream-element-type stream) '(unsigned-byte 8)))
 
+(defun %stream-input-ready-p (stream fd)
+  "T when STREAM can deliver input without blocking: buffered input
+(LISTEN) or a readiness/hangup event on FD. A hangup counts as ready
+so the following read reports EOF instead of parking forever."
+  (or (listen stream)
+      (and (%poll-fd fd (logior +pollin+ +pollhup+ +pollerr+ +pollnval+) 0)
+           t)))
+
 (defun cl-stream-source (stream)
-  "A host SOURCE over CL input STREAM: (max) -> (values byte-list
-eof-p). Character streams are encoded byte-per-character (the WASI
-byte stream is opaque; chars are taken modulo the code)."
+  "A host SOURCE over CL input STREAM: (max) -> (values octets eof-p),
+OCTETS a REUSABLE u8 vector whose length is the count. Character
+streams are encoded byte-per-character (the WASI byte stream is
+opaque; chars are taken modulo the code). (NIL NIL) is WOULD-BLOCK: a
+host-backed stream with nothing to read right now parks the copy
+instead of blocking the host thread."
   (let* ((byte-p (%byte-stream-p stream))
-         (buf (if byte-p
-                  (make-array *cli-stream-chunk*
-                              :element-type '(unsigned-byte 8))
+         (fd (%stream-fd stream))
+         (buf (make-array *cli-stream-chunk*
+                          :element-type '(unsigned-byte 8)
+                          :fill-pointer 0))
+         (chars (unless byte-p
                   (make-array *cli-stream-chunk* :element-type 'character))))
     (lambda (max)
       (let ((want (min max *cli-stream-chunk*)))
-        (if (<= want 0)
-            (values nil nil)
-            (let ((got (read-sequence buf stream :end want)))
-              (values (if byte-p
-                          (loop for i below got collect (aref buf i))
-                          (loop for i below got
-                                collect (char-code (aref buf i))))
-                      (< got want))))))))
+        (cond
+          ((<= want 0) (values nil nil))
+          ((and (integerp fd) (minusp fd)) (values nil nil))
+          ((and (integerp fd) (not (%stream-input-ready-p stream fd)))
+           (values nil nil))
+          (t
+           (setf (fill-pointer buf) want)
+           (let ((got (if byte-p
+                          (read-sequence buf stream :end want)
+                          (read-sequence chars stream :end want))))
+             (unless byte-p
+               (dotimes (i got)
+                 (setf (aref buf i)
+                       (logand #xff (char-code (aref chars i))))))
+             (setf (fill-pointer buf) got)
+             (values buf (< got want)))))))))
+
+(defun %output-stream-fd (stream)
+  "The host file descriptor CL STREAM writes to, or NIL (string /
+broadcast streams have none). Synonym streams are unwrapped and a
+two-way stream uses its OUTPUT side."
+  (typecase stream
+    (sb-sys:fd-stream
+     (sb-sys:fd-stream-fd stream))
+    (synonym-stream
+     (%output-stream-fd (symbol-value (synonym-stream-symbol stream))))
+    (two-way-stream
+     (%output-stream-fd (two-way-stream-output-stream stream)))
+    (t nil)))
 
 (defun cl-stream-sink (stream)
-  "A host SINK over CL output STREAM: (byte-list) -> an error-code
-label or NIL. Flushed on every drain."
-  (let ((byte-p (%byte-stream-p stream)))
-    (lambda (bytes)
-      (handler-case
-          (progn
-            (if byte-p
-                (write-sequence
-                 (make-array (length bytes) :element-type '(unsigned-byte 8)
-                                            :initial-contents bytes)
-                 stream)
-                (write-sequence (map 'string #'code-char bytes) stream))
-            (finish-output stream)
-            nil)
-        (error () "io")))))
+  "A host SINK over CL output STREAM: (octets start end) ->
+(values consumed error-or-nil). At most END-START bytes are written in
+one call and CONSUMED is what the stream took. A host-backed stream
+that is not writable RIGHT NOW returns (0 NIL) — WOULD-BLOCK, so the
+copy parks instead of blocking the host thread — and an I/O failure
+returns (0 \"io\"). Flushed on every drain."
+  (let* ((byte-p (%byte-stream-p stream))
+         (fd (%output-stream-fd stream))
+         (chars (unless byte-p
+                  (make-array 0 :element-type 'character
+                                :adjustable t :fill-pointer 0))))
+    (lambda (octets start end)
+      (let ((n (- end start)))
+        (cond
+          ((<= n 0) (values 0 nil))
+          ((and (integerp fd) (minusp fd)) (values 0 nil))
+          ((and (integerp fd) (not (%poll-fd fd +pollout+ 0)))
+           (values 0 nil))
+          (t
+           (handler-case
+               (progn
+                 (if byte-p
+                     (write-sequence octets stream :start start :end end)
+                     (progn
+                       (setf (fill-pointer chars) 0)
+                       (loop for i from start below end
+                             do (vector-push-extend
+                                 (code-char (aref octets i)) chars))
+                       (write-sequence chars stream)))
+                 (finish-output stream)
+                 (values n nil))
+             (error () (values 0 "io")))))))))
 
 (defun %stdio-require (stream what)
   (or stream
@@ -1834,37 +1896,41 @@ produce a writable stream."
      (wasmdown.component.runtime:host-future-resolve ,writer ,value)))
 
 (defun %fd-pread-source (fd offset settle)
-  "A host SOURCE over pread(FD, ..., POS): (max) -> (values byte-list
-eof-p). POS advances with every read and the kernel file offset is
-never consulted. A short/empty read is EOF and SETTLEs the future
-(:ok); an OS error SETTLEs it (:err . code) and also reports EOF (the
-source drops its end, so the guest's read sees DROPPED)."
-  (let ((pos offset))
+  "A host SOURCE over pread(FD, ..., POS): (max) -> (values octets
+eof-p). OCTETS is a REUSABLE u8 vector whose length is the count; one
+pread(2) per attempt, so at most MAX (and at most *FS-STREAM-CHUNK*)
+bytes and no per-call allocation. POS advances with every read and the
+kernel file offset is never consulted. A short/empty read is EOF and
+SETTLEs the future (:ok); an OS error SETTLEs it (:err . code) and
+also reports EOF (the source drops its end, so the guest's read sees
+DROPPED)."
+  (let ((pos offset)
+        (slice (make-array *fs-stream-chunk*
+                           :element-type '(unsigned-byte 8)))
+        (out (make-array *fs-stream-chunk*
+                         :element-type '(unsigned-byte 8)
+                         :fill-pointer 0)))
     (lambda (max)
       (let ((want (min max *fs-stream-chunk*)))
         (if (<= want 0)
             (values nil nil)
-            (let ((buf (sb-alien:make-alien sb-alien:unsigned-char want)))
-              (unwind-protect
-                   (let ((n (%libc-pread fd buf want pos)))
-                     (cond
-                       ((minusp n)
-                        (funcall settle (cons :err (errno->error-code
-                                                    (sb-alien:get-errno))))
-                        (values nil t))
-                       ((zerop n)
-                        (funcall settle (cons :ok nil))
-                        (values nil t))
-                       (t
-                        (let ((bytes
-                                (loop for i below n
-                                      collect (sb-sys:sap-ref-8
-                                               (sb-alien:alien-sap buf) i))))
-                          (incf pos n)
-                          (when (< n want)
-                            (funcall settle (cons :ok nil)))
-                          (values bytes (< n want))))))
-                (sb-alien:free-alien buf))))))))
+            (let ((n (sb-sys:with-pinned-objects (slice)
+                       (%libc-pread fd (sb-sys:vector-sap slice) want pos))))
+              (cond
+                ((minusp n)
+                 (funcall settle (cons :err (errno->error-code
+                                             (sb-alien:get-errno))))
+                 (values nil t))
+                ((zerop n)
+                 (funcall settle (cons :ok nil))
+                 (values nil t))
+                (t
+                 (setf (fill-pointer out) n)
+                 (replace out slice :start2 0 :end2 n)
+                 (incf pos n)
+                 (when (< n want)
+                   (funcall settle (cons :ok nil)))
+                 (values out (< n want))))))))))
 
 (defun %byte-list->alien (bytes)
   "A fresh unsigned-char alien holding BYTES (a u8 element list)."
@@ -1876,39 +1942,37 @@ source drops its end, so the guest's read sees DROPPED)."
     buf))
 
 (defun %fd-pwrite-sink (fd position-fn advance-fn)
-  "A host SINK writing BYTES at POSITION-FN's offset each drain:
-error-code label or NIL. ADVANCE-FN records the bytes written (the
-write-via-stream cursor advances; append re-reads the file's size
-every drain — O_APPEND/EOF-append semantics)."
-  (lambda (bytes)
-    (if (null bytes)
-        nil
-        (let ((n (length bytes)))
-          (if (zerop n)
-              nil
-              (let ((buf (%byte-list->alien bytes)))
-                (unwind-protect
-                     (let ((done 0)
-                           (pos (funcall position-fn fd)))
-                       (loop while (< done n)
-                             do (let* ((ptr (sb-alien:sap-alien
-                                             (sb-sys:sap+ (sb-alien:alien-sap buf)
-                                                          done)
-                                             (* sb-alien:unsigned-char)))
-                                       (written (%libc-pwrite fd ptr (- n done)
-                                                              pos)))
-                                  (cond
-                                    ((minusp written)
-                                     (return (errno->error-code
-                                              (sb-alien:get-errno))))
-                                    ((zerop written)
-                                     (return "io"))
-                                    (t
-                                     (incf done written)
-                                     (setf pos (funcall advance-fn pos
-                                                        written))))))
-                       nil)
-                  (sb-alien:free-alien buf))))))))
+  "A host SINK writing a span at POSITION-FN's offset: (octets start
+end) -> (values consumed error-or-nil). ONE pwrite(2) per call: a
+short write is the count ACCEPTED (the remainder continues on the
+guest's next attempt), EAGAIN/EWOULDBLOCK is WOULD-BLOCK (0 NIL,
+nothing consumed), and any other failure is (values 0 <error-code
+label>). ADVANCE-FN is told the accepted count, so a fixed-offset
+stream's cursor moves across attempts; an append stream re-reads the
+file's size from POSITION-FN at every attempt (EOF-append semantics)."
+  (lambda (octets start end)
+    (let ((n (- end start)))
+      (cond
+        ((<= n 0) (values 0 nil))
+        (t
+         (let ((pos (funcall position-fn fd)))
+           (sb-alien:set-errno 0)
+           (let ((written
+                   (sb-sys:with-pinned-objects (octets)
+                     (%libc-pwrite fd
+                                   (sb-sys:sap+ (sb-sys:vector-sap octets)
+                                                start)
+                                   n pos))))
+             (cond
+               ((plusp written)
+                (funcall advance-fn pos written)
+                (values written nil))
+               ((zerop written) (values 0 "io"))
+               (t
+                (let ((errno (sb-alien:get-errno)))
+                  (if (= errno +eagain+)
+                      (values 0 nil)
+                      (values 0 (errno->error-code errno)))))))))))))
 
 (defun %fs-dropped-stream-and-future (elem-ct future-ct code)
   "The REFUSED shape of a stream-returning method: the guest's stream
@@ -2028,12 +2092,14 @@ to the error-code."
         (%fs-error-future future-ct (wasi-fs-error-code c))))))
 
 (defun fs-write-via-stream (context self data offset)
-  "pwrite-backed write stream starting at OFFSET."
+  "pwrite-backed write stream starting at OFFSET. The cursor is the
+stream's own: every byte the sink ACCEPTS (a short write is a partial
+accept) moves it, so later attempts continue where the file left off."
   (let ((pos offset))
     (%fs-write-stream
      context self data "write-via-stream"
      (lambda (fd) (declare (ignore fd)) pos)
-     (lambda (p n) (+ p n)))))
+     (lambda (p n) (setf pos (+ p n))))))
 
 (defun fs-append-via-stream (context self data)
   "append stream: every drain pwrites at the file's CURRENT size."
@@ -2088,35 +2154,41 @@ fstat (never following the link — a symlink reports itself)."
           (cons "name" name))))
 
 (defun %directory-source (dir dirfd settle)
-  "A host SOURCE over the fdopendir stream DIR (whose fds is DIRFD):
-(min) -> (values entry-list eof-p). `.` and `..` are omitted (the
-WIT's rule). At the end of the directory SETTLE the future (:ok); a
-readdir error SETTLEs (:err . code) and reports EOF."
-  (lambda (max)
-    (if (<= max 0)
-        (values nil nil)
-        (let ((entries '())
-              (eof nil))
-          ;; the requested bound counts DELIVERED entries: `.`/`..` are
-          ;; skipped inside the walk (a skipped entry must not turn the
-          ;; guest's read into a zero-progress completion).
-          (loop while (and (< (length entries) max) (not eof))
-                do (sb-alien:set-errno 0)
-                   (let ((p (%libc-readdir dir)))
-                     (cond
-                       ((sb-sys:sap= (sb-alien:alien-sap p) (sb-sys:int-sap 0))
-                        (setf eof t)
-                        (let ((errno (sb-alien:get-errno)))
-                          (if (zerop errno)
-                              (funcall settle (cons :ok nil))
-                              (funcall settle (cons :err
-                                                    (errno->error-code
-                                                     errno))))))
-                       (t
-                        (let ((name (%dirent-name p)))
-                          (unless (member name '("." "..") :test #'string=)
-                            (push (%dirent-entry p dirfd) entries)))))))
-          (values (nreverse entries) eof)))))
+  "A host SOURCE over the fdopendir stream DIR (whose fd is DIRFD):
+(min) -> (values entry-vector eof-p), ENTRY-VECTOR a REUSABLE vector
+whose length is the count (the typed directory-entry values, never a
+byte list). `.` and `..` are omitted (the WIT's rule). At the end of
+the directory SETTLE the future (:ok); a readdir error SETTLEs
+(:err . code) and reports EOF."
+  (let ((out (make-array 0 :adjustable t :fill-pointer 0)))
+    (lambda (max)
+      (if (<= max 0)
+          (values nil nil)
+          (progn
+            (setf (fill-pointer out) 0)
+            (let ((eof nil))
+              ;; the requested bound counts DELIVERED entries: `.`/`..` are
+              ;; skipped inside the walk (a skipped entry must not turn the
+              ;; guest's read into a zero-progress completion).
+              (loop while (and (< (fill-pointer out) max) (not eof))
+                    do (sb-alien:set-errno 0)
+                       (let ((p (%libc-readdir dir)))
+                         (cond
+                           ((sb-sys:sap= (sb-alien:alien-sap p)
+                                         (sb-sys:int-sap 0))
+                            (setf eof t)
+                            (let ((errno (sb-alien:get-errno)))
+                              (if (zerop errno)
+                                  (funcall settle (cons :ok nil))
+                                  (funcall settle (cons :err
+                                                        (errno->error-code
+                                                         errno))))))
+                           (t
+                            (let ((name (%dirent-name p)))
+                              (unless (member name '("." "..") :test #'string=)
+                                (vector-push-extend (%dirent-entry p dirfd)
+                                                    out)))))))
+              (values out eof)))))))
 
 (defun fs-read-directory (context self
                           &key (package (wasi-package "filesystem")))
@@ -2351,10 +2423,6 @@ preopens)."
 (defparameter +shut-rd+ 0)
 (defparameter +shut-wr+ 1)
 (defparameter +msg-nosignal+ #x4000)
-(defparameter +pollin+ 1)
-(defparameter +pollout+ 4)
-(defparameter +eintr+ 4)
-(defparameter +eagain+ 11)
 (defparameter +einprogress+ 115)
 
 ;;; The sockaddr layouts (Linux LP64). Offsets are the C ABI's:
@@ -3732,71 +3800,78 @@ TIME_WAIT binding does not block the guest."
 
 (defun %tcp-accept-source (sock)
   "A host SOURCE yielding new tcp-socket OWN HANDLES: (max) ->
-(values element-list eof-p). EAGAIN returns what was accepted and
-parks (eof NIL); a fatal error ends the stream."
+(values element-vector eof-p), ELEMENT-VECTOR a REUSABLE vector whose
+length is the count. accept4 is already nonblocking: EAGAIN/EINTR is
+WOULD-BLOCK — (NIL NIL) when nothing was accepted, else the entries
+accepted so far with eof NIL — never an accept spin; a fatal error
+ends the stream."
   (let ((ct (tcp-socket-resource-ct))
-        (family (wasi-tcp-socket-family sock)))
+        (family (wasi-tcp-socket-family sock))
+        (out (make-array 0 :adjustable t :fill-pointer 0)))
     (lambda (max)
       (if (<= max 0)
           (values nil nil)
-          (let ((out '())
-                (eof nil))
-            (loop while (and (< (length out) max) (not eof))
-                  do (sb-alien:set-errno 0)
-                     (let ((fd (%libc-accept4 (wasi-tcp-socket-fd sock)
-                                              (%sock-null) (%sock-null)
-                                              (logior +sock-nonblock+
-                                                      +sock-cloexec+))))
-                       (cond
-                         ((>= fd 0)
-                          (push (list :own-handle ct
-                                      (make-wasi-tcp-socket
-                                       :fd fd
-                                       :network (wasi-tcp-socket-network sock)
-                                       :family family
-                                       :state :connected))
-                                out))
-                         (t
-                          (let ((errno (sb-alien:get-errno)))
-                            (cond ((or (= errno +eagain+) (= errno +eintr+))
-                                   ;; park: the guest may retry the read
-                                   nil)
-                                  (t (setf eof t))))))))
-            (values (nreverse out) eof))))))
+          (progn
+            (setf (fill-pointer out) 0)
+            (let ((eof nil)
+                  (blocked nil))
+              (loop while (and (< (fill-pointer out) max) (not eof)
+                               (not blocked))
+                    do (sb-alien:set-errno 0)
+                       (let ((fd (%libc-accept4 (wasi-tcp-socket-fd sock)
+                                                (%sock-null) (%sock-null)
+                                                (logior +sock-nonblock+
+                                                        +sock-cloexec+))))
+                         (cond
+                           ((>= fd 0)
+                            (vector-push-extend
+                             (list :own-handle ct
+                                   (make-wasi-tcp-socket
+                                    :fd fd
+                                    :network (wasi-tcp-socket-network sock)
+                                    :family family
+                                    :state :connected))
+                             out))
+                           (t
+                            (let ((errno (sb-alien:get-errno)))
+                              (if (or (= errno +eagain+) (= errno +eintr+))
+                                  ;; would-block: nothing more RIGHT NOW;
+                                  ;; the copy parks until a readiness wake
+                                  (setf blocked t)
+                                  (setf eof t)))))))
+              (if (and blocked (zerop (fill-pointer out)))
+                  (values nil nil)
+                  (values out eof))))))))
 
-(defun %fd-send-all (fd bytes)
-  "Send BYTES to the stream socket FD; returns an error-code DOMAIN
-value or NIL. EAGAIN waits (bounded) for POLLOUT; MSG_NOSIGNAL keeps
-a peer reset from killing the host."
-  (let ((n (length bytes)))
-    (if (zerop n)
-        nil
-        (let ((buf (%byte-list->alien bytes)))
-          (unwind-protect
-               (block write
-                 (let ((done 0))
-                   (loop while (< done n)
-                         do (let* ((ptr (sb-sys:sap+ (sb-alien:alien-sap buf)
-                                                     done))
-                                   (ret (%libc-send fd ptr (- n done)
-                                                    +msg-nosignal+)))
-                              (cond
-                                ((plusp ret) (incf done ret))
-                                ((zerop ret)
-                                 (return-from write (%socket-code "connection-broken")))
-                                (t
-                                 (let ((errno (sb-alien:get-errno)))
-                                   (cond
-                                     ((= errno +eintr+) nil)
-                                     ((= errno +eagain+)
-                                      (unless (%poll-fd fd +pollout+ 5000)
-                                        (return-from write
-                                          (%socket-code "timeout"))))
-                                     (t
-                                      (return-from write
-                                        (%socket-errno-code errno)))))))))
-                   nil))
-            (sb-alien:free-alien buf))))))
+(defun %fd-send-sink (fd)
+  "A host SINK over send(2) on the connected stream socket FD:
+(octets start end) -> (values consumed error-or-nil). ONE send per
+call: a short send is the count ACCEPTED (the remainder continues on
+the guest's next attempt), EAGAIN/EWOULDBLOCK is WOULD-BLOCK (0 NIL,
+nothing consumed), a zero-length send is connection-broken, and
+MSG_NOSIGNAL keeps a peer reset from killing the host. The error is
+the sockets error-code DOMAIN value."
+  (lambda (octets start end)
+    (let ((n (- end start)))
+      (if (<= n 0)
+          (values 0 nil)
+          (loop
+            (sb-alien:set-errno 0)
+            (let ((ret (sb-sys:with-pinned-objects (octets)
+                         (%libc-send fd
+                                     (sb-sys:sap+ (sb-sys:vector-sap octets)
+                                                  start)
+                                     n +msg-nosignal+))))
+              (cond
+                ((plusp ret) (return (values ret nil)))
+                ((zerop ret)
+                 (return (values 0 (%socket-code "connection-broken"))))
+                (t
+                 (let ((errno (sb-alien:get-errno)))
+                   (cond
+                     ((= errno +eintr+) nil)   ; retry the same span
+                     ((= errno +eagain+) (return (values 0 nil)))
+                     (t (return (values 0 (%socket-errno-code errno))))))))))))))
 
 (defun tcp-send (context network self data
                  &key (package (wasi-package "sockets")))
@@ -3829,7 +3904,7 @@ a peer reset from killing the host."
                          (%release-tcp sock shutdown-how))))
                 (incf (wasi-tcp-socket-refs sock))
                 (wasmdown.component.runtime:host-end-set-sink
-                 data (lambda (bytes) (%fd-send-all fd bytes)))
+                 data (%fd-send-sink fd))
                 (wasmdown.component.runtime:host-end-set-on-drop
                  data
                  (lambda (dropped error)
@@ -3847,41 +3922,40 @@ a peer reset from killing the host."
         (%socket-error-future future-ct (wasi-socket-error-code c))))))
 
 (defun %tcp-recv-source (fd settle)
-  "A host SOURCE over recv(2): (max) -> (values byte-list eof-p).
-A would-block result gets one bounded poll(2) readiness wait (there
-is no socket reactor to wake the guest later); when nothing arrives
-the source parses as no-progress and the guest's read parks. A
-zero-length recv is a graceful FIN and SETTLES the future (:ok); a
-recv error SETTLES it (:err . code) and reports EOF."
-  (lambda (max)
-    (if (<= max 0)
-        (values nil nil)
-        (let ((want (min max 65536)))
-          (loop
-            (let ((buf (sb-alien:make-alien sb-alien:unsigned-char want)))
-              (unwind-protect
-                   (let ((n (%libc-recv fd (sb-alien:alien-sap buf) want 0)))
-                     (cond
-                       ((plusp n)
-                        (return
-                          (values (loop for i below n
-                                        collect (sb-sys:sap-ref-8
-                                                 (sb-alien:alien-sap buf) i))
-                                  nil)))
-                       ((zerop n)
-                        (funcall settle (cons :ok nil))
-                        (return (values nil t)))
-                       (t
-                        (let ((errno (sb-alien:get-errno)))
-                          (cond
-                            ((or (= errno +eagain+) (= errno +eintr+))
-                             (unless (%poll-fd fd +pollin+ 2000)
-                               (return (values nil nil))))
-                            (t
-                             (funcall settle
-                                      (cons :err (%socket-errno-code errno)))
-                             (return (values nil t))))))))
-                (sb-alien:free-alien buf))))))))
+  "A host SOURCE over recv(2): (max) -> (values octets eof-p),
+OCTETS a REUSABLE u8 vector whose length is the count. ONE
+nonblocking recv per attempt: EAGAIN/EINTR is WOULD-BLOCK ((NIL NIL)),
+so the guest's read parks on readiness instead of polling the host
+thread. A zero-length recv is a graceful FIN and SETTLES the future
+(:ok) with an EMPTY vector and EOF; a recv error SETTLES it
+(:err . code) and reports EOF."
+  (let ((slice (make-array 65536 :element-type '(unsigned-byte 8)))
+        (out (make-array 65536 :element-type '(unsigned-byte 8)
+                                :fill-pointer 0)))
+    (lambda (max)
+      (if (<= max 0)
+          (values nil nil)
+          (let ((want (min max 65536)))
+            (sb-alien:set-errno 0)
+            (let ((n (sb-sys:with-pinned-objects (slice)
+                       (%libc-recv fd (sb-sys:vector-sap slice) want 0))))
+              (cond
+                ((plusp n)
+                 (setf (fill-pointer out) n)
+                 (replace out slice :start2 0 :end2 n)
+                 (values out nil))
+                ((zerop n)
+                 (funcall settle (cons :ok nil))
+                 (values #() t))
+                (t
+                 (let ((errno (sb-alien:get-errno)))
+                   (cond
+                     ((or (= errno +eagain+) (= errno +eintr+))
+                      (values nil nil))
+                     (t
+                      (funcall settle
+                               (cons :err (%socket-errno-code errno)))
+                      (values nil t))))))))))))
 
 (defun tcp-receive (context network self
                     &key (package (wasi-package "sockets")))

@@ -238,7 +238,9 @@ machinery is deliberately not part of the public surface)."
     (multiple-value-bind (reader writer)
         (wasmdown.component.runtime:make-host-stream-pair *u8-ct*)
       (wasmdown.component.runtime:host-end-set-sink
-       reader (lambda (bytes) (setf sink-bytes bytes) nil))
+       reader (lambda (octets start end)
+                (setf sink-bytes (coerce (subseq octets start end) 'list))
+                (values (- end start) nil)))
       (let ((staged (wasmdown.component.runtime:make-host-buffer
                      2 :values '(104 105))))
         ;; the guest's write (case 2: the peer has no buffer)
@@ -377,6 +379,40 @@ machinery is deliberately not part of the public surface)."
         (rtcall "%END-COPY" future fbuf t)
         (is (equal '((:ok))
                    (wasmdown.component.runtime:host-buffer-values fbuf)))))))
+
+(test wasi/cli-stdio-providers-span-contract
+  ;; M17 step 5: the CLI providers speak the byte contract directly —
+  ;; the sink consumes a SPAN and reports (values count error), the
+  ;; source yields a REUSABLE u8 VECTOR whose length is the count
+  ;; (never a one-argument byte list).
+  (let ((out (make-string-output-stream)))
+    (let ((sink (wasmdown.wasi:cl-stream-sink out)))
+      (multiple-value-bind (consumed err)
+          (funcall sink (make-array 4 :element-type '(unsigned-byte 8)
+                                      :initial-contents '(97 98 99 100))
+                   1 3)
+        (is (eql 2 consumed))
+        (is (null err)))
+      (is (string= "bc" (get-output-stream-string out)))
+      ;; an empty span consumes nothing and is not an error
+      (multiple-value-bind (consumed err)
+          (funcall sink (make-array 1 :element-type '(unsigned-byte 8)) 0 0)
+        (is (eql 0 consumed))
+        (is (null err)))))
+  (let ((in (make-string-input-stream "hello")))
+    (let ((source (wasmdown.wasi:cl-stream-source in)))
+      (multiple-value-bind (octets eof) (funcall source 3)
+        (is (vectorp octets))
+        (is (not (listp octets)))
+        (is (string= "hel" (map 'string #'code-char octets)))
+        (is (null eof)))
+      (multiple-value-bind (octets eof) (funcall source 8)
+        (is (string= "lo" (map 'string #'code-char octets)))
+        (is eof))
+      ;; exhausted: a reusable empty vector and EOF (not would-block)
+      (multiple-value-bind (octets eof) (funcall source 8)
+        (is (= 0 (length octets)))
+        (is eof)))))
 
 (test wasi/cli-stdio-capability-withdrawn
   ;; An absent stream is a withdrawn capability: the interface is still
@@ -1450,9 +1486,35 @@ accumulated u8 values."
         (wasmdown.wasi:close-wasi-preopen pre)))))
 
 ;;; ---------------------------------------------------------------
-;;; DESCRIPTOR / HOST-RESOURCE LIFETIME: the descriptor handle and
-;;; each stream end hold independent references to the fd; the fd is
-;;; closed exactly once, when the last holder releases it.
+;;; THE BYTE SOURCE/SINK CONTRACT at the provider boundary: a source
+;;; hands back a REUSABLE u8 VECTOR (not a byte list) and reports EOF
+;;; separately from would-block; a sink consumes a SPAN in ONE syscall.
+
+(test wasi/fd-pread-source-vector-and-eof
+  (with-fs-root (root "fs-pread-src" '("data.txt"))
+    (fs-write! (fs-p root "data.txt") "abcdef")
+    (let* ((fd (wasmdown.wasi::%libc-open
+                (fs-p root "data.txt") wasmdown.wasi::+o-rdonly+ 0))
+           (settled '())
+           (source (wasmdown.wasi::%fd-pread-source
+                    fd 0 (lambda (v) (push v settled)))))
+      (unwind-protect
+           (progn
+             (multiple-value-bind (octets eof) (funcall source 4)
+               (is (vectorp octets))
+               (is (not (listp octets)))
+               (is (equal "abcd" (map 'string #'code-char octets)))
+               (is (null eof)))
+             ;; the same vector is reused: the length is the new count
+             (multiple-value-bind (octets eof) (funcall source 4)
+               (is (equal "ef" (map 'string #'code-char octets)))
+               (is eof))
+             ;; a short read settles the stream's future (:ok)
+             (is (equal '((:ok)) settled))
+             (multiple-value-bind (octets eof) (funcall source 4)
+               (is (null octets))
+               (is eof)))
+        (wasmdown.wasi::%close-fd fd)))))
 
 (test wasi/fs-descriptor-refcount-stream-outlives-handle
   ;; dropping the descriptor handle while a stream is live must not
@@ -2308,6 +2370,46 @@ progress is possible, or the end is DROPPED."
 ;;; ---------------------------------------------------------------
 ;;; The keep-alive / hop-limit / buffer knobs and their validation.
 
+(test wasi/tcp-accept-source-would-block
+  ;; M17 step 5: accept4 is NONBLOCKING. An empty accept queue is
+  ;; WOULD-BLOCK ((nil nil) — never an empty-EOF, never a spin), and a
+  ;; queued connection is an element VECTOR of own handles.
+  (let* ((net (sock-network))
+         (server (sock-rep (wasmdown.wasi:tcp-create
+                            nil net (cons :enum "ipv4"))))
+         (client (sock-rep (wasmdown.wasi:tcp-create
+                            nil net (cons :enum "ipv4"))))
+         (accepted nil))
+    (unwind-protect
+         (progn
+           (is (equal '(:ok)
+                      (wasmdown.wasi:tcp-bind nil net server (sock-addr 0))))
+           (let* ((port (sock-value-port
+                         (sock-ok (wasmdown.wasi:tcp-get-local-address
+                                   nil net server))))
+                  (listening (wasmdown.wasi:tcp-listen nil net server))
+                  (reader (cdr listening))
+                  (source (rtcall "ASYNC-END-HOST-SOURCE"
+                                  (rtcall "ASYNC-END-OTHER" reader))))
+             (is (functionp source))
+             ;; nothing queued: WOULD-BLOCK, not EOF
+             (multiple-value-bind (seq eof) (funcall source 4)
+               (is (null seq))
+               (is (null eof)))
+             (is (equal '(:ok)
+                        (wasmdown.wasi:tcp-connect nil net client
+                                                   (sock-addr port))))
+             (multiple-value-bind (seq eof) (funcall source 4)
+               (is (vectorp seq))
+               (is (= 1 (length seq)))
+               (is (null eof))
+               (setf accepted (third (aref seq 0))))
+             (is (eq :connected
+                     (wasmdown.wasi:wasi-tcp-socket-state accepted)))))
+      (when accepted (wasmdown.wasi:close-wasi-tcp-socket accepted))
+      (wasmdown.wasi:close-wasi-tcp-socket client)
+      (wasmdown.wasi:close-wasi-tcp-socket server))))
+
 (test wasi/sockets-tcp-knobs
   (let* ((net (sock-network))
          (sock (sock-rep (wasmdown.wasi:tcp-create nil net (cons :enum "ipv4")))))
@@ -2667,14 +2769,15 @@ progress is possible, or the end is DROPPED."
             (br $poll))) ~
         (if (i32.ne (i32.const 1) (i32.load (i32.const 224))) (then unreachable)) ~
         (call $subdrop (local.get $sub))))) ~
-  (func (export \"f\") (result i32) ~
-    (local $s i32) (local $ws i32) (local $packed i32) ~
-    (local $rx i32) (local $tx i32) (local $pair i64) (local $fut i32) ~
-    (local $rs i32) (local $rf i32) (local $r i32) ~
+  (global $sock (mut i32) (i32.const 0)) ~
+  (func (export \"f1\") (result i32) ~
+    (local $ws i32) (local $packed i32) ~
+    (local $rx i32) (local $tx i32) (local $pair i64) ~
+    (local $r i32) ~
     (call $create (i32.const 0) (i32.const 64)) ~
     (if (i32.ne (i32.const 0) (i32.load8_u (i32.const 64))) (then unreachable)) ~
-    (local.set $s (i32.load (i32.const 68))) ~
-    (i32.store (i32.const 0) (local.get $s)) ~
+    (global.set $sock (i32.load (i32.const 68))) ~
+    (i32.store (i32.const 0) (global.get $sock)) ~
     (i32.store8 (i32.const 4) (i32.const 0)) ~
     (i32.store16 (i32.const 8) (i32.const ~d)) ~
     (i32.store8 (i32.const 10) (i32.const 127)) ~
@@ -2693,13 +2796,15 @@ progress is possible, or the end is DROPPED."
     (i32.store8 (i32.const 161) (i32.const 105)) ~
     (i32.store8 (i32.const 162) (i32.const 110)) ~
     (i32.store8 (i32.const 163) (i32.const 103)) ~
-    (local.set $fut (call $send (local.get $s) (local.get $rx))) ~
+    (drop (call $send (global.get $sock) (local.get $rx))) ~
     (local.set $r (call $swrite (local.get $tx) (i32.const 160) (i32.const 4))) ~
     (if (i32.ne (i32.const 64) (local.get $r)) (then unreachable)) ~
     (call $sdropw (local.get $tx)) ~
-    (call $receive (local.get $s) (i32.const 128)) ~
+    (i32.const 0)) ~
+  (func (export \"f2\") (result i32) ~
+    (local $rs i32) (local $r i32) ~
+    (call $receive (global.get $sock) (i32.const 128)) ~
     (local.set $rs (i32.load (i32.const 128))) ~
-    (local.set $rf (i32.load (i32.const 132))) ~
     (local.set $r (call $sread (local.get $rs) (i32.const 176) (i32.const 4))) ~
     (if (i32.ne (i32.const 64) (local.get $r)) (then unreachable)) ~
     (i32.load8_u (i32.const 176)))) ~
@@ -2717,7 +2822,8 @@ progress is possible, or the end is DROPPED."
    (export \"join\" (func $join)) ~
    (export \"wsnew\" (func $wsnew)) ~
    (export \"wait\" (func $wait)))))) ~
- (func (export \"f\") (result u32) (canon lift (core func $m \"f\"))))"
+ (func (export \"f1\") (result u32) (canon lift (core func $m \"f1\"))) ~
+ (func (export \"f2\") (result u32) (canon lift (core func $m \"f2\"))))"
           port))
 
 (defun sock-host-listener ()
@@ -2777,13 +2883,20 @@ caller closes FD."
              (let* ((inst (wasmdown.component.runtime:instantiate-component
                            comp
                            :with-args (wasmdown.wasi:sockets-provider context)))
-                    (f (wasmdown.component.runtime:runtime-export-value
-                        inst "f")))
-               ;; the guest read "pong" and returned its first byte
-               (is (eql 112 (wasmdown.component.runtime:lifted-func-call f))))
-             (sb-thread:join-thread thread)
-             ;; the host received exactly the guest's "ping"
-             (is (equal '(112 105 110 103) (car got))))
+                    (f1 (wasmdown.component.runtime:runtime-export-value
+                         inst "f1"))
+                    (f2 (wasmdown.component.runtime:runtime-export-value
+                         inst "f2")))
+               ;; PHASE 1: the guest connects, sends "ping" and drops its
+               ;; write end. The provider's sink must not block, so the
+               ;; guest's READ is a second call: the test lets the host
+               ;; echo land first, then the nonblocking recv finds it.
+               (is (eql 0 (wasmdown.component.runtime:lifted-func-call f1)))
+               (sb-thread:join-thread thread)
+               ;; the host received exactly the guest's "ping"
+               (is (equal '(112 105 110 103) (car got)))
+               ;; PHASE 2: the guest reads "pong" and returns its first byte
+               (is (eql 112 (wasmdown.component.runtime:lifted-func-call f2)))))
         (ignore-errors (sb-thread:join-thread thread :timeout 2))
         (wasmdown.wasi::%close-fd listen-fd)))))
 

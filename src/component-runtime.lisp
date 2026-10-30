@@ -3882,7 +3882,7 @@ to the guest. Same pair/linkage as canon stream.new."
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
   ;; the sink protocol's arity probe (a one-argument SINK is the
-  ;; pre-cutover LIST contract; see %sink-span-arity-p)
+  ;; the span contract is required at registration; no arity adapter remains
   (ignore-errors (require :sb-introspect)))
 
 ;;; ---- M17 STEP 5: RESUMABLE BYTE COPIES AND ASYNCHRONOUS HOST CALLS ----
@@ -3963,36 +3963,6 @@ unresolvable one (an opaque type index in a host pair) is left to
 the copy itself, as before."
   (let ((c (and t-ct (ignore-errors (%abi-ct t-ct inst)))))
     (and c (not (%u8-element-p c nil)))))
-
-(defun %sink-span-arity-p (sink)
-  "T when SINK takes the (octets start end) span contract. A
-ONE-argument SINK is the pre-cutover LIST contract (the WASI
-providers still register one; their migration is the next wave) and
-is adapted at registration, so the copy path itself has one shape."
-  (let* ((pkg (find-package "SB-INTROSPECT"))
-         (fn (and pkg (find-symbol "FUNCTION-LAMBDA-LIST" pkg))))
-    (and fn
-         (let ((ll (ignore-errors (funcall fn sink))))
-           (and (listp ll)
-                (>= (loop for x in ll
-                          while (not (member x lambda-list-keywords))
-                          count t)
-                    3))))))
-
-(defun %normalize-sink (sink)
-  "SINK as the span contract. A legacy (byte-list) -> error-or-nil
-sink consumes the whole span and reports (values n NIL) or
-(values 0 error): it can never would-block, which is exactly its
-limitation."
-  (cond
-    ((null sink) nil)
-    ((%sink-span-arity-p sink) sink)
-    (t (lambda (octets start end)
-         (let ((err (funcall sink
-                             (coerce (subseq octets start end) 'list))))
-           (if err
-               (values 0 err)
-               (values (- end start) nil)))))))
 
 ;;; ---- THE HOST EVENT QUEUE ----
 ;;; A pending's resolution (and a future watch's delivery) may land
@@ -4374,7 +4344,7 @@ stale-fd/stale-copy guard. T when a parked copy was resumed."
   "Make the READABLE end END drain the bytes its guest writer stages
 into SINK: (octets start end) -> (values consumed-count
 error-or-nil). A one-argument SINK is the legacy (byte-list) shape
-and is adapted (see %normalize-sink). Only a stream<u8> may carry a
+and must take the (octets start end) span contract. Only a stream<u8> may carry a
 byte sink: any other element type is a HOST ERROR, refused HERE so a
 provider learns at registration, not mid-copy."
   (when (and sink
@@ -4382,7 +4352,18 @@ provider learns at registration, not mid-copy."
                                 (async-end-owner end)))
     (error 'wasmdown:host-error
            :message "a byte sink requires a stream<u8> element type"))
-  (setf (async-end-host-sink end) (%normalize-sink sink))
+  ;; THE SPAN CONTRACT IS REQUIRED: an arity probe used to adapt the old
+  ;; one-argument LIST sinks, which let a sink consume a whole span and report
+  ;; success without ever being able to would-block. Every provider now speaks
+  ;; (octets start end) -> (values consumed error), so a wrong-arity sink is a
+  ;; HOST ERROR here rather than silently adapted.
+  (unless (or (null sink)
+              (and (functionp sink)
+                   (>= (length (sb-introspect:function-lambda-list sink)) 3)))
+    (error 'wasmdown:host-error
+           :message (format nil "host-end-set-sink: ~S is not a (octets start end) sink"
+                            sink)))
+  (setf (async-end-host-sink end) sink)
   end)
 
 (defun host-end-set-source (end source)
