@@ -25,8 +25,10 @@
 #       |   (%outer-state-at nil (1- count)) + aref form            | 3/3    | ctr::9 x1
 #   5   | %instance-ct-type-space's memo lookup bypassed            | 3/3    | none
 # THE VALID NULL-DIFF (the earlier one was sub-resolution and invalid): master
-# with `(sb-ext:gc :full t)` before every FILE — 69 real full GCs per run, i.e.
-# genuine per-command work, no semantic change. Manipulation ENGAGED and measured
+# with `(sb-ext:gc :full t)` injected once per FILE inside the runner's
+# `(dolist (f *files*))` — 69 full GCs per run, NOT per command (1631); the factor
+# of 24 matters to anyone replicating this. Harness restored afterwards (the tree
+# has 0 `sb-ext:gc` injections and `git diff` on the runner is empty). Manipulation ENGAGED and measured
 # by wall: 56.4 s per 6 runs = 9.4 s/run against 8.2 s/run in the control batch.
 # RESULT: acs::2 = 0/6, total 1 fail over 6 runs. So EXTRA PER-COMMAND WORK DOES
 # NOT FLIP acs::2 — the generic-overhead/margin account is dead, this time on a
