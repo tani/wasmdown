@@ -1,3 +1,31 @@
+# M17 SESSION 13 — STEP 5's PROVIDER HALF LANDED: the LIST-sink contract exists
+# NOWHERE in the tree (merge 0446eef / 0446eef's branch).
+# WHAT LANDED: every WASI provider takes the span contract or returns vectors, with
+# ONE syscall per attempt instead of a loop to completion — cl-stream-sink /
+# cl-stream-source, %fd-pwrite-sink (one pwrite pinned on the span; the cursor really
+# advances now), %fd-pread-source, %directory-source (typed vector), TCP send (one
+# send, MSG_NOSIGNAL, short = partial accept, EINTR retried in place), %tcp-recv-source
+# (one nonblocking recv, EAGAIN/EINTR -> (nil nil), zero length -> (values #() t)) and
+# %tcp-accept-source (reusable vector; EAGAIN stops the walk instead of spinning).
+# The three "wait it out" paths are DELETED: TCP send's 5 s timeout, recv's 2 s poll,
+# and accept's busy spin. Every other WIT error mapping is preserved verbatim.
+# THE RUNTIME ADAPTER IS DELETED TOO: %normalize-sink / %sink-span-arity-p and the
+# sb-introspect arity probe are gone; host-end-set-sink REQUIRES the span contract and
+# rejects any other arity with a host error naming the sink. That closes the hole where
+# a provider could consume a whole span, report success, and never would-block.
+# MEASURED: units 517/0 twice (514 + 3 provider tests); the eight stream/future
+# fixtures 151 rows / 0 FAIL before AND after the adapter removal; grep for
+# sb-introspect / %normalize-sink in src/wasi.lisp is empty.
+# TEST NOTE worth keeping: wasi/e2e-tcp-echo-component's guest was ONE function that
+# relied on the provider blocking; under real would-block it trapped 3 of 4 runs. It is
+# now two exports sharing the socket in a core global (connect+send+drop, then
+# receive+read) so the nonblocking recv deterministically finds the buffered pong.
+# That is the pattern any future guest-side fixture must use once a provider can
+# would-block: a single blocking-shaped guest function is no longer valid.
+# STILL OPEN in step 5: (a) providers that should RETURN a pending (monotonic clock,
+# reactor-driven socket I/O, DNS and blocking-stdio executors); (b) the completion
+# queue moving from the global FIFO into the STORE's queue driven by %store-tick
+# (today host-end-ready retries on the caller's thread).
 # M17 SESSION 12 — STEP 5's RUNTIME HALF LANDED (08c7d2d). The provider migration and
 # the store-owned event queue are the NEXT wave, and they are named below so nobody
 # reads this as step 5 complete.
