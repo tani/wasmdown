@@ -5795,6 +5795,245 @@ THE LOCK ORDER rule (b): those are RIGHT acquisitions, and a held
               (wasmdown.component.runtime::async-thread-spawn-thunk th)
               :done)))))
 
+;;; ---- THE NESTED SYNC LOWER / STORE-RIGHT PIN (sync-streams::1) ----
+;;; THE DECODE: a SYNC lower of an ASYNC-typed callee returns to its
+;;; caller once the callee has RESOLVED and the caller can take the
+;;; store right — and the caller can take it only at the callee's
+;;; PARK or EXIT (the right's turn reservation forbids a mid-turn
+;;; grab). The caller's turn then CONTINUES: it must KEEP the right
+;;; until its own next park/exit. The pre-fix cleanup released it at
+;;; the lower's return, so a GRANTED sibling could take a turn
+;;; inside the caller's turn. In sync-streams.wast that sibling is
+;;; $C.get's post-task.return continuation: it returned from its
+;;; sync write, EXITed, and released $C's exclusive lock BEFORE the
+;;; caller's next async lower looked at the backpressure gate, so
+;;; the lower packed STARTED(1) where the fixture pins STARTING(0)
+;;; and the guest's `unreachable' fired.
+;;; THE CAPTURE (in-memory, printed once at the script boundary):
+;;; the failing pair read `TRET (912 1) ... COPY-PARK 3 ...
+;;; COPY-WAKE 3 65 ... DROP 3 :DONE ... TEXIT (912 1) :RESOLVED T`
+;;; then `PACK 1 1 NIL T NIL` (packed STARTED, started-at-flip T)
+;;; and `GTRAP (912) "unreachable executed"`.
+;;; THE RULE FIX: %canon-lift-async keeps the right for a GUEST
+;;; caller (a driver caller still releases: it leaves the store).
+;;; NEGATIVE CONTROL: with the keep-right test forced to NIL the
+;;; crafted fixture below traps 10/10 runs; with the rule it passes.
+;;; THE PAIR PROBE that reproduced the row (predecessor ->
+;;; sync-streams in one process, the historical cross-file store
+;;; coupling): pre-fix 6 failing sync-streams::1 rows / 500
+;;; iterations (3/100 after sync-barges-in, 2/100 after empty-wait,
+;;; 1/200 in the instrumented capture run; 0/100 after
+;;; switch-to-ready-callback); post-fix 0 / 1300 (1000
+;;; sync-barges-in, 300 empty-wait).
+(defparameter *ss1-nested-sync-lower-fixture*
+  ";; A deterministic discriminator for the sync-lower / store-right rule
+;; seen in sync-streams.wast: after a SYNC lower of an ASYNC-typed
+;; callee returns, the CALLER's turn is not over, so it must still hold
+;; the store right; otherwise the callee's post-task.return continuation
+;; runs concurrently and can release the instance's exclusive lock
+;; before the caller's next async lower looks at the backpressure gate.
+(component
+  (component $C
+    (core module $Memory (memory (export \"mem\") 1))
+    (core instance $memory (instantiate $Memory))
+    (core module $CM
+      (import \"\" \"mem\" (memory 1))
+      (import \"\" \"task.return0\" (func $task.return0))
+      (import \"\" \"task.return1\" (func $task.return1 (param i32)))
+      (import \"\" \"stream.new\" (func $stream.new (result i64)))
+      (import \"\" \"stream.write\" (func $stream.write (param i32 i32 i32) (result i32)))
+      (import \"\" \"stream.drop-writable\" (func $stream.drop-writable (param i32)))
+      (func (export \"get\") (result i32)
+        (local $ret i32) (local $ret64 i64) (local $tx i32) (local $rx i32)
+        (local.set $ret64 (call $stream.new))
+        (local.set $rx (i32.wrap_i64 (local.get $ret64)))
+        (local.set $tx (i32.wrap_i64 (i64.shr_u (local.get $ret64) (i64.const 32))))
+        (call $task.return1 (local.get $rx))
+        (i32.store (i32.const 16) (i32.const 0x01234567))
+        (local.set $ret (call $stream.write (local.get $tx) (i32.const 16) (i32.const 4)))
+        (if (i32.ne (i32.const 0x41 (; DROPPED=1 | (4<<4) ;)) (local.get $ret))
+          (then unreachable))
+        (call $stream.drop-writable (local.get $tx))
+        (return (i32.const 0 (; EXIT ;))))
+      (func (export \"get_cb\") (param i32 i32 i32) (result i32) unreachable)
+      (func (export \"ping\") (result i32)
+        (return (i32.const 0 (; EXIT ;))))
+      (func (export \"ping_cb\") (param i32 i32 i32) (result i32) unreachable)
+    )
+    (type $ST (stream u8))
+    (canon task.return (memory (core memory $memory \"mem\")) (core func $task.return0))
+    (canon task.return (result $ST) (memory (core memory $memory \"mem\")) (core func $task.return1))
+    (canon stream.new $ST (core func $stream.new))
+    (canon stream.write $ST (memory (core memory $memory \"mem\")) (core func $stream.write))
+    (canon stream.drop-writable $ST (core func $stream.drop-writable))
+    (core instance $cm (instantiate $CM (with \"\" (instance
+      (export \"mem\" (memory $memory \"mem\"))
+      (export \"task.return0\" (func $task.return0))
+      (export \"task.return1\" (func $task.return1))
+      (export \"stream.new\" (func $stream.new))
+      (export \"stream.write\" (func $stream.write))
+      (export \"stream.drop-writable\" (func $stream.drop-writable))
+    ))))
+    (func (export \"get\") async (result (stream u8)) (canon lift
+      (core func $cm \"get\")
+      async (memory (core memory $memory \"mem\")) (callback (core func $cm \"get_cb\"))
+    ))
+    (func (export \"ping\") async (canon lift
+      (core func $cm \"ping\")
+      async (memory (core memory $memory \"mem\")) (callback (core func $cm \"ping_cb\"))
+    ))
+  )
+  (component $D
+    (import \"get\" (func $get async (result (stream u8))))
+    (import \"ping\" (func $ping async))
+    (import \"spin\" (func $spin async))
+
+    (core module $Memory (memory (export \"mem\") 1))
+    (core instance $memory (instantiate $Memory))
+    (core module $DM
+      (import \"\" \"mem\" (memory 1))
+      (import \"\" \"stream.read\" (func $stream.read (param i32 i32 i32) (result i32)))
+      (import \"\" \"stream.drop-readable\" (func $stream.drop-readable (param i32)))
+      (import \"\" \"get\" (func $get (result i32)))
+      (import \"\" \"ping\" (func $ping (result i32)))
+      (import \"\" \"spin\" (func $spin (result i32)))
+      (func (export \"run\") (result i32)
+        (local $ret i32) (local $rx i32) (local $cnt i32)
+        ;; a ready sibling in the STORE (spawned FIRST, so it is
+        ;; already yield-parked): its yield park makes the driver
+        ;; keep spending ticks while the caller runs.
+        (drop (call $spin))
+        ;; $rx = $C.get() -- the sync lower of an ASYNC-typed callee
+        (local.set $rx (call $get))
+        ;; the callee's post-task.return write has staged: this is the
+        ;; rendezvous and it must complete without blocking
+        (local.set $ret (call $stream.read (local.get $rx) (i32.const 20) (i32.const 4)))
+        (if (i32.ne (i32.const 0x40 (; COMPLETED=0 | (4<<4) ;)) (local.get $ret))
+          (then unreachable))
+        (if (i32.ne (i32.const 0x01234567) (i32.load (i32.const 20)))
+          (then unreachable))
+        (call $stream.drop-readable (local.get $rx))
+        ;; a long caller-side window: if the caller did NOT keep the
+        ;; right, $C.get's parked continuation runs here, returns from
+        ;; its sync write and EXITs, releasing $C's exclusive lock.
+        (local.set $cnt (i32.const 200000))
+        (loop $L
+          (local.set $cnt (i32.sub (local.get $cnt) (i32.const 1)))
+          (br_if $L (local.get $cnt)))
+        ;; the async lower of $C.ping must still see $C's exclusive
+        ;; lock held: STARTING(0). STARTED(1) means $C.get already ran
+        ;; the continuation past the caller's turn.
+        (local.set $ret (call $ping))
+        (if (i32.ne (i32.const 0 (; STARTING ;)) (i32.and (local.get $ret) (i32.const 0xf)))
+          (then unreachable))
+        (i32.const 42)
+      )
+    )
+    (type $ST (stream u8))
+    (canon stream.read $ST (memory (core memory $memory \"mem\")) (core func $stream.read))
+    (canon stream.drop-readable $ST (core func $stream.drop-readable))
+    (canon lower (func $get) (core func $get'))
+    (canon lower (func $ping) async (memory (core memory $memory \"mem\")) (core func $ping'))
+    (canon lower (func $spin) async (core func $spin'))
+    (core instance $dm (instantiate $DM (with \"\" (instance
+      (export \"mem\" (memory $memory \"mem\"))
+      (export \"stream.read\" (func $stream.read))
+      (export \"stream.drop-readable\" (func $stream.drop-readable))
+      (export \"get\" (func $get'))
+      (export \"ping\" (func $ping'))
+      (export \"spin\" (func $spin'))
+    ))))
+    (func (export \"run\") async (result u32) (canon lift (core func $dm \"run\")))
+  )
+
+  (component $Y
+    (core module $YM
+      (func (export \"spin\") (result i32) (i32.const 1 (; YIELD ;)))
+      (func (export \"spin_cb\") (param i32 i32 i32) (result i32)
+        (i32.const 1 (; YIELD ;))))
+    (core instance $ym (instantiate $YM))
+    (func (export \"spin\") async (canon lift
+      (core func $ym \"spin\")
+      async (callback (core func $ym \"spin_cb\"))
+    ))
+  )
+  (instance $c (instantiate $C))
+  (instance $y (instantiate $Y))
+  (instance $d (instantiate $D
+    (with \"get\" (func $c \"get\"))
+    (with \"ping\" (func $c \"ping\"))
+    (with \"spin\" (func $y \"spin\"))
+  ))
+  (func (export \"run\") (alias export $d \"run\"))
+)
+(assert_return (invoke \"run\") (u32.const 42))
+")
+
+(test component/nested-sync-lower-keeps-guest-right-pin
+  ;; (1) THE RULE at the real entry point: after %canon-lift-async
+  ;; (the sync lower of an ASYNC-typed callee) returns, a GUEST
+  ;; caller still holds the store right and the ticket names it; a
+  ;; DRIVER caller still releases (it is leaving the store). The
+  ;; pre-fix shape fails the first pair (the negative control).
+  (%pin-with-store
+    (let* ((ci (%exec-comp
+                "(component
+                   (core module $M (func (export \"f\")))
+                   (core instance $m (instantiate $M))
+                   (func (export \"f\") async (canon lift (core func $m \"f\"))))"))
+           (f (wasmdown.component.runtime:runtime-export-value ci "f")))
+      ;; THE GUEST CALLER
+      (let* ((task (wasmdown.component.runtime::make-async-task
+                    :inst ci :seq '(1)))
+             (th (wasmdown.component.runtime::make-async-thread
+                  :task task :index 1)))
+        (setf (wasmdown.component.runtime::async-task-implicit-thread task) th)
+        (let ((wasmdown.component.runtime::*current-thread* th)
+              (wasmdown.component.runtime::*current-task* task)
+              (wasmdown.component.runtime::*right-self* th))
+          (wasmdown.component.runtime::%right-acquire th)
+          (unwind-protect
+               (progn
+                 (wasmdown.component.runtime:lifted-func-call f)
+                 (is (sb-thread:holding-mutex-p
+                      wasmdown.component.runtime::*store-right*))
+                 (is (eq wasmdown.component.runtime::*right-ticket* th)))
+            (when (sb-thread:holding-mutex-p
+                   wasmdown.component.runtime::*store-right*)
+              (sb-thread:release-mutex
+               wasmdown.component.runtime::*store-right*)
+              (setf wasmdown.component.runtime::*right-ticket* nil)))))
+      ;; THE DRIVER CALLER
+      (let ((wasmdown.component.runtime::*current-thread* nil)
+            (wasmdown.component.runtime::*current-task* nil)
+            (wasmdown.component.runtime::*right-self* nil))
+        (let ((drv (wasmdown.component.runtime::%driver-self)))
+          (wasmdown.component.runtime::%right-acquire drv)
+          (unwind-protect
+               (progn
+                 (wasmdown.component.runtime:lifted-func-call f)
+                 (is (not (sb-thread:holding-mutex-p
+                           wasmdown.component.runtime::*store-right*))))
+            (when (sb-thread:holding-mutex-p
+                   wasmdown.component.runtime::*store-right*)
+              (sb-thread:release-mutex
+               wasmdown.component.runtime::*store-right*)))))))
+  ;; (2) THE OBSERVED SHAPE through guest code: a granted sibling
+  ;; runs inside the caller's turn only if the caller dropped the
+  ;; right; the fixture then sees the callee started before its
+  ;; next async lower (STARTED) and traps. With the rule: STARTING,
+  ;; run returns 42. (Negative control: keep-right NIL -> 10/10
+  ;; trap; keep-right on -> 10/10 pass.)
+  (dotimes (i 5)
+    (is (%pin-rows-pass-p *ss1-nested-sync-lower-fixture*
+                          "nested-sync-lower-pin.wast")))
+  ;; (3) THE FIXTURE ROWS VERBATIM (the component + its one
+  ;; assert_return from the vendored sync-streams.wast).
+  (dotimes (i 5)
+    (is (%pin-rows-pass-p
+         (%pin-slice "tests/component/async/sync-streams.wast" 1 208)
+         "sync-streams-pin.wast"))))
+
 (defun run-component-pins ()
   "Run the component pins (registered via TEST; returns T)."
   (let ((wasmdown.test::*tests*
@@ -5890,6 +6129,7 @@ THE LOCK ORDER rule (b): those are RIGHT acquisitions, and a held
                       component/type-view-owner-pins
                       component/borrowed-handle-not-joinable-pin
                       component/switched-target-exit-releases-pin
+                      component/nested-sync-lower-keeps-guest-right-pin
                       component/lock-order-no-scheduler-held-across-store-right-pin
                       component/store-teardown-runs-with-right-held-pin)))          wasmdown.test::*tests*)))
     (multiple-value-bind (passed failed)
