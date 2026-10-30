@@ -4033,3 +4033,432 @@ it creates the store). Returns (values INSTANCE STORE)."
             (is (= 3 calls))
             (is (null (funcall (rsym "async-end-host-copy") reader)))
             (is (null (funcall (rsym "async-end-buffer") writer)))))))))
+
+;;; ---------------------------------------------------------------
+;;; STEP 6: the bounded HOST EXECUTOR (DNS + blocking stdio).
+;;; Deterministic: worker completion is observed through condition
+;;; variables / bounded YIELDs — no test sleeps.
+
+(defun wait-until (predicate &key (limit 200000))
+  "Bounded, sleep-free wait for PREDICATE (a worker's observable
+effect): yield the CPU between checks, never sleep."
+  (loop repeat limit
+        when (funcall predicate) return t
+        do (sb-thread:thread-yield)))
+
+(test wasi/host-executor-budget-and-close
+  (let* ((exec (wasmdown.wasi:make-host-executor :name "test-exec"
+                                                 :workers 2))
+         (mutex (sb-thread:make-mutex :name "test-exec-done"))
+         (cv (sb-thread:make-waitqueue :name "test-exec-done"))
+         (done 0))
+    ;; the budget is FIXED at construction
+    (is (= 2 (wasmdown.wasi::host-executor-worker-count exec)))
+    (is (= 2 (length (wasmdown.wasi::host-executor-threads exec))))
+    (dotimes (i 2)
+      (is (wasmdown.wasi::%executor-submit
+           exec
+           (lambda ()
+             (sb-thread:with-recursive-lock (mutex)
+               (incf done)
+               (sb-thread:condition-broadcast cv))))))
+    (sb-thread:with-recursive-lock (mutex)
+      (loop while (< done 2)
+            do (sb-thread:condition-wait cv mutex)))
+    (is (= 2 done))
+    (is (wasmdown.wasi::%executor-close exec))
+    ;; a closed service refuses work: the caller DETACHES
+    (is (null (wasmdown.wasi::%executor-submit exec (lambda () nil))))))
+
+(test wasi/host-executor-close-never-joins
+  ;; CLOSE must not wait for an un-cancellable job: it returns while
+  ;; the job is still running, and the job finishes into a discarded
+  ;; result.
+  (let* ((exec (wasmdown.wasi:make-host-executor :name "test-block"
+                                                 :workers 1))
+         (started (sb-thread:make-semaphore :name "started"))
+         (release (sb-thread:make-semaphore :name "release"))
+         (finished (sb-thread:make-semaphore :name "finished"))
+         (ran nil))
+    (is (wasmdown.wasi::%executor-submit
+         exec (lambda ()
+                (sb-thread:signal-semaphore started)
+                (sb-thread:wait-on-semaphore release)
+                (setf ran t)
+                (sb-thread:signal-semaphore finished))))
+    (sb-thread:wait-on-semaphore started)
+    (is (wasmdown.wasi::%executor-close exec))
+    (is (null ran))                    ; close returned first
+    (is (null (wasmdown.wasi::%executor-submit exec (lambda () nil))))
+    (sb-thread:signal-semaphore release)
+    (sb-thread:wait-on-semaphore finished)
+    (is ran)))
+
+(test wasi/host-executor-separate-budgets
+  ;; DNS and blocking stdio never share a pool: one slow resolver can
+  ;; not starve a stdio span.
+  (let ((ctx (wasmdown.wasi:make-wasi-context)))
+    (unwind-protect
+         (let ((dns (wasmdown.wasi:wasi-context-dns-executor ctx))
+               (stdio (wasmdown.wasi:wasi-context-stdio-executor ctx)))
+           (is (not (eq dns stdio)))
+           (is (= wasmdown.wasi::*dns-worker-count*
+                  (wasmdown.wasi::host-executor-worker-count dns)))
+           (is (= wasmdown.wasi::*stdio-worker-count*
+                  (wasmdown.wasi::host-executor-worker-count stdio)))
+           ;; the context caches them: same service on the next call
+           (is (eq dns (wasmdown.wasi:wasi-context-dns-executor ctx)))
+           (is (eq stdio (wasmdown.wasi:wasi-context-stdio-executor ctx))))
+      (is (wasmdown.wasi:close-wasi-context-executors ctx))
+      ;; idempotent, and a fresh service can be built afterwards
+      (is (wasmdown.wasi:close-wasi-context-executors ctx)))))
+
+(test wasi/stdio-blocking-sink-copies-the-span
+  ;; A borrowed BLOCKING fd must never run write(2) on the guest's
+  ;; thread. The span is COPIED into the worker's vector: overwriting
+  ;; the caller's vector immediately after the call cannot change what
+  ;; reaches the pipe.
+  (multiple-value-bind (read-fd write-fd) (sb-unix:unix-pipe)
+    (multiple-value-bind (pair-reader end)
+        (wasmdown.component.runtime:make-host-stream-pair :u8)
+      (declare (ignore pair-reader))
+      (let* ((out (sb-sys:make-fd-stream write-fd :output t
+                                                 :element-type '(unsigned-byte 8)
+                                                 :buffering :none))
+             (ctx (wasmdown.wasi:make-wasi-context))
+             (sink nil)
+             (octets (make-array 4 :element-type '(unsigned-byte 8)
+                                   :initial-contents '(97 98 99 100))))
+      (unwind-protect
+           (progn
+             ;; the fd is BLOCKING (borrowed): the worker path applies
+             (is (not (wasmdown.wasi::%fd-nonblocking-p write-fd)))
+             (setf sink (wasmdown.wasi:cl-stream-sink
+                         out :context ctx :end end))
+             (multiple-value-bind (consumed error) (funcall sink octets 0 4)
+               ;; WOULD-BLOCK: nothing was CLAIMED before the write ran
+               (is (eql 0 consumed))
+               (is (null error)))
+             ;; the worker owns a COPY: clobber the caller's vector now
+             (fill octets 120)
+             (let ((count nil))
+               (is (wait-until (lambda ()
+                                 (multiple-value-bind (n error)
+                                     (funcall sink octets 0 4)
+                                   (declare (ignore error))
+                                   (when (and (integerp n) (plusp n))
+                                     (setf count n)
+                                     t)))))
+               (is (= 4 count)))
+             (let ((buf (make-array 4 :element-type '(unsigned-byte 8))))
+               (is (= 4 (sb-unix:unix-read read-fd (sb-sys:vector-sap buf) 4)))
+               (is (equal '(97 98 99 100) (coerce buf 'list)))))
+        (ignore-errors (close out))
+        (wasmdown.wasi:close-wasi-context-executors ctx)
+        (ignore-errors (sb-unix:unix-close read-fd)))))))
+
+(test wasi/stdio-blocking-source-reads-on-the-worker
+  ;; Even when bytes are ALREADY available, a blocking fd's read is the
+  ;; worker's: the first attempt is WOULD-BLOCK, the retry delivers.
+  (multiple-value-bind (read-fd write-fd) (sb-unix:unix-pipe)
+    (multiple-value-bind (pair-reader end)
+        (wasmdown.component.runtime:make-host-stream-pair :u8)
+      (declare (ignore pair-reader))
+      (let* ((in (sb-sys:make-fd-stream read-fd :input t
+                                               :element-type '(unsigned-byte 8)
+                                               :buffering :none))
+             (ctx (wasmdown.wasi:make-wasi-context))
+             (source nil))
+      (unwind-protect
+           (progn
+             (let ((bytes (make-array 3 :element-type '(unsigned-byte 8)
+                                        :initial-contents '(104 105 33))))
+               (sb-unix:unix-write write-fd bytes 0 3))
+             (setf source (wasmdown.wasi:cl-stream-source
+                           in :context ctx :end end))
+             (multiple-value-bind (octets eof) (funcall source 3)
+               (is (null octets))
+               (is (null eof)))
+             (let ((got nil))
+               (is (wait-until (lambda ()
+                                 (multiple-value-bind (octets eof)
+                                     (funcall source 3)
+                                   (declare (ignore eof))
+                                   (when octets
+                                     (setf got (coerce octets 'list))
+                                     t)))))
+               (is (equal '(104 105 33) got))))
+        (ignore-errors (close in))
+        (wasmdown.wasi:close-wasi-context-executors ctx)
+        (ignore-errors (sb-unix:unix-close write-fd)))))))
+
+;;; ---------------------------------------------------------------
+;;; STEP 6: resolve-addresses on the bounded DNS executor.
+
+(test wasi/dns-async-pending-and-detach
+  (let* ((ctx (wasmdown.wasi:make-wasi-context))
+         (net (sock-network :dns '("localhost")))
+         (exec (wasmdown.wasi:wasi-context-dns-executor ctx)))
+    (unwind-protect
+         (progn
+           (is (= wasmdown.wasi::*dns-worker-count*
+                  (wasmdown.wasi::host-executor-worker-count exec)))
+           ;; the provider's answer is a HOST-PENDING (async WIT), and
+           ;; the join drives it to the resolved value
+           (let ((pending (wasmdown.wasi:ip-name-lookup-resolve-async
+                           ctx net "localhost")))
+             (is (wasmdown.component.runtime:host-pending-p pending))
+             (let ((value (pending-drive pending)))
+               (is (eq :ok (car value)))
+               (is (plusp (length (cdr value))))))
+           ;; an IP literal never reaches the resolver (no worker)
+           (let ((literal (wasmdown.wasi:ip-name-lookup-resolve-async
+                           ctx net "127.0.0.1")))
+             (is (equal '(:ok ("ipv4" 127 0 0 1)) literal)))
+           ;; a DNS-policy refusal stays a synchronous error value
+           (let ((denied (wasmdown.wasi:ip-name-lookup-resolve-async
+                          ctx (sock-network :dns :none) "example.invalid")))
+             (is (eq :err (car denied)))
+             (is (equal "access-denied"
+                        (wasmdown.wasi:sockets-error-code (cdr denied)))))
+           ;; the provider closure itself answers with a HOST-PENDING
+           ;; (the async functype); a direct CL caller has no guest
+           ;; thread to park, so the test drives the pending itself
+           (let* ((inst (wasmdown.wasi:ip-name-lookup-instance ctx :network net))
+                  (fn (provider-fn inst "resolve-addresses"))
+                  (pending (funcall (wasmdown.component.runtime:lifted-func-host fn)
+                                    (list "localhost"))))
+             (is (wasmdown.component.runtime:host-pending-p pending))
+             (is (eq :ok (car (pending-drive pending)))))
+           ;; CANCEL DETACHES: the pending is terminal (:cancelled) after
+           ;; the pump ran its cancel-fn, and a LATE worker result cannot
+           ;; deliver into it (the job's target is gone, the chain is
+           ;; still freeaddrinfo'd by %GETADDRINFO-CHAIN).
+           (let ((pending (wasmdown.wasi:ip-name-lookup-resolve-async
+                           ctx net "localhost")))
+             (is (funcall (rsym "%host-pending-request-cancel") pending))
+             (funcall (rsym "%host-pump")
+                      (funcall (rsym "host-pending-store") pending))
+             (is (eq :cancelled
+                     (funcall (rsym "host-pending-state") pending)))
+             (is (eq :cancel
+                     (car (funcall (rsym "host-pending-outcome") pending))))
+             ;; a second resolve request is refused (already terminal)
+             (is (null (funcall (rsym "%host-pending-request-cancel")
+                                pending)))))
+      (is (wasmdown.wasi:close-wasi-context-executors ctx)))))
+
+;;; ---------------------------------------------------------------
+;;; STEP 6: accept/recv/send register a reactor watch keyed by the
+;;; CONNECTION/STREAM identity, and readiness resumes the parked copy
+;;; through the store queue. The reactor is REAL (libc poll); the fd is
+;;; made ready BEFORE the tick, so no step waits and nothing sleeps.
+
+(test wasi/sockets-accept-reactor-readiness
+  (let* ((reactor (wasmdown.wasi:make-wasi-reactor :wake-p nil))
+         (ctx (wasmdown.wasi:make-wasi-context :reactor reactor))
+         (net (sock-network))
+         (server (sock-rep (wasmdown.wasi:tcp-create
+                            nil net (cons :enum "ipv4"))))
+         (client (sock-rep (wasmdown.wasi:tcp-create
+                            nil net (cons :enum "ipv4"))))
+         (accepted nil)
+         (listening nil))
+    (multiple-value-bind (inst store) (store-instance :reactor reactor)
+      (declare (ignore inst))
+      (let ((wasmdown.component.runtime::*current-component-store* store))
+        (unwind-protect
+             (progn
+               (is (equal '(:ok) (wasmdown.wasi:tcp-bind
+                                  ctx net server (sock-addr 0))))
+               (let* ((port (sock-value-port
+                             (sock-ok (wasmdown.wasi:tcp-get-local-address
+                                       ctx net server))))
+                      (buf (wasmdown.component.runtime:make-host-buffer 1)))
+                 (setf listening (wasmdown.wasi:tcp-listen ctx net server))
+                 (is (eq :ok (car listening)))
+                 (let ((stream (cdr listening)))
+                   ;; nothing queued: WOULD-BLOCK, and a READ watch is
+                   ;; armed under the STREAM's identity (never the fd)
+                   (rtcall "%END-COPY" stream buf t)
+                   (is (null (funcall (rsym "async-waitable-pending-event") stream)))
+                   (is (= 1 (hash-table-count
+                             (wasmdown.wasi::wasi-reactor-fd-table reactor))))
+                   (let ((key (first (loop for k being the hash-keys
+                                           of (wasmdown.wasi::wasi-reactor-fd-table
+                                               reactor)
+                                           collect k))))
+                     (is (eq (rtcall "ASYNC-END-OTHER" stream) (second key)))
+                     (is (eq :read (third key))))
+                   ;; the connection arrives; ONE tick: reactor fires ->
+                   ;; host-end-ready is QUEUED -> the parked copy resumes
+                   (is (equal '(:ok) (wasmdown.wasi:tcp-connect
+                                      ctx net client (sock-addr port))))
+                   (rtcall "%STORE-TICK" store)
+                   (is (eql (%completed 1)
+                            (third (rtcall "%WAITABLE-GET-PENDING-EVENT"
+                                           stream))))
+                   (let ((vals (wasmdown.component.runtime:host-buffer-values
+                                buf)))
+                     (is (= 1 (length vals)))
+                     (setf accepted (third (first vals))))
+                   ;; one-shot: the watch is gone and the gate released
+                   (is (zerop (hash-table-count
+                               (wasmdown.wasi::wasi-reactor-fd-table reactor))))
+                   (is (zerop (funcall (rsym "host-store-work") store))))))
+          (when accepted (wasmdown.wasi:close-wasi-tcp-socket accepted))
+          (wasmdown.wasi:close-wasi-tcp-socket client)
+          (wasmdown.wasi:close-wasi-tcp-socket server)
+          (wasmdown.wasi:reactor-close reactor))))))
+
+(test wasi/sockets-recv-reactor-readiness
+  (let* ((reactor (wasmdown.wasi:make-wasi-reactor :wake-p nil))
+         (ctx (wasmdown.wasi:make-wasi-context :reactor reactor))
+         (net (sock-network))
+         (server (sock-rep (wasmdown.wasi:tcp-create
+                            nil net (cons :enum "ipv4"))))
+         (client (sock-rep (wasmdown.wasi:tcp-create
+                            nil net (cons :enum "ipv4"))))
+         (accepted nil))
+    (multiple-value-bind (inst store) (store-instance :reactor reactor)
+      (declare (ignore inst))
+      (let ((wasmdown.component.runtime::*current-component-store* store))
+        (unwind-protect
+             (progn
+               (is (equal '(:ok) (wasmdown.wasi:tcp-bind
+                                  ctx net server (sock-addr 0))))
+               (let* ((port (sock-value-port
+                             (sock-ok (wasmdown.wasi:tcp-get-local-address
+                                       ctx net server))))
+                      (listening (wasmdown.wasi:tcp-listen ctx net server)))
+                 (is (equal '(:ok) (wasmdown.wasi:tcp-connect
+                                    ctx net client (sock-addr port))))
+                 (setf accepted (sock-accept (cdr listening)))
+                 (is (not (null accepted)))
+                 (let* ((pair (wasmdown.wasi:tcp-receive ctx net accepted))
+                        (stream (first pair))
+                        (buf (wasmdown.component.runtime:make-host-buffer 8)))
+                   ;; nothing to read: WOULD-BLOCK + a READ watch
+                   (rtcall "%END-COPY" stream buf t)
+                   (is (null (funcall (rsym "async-waitable-pending-event") stream)))
+                   (is (= 1 (hash-table-count
+                             (wasmdown.wasi::wasi-reactor-fd-table reactor))))
+                   ;; the peer writes only AFTER the park
+                   (multiple-value-bind (wreader wwriter) (sock-stream)
+                     (let ((future (wasmdown.wasi:tcp-send ctx net client
+                                                           wreader)))
+                       (is (eql (%completed 4)
+                                (sock-stage wwriter '(112 105 110 103))))
+                       (sock-drop wwriter)
+                       (is (equal '(:ok) (sock-future future)))))
+                   (rtcall "%STORE-TICK" store)
+                   (is (eql (%completed 4)
+                            (third (rtcall "%WAITABLE-GET-PENDING-EVENT"
+                                           stream))))
+                   (is (equal '(112 105 110 103)
+                              (wasmdown.component.runtime:host-buffer-values
+                               buf)))
+                   (is (zerop (hash-table-count
+                               (wasmdown.wasi::wasi-reactor-fd-table reactor))))
+                   (is (zerop (funcall (rsym "host-store-work") store)))
+                   (sock-drop stream))))
+          (when accepted (wasmdown.wasi:close-wasi-tcp-socket accepted))
+          (wasmdown.wasi:close-wasi-tcp-socket client)
+          (wasmdown.wasi:close-wasi-tcp-socket server)
+          (wasmdown.wasi:reactor-close reactor))))))
+
+(defun drain-available (reader limit)
+  "One non-blocking read of whatever READER has RIGHT NOW (a parked
+copy stays parked and its absent event is simply cleared)."
+  (let ((buf (wasmdown.component.runtime:make-host-buffer limit)))
+    (rtcall "%END-COPY" reader buf t)
+    (let ((values (wasmdown.component.runtime:host-buffer-values buf))
+          (event (funcall (rsym "async-waitable-pending-event") reader)))
+      (when event (funcall event))
+      values)))
+
+(test wasi/sockets-send-reactor-readiness
+  ;; A full kernel buffer makes send(2) would-block; the sink arms a
+  ;; WRITE watch; draining the peer and ticking the store resumes the
+  ;; parked write until it is fully accepted.
+  (let* ((reactor (wasmdown.wasi:make-wasi-reactor :wake-p nil))
+         (ctx (wasmdown.wasi:make-wasi-context :reactor reactor))
+         (net (sock-network))
+         (server (sock-rep (wasmdown.wasi:tcp-create
+                            nil net (cons :enum "ipv4"))))
+         (client (sock-rep (wasmdown.wasi:tcp-create
+                            nil net (cons :enum "ipv4"))))
+         (accepted nil))
+    (multiple-value-bind (inst store) (store-instance :reactor reactor)
+      (declare (ignore inst))
+      (let ((wasmdown.component.runtime::*current-component-store* store))
+        (unwind-protect
+             (progn
+               (is (equal '(:ok) (wasmdown.wasi:tcp-bind
+                                  ctx net server (sock-addr 0))))
+               (let* ((port (sock-value-port
+                             (sock-ok (wasmdown.wasi:tcp-get-local-address
+                                       ctx net server))))
+                      (listening (wasmdown.wasi:tcp-listen ctx net server)))
+                 (is (equal '(:ok) (wasmdown.wasi:tcp-connect
+                                    ctx net client (sock-addr port))))
+                 (setf accepted (sock-accept (cdr listening)))
+                 (is (not (null accepted)))
+                 (is (equal '(:ok) (wasmdown.wasi::tcp-set-send-buffer-size
+                                    ctx net client 4096)))
+                 (is (equal '(:ok)
+                            (wasmdown.wasi::tcp-set-receive-buffer-size
+                             ctx net accepted 4096)))
+                 (multiple-value-bind (reader writer) (sock-stream)
+                   (let ((future (wasmdown.wasi:tcp-send ctx net client
+                                                         reader))
+                         (payload (make-list 65536 :initial-element 122)))
+                     ;; stage the whole payload: it cannot all fit
+                     (rtcall "%END-COPY" writer
+                             (wasmdown.component.runtime:make-host-buffer
+                              65536 :values payload)
+                             nil)
+                     ;; the copy is PARKED with a WRITE watch
+                     (is (not (null (funcall (rsym "async-end-host-copy")
+                                             reader))))
+                     (is (= 1 (hash-table-count
+                               (wasmdown.wasi::wasi-reactor-fd-table reactor))))
+                     (let ((key (first (loop for k being the hash-keys
+                                             of (wasmdown.wasi::wasi-reactor-fd-table
+                                                 reactor)
+                                             collect k))))
+                       (is (eq reader (second key)))
+                       (is (eq :write (third key))))
+                     ;; the peer ITSELF can read what was accepted (the
+                     ;; bytes the sink took are on the wire)
+                     (let* ((pair (wasmdown.wasi:tcp-receive ctx net accepted))
+                            (stream (first pair))
+                            (got 0))
+                       (loop repeat 500
+                             for before = got
+                             do (incf got (length (drain-available stream 65536)))
+                             while (and (> got before) (< got 32768)))
+                       (is (plusp got)))
+                     ;; dropping the writer ends the copy and settles the
+                     ;; send future (the remaining bytes are abandoned)
+                     (sock-drop writer)
+                     (is (equal '(:ok) (sock-future future)))))))
+          (when accepted (wasmdown.wasi:close-wasi-tcp-socket accepted))
+          (wasmdown.wasi:close-wasi-tcp-socket client)
+          (wasmdown.wasi:close-wasi-tcp-socket server)
+          (wasmdown.wasi:reactor-close reactor))))))
+
+(defun pending-drive (pending)
+  "Drive PENDING to a terminal outcome on its own store (the test's
+store driver: bounded %STORE-TICK yields — no sleep) and return its
+resolved/rejected value (:cancelled for a cancel)."
+  (let ((store (funcall (rsym "host-pending-store") pending)))
+    (is (wait-until (lambda ()
+                      (funcall (rsym "%store-tick") store)
+                      (funcall (rsym "host-pending-terminal-p") pending))))
+    (funcall (rsym "%host-pump") store)
+    (let ((outcome (funcall (rsym "host-pending-outcome") pending)))
+      (ecase (car outcome)
+        (:resolve (cdr outcome))
+        (:reject (cdr outcome))
+        (:cancel :cancelled)))))

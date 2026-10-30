@@ -30,7 +30,12 @@
                     "WASI-CONTEXT-STDERR" "CL-STREAM-SOURCE" "CL-STREAM-SINK"
                     "CLI-STDIN-INSTANCE" "CLI-STDOUT-INSTANCE"
                     "CLI-STDERR-INSTANCE" "CLI-OUTPUT-INSTANCE"
-                    "CLI-STDIO-PROVIDER"))
+                    "CLI-STDIO-PROVIDER"
+                    ;; the bounded host-executor service (step 6)
+                    "MAKE-HOST-EXECUTOR" "HOST-EXECUTOR"
+                    "WASI-CONTEXT-DNS-EXECUTOR" "WASI-CONTEXT-STDIO-EXECUTOR"
+                    "CLOSE-WASI-CONTEXT-EXECUTORS"
+                    "IP-NAME-LOOKUP-RESOLVE-ASYNC"))
       (export (intern name package) package))))
 
 ;;; ---------------------------------------------------------------
@@ -59,7 +64,161 @@ slice 3) — never a path-prefix string."
   ;; clock/time capability). monotonic-clock's wait-until/wait-for arm
   ;; their one-shot deadline here; the store driver owns when STEP
   ;; runs, exactly as it owns every other readiness pump.
-  (reactor nil))
+  (reactor nil)
+  ;; M17 step 6: the TWO bounded host-executor services (created on
+  ;; first use, FIXED worker budgets, SEPARATE so a slow resolver
+  ;; cannot starve blocking stdio). They are host services, not a
+  ;; result FIFO: a worker's only way back is the store queue.
+  (dns-exec nil)
+  (stdio-exec nil))
+
+;;; ---------------------------------------------------------------
+;;; THE BOUNDED HOST EXECUTOR (plan step 6).
+;;;
+;;; getaddrinfo(3) and a borrowed BLOCKING stdio stream cannot be made
+;;; nonblocking without changing an fd the embedder owns. They run on
+;;; a small explicit worker service instead: a FIXED number of native
+;;; worker threads, each taking one host thunk at a time.
+;;;
+;;; THE WORKER DISCIPLINE:
+;;;   * a worker NEVER touches guest memory and NEVER calls guest code;
+;;;     the only way back is the STORE's completion queue (a pending's
+;;;     resolve, or host-end-ready for a parked copy);
+;;;   * a job that is cancelled/closed is DETACHED from its completion
+;;;     target and its late result is discarded (and, for DNS, the
+;;;     getaddrinfo chain is still freed by %GETADDRINFO-CHAIN's own
+;;;     unwind-protect);
+;;;   * CLOSE NEVER JOINS: an un-cancellable job finishes into a
+;;;     dropped result and its worker exits afterwards;
+;;;   * DNS and stdio have SEPARATE services/budgets (never one pool).
+
+(defparameter *dns-worker-count* 2
+  "The DNS executor's FIXED worker budget.")
+(defparameter *stdio-worker-count* 2
+  "The blocked-stdio executor's FIXED worker budget (separate from DNS's).")
+
+(defstruct (host-executor (:constructor %make-host-executor))
+  (name "host-executor")
+  (mutex (sb-thread:make-mutex :name "host-executor"))
+  (condition (sb-thread:make-waitqueue :name "host-executor"))
+  (jobs '())                           ; host thunks (LIFO)
+  (worker-count 0)
+  (active 0)
+  (closed-p nil)
+  (threads '()))
+
+(defun %host-executor-loop (executor)
+  "One worker: take a job, run it (its failure is the job's own
+business), repeat until the executor is closed AND its queue drained."
+  (loop
+    (let ((job (sb-thread:with-recursive-lock ((host-executor-mutex executor))
+                 (loop
+                   (cond
+                     ((and (null (host-executor-jobs executor))
+                           (host-executor-closed-p executor))
+                      (return-from %host-executor-loop nil))
+                     ((host-executor-jobs executor)
+                      (let ((j (pop (host-executor-jobs executor))))
+                        (incf (host-executor-active executor))
+                        (return j)))
+                     (t
+                      (sb-thread:condition-wait
+                       (host-executor-condition executor)
+                       (host-executor-mutex executor))))))))
+      (unwind-protect
+           (handler-case (funcall job) (error () nil))
+        (sb-thread:with-recursive-lock ((host-executor-mutex executor))
+          (decf (host-executor-active executor))
+          (sb-thread:condition-broadcast
+           (host-executor-condition executor)))))))
+
+(defun make-host-executor (&key (name "host-executor") (workers 1))
+  "An explicit worker service with WORKERS FIXED native threads. The
+count is a budget decided at construction and never grows; two
+services never share a queue. Jobs are host thunks."
+  (unless (and (integerp workers) (plusp workers))
+    (error 'wasmdown:host-error
+           :message (format nil "host executor ~a needs a positive fixed worker count, not ~s"
+                            name workers)))
+  (let ((executor (%make-host-executor :name name :worker-count workers)))
+    (setf (host-executor-threads executor)
+          (loop for i below workers
+                collect (sb-thread:make-thread
+                         (lambda () (%host-executor-loop executor))
+                         :name (format nil "~a-~d" name i))))
+    executor))
+
+(defun %executor-submit (executor job)
+  "Queue JOB on EXECUTOR. Never runs it here and never blocks. NIL when
+the executor is closed — the caller must then DETACH (a submit into a
+closed service can never be answered)."
+  (when executor
+    (sb-thread:with-recursive-lock ((host-executor-mutex executor))
+      (unless (host-executor-closed-p executor)
+        (push job (host-executor-jobs executor))
+        (sb-thread:condition-broadcast (host-executor-condition executor))
+        t))))
+
+(defun %executor-close (executor)
+  "Close EXECUTOR: drop every QUEUED job (none started, so none holds
+a resource) and let an in-flight job run to completion into a
+DISCARDED result. Never joins — the store's close may not wait on an
+un-cancellable worker."
+  (when executor
+    (sb-thread:with-recursive-lock ((host-executor-mutex executor))
+      (setf (host-executor-closed-p executor) t
+            (host-executor-jobs executor) nil)
+      (sb-thread:condition-broadcast (host-executor-condition executor)))
+    t))
+
+(defvar *executor-service-lock* (sb-thread:make-mutex :name "wasi-executors"))
+(defvar *default-dns-executor* nil
+  "The DNS service for a provider built with a NIL context (a bare
+host call / a unit test): same fixed budget, created on first use.")
+(defvar *default-stdio-executor* nil
+  "The blocked-stdio service for a NIL context (see *DEFAULT-DNS-EXECUTOR*).")
+
+(defun wasi-context-dns-executor (context)
+  "CONTEXT's DNS worker service (fixed *DNS-WORKER-COUNT* budget),
+created on first use. A NIL context uses the process default."
+  (sb-thread:with-recursive-lock (*executor-service-lock*)
+    (if context
+        (or (wasi-context-dns-exec context)
+            (setf (wasi-context-dns-exec context)
+                  (make-host-executor :name "wasi-dns"
+                                      :workers *dns-worker-count*)))
+        (or *default-dns-executor*
+            (setf *default-dns-executor*
+                  (make-host-executor :name "wasi-dns"
+                                      :workers *dns-worker-count*))))))
+
+(defun wasi-context-stdio-executor (context)
+  "CONTEXT's blocked-stdio worker service (fixed
+*STDIO-WORKER-COUNT* budget), created on first use."
+  (sb-thread:with-recursive-lock (*executor-service-lock*)
+    (if context
+        (or (wasi-context-stdio-exec context)
+            (setf (wasi-context-stdio-exec context)
+                  (make-host-executor :name "wasi-stdio"
+                                      :workers *stdio-worker-count*)))
+        (or *default-stdio-executor*
+            (setf *default-stdio-executor*
+                  (make-host-executor :name "wasi-stdio"
+                                      :workers *stdio-worker-count*))))))
+
+(defun close-wasi-context-executors (context)
+  "Detach CONTEXT's executor services (idempotent). Queued jobs are
+dropped, an in-flight job finishes into a discarded result; nothing
+is joined."
+  (when context
+    (sb-thread:with-recursive-lock (*executor-service-lock*)
+      (let ((dns (wasi-context-dns-exec context))
+            (stdio (wasi-context-stdio-exec context)))
+        (setf (wasi-context-dns-exec context) nil
+              (wasi-context-stdio-exec context) nil)
+        (%executor-close dns)
+        (%executor-close stdio))))
+  t)
 
 ;;; ---------------------------------------------------------------
 ;;; Host exit.
@@ -606,38 +765,180 @@ so the following read reports EOF instead of parking forever."
       (and (%poll-fd fd (logior +pollin+ +pollhup+ +pollerr+ +pollnval+) 0)
            t)))
 
-(defun cl-stream-source (stream)
+;;; ---- BORROWED BLOCKING STDIO: the bounded worker path ----
+;;; A stream whose fd is NOT O_NONBLOCK can block inside read(2)/
+;;; write(2) (a full pipe, a terminal). The guest's thread must never
+;;; be the one that blocks: the SPAN IS COPIED into a worker-owned
+;;; vector and the context's bounded STDIO EXECUTOR performs the
+;;; call. No guest pointer ever reaches the worker, and the worker's
+;;; only way back is the store queue (HOST-END-READY for the parked
+;;; copy's generation). A string stream or an already-nonblocking fd
+;;; keeps today's direct path verbatim.
+
+(defstruct (stdio-wait (:constructor %make-stdio-wait))
+  "One blocking stream's in-flight worker job and its lifecycle."
+  (mutex (sb-thread:make-mutex :name "stdio-wait"))
+  (job nil)
+  (closed-p nil))
+
+(defstruct (stdio-sink-job (:constructor %make-stdio-sink-job))
+  (generation 0)
+  (vector nil)                        ; the COPIED span (host-owned)
+  (count 0)
+  (error nil)
+  (done-p nil))
+
+(defstruct (stdio-source-job (:constructor %make-stdio-source-job))
+  (generation 0)
+  (want 0)
+  (vector nil)
+  (eof nil)
+  (done-p nil))
+
+(defun %stdio-generation (end)
+  "END's current copy generation (the attempt a worker completion must
+name, so a late completion cannot resume a LATER copy)."
+  (and end (wasmdown.component.runtime:host-end-generation end)))
+
+(defun %stdio-wait-close (wait)
+  "Close WAIT (the stream dropped / the provider gave it up), DROPPING
+the in-flight job's binding: its late completion still posts a
+readiness notification, which finds no parked copy."
+  (when wait
+    (sb-thread:with-recursive-lock ((stdio-wait-mutex wait))
+      (setf (stdio-wait-closed-p wait) t
+            (stdio-wait-job wait) nil))
+    t))
+
+(defun %stdio-sink-run (stream byte-p job end generation)
+  "The WORKER body for one copied span: write it (the job's OWN vector
+only) and let the STORE queue wake the parked copy."
+  (handler-case
+      (let ((vector (stdio-sink-job-vector job)))
+        (if byte-p
+            (write-sequence vector stream)
+            (let ((chars (make-array (length vector)
+                                     :element-type 'character)))
+              (dotimes (i (length vector))
+                (setf (aref chars i) (code-char (aref vector i))))
+              (write-sequence chars stream)))
+        (finish-output stream)
+        (setf (stdio-sink-job-count job) (length vector)))
+    (error ()
+      (setf (stdio-sink-job-count job) 0
+            (stdio-sink-job-error job) "io")))
+  (setf (stdio-sink-job-done-p job) t)
+  (wasmdown.component.runtime:host-end-ready end generation))
+
+(defun %stdio-source-run (stream byte-p job end generation)
+  "The WORKER body for one bounded read into the job's OWN vector."
+  (handler-case
+      (let ((want (stdio-source-job-want job))
+            (vector (make-array *cli-stream-chunk*
+                                :element-type '(unsigned-byte 8)
+                                :fill-pointer 0))
+            (chars (unless byte-p
+                     (make-array *cli-stream-chunk*
+                                 :element-type 'character))))
+        (setf (fill-pointer vector) want)
+        (let ((got (if byte-p
+                       (read-sequence vector stream :end want)
+                       (read-sequence chars stream :end want))))
+          (unless byte-p
+            (dotimes (i got)
+              (setf (aref vector i)
+                    (logand #xff (char-code (aref chars i))))))
+          (setf (fill-pointer vector) got
+                (stdio-source-job-vector job) vector
+                (stdio-source-job-eof job) (< got want))))
+    (error ()
+      (setf (stdio-source-job-vector job) nil
+            (stdio-source-job-eof job) t)))
+  (setf (stdio-source-job-done-p job) t)
+  (wasmdown.component.runtime:host-end-ready end generation))
+
+(defun cl-stream-source (stream &key context end)
   "A host SOURCE over CL input STREAM: (max) -> (values octets eof-p),
 OCTETS a REUSABLE u8 vector whose length is the count. Character
 streams are encoded byte-per-character (the WASI byte stream is
 opaque; chars are taken modulo the code). (NIL NIL) is WOULD-BLOCK: a
 host-backed stream with nothing to read right now parks the copy
-instead of blocking the host thread."
+instead of blocking the host thread.
+
+M17 step 6: a BORROWED BLOCKING fd (with a CONTEXT and the host END)
+hands the read to the context's bounded stdio executor — the worker
+reads into its OWN vector and its completion posts HOST-END-READY."
   (let* ((byte-p (%byte-stream-p stream))
          (fd (%stream-fd stream))
+         (worker-p (and context end (integerp fd) (>= fd 0)
+                        (not (%fd-nonblocking-p fd))))
+         (wait (and worker-p (%make-stdio-wait)))
          (buf (make-array *cli-stream-chunk*
                           :element-type '(unsigned-byte 8)
                           :fill-pointer 0))
          (chars (unless byte-p
                   (make-array *cli-stream-chunk* :element-type 'character))))
-    (lambda (max)
-      (let ((want (min max *cli-stream-chunk*)))
-        (cond
-          ((<= want 0) (values nil nil))
-          ((and (integerp fd) (minusp fd)) (values nil nil))
-          ((and (integerp fd) (not (%stream-input-ready-p stream fd)))
-           (values nil nil))
-          (t
-           (setf (fill-pointer buf) want)
-           (let ((got (if byte-p
-                          (read-sequence buf stream :end want)
-                          (read-sequence chars stream :end want))))
-             (unless byte-p
-               (dotimes (i got)
-                 (setf (aref buf i)
-                       (logand #xff (char-code (aref chars i))))))
-             (setf (fill-pointer buf) got)
-             (values buf (< got want)))))))))
+    (if worker-p
+        (lambda (max)
+          (let ((want (min max *cli-stream-chunk*)))
+            (if (<= want 0)
+                (values nil nil)
+                (let ((job nil) (submit nil) (generation nil))
+                  (sb-thread:with-recursive-lock ((stdio-wait-mutex wait))
+                    (setf job (stdio-wait-job wait))
+                    (when (and job
+                               (not (eql (stdio-source-job-generation job)
+                                         (%stdio-generation end))))
+                      ;; a job from a copy attempt that is GONE: drop it
+                      (setf job nil
+                            (stdio-wait-job wait) nil))
+                    (when (and (null job) (not (stdio-wait-closed-p wait)))
+                      (setf generation (%stdio-generation end)
+                            job (%make-stdio-source-job
+                                 :generation generation :want want)
+                            (stdio-wait-job wait) job
+                            submit t)))
+                  (cond
+                    (submit
+                     (if (%executor-submit
+                          (wasi-context-stdio-executor context)
+                          (lambda ()
+                            (%stdio-source-run stream byte-p job
+                                               end generation)))
+                         (values nil nil)
+                         (progn
+                           (sb-thread:with-recursive-lock
+                               ((stdio-wait-mutex wait))
+                             (setf (stdio-wait-job wait) nil))
+                           (values nil t))))
+                    ((null job) (values nil nil))
+                    ((not (stdio-source-job-done-p job)) (values nil nil))
+                    (t
+                     (let ((vector (stdio-source-job-vector job))
+                           (eof (stdio-source-job-eof job)))
+                       (sb-thread:with-recursive-lock
+                           ((stdio-wait-mutex wait))
+                         (when (eq (stdio-wait-job wait) job)
+                           (setf (stdio-wait-job wait) nil)))
+                       (values vector eof))))))))
+        (lambda (max)
+          (let ((want (min max *cli-stream-chunk*)))
+            (cond
+              ((<= want 0) (values nil nil))
+              ((and (integerp fd) (minusp fd)) (values nil nil))
+              ((and (integerp fd) (not (%stream-input-ready-p stream fd)))
+               (values nil nil))
+              (t
+               (setf (fill-pointer buf) want)
+               (let ((got (if byte-p
+                              (read-sequence buf stream :end want)
+                              (read-sequence chars stream :end want))))
+                 (unless byte-p
+                   (dotimes (i got)
+                     (setf (aref buf i)
+                           (logand #xff (char-code (aref chars i))))))
+                 (setf (fill-pointer buf) got)
+                 (values buf (< got want))))))))))
 
 (defun %output-stream-fd (stream)
   "The host file descriptor CL STREAM writes to, or NIL (string /
@@ -652,39 +953,106 @@ two-way stream uses its OUTPUT side."
      (%output-stream-fd (two-way-stream-output-stream stream)))
     (t nil)))
 
-(defun cl-stream-sink (stream)
+(defun cl-stream-sink (stream &key context end)
   "A host SINK over CL output STREAM: (octets start end) ->
 (values consumed error-or-nil). At most END-START bytes are written in
 one call and CONSUMED is what the stream took. A host-backed stream
 that is not writable RIGHT NOW returns (0 NIL) — WOULD-BLOCK, so the
 copy parks instead of blocking the host thread — and an I/O failure
-returns (0 \"io\"). Flushed on every drain."
+returns (0 \"io\"). Flushed on every drain.
+
+M17 step 6: a BORROWED BLOCKING fd (with a CONTEXT and the host END)
+hands the SPAN — COPIED into a worker-owned vector, never a guest
+pointer — to the context's bounded stdio executor. The sink returns
+WOULD-BLOCK until the worker's completion posts HOST-END-READY; the
+retry then reports the worker's actual count (or its error)."
   (let* ((byte-p (%byte-stream-p stream))
          (fd (%output-stream-fd stream))
+         (worker-p (and context end (integerp fd) (>= fd 0)
+                        (not (%fd-nonblocking-p fd))))
+         (wait (and worker-p (%make-stdio-wait)))
          (chars (unless byte-p
                   (make-array 0 :element-type 'character
                                 :adjustable t :fill-pointer 0))))
-    (lambda (octets start end)
-      (let ((n (- end start)))
-        (cond
-          ((<= n 0) (values 0 nil))
-          ((and (integerp fd) (minusp fd)) (values 0 nil))
-          ((and (integerp fd) (not (%poll-fd fd +pollout+ 0)))
-           (values 0 nil))
-          (t
-           (handler-case
-               (progn
-                 (if byte-p
-                     (write-sequence octets stream :start start :end end)
-                     (progn
-                       (setf (fill-pointer chars) 0)
-                       (loop for i from start below end
-                             do (vector-push-extend
-                                 (code-char (aref octets i)) chars))
-                       (write-sequence chars stream)))
-                 (finish-output stream)
-                 (values n nil))
-             (error () (values 0 "io")))))))))
+    (if worker-p
+        (lambda (octets offset limit)
+          (let ((n (- limit offset)))
+            (if (<= n 0)
+                (values 0 nil)
+                (let ((job nil) (submit nil) (generation nil))
+                  (sb-thread:with-recursive-lock ((stdio-wait-mutex wait))
+                    (setf job (stdio-wait-job wait))
+                    (when (and job
+                               (not (eql (stdio-sink-job-generation job)
+                                         (%stdio-generation end))))
+                      ;; a job from a copy attempt that is GONE: drop it
+                      (setf job nil
+                            (stdio-wait-job wait) nil))
+                    (when (and (null job) (not (stdio-wait-closed-p wait)))
+                      (let ((vector (make-array n
+                                                :element-type
+                                                '(unsigned-byte 8))))
+                        (replace vector octets :start2 offset :end2 limit)
+                        (setf generation (%stdio-generation end)
+                              job (%make-stdio-sink-job
+                                   :generation generation
+                                   :vector vector :count n)
+                              (stdio-wait-job wait) job
+                              submit t))))
+                  (cond
+                    (submit
+                     (if (%executor-submit
+                          (wasi-context-stdio-executor context)
+                          (lambda ()
+                            (%stdio-sink-run stream byte-p job
+                                             end generation)))
+                         (values 0 nil)
+                         (progn
+                           (sb-thread:with-recursive-lock
+                               ((stdio-wait-mutex wait))
+                             (setf (stdio-wait-job wait) nil))
+                           (values 0 "io"))))
+                    ((null job) (values 0 "io"))
+                    ((not (stdio-sink-job-done-p job)) (values 0 nil))
+                    ((stdio-sink-job-error job)
+                     (let ((error (stdio-sink-job-error job)))
+                       (sb-thread:with-recursive-lock
+                           ((stdio-wait-mutex wait))
+                         (when (eq (stdio-wait-job wait) job)
+                           (setf (stdio-wait-job wait) nil)))
+                       (values 0 error)))
+                    (t
+                     (let ((count (stdio-sink-job-count job)))
+                       (sb-thread:with-recursive-lock
+                           ((stdio-wait-mutex wait))
+                         (when (eq (stdio-wait-job wait) job)
+                           (setf (stdio-wait-job wait) nil)))
+                       (when (> count n)
+                         (error 'wasmdown:host-error
+                                :message
+                                "a stdio sink accepted more bytes than its span"))
+                       (values count nil))))))))
+        (lambda (octets start end)
+          (let ((n (- end start)))
+            (cond
+              ((<= n 0) (values 0 nil))
+              ((and (integerp fd) (minusp fd)) (values 0 nil))
+              ((and (integerp fd) (not (%poll-fd fd +pollout+ 0)))
+               (values 0 nil))
+              (t
+               (handler-case
+                   (progn
+                     (if byte-p
+                         (write-sequence octets stream :start start :end end)
+                         (progn
+                           (setf (fill-pointer chars) 0)
+                           (loop for i from start below end
+                                 do (vector-push-extend
+                                     (code-char (aref octets i)) chars))
+                           (write-sequence chars stream)))
+                     (finish-output stream)
+                     (values n nil))
+                 (error () (values 0 "io"))))))))))
 
 (defun %stdio-require (stream what)
   (or stream
@@ -692,10 +1060,11 @@ returns (0 \"io\"). Flushed on every drain."
              :message (format nil "no ~a capability in this wasi-context"
                               what))))
 
-(defun %write-via-stream (data stream future-ct)
+(defun %write-via-stream (data stream future-ct &key context)
   "Drain the guest's stream DATA into STREAM; the returned future
 resolves once the guest drops the stream's writable end (the WIT's
-success condition) or a sink error drops it."
+success condition) or a sink error drops it. A borrowed blocking
+STREAM's span is copied onto the context's stdio worker (M17 step 6)."
   (let ((sink-stream (%stdio-require stream "stdout/stderr")))
     (unless (wasmdown.component.runtime:async-end-p data)
       (error 'wasmdown:host-error
@@ -703,7 +1072,7 @@ success condition) or a sink error drops it."
     (multiple-value-bind (future-reader future-writer)
         (wasmdown.component.runtime:make-host-future-pair future-ct)
       (wasmdown.component.runtime:host-end-set-sink
-       data (cl-stream-sink sink-stream))
+       data (cl-stream-sink sink-stream :context context :end data))
       (wasmdown.component.runtime:host-end-set-on-drop
        data (lambda (dropped error)
               (declare (ignore dropped))
@@ -714,15 +1083,19 @@ success condition) or a sink error drops it."
       (wasmdown.component.runtime:host-end-drain data)
       future-reader)))
 
-(defun %read-via-stream (stream future-ct)
-  "A stream fed from STREAM and a future signalling the read result."
+(defun %read-via-stream (stream future-ct &key context)
+  "A stream fed from STREAM and a future signalling the read result.
+A borrowed blocking STREAM's read runs on the context's stdio worker
+(M17 step 6), so the guest's thread parks instead of blocking."
   (let ((source-stream (%stdio-require stream "stdin")))
     (multiple-value-bind (stream-reader stream-writer)
         (wasmdown.component.runtime:make-host-stream-pair (%cli-u8-ct))
       (multiple-value-bind (future-reader future-writer)
           (wasmdown.component.runtime:make-host-future-pair future-ct)
         (wasmdown.component.runtime:host-end-set-source
-         stream-writer (cl-stream-source source-stream))
+         stream-writer (cl-stream-source source-stream
+                                         :context context
+                                         :end stream-writer))
         (wasmdown.component.runtime:host-end-set-on-drop
          stream-writer (lambda (dropped error)
                          (declare (ignore dropped))
@@ -740,7 +1113,8 @@ success condition) or a sink error drops it."
      (list (cons "read-via-stream"
                  (lambda ()
                    (%read-via-stream (wasi-context-stdin context)
-                                     future-ct))))
+                                     future-ct
+                                     :context context))))
      :packages (list package))))
 
 (defun cli-output-instance (context stream interface-name
@@ -751,7 +1125,8 @@ success condition) or a sink error drops it."
      (wasmdown.wit:package-interface package interface-name)
      (list (cons "write-via-stream"
                  (lambda (data)
-                   (%write-via-stream data stream future-ct))))
+                   (%write-via-stream data stream future-ct
+                                      :context context))))
      :packages (list package))))
 
 (defun cli-stdout-instance (context &key (package (wasi-package "cli")))
@@ -3003,6 +3378,22 @@ revents, or NIL on timeout/error."
   "POLLNVAL — the fd was not open when poll ran.")
 (defparameter +o-nonblock+ #x800)
 
+;;; F_GETFL: does a borrowed stdio fd carry O_NONBLOCK? A BLOCKING fd
+;;; is the bounded stdio executor's business (M17 step 6) — an fd
+;;; already in nonblocking mode keeps the direct would-block path.
+(defconstant +f-getfl+ 3)
+
+(sb-alien:define-alien-routine ("fcntl" %libc-fcntl) sb-alien:int
+  (fd sb-alien:int) (cmd sb-alien:int) (arg sb-alien:int))
+
+(defun %fd-nonblocking-p (fd)
+  "T when FD carries O_NONBLOCK (or the probe itself failed, so the
+caller keeps the safe direct path)."
+  (and (integerp fd)
+       (>= fd 0)
+       (let ((flags (%libc-fcntl fd +f-getfl+ 0)))
+         (or (minusp flags) (logtest +o-nonblock+ flags)))))
+
 (sb-alien:define-alien-routine ("pipe2" %libc-pipe2) sb-alien:int
   (fds sb-sys:system-area-pointer) (flags sb-alien:int))
 
@@ -3524,6 +3915,148 @@ the reactor refuse new watches. No callback starts after this returns
            t)
       (sb-thread:release-mutex mutex))))
 
+;;; ---------------------------------------------------------------
+;;; STREAM READINESS (plan step 6): with a reactor attached, an
+;;; EAGAIN/EWOULDBLOCK on accept/recv/send REGISTERS a watch keyed by
+;;; the CONNECTION/STREAM IDENTITY (never the bare fd: a reused fd
+;;; number must not inherit a stale watch) and the parked copy
+;;; resumes through the STORE QUEUE via HOST-END-READY. Without a
+;;; reactor the provider keeps today's would-block/poll path exactly.
+;;;
+;;; A live watch holds ONE store-work unit — a HOST-PENDING "gate" —
+;;; so the store driver keeps pumping the reactor while the guest is
+;;; parked (the gate is released exactly once when the watch fires or
+;;; is disarmed; a store with no live host work never polls).
+;;;
+;;; THE GENERATION is captured when the watch is ARMED (the attempt
+;;; the copy record holds); a callback that fires after the copy was
+;;; cancelled, dropped or replaced names a different generation and
+;;; HOST-END-READY resumes nothing.
+
+(defstruct (readiness-wait (:constructor %make-readiness-wait (end)))
+  "One parked stream copy's readiness subscription."
+  (end nil)                            ; the host end whose copy wakes
+  (mutex (sb-thread:make-mutex :name "readiness-wait"))
+  (armed-p nil)
+  (generation 0)
+  (cancel nil)                         ; the reactor watch's cancel-fn
+  (resolve nil))                       ; the gate pending's resolve
+
+(defun %context-reactor (context)
+  "CONTEXT's reactor, or NIL (a NIL context has no capabilities)."
+  (and context (wasi-context-reactor context)))
+
+(defun %readiness-armed-p (wait)
+  (and wait
+       (sb-thread:with-recursive-lock ((readiness-wait-mutex wait))
+         (readiness-wait-armed-p wait))))
+
+(defun %readiness-arm (wait reactor fd direction identity)
+  "Register a ONE-SHOT reactor watch for FD/DIRECTION under
+REGISTRATION-IDENTITY (the connection/stream object, not the fd), and
+wake WAIT's parked copy through the store queue. Idempotent while
+armed. T when newly armed."
+  (when (and wait reactor (integerp fd) (>= fd 0))
+    (let ((arm nil) (generation nil))
+      (sb-thread:with-recursive-lock ((readiness-wait-mutex wait))
+        (unless (readiness-wait-armed-p wait)
+          (setf (readiness-wait-armed-p wait) t
+                generation (wasmdown.component.runtime:host-end-generation
+                            (readiness-wait-end wait))
+                (readiness-wait-generation wait) generation
+                arm t)))
+      (when arm
+        (let ((resolve nil))
+          (handler-case
+              (progn
+                (wasmdown.component.runtime:make-host-pending
+                 :start
+                 (lambda (res reject acknowledge)
+                   (declare (ignore reject acknowledge))
+                   (setf resolve res)
+                   (let ((cancel
+                           (reactor-watch-fd
+                            reactor fd direction identity
+                            (lambda (status)
+                              (declare (ignore status))
+                              ;; the watch is SPENT: unlink it and clear
+                              ;; the record, so the resumed copy's next
+                              ;; would-block arms a FRESH watch
+                              (let ((spent nil))
+                                (sb-thread:with-recursive-lock
+                                    ((readiness-wait-mutex wait))
+                                  (when (readiness-wait-armed-p wait)
+                                    (setf spent (readiness-wait-cancel wait)
+                                          (readiness-wait-armed-p wait) nil
+                                          (readiness-wait-cancel wait) nil
+                                          (readiness-wait-resolve wait) nil)))
+                                (when spent
+                                  (ignore-errors (funcall spent))))
+                              ;; the ONLY way back: the store queue.
+                              (wasmdown.component.runtime:host-end-ready
+                               (readiness-wait-end wait) generation)
+                              (funcall res nil)))))
+                     (sb-thread:with-recursive-lock
+                         ((readiness-wait-mutex wait))
+                       (setf (readiness-wait-cancel wait) cancel))
+                     ;; the gate pending's own cancel-fn (unused: the
+                     ;; disarm settles it with RESOLVE)
+                     (lambda () (funcall cancel) t))))
+                (sb-thread:with-recursive-lock ((readiness-wait-mutex wait))
+                  (setf (readiness-wait-resolve wait) resolve))
+                t)
+            (error ()
+              ;; the watch could not be registered (a closed reactor):
+              ;; settle the gate and let the caller retry later
+              (sb-thread:with-recursive-lock ((readiness-wait-mutex wait))
+                (setf (readiness-wait-armed-p wait) nil
+                      (readiness-wait-resolve wait) nil))
+              (when resolve (funcall resolve nil))
+              nil)))))))
+
+(defun %readiness-disarm (wait)
+  "Release WAIT exactly once: cancel the watch and settle its gate
+pending (the store's work unit is freed when the delivery runs). A
+later callback for the SAME registration finds it cancelled, and its
+generation is stale anyway."
+  (when wait
+    (let ((cancel nil) (resolve nil))
+      (sb-thread:with-recursive-lock ((readiness-wait-mutex wait))
+        (when (readiness-wait-armed-p wait)
+          (setf (readiness-wait-armed-p wait) nil
+                cancel (readiness-wait-cancel wait)
+                resolve (readiness-wait-resolve wait)
+                (readiness-wait-cancel wait) nil
+                (readiness-wait-resolve wait) nil)))
+      (when cancel (ignore-errors (funcall cancel)))
+      (when resolve (funcall resolve nil)))
+    t))
+
+(defvar *socket-wait-lock* (sb-thread:make-mutex :name "socket-waits")
+  "Guards the per-socket list of live readiness waits (close must be
+able to release them all; it is a lock, never a result queue).")
+
+(defun %socket-wait-register (sock wait)
+  (when (and sock wait)
+    (sb-thread:with-recursive-lock (*socket-wait-lock*)
+      (pushnew wait (wasi-tcp-socket-waits sock) :test #'eq))))
+
+(defun %socket-wait-unregister (sock wait)
+  (when (and sock wait)
+    (sb-thread:with-recursive-lock (*socket-wait-lock*)
+      (setf (wasi-tcp-socket-waits sock)
+            (delete wait (wasi-tcp-socket-waits sock) :test #'eq)))))
+
+(defun %socket-waits-release (sock)
+  "Release every watch a SOCK's streams still hold (CLOSE): each is
+disarmed exactly once."
+  (when sock
+    (let ((waits nil))
+      (sb-thread:with-recursive-lock (*socket-wait-lock*)
+        (setf waits (wasi-tcp-socket-waits sock)
+              (wasi-tcp-socket-waits sock) nil))
+      (dolist (wait waits) (%readiness-disarm wait)))))
+
 (defun %getsockname-domain (fd what)
   "getsockname/getpeername as a WIT ip-socket-address domain value."
   (let ((alien (sb-alien:make-alien sb-alien:unsigned-char +sockaddr-storage-size+))
@@ -3572,6 +4105,9 @@ every derived send/receive/listen stream); the fd closes at zero."
   (sent-p nil)
   (received-p nil)
   (backlog 128)
+  ;; M17 step 6: the LIVE readiness watches this socket's streams hold
+  ;; (released by CLOSE and by each stream's drop).
+  (waits nil)
   (refs 1))
 
 (defstruct wasi-udp-socket
@@ -3623,6 +4159,8 @@ SHUT_RD)."
         (let ((fd (wasi-tcp-socket-fd sock)))
           (setf (wasi-tcp-socket-fd sock) -1
                 (wasi-tcp-socket-state sock) :closed)
+          ;; a watch on this fd must not survive the fd
+          (%socket-waits-release sock)
           (when (and (integerp fd) (not (minusp fd)))
             (%close-fd fd)))))))
 
@@ -3884,7 +4422,6 @@ TIME_WAIT binding does not block the guest."
 
 (defun tcp-listen (context network self
                    &key (package (wasi-package "sockets")))
-  (declare (ignore context))
   (let ((elem-ct (%sockets-stream-ct "tcp-socket" "listen" :package package)))
     (handler-case
         (let ((sock (%tcp-of network self (tcp-socket-resource-ct
@@ -3902,25 +4439,40 @@ TIME_WAIT binding does not block the guest."
           (incf (wasi-tcp-socket-refs sock))
           (multiple-value-bind (reader writer)
               (wasmdown.component.runtime:make-host-stream-pair elem-ct)
-            (wasmdown.component.runtime:host-end-set-source
-             writer (%tcp-accept-source sock))
-            (wasmdown.component.runtime:host-end-set-on-drop
-             writer (lambda (dropped error)
-                      (declare (ignore dropped error))
-                      (%release-tcp sock)))
-            (cons :ok reader)))
+            ;; M17 step 6: a would-blocked accept waits on the LISTENER's
+            ;; fd through the reactor, keyed by this stream's identity
+            (let ((wait (%make-readiness-wait writer))
+                  (reactor (%context-reactor context)))
+              (%socket-wait-register sock wait)
+              (wasmdown.component.runtime:host-end-set-source
+               writer (%tcp-accept-source sock
+                                          :reactor reactor
+                                          :identity writer
+                                          :wait wait))
+              (wasmdown.component.runtime:host-end-set-on-drop
+               writer (lambda (dropped error)
+                        (declare (ignore dropped error))
+                        (%readiness-disarm wait)
+                        (%socket-wait-unregister sock wait)
+                        (%release-tcp sock)))
+              (cons :ok reader))))
       (wasi-socket-error (c)
         (cons :err (wasi-socket-error-code c))))))
 
-(defun %tcp-accept-source (sock)
+(defun %tcp-accept-source (sock &key reactor identity wait)
   "A host SOURCE yielding new tcp-socket OWN HANDLES: (max) ->
 (values element-vector eof-p), ELEMENT-VECTOR a REUSABLE vector whose
 length is the count. accept4 is already nonblocking: EAGAIN/EINTR is
 WOULD-BLOCK — (NIL NIL) when nothing was accepted, else the entries
 accepted so far with eof NIL — never an accept spin; a fatal error
-ends the stream."
+ends the stream.
+
+With a REACTOR, an empty queue instead REGISTERS a read watch on the
+listener (keyed by this stream's IDENTITY) and the parked copy resumes
+through the store queue."
   (let ((ct (tcp-socket-resource-ct))
         (family (wasi-tcp-socket-family sock))
+        (fd (wasi-tcp-socket-fd sock))
         (out (make-array 0 :adjustable t :fill-pointer 0)))
     (lambda (max)
       (if (<= max 0)
@@ -3932,16 +4484,16 @@ ends the stream."
               (loop while (and (< (fill-pointer out) max) (not eof)
                                (not blocked))
                     do (sb-alien:set-errno 0)
-                       (let ((fd (%libc-accept4 (wasi-tcp-socket-fd sock)
-                                                (%sock-null) (%sock-null)
-                                                (logior +sock-nonblock+
-                                                        +sock-cloexec+))))
+                       (let ((new (%libc-accept4 (wasi-tcp-socket-fd sock)
+                                                 (%sock-null) (%sock-null)
+                                                 (logior +sock-nonblock+
+                                                         +sock-cloexec+))))
                          (cond
-                           ((>= fd 0)
+                           ((>= new 0)
                             (vector-push-extend
                              (list :own-handle ct
                                    (make-wasi-tcp-socket
-                                    :fd fd
+                                    :fd new
                                     :network (wasi-tcp-socket-network sock)
                                     :family family
                                     :state :connected))
@@ -3953,20 +4505,32 @@ ends the stream."
                                   ;; the copy parks until a readiness wake
                                   (setf blocked t)
                                   (setf eof t)))))))
-              (if (and blocked (zerop (fill-pointer out)))
-                  (values nil nil)
-                  (values out eof))))))))
+              (cond
+                ((plusp (fill-pointer out))
+                 (%readiness-disarm wait)
+                 (values out eof))
+                (eof
+                 (%readiness-disarm wait)
+                 (values nil t))
+                (t
+                 (%readiness-arm wait reactor fd :read identity)
+                 (values nil nil)))))))))
 
-(defun %fd-send-sink (fd)
+(defun %fd-send-sink (fd &key reactor identity wait)
   "A host SINK over send(2) on the connected stream socket FD:
 (octets start end) -> (values consumed error-or-nil). ONE send per
 call: a short send is the count ACCEPTED (the remainder continues on
 the guest's next attempt), EAGAIN/EWOULDBLOCK is WOULD-BLOCK (0 NIL,
 nothing consumed), a zero-length send is connection-broken, and
 MSG_NOSIGNAL keeps a peer reset from killing the host. The error is
-the sockets error-code DOMAIN value."
-  (lambda (octets start end)
-    (let ((n (- end start)))
+the sockets error-code DOMAIN value.
+
+With a REACTOR, a would-block REGISTERS a write watch (keyed by the
+stream IDENTITY, never the fd) and the parked copy resumes through the
+store queue; the watch is released once on the next progress, error or
+close."
+  (lambda (octets offset limit)
+    (let ((n (- limit offset)))
       (if (<= n 0)
           (values 0 nil)
           (loop
@@ -3974,24 +4538,31 @@ the sockets error-code DOMAIN value."
             (let ((ret (sb-sys:with-pinned-objects (octets)
                          (%libc-send fd
                                      (sb-sys:sap+ (sb-sys:vector-sap octets)
-                                                  start)
+                                                  offset)
                                      n +msg-nosignal+))))
               (cond
-                ((plusp ret) (return (values ret nil)))
+                ((plusp ret)
+                 (%readiness-disarm wait)
+                 (return (values ret nil)))
                 ((zerop ret)
+                 (%readiness-disarm wait)
                  (return (values 0 (%socket-code "connection-broken"))))
                 (t
                  (let ((errno (sb-alien:get-errno)))
                    (cond
                      ((= errno +eintr+) nil)   ; retry the same span
-                     ((= errno +eagain+) (return (values 0 nil)))
-                     (t (return (values 0 (%socket-errno-code errno))))))))))))))
+                     ((= errno +eagain+)
+                      (%readiness-arm wait reactor fd :write identity)
+                      (return (values 0 nil)))
+                     (t
+                      (%readiness-disarm wait)
+                      (return (values 0 (%socket-errno-code errno))))))))))))))
 
 (defun tcp-send (context network self data
                  &key (package (wasi-package "sockets")))
-  (declare (ignore context))
   (let ((future-ct (%sockets-future-ct "tcp-socket" "send"
-                                        :package package)))
+                                        :package package))
+        (reactor (%context-reactor context)))
     (handler-case
         (let* ((sock (%tcp-of network self (tcp-socket-resource-ct
                                             :package package)))
@@ -4006,7 +4577,8 @@ the sockets error-code DOMAIN value."
           (multiple-value-bind (reader writer)
               (wasmdown.component.runtime:make-host-future-pair future-ct)
             (let ((settled nil)
-                  (released nil))
+                  (released nil)
+                  (wait (%make-readiness-wait data)))
               (flet ((settle (v)
                        (unless settled
                          (setf settled t)
@@ -4015,10 +4587,14 @@ the sockets error-code DOMAIN value."
                      (release (&optional shutdown-how)
                        (unless released
                          (setf released t)
+                         (%readiness-disarm wait)
+                         (%socket-wait-unregister sock wait)
                          (%release-tcp sock shutdown-how))))
                 (incf (wasi-tcp-socket-refs sock))
+                (%socket-wait-register sock wait)
                 (wasmdown.component.runtime:host-end-set-sink
-                 data (%fd-send-sink fd))
+                 data (%fd-send-sink fd :reactor reactor
+                                        :identity data :wait wait))
                 (wasmdown.component.runtime:host-end-set-on-drop
                  data
                  (lambda (dropped error)
@@ -4035,14 +4611,18 @@ the sockets error-code DOMAIN value."
           (wasmdown.component.runtime:host-end-drop data))
         (%socket-error-future future-ct (wasi-socket-error-code c))))))
 
-(defun %tcp-recv-source (fd settle)
+(defun %tcp-recv-source (fd settle &key reactor identity wait)
   "A host SOURCE over recv(2): (max) -> (values octets eof-p),
 OCTETS a REUSABLE u8 vector whose length is the count. ONE
 nonblocking recv per attempt: EAGAIN/EINTR is WOULD-BLOCK ((NIL NIL)),
 so the guest's read parks on readiness instead of polling the host
 thread. A zero-length recv is a graceful FIN and SETTLES the future
 (:ok) with an EMPTY vector and EOF; a recv error SETTLES it
-(:err . code) and reports EOF."
+(:err . code) and reports EOF.
+
+With a REACTOR the would-block REGISTERS a read watch keyed by the
+stream IDENTITY and the parked copy resumes through the store queue;
+data/EOF/error release the watch once."
   (let ((slice (make-array 65536 :element-type '(unsigned-byte 8)))
         (out (make-array 65536 :element-type '(unsigned-byte 8)
                                 :fill-pointer 0)))
@@ -4055,31 +4635,35 @@ thread. A zero-length recv is a graceful FIN and SETTLES the future
                        (%libc-recv fd (sb-sys:vector-sap slice) want 0))))
               (cond
                 ((plusp n)
+                 (%readiness-disarm wait)
                  (setf (fill-pointer out) n)
                  (replace out slice :start2 0 :end2 n)
                  (values out nil))
                 ((zerop n)
+                 (%readiness-disarm wait)
                  (funcall settle (cons :ok nil))
                  (values #() t))
                 (t
                  (let ((errno (sb-alien:get-errno)))
                    (cond
                      ((or (= errno +eagain+) (= errno +eintr+))
+                      (%readiness-arm wait reactor fd :read identity)
                       (values nil nil))
                      (t
+                      (%readiness-disarm wait)
                       (funcall settle
                                (cons :err (%socket-errno-code errno)))
                       (values nil t))))))))))))
 
 (defun tcp-receive (context network self
                     &key (package (wasi-package "sockets")))
-  (declare (ignore context))
   (let* ((ft (%sockets-method-ct "tcp-socket" "receive" :package package))
          (result (second (wasmdown.component:ct-payload ft)))
          (elem-ct (wasmdown.component:ct-payload
                    (%ct-find-kind result :stream)))
          (future-ct (wasmdown.component:ct-payload
-                     (%ct-find-kind result :future))))
+                     (%ct-find-kind result :future)))
+         (reactor (%context-reactor context)))
     (handler-case
         (let* ((sock (%tcp-of network self (tcp-socket-resource-ct
                                             :package package)))
@@ -4094,7 +4678,8 @@ thread. A zero-length recv is a graceful FIN and SETTLES the future
             (multiple-value-bind (future-reader future-writer)
                 (wasmdown.component.runtime:make-host-future-pair future-ct)
               (let ((settled nil)
-                    (released nil))
+                    (released nil)
+                    (wait (%make-readiness-wait stream-writer)))
                 (flet ((settle (v)
                          (unless settled
                            (setf settled t)
@@ -4103,10 +4688,16 @@ thread. A zero-length recv is a graceful FIN and SETTLES the future
                        (release (&optional shutdown-how)
                          (unless released
                            (setf released t)
+                           (%readiness-disarm wait)
+                           (%socket-wait-unregister sock wait)
                            (%release-tcp sock shutdown-how))))
                   (incf (wasi-tcp-socket-refs sock))
+                  (%socket-wait-register sock wait)
                   (wasmdown.component.runtime:host-end-set-source
-                   stream-writer (%tcp-recv-source fd #'settle))
+                   stream-writer (%tcp-recv-source fd #'settle
+                                                  :reactor reactor
+                                                  :identity stream-writer
+                                                  :wait wait))
                   (wasmdown.component.runtime:host-end-set-on-drop
                    stream-writer
                    (lambda (dropped error)
@@ -4720,6 +5311,72 @@ ip-name-lookup error variant on failure."
       (sb-alien:free-alien hints)
       (sb-alien:free-alien out))))
 
+;;; ---- resolve-addresses on the DNS EXECUTOR ----
+;;; The WIT's `resolve-addresses` is an ASYNC func, and getaddrinfo(3)
+;;; BLOCKS: it must not run on the guest's thread. The job is submitted
+;;; to the context's DNS service (a FIXED, SEPARATE worker budget) and
+;;; its result travels back ONLY through the store queue (the pending's
+;;; RESOLVE). A cancel/close DETACHES the job from that target; the
+;;; worker still frees the getaddrinfo chain (%GETADDINFO-CHAIN's own
+;;; unwind-protect), and the detached result is dropped.
+
+(defstruct (dns-job (:constructor %make-dns-job))
+  (mutex (sb-thread:make-mutex :name "dns-job"))
+  (target nil))                        ; (RESOLVE . REJECT), NIL once detached
+
+(defun %lookup-result (name flags)
+  "The domain result of one getaddrinfo chain: (:ok . addresses) or
+(:err . error-code)."
+  (handler-case
+      (cons :ok (%getaddrinfo-chain name flags))
+    (wasi-socket-error (c)
+      (cons :err (wasi-socket-error-code c)))))
+
+(defun %dns-job-run (job name flags)
+  "The WORKER body: resolve NAME, then hand the result to the pending's
+resolve/reject UNLESS the job was detached first. The chain is freed
+before the target is consulted, so a cancelled job's late result is
+always freeaddrinfo'd."
+  (let ((result (%lookup-result name flags)))
+    (let ((target nil))
+      (sb-thread:with-recursive-lock ((dns-job-mutex job))
+        (setf target (dns-job-target job)
+              (dns-job-target job) nil))
+      (when target
+        (if (eq (car result) :ok)
+            (funcall (car target) result)
+            (funcall (cdr target) result))))))
+
+(defun %dns-resolve-pending (context name flags)
+  "NAME goes through getaddrinfo(3) on the DNS service. The guest's
+thread only SUBMITS; the worker posts the result to the store queue."
+  (let ((executor (wasi-context-dns-executor context)))
+    (wasmdown.component.runtime:make-host-pending
+     :start
+     (lambda (resolve reject acknowledge-cancel)
+       (declare (ignore acknowledge-cancel))
+       (let ((job (%make-dns-job)))
+         (setf (dns-job-target job) (cons resolve reject))
+         (unless (%executor-submit executor
+                                   (lambda () (%dns-job-run job name flags)))
+           ;; no worker can ever answer: detach and report it
+           (sb-thread:with-recursive-lock ((dns-job-mutex job))
+             (setf (dns-job-target job) nil))
+           (funcall reject
+                    (make-condition 'wasmdown:host-error
+                                    :message
+                                    "the DNS executor is closed")))
+         ;; the pending's cancel-fn: DETACH. T when the job was
+         ;; detached (the store forgets it); NIL once it completed
+         ;; (its result delivers normally).
+         (lambda ()
+           (let ((detached nil))
+             (sb-thread:with-recursive-lock ((dns-job-mutex job))
+               (when (dns-job-target job)
+                 (setf (dns-job-target job) nil
+                       detached t)))
+             detached)))))))
+
 (defun ip-name-lookup-resolve (context network name
                                &key (package (wasi-package "sockets")))
   "resolve-addresses: an IP literal is parsed as-is (no external
@@ -4739,6 +5396,25 @@ getaddrinfo."
       (unless (wasi-network-allows-dns-p network name)
         (%socket-error (%socket-code "access-denied")))
       (%getaddrinfo-chain name 0)))))
+
+(defun ip-name-lookup-resolve-async (context network name
+                                     &key (package (wasi-package "sockets")))
+  "The PROVIDER's `resolve-addresses`: the same policy checks as
+IP-NAME-LOOKUP-RESOLVE, but a real NAME is resolved on the bounded DNS
+executor and answered with a HOST-PENDING (the async WIT signature).
+A literal, a policy refusal or a numeric IPv6 lookup answer INLINE."
+  (declare (ignore package))
+  (cond
+    ((zerop (length name))
+     (cons :err (%socket-code "invalid-argument")))
+    ((%parse-ipv4-literal name)
+     (cons :ok (list (cons "ipv4" (%parse-ipv4-literal name)))))
+    ((find #\: name)
+     (%lookup-result name +ai-numerichost+))
+    ((not (wasi-network-allows-dns-p network name))
+     (cons :err (%socket-code "access-denied")))
+    (t
+     (%dns-resolve-pending context name 0))))
 
 ;;; ---------------------------------------------------------------
 ;;; The provider instances.
@@ -4893,8 +5569,8 @@ NETWORK's) DNS policy."
      (wasmdown.wit:package-interface package "ip-name-lookup")
      (list (cons "resolve-addresses"
                  (lambda (name)
-                   (ip-name-lookup-resolve context net name
-                                           :package package))))
+                   (ip-name-lookup-resolve-async context net name
+                                                 :package package))))
      :packages (%sockets-packages :package package))))
 
 (defun sockets-provider (context
