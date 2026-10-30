@@ -65,7 +65,14 @@
            #:host-end-drop
            #:host-end-drain
            #:host-end-read
+           #:host-end-generation
+           #:host-end-ready
            #:host-future-resolve
+           #:host-future-watch
+           ;; M17 step 5 — the ASYNCHRONOUS HOST CALL: an async-typed
+           ;; host closure returns a pending instead of a value
+           #:make-host-pending
+           #:host-pending-p
            #:make-host-buffer
            #:host-buffer-p
            #:host-buffer-values
@@ -2357,9 +2364,22 @@ reentrance phase checks). The CALLER then waits:
       ;; own comp-instance) and hand the provider that index; the
       ;; provider's host-resource-rep falls back to it when the
       ;; dynamic caller's table does not hold the index.
-      (let ((*host-provider-inst* (lifted-func-inst lf)))
+      ;; M17 step 5: an ASYNC-typed host closure may answer with a
+      ;; HOST-PENDING; a DIRECT call drives it to completion on the
+      ;; same host driver and returns the domain result (a synchronous
+      ;; host caller has nowhere else to get it). A SYNC-typed closure
+      ;; may not: the pending contract belongs to the async canons.
+      (let* ((*host-provider-inst* (lifted-func-inst lf))
+             (val (funcall (lifted-func-host lf) args)))
         (return-from lifted-func-call
-          (funcall (lifted-func-host lf) args))))
+          (cond
+            ((not (host-pending-p val)) val)
+            ((and ft (third (wasmdown.component:ct-payload ft)))
+             (%host-pending-join val))
+            (t
+             (error 'wasmdown:host-error
+                    :message
+                    "a sync-typed host closure returned a host-pending"))))))
     (unless (and core (wasmdown.runtime:func-instance-p core))
       (error 'wasmdown:host-error
              :message "lifted func wraps no core func"))
@@ -3550,12 +3570,15 @@ of a stream or future pair."
   ;; M16 SLICE 2 — THE HOST BACKING. A provider-owned end carries the
   ;; CL closure that feeds/drains its PAIRED end (PLAN.md §8.3/§9.1:
   ;; the host side of stream<u8>/future<T>, no ambient globals):
-  ;;   HOST-SINK (on a host READABLE end): (byte-list) -> error-code
-  ;;     string or NIL. Consulted when the guest's writable peer
-  ;;     stages a write: the bytes are drained immediately.
+  ;;   HOST-SINK (on a host READABLE end): (octets start end) ->
+  ;;     (values consumed-count error-or-nil) — a u8 SPAN, at most
+  ;;     +HOST-SPAN-MAX+ bytes, handed to the provider without a copy.
+  ;;     Consulted when the guest's writable peer stages a write: the
+  ;;     accepted prefix is drained now, (0 NIL) PARKS the copy.
   ;;   HOST-SOURCE (on a host WRITABLE end): (max) -> (values
-  ;;     byte-list eof-p). Consulted when the guest's readable peer
-  ;;     asks: the bytes are pulled from the CL source now.
+  ;;     sequence eof-p) where SEQUENCE is a u8 vector or an element
+  ;;     list; (NIL NIL) is a TEMPORARY would-block, not EOF.
+  ;;     Consulted when the guest's readable peer asks.
   ;;   HOST-VALUE(-P) (on a host WRITABLE future end): the resolved
   ;;     component-domain value, delivered at the guest's read.
   ;;   HOST-EOF-P: the source reported EOF (the writable peer is then
@@ -3566,6 +3589,19 @@ of a stream or future pair."
   ;;     the PAIRED guest end is dropped (resolve the future).
   (host-sink nil)
   (host-source nil)
+  ;; M17 step 5 — THE COPY GENERATION. Advanced whenever a NEW host
+  ;; copy attempt starts, and whenever the copy is cancelled or the
+  ;; end dropped. A provider registers the generation it observed
+  ;; with host-end-ready; a notification from an OLD attempt names an
+  ;; old generation and resumes nothing.
+  (generation 0)
+  ;; the copy parked on THIS host end (a host-copy record: :sink /
+  ;; :source + its generation + the guest-side end holding the
+  ;; canonical buffer); NIL when the end has no parked attempt
+  (host-copy nil)
+  ;; the one-shot read subscription (host-future-watch) on this
+  ;; readable future end
+  (host-watch nil)
   (host-value nil)
   (host-value-p nil)
   (host-eof-p nil)
@@ -3774,12 +3810,15 @@ domain values (no ABI encoding — there is no guest memory)."
     (nreverse vals)))
 
 (defun %buffer-put (buf vals t-ct inst)
-  "WritableGuestBuffer.write (§1577-1585): store the VALUES list
-into the buffer's memory at its advancing ptr, advancing the
-progress by the count. A HOST buffer accumulates the domain values."
+  "WritableGuestBuffer.write (§1577-1585): store VALS — an element
+list OR a u8 vector — into the buffer's memory at its advancing
+ptr, advancing the progress by the count. A HOST buffer accumulates
+the domain values. A u8 vector into a GUEST u8 buffer is one bulk
+replace (the source contract's vector shape, no per-element call)."
   (when (host-buffer-p buf)
     (setf (host-buffer-values buf)
-          (append (host-buffer-values buf) (copy-list vals)))
+          (append (host-buffer-values buf)
+                  (if (listp vals) (copy-list vals) (coerce vals 'list))))
     (incf (host-buffer-progress buf) (length vals))
     (return-from %buffer-put (length vals)))
   (let* ((memory (first buf))
@@ -3789,23 +3828,38 @@ progress by the count. A HOST buffer accumulates the domain values."
                            (error () 1))))
          (n (length vals))
          (ptr (+ (second buf) (* (fourth buf) (or elem-size 1)))))
-    (when (and t-ct vals)
-      (let ((cx (make-abi-cx :memory memory
-                             :realloc (nth 4 buf)
-                             :encoding (or (nth 5 buf) :utf8)
-                             :inst inst)))
-        ;; M13-tok25 THE OWN-TRANSFER'S DEST HALF: an
-        ;; (:own-handle rt rep) element (the take's source-side
-        ;; transfer) is RE-ADDED into THIS instance's table and
-        ;; the new index stored — the consumer's core then holds
-        ;; a live handle whose rep survives.
-        (dolist (v vals)
-          (if (and (consp v) (eq (car v) :own-handle))
-              (%abi-store-int cx (%handle-add inst (second v)
-                                              (third v) t)
-                              ptr 4)
-              (%abi-store cx v t-ct ptr))
-          (incf ptr (or elem-size 1)))))
+    (cond
+      ;; the BYTE fast path: a u8 vector into a guest u8 buffer
+      ((and (not (listp vals)) (vectorp vals) (plusp n)
+            (or (eq t-ct :u8)
+                (let ((c (ignore-errors (%abi-ct t-ct inst))))
+                  (and c (eq (wasmdown.component:ct-kind c) :prim)
+                       (eq (wasmdown.component:ct-payload c) :u8)))))
+       (let ((bytes (wasmdown.runtime:memory-instance-bytes memory)))
+         (unless (<= (+ ptr n) (length bytes))
+           (error 'wasmdown:wasm-trap :kind :generic
+                  :message "out of bounds memory access"))
+         (replace bytes vals :start1 ptr :end1 (+ ptr n) :end2 n)))
+      ((and t-ct vals)
+       (let ((cx (make-abi-cx :memory memory
+                              :realloc (nth 4 buf)
+                              :encoding (or (nth 5 buf) :utf8)
+                              :inst inst)))
+         ;; M13-tok25 THE OWN-TRANSFER'S DEST HALF: an
+         ;; (:own-handle rt rep) element (the take's source-side
+         ;; transfer) is RE-ADDED into THIS instance's table and
+         ;; the new index stored — the consumer's core then holds
+         ;; a live handle whose rep survives.
+         (flet ((put-one (v)
+                  (if (and (consp v) (eq (car v) :own-handle))
+                      (%abi-store-int cx (%handle-add inst (second v)
+                                                      (third v) t)
+                                      ptr 4)
+                      (%abi-store cx v t-ct ptr))
+                  (incf ptr (or elem-size 1))))
+           (if (listp vals)
+               (dolist (v vals) (put-one v))
+               (dotimes (i n) (put-one (aref vals i))))))))
     (incf (fourth buf) n)))
 
 ;;; ---- The HOST-BACKED ends (M16 slice 2, PLAN.md §8.3/§9.1) ----
@@ -3826,15 +3880,515 @@ to the guest. Same pair/linkage as canon stream.new."
   "The linked (readable . writable) FUTURE end pair for ELEMENT-TYPE."
   (%new-async-pair element-type owner +event-future-read+ t))
 
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  ;; the sink protocol's arity probe (a one-argument SINK is the
+  ;; pre-cutover LIST contract; see %sink-span-arity-p)
+  (ignore-errors (require :sb-introspect)))
+
+;;; ---- M17 STEP 5: RESUMABLE BYTE COPIES AND ASYNCHRONOUS HOST CALLS ----
+;;;
+;;; THREE CONTRACTS LIVE HERE.
+;;;
+;;; 1. THE BYTE SINK is (octets start end) -> (values consumed
+;;;    error-or-nil). The span is at most +HOST-SPAN-MAX+ bytes and
+;;;    the provider must NOT retain OCTETS across the call. Consumed
+;;;    bytes alone advance the canonical buffer's progress; the rest
+;;;    continues on a later attempt. (0 NIL) is WOULD-BLOCK: nothing
+;;;    is consumed and the copy PARKS. n > 0 together with an error
+;;;    is a provider bug (host error). A sink on a non-u8 element
+;;;    type is a host error.
+;;;
+;;; 2. THE SOURCE keeps (max) -> (values sequence eof-p), accepts a
+;;;    u8 vector as well as an element list, and (NIL NIL) is a
+;;;    TEMPORARY would-block, never EOF.
+;;;
+;;; 3. THE COPY GENERATION names one attempt. A new attempt advances
+;;;    it, a retry keeps it, and cancel/drop/error advance it again.
+;;;    A provider registers the generation it saw with
+;;;    HOST-END-READY; a notification naming any other generation
+;;;    (a stale fd wake, a stale copy) resumes nothing.
+;;;
+;;; THE PARK IS THE WHOLE POINT: the parked copy holds NO host
+;;; thread. The provider's readiness callback calls host-end-ready
+;;; from its own event loop; the guest's writable end stays COPYING
+;;; with its buffer parked, exactly as the canonical protocol's
+;;; case 2.
+
+(defconstant +host-span-max+ (* 64 1024)
+  "The largest span one sink call may see (the plan's 64 KiB cap:
+bounded work per syscall, bounded latency before other tasks run).")
+
+(defstruct (host-copy (:constructor make-host-copy
+                                   (&key kind generation end scratch)))
+  "One PARKED host copy. KIND is :SINK (the guest staged a write the
+host readable end's sink could not take) or :SOURCE (the guest's
+read asked a host writable end's source that would block).
+GENERATION is the end's copy generation at this attempt; END is the
+guest-side end whose canonical buffer is parked; SCRATCH is the
+reusable octet vector a HOST buffer's element queue is packed into
+(a guest u8 buffer needs none — its linear memory IS the span)."
+  (kind nil)
+  (generation 0)
+  (end nil)
+  (scratch nil))
+
+(defun %end-advance-generation (end)
+  "Start a NEW copy generation on END."
+  (when end (incf (async-end-generation end))))
+
+(defun %end-invalidate-copy (end)
+  "END's copy is over (cancel/drop/hard error): advance the
+generation on BOTH ends and forget any parked host copy, so a stale
+readiness registration can never resume it (and never resumes a
+LATER copy that reuses the same end)."
+  (let ((other (async-end-other end)))
+    (dolist (e (list end other))
+      (when e
+        (incf (async-end-generation e))
+        (setf (async-end-host-copy e) nil)))))
+
+(defun %u8-element-p (t-ct inst)
+  "Is T-CT the byte element type? A byte sink/source span is only
+meaningful there."
+  (or (eq t-ct :u8)
+      (let ((c (and t-ct (ignore-errors (%abi-ct t-ct inst)))))
+        (and c
+             (eq (wasmdown.component:ct-kind c) :prim)
+             (eq (wasmdown.component:ct-payload c) :u8)))))
+
+(defun %non-u8-element-p (t-ct inst)
+  "Does T-CT POSITIVELY name a non-byte element type? The byte-sink
+gate: a resolvable, non-u8 element type is a HOST ERROR; an
+unresolvable one (an opaque type index in a host pair) is left to
+the copy itself, as before."
+  (let ((c (and t-ct (ignore-errors (%abi-ct t-ct inst)))))
+    (and c (not (%u8-element-p c nil)))))
+
+(defun %sink-span-arity-p (sink)
+  "T when SINK takes the (octets start end) span contract. A
+ONE-argument SINK is the pre-cutover LIST contract (the WASI
+providers still register one; their migration is the next wave) and
+is adapted at registration, so the copy path itself has one shape."
+  (let* ((pkg (find-package "SB-INTROSPECT"))
+         (fn (and pkg (find-symbol "FUNCTION-LAMBDA-LIST" pkg))))
+    (and fn
+         (let ((ll (ignore-errors (funcall fn sink))))
+           (and (listp ll)
+                (>= (loop for x in ll
+                          while (not (member x lambda-list-keywords))
+                          count t)
+                    3))))))
+
+(defun %normalize-sink (sink)
+  "SINK as the span contract. A legacy (byte-list) -> error-or-nil
+sink consumes the whole span and reports (values n NIL) or
+(values 0 error): it can never would-block, which is exactly its
+limitation."
+  (cond
+    ((null sink) nil)
+    ((%sink-span-arity-p sink) sink)
+    (t (lambda (octets start end)
+         (let ((err (funcall sink
+                             (coerce (subseq octets start end) 'list))))
+           (if err
+               (values 0 err)
+               (values (- end start) nil)))))))
+
+;;; ---- THE HOST EVENT QUEUE ----
+;;; A pending's resolution (and a future watch's delivery) may land
+;;; on ANY native thread. It is QUEUED there and RUN by the pump on
+;;; the context that owns the call — never on the poster, never
+;;; inside the queue's mutex. The pump runs at the store's host
+;;; boundaries: a pending's own driver, the direct lifted-func-call
+;;; join, and every guest block (%park / %right-stall).
+
+(defstruct (host-event (:constructor %make-host-event (thunk)))
+  thunk)
+
+(defparameter *host-event-count* 0
+  "The number of QUEUED host events, readable without the queue's
+mutex (word-sized): the wait primitives test it before taking the
+lock, so an idle store pays nothing.")
+
+(defparameter *host-event-mutex* (sb-thread:make-mutex :name "host-events"))
+(defparameter *host-event-entries* nil)   ; reversed push order
+(defparameter *host-pumping* nil)         ; bound while a pump runs
+
+(defun %host-enqueue (thunk)
+  "Queue THUNK for the pump. Never runs it here — callable from any
+native thread."
+  (sb-thread:with-recursive-lock (*host-event-mutex*)
+    (setf *host-event-entries*
+          (cons (%make-host-event thunk) *host-event-entries*))
+    (incf *host-event-count*))
+  (sb-thread:with-recursive-lock (*scheduler-mutex*)
+    (incf *async-progress*))
+  nil)
+
+(defun %host-pump ()
+  "Run every queued host event, one at a time, outside every lock.
+A re-entrant pump (an event that blocks and parks) is refused; the
+nested site simply returns and the outer pump finishes the queue.
+Returns the number of events run."
+  (when (or *host-pumping* (not (plusp *host-event-count*)))
+    (return-from %host-pump 0))
+  (let ((*host-pumping* t)
+        (n 0))
+    (loop
+      for ev = (sb-thread:with-recursive-lock (*host-event-mutex*)
+                 (let ((e (car *host-event-entries*)))
+                   (when e
+                     (setf *host-event-entries* (cdr *host-event-entries*))
+                     (decf *host-event-count*))
+                   e))
+      while ev
+      do (funcall (host-event-thunk ev))
+         (incf n))
+    n))
+
+(defmacro %pump-if-pending ()
+  "The wait primitives' cheap hook: pump only when an event is
+queued (an empty queue costs one word read)."
+  '(when (plusp *host-event-count*) (%host-pump)))
+
+;;; ---- THE HOST PENDING (an asynchronous host call) ----
+;;;
+;;; An async-typed host closure may return a HOST-PENDING instead of
+;;; a value. The caller's contract capture (its instance, memory,
+;;; out-param, borrow context — whatever ON-RESOLVE closes over)
+;;; lives in the pending's CONTINUATION, never in the worker's
+;;; dynamic bindings.
+;;;
+;;; STATES: :STARTING (START is still running — its cancel-fn does
+;;; not exist yet, so a cancel is RECORDED only), :WAITING (the
+;;; provider owns the work), :RESOLVED / :REJECTED / :CANCELLED
+;;; (terminal). A CANCEL REQUEST IS NOT TERMINAL: an un-stoppable
+;;; operation still delivers its normal result later. A completion
+;;; after a terminal state is DROPPED (the provider already owns
+;;; the resources it completed with).
+
+(defstruct (host-pending (:constructor %make-host-pending))
+  (state :starting)
+  (terminal-p nil)
+  (cancel-requested nil)
+  (cancel-fn nil)
+  (cancel-installed-p nil)
+  (cancel-fired-p nil)
+  (cancel-queued-p nil)
+  (outcome nil)                     ; (:resolve . v) (:reject . x) (:cancel)
+  (continuation nil)                ; (outcome) -> values, on the pump
+  (delivery-queued-p nil)
+  (delivered-p nil)
+  (delivery-error nil)
+  (mutex (sb-thread:make-mutex :name "host-pending"))
+  (waitqueue (sb-thread:make-waitqueue :name "host-pending")))
+
+(defun %host-pending-terminalize (p outcome)
+  "Set P's terminal OUTCOME once; queue its delivery. T when this
+call won."
+  (let ((won nil))
+    (sb-thread:with-recursive-lock ((host-pending-mutex p))
+      (unless (host-pending-terminal-p p)
+        (setf (host-pending-terminal-p p) t
+              (host-pending-outcome p) outcome
+              (host-pending-state p)
+              (ecase (car outcome)
+                (:resolve :resolved)
+                (:reject :rejected)
+                (:cancel :cancelled))
+              won t)
+        (sb-thread:condition-broadcast (host-pending-waitqueue p))))
+    (when won (%host-pending-queue-delivery p))
+    won))
+
+(defun %host-pending-resolve (p value)
+  "Queue P's RESOLUTION with VALUE (NIL is a legitimate value: the
+tags, not the payload, carry the meaning)."
+  (%host-pending-terminalize p (cons :resolve value)))
+
+(defun %host-pending-reject (p failure)
+  "Queue P's REJECTION with FAILURE (a condition, or the provider's
+domain error value)."
+  (%host-pending-terminalize p (cons :reject failure)))
+
+(defun %host-pending-acknowledge-cancel (p)
+  "The provider (or its cancel-fn) confirms the work STOPPED. Queues
+the CANCELLED outcome; T when this call won."
+  (let ((won nil))
+    (sb-thread:with-recursive-lock ((host-pending-mutex p))
+      (unless (host-pending-terminal-p p)
+        (setf (host-pending-terminal-p p) t
+              (host-pending-outcome p) (list :cancel)
+              (host-pending-state p) :cancelled
+              won t)
+        (sb-thread:condition-broadcast (host-pending-waitqueue p))))
+    (when won (%host-pending-queue-delivery p))
+    won))
+
+(defun %host-pending-request-cancel (p)
+  "The RUNTIME's cancel path (a Subtask's OnCancel). The request is
+RECORDED under the pending's mutex; a request that arrives while
+START is still running fires once, AFTER the cancel-fn is installed.
+T when the request was newly recorded."
+  (let ((fresh nil))
+    (sb-thread:with-recursive-lock ((host-pending-mutex p))
+      (when (or (host-pending-terminal-p p)
+                (host-pending-cancel-requested p))
+        (return-from %host-pending-request-cancel nil))
+      (setf (host-pending-cancel-requested p) t
+            fresh t))
+    (when fresh (%host-pending-queue-cancel p))
+    t))
+
+(defun %host-pending-queue-cancel (p)
+  (let ((queue nil))
+    (sb-thread:with-recursive-lock ((host-pending-mutex p))
+      (when (and (host-pending-cancel-installed-p p)
+                 (not (host-pending-cancel-fired-p p))
+                 (not (host-pending-cancel-queued-p p))
+                 (not (host-pending-terminal-p p)))
+        (setf (host-pending-cancel-queued-p p) t
+              queue t)))
+    (when queue
+      (%host-enqueue (lambda () (%host-pending-run-cancel p))))))
+
+(defun %host-pending-run-cancel (p)
+  "Run the provider's cancel-fn ONCE, on the pump. T from it means
+the work actually STOPPED (acknowledged); NIL leaves the operation
+running and its later normal result still delivers."
+  (let ((fn nil))
+    (sb-thread:with-recursive-lock ((host-pending-mutex p))
+      (setf (host-pending-cancel-queued-p p) nil)
+      (unless (or (host-pending-cancel-fired-p p)
+                  (host-pending-terminal-p p)
+                  (not (host-pending-cancel-installed-p p)))
+        (setf (host-pending-cancel-fired-p p) t
+              fn (host-pending-cancel-fn p))))
+    (when fn
+      (let ((stopped (handler-case (funcall fn) (error () nil))))
+        (when stopped (%host-pending-acknowledge-cancel p))))))
+
+(defun %host-pending-set-continuation (p fn)
+  "Attach P's completion continuation — run ONCE on the pump with the
+outcome, in the caller's captured context. A pending that already
+settled queues its delivery now."
+  (let ((queue nil))
+    (sb-thread:with-recursive-lock ((host-pending-mutex p))
+      (setf (host-pending-continuation p) fn)
+      (when (and (host-pending-terminal-p p)
+                 (not (host-pending-delivered-p p)))
+        (setf queue t)))
+    (when queue (%host-pending-queue-delivery p)))
+  p)
+
+(defun %host-pending-queue-delivery (p)
+  (let ((queue nil))
+    (sb-thread:with-recursive-lock ((host-pending-mutex p))
+      (when (and (not (host-pending-delivery-queued-p p))
+                 (not (host-pending-delivered-p p)))
+        (setf (host-pending-delivery-queued-p p) t
+              queue t)))
+    (when queue
+      (%host-enqueue (lambda () (%host-pending-deliver p))))))
+
+(defun %host-pending-deliver (p)
+  "Run P's continuation once. The continuation is the runtime's
+result path (lower the result / resolve the subtask); its failure is
+recorded for the driver, never re-signalled on the pump."
+  (let ((fn nil)
+        (outcome nil))
+    (sb-thread:with-recursive-lock ((host-pending-mutex p))
+      (setf (host-pending-delivery-queued-p p) nil)
+      (when (and (host-pending-terminal-p p)
+                 (not (host-pending-delivered-p p))
+                 (host-pending-continuation p))
+        (setf (host-pending-delivered-p p) t
+              fn (host-pending-continuation p)
+              outcome (host-pending-outcome p))))
+    (when fn
+      (handler-case (funcall fn outcome)
+        (error (c) (setf (host-pending-delivery-error p) c))))))
+
+(defun %host-pending-join (p)
+  "Drive P to its terminal outcome on THIS thread and return the
+domain result (the DIRECT lifted-func-call path). A rejected call
+re-signals a condition failure (a non-condition failure is returned
+as the provider's domain error value); a cancelled call is a host
+error. The wait is the store's own park (the right is RELEASED
+across it, and queued events run at the boundary), so a guest caller
+never holds the right across a host wait."
+  (loop
+    with last-state = nil
+    with idle = 0
+    do (%host-pump)
+    do (let ((terminal nil) (outcome nil) (state nil))
+      (sb-thread:with-recursive-lock ((host-pending-mutex p))
+        (setf terminal (host-pending-terminal-p p)
+              outcome (host-pending-outcome p)
+              state (host-pending-state p)))
+      (when terminal
+        (let ((e (host-pending-delivery-error p)))
+          (when e (error e)))
+        (case (car outcome)
+          (:resolve (return (cdr outcome)))
+          (:reject (let ((x (cdr outcome)))
+                     (if (typep x 'condition)
+                         (error x)
+                         (return x))))
+          (:cancel
+           (error 'wasmdown:host-error
+                  :message "host call cancelled"))))
+      ;; the interim liveness guard (the reactor wave replaces it with
+      ;; a deadline-driven poll): a provider that never settles is
+      ;; reported, not hung on.
+      (if (eql state last-state)
+          (incf idle)
+          (setf idle 0
+                last-state state))
+      (when (> idle (* 5000 2))
+        (error 'wasmdown:wasm-trap :kind :generic
+               :message
+               "deadlock detected: host call cannot make further progress")))
+    do (let ((m (host-pending-mutex p))
+             (q (host-pending-waitqueue p))
+             (self (or *right-self* *current-thread*)))
+         (sb-thread:grab-mutex m)
+         (unwind-protect
+              (%park self m q)
+           (when (sb-thread:holding-mutex-p m)
+             (sb-thread:release-mutex m))))))
+
+(defun make-host-pending (&key start)
+  "An ASYNCHRONOUS host call. START is
+  (resolve reject acknowledge-cancel) -> cancel-fn
+called ONCE, now, with three closures that may be invoked from ANY
+native thread (they only QUEUE an event):
+  RESOLVE            (&optional value) — the domain result;
+  REJECT             (failure)         — a condition or a domain error;
+  ACKNOWLEDGE-CANCEL ()               — the work stopped.
+The returned cancel-fn is called at most once, on the pump, and its
+true return value acknowledges the cancellation (an un-stoppable
+operation returns NIL and delivers its normal result later).
+Returns the pending record (see HOST-PENDING): the caller hands it
+back to the runtime, which attaches the completion continuation."
+  (unless (functionp start)
+    (error 'wasmdown:host-error
+           :message "make-host-pending requires a start function"))
+  (let* ((p (%make-host-pending))
+         (cancel-fn
+           (funcall start
+                    (lambda (&optional value) (%host-pending-resolve p value))
+                    (lambda (failure) (%host-pending-reject p failure))
+                    (lambda () (%host-pending-acknowledge-cancel p)))))
+    (sb-thread:with-recursive-lock ((host-pending-mutex p))
+      (setf (host-pending-cancel-fn p) cancel-fn
+            (host-pending-cancel-installed-p p) t)
+      (when (eq (host-pending-state p) :starting)
+        (setf (host-pending-state p) :waiting)))
+    ;; a cancel that arrived DURING start fires once, now
+    (when (host-pending-cancel-requested p)
+      (%host-pending-queue-cancel p))
+    p))
+
+;;; ---- THE BYTE SPAN AND THE PARTIAL ACCEPT ----
+
+(defun %sink-span (writer copy remain)
+  "The octet span of WRITER's buffer for ONE sink attempt: at most
++HOST-SPAN-MAX+ bytes from the buffer's current progress.
+A GUEST buffer yields the linear memory's OWN byte vector, taken
+FRESH (a memory.grow may have replaced it since the last attempt) —
+the provider must not retain it across the call. A HOST buffer's
+element queue is packed into COPY's reusable scratch vector (the
+bounded scratch, reused per copy generation)."
+  (let* ((buf (async-end-buffer writer))
+         (span (min remain +host-span-max+)))
+    (if (host-buffer-p buf)
+        (let* ((scratch (or (host-copy-scratch copy)
+                            (setf (host-copy-scratch copy)
+                                  (make-array +host-span-max+
+                                              :element-type '(unsigned-byte 8)))))
+               (vals (host-buffer-values buf))
+               (k (min span (length vals))))
+          (loop for v in vals
+                for i from 0 below k
+                do (setf (aref scratch i) (logand (or v 0) #xff)))
+          (values scratch 0 k))
+        (let* ((memory (first buf))
+               ;; byte offsets ARE element offsets only at element
+               ;; size 1 (a u8 sink on anything wider is a host error)
+               (esz (or (and (async-end-t-ct writer)
+                             (ignore-errors
+                               (%abi-elem-size (async-end-t-ct writer)
+                                               (async-end-owner writer))))
+                        1))
+               (octets (wasmdown.runtime:memory-instance-bytes memory))
+               (start (+ (second buf) (* (fourth buf) esz)))
+               (end (+ start (* span esz))))
+          (unless (= esz 1)
+            (error 'wasmdown:host-error
+                   :message "a byte sink requires a stream<u8> element type"))
+          (when (> end (length octets))
+            (error 'wasmdown:wasm-trap :kind :generic
+                   :message "out of bounds memory access"))
+          (values octets start end)))))
+
+(defun %buffer-accept (buf n)
+  "Advance BUF's progress by the N bytes a sink accepted: a guest u8
+buffer's element offsets (element size 1), a host buffer's element
+queue."
+  (if (host-buffer-p buf)
+      (progn
+        (setf (host-buffer-values buf) (nthcdr n (host-buffer-values buf)))
+        (incf (host-buffer-progress buf) n))
+      (incf (fourth buf) n)))
+
+(defun host-end-generation (end)
+  "END's CURRENT copy generation — the value a provider registers
+with host-end-ready. Taken from INSIDE a sink/source call it names
+the attempt in progress; taken after a (0 NIL) would-block it names
+the PARKED attempt."
+  (async-end-generation end))
+
+(defun host-end-ready (end generation)
+  "Re-run the copy parked on END for GENERATION only. A notification
+from an older attempt (or from a copy that was cancelled, dropped or
+replaced) names a different generation and resumes NOTHING — the
+stale-fd/stale-copy guard. T when a parked copy was resumed."
+  (let ((copy (async-end-host-copy end)))
+    (when (and copy
+               (eql generation (async-end-generation end))
+               (eql generation (host-copy-generation copy)))
+      (setf (async-end-host-copy end) nil)   ; claim it: one retry
+      (ecase (host-copy-kind copy)
+        (:sink
+         (%host-sink-drain (host-copy-end copy) :retry t)
+         t)
+        (:source
+         (let* ((reader (host-copy-end copy))
+                (buf (async-end-buffer reader)))
+           (when buf
+             (%host-source-fill reader buf end :retry t)
+             t)))))))
+
 (defun host-end-set-sink (end sink)
   "Make the READABLE end END drain the bytes its guest writer stages
-into SINK: (byte-list) -> error-code string or NIL."
-  (setf (async-end-host-sink end) sink)
+into SINK: (octets start end) -> (values consumed-count
+error-or-nil). A one-argument SINK is the legacy (byte-list) shape
+and is adapted (see %normalize-sink). Only a stream<u8> may carry a
+byte sink: any other element type is a HOST ERROR, refused HERE so a
+provider learns at registration, not mid-copy."
+  (when (and sink
+             (%non-u8-element-p (async-end-t-ct end)
+                                (async-end-owner end)))
+    (error 'wasmdown:host-error
+           :message "a byte sink requires a stream<u8> element type"))
+  (setf (async-end-host-sink end) (%normalize-sink sink))
   end)
 
 (defun host-end-set-source (end source)
   "Make the WRITABLE end END feed its guest reader from SOURCE:
-(max) -> (values byte-list eof-p)."
+(max) -> (values sequence eof-p), SEQUENCE a u8 vector or an element
+list; (NIL NIL) means WOULD-BLOCK (never EOF)."
   (setf (async-end-host-source end) source)
   end)
 
@@ -3859,15 +4413,21 @@ side of a refused stream uses this to close a stream it cannot feed."
 
 (defun %host-peer-dropped (host-end dropped)
   "The DROP NOTIFICATION: the guest dropped DROPPED, which was paired
-with the host end HOST-END. Fire its one-shot hook."
+with the host end HOST-END. Fire its one-shot hook — and a pending
+future watch learns the peer is gone (queued, never inline)."
   (let ((hook (async-end-host-on-drop host-end)))
     (when hook
       (setf (async-end-host-on-drop host-end) nil)
-      (funcall hook dropped (async-end-host-error host-end)))))
+      (funcall hook dropped (async-end-host-error host-end))))
+  (let ((w (async-end-host-watch host-end)))
+    (when w (%host-watch-queue w t))))
 
 (defun %host-drop (host-end)
   "Drop the host end HOST-END: its guest peer learns DROPPED and the
-host end's one-shot hook fires (the future resolves)."
+host end's one-shot hook fires (the future resolves). The copy is
+over: its generation advances, so a late readiness notification
+resumes nothing."
+  (%end-invalidate-copy host-end)
   (%end-drop host-end)
   (when (async-end-host-on-drop host-end)
     (%host-peer-dropped host-end nil))
@@ -3877,7 +4437,8 @@ host end's one-shot hook fires (the future resolves)."
   "The provider-side drain: READER is the host READABLE end a provider
 just took over (wasi:cli's write-via-stream). If the guest staged a
 write before the call, its parked buffer drains into the sink now;
-returns the number of elements drained (0 when nothing was staged)."
+returns the number of bytes accepted (0 when nothing was staged or
+the sink would block)."
   (let ((writer (async-end-other reader)))
     (if (and writer (async-end-host-sink reader)
              (let ((buf (async-end-buffer writer)))
@@ -3885,53 +4446,214 @@ returns the number of elements drained (0 when nothing was staged)."
         (%host-sink-drain writer)
         0)))
 
-(defun %host-sink-drain (writer)
+(defun %host-sink-drain (writer &key retry)
   "Drain WRITER's staged buffer (case 2 parked it there) into the
-HOST-SINK of its readable peer, then notify WRITER COMPLETED. A sink
-error drops the readable peer (the guest's next write sees DROPPED)
-and rides the resolved future."
+HOST-SINK of its readable peer, one bounded span at a time:
+
+  * the sink's consumed count advances the buffer by exactly that
+    many bytes and the REMAINDER continues in this same call;
+  * (0 NIL) is WOULD-BLOCK — nothing is consumed, the buffer stays
+    parked, the copy stays COPYING, and the end keeps the attempt's
+    GENERATION for host-end-ready;
+  * an error ends the copy. Already-accepted progress is NOT lost:
+    WRITER is notified with the count it reached and the error rides
+    the host end (whose drop resolves the provider's future).
+
+RETRY keeps the parked attempt's generation; a new attempt
+advances it."
   (let* ((buf (async-end-buffer writer))
          (reader (async-end-other writer))
-         (sink (and reader (async-end-host-sink reader)))
-         (n (if buf (%buffer-remain buf) 0)))
+         (sink (and reader (async-end-host-sink reader))))
     (cond
       ((null buf) 0)
-      ((or (zerop n) (null sink))
+      ((or (null sink) (zerop (%buffer-remain buf)))
        (setf (async-end-buffer writer) nil)
        0)
       (t
-       (let* ((vals (%buffer-take buf n (async-end-t-ct writer)
-                                  (async-end-owner writer)))
-              (progress (%buffer-progress buf))
-              (err (funcall sink vals)))
-         (setf (async-end-buffer writer) nil)
-         (if err
-             (progn
-               (setf (async-end-host-error reader) err)
-               (%host-drop reader))
-             (%end-notify writer progress))
-         n)))))
+       (when (%non-u8-element-p (async-end-t-ct writer)
+                                (async-end-owner writer))
+         (error 'wasmdown:host-error
+                :message "a byte sink requires a stream<u8> element type"))
+       (let ((copy (async-end-host-copy reader)))
+         (unless (and retry copy
+                      (eq (host-copy-kind copy) :sink)
+                      (eq (host-copy-end copy) writer))
+           (%end-advance-generation reader)
+           (setf copy (make-host-copy
+                       :kind :sink
+                       :generation (async-end-generation reader)
+                       :end writer)))
+         (setf (async-end-host-copy reader) copy)
+         (let ((accepted 0)
+               (error-code nil))
+           (loop
+             for remain = (%buffer-remain buf)
+             while (plusp remain)
+             do (multiple-value-bind (octets start end)
+                    (%sink-span writer copy remain)
+                  (multiple-value-bind (n err)
+                      (funcall sink octets start end)
+                    (cond
+                      ((and (integerp n) (plusp n))
+                       (when (> n (- end start))
+                         (error 'wasmdown:host-error
+                                :message
+                                "a byte sink accepted more bytes than its span"))
+                       (%buffer-accept buf n)
+                       (incf accepted n)
+                       (when err
+                         ;; n > 0 together with an error is a provider
+                         ;; bug; the accepted prefix is still kept
+                         (setf error-code err)
+                         (return)))
+                      (err
+                       (setf error-code err)
+                       (return))
+                      (t (return))))))  ; (0 NIL): WOULD-BLOCK
+           (cond
+             (error-code
+              (setf (async-end-buffer writer) nil)
+              (setf (async-end-host-error reader) error-code)
+              (%end-notify writer (%buffer-progress buf))
+              (%host-drop reader))
+             ((zerop (%buffer-remain buf))
+              (setf (async-end-buffer writer) nil)
+              (setf (async-end-host-copy reader) nil)
+              (%end-notify writer (%buffer-progress buf)))
+             (t
+              ;; WOULD-BLOCK: park — buffer on WRITER, attempt on READER
+              (setf (async-end-buffer writer) buf)
+              (setf (async-end-host-copy reader) copy)))
+           accepted))))))
 
-(defun %host-source-fill (reader buffer peer)
-  "Fill READER's BUFFER from the SOURCE on its writable peer PEER:
-bytes now -> COMPLETED with the count; none + EOF -> PEER dropped and
-READER notified DROPPED; none + not EOF -> park BUFFER and wait."
+(defun %host-source-fill (reader buffer peer &key retry)
+  "Fill READER's BUFFER from the SOURCE on its writable peer PEER.
+
+  * bytes -> sealed into the buffer; READER told COMPLETED|count;
+  * (NIL T) -> EOF: PEER drops (the next read is DROPPED);
+  * (NIL NIL) -> WOULD-BLOCK: a TEMPORARY empty, never EOF. The
+    buffer stays parked on READER with the attempt's generation, and
+    host-end-ready resumes it.
+
+RETRY keeps the parked attempt's generation."
   (if (async-end-host-eof-p peer)
       (progn (setf (async-end-buffer reader) nil) (%host-drop peer))
-      (multiple-value-bind (bytes eof)
-          (funcall (async-end-host-source peer)
-                   (%buffer-remain buffer))
-        (when eof (setf (async-end-host-eof-p peer) t))
-        (cond
-          ((plusp (length bytes))
-           (%buffer-put buffer bytes (async-end-t-ct reader)
-                        (async-end-owner reader))
-           (%end-notify reader (%buffer-progress buffer)))
-          (eof
-           ;; §: the host writer's end is gone — DROPPED to the reader
-           (setf (async-end-buffer reader) nil)
-           (%host-drop peer))
-          (t (setf (async-end-buffer reader) buffer))))))
+      (let ((copy (async-end-host-copy peer)))
+        (unless (and retry copy
+                     (eq (host-copy-kind copy) :source)
+                     (eq (host-copy-end copy) reader))
+          (%end-advance-generation peer)
+          (setf copy (make-host-copy
+                      :kind :source
+                      :generation (async-end-generation peer)
+                      :end reader)))
+        (setf (async-end-host-copy peer) copy)
+        (multiple-value-bind (seq eof)
+            (funcall (async-end-host-source peer) (%buffer-remain buffer))
+          (when eof (setf (async-end-host-eof-p peer) t))
+          (let* ((have (and seq (length seq)))
+                 (k (and have (min have (%buffer-remain buffer)))))
+            (cond
+              ((and k (plusp k))
+               (setf (async-end-host-copy peer) nil)
+               (%buffer-put buffer
+                            (if (= k have) seq (subseq seq 0 k))
+                            (async-end-t-ct reader)
+                            (async-end-owner reader))
+               (%end-notify reader (%buffer-progress buffer)))
+              (eof
+               ;; §: the host writer's end is gone — DROPPED to the
+               ;; reader
+               (setf (async-end-buffer reader) nil)
+               (setf (async-end-host-copy peer) nil)
+               (%host-drop peer))
+              (t
+               ;; (NIL NIL) or an empty non-EOF sequence: WOULD-BLOCK
+               (setf (async-end-buffer reader) buffer)
+               (setf (async-end-host-copy peer) copy))))))))
+
+;;; ---- THE ONE-SHOT FUTURE WATCH ----
+;;; A provider that must observe a HOST-OWNED readable future
+;;; subscribes once. Delivery is ALWAYS queued (a value that is
+;;; already there is no exception) and happens exactly once, on the
+;;; pump, with the caller's context. The reader is CONSUMED: the
+;;; value moves to the observer (the same object — an own resource is
+;;; never copied), so a later normal read cannot double-consume it.
+
+(defstruct (host-future-watch (:constructor %make-host-future-watch
+                                            (&key end callback)))
+  (end nil)
+  (callback nil)
+  (state :waiting)   ; :waiting :queued :delivered :cancelled
+  (dropped-p nil)
+  (value nil)
+  (value-p nil)
+  (mutex (sb-thread:make-mutex :name "future-watch")))
+
+(defun %host-watch-take-value (w)
+  "Take the peer's resolved value into W's record WITHOUT copying it:
+the same domain object moves to the observer."
+  (let ((peer (async-end-other (host-future-watch-end w))))
+    (when (and peer (async-end-host-value-p peer))
+      (setf (host-future-watch-value w) (async-end-host-value peer)
+            (host-future-watch-value-p w) t
+            (async-end-host-value-p peer) nil))))
+
+(defun %host-watch-queue (w dropped-p)
+  "Queue W's ONE delivery. Called from resolve/drop — never
+inline-delivers."
+  (let ((queue nil))
+    (sb-thread:with-recursive-lock ((host-future-watch-mutex w))
+      (when (eq (host-future-watch-state w) :waiting)
+        (setf (host-future-watch-state w) :queued
+              (host-future-watch-dropped-p w) dropped-p
+              queue t)
+        (%host-watch-take-value w)))
+    (when queue
+      (%host-enqueue (lambda () (%host-watch-deliver w))))))
+
+(defun %host-watch-deliver (w)
+  "Deliver W's one shot: (CALLBACK value peer-dropped-p)."
+  (let ((cb nil) (value nil) (value-p nil) (dropped nil))
+    (sb-thread:with-recursive-lock ((host-future-watch-mutex w))
+      (when (eq (host-future-watch-state w) :queued)
+        (setf (host-future-watch-state w) :delivered
+              cb (host-future-watch-callback w)
+              value (host-future-watch-value w)
+              value-p (host-future-watch-value-p w)
+              dropped (host-future-watch-dropped-p w))
+        (setf (async-end-host-watch (host-future-watch-end w)) nil)))
+    (when cb
+      (funcall cb value (and dropped (not value-p))))))
+
+(defun %host-watch-cancel (w)
+  "Withdraw a NOT-YET-QUEUED subscription. A queued one cannot be
+withdrawn (the reader was already consumed at queue time): a second
+consumer must never observe the same value."
+  (let ((cancelled nil))
+    (sb-thread:with-recursive-lock ((host-future-watch-mutex w))
+      (when (eq (host-future-watch-state w) :waiting)
+        (setf (host-future-watch-state w) :cancelled
+              cancelled t)
+        (setf (async-end-host-watch (host-future-watch-end w)) nil)))
+    cancelled))
+
+(defun host-future-watch (end callback)
+  "A ONE-SHOT read subscription on the host-owned READABLE future END.
+CALLBACK is (value peer-dropped-p) -> side effect, run ONCE on the
+pump — never inline, even when the value is already there — and the
+reader is consumed by the delivery. Returns the cancel-fn (withdraws
+a subscription that has not been queued yet; NIL once queued)."
+  (unless (and (async-end-p end) (async-end-future-p end))
+    (error 'wasmdown:host-error
+           :message "host-future-watch needs a readable future end"))
+  (let ((w (%make-host-future-watch :end end :callback callback))
+        (peer (async-end-other end)))
+    (setf (async-end-host-watch end) w)
+    (cond
+      ((null peer) (%host-watch-queue w t))
+      ((async-end-host-value-p peer) (%host-watch-queue w nil)))
+    (lambda () (%host-watch-cancel w))))
 
 (defun %host-value-deliver (reader buffer peer)
   "Deliver the resolved HOST-VALUE on PEER into READER's BUFFER
@@ -3946,16 +4668,20 @@ READER notified DROPPED; none + not EOF -> park BUFFER and wait."
 (defun host-future-resolve (writer value)
   "Resolve the host WRITABLE future end WRITER with the component
 domain VALUE (`(:ok)` / `(:err . \"io\")`): delivered at the guest's
-read — or now, if the guest is already parked with a buffer."
+read — or now, if the guest is already parked with a buffer. A
+one-shot watch on the readable peer is QUEUED (never run inline)."
   (setf (async-end-host-value writer) value
         (async-end-host-value-p writer) t)
   (let ((reader (async-end-other writer)))
-    (when (and reader (async-end-buffer reader))
-      (let ((buf (async-end-buffer reader)))
-        (setf (async-end-buffer reader) nil)
-        (%buffer-put buf (list value) (async-end-t-ct reader)
-                     (async-end-owner reader))
-        (%end-notify reader 1))))
+    (when reader
+      (let ((w (async-end-host-watch reader)))
+        (when w (%host-watch-queue w nil)))
+      (when (async-end-buffer reader)
+        (let ((buf (async-end-buffer reader)))
+          (setf (async-end-buffer reader) nil)
+          (%buffer-put buf (list value) (async-end-t-ct reader)
+                       (async-end-owner reader))
+          (%end-notify reader 1)))))
   value)
 
 (defun host-end-read (reader)
@@ -4100,15 +4826,21 @@ the (memory ptr length progress) list. The 5 cases in order:
 DROPPED on its next event delivery) unless it is already DONE or
 already has a pending event; detach both ends. M16 slice 2: the
 detached HOST peer's one-shot hook fires (a provider resolves its
-future when the guest drops the stream's writable end)."
+future when the guest drops the stream's writable end). M17 step 5:
+the copy generation advances on BOTH ends, so a readiness
+registration from the dropped copy resumes nothing, and a pending
+future watch learns the peer is gone."
   (let ((other (async-end-other end)))
+    (%end-invalidate-copy end)
     (when other
       (unless (or (eq (async-end-state other) :done)
                   (async-waitable-pending-event other))
         (%end-notify other 0))
       (setf (async-end-other other) nil))
     (setf (async-end-other end) nil)
-    (when (and other (async-end-host-on-drop other))
+    (when (and other
+               (or (async-end-host-on-drop other)
+                   (async-end-host-watch other)))
       (%host-peer-dropped other end)))
   ;; Waitable.drop: leave any waitable set
   (%waitable-join end nil))
@@ -4118,7 +4850,12 @@ future when the guest drops the stream's writable end)."
 COPY, arming the pending event with progress 0 (the deterministic
 profile's always-notify — the host-owned nondeterministic branch
 is the host's freedom, taken as notify here) unless one is
-already armed (never overwrite a previous progress)."
+already armed (never overwrite a previous progress). M17 step 5: a
+cancelled copy drops its parked buffer and advances the generation,
+so its provider's late readiness notification resumes nothing."
+  (when (async-end-buffer end)
+    (setf (async-end-buffer end) nil))
+  (%end-invalidate-copy end)
   (setf (async-end-state end) :cancelling-copy)
   (unless (async-waitable-pending-event end)
     (%end-notify end 0)))
@@ -4682,19 +5419,25 @@ never with the park)."
   "SELF holds the right and MUTEX. Release the right, wait bounded on
 QUEUE/MUTEX (the wait leaves MUTEX released, and fact (a)'s re-grab
 is inside %bounded-wait), release MUTEX, re-acquire the right.
-Returns with the right held and MUTEX not held."
+Returns with the right held and MUTEX not held. M17 step 5: a guest
+wait is a host-completion boundary too — queued host events (a
+pending's resolution, a future watch) run HERE, in the caller's
+captured context, never on the posting thread."
   (%right-yield self)
   (%bounded-wait queue mutex timeout)
   (sb-thread:release-mutex mutex)
-  (%right-acquire self))
+  (%right-acquire self)
+  (%pump-if-pending))
 
 (defun %right-stall (self &key (seconds +poll-slice+))
   "The five POLL sites' wait: release the right, sleep one bounded
 slice, re-acquire. Same cadence as the M15/M17 sleep-polls (their
-oracles' idle budgets are calibrated on it)."
+oracles' idle budgets are calibrated on it). A poll boundary is a
+host-completion boundary too (see %park)."
   (%right-yield self)
   (sleep seconds)
-  (%right-acquire self))
+  (%right-acquire self)
+  (%pump-if-pending))
 
 (defun %right-handoff-to (self target &key (seconds 0.0002))
   "Release the right NAMING TARGET as the next ticket — a targeted
@@ -7994,13 +8737,47 @@ is the valtype."
   (let ((ft (and (lifted-func-p f)
                  (lifted-func-type f))))
     (when (and (lifted-func-p f) (lifted-func-host f))
-      ;; M16 slice 3b: a HOST provider is a CL closure — it cannot
-      ;; block, so the async lift contract reduces to on_start, the
-      ;; call, on_resolve (the caller's pack then sees the resolved
-      ;; subtask and returns RETURNED eagerly).
-      (when on-start (funcall on-start))
-      (funcall on-resolve (apply #'lifted-func-call f component-args))
-      (return-from %call-async-funcinst (values (lambda () nil) nil)))
+      ;; M16 slice 3b: a HOST provider is a CL closure. M17 step 5:
+      ;; an ASYNC-typed one may return a HOST-PENDING instead of a
+      ;; value — the runtime registers the caller's completion
+      ;; continuation (the CALLER's captured context: this closure
+      ;; already closes over the callee instance, memory, out-param
+      ;; and borrow state) and the Subtask's cancel path, then calls
+      ;; the provider ONCE. Nothing blocks here: the subtask stays
+      ;; STARTED and its resolution is delivered by the pump, at a
+      ;; store boundary (a guest wait or the oracle's poll).
+      (let* ((host (lifted-func-host f))
+             (*host-provider-inst* (lifted-func-inst f))
+             (async-p (and ft (third (wasmdown.component:ct-payload ft)))))
+        (when on-start (funcall on-start))
+        (let ((val (funcall host component-args)))
+          (cond
+            ((host-pending-p val)
+             (unless async-p
+               (error 'wasmdown:host-error
+                      :message
+                      "a sync-typed host closure returned a host-pending"))
+             (let ((pending val))
+               (%host-pending-set-continuation
+                pending
+                (lambda (outcome)
+                  (ecase (car outcome)
+                    (:resolve (funcall on-resolve (cdr outcome)))
+                    (:cancel (funcall on-resolve :cancelled))
+                    (:reject (let ((x (cdr outcome)))
+                               (if (typep x 'condition)
+                                   (funcall on-resolve (cons :trap x))
+                                   (funcall on-resolve x)))))))
+               ;; an already-settled pending delivers NOW (still
+               ;; through the pump: one code path for both cases)
+               (%host-pump)
+               (return-from %call-async-funcinst
+                 (values (lambda () (%host-pending-request-cancel pending))
+                         nil))))
+            (t
+             (funcall on-resolve val)
+             (return-from %call-async-funcinst
+               (values (lambda () nil) nil)))))))
     (if (and ft (third (wasmdown.component:ct-payload ft)))
         ;; the callee is ASYNC-TYPED: run the lift on its own thread
         ;; (the task resolves via task.return whenever it's ready)
