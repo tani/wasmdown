@@ -1,3 +1,41 @@
+# M17 SESSION 38 — THE WATCH ROW IS CLOSED (merge 783f067): A GUEST'S NESTED ASYNC-CALLEE
+# LOWER KEEPS THE RIGHT UNTIL ITS OWN NEXT PARK. The project now has NO open row.
+# REPRODUCTION: 0/150 in-lane this window (also 0/30 under 20 CPU hogs), so it was reproduced
+# with the ledger's own PREDECESSOR-PAIR shape — predecessor -> sync-streams in one process:
+# pre-fix 6 failing `sync-streams::1` rows / 500 iterations (3/100 after sync-barges-in, 2/100
+# after empty-wait, 1/200 instrumented, 0/100 after switch-to-ready-callback).
+# THE GUEST'S CHECK at index 1 (in $DM.run): the async lower packed STARTED (1) where the
+# fixture pins STARTING (0), i.e. $C.set had already passed Task.enter_implicit_thread's
+# backpressure gate — but the fixture pins STARTING because $C.get must still HOLD $C's
+# exclusive_thread at that gate.
+# NON-INTRUSIVE CAPTURE (in-memory cons log printed ONCE at %store-teardown; nothing added to
+# the hot path — the lesson that per-event I/O changes the interleave and has twice deadlocked
+# a diagnosis):
+#   (:TEXIT (912 1) :RESOLVED T)      ; $C.get EXITs, releasing $C's exclusive
+#   (:PACK 1 1 NIL T NIL)             ; packed STARTED, started-at-flip T
+#   (:GTRAP (912) "unreachable executed")
+# THE RULE: %canon-lift-async's loop can only take the store right at the callee's park or
+# exit, so the returning caller is mid-turn — yet the cleanup RELEASED the right, and a tick
+# fired for a granted sibling let $C.get's post-task.return continuation run inside the
+# caller's turn, EXIT, and release $C's exclusive before the gate check.
+# FIX: a GUEST caller keeps the right until its own next park/exit; a DRIVER caller (top-level
+# invoke / synthetic executor) still releases, since it leaves the store. No lock-order edge
+# added; no other rule touched.
+# PIN component/nested-sync-lower-keeps-guest-right-pin: the real entry point (guest keeps the
+# right AND the ticket, driver releases), a crafted fixture (sync-streams shape + a ready yield
+# sibling + a long caller window) that must read STARTING, and the vendored component + assert
+# row verbatim x5. NEGATIVE CONTROL in-tree: forcing keep-right to NIL makes the pin FAIL and
+# the crafted fixture trap 10/10.
+# Measured: pin 30/30; units 553/0 twice (552 + the pin); the ENUMERATED 12-fixture set 336
+# rows / 336 pass / 0 fail; probe-async-perfile prints `done`; adjacent n=30 pair master 0/30
+# (10.14 s) vs this tree 0/30 (10.17 s) = zero cost; the pair probe after the fix reads 0
+# failing rows / 1300 iterations; and the LANE BLOCK AFTER THE MERGE reads red 0/30,
+# fail_commands 0, walls 9.96-10.29.
+# PROJECT STATE: master 783f067, units 553/0, one branch (master), working tree clean except the
+# user's .envrc, plan steps 1-6 implemented, steps 7/8 out of scope by direction, NO parked
+# branch, NO open row, NO unresolved finding. What remains is not work: the standing caveat that
+# the lane's 0-fail x 30 is window-locked while the PINS (each with a negative control that
+# fails when its rule is re-broken) are the guarantee.
 # M17 SESSION 37 — A FRESH-CHECKOUT VERIFICATION, WHICH IS THE ONE THING A CLOSING RECORD
 # SHOULD ALSO PROVE: the committed tree is SELF-CONTAINED.
 # Run in a clean `git worktree add /tmp/fresh HEAD` (no working-tree state, no untracked
