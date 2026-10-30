@@ -1,3 +1,45 @@
+# M17 SESSION 17 — THE TWO "PREMATURE PARK RELEASE" ROWS WERE ALREADY CLOSED BY
+# 90715e2; THIS SLICE PROVED IT DIFFERENTIALLY AND PINNED IT (merge 3ab0d5a).
+# THE PROOF: the credit split was RE-BROKEN in isolation (async-thread-suspend made to
+# accept wake-count again, i.e. the pre-90715e2 rule), measured, then
+# src/component-runtime.lisp restored BYTE-IDENTICALLY (`git diff` = 0 lines). On the
+# re-broken rule, 30 standalone runs each: excl-resume::2 7/30 red, may-block::8 10/30
+# red. The instrumented provenance showed a GENERIC NUDGE (wake-count=1,
+# resume-count=0) — the store-right handoff or the no-quantum fallback — never a
+# resume. With the split in place both are 0/10 runs.
+# THE GUEST'S OWN SPECIFICATION, quoted from the fixtures: both rows do
+# `(drop (call $thread.suspend))` and then check a peer's flag
+# (`$pinged` / `$worker-ran`); the check trips when suspend returns before that peer
+# ran. §494 suspend is block() with NO readiness, §407 ready_func is None, §433-440/
+# §936 a suspended thread is not in Store.waiting — so no tick may pick it and only a
+# spec-level resume may end it. All four resume-count writers were audited; each is a
+# spec-level resume.
+# THE PIN, component/premature-park-release-pin: (1) a synthetic thread in the real
+# async-thread-suspend stays parked across a plain nudge AND across
+# async-thread-resume-all, while a same-instance READY peer's resume-later is only a
+# MARK (ready-p + the §242-273 handoff slot, resume-count 0) that does not inline-wake
+# it, and the next tick's ready-grant resumes it exactly once with no credit left;
+# (2) the exclusive-lock window (§3495-3508) — a needs-exclusive holder's suspend does
+# NOT release the lock, a same-instance needs-exclusive peer stays at
+# Task.enter_implicit_thread's gate (§681/§669-672) with no index and no registration,
+# and only the holder's exit admits it; (3) the two fixture rows VERBATIM through the
+# script path, so the guest checks are the oracle. Sensitivity: 3/3 FAIL on the
+# re-broken rule, PASS on master.
+# THE REMAINING LIST IS NOW FOUR ROWS, all quantified in the same 30-run suite:
+#   dssc::2   6/30 standalone, 0/30 in-lane — the spec's SYNCHRONOUS switch_to chain
+#             (§474-484) against async native threads: a yield-then-promote caller can
+#             be re-resumed before the switched-to thread takes its first turn. This is
+#             the last during-sync row and it is scheduler work.
+#   reentrance::14                8/30   (newly quantified; not yet decoded)
+#   cancel-resumed-callback-switch::1  6/30   (newly quantified; crcc::3 stays 0)
+#   component/cancel-window-fire-gate-pins flaky on BOTH trees (a pin, not a fixture)
+# Note for the next session: excl-resume::2, may-block::8 and dssc::19 are all 0/30 in
+# a 30-run component suite on master now, which is the first time three of the four
+# historical residual rows are simultaneously clean.
+# Also corrected: the ledger's "eight stream/future fixtures / 151 rows" set has NO
+# enumeration anywhere in the tree or its history — the superset (12 fixtures, 225
+# rows) was run instead (1125/0 over five passes). Enumerate the set in the ledger
+# before quoting a row count again.
 # M17 SESSION 16 — DEFECT 1 OF 3 CLOSED: THREAD IDENTITY AND THE SUSPEND PARK
 # CREDIT (90715e2). dssc::19 measured 13/30 red on master -> 0/30 here, plus 10/10,
 # 15/15, 10/10 and 5/5 in further batches.
