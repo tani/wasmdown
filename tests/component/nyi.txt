@@ -1,3 +1,33 @@
+# M17 SESSION 14 — MONOTONIC-CLOCK WAITS ARE HOST-PENDING CALLS (merge ea5fa23).
+# They were trapping STUBS in this tree, so the plan's clock item was fresh work, not
+# a conversion: wait-until / wait-for now return make-host-pending, arm ONE
+# reactor-watch-deadline, and resolve through the event pump — the guest's task parks
+# and the provider does not sit in a step loop holding the store's execution right.
+# Details that are pinned by tests: deadlines use the REACTOR's clock (one time source
+# for arithmetic and timer); u64 overflow traps (sum == u64-max allowed, +1 ns traps,
+# no registration left); past/zero resolve inside start with no registration; the
+# :armed -> :fired | :cancelled state machine is mutex-serialized so a fired wait
+# cannot cancel and a cancelled wait cannot resolve; a resolved pending is terminal so
+# its cancel-fn never runs; reactor-deadlines returns to 0 in both outcomes (no timer
+# leak); without a reactor the wait is a host error, not a silent no-op.
+# Measured: units 522/0 twice (517 + 5 wasi/clock-pending-* tests); the eight
+# stream/future fixtures stay 151/0; per-file probe has no hang and only the recorded
+# during-sync/reentrance floor rows.
+# THE ONE THING THAT IS STILL MISSING FOR AN END-TO-END GUEST WAIT: WHO CALLS
+# reactor-step. The reactor is armed by the provider and delivered by the pump, but the
+# store driver that would pump it per tie is step 6's remaining item — and the same
+# driver is what moves the host completion queue from the global FIFO into the store
+# (%store-tick). Those two are ONE slice, and they are the last structural piece of
+# steps 5/6:
+#   - a store-owned completion queue + reactor reference;
+#   - %store-tick pumps reactor-step with a bounded budget when (and only when) the
+#     store has pending host work, and drains the queue on the store's own context;
+#   - host-end-ready's retry moves from the caller's thread onto that path;
+#   - socket accept/recv/send/I-O registering watches (the providers already report
+#     would-block; the driver turns that into a watch + park instead of a poll).
+# After that, the remaining work is the three named defects (dssc::19's shared record,
+# may-block::8 and excl-resume::2's premature park release) plus the lane verdicts for
+# rerun/type-view and wip/reactor-wiring when the machine is quiet.
 # M17 SESSION 13 — STEP 5's PROVIDER HALF LANDED: the LIST-sink contract exists
 # NOWHERE in the tree (merge 0446eef / 0446eef's branch).
 # WHAT LANDED: every WASI provider takes the span contract or returns vectors, with
