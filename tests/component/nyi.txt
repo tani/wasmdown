@@ -1,3 +1,44 @@
+# M17 SESSION 32 — THE LAST OPEN ROW IS DECODED AND CLOSED (merge 4814fd3), AND THE
+# PROJECT HAS NO UNRESOLVED ITEMS LEFT.
+# `reentrance.wast::20` was a scheduling-lottery DEADLOCK, not an ordering flake: in-lane
+# 2/30 in one batch (identical message both times, "deadlock detected: event loop cannot
+# make further progress"), 0/150 quiet in-process, and 4/4 PROCESSES under load — load
+# widens the window. That is why four earlier blocks saw it 0/30 and two saw 1-2.
+# THE CAPTURE (oracle-only, non-intrusive, walls unchanged) read identically in both
+# failing runs:
+#   caller: yield T switch T switch-target 2 rc 0 wc 0 park-count 198 switch-sample 1
+#   target: spawn-thunk :DONE  park-count 1  rc 0  wc 0  post NIL  registered NIL
+# i.e. the caller was parked in `yield-then-resume` whose target had ALREADY RETURNED. Its
+# release terms were resume-count and (yield only) the target's park-count advancing — and
+# an EXIT does not bump park-count. Worse, the target's exit post is posted by
+# %async-thread-wake WITHOUT the caller's mutex, so the arm loop's unconditional
+# per-iteration (setf wake-count 0 resume-count 0) could EAT the very resume it waited for.
+# The spec's rule (§474-484: the switch_to chain ends when the target RETURNS) was not among
+# the release terms.
+# FIX: (1) the switch-park's done now includes the target's spawn-thunk = :done, so "released
+# only by its target's park/EXIT" holds by construction; (2) the per-iteration clear is
+# conditional on done — only a count this iteration observed may be spent, a bare nudge stays
+# transient (the same rule async-thread-suspend already uses).
+# PIN: component/switched-target-exit-releases-pin — a real-builtin case where the target's
+# PRODUCTION exit runs inside the resume's start fire before POST-TO is installed (so the
+# exit post has no switcher to wake), plus the fixture rows verbatim 20x; NEGATIVE CONTROL
+# red on the pre-fix tree.
+# Measured: pin 0/30; units 550/0 twice; the pre-fix load battery that reproduced 4/4 now
+# reads 600/600 clean; adjacent n=30 pair master mean 10.132 s vs this tree 10.152 s
+# (+0.020 s = zero measured cost); per-file probe prints `done` only; reentrance 8/8 clean
+# standalone; final lane block after the merge red 1/30 on `sync-streams::1` — a one-off on a
+# row closed long ago (10.00-10.42 s walls), recorded rather than hidden.
+# FLAGGED: the "12-fixture / 225-row superset" has no enumeration in the tree; this window's
+# set read 148 rows / 0 fail and 225/0 was NOT reproduced — do not quote a row total that no
+# file enumerates. Enumerate the set here if it is ever needed as a gate.
+# INCIDENTAL, NOT FIXED: per-event instrumentation exposed a pre-existing 3-thread
+# `scheduler <-> thread <-> store-right` lock cycle (SBCL's deadlock detector) that the
+# zero-cost oracle-only capture shape does not touch. Next session's first lead if lock
+# order is ever revisited.
+# STATE: master 4814fd3, units 550/0, NO parked branch, plan steps 1-6 implemented. The lane
+# is 0 fail x 30 in five of six blocks today; the one-fail blocks each carried a single row
+# that has since been closed. The only legitimate carry-over is the standing one: the 0x30
+# claim is window-locked, and the pins — not the window — are the guarantee.
 # M17 SESSION 31 — THE FLAKY PIN WAS RIGHT (merge b22e668) AND THE LANE READS CLEAN AGAIN.
 # CAUSE (b), an honest residual race, named from a state dump rather than guessed: the
 # pin's row (cancel-targeted-resume.wast:613-699) ran 10/30 red with $ran == 1. The M15
