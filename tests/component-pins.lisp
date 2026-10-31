@@ -4408,8 +4408,16 @@ waits unbounded)."
                   (wasmdown.component.runtime::%inst-exclusive-thread inst)))
           (wasmdown.component.runtime::%task-exit-implicit-thread
            holder-task)
-          (is (null (wasmdown.component.runtime::%inst-exclusive-thread
+          ;; the exit releases the holder's lock AND re-tests the gate
+          ;; (§3495): the waiting peer may already be entering on its
+          ;; own OS thread, so the stable invariant is that the HOLDER
+          ;; no longer owns the lock (the join below proves the peer
+          ;; got in). Asserting NULL here raced that gate handoff —
+          ;; the flake this pin used to exhibit under load.
+          (let ((ex (wasmdown.component.runtime::%inst-exclusive-thread
                      inst)))
+            (is (not (eq holder ex)))
+            (is (or (null ex) (eq peer ex))))
           ;; the gate's park is a WAITING park (§681's wait-until): a
           ;; nudge re-tests it — the production resume-all reaches the
           ;; real store's registry; this pin's gate thread owns its
