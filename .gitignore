@@ -4,3 +4,9 @@ __pycache__/
 tmp-cli-*.wasm
 *~
 .\#*
+.cache/
+tmp-census/
+tests/upstream-testsuite/
+tests/upstream-results.jsonl
+tests/wasi-results/
+tests/fixtures/wasi/*.wasm
