@@ -90,15 +90,31 @@ threads `WASMDOWN_API_MODE` through `run-component :mode`, so
 cores instead of setting an unused variable. It is slow (the 6 MB
 SQLite core needs a large compile-time heap and ~200 s per component
 case, hence the runner's 8 GB default), which is why the quick gate is
-the interpret lane. Baseline is currently **RED on
-`p1/disk-persist-reopen`** for an engine reason, not a lane reason:
-reproduced standalone, a baseline-compiled guest reports its rows and
-exits 0, but the file stays at its bare 8192-byte header — the
-interpret build and host `sqlite3` (reference reader) both report
-`no such table`, and `PRAGMA integrity_check` flags page 1. Writes
-therefore never commit under compiled guest code. The lane reports it
-as a failure with the guest's stdout/stderr/exit kept under
-`<output-dir>/failures/` — nothing is skipped.
+the interpret lane. Disk writes under compiled guest code are
+**correct** as of 2026-11-01: the compiled backend used to push the
+local's SYMBOL as a `local.get` operand, so a later `local.set` of the
+same local changed the value behind that operand (SQLite's
+`++data[hdrOffset+4]` landed at address 5 instead of the page
+buffer). `%CAPTURE-PENDING` now copies the current value at the
+write whenever a pending operand still references it, verified by
+`codegen/mutable-local-operand-snapshot` and end to end with the P1
+artifact: host `sqlite3` reads back the inserted rows and
+`PRAGMA integrity_check` = `ok`, including a 20 000-row recursive-CTE
+INSERT. A baseline lane case that fails still has the guest's
+stdout/stderr/exit kept under `<output-dir>/failures/` — nothing is
+skipped.
+
+The compiled backend's core-suite status is measured separately, one
+process per file (`--backend baseline` through the WAST runner), and is
+not the green interpret baseline: 86 of the 97 pinned `.wast` files are
+fully green, and 11 still diverge — `call`, `call_indirect`, `fac` and
+`skip-stack-guard-page` exhaust the control stack (the compiled
+backend has no `return_call`/`return_call_indirect`, so tail-recursive
+fixtures recurse on the host stack), and `instance`, `return_call`,
+`return_call_indirect`, `table_grow`, `table_size` (reference-types
+tables), `type-equivalence` and `type-rec` report partial failures.
+Those eleven are pre-existing compiled-backend gaps, not interpret
+gaps: the same files pass on the interpret lane.
 
 ### Upstream testsuite lane (discovery, never a gate)
 
@@ -349,16 +365,16 @@ permanently out of scope per PLAN.md §3.3). SIMD (v128 + relaxed,
 loop 24: the full 236-op v128 family + the 20 relaxed ops with
 documented canonical choices, scalarized per PLAN.md §7.3 — the
 one vendored SIMD fixture, obsolete-keywords::10, passes at
-DECODE with the honest malformed message), tail calls
-`return_call`/`return_call_indirect`, exception handling (tags,
-`try_table`, `throw`, cross-call propagation, uncaught boundary
-at the outermost guest frame), typed function references (the
-`(ref $t)`/`(ref null $t)` lattice, `call_ref`, `return_call_ref`,
-`br_on_null`, `br_on_non_null`, `ref.as_non_null`, definite
-initialization for non-defaultable locals), `rec` type groups
-with canonicalization + iso-recursive equivalence (the
-wasm-comptype/rectype-group engine, cross-module
-`func-type-match-p`), GC values END TO END (struct/array type
+DECODE with the honest malformed message). Tail calls
+(`return_call`/`return_call_indirect`) are interpret-only: the
+compiled backend does not emit them yet, so `return_call.wast`,
+`return_call_indirect.wast`, `fac.wast`, `call.wast` and
+`call_indirect.wast` still fail under `--backend baseline`.
+Exception handling (tags, `try_table`, `throw`, cross-call
+propagation, uncaught boundary at the outermost guest frame),
+`rec` type groups with canonicalization + iso-recursive
+equivalence (the wasm-comptype/rectype-group engine, cross-module
+`func-type-match-p`), and GC values END TO END (struct/array type
 declarations + the full opcode surface: struct.new/get/set with
 packed-field normalization, array.new/get/set/len/fill/copy/
 init, i31 with 31-bit payload semantics, ref.cast/ref.test/
@@ -370,7 +386,11 @@ copy with bounds on both backings, i64 addressing with the
 addrtype-typed size/grow/fill/init rules, the (memory i64 ...)
 text marker and limits flags 0x04 — self-authored tests), and
 the named module definition/instance script forms **are**
-implemented. The `.wat` text format and `.wast` spec runner
+implemented. Typed function references are implemented in **both**
+backends, including the opcodes the compiled emitter used to reject:
+`call_ref`, `return_call_ref`, `br_on_null`, `br_on_non_null` and
+`ref.as_non_null` (`br_on_null.wast` 10/10 and
+`br_on_non_null.wast` 12/12 pass under `--backend baseline`). The `.wat` text format and `.wast` spec runner
 **are** implemented (`src/text.lisp`, `src/wast.lisp`), as is
 conformance reporting.
 

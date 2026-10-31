@@ -667,3 +667,29 @@ functions, and require the same result (EQUALP)."
                           (block (br 0))
                           (i32.const 2)))))"
             3))))
+
+(wasmdown.test:test codegen/mutable-local-operand-snapshot
+  ;; An operand that is a MUTABLE local must be snapshotted at the
+  ;; point of the read. The store's address operand is `(local.get 0)`
+  ;; and the VALUE operand reassigns local 0 before the store emits:
+  ;; the old emitter kept the local symbol, so the store went to
+  ;; address 42 instead of the address the read produced (the defect
+  ;; that made baseline SQLite write its page-count byte to address 5).
+  (let* ((m (wasmdown.text:parse-wat
+             "(module (memory 1)
+                (func (export \"f\") (param i32) (result i32)
+                  (i32.store8 (i32.const 1024) (i32.const 0))
+                  (i32.store8 (i32.const 42) (i32.const 0))
+                  (i32.store8 (local.get 0)
+                              (local.tee 0 (i32.const 42)))
+                  (i32.load8_u (i32.const 1024))))"))
+         (inst (wasmdown:instantiate m))
+         (compiled (wasmdown.codegen:compile-module-functions m inst))
+         (mem (svref (module-instance-memories inst) 0)))
+    (wasmdown.test:is (equalp (call-export inst "f" 1024) '(42)))
+    (wasmdown.test:is (= 42 (aref (memory-instance-bytes mem) 1024)))
+    (wasmdown.test:is (= 0 (aref (memory-instance-bytes mem) 42)))
+    (%install-compiled! m inst compiled)
+    (wasmdown.test:is (equalp (call-export inst "f" 1024) '(42)))
+    (wasmdown.test:is (= 42 (aref (memory-instance-bytes mem) 1024)))
+    (wasmdown.test:is (= 0 (aref (memory-instance-bytes mem) 42)))))

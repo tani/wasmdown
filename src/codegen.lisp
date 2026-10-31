@@ -811,17 +811,38 @@ its :end)."
              (tmp (%result-temp cctx)))
          (%emit cctx `(setf ,tmp (if (plusp ,c) ,a ,b)))
          (%push cctx tmp)))
+      ;; LOCALS ARE MUTABLE, and the streaming emitter writes the
+      ;; consumer's form LATER than the read. An operand pushed from
+      ;; `local.get' is the local's SYMBOL; if a later local.set/tee
+      ;; rewrites that symbol before the consumer's form is emitted,
+      ;; the consumer would see the NEW value (SQLite: `LOCAL.TEE 7'
+      ;; feeds a load8, is reassigned, and the later store then went
+      ;; to address 5 instead of the page buffer). The fix captures
+      ;; the OLD value into a temp at the WRITE, i.e. only when a
+      ;; pending operand actually references the written local - no
+      ;; per-read cost.
       ((eq op :local.get)
        (%push cctx (svref (cctx-locals cctx) (getf imms :local))))
       ((eq op :local.set)
-       (let ((v (%pop cctx)))
-         (%emit cctx `(setf ,(svref (cctx-locals cctx) (getf imms :local))
-                            ,v))))
+       (let* ((idx (getf imms :local))
+              (l (svref (cctx-locals cctx) idx))
+              (v (%pop cctx)))
+         (%capture-pending cctx l)
+         (%emit cctx `(setf ,l ,v))))
       ((eq op :local.tee)
-       (let ((v (%pop cctx))
-             (l (svref (cctx-locals cctx) (getf imms :local))))
-         (%emit cctx `(setf ,l ,v))
-         (%push cctx l)))
+       (let* ((idx (getf imms :local))
+              (l (svref (cctx-locals cctx) idx))
+              (v (%pop cctx)))
+         (%capture-pending cctx l)
+         ;; the tee's own value is consumed here: when it IS the local
+         ;; itself, copy it before the write.
+         (let ((val (if (eq v l)
+                        (let ((tmp (%result-temp cctx)))
+                          (%emit cctx `(setf ,tmp ,l))
+                          tmp)
+                        v)))
+           (%emit cctx `(setf ,l ,val))
+           (%push cctx val))))
       ((eq op :global.get)
        (let ((tmp (%result-temp cctx)))
          (%emit cctx `(setf ,tmp (wasmdown.runtime:global-value
@@ -846,6 +867,48 @@ its :end)."
                                                      (cctx-type cctx))))))
                (t
                 (%emit-br cctx depth)))))
+      ((member op '(:br-on-null :br-on-non-null))
+       ;; Typed-reference conditional branch (Core 3.0):
+       ;;   br_on_null l     : [t* (ref null ht)] -> [t* (ref ht)]
+       ;;   br_on_non_null l : [t* (ref null ht)] -> [t*]
+       ;; A null ref branches WITHOUT it; a non-null ref continues (and
+       ;; for br_on_non_null branches WITH it).
+       (let* ((depth (getf imms :label))
+              (frame (and (< depth (length (cctx-blocks cctx)))
+                          (nth depth (cctx-blocks cctx))))
+              (v (%pop cctx))
+              (on-null (eq op :br-on-null)))
+         (if (null frame)
+             ;; the label names the FUNCTION BODY
+             (let* ((nresults (length (wasm-func-type-results
+                                       (cctx-type cctx))))
+                    (take (if on-null nresults (1- nresults)))
+                    (vals (%pop-n cctx take))
+                    (dup (copy-list vals))
+                    (full (if on-null dup (append dup (list v)))))
+               (%emit-flush cctx)
+               (%emit cctx `(when ,(if on-null `(null ,v) v)
+                              (return-from ,(cctx-fn-sym cctx)
+                                (list ,@full))))
+               (dolist (x dup) (%push cctx x))
+               (when on-null (%push cctx v)))
+             (let* ((loop-p (eq (block-state-kind frame) :loop))
+                    (arity (if loop-p (block-state-nparams frame)
+                               (block-state-nresults frame)))
+                    (targets (if loop-p (block-state-entry-temps frame)
+                                 (block-state-results frame)))
+                    (take (if on-null arity (1- arity)))
+                    (vals (%pop-n cctx take))
+                    (dup (copy-list vals))
+                    (full (if on-null dup (append dup (list v)))))
+               (%emit-flush cctx)
+               (%emit cctx `(when ,(if on-null `(null ,v) v)
+                              ,@(loop for x in full
+                                      for tt in targets
+                                      collect `(setf ,tt ,x))
+                              (go ,(block-state-entry-tag frame))))
+               (dolist (x dup) (%push cctx x))
+               (when on-null (%push cctx v))))))
       ((eq op :br-if)
        (let* ((depth (getf imms :label))
               (c (%pop cctx))
@@ -912,9 +975,61 @@ its :end)."
                                             (cctx-type cctx))))))
       ((eq op :call) (%emit-call cctx instr))
       ((eq op :call-indirect) (%emit-call-indirect cctx instr))
+      ((eq op :call-ref)
+       ;; call_ref (typed function references): params below, the
+       ;; callee REF on top. A null ref traps :null-reference. The
+       ;; callee's arity comes from the instruction's type immediate.
+       (let* ((typeidx (getf imms :type))
+              (expected (svref (wasm-module-types (cctx-module cctx))
+                               typeidx))
+              (eparams (wasm-func-type-params expected))
+              (eresults (wasm-func-type-results expected))
+              (ref (%pop cctx))
+              (params (%pop-n cctx (length eparams)))
+              (results (loop for r in eresults collect (%result-temp cctx)))
+              (list-sym (%temp cctx "cr-args")))
+         (%emit cctx `(unless (wasmdown.runtime:func-instance-p ,ref)
+                        (%trap :null-reference
+                               "null function reference")))
+         (%emit cctx `(setf ,list-sym (list ,@params)))
+         (%emit cctx `(multiple-value-setq (,@results)
+                        (values-list
+                         (apply #'wasmdown.runtime:wasm-call ,ref ,list-sym))))
+         (dolist (r results) (%push cctx r))))
+      ((eq op :return-call-ref)
+       ;; return_call_ref: same call, then return its results from the
+       ;; function (the host-stack depth difference of a true tail call
+       ;; is not observable here: wasmdown's invoke is not recursive
+       ;; per wasm frame in compiled mode).
+       (let* ((typeidx (getf imms :type))
+              (expected (svref (wasm-module-types (cctx-module cctx))
+                               typeidx))
+              (eparams (wasm-func-type-params expected))
+              (eresults (wasm-func-type-results expected))
+              (ref (%pop cctx))
+              (params (%pop-n cctx (length eparams)))
+              (results (loop for r in eresults collect (%result-temp cctx)))
+              (list-sym (%temp cctx "rtc-args")))
+         (%emit cctx `(unless (wasmdown.runtime:func-instance-p ,ref)
+                        (%trap :null-reference
+                               "null function reference")))
+         (%emit cctx `(setf ,list-sym (list ,@params)))
+         (%emit cctx `(multiple-value-setq (,@results)
+                        (values-list
+                         (apply #'wasmdown.runtime:wasm-call ,ref ,list-sym))))
+         (%emit cctx `(return-from ,(cctx-fn-sym cctx) (list ,@results)))
+         (setf (cctx-operands cctx) nil)))
       ((eq op :ref.null)
        (let ((tmp (%result-temp cctx)))
          (%emit cctx `(setf ,tmp nil))
+         (%push cctx tmp)))
+      ((eq op :ref.as-non-null)
+       ;; pop the ref; null traps, non-null pushes the same value back
+       ;; (the static type narrows, the runtime value does not change).
+       (let ((v (%pop cctx)) (tmp (%result-temp cctx)))
+         (%emit cctx `(when (null ,v)
+                        (%trap :null-reference "null function reference")))
+         (%emit cctx `(setf ,tmp ,v))
          (%push cctx tmp)))
       ((eq op :ref.is-null)
        (let ((v (%pop cctx)) (tmp (%result-temp cctx)))
@@ -947,6 +1062,19 @@ its :end)."
     (:f32 (wasmdown.numops:f32-from-bits 0))
     (:f64 (wasmdown.numops:f64-from-bits 0))
     (t nil)))
+
+(defun %capture-pending (cctx sym)
+  "Replace every operand-stack reference to SYM with a fresh temp holding
+SYM's CURRENT value. Called just before a write to SYM so that operands
+already pushed from that local keep the value they were read with."
+  (let ((tmp nil))
+    (loop for tail on (cctx-operands cctx)
+          do (when (eq (car tail) sym)
+               (unless tmp
+                 (setf tmp (%result-temp cctx))
+                 (%emit cctx `(setf ,tmp ,sym)))
+               (setf (car tail) tmp)))
+    tmp))
 
 (defun %expand-local-types (fn type)
   "Local index space: params then declared locals, types expanded."
