@@ -448,7 +448,10 @@ its :end)."
     (%emit cctx `(setf ,raw (wasmdown.runtime:memory-load ,(%mem cctx memidx)
                                                           ,ea ,width)))
     (cond (float-type
-           (%emit cctx `(setf ,out (wasmdown.numops:f32-bits 0)))
+           ;; NB: no placeholder emit here. A `(setf out (f32-bits 0))'
+           ;; used to sit above as a type hint, but it is a real CALL
+           ;; at runtime: every float LOAD (f64.load included) then
+           ;; signalled "0 is not a SINGLE-FLOAT" in baseline mode.
            (case float-type
              (:f32 (%emit cctx `(setf ,out
                                       (wasmdown.numops:f32-from-bits ,raw))))
