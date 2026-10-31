@@ -292,7 +292,8 @@ in the context so the function's LET binds every temp exactly once."
   nresults                               ; block results (br arity)
   results                                ; result temp symbols (phi)
   entry-temps                            ; loop entry temp symbols
-  stack-height)                          ; operand depth below params
+  stack-height                           ; operand depth below params
+  tail)                                  ; the operand LIST below params
 
 (defun %push (cctx sym)
   (push sym (cctx-operands cctx)))
@@ -402,9 +403,14 @@ domain (CONTRACTS.md unsigned storage; spec load semantics)."
     ;; Dead region: fill with the target's phis atop nils down to the
     ;; target frame's base height, so any residual (unreachable)
     ;; instructions still emit well-formed dead forms.
+    ;; restore the operand list that existed BELOW the target's params
+    ;; at its entry: the symbols there are still live (a block used as
+    ;; an operand keeps the earlier stack entries), so filling with
+    ;; NILs lost them and the following reachable code consumed NIL —
+    ;; e.g. (i32.add (local.get 0) (block ...)) added NIL.
     (setf (cctx-operands cctx)
           (append (reverse (copy-list targets))
-                  (make-list (block-state-stack-height frame))))))
+                  (block-state-tail frame)))))
 
 (defun %emit-return (cctx vals)
   "Emit the function epilogue: return the results LIST (the :host
@@ -671,7 +677,7 @@ its :end)."
            (entry-temps (loop repeat nparams collect (%temp cctx "bp")))
            (result-temps (loop repeat nresults collect (%temp cctx "br")))
            (tag (gensym "B"))
-           (base (- (length (cctx-operands cctx)) nparams)))
+           (base (length (cctx-operands cctx))))
       (loop for p in params
             for tp in entry-temps
             do (%emit cctx `(setf ,tp ,p)))
@@ -681,19 +687,24 @@ its :end)."
                               :nparams nparams :nresults nresults
                               :results result-temps
                               :entry-temps entry-temps
-                              :stack-height base)
+                              :stack-height base
+                              :tail (cctx-operands cctx))
             (cctx-blocks cctx))
       (%emit-seq cctx (wasm-instr-body instr))
-      (pop (cctx-blocks cctx))
-      ;; fall-through: top NRESULTS are the block results
-      (let ((fallthrough (%pop-n cctx nresults)))
-        (loop for ft in fallthrough
-              for rt in result-temps
-              do (%emit cctx `(setf ,rt ,ft)))
+      ;; the DEAD code after a branch may have consumed operands; the
+      ;; block's entry tail is the only reliable record of what was
+      ;; below it (br.wast's as-return-values: the dead `return` ate
+      ;; the `2` and the block then dropped it)
+      (let ((tail (block-state-tail (first (cctx-blocks cctx)))))
+        (pop (cctx-blocks cctx))
+        ;; fall-through: top NRESULTS are the block results
+        (let ((fallthrough (%pop-n cctx nresults)))
+          (loop for ft in fallthrough
+                for rt in result-temps
+                do (%emit cctx `(setf ,rt ,ft))))
         (%emit-tag cctx tag)
         (setf (cctx-operands cctx)
-              (append (reverse result-temps)
-                      (nthcdr nresults (cctx-operands cctx))))))))
+              (append (reverse result-temps) tail))))))
 
 (defun %emit-loop (cctx instr)
   (multiple-value-bind (nparams nresults)
@@ -702,7 +713,7 @@ its :end)."
            (entry-temps (loop repeat nparams collect (%temp cctx "lp")))
            (result-temps (loop repeat nresults collect (%temp cctx "br")))
            (tag (gensym "L"))
-           (base (- (length (cctx-operands cctx)) nparams)))
+           (base (length (cctx-operands cctx))))
       (loop for p in params
             for tp in entry-temps
             do (%emit cctx `(setf ,tp ,p)))
@@ -713,7 +724,8 @@ its :end)."
                               :nparams nparams :nresults nresults
                               :results result-temps
                               :entry-temps entry-temps
-                              :stack-height base)
+                              :stack-height base
+                              :tail (cctx-operands cctx))
             (cctx-blocks cctx))
       (%emit-seq cctx (wasm-instr-body instr))
       (pop (cctx-blocks cctx))
@@ -725,7 +737,7 @@ its :end)."
         (%emit-tag cctx (gensym "LEND"))   ; unreachable landing pad
         (setf (cctx-operands cctx)
               (append (reverse result-temps)
-                      (nthcdr nresults (cctx-operands cctx))))))))
+                      (cctx-operands cctx)))))))
 
 (defun %emit-if (cctx instr)
   (multiple-value-bind (nparams nresults)
@@ -736,7 +748,7 @@ its :end)."
            (result-temps (loop repeat nresults collect (%temp cctx "br")))
            (tag (gensym "I"))
            (else-tag (gensym "ELSE"))
-           (base (- (length (cctx-operands cctx)) nparams)))
+           (base (length (cctx-operands cctx))))
       (loop for p in params
             for tp in entry-temps
             do (%emit cctx `(setf ,tp ,p)))
@@ -749,7 +761,8 @@ its :end)."
                               :nparams nparams :nresults nresults
                               :results result-temps
                               :entry-temps entry-temps
-                              :stack-height base)
+                              :stack-height base
+                              :tail (cctx-operands cctx))
             (cctx-blocks cctx))
       (%emit-seq cctx (wasm-instr-body instr))
       (pop (cctx-blocks cctx))
@@ -762,12 +775,13 @@ its :end)."
       (%emit-tag cctx else-tag)
       (setf (cctx-operands cctx)
             (append (reverse entry-temps)
-                    (nthcdr nparams (cctx-operands cctx))))
+                    (cctx-operands cctx)))
       (push (make-block-state :kind :block :entry-tag tag
                               :nparams nparams :nresults nresults
                               :results result-temps
                               :entry-temps entry-temps
-                              :stack-height base)
+                              :stack-height base
+                              :tail (cctx-operands cctx))
             (cctx-blocks cctx))
       (%emit-seq cctx (or (getf (wasm-instr-imms instr) :else-body) #()))
       (pop (cctx-blocks cctx))
@@ -778,7 +792,7 @@ its :end)."
       (%emit-tag cctx tag)
       (setf (cctx-operands cctx)
             (append (reverse result-temps)
-                    (nthcdr nresults (cctx-operands cctx)))))))
+                    (cctx-operands cctx))))))
 
 ;;; ---------------------------------------------------------------
 ;;; Main instruction dispatcher.
@@ -966,16 +980,35 @@ its :end)."
                              'vector)))
     (setf (cctx-locals cctx) local-syms
           (cctx-inst-sym cctx) inst-sym)
-    (%emit-seq cctx (wasm-func-body fn))
-    ;; fall-through results (or the explicit return already emitted)
+    ;; THE FUNCTION BODY IS ITSELF A LABEL (Wasm: `br N' with N equal
+    ;; to the number of enclosing blocks targets the function body, and
+    ;; fixtures use it - br.wast's as-return-values, br_table's default
+    ;; arms). Without a frame for it, (nth depth blocks) was NIL and the
+    ;; compiler blew up on a BLOCK-STATE type error.
     (let* ((nresults (length (wasm-func-type-results type)))
-           (results (%pop-n cctx nresults))
-           (results-sym (%temp cctx "results")))
-      (%emit-flush cctx)
-      (%emit cctx `(setf ,results-sym (list ,@results)))
-      (%emit cctx `(return-from ,fn-sym ,results-sym))
-      (%emit-flush cctx)
-      (setf (cctx-results-sym cctx) results-sym))
+           (fn-tag (gensym "FNTAG"))
+           (fn-results (loop repeat nresults collect (%temp cctx "fr"))))
+      (push (make-block-state :kind :return :entry-tag fn-tag
+                              :nparams 0 :nresults nresults
+                              :results fn-results
+                              :entry-temps nil
+                              :stack-height 0
+                              :tail nil)
+            (cctx-blocks cctx))
+      (%emit-seq cctx (wasm-func-body fn))
+      (pop (cctx-blocks cctx))
+      ;; fall-through: the top NRESULTS become this body's results
+      (let ((fallthrough (%pop-n cctx nresults)))
+        (loop for v in fallthrough
+              for tt in fn-results
+              do (%emit cctx `(setf ,tt ,v))))
+      (%emit-tag cctx fn-tag)
+      (let ((results-sym (%temp cctx "results")))
+        (%emit-flush cctx)
+        (%emit cctx `(setf ,results-sym (list ,@fn-results)))
+        (%emit cctx `(return-from ,fn-sym ,results-sym))
+        (%emit-flush cctx)
+        (setf (cctx-results-sym cctx) results-sym)))
     (let* ((tagbody-items (reverse (cctx-tagbody cctx)))
            (param-binds
             (loop for i below nparams

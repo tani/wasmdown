@@ -603,3 +603,67 @@ PLAN.md 6.1/12.3). Returns the compiled-phase instance."
                   :mems (vector (make-wasm-memory (lim 1)))
                   :exports (vector (make-wasm-export "oob" :func 0)))))
       (parity mod2 :name "oob" :args '(7)))))
+
+;;; ================================================================
+;;; ================================================================
+;;; Regressions found by running the pinned core suite under the
+;;; compiled backend: block values used MID-EXPRESSION, `br` to the
+;;; function-body label, and dead code after a branch consuming the
+;;; live operand tail.
+
+(defun %parity-wat (wat &rest args)
+  "Parse WAT, run F under the interpreter, install the compiled
+functions, and require the same result (EQUALP)."
+  (let* ((m (wasmdown.text:parse-wat wat))
+         (inst (wasmdown:instantiate m))
+         (compiled (wasmdown.codegen:compile-module-functions m inst))
+         (interp (apply #'call-export inst "f" args)))
+    (%install-compiled! m inst compiled)
+    (let ((compiled-result (apply #'call-export inst "f" args)))
+      (wasmdown.test:is (equalp interp compiled-result))
+      compiled-result)))
+
+(wasmdown.test:test codegen/block-value-as-operand
+  ;; (select (i32.const 2) (block (result i32) (i32.const 1)) (i32.const 3))
+  ;; - the block's result must join the operands already below it. The
+  ;; old emitter dropped them (nthcdr nresults) and SELECT read NIL.
+  (wasmdown.test:is
+   (equalp '(2)
+           (%parity-wat
+            "(module (func (export \"f\") (result i32)
+               (select (i32.const 2) (block (result i32) (i32.const 1))
+                       (i32.const 3))))"))))
+
+(wasmdown.test:test codegen/br-to-function-label
+  ;; `br 0' at the FUNCTION TOP LEVEL names the function body's own
+  ;; label (br.wast's as-return-values shape): without a frame for the
+  ;; body the compiler looked up NIL and blew up.
+  (wasmdown.test:is
+   (equalp '(5)
+           (%parity-wat
+            "(module (func (export \"f\") (result i32)
+               (i32.const 5)
+               (br 0)))")))
+  ;; the multi-value shape: a `return' inside a block leaves its two
+  ;; values, the block yields the second
+  (wasmdown.test:is
+   (equalp '(2 7)
+           (%parity-wat
+            "(module (func (export \"f\") (result i32 i64)
+               (i32.const 2)
+               (block (result i64) (return (br 0 (i32.const 1)
+                                                 (i64.const 7))))))"))))
+
+(wasmdown.test:test codegen/dead-code-after-br-keeps-tail
+  ;; (i32.add (local.get 0) (block (result i32) (block (br 0))
+  ;;          (i32.const 2))) - the inner br's dead region must restore
+  ;; the operands it found (the local), not NIL fillers.
+  (wasmdown.test:is
+   (equalp '(5)
+           (%parity-wat
+            "(module (func (export \"f\") (param i32) (result i32)
+               (i32.add (local.get 0)
+                        (block (result i32)
+                          (block (br 0))
+                          (i32.const 2)))))"
+            3))))

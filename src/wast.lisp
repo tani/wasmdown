@@ -1598,6 +1598,7 @@ instantiate/execute. Returns (values outcome phase detail instance)."
                        (wasmdown:validate-module module)
                        (let ((inst (wasmdown:instantiate
                                     module
+                                    :mode *instantiate-mode*
                                     :imports (%state-imports-for module))))
                          (values :pass nil "ok" inst)))
                      ;; the definition was out-of-scope (never stored):
@@ -1633,6 +1634,7 @@ instantiate/execute. Returns (values outcome phase detail instance)."
                             "imports from an out-of-scope module")))
                 (let ((inst (wasmdown:instantiate
                              module
+                             :mode *instantiate-mode*
                              :imports (%state-imports-for module))))
                   (values :pass nil "ok" inst))))))
     (wasmdown:decode-error (c)
@@ -2369,6 +2371,13 @@ it); the core path is unchanged."
 
 ;;; ---------------------------------------------------------------
 ;;; The script driver.
+
+(defvar *instantiate-mode* :interpret
+  "Execution mode for the modules the script runner instantiates:
+  :INTERPRET (the reference interpreter) or :BASELINE (compile each
+  module with wasmdown.codegen and install it). A baseline conformance
+  pass binds this to :baseline; the default keeps every existing lane
+  on the interpreter.")
 
 (defvar *script-source* ""
   "The source of the script being executed (for slicing embedded
