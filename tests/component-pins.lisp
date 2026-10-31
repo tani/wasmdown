@@ -11,6 +11,47 @@
 
 (in-package #:wasmdown.test.component)
 
+
+;;; Pins that manipulate scheduler state run inside a FRESH STORE (the
+;;; step-2 ownership model): the registry and the execution right are
+;;; the store's own slots, so two pins can never nudge each other's
+;;; threads the way process globals did.
+(defmacro %pin-in-store (() &body body)
+  "Run BODY on a RAW (non-runtime) thread with the CURRENT store bound.
+Store ownership is per instantiation graph, and the dynamic binding
+does not cross SB-THREAD:MAKE-THREAD, so a pin's bare thread must
+carry the store explicitly."
+  `(let ((store (wasmdown.component.runtime::%cs)))
+     (lambda () (let ((wasmdown.component.runtime::*current-component-store* store))
+                  ,@body))))
+
+(defmacro pin-test (name &body body)
+  `(test ,name
+     (let ((wasmdown.component.runtime::*current-component-store*
+             (wasmdown.component.runtime:make-component-store)))
+       (unwind-protect (progn ,@body)
+         (wasmdown.component.runtime::%store-teardown)))))
+
+
+;;; step 2: the execution tables live on the STORE. Tests that drive
+;;; the runtime directly run on the thread's bound store (or the
+;;; process fallback, exactly where a bare host caller is).
+(defun %current-store ()
+  (or wasmdown.component.runtime::*current-component-store*
+      wasmdown.component.runtime::*global-host-store*))
+
+(defun right-handoffs ()
+  (wasmdown.component.runtime::component-store-right-handoffs (%current-store)))
+
+(defun (setf right-handoffs) (value)
+  (setf (wasmdown.component.runtime::component-store-right-handoffs
+         (%current-store))
+        value))
+
+(defun ct-defining ()
+  (wasmdown.component.runtime::component-store-ct-defining-inst (%current-store)))
+
+
 ;;; ---- byte helpers (a (component binary "...") payload builder) ----
 
 (defun %hexb (&rest strs)
@@ -2933,7 +2974,7 @@ repo root, as a string — the pin runs a fixture row VERBATIM."
                    1 238)
        "result-two-spaces-pin.wast")))
 
-(test component/cancel-window-fire-gate-pins
+(pin-test component/cancel-window-fire-gate-pins
   ;; M15 MECHANISM 4 + M17's SYNC-CALL FIRE WINDOW.
   ;;
   ;; GUARANTEE (what this pin carries): a thread that a cancellation
@@ -2981,13 +3022,13 @@ repo root, as a string — the pin runs a fixture row VERBATIM."
            (wasmdown.component.runtime::make-async-thread
             :task (wasmdown.component.runtime::make-async-task
                    :inst other-inst :seq '(2))))
-         (old-threads wasmdown.component.runtime::*scheduler-threads*)
+         (old-threads (wasmdown.component.runtime::%store-threads))
          (old-depth (wasmdown.component.runtime::comp-instance-sync-window-depth
                      inst))
          (fired 0))
     (unwind-protect
          (progn
-           (setf wasmdown.component.runtime::*scheduler-threads*
+           (setf (wasmdown.component.runtime::%store-threads)
                  (list th))
            (setf (wasmdown.component.runtime::async-thread-spawn-thunk th)
                  (lambda () (incf fired))
@@ -3013,7 +3054,7 @@ repo root, as a string — the pin runs a fixture row VERBATIM."
                      (wasmdown.component.runtime::async-thread-spawn-thunk th))))
            (wasmdown.component.runtime::async-thread-resume-all)
            (is (= 1 fired)))
-      (setf wasmdown.component.runtime::*scheduler-threads* old-threads
+      (setf (wasmdown.component.runtime::%store-threads) old-threads
             (wasmdown.component.runtime::comp-instance-sync-window-depth inst)
             old-depth)
       (when (sb-thread:holding-mutex-p
@@ -3029,7 +3070,7 @@ repo root, as a string — the pin runs a fixture row VERBATIM."
                    613 699)
        "cancel-fire-gate-pin.wast")))
 
-(test component/reentrance-14-pin
+(pin-test component/reentrance-14-pin
   ;; THE TARGETED HANDOFF IS A RESERVED WINDOW (reentrance ::14, the
   ;; drift row). The async lower's STARTED-wait releases the store
   ;; right to ONE callee thread for its first turn, then observes the
@@ -3059,30 +3100,30 @@ repo root, as a string — the pin runs a fixture row VERBATIM."
          (p (wasmdown.component.runtime::make-async-thread
              :task (wasmdown.component.runtime::make-async-task
                     :seq '(2))))
-         (old-threads wasmdown.component.runtime::*scheduler-threads*)
-         (old-ticket wasmdown.component.runtime::*right-ticket*)
-         (old-frames wasmdown.component.runtime::*right-handoffs*)
-         (old-owner wasmdown.component.runtime::*right-owner*)
+         (old-threads (wasmdown.component.runtime::%store-threads))
+         (old-ticket (wasmdown.component.runtime::%store-right-ticket))
+         (old-frames (right-handoffs))
+         (old-owner (wasmdown.component.runtime::%store-right-owner))
          (violation nil)
          (peer-took nil))
     (unwind-protect
          (progn
            ;; ---- (a1) a third party may not take the handoff window
-           (setf wasmdown.component.runtime::*scheduler-threads*
+           (setf (wasmdown.component.runtime::%store-threads)
                  (list c tg p)
-                 wasmdown.component.runtime::*right-ticket* nil
-                 wasmdown.component.runtime::*right-handoffs* nil
-                 wasmdown.component.runtime::*right-owner* nil)
+                 (wasmdown.component.runtime::%store-right-ticket) nil
+                 (right-handoffs) nil
+                 (wasmdown.component.runtime::%store-right-owner) nil)
            (let ((peer
                    (sb-thread:make-thread
-                    (lambda ()
+                    (%pin-in-store ()
                       (let ((wasmdown.component.runtime::*right-self* p))
                         (unwind-protect
                              (progn
                                (wasmdown.component.runtime::%right-acquire p)
                                ;; acquiring while a frame is on top is
                                ;; the defect this pin forbids
-                               (when wasmdown.component.runtime::*right-handoffs*
+                               (when (right-handoffs)
                                  (setf violation t))
                                (setf peer-took t))
                           (wasmdown.component.runtime::%right-drop p))))
@@ -3092,10 +3133,10 @@ repo root, as a string — the pin runs a fixture row VERBATIM."
              ;; . target), right released
              (sb-thread:grab-mutex wasmdown.component.runtime::*store-right*)
              (wasmdown.component.runtime::%right-take c)
-             (setf wasmdown.component.runtime::*right-ticket* tg
-                   wasmdown.component.runtime::*right-handoffs*
+             (setf (wasmdown.component.runtime::%store-right-ticket) tg
+                   (right-handoffs)
                    (list (cons c tg))
-                   wasmdown.component.runtime::*right-owner* nil)
+                   (wasmdown.component.runtime::%store-right-owner) nil)
              (sb-thread:release-mutex
               wasmdown.component.runtime::*store-right*)
              (sleep 0.05)
@@ -3104,46 +3145,46 @@ repo root, as a string — the pin runs a fixture row VERBATIM."
              (wasmdown.component.runtime::%right-acquire c)
              (is (sb-thread:holding-mutex-p
                   wasmdown.component.runtime::*store-right*))
-             (is (eq wasmdown.component.runtime::*right-ticket* c))
-             (pop wasmdown.component.runtime::*right-handoffs*)
-             (is (null wasmdown.component.runtime::*right-handoffs*))
+             (is (eq (wasmdown.component.runtime::%store-right-ticket) c))
+             (pop (right-handoffs))
+             (is (null (right-handoffs)))
              (wasmdown.component.runtime::%right-drop c)
              (sb-thread:join-thread peer :timeout 5.0)
              (is peer-took)
              (is (not violation)))
            ;; ---- (a2) the target's PARK names the handoff caller
-           (setf wasmdown.component.runtime::*right-handoffs*
+           (setf (right-handoffs)
                  (list (cons c tg))
-                 wasmdown.component.runtime::*right-ticket* tg
-                 wasmdown.component.runtime::*scheduler-threads*
+                 (wasmdown.component.runtime::%store-right-ticket) tg
+                 (wasmdown.component.runtime::%store-threads)
                  (list c tg))
            (sb-thread:grab-mutex wasmdown.component.runtime::*store-right*)
            (let ((wasmdown.component.runtime::*right-self* tg))
              (wasmdown.component.runtime::%right-take tg)
              (wasmdown.component.runtime::%right-yield tg))
-           (is (eq wasmdown.component.runtime::*right-ticket* c))
+           (is (eq (wasmdown.component.runtime::%store-right-ticket) c))
            (is (plusp (wasmdown.component.runtime::async-thread-wake-count
                        c)))
            ;; ---- (a3) the target's EXIT names the handoff caller
-           (setf wasmdown.component.runtime::*right-handoffs*
+           (setf (right-handoffs)
                  (list (cons c tg))
-                 wasmdown.component.runtime::*right-ticket* tg
-                 wasmdown.component.runtime::*scheduler-threads*
+                 (wasmdown.component.runtime::%store-right-ticket) tg
+                 (wasmdown.component.runtime::%store-threads)
                  (list c tg))
            (sb-thread:grab-mutex wasmdown.component.runtime::*store-right*)
            (let ((wasmdown.component.runtime::*right-self* tg))
              (wasmdown.component.runtime::%right-take tg)
              (wasmdown.component.runtime::%right-release-on-exit tg))
-           (is (eq wasmdown.component.runtime::*right-ticket* c)))
+           (is (eq (wasmdown.component.runtime::%store-right-ticket) c)))
       ;; never leave the store right or the frames to the next test
       (when (sb-thread:holding-mutex-p
              wasmdown.component.runtime::*store-right*)
         (sb-thread:release-mutex
          wasmdown.component.runtime::*store-right*))
-      (setf wasmdown.component.runtime::*scheduler-threads* old-threads
-            wasmdown.component.runtime::*right-ticket* old-ticket
-            wasmdown.component.runtime::*right-handoffs* old-frames
-            wasmdown.component.runtime::*right-owner* old-owner))
+      (setf (wasmdown.component.runtime::%store-threads) old-threads
+            (wasmdown.component.runtime::%store-right-ticket) old-ticket
+            (right-handoffs) old-frames
+            (wasmdown.component.runtime::%store-right-owner) old-owner))
     ;; ---- (b) the fixture row VERBATIM (component + assert_return)
     (let ((wast (%pin-slice "tests/component/async/reentrance.wast"
                             239 346)))
@@ -3574,7 +3615,7 @@ they use no type aliases or type imports)."
                (list guest) (wasmdown.component:make-ct
                              :kind :resource :payload "absent"))))))
 
-(test component/two-providers-drop-own-finalizers-pin
+(pin-test component/two-providers-drop-own-finalizers-pin
   ;; TWO filesystem providers, DIFFERENT capability contexts, BOTH
   ;; linked into ONE guest: each owns its own descriptor reps and its
   ;; own registry entry for the descriptor ct. Dropping a rep releases
@@ -3715,15 +3756,14 @@ they use no type aliases or type imports)."
 the pin neither sees nor leaves the fixtures' threads. On unwind,
 abandon + unblock whatever the pin registered (the park sites check
 the abandoned mark at their loop top and exit)."
-  `(let ((wasmdown.component.runtime::*scheduler-threads* nil)
-         (wasmdown.component.runtime::*right-ticket* nil)
-         (wasmdown.component.runtime::*right-owner* nil)
+  `(let ((wasmdown.component.runtime::*current-component-store*
+           (wasmdown.component.runtime:make-component-store))
          (wasmdown.component.runtime::*right-self* nil)
          (wasmdown.component.runtime::*current-thread* nil)
          (wasmdown.component.runtime::*current-task* nil))
      (unwind-protect
           (progn ,@body)
-       (dolist (th wasmdown.component.runtime::*scheduler-threads*)
+       (dolist (th (wasmdown.component.runtime::%store-threads))
          (setf (wasmdown.component.runtime::async-thread-abandoned th) t
                (wasmdown.component.runtime::async-thread-suspended-p th) nil
                (wasmdown.component.runtime::async-thread-yield-parked th) nil
@@ -3737,7 +3777,7 @@ the abandoned mark at their loop top and exit)."
             (wasmdown.component.runtime::async-thread-suspend-waitqueue th))))
        (sb-thread:with-recursive-lock
            (wasmdown.component.runtime::*scheduler-mutex*)
-         (setf wasmdown.component.runtime::*scheduler-threads* nil)))))
+         (setf (wasmdown.component.runtime::%store-threads) nil)))))
 
 (defun %pin-inst ()
   "A bare comp-instance: all the thread builtins need from it is the
@@ -3764,7 +3804,7 @@ thread."
                                        :test #'eq)))
   (sb-thread:with-recursive-lock
       (wasmdown.component.runtime::*scheduler-mutex*)
-    (pushnew th wasmdown.component.runtime::*scheduler-threads*
+    (pushnew th (wasmdown.component.runtime::%store-threads)
              :test #'eq))
   th)
 
@@ -3774,8 +3814,8 @@ thread."
                                         :test #'eq)))
   (sb-thread:with-recursive-lock
       (wasmdown.component.runtime::*scheduler-mutex*)
-    (setf wasmdown.component.runtime::*scheduler-threads*
-          (remove th wasmdown.component.runtime::*scheduler-threads*
+    (setf (wasmdown.component.runtime::%store-threads)
+          (remove th (wasmdown.component.runtime::%store-threads)
                   :test #'eq))))
 
 (defun %pin-builtin (inst kind)
@@ -3799,11 +3839,9 @@ registry/right ticket; the shared record is the channel."
   (let* ((done (list nil))
          (err (list nil))
          (bt (sb-thread:make-thread
-              (lambda ()
+              (%pin-in-store ()
                 (let ((wasmdown.component.runtime::*current-thread* th)
-                      (wasmdown.component.runtime::*right-self* th)
-                      (wasmdown.component.runtime::*right-ticket* nil)
-                      (wasmdown.component.runtime::*scheduler-threads* nil))
+                      (wasmdown.component.runtime::*right-self* th))
                   (unwind-protect
                        (handler-case
                            (sb-ext:with-timeout
@@ -3984,7 +4022,7 @@ waits unbounded)."
           (wasmdown:wasm-trap (c) c))
       (sb-ext:timeout () :parked))))
 
-(test component/explicit-resume-requires-parked-peer-pin
+(pin-test component/explicit-resume-requires-parked-peer-pin
   ;; §4688/§4714 (canon_thread_{suspend,yield}_then_resume): the target
   ;; must be SUSPENDED — §391-407: blocked with NO readiness function.
   ;; §494/§4688 make the switch builtins the ONLY explicit resumers, so
@@ -4011,16 +4049,13 @@ waits unbounded)."
         (%pin-wait-parked parked)
         (let* ((outcome (list :res :running))
                (bt (sb-thread:make-thread
-                    (lambda ()
+                    (%pin-in-store ()
                       (let ((wasmdown.component.runtime::*current-thread*
                               caller)
                             (wasmdown.component.runtime::*current-task*
                               (wasmdown.component.runtime::async-thread-task
                                caller))
-                            (wasmdown.component.runtime::*right-self* caller)
-                            (wasmdown.component.runtime::*right-ticket* nil)
-                            (wasmdown.component.runtime::*scheduler-threads*
-                              nil))
+                            (wasmdown.component.runtime::*right-self* caller))
                         (unwind-protect
                              (handler-case
                                  (sb-ext:with-timeout
@@ -4228,7 +4263,7 @@ waits unbounded)."
         (wasmdown.component.runtime::%task-exit-implicit-thread
          (wasmdown.component.runtime::async-thread-task p))))))
 
-(test component/premature-park-release-pin
+(pin-test component/premature-park-release-pin
   ;; THE SUSPEND PARK IS RELEASED BY A RESUME, NEVER BY A SCHEDULER
   ;; HANDOFF (§407: a SUSPENDED thread has `ready_func` None; §433-440:
   ;; it is absent from `Store.waiting`, so §936's tick cannot pick it;
@@ -4337,21 +4372,17 @@ waits unbounded)."
                (peer (wasmdown.component.runtime::make-async-thread
                       :task peer-task))
                (started (list nil))
-               (registry wasmdown.component.runtime::*scheduler-threads*)
                (gate nil))
           (setf (wasmdown.component.runtime::async-task-implicit-thread
                  peer-task)
                 peer)
           (setf gate
                 (sb-thread:make-thread
-                  (lambda ()
+                  (%pin-in-store ()
                     (let ((wasmdown.component.runtime::*current-thread* peer)
                           (wasmdown.component.runtime::*current-task*
                             peer-task)
-                          (wasmdown.component.runtime::*right-self* peer)
-                          (wasmdown.component.runtime::*right-ticket* nil)
-                          (wasmdown.component.runtime::*scheduler-threads*
-                            registry))
+                          (wasmdown.component.runtime::*right-self* peer))
                       (unwind-protect
                            (setf (car started)
                                  (wasmdown.component.runtime::
@@ -4405,7 +4436,7 @@ waits unbounded)."
         136 207)
        "premature-park-may-block.wast")))
 
-(test component/switch-caller-is-not-grantable-pin
+(pin-test component/switch-caller-is-not-grantable-pin
   ;; THE EXPLICIT SWITCH IS A TARGET-LIMITED HANDOFF
   ;; (CanonicalABI.md 474-484, 528-565; the §242-273 handler
   ;; discipline). The spec's switch is SYNCHRONOUS: `block(switch_to
@@ -4471,15 +4502,11 @@ waits unbounded)."
           (%pin-register inst target)
           (%pin-register inst caller)
           (let ((bt (sb-thread:make-thread
-                     (lambda ()
+                     (%pin-in-store ()
                        (let ((wasmdown.component.runtime::*current-thread*
                                target)
                              (wasmdown.component.runtime::*right-self*
-                               target)
-                             (wasmdown.component.runtime::*right-ticket*
-                               nil)
-                             (wasmdown.component.runtime::*scheduler-threads*
-                               nil))
+                               target))
                          (unwind-protect
                               (handler-case
                                   (progn
@@ -4516,18 +4543,14 @@ waits unbounded)."
                (wasmdown.component.runtime::async-thread-yield-parked target))
              :what "the target's yield park")
             (let ((bc (sb-thread:make-thread
-                       (lambda ()
+                       (%pin-in-store ()
                          (let ((wasmdown.component.runtime::*current-thread*
                                  caller)
                                (wasmdown.component.runtime::*current-task*
                                  (wasmdown.component.runtime::async-thread-task
                                   caller))
                                (wasmdown.component.runtime::*right-self*
-                                 caller)
-                               (wasmdown.component.runtime::*right-ticket*
-                                 nil)
-                               (wasmdown.component.runtime::*scheduler-threads*
-                                 nil))
+                                 caller))
                            (unwind-protect
                                 (handler-case
                                     (progn
@@ -4624,18 +4647,14 @@ waits unbounded)."
                  target2)
                 (lambda () nil))
           (let ((bc (sb-thread:make-thread
-                     (lambda ()
+                     (%pin-in-store ()
                        (let ((wasmdown.component.runtime::*current-thread*
                                caller2)
                              (wasmdown.component.runtime::*current-task*
                                (wasmdown.component.runtime::async-thread-task
                                 caller2))
                              (wasmdown.component.runtime::*right-self*
-                               caller2)
-                             (wasmdown.component.runtime::*right-ticket*
-                               nil)
-                             (wasmdown.component.runtime::*scheduler-threads*
-                               nil))
+                               caller2))
                          (unwind-protect
                               (handler-case
                                   (progn
@@ -4668,7 +4687,7 @@ waits unbounded)."
             (is (%pin-clean-p caller2))
             (is (%pin-join bc))))))))
 
-(test component/crcc-1-pin
+(pin-test component/crcc-1-pin
   ;; THE OUTER RESUMER WAITS FOR THE WHOLE SWITCH CHAIN
   ;; (CanonicalABI.md 469-484: Thread.resume runs the switch_to chain
   ;; in a loop until a continuation RETURNS or BLOCKS with no thread
@@ -4730,14 +4749,12 @@ waits unbounded)."
       (setf (wasmdown.component.runtime::async-thread-spawn-thunk target)
             (lambda ()
               (sb-thread:make-thread
-               (lambda ()
+               (%pin-in-store ()
                  (let ((wasmdown.component.runtime::*current-thread* target)
                        (wasmdown.component.runtime::*current-task*
                          (wasmdown.component.runtime::async-thread-task
                           target))
-                       (wasmdown.component.runtime::*right-self* target)
-                       (wasmdown.component.runtime::*right-ticket* nil)
-                       (wasmdown.component.runtime::*scheduler-threads* nil))
+                       (wasmdown.component.runtime::*right-self* target))
                    (unwind-protect
                         (handler-case
                             (progn
@@ -4761,12 +4778,10 @@ waits unbounded)."
       ;; builtin (suspend_then_resume)
       (setf bt
             (sb-thread:make-thread
-             (lambda ()
+             (%pin-in-store ()
                (let ((wasmdown.component.runtime::*current-thread* caller)
                      (wasmdown.component.runtime::*current-task* ctask)
-                     (wasmdown.component.runtime::*right-self* caller)
-                     (wasmdown.component.runtime::*right-ticket* nil)
-                     (wasmdown.component.runtime::*scheduler-threads* nil))
+                     (wasmdown.component.runtime::*right-self* caller))
                  (unwind-protect
                       (handler-case
                           (progn
@@ -4806,17 +4821,14 @@ waits unbounded)."
              ;; the canceller: the REAL %TASK-REQUEST-CANCELLATION
              (setf bc
                    (sb-thread:make-thread
-                    (lambda ()
+                    (%pin-in-store ()
                       (let ((wasmdown.component.runtime::*current-thread*
                               canceller)
                             (wasmdown.component.runtime::*current-task*
                               (wasmdown.component.runtime::async-thread-task
                                canceller))
                             (wasmdown.component.runtime::*right-self*
-                              canceller)
-                            (wasmdown.component.runtime::*right-ticket* nil)
-                            (wasmdown.component.runtime::*scheduler-threads*
-                              nil))
+                              canceller))
                         (unwind-protect
                              (handler-case
                                  (progn
@@ -5444,7 +5456,7 @@ instance is torn down."
     ;; dynamic caller's table) and the callee receives THAT index, not
     ;; the caller's raw source index. Delete the arm and the closure
     ;; sees the source index (passing-resources::1's 55-from-5).
-    (let ((store wasmdown.component.runtime::*ct-defining-inst*))
+    (let ((store (ct-defining)))
       (let* ((callee (wasmdown.component.runtime:make-comp-instance))
              (caller (wasmdown.component.runtime:make-comp-instance))
              (bct (wasmdown.component.runtime::make-ct* :borrow 0))
@@ -5488,7 +5500,7 @@ instance is torn down."
                        caller src rt)))))
           (remhash (cons callee 0) store))))))
 
-(test component/switched-target-exit-releases-pin
+(pin-test component/switched-target-exit-releases-pin
   ;; §474-484: the switch_to chain runs the target until it BLOCKS OR
   ;; RETURNS; its caller is released only at that boundary, and the
   ;; §242-273 exit post normally carries the release.
@@ -5535,15 +5547,12 @@ instance is torn down."
               (wasmdown.component.runtime::%task-exit-implicit-thread
                (wasmdown.component.runtime::async-thread-task target))))
       (let ((bc (sb-thread:make-thread
-                 (lambda ()
+                 (%pin-in-store ()
                    (let ((wasmdown.component.runtime::*current-thread* caller)
                          (wasmdown.component.runtime::*current-task*
                            (wasmdown.component.runtime::async-thread-task
                             caller))
-                         (wasmdown.component.runtime::*right-self* caller)
-                         (wasmdown.component.runtime::*right-ticket* nil)
-                         (wasmdown.component.runtime::*scheduler-threads*
-                           nil))
+                         (wasmdown.component.runtime::*right-self* caller))
                      (unwind-protect
                           (handler-case
                               (progn
@@ -5715,9 +5724,14 @@ THE LOCK ORDER rule (b): those are RIGHT acquisitions, and a held
     (is (search "(defun %store-teardown" text))
     (is (search "(%task-exit-implicit-thread" text))
     (is (search "(defun %without-right" text))
+    ;; ANCHOR ROT IS RED, NOT BLIND: the detector must actually find
+    ;; scheduler sections in the real source. Renaming the lock variable
+    ;; (or reformatting the section) without updating the anchor would
+    ;; otherwise turn this control into a vacuous pass.
+    (is (plusp (length (%pin-scheduler-spans text))))
     (is (not (%pin-lock-order-violation-p text)))))
 
-(test component/store-teardown-runs-with-right-held-pin
+(pin-test component/store-teardown-runs-with-right-held-pin
   ;; EXERCISE: the previously cyclic path, end to end. A thread that
   ;; OWNS the store right (and has *RIGHT-SELF* bound, the shape the
   ;; incident had) runs the REAL %STORE-TEARDOWN with async exclusive
@@ -5745,10 +5759,10 @@ THE LOCK ORDER rule (b): those are RIGHT acquisitions, and a held
                                   task)
                                  th)
                            th)))
-         (old-threads wasmdown.component.runtime::*scheduler-threads*)
-         (old-ticket wasmdown.component.runtime::*right-ticket*)
-         (old-frames wasmdown.component.runtime::*right-handoffs*)
-         (old-owner wasmdown.component.runtime::*right-owner*)
+         (old-threads (wasmdown.component.runtime::%store-threads))
+         (old-ticket (wasmdown.component.runtime::%store-right-ticket))
+         (old-frames (right-handoffs))
+         (old-owner (wasmdown.component.runtime::%store-right-owner))
          (self (wasmdown.component.runtime::make-async-thread
                 :task (wasmdown.component.runtime::make-async-task
                        :seq '(0))))
@@ -5759,13 +5773,13 @@ THE LOCK ORDER rule (b): those are RIGHT acquisitions, and a held
          (teardown-finished nil))
     (unwind-protect
          (progn
-           (setf wasmdown.component.runtime::*scheduler-threads* threads
-                 wasmdown.component.runtime::*right-ticket* nil
-                 wasmdown.component.runtime::*right-handoffs* nil
-                 wasmdown.component.runtime::*right-owner* nil)
+           (setf (wasmdown.component.runtime::%store-threads) threads
+                 (wasmdown.component.runtime::%store-right-ticket) nil
+                 (right-handoffs) nil
+                 (wasmdown.component.runtime::%store-right-owner) nil)
            (let* ((competitor
                     (sb-thread:make-thread
-                     (lambda ()
+                     (%pin-in-store ()
                        (sb-thread:wait-on-semaphore go)
                        ;; ARM, then contend: the signal is posted one
                        ;; pair of instructions before the mutex wait,
@@ -5788,7 +5802,7 @@ THE LOCK ORDER rule (b): those are RIGHT acquisitions, and a held
                      :name "pin-lock-order-competitor"))
                   (teardown
                     (sb-thread:make-thread
-                     (lambda ()
+                     (%pin-in-store ()
                        (let ((wasmdown.component.runtime::*right-self* self))
                          (sb-thread:grab-mutex
                           wasmdown.component.runtime::*store-right*)
@@ -5820,10 +5834,10 @@ THE LOCK ORDER rule (b): those are RIGHT acquisitions, and a held
              wasmdown.component.runtime::*store-right*)
         (sb-thread:release-mutex
          wasmdown.component.runtime::*store-right*))
-      (setf wasmdown.component.runtime::*scheduler-threads* old-threads
-            wasmdown.component.runtime::*right-ticket* old-ticket
-            wasmdown.component.runtime::*right-handoffs* old-frames
-            wasmdown.component.runtime::*right-owner* old-owner)
+      (setf (wasmdown.component.runtime::%store-threads) old-threads
+            (wasmdown.component.runtime::%store-right-ticket) old-ticket
+            (right-handoffs) old-frames
+            (wasmdown.component.runtime::%store-right-owner) old-owner)
       (dolist (th threads)
         (setf (wasmdown.component.runtime::async-thread-abandoned th) t
               (wasmdown.component.runtime::async-thread-spawn-thunk th)
@@ -6003,7 +6017,7 @@ THE LOCK ORDER rule (b): those are RIGHT acquisitions, and a held
 (assert_return (invoke \"run\") (u32.const 42))
 ")
 
-(test component/nested-sync-lower-keeps-guest-right-pin
+(pin-test component/nested-sync-lower-keeps-guest-right-pin
   ;; (1) THE RULE at the real entry point: after %canon-lift-async
   ;; (the sync lower of an ASYNC-typed callee) returns, a GUEST
   ;; caller still holds the store right and the ticket names it; a
@@ -6031,12 +6045,12 @@ THE LOCK ORDER rule (b): those are RIGHT acquisitions, and a held
                  (wasmdown.component.runtime:lifted-func-call f)
                  (is (sb-thread:holding-mutex-p
                       wasmdown.component.runtime::*store-right*))
-                 (is (eq wasmdown.component.runtime::*right-ticket* th)))
+                 (is (eq (wasmdown.component.runtime::%store-right-ticket) th)))
             (when (sb-thread:holding-mutex-p
                    wasmdown.component.runtime::*store-right*)
               (sb-thread:release-mutex
                wasmdown.component.runtime::*store-right*)
-              (setf wasmdown.component.runtime::*right-ticket* nil)))))
+              (setf (wasmdown.component.runtime::%store-right-ticket) nil)))))
       ;; THE DRIVER CALLER
       (let ((wasmdown.component.runtime::*current-thread* nil)
             (wasmdown.component.runtime::*current-task* nil)
@@ -6170,3 +6184,58 @@ THE LOCK ORDER rule (b): those are RIGHT acquisitions, and a held
         (wasmdown.test:run-all-tests)
       (declare (ignore passed))
       (zerop failed))))
+
+(test component/abi-variant-tag-matching
+  ;; A host domain value tags its case with a KEYWORD (a P2 provider
+  ;; returns (:closed . nil)); the WIT names the case with a string.
+  ;; Matching on the normalised name is what makes the right
+  ;; discriminant land in the right payload slot: the old
+  ;; (string= :closed "closed") fell through to case 0 and stored the
+  ;; NIL payload of the WRONG case's resource slot — the trap that
+  ;; blocked the real 0.2 SQLite artifact.
+  (let ((cases '(("last-operation-failed" . :error)
+                 ("closed" . nil))))
+    (wasmdown.test:is
+     (= 1 (wasmdown.component.runtime::%abi-case-index :closed cases)))
+    (wasmdown.test:is
+     (= 0 (wasmdown.component.runtime::%abi-case-index
+           :last-operation-failed cases)))
+    ;; string tags (the ABI's own "ok"/"error" spelling) keep working
+    (wasmdown.test:is
+     (= 0 (wasmdown.component.runtime::%abi-case-index "last-operation-failed"
+                                                      cases)))
+    ;; an unknown tag keeps the spec's fall-through default
+    (wasmdown.test:is
+     (= 0 (wasmdown.component.runtime::%abi-case-index :nope cases)))))
+
+(test component/abi-result-layout
+  ;; result<T,E> is a VARIANT: alignment = max(discriminant size, the
+  ;; payloads' alignments), size = aligned(discriminant + payload).
+  ;; The old alignment hardcoded 4 and the old size dropped the
+  ;; discriminant, so result<enum,error-code> (alignment 1, size 2)
+  ;; trapped "unaligned pointer (store)" on an adapter-supplied retptr
+  ;; and then disagreed with itself about the layout.
+  (multiple-value-bind (mk-ct mk-prim)
+      (values (find-symbol "MAKE-CT" '#:wasmdown.component)
+              (find-symbol "MAKE-CT*" '#:wasmdown.component))
+    (declare (ignore mk-prim))
+    (flet ((prim (p) (funcall mk-ct :kind :prim :payload p :offset 0))
+           (enum (labels) (funcall mk-ct :kind :enum
+                                   :payload (coerce labels 'vector)
+                                   :offset 0)))
+      (let* ((code (enum '("no-entry" "access")))
+             (res (funcall mk-ct :kind :result
+                           :payload (cons code code) :offset 0))
+             (inst (wasmdown.component.runtime:make-comp-instance)))
+        (wasmdown.test:is
+         (= 1 (wasmdown.component.runtime::%abi-alignment res inst)))
+        (wasmdown.test:is
+         (= 2 (wasmdown.component.runtime::%abi-elem-size res inst)))
+        ;; a 32-bit payload keeps its 4-alignment for both
+        (let ((res32 (funcall mk-ct :kind :result
+                              :payload (cons (prim :u32) (prim :u32))
+                              :offset 0)))
+          (wasmdown.test:is
+           (= 4 (wasmdown.component.runtime::%abi-alignment res32 inst)))
+          (wasmdown.test:is
+           (= 8 (wasmdown.component.runtime::%abi-elem-size res32 inst))))))))

@@ -27,7 +27,9 @@
    (:file "src/component-runtime")
    (:file "src/component-text")
    (:file "src/wit")
-   (:file "src/wasi")))
+   (:file "src/wasi")
+   (:file "src/wasi-preview1")
+   (:file "src/wasi-preview2")))
 
 (asdf:defsystem #:wasmdown/test
   :description "WASMDOWN unit and integration tests."
@@ -46,4 +48,9 @@
    (:file "tests/simd")
    (:file "tests/wast")
    (:file "tests/wit")
-   (:file "tests/wasi")))
+   (:file "tests/component-pins")
+   (:file "tests/component-store")
+   (:file "tests/wasi")
+   (:file "tests/wasi-preview1")
+   (:file "tests/wasi-p2-fixtures")
+   (:file "tests/wasi-preview2")))

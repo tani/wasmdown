@@ -1544,7 +1544,11 @@ the memarg's static offset. Returns (values ea memidx new-stack)."
                               (t 32)))
                     (signed (search "_s" name))
                     (r (wasmdown.simd:make-v128)))
-               (loop for i below 8
+               ;; the SOURCE is always 8 bytes: the number of lanes is
+               ;; 8 bytes / (sw/8) bytes-per-lane (8 for load8x8,
+               ;; 4 for load16x4, 2 for load32x2) — the hardcoded 8
+               ;; overran the 16-byte result for the wider sources
+               (loop for i below (/ 64 sw)
                      do (let ((x (wasmdown.runtime:memory-load
                                   mem (+ ea (* i (/ sw 8)))
                                   (/ sw 8))))

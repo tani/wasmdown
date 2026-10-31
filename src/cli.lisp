@@ -249,17 +249,26 @@ functions first)."
   "Return (values file invokes options guest-args). INVOKES is a list
 of (name . integer-args) in command-line order (core modules).
 OPTIONS is an alist of the WASI-capability flags (repeats kept, in
-order); GUEST-ARGS are the positional tokens AFTER the input file."
+order); GUEST-ARGS are the positional tokens AFTER the input file.
+`--` ends option parsing: every later token reaches the guest
+unchanged, including dash-prefixed ones."
   (let ((rest argv) (file nil) (invokes '()) (options '()) (guest '()))
     (loop while rest
           for tok = (pop rest)
           do (cond
+               ((string= tok "--")
+                ;; everything after `--' is a guest argument
+                (loop while rest
+                      do (push (pop rest) guest))
+                (setf rest nil))
                ((string= tok "--invoke")
                 (let ((name (pop rest)))
                   (unless name
                     (%usage-error "run: --invoke requires an export name"))
                   (let ((ints '()))
-                    (loop while (and rest (not (%flagp (first rest))))
+                    (loop while (and rest
+                                     (not (string= (first rest) "--"))
+                                     (not (%flagp (first rest))))
                           do (push (%parse-int (pop rest)) ints))
                     (push (cons name (nreverse ints)) invokes))))
                ((string= tok "--wasi")
@@ -276,6 +285,19 @@ order); GUEST-ARGS are the positional tokens AFTER the input file."
     (unless file
       (%usage-error "run: missing input file"))
     (values file (nreverse invokes) (nreverse options) (nreverse guest))))
+
+(defun %api-mode ()
+  "The documented WASMDOWN_API_MODE selection: absent or `interpret'
+selects the reference interpreter, `baseline' the wasmdown codegen
+backend, anything else is a host usage error. This mode is threaded
+into the CORE instantiation that actually executes guest code."
+  (let ((value (sb-ext:posix-getenv "WASMDOWN_API_MODE")))
+    (cond
+      ((or (null value) (string= value "") (string= value "interpret"))
+       :interpret)
+      ((string= value "baseline") :baseline)
+      (t (%usage-error "WASMDOWN_API_MODE must be `interpret' or `baseline', got ~s"
+                       value)))))
 
 (defun %run-collect (options flag)
   "The values of the repeated option FLAG, in command-line order."
@@ -299,13 +321,20 @@ order); GUEST-ARGS are the positional tokens AFTER the input file."
     (cons (subseq spec 0 eq) (subseq spec (1+ eq)))))
 
 (defun %dir-preopen (spec)
-  "HOST[::GUEST] -> an open wasi-preopen (the host directory handle)."
-  (let* ((sep (search "::" spec))
+  "HOST[::GUEST][:ro] -> an open wasi-preopen (the host directory
+handle). `:ro' grants a read-only authority: creation, writing and
+mutation through the root are denied by the derived ABI rights."
+  (let* ((read-only (and (> (length spec) 3)
+                         (string= spec ":ro" :start1 (- (length spec) 3))))
+         (spec (if read-only (subseq spec 0 (- (length spec) 3)) spec))
+         (sep (search "::" spec))
          (host (if sep (subseq spec 0 sep) spec))
          (guest (if sep (subseq spec (+ sep 2)) spec)))
     (unless (plusp (length host))
-      (%usage-error "run: --dir expects HOST[::GUEST], got ~s" spec))
-    (wasmdown.wasi:open-wasi-preopen host :name guest)))
+      (%usage-error "run: --dir expects HOST[::GUEST][:ro], got ~s" spec))
+    (wasmdown.wasi:open-wasi-preopen
+     host :name guest
+     :permissions (if read-only '("read") '("read" "write" "mutate-directory")))))
 
 (defun %run-network (options)
   "The network authority declared by --net/--listen/--dns, or NIL
@@ -356,7 +385,17 @@ component path as argv[0]) are the explicitly configured ones."
     ;; the component is known to be a valid command
     (let ((context (%component-context options guest-args file)))
       (unwind-protect
-           (wasmdown.wasi:run-component comp context)
+           ;; providers follow the component's DECLARED imports: a 0.2
+           ;; command gets the versioned P2 tables, a 0.3 one the
+           ;; vendored 0.3 world
+           (wasmdown.wasi:run-component
+            comp context
+            ;; the documented WASMDOWN_API_MODE reaches the embedded
+            ;; cores through this mode, not through an unused
+            ;; environment read
+            :mode (%api-mode)
+            :providers (wasmdown.wasi:component-command-providers
+                        context comp))
         ;; the preopen handles belong to the CLI invocation
         (dolist (preopen (wasmdown.wasi:wasi-context-preopens context))
           (ignore-errors (wasmdown.wasi:close-wasi-preopen preopen)))))))
@@ -372,24 +411,42 @@ component path as argv[0]) are the explicitly configured ones."
                    "run: --invoke applies to core modules, not components"))
                 (%run-component-file bytes options guest-args file))
               (progn
-                (when guest-args
-                  (%usage-error "run: stray argument ~s (core modules take --invoke)"
-                                (first guest-args)))
-                (when (or (assoc "--wasi" options :test #'string=)
-                          (%run-collect options "--dir")
-                          (%run-collect options "--env")
-                          (%run-collect options "--net")
-                          (%run-collect options "--listen")
-                          (%run-collect options "--dns"))
-                  (%usage-error
-                   "run: the WASI options require a Component Model component"))
-                (let* ((module (wasmdown:read-module bytes))
-                       (inst (wasmdown:instantiate module)))
-                  (dolist (inv invokes)
-                    (let ((results (apply #'wasmdown:invoke inst
-                                          (car inv) (cdr inv))))
-                      (format t "~{~a~^ ~}~%" results)))
-                  0))))
+                ;; CORE module. With --wasi it is a Preview1 command:
+                ;; it gets the explicit capabilities and its `_start'
+                ;; runs once; without it only --invoke is available.
+                (let ((wasi (assoc "--wasi" options :test #'string=)))
+                  (when (and wasi invokes)
+                    (%usage-error
+                     "run: a WASI command module runs `_start'; `--invoke' may not also be requested"))
+                  (if wasi
+                      (let* ((module (wasmdown:read-module bytes))
+                             (context (%component-context options guest-args file)))
+                        (unwind-protect
+                             (let ((status (wasmdown.wasi:run-preview1
+                                            module context :mode (%api-mode))))
+                               ;; the embedding result is the RAW u32; the
+                               ;; CLI status is its low eight bits
+                               (logand status #xff))
+                          (dolist (preopen (wasmdown.wasi:wasi-context-preopens context))
+                            (ignore-errors (wasmdown.wasi:close-wasi-preopen preopen)))))
+                      (progn
+                        (when guest-args
+                          (%usage-error "run: stray argument ~s (core modules take --invoke)"
+                                        (first guest-args)))
+                        (when (or (%run-collect options "--dir")
+                                  (%run-collect options "--env")
+                                  (%run-collect options "--net")
+                                  (%run-collect options "--listen")
+                                  (%run-collect options "--dns"))
+                          (%usage-error
+                           "run: --dir/--env/--net/--listen/--dns require --wasi"))
+                        (let* ((module (wasmdown:read-module bytes))
+                               (inst (wasmdown:instantiate module :mode (%api-mode))))
+                          (dolist (inv invokes)
+                            (let ((results (apply #'wasmdown:invoke inst
+                                                  (car inv) (cdr inv))))
+                              (format t "~{~a~^ ~}~%" results)))
+                          0)))))))
       (wasmdown:decode-error (c) (%diag c) 1)
       (wasmdown:validation-error (c) (%diag c) 1)
       (wasmdown:link-error (c) (%diag c) 1)

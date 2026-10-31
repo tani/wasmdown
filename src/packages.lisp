@@ -200,6 +200,7 @@
    #:memory-instance #:memory-instance-p
    #:memory-instance-bytes #:memory-instance-pages
    #:memory-instance-max-pages #:memory-instance-has-max-p
+   #:memory-instance-i64-p
    #:make-memory-instance
    #:memory-load #:memory-store #:memory-size #:memory-grow #:memory-fill
    #:memory-copy #:memory-copy2 #:memory-init
@@ -250,6 +251,8 @@
   (:export
    ;; reader entry points
    #:parse-wit-file
+   #:parse-wit-files
+   #:parse-wit-directory
    #:parse-wit-string
    #:wit-error
    #:wit-error-path
@@ -390,6 +393,10 @@
    #:wasi-context-stderr
    #:wasi-context-preopens
    #:wasi-context-networks
+   #:wasi-context-reactor
+   #:wasi-context-closed-p
+   #:close-wasi-context
+   #:call-with-wasi-context
    ;; host exit
    #:wasi-exit
    #:wasi-exit-p
@@ -400,7 +407,59 @@
    #:make-host-lifted-func
    #:wasi-package
    #:wasi-package-file
+   #:wasi-package-files
    #:*wasi-wit-root*
+   ;; WASI Preview1 (wasi_snapshot_preview1)
+   #:make-preview1-instance
+   #:run-preview1
+   #:close-preview1-state
+   #:preview1-state
+   #:preview1-state-p
+   ;; WASI 0.2 (Preview2) facade
+   #:p2-import-name-parts
+   #:preview2-command-world
+   #:preview2-command-provider
+   #:run-preview2
+   #:p2-packages
+   #:p2-interface
+   #:p2-builder-table
+   #:p2-stable-node-p
+   #:p2-monotonic-clock-instance
+   #:p2-wall-clock-instance
+   #:p2-random-instance
+   #:p2-insecure-instance
+   #:p2-insecure-seed-instance
+   #:p2-environment-instance
+   #:p2-exit-instance
+   #:p2-error-instance
+   #:p2-poll-instance
+   #:p2-streams-instance
+   #:p2-stdin-instance
+   #:p2-stdout-instance
+   #:p2-terminal-resource-instance
+   #:p2-terminal-stream-instance
+   #:p2-error
+   #:p2-error-p
+   #:p2-error-message
+   #:p2-error-ct
+   #:p2-in-ct
+   #:p2-out-ct
+   #:p2-pollable-ct
+   #:p2-filesystem-types-instance
+   #:p2-preopens-instance
+   #:p2-descriptor-ct
+   #:p2-entry-stream-ct
+   #:p2-sockets-package
+   #:p2-network-ct
+   #:p2-tcp-ct
+   #:p2-udp-ct
+   #:p2-tcp-instance
+   #:p2-udp-instance
+   #:p2-tcp-create-instance
+   #:p2-udp-create-instance
+   #:p2-network-instance
+   #:p2-instance-network-instance
+   #:p2-ip-name-lookup-instance
    ;; clocks
    #:monotonic-now
    #:monotonic-resolution
@@ -441,6 +500,8 @@
    #:command-world
    #:compose-world-providers
    #:command-provider
+   #:declared-component-imports
+   #:component-command-providers
    #:run-component
    #:component-run-export
    #:parse-wasi-endpoint

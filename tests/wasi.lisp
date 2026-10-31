@@ -216,9 +216,15 @@ packages this runtime provides."
     (nreverse out)))
 
 (defun %wasi-exported-func-names (instance)
+  "The WIT-DECLARED function names an instance exports. The implicit
+`[resource-drop]R' destructors are ABI-level exports (every imported
+resource needs one), not WIT functions, so they are excluded from the
+declared-surface comparison."
   (let (out)
     (maphash (lambda (key value)
-               (when (eq (car value) :func) (push key out)))
+               (when (and (eq (car value) :func)
+                          (not (eql 0 (search "[resource-drop]" key))))
+                 (push key out)))
              (wasmdown.component.runtime:comp-instance-exports instance))
     out))
 
@@ -3428,23 +3434,37 @@ Returns (values stream fd); the caller closes FD."
          (context (wasmdown.wasi:make-wasi-context
                    :arguments '("prog" "-v")
                    :stdout sink))
-         (status (wasmdown.wasi:run-component
-                  (%command-component *command-ok-fixture*) context)))
+         (status nil) (store nil))
+    (multiple-value-setq (status store)
+      (wasmdown.wasi:run-component
+       (%command-component *command-ok-fixture*) context))
     (is (eql 0 status))
     (is (string= "prog" (get-output-stream-string sink)))
-    ;; the exit boundary tore the store down: no registered guest threads
-    (is (zerop (length wasmdown.component.runtime::*scheduler-threads*)))))
+    ;; the exit boundary tore the RUN'S OWN store down: no registered
+    ;; guest threads in it
+    (is (zerop (length
+                (wasmdown.component.runtime:component-store-threads store))))))
 
 (test wasi/command-runner-err-and-exit
   ;; run returning err -> 1; exit-with-code(7) -> 7 with a clean store
-  (is (eql 1 (wasmdown.wasi:run-component
-              (%command-component *command-err-fixture*)
-              (wasmdown.wasi:make-wasi-context))))
-  (is (zerop (length wasmdown.component.runtime::*scheduler-threads*)))
-  (is (eql 7 (wasmdown.wasi:run-component
-              (%command-component *command-exit-fixture*)
-              (wasmdown.wasi:make-wasi-context))))
-  (is (zerop (length wasmdown.component.runtime::*scheduler-threads*))))
+  (let (store)
+    (is (eql 1 (multiple-value-bind (st s)
+                   (wasmdown.wasi:run-component
+                    (%command-component *command-err-fixture*)
+                    (wasmdown.wasi:make-wasi-context))
+                 (setf store s)
+                 st)))
+    (is (zerop (length
+                (wasmdown.component.runtime:component-store-threads store)))))
+  (let (store)
+    (is (eql 7 (multiple-value-bind (st s)
+                   (wasmdown.wasi:run-component
+                    (%command-component *command-exit-fixture*)
+                    (wasmdown.wasi:make-wasi-context))
+                 (setf store s)
+                 st)))
+    (is (zerop (length
+                (wasmdown.component.runtime:component-store-threads store))))))
 
 ;;; ---- the CLI: a component binary file + the WASI flags ----
 

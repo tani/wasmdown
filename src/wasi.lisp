@@ -72,7 +72,10 @@ slice 3) — never a path-prefix string."
   ;; cannot starve blocking stdio). They are host services, not a
   ;; result FIFO: a worker's only way back is the store queue.
   (dns-exec nil)
-  (stdio-exec nil))
+  (stdio-exec nil)
+  ;; the lifecycle flag: a closed context rejects NEW work and owns
+  ;; nothing any more (close-wasi-context is idempotent)
+  (closed-p nil))
 
 ;;; ---------------------------------------------------------------
 ;;; THE BOUNDED HOST EXECUTOR (plan step 6).
@@ -180,9 +183,19 @@ host call / a unit test): same fixed budget, created on first use.")
 (defvar *default-stdio-executor* nil
   "The blocked-stdio service for a NIL context (see *DEFAULT-DNS-EXECUTOR*).")
 
+(defun %context-work-gate (context what)
+  "Reject new host work for a CLOSED context: a context that was
+released must never start a resolver/stdio job whose completion no
+store will drain."
+  (when (and context (wasi-context-closed-p context))
+    (error 'wasmdown:host-error
+           :message (format nil "wasi context is closed: refusing ~a" what))))
+
 (defun wasi-context-dns-executor (context)
   "CONTEXT's DNS worker service (fixed *DNS-WORKER-COUNT* budget),
-created on first use. A NIL context uses the process default."
+created on first use. A NIL context uses the process default.
+A CLOSED context refuses new work."
+  (%context-work-gate context "a DNS lookup")
   (sb-thread:with-recursive-lock (*executor-service-lock*)
     (if context
         (or (wasi-context-dns-exec context)
@@ -196,7 +209,9 @@ created on first use. A NIL context uses the process default."
 
 (defun wasi-context-stdio-executor (context)
   "CONTEXT's blocked-stdio worker service (fixed
-*STDIO-WORKER-COUNT* budget), created on first use."
+*STDIO-WORKER-COUNT* budget), created on first use. A CLOSED context
+refuses new work."
+  (%context-work-gate context "a blocking stdio job")
   (sb-thread:with-recursive-lock (*executor-service-lock*)
     (if context
         (or (wasi-context-stdio-exec context)
@@ -207,6 +222,25 @@ created on first use. A NIL context uses the process default."
             (setf *default-stdio-executor*
                   (make-host-executor :name "wasi-stdio"
                                       :workers *stdio-worker-count*))))))
+
+(defun close-wasi-context (context)
+  "Release CONTEXT: reject new host work, detach its owned executor
+services (in-flight jobs finish into discarded results, never joined)
+and mark the context closed. Borrowed authorities (preopens, stdio
+streams, networks, reactor, a caller-owned store) are NOT closed —
+the embedder that lent them owns them. Idempotent."
+  (when context
+    (sb-thread:with-recursive-lock (*executor-service-lock*)
+      (setf (wasi-context-closed-p context) t))
+    (close-wasi-context-executors context))
+  context)
+
+(defmacro call-with-wasi-context ((context &key (close-p t)) &body body)
+  "Run BODY with CONTEXT established. When CLOSE-P (the default) the
+context is released on exit — a CLI-style invocation owns its
+context, while an embedder lending one closes it itself."
+  `(unwind-protect (progn ,@body)
+     ,(when close-p `(close-wasi-context ,context))))
 
 (defun close-wasi-context-executors (context)
   "Detach CONTEXT's executor services (idempotent). Queued jobs are
@@ -257,22 +291,119 @@ fasl rather than the checkout)."
                    (%source-file))
   "The vendored WASI 0.3.2 WIT tree (specs/wasi/MANIFEST.md).")
 
-(defun wasi-package-file (short-name)
-  "The vendored file for the package whose short name is SHORT-NAME
-(\"clocks\" -> clocks/clocks.wit)."
-  (merge-pathnames (make-pathname :directory (list :relative short-name)
-                                  :name short-name :type "wit")
-                   *wasi-wit-root*))
+(defparameter *wasi-spec-root*
+  (merge-pathnames #p"../specs/wasi/" (%source-file))
+  "The vendored specification root: every supported release plus the
+generated index (specs/wasi/index.txt).")
+
+(defparameter *wasi-supported-versions*
+  '("0.3.2" "0.2.12" "0.2.11" "0.2.10" "0.2.9" "0.2.8" "0.2.7"
+    "0.2.6" "0.2.5" "0.2.4" "0.2.3" "0.2.2" "0.2.1" "0.2.0")
+  "Every WIT release whose sources are vendored, newest first.")
+
+(defvar *wasi-package-index* nil
+  "version -> package short name -> list of pathnames, built once from
+specs/wasi/index.txt (never from directory-name guessing).")
+
+(defun %wasi-split-fields (line)
+  "Split an index line on tabs."
+  (let ((fields '()) (start 0))
+    (loop for i from 0 to (length line)
+          when (or (= i (length line)) (char= (char line i) #\Tab))
+            do (push (subseq line start i) fields)
+               (setf start (1+ i)))
+    (nreverse fields)))
+
+(defun wasi-package-index ()
+  "version -> package -> sorted list of vendored source pathnames."
+  (or *wasi-package-index*
+      (let ((table (make-hash-table :test #'equal))
+            (file (merge-pathnames "index.txt" *wasi-spec-root*)))
+        (with-open-file (in file :direction :input
+                                 :if-does-not-exist :error)
+          (loop for line = (read-line in nil nil)
+                while line
+                unless (or (zerop (length line)) (char= (char line 0) #\#))
+                  do (let* ((fields (%wasi-split-fields line))
+                            (version (first fields))
+                            (package (second fields))
+                            (rel (third fields)))
+                       (when (and version package rel)
+                         (let ((pkgs (or (gethash version table)
+                                         (setf (gethash version table)
+                                               (make-hash-table :test #'equal)))))
+                           (push (merge-pathnames rel *wasi-spec-root*)
+                                 (gethash package pkgs)))))))
+        (maphash (lambda (version pkgs)
+                   (declare (ignore version))
+                   (maphash (lambda (package paths)
+                              (setf (gethash package pkgs)
+                                    (sort paths #'string< :key #'namestring)))
+                            pkgs))
+                 table)
+        (setf *wasi-package-index* table))))
+
+(defun %wasi-version-ok-p (version)
+  (member version *wasi-supported-versions* :test #'string=))
+
+(defun %wasi-version-check (short-name version)
+  (unless (%wasi-version-ok-p version)
+    (error 'wasmdown:link-error
+           :message (format nil "wasi:~a@~a is not a supported release (supported: ~{~a~^, ~})"
+                            short-name version *wasi-supported-versions*))))
+
+(defun wasi-package-files (short-name &key (version "0.3.2"))
+  "Every vendored WIT source file of SHORT-NAME at VERSION, in lexical
+order. Unknown versions are a link error naming the exact request."
+  (%wasi-version-check short-name version)
+  (let* ((pkgs (gethash version (wasi-package-index)))
+         (paths (and pkgs (gethash short-name pkgs))))
+    (unless paths
+      (error 'wasmdown:link-error
+             :message (format nil "no vendored sources for wasi:~a@~a"
+                              short-name version)))
+    ;; a release ships its dependencies as copies under <pkg>/deps/;
+    ;; those belong to OTHER packages (their headers say so) and are
+    ;; loaded through their own index entry, never as this package's
+    ;; declarations.
+    (remove-if (lambda (path)
+                 (search "/deps/" (namestring path) :test #'char=))
+               paths)))
+
+(defun wasi-package-file (short-name &key (version "0.3.2"))
+  "The PRIMARY source file of the package: the header-carrying unit the
+single-file API has always returned (0.3.2: <short>/<short>.wit, the
+manifest's entry). Multi-file loading uses WASI-PACKAGE-FILES."
+  (%wasi-version-check short-name version)
+  (if (string= version "0.3.2")
+      (let ((path (merge-pathnames (make-pathname :directory (list :relative short-name)
+                                                  :name short-name :type "wit")
+                                   *wasi-wit-root*)))
+        (unless (probe-file path)
+          (error 'wasmdown:link-error
+                 :message (format nil "no vendored sources for wasi:~a@~a"
+                                  short-name version)))
+        path)
+      (or (first (wasi-package-files short-name :version version))
+          (error 'wasmdown:link-error
+                 :message (format nil "no vendored sources for wasi:~a@~a"
+                                  short-name version)))))
 
 (defvar *wasi-package-cache* (make-hash-table :test #'equal))
 
-(defun wasi-package (short-name)
-  "Parse (and cache) the vendored WIT package SHORT-NAME."
-  (let* ((path (wasi-package-file short-name))
-         (key (namestring path)))
+(defun wasi-package (short-name &key (version "0.3.2"))
+  "Parse (and cache) the vendored WIT package SHORT-NAME at VERSION.
+Multi-file packages are loaded through PARSE-WIT-DIRECTORY so the
+released layout (headerless continuation files) is honoured."
+  (let ((key (list version short-name)))
     (or (gethash key *wasi-package-cache*)
         (setf (gethash key *wasi-package-cache*)
-              (wasmdown.wit:parse-wit-file path)))))
+              (if (string= version "0.3.2")
+                  (wasmdown.wit:parse-wit-file
+                   (wasi-package-file short-name :version version))
+                  (wasmdown.wit:parse-wit-files
+                   (wasi-package-files short-name :version version)
+                   :origin (format nil "wasi:~a@~a" short-name version)))))))
 
 ;;; ---------------------------------------------------------------
 ;;; The host-provider framework.
@@ -382,13 +513,16 @@ has no self, and its result is the implicit `own<R>' (the WIT's
                         (second (wasmdown.component:ct-payload ct)))
                     (wasmdown.wit:wit-func-async-p method)))))
 
-(defun provider-instance (interface implementations &key packages)
+(defun provider-instance (interface implementations &key packages (include nil))
   "Build a comp-instance for the parsed WIT INTERFACE. IMPLEMENTATIONS
 is an alist ((\"now\" . fn) ...) of CL functions taking the component
 domain arguments. Every function and resource method the INTERFACE
 declares MUST be supplied — an absent entry is a construction-time
 HOST-ERROR naming the interface and the function; it is never
-exported as a trapping stub. The instance's export table also carries
+exported as a trapping stub. INCLUDE, when non-NIL, is a predicate on
+the WIT node (func/resource/type): a node it rejects is NOT exported
+(the WASI 0.2 facade uses it to keep `@unstable` members out of a
+stable release's surface). The instance's export table also carries
 the interface's TYPE definitions, so a consumer can alias them with
 the runtime's type-projection path.
 
@@ -397,52 +531,85 @@ core names ([method]R.m / [static]R.m / [constructor]R), can be
 implemented either by that name or by the bare method name, and the
 resource type is exported as (:type . ct) — the ct every occurrence
 of the resource shares (the handle table's type identity)."
-  (let ((inst (wasmdown.component.runtime:make-comp-instance)))
+  (let ((inst (wasmdown.component.runtime:make-comp-instance))
+        (wanted (lambda (node) (or (null include) (funcall include node)))))
     (dolist (fn (wasmdown.wit:wit-interface-func-list interface))
-      (let* ((fname (wasmdown.wit:wit-func-name fn))
-             (ct (wasmdown.wit:wit-func->ct interface fn
-                                            :packages packages))
-             (closure (%provider-closure interface implementations fname)))
-        (setf (gethash fname
-                       (wasmdown.component.runtime:comp-instance-exports inst))
-              (cons :func (make-host-lifted-func ct closure :inst inst)))))
+      (when (funcall wanted fn)
+        (let* ((fname (wasmdown.wit:wit-func-name fn))
+               (ct (wasmdown.wit:wit-func->ct interface fn
+                                              :packages packages))
+               (closure (%provider-closure interface implementations fname)))
+          (setf (gethash fname
+                         (wasmdown.component.runtime:comp-instance-exports inst))
+                (cons :func (make-host-lifted-func ct closure :inst inst))))))
     ;; M16 slice 3: the interface's RESOURCES — the type export first
     ;; (the shared ct), then each method as a func export.
     (dolist (res (wasmdown.wit:wit-interface-resource-list interface))
       (let* ((rname (wasmdown.wit:wit-resource-name res))
              (rct (wasmdown.wit:wit-type->ct
                    interface (list :resource rname) :packages packages)))
-        (setf (gethash rname
-                       (wasmdown.component.runtime:comp-instance-exports inst))
-              (cons :type rct))
+        (when (funcall wanted res)
+          (setf (gethash rname
+                         (wasmdown.component.runtime:comp-instance-exports inst))
+                (cons :type rct)))
+        ;; The IMPLICIT resource destructor is part of an imported
+        ;; interface's surface: a component that imports an interface
+        ;; instance imports `[resource-drop]R` as a FUNCTION (the
+        ;; adapter does for every resource it forwards). Export it for
+        ;; every resource, whatever @unstable filtering says about the
+        ;; explicit methods: dropping a handle is not a feature gate.
+        (let* ((i32 (wasmdown.component:make-ct :kind :prim :payload :i32))
+               (drop-ft (wasmdown.component:make-ct
+                         :kind :func
+                         :payload (list (vector (cons "rep" i32)) nil nil)))
+               (drop-name (format nil "[resource-drop]~a" rname))
+               (rct-for-drop rct))
+          (setf (gethash drop-name
+                         (wasmdown.component.runtime:comp-instance-exports inst))
+                (cons :func
+                      (make-host-lifted-func
+                       drop-ft
+                       (lambda (args)
+                         (let ((rep (and (consp args)
+                                         (wasmdown.component.runtime:host-resource-rep
+                                          rct-for-drop (car args)))))
+                           (let ((finalizer
+                                   (wasmdown.component.runtime:host-resource-finalizer
+                                    inst rct-for-drop)))
+                             (when (and finalizer rep)
+                               (ignore-errors (funcall finalizer rep)))))
+                         '())
+                       :inst inst))))
         (dolist (method (wasmdown.wit:wit-resource-methods res))
-          (let* ((mname (wasmdown.wit:wit-func-name method))
-                 (fname (%resource-method-export-name res method))
-                 (ct (%resource-method-ct interface res method packages))
-                 (key (cond ((assoc fname implementations :test #'string=)
-                             fname)
-                            ((assoc mname implementations :test #'string=)
-                             mname)
-                            (t fname)))
-                 (closure (%provider-closure interface implementations key)))
-            (setf (gethash fname
-                           (wasmdown.component.runtime:comp-instance-exports
-                            inst))
-                  (cons :func (make-host-lifted-func ct closure
-                                                     :inst inst)))))))
+          (when (funcall wanted method)
+            (let* ((mname (wasmdown.wit:wit-func-name method))
+                   (fname (%resource-method-export-name res method))
+                   (ct (%resource-method-ct interface res method packages))
+                   (key (cond ((assoc fname implementations :test #'string=)
+                               fname)
+                              ((assoc mname implementations :test #'string=)
+                               mname)
+                              (t fname)))
+                   (closure (%provider-closure interface implementations key)))
+              (setf (gethash fname
+                             (wasmdown.component.runtime:comp-instance-exports
+                              inst))
+                    (cons :func (make-host-lifted-func ct closure
+                                                       :inst inst))))))))
     ;; The interface's defined types (not resources: those are above)
     ;; are exported as (:type . ct).
     (dolist (item (wasmdown.wit:wit-interface-items interface))
       (when (wasmdown.wit:wit-type-p item)
         (let ((expr (wasmdown.wit:wit-type-expr item)))
           (unless (and (consp expr) (eq (car expr) :resource))
-            (let ((ct (wasmdown.wit:wit-type->ct interface expr
-                                                 :packages packages)))
-              (when ct
-                (setf (gethash (wasmdown.wit:wit-type-name item)
-                               (wasmdown.component.runtime:comp-instance-exports
-                                inst))
-                      (cons :type ct))))))))
+            (when (funcall wanted item)
+              (let ((ct (wasmdown.wit:wit-type->ct interface expr
+                                                   :packages packages)))
+                (when ct
+                  (setf (gethash (wasmdown.wit:wit-type-name item)
+                                 (wasmdown.component.runtime:comp-instance-exports
+                                  inst))
+                        (cons :type ct)))))))))
     inst))
 
 (defun provider-instance-function (instance name)
@@ -1606,9 +1773,13 @@ read only on failure: a successful call leaves it stale)."
 (defstruct wasi-preopen
   "A WASI file root: an OPEN HOST DIRECTORY HANDLE (PLAN.md §9.1) and
 the guest-visible path string the guest knows it by. Every operation
-on it is handle-relative; there is no path-prefix check to bypass."
+on it is handle-relative; there is no path-prefix check to bypass.
+PERMISSIONS is the EXPLICIT authority the embedder granted (\"read\",
+\"write\", \"mutate-directory\") — the Preview1/P2 rights are derived
+from it, never minted from the host handle's own mode bits."
   (fd -1)
   (name "")
+  (permissions '("read" "write" "mutate-directory"))
   (descriptor nil))
 
 (defstruct wasi-descriptor
@@ -1700,16 +1871,29 @@ guest's handle must not close the root."
                               path (sb-alien:get-errno))))
     fd))
 
-(defun open-wasi-preopen (host-path &key name)
+(defun open-wasi-preopen (host-path &key name
+                                      (permissions '("read" "write" "mutate-directory")))
   "Establish a file root: open HOST-PATH once as a directory handle.
 NAME is the guest-visible preopen name (defaults to the host path).
+PERMISSIONS is the explicit authority the guest may exercise through
+this root; the default preserves the previous behavior (a read/write
+root). A read-only root denies creation, writing and mutation, and
+its derived ABI rights can never be widened by a guest.
 The caller owns the preopen; close-wasi-preopen releases the fd."
+  (dolist (p permissions)
+    (unless (member p '("read" "write" "mutate-directory") :test #'string=)
+      (error 'wasmdown:host-error
+             :message (format nil "unknown preopen permission ~s" p))))
   (let* ((fd (%open-host-directory host-path))
-         (pre (make-wasi-preopen :fd fd :name (or name (namestring host-path))))
+         (pre (make-wasi-preopen :fd fd
+                                 :name (or name (namestring host-path))
+                                 :permissions permissions))
          (desc (make-wasi-descriptor
                 :fd fd
                 :preopen pre
-                :flags '("read" "write" "mutate-directory")
+                :flags (if (member "write" permissions :test #'string=)
+                           '("read" "write" "mutate-directory")
+                           '("read"))
                 :owned-p nil
                 :dir-p t)))
     (setf (wasi-preopen-descriptor pre) desc)
@@ -5846,6 +6030,53 @@ PACKAGES supplying its cross-package imports."
                                   :packages packages
                                   :selection selection))
 
+(defun declared-component-imports (comp)
+  "The exact import names a decoded component DECLARES, in order."
+  (loop for d across (wasmdown.component:comp-defs comp)
+        when (eq (wasmdown.component:compdef-kind d) :import)
+          collect (wasmdown.component::importrec-name
+                   (wasmdown.component:compdef-payload d))))
+
+(defun component-command-providers (context comp &key (version "0.2.12"))
+  "The provider set for COMP's DECLARED command imports, chosen by the
+release line the component asks for: an exact `@0.2.x' import gets the
+versioned P2 provider table at THAT version (mixed patch versions are
+composed per version), anything else gets the vendored 0.3 command
+world. Choosing from the declared contract — never from the file name
+— is what keeps a 0.2 component from being handed 0.3 providers."
+  (let* ((names (declared-component-imports comp))
+         (wasi-names (remove-if-not (lambda (n)
+                                      (and (stringp n)
+                                           (eql 0 (search "wasi:" n))))
+                                    names))
+         (v2 (loop for n in wasi-names
+                   for (short iface ver) = (multiple-value-list
+                                            (p2-import-name-parts n))
+                   when (and short ver (p2-version-p ver)
+                             (eql 0 (search "0.2." ver)))
+                     collect (cons n ver))))
+    (cond
+     ((null v2)
+      (command-provider context))
+     ((= (length v2) (length wasi-names))
+      ;; every WASI import is a 0.2 release: compose per exact version
+      (let ((by-version (make-hash-table :test #'equal))
+            (providers '()))
+        (dolist (pair v2)
+          (push (car pair) (gethash (cdr pair) by-version)))
+        (maphash (lambda (ver imports)
+                   (dolist (p (preview2-command-provider
+                               context :version ver
+                               :imports (nreverse imports)))
+                     (push p providers)))
+                 by-version)
+        (nreverse providers)))
+     (t
+      (error 'wasmdown:link-error
+             :message
+             (format nil "component mixes WASI release lines (~{~a~^, ~}); no single provider graph applies"
+                     wasi-names))))))
+
 (defun command-provider (context &key (world (command-world)))
   "The provider set of the `command' world as a with-args alist,
 bound to CONTEXT and composed from the resolved WORLD (default: the
@@ -5858,8 +6089,10 @@ never bound."
 
 (defun component-run-export (instance)
   "The `run' function a command-world component exports: the exported
-`wasi:cli/run@0.3.2' instance's `run' (a comp-instance or an inline
-bag), else a direct top-level `run' export. NIL when absent."
+`wasi:cli/run@<version>' instance's `run' (a comp-instance or an
+inline bag) at ANY supported version — a 0.2.12 command and a 0.3.2
+command export the same shape under their own release name — else a
+direct top-level `run' export. NIL when absent."
   (flet ((%export (name)
            (let ((hit (gethash name
                                (wasmdown.component.runtime:comp-instance-exports
@@ -5872,7 +6105,23 @@ bag), else a direct top-level `run' export. NIL when absent."
               (wasmdown.component.runtime:runtime-export-value value "run"))
              (hash-table (gethash "run" value))
              (t nil))))
-    (or (run-of (%export "wasi:cli/run@0.3.2"))
+    (or (let ((run-value nil)
+              (found nil))
+          ;; pick the run instance by PREFIX: the version is the
+          ;; component's, never assumed
+          (maphash (lambda (name value)
+                     (when (and (not found)
+                                (stringp name)
+                                (let ((p (search "wasi:cli/run" name
+                                                 :test #'char=)))
+                                  (and p (zerop p)))
+                                (or (= (length name) 12)
+                                    (char= (char name 12) #\@)))
+                       ;; the export table entry is (sort . value)
+                       (setf run-value (cdr value)
+                             found t)))
+                   (wasmdown.component.runtime:comp-instance-exports instance))
+          (and found (run-of run-value)))
         (let ((direct (%export "run")))
           (and (wasmdown.component.runtime:lifted-func-p direct) direct)))))
 
@@ -5881,29 +6130,33 @@ bag), else a direct top-level `run' export. NIL when absent."
 status: ok -> 0, err (or an absent/false result) -> 1."
   (if (and (consp result) (eq (car result) :ok)) 0 1))
 
-(defun run-component (comp context &key providers)
+(defun run-component (comp context &key providers (mode :interpret))
   "Drive the VALIDATED command component COMP to completion under the
 capabilities of CONTEXT. Instantiates with PROVIDERS (default: the
 whole COMMAND-PROVIDER set for CONTEXT), calls the exported
-`wasi:cli/run@0.3.2' `run' (async or sync), and returns the process
+`wasi:cli/run@<version>' `run' (async or sync) under execution MODE
+(:interpret or :baseline — the embedded cores compile through the
+wasmdown codegen backend when :baseline), and returns the process
 status. A `wasi:cli/exit' terminates the run with its status; the
 store is torn down in every case (no leaked guest threads). Traps
-propagate to the caller."
-  (let ((providers (or providers (command-provider context))))
-    (unwind-protect
+propagate to the caller. Returns (VALUES STATUS STORE): the store is
+the run's own boundary object, so a caller can prove the teardown
+left nothing registered (COMPONENT-STORE-THREADS)."
+  (let ((providers (or providers (command-provider context)))
+        (store (wasmdown.component.runtime:make-component-store
+                :reactor (wasi-context-reactor context))))
+    (values
+     (unwind-protect
          (handler-case
              (let* ((instance
                       (wasmdown.component.runtime:instantiate-component
-                       comp :with-args providers))
+                       comp :with-args providers :store store
+                       :mode mode))
                     (run (component-run-export instance)))
-               ;; THE STORE'S REACTOR (step 5/6 driver): registering the context's
-               ;; reactor on the instance's store is what lets a would-blocked copy
-               ;; or a clock deadline be woken from the store's own tick. Without
-               ;; it the store falls back to the single global FIFO and only
-               ;; direct/fake-reactor paths can be served.
-               (when (wasi-context-reactor context)
-                 (setf (wasmdown.component.runtime::%inst-reactor instance)
-                       (wasi-context-reactor context)))
+               ;; THE STORE'S REACTOR was installed on the store BEFORE
+               ;; instantiation/start (step 2's ownership rule), so a
+               ;; would-blocked copy or clock deadline is already
+               ;; servable by the store's own tick.
                (unless run
                  (error 'wasmdown:link-error
                         :message
@@ -5913,7 +6166,9 @@ propagate to the caller."
            (wasi-exit (c) (wasi-exit-status c)))
       ;; the exit semantics: whatever the guest started, the command
       ;; is over — abandon + unblock + join every registered thread
-      (wasmdown.component.runtime:store-teardown))))
+      ;; (the store this run created is the boundary)
+      (wasmdown.component.runtime:store-teardown store))
+     store)))
 
 ;;; ---------------------------------------------------------------
 ;;; The CLI's network-authority parsing (`--net HOST:PORT').

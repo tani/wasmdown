@@ -648,11 +648,16 @@ else is malformed here."
          (prim (%read-primvaltype r b)))
     (cond
      (prim (read-byte-at r) prim)
-     ((and (>= b 0) (< b #x40))
+     ;; A type index is an s33: single-byte indices are 0x00-0x3F, and
+     ;; anything with the CONTINUATION bit set starts a multi-byte s33.
+     ;; Real components routinely have >63 types, where the first index
+     ;; byte is 0xC0-0xFF (e.g. 64 = 0xC0 0x00) — treating those as
+     ;; malformed rejected every adapter-produced component.
+     ((or (logbitp 7 b) (< b #x40))
       (cons :idx (read-s33 r)))
      (t
-      ;; a multi-byte negative s33 in valtype position, or a
-      ;; constructor byte that is not a valtype here
+      ;; a single-byte negative s33 that is not a primitive here, or a
+      ;; constructor byte that is not a valtype
       (%derr r "invalid leading byte (0x~x) for component value type" b)))))
 
 (defun %read-defvaltype (r)
@@ -1324,7 +1329,7 @@ the TYPE index space built so far. Returns the Lisp value."
                                lo)))))
                 (:char (read-name r))
                 (:string (read-name r))
-                (t (%derr r "cannot decode value of this type")))
+                (t (%derr r "cannot decode value of this type"))))
              (:record
               (loop for (nil . vt) across (ct-payload c)
                     collect (dec (resolve-valtype vt))))
@@ -1374,8 +1379,8 @@ the TYPE index space built so far. Returns the Lisp value."
                          (list :error (dec (resolve-valtype err))))
                         ((= b 0) :ok)
                         (t :error)))))
-             (t (%derr r "cannot decode value of this type")))))
-    (dec (if (ct-p type) type (resolve-valtype type)))))))
+             (t (%derr r "cannot decode value of this type"))))))
+    (dec (if (ct-p type) type (resolve-valtype type)))))
 
 ;;; ---------------------------------------------------------------
 ;;; The section readers.
@@ -1717,9 +1722,12 @@ rather than signaling."
            (and (ct-p ty) ty))))
    (t
     (when (>= idx (length (cval-types state)))
-      (%verr "type index out of bounds"))
+      (%verr "type index out of bounds: ~d of ~d"
+             idx (length (cval-types state))))
     (let ((ty (aref (cval-types state) idx)))
-      (unless (ct-p ty) (%verr "type index out of bounds"))
+      (unless (ct-p ty)
+        (%verr "type index out of bounds: slot ~d of ~d holds ~s"
+               idx (length (cval-types state)) (type-of ty)))
       ty))))
 
 (defun ct-at (state idx)
@@ -2701,8 +2709,7 @@ type's own declarators stay against STATE, the inner space)."
                ;; annotated-name resource rules read it inside types;
                ;; the pre-push length IS the index the declarator's
                ;; ct is about to occupy)
-               (when (or (eq *component-def-source* :text)
-                         (eq (car et) :type))
+               (when (eq (car et) :type)
                  (setf (gethash (length (cval-types inner))
                                 (if (eq (typedecl-kind d) :import)
                                     (cval-vis-imports inner)
@@ -2739,8 +2746,7 @@ type's own declarators stay against STATE, the inner space)."
                ;; wasi:io/streams@0.2.12: 15 type indices across 29
                ;; declarators). The TEXT parser's convention (see
                ;; COMP-SOURCE) occupies a slot per declarator.
-               (when (or (eq *component-def-source* :text)
-                         (eq (car et) :type))
+               (when (eq (car et) :type)
                (vector-push-extend
                 (if (and (eq (car et) :type)
                          (eq (cdr et) :sub-resource))
@@ -3816,7 +3822,8 @@ the CONTENT, never on the representation or object identity."
                                         (wasmdown.types:wasm-comptype-results
                                          ct))
                                   (cdr prov)))
-                      (%verr "expected: ~a" "(func)"))))
+                      (%verr "expected: ~a for import ~a.~a (module type ~a)"
+                             "(func)" mod field ti))))
                  (:global
                   (unless (eq (car prov) :global)
                     (%verr "expected global, found ~a"
@@ -4935,8 +4942,7 @@ same argument SHARE the resource (resources.wast ::44/::45)."
       ;; %instance-ct-ids)
       (let ((slot (loop with n = -1
                         for x across (ct-payload ent)
-                        when (member (typedecl-kind x)
-                                     '(:type :alias :import :export))
+                        when (%type-indexing-declarator-p x)
                           do (incf n)
                         when (and (eq (typedecl-kind x) :export)
                                   (string= (first (typedecl-payload x))
@@ -4948,98 +4954,94 @@ same argument SHARE the resource (resources.wast ::44/::45)."
      (t nil))))
 
 (defun %instance-ct-ids (inst-idx ct)
-  "Slice 5e (resources ::27/::28/::43): the identity vector for an
-IMPORTED instance's own type space — the instance ct's declarator
-sequence maps to GENERATIVE per-(instance, slot) resource ids for
-(sub resource) exports/imports, :ref chains for (eq i) bounds, and
-opaque markers otherwise. The SAME ids the type-alias identity uses
-(%inst-gen-id), so a func-type's (own $r) resolves to the same
-resource the (type $i \"r\") alias projects."
+  "The identity vector for ICT's type-index space (see
+%INSTANCE-CT-TYPE-SPACE)."
+  (%instance-ct-ids-spec inst-idx ct))
+
+(defvar *instance-ct-spec-type-space* (make-hash-table :test #'eq))
+
+(defun %compdef-type-index-p (d)
+  "Does a COMPONENT-level def D introduce a type index? The same rule as
+%TYPE-INDEXING-DECLARATOR-P, one level out: a :type def, a :alias of
+sort :type, and an :import/:export whose ascription is a type bound
+(Binary.md line 274). A func/instance/component def or export names an
+EXTERN index and never shifts the type space."
+  (case (compdef-kind d)
+    (:type t)
+    (:alias (let ((a (compdef-payload d)))
+              (and (aliasrec-p a) (eq (aliasrec-sort a) :type))))
+    (:import (let ((ty (importrec-type (compdef-payload d))))
+               (and (consp ty) (eq (car ty) :type))))
+    (:export (eq (sortidx-sort
+                  (exportrec-sortidx (compdef-payload d)))
+                 :type))
+    (t nil)))
+
+(defun %type-indexing-declarator-p (d)
+  "Does declarator D introduce a COMPONENT TYPE INDEX? (Binary.md 274:
+  `type`, an alias of sort :type, and an import/export whose externtype
+  is a type bound.)"
+  (case (typedecl-kind d)
+    (:type t)
+    (:alias (eq (aliasrec-sort (typedecl-payload d)) :type))
+    ((:import :export)
+     (let ((et (third (typedecl-payload d))))
+       (and (consp et) (eq (car et) :type))))
+    (t nil)))
+
+(defun %ict-type-space-spec (ict)
+  "The SPEC-conforming type-index space of ICT (see
+%TYPE-INDEXING-DECLARATOR-P)."
+  (let ((v (make-array 16 :fill-pointer 0 :adjustable t)))
+    (loop for d across (ct-payload ict)
+          when (%type-indexing-declarator-p d)
+            do (case (typedecl-kind d)
+                 (:type (vector-push-extend (typedecl-payload d) v))
+                 (:alias (vector-push-extend
+                          (cons :outer-alias (typedecl-payload d)) v))
+                 (t (vector-push-extend
+                     (cons :type-bound (cdr (third (typedecl-payload d))))
+                     v))))
+    v))
+
+(defun %instance-ct-ids-spec (inst-idx ct)
+  "The SPEC-conforming identity vector (see %ICT-TYPE-SPACE-SPEC)."
   (let ((ids (make-array 16 :fill-pointer 0 :adjustable t))
-        (n -1))
-    (loop for d across (ct-payload ct)
-          do (let ((slot (incf n)))
-               (vector-push-extend
-                (etypecase d
-                  (null '(:opaque))
-                  (t (case (typedecl-kind d)
-                       (:type (cons :ct (typedecl-payload d)))
-                       (:alias '(:opaque))
-                       ((:import :export)
-                        (let ((et (third (typedecl-payload d))))
-                          (cond
-                           ((and (eq (car et) :type)
-                                 (eq (cdr et) :sub-resource))
-                            (%inst-gen-id inst-idx slot))
-                           ;; M9 (linking ::128): a BIND-ID sub-resource
-                           ;; export — (export "r" (type $r (sub
-                           ;; resource))) — interns the sub-resource ct
-                           ;; and ascribes its INDEX; resolve the index
-                           ;; through the declarator sequence and treat
-                           ;; a resource target as the generative id
-                           ((and (eq (car et) :type)
-                                 (integerp (cdr et))
-                                 (let ((n2 -1))
-                                   (loop for td2 across (ct-payload ct)
-                                         do (case (typedecl-kind td2)
-                                              ((:type :alias :import
-                                                :export)
-                                               (incf n2)
-                                               (when (= n2 (cdr et))
-                                                 (return
-                                                  (and
-                                                   (eq (typedecl-kind
-                                                        td2)
-                                                       :type)
-                                                   (ct-resourcetype-p
-                                                    (typedecl-payload
-                                                     td2))))))
-                                              (t nil))
-                                         finally (return nil))))
-                            (%inst-gen-id inst-idx slot))
-                           ((and (eq (car et) :type)
-                                 (listp (cdr et))
-                                 (eq (car (cdr et)) :eq))
-                            (cons :ref (second (cdr et))))
-                           (t '(:opaque)))))
-                       (t '(:opaque)))))
-                ids)))
+        (slot -1))
+    (dolist (d (coerce (ct-payload ct) 'list))
+      (when (%type-indexing-declarator-p d)
+        (incf slot)
+        (let* ((kind (typedecl-kind d))
+               (entry
+                 (cond
+                   ((eq kind :type) (cons :ct (typedecl-payload d)))
+                   ((eq kind :alias) '(:opaque))
+                   (t (let ((et (third (typedecl-payload d))))
+                        (cond
+                          ((and (eq (car et) :type)
+                                (eq (cdr et) :sub-resource))
+                           (%inst-gen-id inst-idx slot))
+                          ((and (eq (car et) :type) (integerp (cdr et)))
+                           (let ((target (%ct-decl-at (ct-payload ct) (cdr et))))
+                             (if (and (consp target)
+                                      (eq (first target) :resource-ct))
+                                 (%inst-gen-id inst-idx slot)
+                                 '(:opaque))))
+                          ((and (eq (car et) :type)
+                                (listp (cdr et))
+                                (eq (car (cdr et)) :eq))
+                           (cons :ref (second (cdr et))))
+                          (t '(:opaque))))))))
+          (vector-push-extend entry ids))))
     ids))
 
-(defvar *instance-ct-type-space* (make-hash-table :test #'eq)
-  "Memoized DECLARATOR-SPACE vectors per instance-type ct: built once
-when the ct is first resolved through a view, so a per-call remap
-never rebuilds the type tree.")
-
 (defun %instance-ct-type-space (ict)
-  "The index-aligned DECLARATOR space of instance/component type ICT:
-one entry per declarator that introduces a COMPONENT TYPE INDEX
-\(Binary.md 274 — :type, :alias, :import and :export alike; a
-:core-type declarator introduces a CORE type index and is skipped).
-A :type declarator carries its ct; an :alias declarator an
-\(:outer-alias . aliasrec) marker resolved lazily by
-resolve-declarator-type so the OWNER is switched, not guessed; an
-import/export carries a (:type-bound . bound) marker; anything else
-\(:opaque) — it names no component type shape."
-  (or (gethash ict *instance-ct-type-space*)
-      (setf (gethash ict *instance-ct-type-space*)
-            (let ((v (make-array 16 :fill-pointer 0 :adjustable t)))
-              (loop for d across (ct-payload ict)
-                    do (case (typedecl-kind d)
-                         (:type
-                          (vector-push-extend (typedecl-payload d) v))
-                         (:alias
-                          (vector-push-extend
-                           (cons :outer-alias (typedecl-payload d)) v))
-                         ((:import :export)
-                          (let ((et (third (typedecl-payload d))))
-                            (vector-push-extend
-                             (if (and (consp et) (eq (car et) :type))
-                                 (cons :type-bound (cdr et))
-                                 '(:opaque))
-                             v)))
-                         (t nil)))
-              v))))
+  "The type-index space of instance/component type ICT: only `type`
+declarators, type aliases and type-bound imports/exports introduce an
+index (Binary.md line 274)."
+  (or (gethash ict *instance-ct-spec-type-space*)
+      (setf (gethash ict *instance-ct-spec-type-space*)
+            (%ict-type-space-spec ict))))
 
 (defun %declarator-view (ict owner-view &optional (inst-idx nil))
   "ICT's declarator space as a type-view. OWNER-VIEW is the view of
@@ -5066,7 +5068,8 @@ Out-of-range is a validation error — the view's own space is the only
 space consulted."
   (when (or (not (integerp index)) (< index 0)
             (>= index (length (type-view-types view))))
-    (%verr "type index out of bounds"))
+    (%verr "type index out of bounds (owner space): ~s of ~d"
+           index (length (type-view-types view))))
   (let ((entry (%type-view-entry-at view index)))
     (and (ct-p entry) entry)))
 
@@ -5081,12 +5084,21 @@ owner switched into VIEW's ring by the alias's de Bruijn count."
         (%resolve-declarator-in view (aliasrec-target alias) '())
         (%resolve-owner-index owner (aliasrec-target alias)))))
 
+(defun resolve-declarator-type (ict index &optional owner-view)
+  "Resolve INDEX in ICT's DECLARATOR space (the spec-shaped type space,
+  see %INSTANCE-CT-TYPE-SPACE). OWNER-VIEW starts the de Bruijn ring:
+  count 1 is the space that DECLARED ict, 2+ its enclosing chain. An
+  out-of-range index, a cyclic alias and a count past the recorded ring
+  are validation errors."
+  (%resolve-declarator-in (%declarator-view ict owner-view) index '()))
+
 (defun %resolve-declarator-in (view index seen)
   "One step of resolve-declarator-type inside VIEW (SEE is the cycle
 guard)."
   (when (or (not (integerp index)) (< index 0)
             (>= index (length (type-view-types view))))
-    (%verr "type index out of bounds"))
+    (%verr "type index out of bounds (declarator space): ~s of ~d"
+           index (length (type-view-types view))))
   (let ((key (cons view index)))
     (when (member key seen :test #'equal)
       (%verr "cyclic type alias"))
@@ -5109,33 +5121,20 @@ guard)."
            ((eq bound :sub-resource)
             (make-ct :kind :resource :payload '(0 . nil) :offset 0))
            ((and (listp bound) (eq (car bound) :eq))
+            ;; an (eq i) bound names a slot of the SAME declarator
+            ;; space: follow it through this view (the cycle guard and
+            ;; the bounds check live in the recursive step)
             (%resolve-declarator-in view (second bound) seen))
-           (t nil))))
-       (t nil)))))
-
-(defun resolve-declarator-type (instance-type index owner-view
-                                &optional (inst-idx nil))
-  "The ct a DECLARATOR-SPACE INDEX denotes in INSTANCE-TYPE's own type
-space, with OWNER-VIEW the space that declared it. The reference
-SWITCHES OWNER as it crosses a boundary: an (:alias outer COUNT ...)
-declarator resolves count 1 in OWNER-VIEW's space and count N in the
-Nth enclosing space of the recorded ring; a (type (eq i)) bound
-follows i in the SAME space; a (sub resource) bound is a resource.
-A missing alias target, an out-of-range index and a cyclic alias chain
-are VALIDATION ERRORS — never a silent substitution and never a raw
-index left for a later reader to misinterpret. NIL when the index
-names a declarator with no component type shape."
-  (%resolve-declarator-in (%declarator-view instance-type owner-view
-                                            inst-idx)
-                          index '()))
+           (t nil))))))))
 
 (defun %instance-ct-export-functype (inst-idx name state &optional view)
-  "Slice 5e (resources ::27/::28/::43): the FUNCTYPE of an IMPORTED
-instance's exported func NAME, read from the instance ct (its (func
-(type i)) ascription indexes the ct's own DECLARATOR space — resolved
-through the owner-qualified view, so an alias declarator's reference
-is followed with the owner switched instead of read at that index in
-the caller's space). NIL when the index names no functype."
+  "The FUNCTYPE an IMPORTED instance's exported func NAME declares: its
+(func (type i)) ascription indexes the instance ct's own TYPE space
+(the spec-shaped declarator space, see %INSTANCE-CT-TYPE-SPACE) — read
+through the owner-qualified VIEW when the caller has one, else through
+the provenance recorded when the ct was validated. NIL when the name
+is absent, the ascription is not a func, or the index resolves to
+something other than a functype."
   (let ((ent (and (< inst-idx (length (cval-instance-types state)))
                   (aref (cval-instance-types state) inst-idx))))
     (when (and (ct-p ent) (eq (ct-kind ent) :instance))
@@ -5147,15 +5146,17 @@ the caller's space). NIL when the index names no functype."
         (when d
           (let* ((et (third (typedecl-payload d)))
                  (fti (and (eq (car et) :func) (integerp (cdr et))
-                           (cdr et)))
-                 (view (or view
-                           (%declarator-view
-                            ent (gethash ent *ct-owner-view*)))))
-            (when (and fti
-                       (<= 0 fti)
-                       (< fti (length (type-view-types view))))
-              (let ((c (%resolve-declarator-in view fti '())))
-                (and (ct-p c) (eq (ct-kind c) :func) c)))))))))
+                           (cdr et))))
+            (when fti
+              (handler-case
+                  (let ((ct (if view
+                                (%resolve-declarator-in view fti '())
+                                (let ((owner (gethash ent *ct-owner-view*)))
+                                  (and owner
+                                       (resolve-declarator-type ent fti
+                                                                owner))))))
+                    (and (ct-p ct) (eq (ct-kind ct) :func) ct))
+                (wasmdown:validation-error () nil)))))))))
 
 (defun %func-arg-ids-at (arg-si &optional (state nil))
   "Slice 5e: the identity vector registered for the func ARG's own
@@ -5167,9 +5168,7 @@ earlier's and the func-arg match read the wrong identity vector)."
   (and (consp arg-si)
        (gethash (sortidx-idx arg-si) *func-arg-ids*)))
 
-(declaim (notinline %func-arg-ids-at))
-
-(defun %remap-ct-refs (c map &optional view)
+(defun %remap-ct-refs (c map)
   "M13-lad (big-interleaving-test): remap a projected type shape's
 VALTYPE refs across instance boundaries. A type shape taken from an
 INSTANTIATED child instance's state (an alias-export type
@@ -5179,22 +5178,13 @@ read them in the PARENT's space. MAP is an alist (child-idx .
 parent-idx) built from the source instance's export table plus the
 alias-export type projections recorded in *inst-alias-typeidx*;
 refs with no mapping stay untouched (the caller's space may itself
-hold the source — a BAG's entry idx is this scope's own).
-VIEW is the TARGET space, owner-qualified: BOTH sides of a mapping
-are resolved through it — a parent-idx value becomes the target ct
-when the view has it, so a later reader never re-reads a bare index
-against a space that might have moved on."
+hold the source — a BAG's entry idx is this scope's own)."
   (labels
       ((remap-valtype (vt)
          (cond
           ((and (consp vt) (eq (car vt) :idx) (integerp (cdr vt)))
            (let ((hit (assoc (cdr vt) map)))
-             (cond
-              ((null hit) vt)
-              ((and view (integerp (cdr hit)))
-               (let ((target (%type-view-entry-at view (cdr hit))))
-                 (or (and (ct-p target) target) (cons :idx (cdr hit)))))
-              (t (cons :idx (cdr hit))))))
+             (if hit (cons :idx (cdr hit)) vt)))
           ((ct-p vt) (remap-ct vt))
           (t vt)))
        (remap-ct (c)
@@ -5301,10 +5291,8 @@ in *inst-alias-typeidx*) — the alist consumed by %remap-ct-refs."
   (let ((copies '())
         (n -1))
     (loop for d across (comp-defs child-comp)
-          do (case (compdef-kind d)
-               ((:type :alias :import :export)
-                (incf n))
-               (otherwise nil))
+          do (when (%compdef-type-index-p d)
+               (incf n))
              (when (and (eq (compdef-kind d) :export)
                         (eq (sortidx-sort (exportrec-sortidx
                                            (compdef-payload d)))
@@ -5331,7 +5319,7 @@ yields a resource ct (the canon resource.* target checks read it)."
              (%alias-exported-type-shape-from-hash payload state ent))
         (and (ct-p ent) (eq (ct-kind ent) :instance)
              (%instance-ct-exported-type-shape
-              (aliasrec-name payload) ent state)))))
+              (aliasrec-name payload) ent)))))
 
 (defun %alias-exported-type-shape-from-hash (payload state ent)
   "The HASH-table branch of %alias-exported-type-shape (a bag or an
@@ -5383,16 +5371,14 @@ instantiated instance's export table)."
                             (and pt (cons (cdr hit2) pt))))
             (%inst-export-copy-remap child-comp src-idx))))
          (t nil))))))
-(defun %instance-ct-exported-type-shape (name ct &optional state)
+
+(defun %instance-ct-exported-type-shape (name ct)
   "The declared SHAPE of an IMPORTED instance's exported TYPE name —
 the instance ct's (export \"n\" (type <bound>)) declarator: a (sub
-resource) bound is a resource ct; an (eq i) bound follows the ct's
-own declarator chain (through an alias declarator too — a re-exported
-\"(export \"error\" (type (eq 0)))\" over an \"(alias outer 1 …)\" is the
-wasi:io/streams shape wasm-tools emits, and its shape is the aliased
-RESOURCE); anything else has no local shape (NIL). STATE is the
-enclosing component's validator state — the space an outer alias
-inside the instance type resolves against."
+resource) bound is a resource ct; an (eq i) bound follows the ct's own
+TYPE space (the spec-shaped declarator space, aliases resolved through
+the recorded owner ring — the wasi:io/streams re-export chain is an
+(eq 0) over an (alias outer 1 …)); anything else has no local shape."
   (let ((d (find name (coerce (ct-payload ct) 'list)
                 :key (lambda (x)
                        (and (eq (typedecl-kind x) :export)
@@ -5405,61 +5391,27 @@ inside the instance type resolves against."
          ((eq bound :sub-resource)
           (make-ct :kind :resource :payload '(0 . nil) :offset 0))
          ((and (listp bound) (eq (car bound) :eq))
-          ;; an (eq i) bound: follow the ct's own type space
-          (let* ((ti (second bound))
-                 (n -1)
-                 (shape (loop for x across (ct-payload ct)
-                              do (case (typedecl-kind x)
-                                   ((:type :alias :import :export)
-                                    (incf n)
-                                    (when (= n ti)
-                                      (return
-                                       (case (typedecl-kind x)
-                                         (:type (typedecl-payload x))
-                                         (:alias
-                                          ;; the target is itself an
-                                          ;; alias declarator: resolve
-                                          ;; the outer/export alias to
-                                          ;; the ct it names (a
-                                          ;; re-exported resource is
-                                          ;; the case wasm-tools emits)
-                                          (let ((a (typedecl-payload x)))
-                                            (cond
-                                             ((and state
-                                                   (eq (aliasrec-kind a)
-                                                       :outer)
-                                                   (eq (aliasrec-sort a)
-                                                       :type)
-                                                   (< (aliasrec-target a)
-                                                      (length (cval-types
-                                                               state))))
-                                              (aref (cval-types state)
-                                                    (aliasrec-target a)))
-                                             ((eq (aliasrec-kind a)
-                                                  :export)
-                                              (%alias-exported-type-shape
-                                               a state))
-                                             (t nil))))
-                                         (t nil)))))
-                                   (t nil))
-                              finally (return nil))))
-            (and shape (ct-p shape) shape)))
+          (handler-case
+              (let ((shape (resolve-declarator-type
+                            ct (second bound)
+                            (gethash ct *ct-owner-view*))))
+                (and (ct-p shape) shape))
+            (wasmdown:validation-error () nil)))
          (t nil))))))
 
-
-
 (defun %ct-decl-at (decls i)
-  "The i'th TYPE-INTRODUCING declarator's payload (slice 5m,
-indicies ::0): an inline instance ct's (instance . k) ascription
-indexes the DECLARATOR sequence's type-introducing positions."
+  "The i'th type-introducing declarator's payload."
   (loop with n = -1
-        for x across decls
-        when (member (typedecl-kind x)
-                     '(:type :alias :import :export))
-          do (incf n)
-             (when (= n i)
-               (return (typedecl-payload x)))
-        finally (return nil)))
+            for x across decls
+            when (%type-indexing-declarator-p x)
+              do (incf n)
+                 (when (= n i)
+                   (when (eq (typedecl-kind x) :type)
+                     (let ((ct (typedecl-payload x)))
+                       (when (wasmdown.component:ct-resourcetype-p ct)
+                         (return (list :resource-ct ct)))))
+                   (return (typedecl-payload x)))
+            finally (return nil)))
 
 (defun %instance-table-projection (a state)
   "Slice 4 (family 3): the export TABLE an (alias export i n
@@ -7150,16 +7102,15 @@ entry: the old NIL left the raw (:idx . k) in the remap and the
 component-space checks read a declarator index ('type index out of
 bounds')."
          ;; (values lane, concat.wast ::36): the DECLARATOR type space
-         ;; counts EVERY declarator (Binary.md: each declarator
-         ;; introduces a type index — :type, :alias, :import, AND
-         ;; :export alike; the old :type/-alias-only counting maxed
-         ;; at the 15 :TYPE entries while the interned inline maps
-         ;; sat at index 18, past the last TYPE, and the raw
-         ;; (:idx . 18) leaked through to the component space).
+         ;; counts the TYPE-INDEXING declarators only (Binary.md 274:
+         ;; a `type`, a type alias, and a type-bound import/export) —
+         ;; the same numbering as %INSTANCE-CT-TYPE-SPACE, so a
+         ;; declarator's (:idx . k) resolves to the same shape here.
          (loop with n = -1
                for td across (ct-payload ict)
                for i from 0
-               do (case (typedecl-kind td)
+               do (when (%type-indexing-declarator-p td)
+                    (case (typedecl-kind td)
                     (:type
                      (incf n)
                      (when (= n k)
@@ -7232,7 +7183,7 @@ bounds')."
                                                (second bound))))
                                   (and m
                                        (deindex-ct (entry-at m)))))))))
-                    (t nil))
+                    (t nil)))
                finally (return-from entry-at nil)))
        (deindex-ct (c)
          "Values lane (variants.wast): a declarator entry's ct may
@@ -7465,8 +7416,7 @@ the number of enclosing component/type scopes (outer aliases)."
       (clrhash *alias-component-source*)
       ;; owner-qualified type layers (plan step 1): provenance is
       ;; per-validation-run, like the stashes above
-      (clrhash *ct-owner-view*)
-      (clrhash *instance-ct-type-space*))
+      (clrhash *ct-owner-view*))
   (let ((state (make-cval
                 :types (make-array 16 :fill-pointer 0 :adjustable t)
                 :core-types (make-array 16 :fill-pointer 0 :adjustable t)
@@ -9009,36 +8959,28 @@ enclosing space)."
       (%ids-ct i ids)))
 
 (defun %declarator-space (ct ids)
-  "A vector mapping the type indices a component/instance TYPE CT
-introduces to the ct they name. A :type declarator carries its ct; an
-:import/:export declarator introduces the index its (type i)
-ascription aliases; an (alias outer 1 ...) :alias declarator names
-the ENCLOSING component's type (the text parser desugars the outer
-`(eq $R)' reference that way), so it resolves in IDS; other aliases
-(instance-export projections, deeper outer counts) contribute an
-opaque slot (NIL)."
+  "A vector mapping the type indices CT introduces to the ct they name
+(see %INSTANCE-CT-TYPE-SPACE)."
   (let* ((decls (ct-payload ct))
-         (space (make-array (length decls) :initial-element nil))
-         (n -1))
+         (space (make-array 16 :fill-pointer 0 :adjustable t)))
     (loop for td across decls
-          do (when (member (typedecl-kind td) '(:type :alias :import :export))
-               (incf n)
-               (setf (aref space n)
-                     (case (typedecl-kind td)
-                       (:type (typedecl-payload td))
-                       (:alias
-                        (let ((a (typedecl-payload td)))
-                          (and (eq (aliasrec-kind a) :outer)
-                               (eq (aliasrec-sort a) :type)
-                               (eql (aliasrec-count a) 1)
-                               (%ids-ct (aliasrec-target a) ids))))
-                       ((:import :export)
-                        (let ((et (third (typedecl-payload td))))
-                          (and (eq (car et) :type)
-                               (integerp (cdr et))
-                               (%decl-type-at (cdr et) space ids))))
-                       (t nil)))))
-    space))
+          when (%type-indexing-declarator-p td)
+            do (vector-push-extend
+                (case (typedecl-kind td)
+                  (:type (typedecl-payload td))
+                  (:alias
+                   (let ((a (typedecl-payload td)))
+                     (and (eq (aliasrec-kind a) :outer)
+                          (eq (aliasrec-sort a) :type)
+                          (eql (aliasrec-count a) 1)
+                          (%ids-ct (aliasrec-target a) ids))))
+                  (t
+                   (let ((et (third (typedecl-payload td))))
+                     (and (eq (car et) :type)
+                          (integerp (cdr et))
+                          (%decl-type-at (cdr et) space ids)))))
+                space))
+    (coerce space 'vector)))
 
 ;;; ---- describing a contract (the message shapes) ----
 

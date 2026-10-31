@@ -537,7 +537,9 @@ a field name to its own annotations (only when it has any)."
                  (%expect-punct r ":")
                  (push (cons name (%parse-type r)) fields)
                  (when as (push (cons name as) member-annotations))))
-             (%expect-punct r ","))
+             ;; a trailing comma before `}' is legal
+             (unless (%punct-p (%peek r) "}")
+               (%expect-punct r ",")))
     (%expect-punct r "}")
     (values (nreverse fields) (nreverse member-annotations))))
 
@@ -598,8 +600,12 @@ LABELS MEMBER-ANNOTATIONS); see %PARSE-RECORD-FIELDS."
           (let ((pname (%expect-ident r)))
             (%expect-punct r ":")
             (push (cons pname (%parse-type r)) params))
+          ;; a trailing comma before `)' is legal in WIT
           (if (%punct-p (%peek r) ",")
-              (%next r)
+              (progn
+                (%next r)
+                (when (%punct-p (%peek r) ")")
+                  (return)))
               (return))))
       (%expect-punct r ")")
       (let ((result nil))
@@ -761,6 +767,9 @@ LABELS MEMBER-ANNOTATIONS); see %PARSE-RECORD-FIELDS."
           do (%parse-interface-item r iface (%parse-annotations r)))
     (%expect-punct r "}")
     (%finalize-interface iface)
+    (when (package-interface package name)
+      (%werr r "duplicate interface `~a` in package ~a" name
+             (wit-package-name package)))
     (setf (gethash name (wit-package-interfaces package)) iface)
     (push iface (wit-package-interface-list package))
     iface))
@@ -969,10 +978,16 @@ ITEMS list."
           (wit-world-exports world) (nreverse (wit-world-exports world))
           (wit-world-includes world) (nreverse (wit-world-includes world))
           (wit-world-uses world) (nreverse (wit-world-uses world)))
+    (when (gethash name (wit-package-worlds package))
+      (%werr r "duplicate world `~a` in package ~a" name
+             (wit-package-name package)))
     (setf (gethash name (wit-package-worlds package)) world)
     world))
 
-(defun %parse-package (r)
+(defun %parse-package-header (r)
+  "Parse one `package ns:name@version;' header and return the empty
+wit-package. Declarations are parsed separately so several source
+units can contribute to ONE package."
   (let* ((annotations (%parse-annotations r))
          (ns nil) (base nil) (version nil))
     (%expect-keyword r "package")
@@ -985,25 +1000,38 @@ ITEMS list."
           (setf base first)))
     (setf version (%parse-version-opt r))
     (%expect-punct r ";")
-    (let ((package (make-wit-package
-                    :namespace (or ns "")
-                    :basename base
-                    :name (if ns (format nil "~a:~a" ns base) base)
-                    :version version
-                    :path (wit-reader-path r)
-                    :annotations annotations)))
-      (loop while (%peek r)
-            do (let ((as (%parse-annotations r)))
-                 (cond
-                   ((%keyword-p r "interface")
-                    (%parse-interface r package as))
-                   ((%keyword-p r "world")
-                    (%parse-world r package as))
-                   (t (%werr r "expected `interface` or `world`~@[ (found ~a)~]"
-                             (and (%peek r) (wit-token-text (%peek r))))))))
-      (setf (wit-package-interface-list package)
-            (nreverse (wit-package-interface-list package)))
-      package)))
+    (make-wit-package
+     :namespace (or ns "")
+     :basename base
+     :name (if ns (format nil "~a:~a" ns base) base)
+     :version version
+     :path (wit-reader-path r)
+     :annotations annotations)))
+
+(defun %parse-package-declarations (r package)
+  "Parse every interface/world declaration R still holds into PACKAGE.
+A duplicate definition is a wit-error naming the collision."
+  (loop while (%peek r)
+        do (let ((as (%parse-annotations r)))
+             (cond
+               ((%keyword-p r "interface")
+                (let ((iface (%parse-interface r package as)))
+                  (declare (ignore iface))))
+               ((%keyword-p r "world")
+                (let ((world (%parse-world r package as)))
+                  (declare (ignore world))))
+               (t (%werr r "expected `interface` or `world`~@[ (found ~a)~]"
+                         (and (%peek r) (wit-token-text (%peek r)))))))))
+
+(defun %finish-package (package)
+  (setf (wit-package-interface-list package)
+        (nreverse (wit-package-interface-list package)))
+  package)
+
+(defun %parse-package (r)
+  (let ((package (%parse-package-header r)))
+    (%parse-package-declarations r package)
+    (%finish-package package)))
 
 ;;; ---------------------------------------------------------------
 ;;; Public entry points.
@@ -1025,6 +1053,96 @@ ITEMS list."
   "Parse the WIT file at PATH into a wit-package."
   (parse-wit-string (read-file-string path)
                     :path (namestring path)))
+
+;;; ---------------------------------------------------------------
+;;; Multi-file packages.
+;;;
+;;; A released WIT package may split its declarations over several
+;;; files, some WITHOUT a `package' header (the official WASI 0.2
+;;; releases do exactly that). The directory loader reads every .wit
+;;; file in lexical order, takes the package identity from the header
+;;; file(s), and parses the headerless files as continuations of that
+;;; package. Nothing is rewritten and no header is stripped from the
+;;; vendored sources: each file is read by its own reader.
+
+(defun %wit-directory-pathname (path)
+  "PATH as a directory pathname (a file pathname becomes its parent +
+name as the last directory component)."
+  (let ((pn (pathname path)))
+    (if (or (null (pathname-name pn)) (null (pathname-type pn)))
+        pn
+        (make-pathname :directory (append (or (pathname-directory pn) '(:relative))
+                                          (list (pathname-name pn)))
+                       :name nil :type nil :defaults pn))))
+
+(defun %wit-directory-p (path)
+  (handler-case (let ((p (probe-file path)))
+                  (and p (null (pathname-name p)) (null (pathname-type p))))
+    (error () nil)))
+
+(defun %wit-source-files (path)
+  "The .wit files of a package directory (lexical order), or PATH
+itself when it names a file."
+  (let ((pn (pathname path)))
+    (cond
+      ((and (probe-file pn) (not (%wit-directory-p pn)))
+       (list pn))
+      (t
+       (sort (directory (merge-pathnames "*.wit" (%wit-directory-pathname pn)))
+             #'string< :key #'namestring)))))
+
+(defun %source-package-header-p (text)
+  "Does TEXT start with a `package ...;' header (after annotations)?"
+  (handler-case
+      (let ((r (make-wit-reader* text)))
+        (%parse-annotations r)
+        (let ((tk (%peek r)))
+          (and tk (string= "package" (wit-token-text tk)))))
+    (error () nil)))
+
+(defun parse-wit-directory (path)
+  "Load a WIT package spread over one or more .wit files. Returns the
+wit-package. Errors: no usable file, no package identity, conflicting
+package headers, duplicate definitions."
+  (parse-wit-files (%wit-source-files path) :origin (namestring path)))
+
+(defun parse-wit-files (files &key (origin nil))
+  "Load the WIT package whose source files are FILES (already in the
+intended order). See PARSE-WIT-DIRECTORY."
+  (let* ((readers '())
+         (package nil)
+         (identity nil))
+    (when (null files)
+      (error 'wit-error
+             :message (format nil "no .wit files in ~a" (or origin "the given file list"))))
+    (dolist (file files)
+      (let* ((text (read-file-string file))
+             (r (make-wit-reader* text :path (namestring file))))
+        (if (%source-package-header-p text)
+            (let* ((pkg (%parse-package-header r))
+                   (id (list (wit-package-namespace pkg)
+                             (wit-package-basename pkg)
+                             (wit-package-version pkg))))
+              (cond
+                ((null package)
+                 (setf package pkg identity id))
+                ((not (equal id identity))
+                 (error 'wit-error
+                        :path (namestring file)
+                        :message
+                        (format nil "conflicting package header ~a in ~a (already ~a:~a@~a)"
+                                (wit-package-name pkg) (file-namestring file)
+                                (first identity) (second identity) (third identity)))))
+              (push r readers))
+            ;; headerless continuation: parsed against the identity the
+            ;; header file(s) establish
+            (push r readers))))
+    (unless package
+      (error 'wit-error
+             :message (format nil "no `package' header in ~a" (or origin "the given file list"))))
+    (dolist (r (nreverse readers))
+      (%parse-package-declarations r package))
+    (%finish-package package)))
 
 ;;; ---------------------------------------------------------------
 ;;; Node lookups.
@@ -1087,6 +1205,43 @@ ITEMS list."
   (if (wit-world-p scope)
       (wit-world-uses scope)
       (wit-interface-uses scope)))
+
+(defun %scope-resources (scope)
+  "NAME -> resource node for a scope. A WORLD has no dedicated
+resource table: its `(resource $r ...)' ITEMS are folded on demand."
+  (if (wit-world-p scope)
+      (let ((table (make-hash-table :test #'equal)))
+        (dolist (item (wit-world-items scope) table)
+          (when (and (eq (wit-world-item-kind item) :resource)
+                     (wit-world-item-name item))
+            (setf (gethash (wit-world-item-name item) table)
+                  (or (wit-world-item-target item)
+                      (make-wit-resource
+                       :name (wit-world-item-name item)))))))
+      (wit-interface-resources scope)))
+
+(defun %lookup-resource (scope name packages &optional (seen '()))
+  "Resolve NAME as a RESOURCE in SCOPE: its own resources first, then
+through `use' imports (recursively — a used interface may itself only
+RE-EXPORT the resource, e.g. wasi:io/streams re-exporting
+wasi:io/error). Returns (values resource-node declaring-scope)."
+  (when (member (list (%scope-kind scope) (%scope-name scope) name)
+                seen :test #'equal)
+    (return-from %lookup-resource (values nil nil)))
+  (let ((own (gethash name (%scope-resources scope))))
+    (if own
+        (values own scope)
+        (dolist (use (%scope-uses scope) (values nil nil))
+          (let ((source (%use-source-name use name)))
+            (when source
+              (let ((target (%used-interface use scope packages)))
+                (when target
+                  (multiple-value-bind (node tgt)
+                      (%lookup-resource target source packages
+                                        (cons (list (%scope-kind scope)
+                                                    (%scope-name scope) name)
+                                              seen))
+                    (when node (return (values node tgt))))))))))))
 
 (defun %scope-resource-cts (scope)
   (if (wit-world-p scope)
@@ -1161,19 +1316,19 @@ non-resource, is a `wit-error' (never a raw string payload)."
      (when (member expr seen :test #'string=)
        (error 'wit-error
               :message (format nil "recursive WIT type reference ~a" expr)))
-     (multiple-value-bind (ty target) (%lookup-type scope expr packages)
-       (unless ty
-         (error 'wit-error
-                :message (format nil "unknown resource type `~a` in ~a ~a"
-                                 expr (%scope-kind scope)
-                                 (%scope-name scope))))
-       (let ((inner (wit-type-expr ty)))
-         (unless (and (consp inner) (eq (car inner) :resource))
+     (multiple-value-bind (res target) (%lookup-resource scope expr packages)
+       (unless res
+         (when (nth-value 0 (%lookup-type scope expr packages))
            (error 'wit-error
                   :message (format nil "`~a` in ~a ~a does not name a resource"
                                    expr (%scope-kind scope)
                                    (%scope-name scope))))
-         (%resource-ct target (second inner)))))
+         (error 'wit-error
+                :message (format nil "unknown resource type `~a` in ~a ~a"
+                                 expr (%scope-kind scope)
+                                 (%scope-name scope))))
+       ;; a re-exported resource keeps the DECLARING scope's ct identity
+       (%resource-ct target (wit-resource-name res))))
     ((and (consp expr) (eq (car expr) :resource))
      (%resource-ct scope (second expr)))
     (t

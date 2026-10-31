@@ -486,3 +486,88 @@
   (wasmdown.test:is
    (%simd-malformed-p
     "(module (func (drop (f32x4.convert_s/i32x4 (v128.const i64x2 0 0)))))")))
+
+;;; ================================================================
+;;; Regressions found by the upstream-testsuite lane (PLAN.md §12.7).
+
+(wasmdown.test:test simd/float-lane-comparisons-yield-masks
+  ;; f32x4.eq used to run its compare through the FLOAT map: the
+  ;; all-ones lane mask was fed back into f32-bits, so the very first
+  ;; assertion trapped. A comparison's result lanes are masks.
+  (let ((r (%simd-run
+            "(module (func (export \"f\") (result v128)
+               (f32x4.eq (v128.const f32x4 1 2 3 4)
+                         (v128.const f32x4 1 0 3 9))))"
+            "f")))
+    ;; the invoke path returns a RESULT LIST of one v128
+    (wasmdown.test:is
+     (equalp (list (%v128 #xff #xff #xff #xff
+                          #x00 #x00 #x00 #x00
+                          #xff #xff #xff #xff
+                          #x00 #x00 #x00 #x00))
+             r)))
+  ;; f64x2.ne: unequal -> all ones, equal -> zero
+  (let ((r (%simd-run
+            "(module (func (export \"f\") (result v128)
+               (f64x2.ne (v128.const f64x2 1 2)
+                         (v128.const f64x2 2 2))))"
+            "f")))
+    (wasmdown.test:is
+     (equalp (list (%v128 #xff #xff #xff #xff #xff #xff #xff #xff
+                          0 0 0 0 0 0 0 0))
+             r))))
+
+(wasmdown.test:test simd/load-extend-lane-counts
+  ;; v128.load16x4_s / load32x2_s load EIGHT source bytes into 4 / 2
+  ;; result lanes; writing 8 lanes overran the 16-byte value.
+  (let ((r (%simd-run
+            "(module (memory 1)
+               (func (export \"f\") (result v128)
+                 (i32.store (i32.const 0) (i32.const 0x01020304))
+                 (i32.store (i32.const 4) (i32.const 0x05060708))
+                 (v128.load16x4_s (i32.const 0))))"
+            "f")))
+    ;; memory bytes: 04 03 02 01 08 07 06 05 (i32.store is
+    ;; little-endian); the 4 i16 lanes 0x0304 0x0102 0x0708 0x0506
+    ;; widen to i32 lanes
+    (wasmdown.test:is
+     (equalp (list (%v128 #x04 #x03 0 0  #x02 #x01 0 0
+                          #x08 #x07 0 0  #x06 #x05 0 0))
+             r)))
+  (let ((r (%simd-run
+            "(module (memory 1)
+               (func (export \"f\") (result v128)
+                 (i32.store (i32.const 0) (i32.const 0x01020304))
+                 (i32.store (i32.const 4) (i32.const 0x05060708))
+                 (v128.load32x2_s (i32.const 0))))"
+            "f")))
+    (wasmdown.test:is
+     (equalp (list (%v128 #x04 #x03 #x02 #x01 0 0 0 0
+                          #x08 #x07 #x06 #x05 0 0 0 0))
+             r))))
+
+(wasmdown.test:test simd/load-store-oob-is-a-trap
+  ;; The SIMD load/store family must trap :out-of-bounds-memory like the
+  ;; scalar path — a raw array-index error would be a host defect, and
+  ;; an in-bounds-but-exactly-fit access must NOT trap.
+  (let* ((m (%simd-mod "(module (memory 1)
+                          (func (export \"full\") (result v128)
+                            (v128.load (i32.const 65520)))
+                          (func (export \"over\") (result v128)
+                            (v128.load (i32.const 65521)))
+                          (func (export \"extend\") (result v128)
+                            (v128.load16x4_s (i32.const 65529)))
+                          (func (export \"store\") (result i32)
+                            (v128.store (i32.const 65521)
+                                        (v128.const i32x4 1 2 3 4))
+                            (i32.const 0)))"))
+         (inst (wasmdown:instantiate (wasmdown:validate-module m))))
+    ;; 65520 + 16 == 65536: exactly the page end, in bounds
+    (wasmdown.test:is (equalp (list (%v128 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0))
+                              (wasmdown:invoke inst "full")))
+    (dolist (name '("over" "extend" "store"))
+      (wasmdown.test:is
+       (eq :out-of-bounds-memory
+           (wasmdown:wasm-trap-kind
+            (wasmdown.test:assert-trap :out-of-bounds-memory
+              (wasmdown:invoke inst name))))))))

@@ -715,7 +715,8 @@ tag: its type's params only, results being empty by construction).
   (loop for expr in (wasm-elem-inits elem)
         collect (%const-eval const-eval inst expr)))
 
-(defun make-module-instance (module imports-alist &key (store nil) (const-eval nil))
+(defun make-module-instance (module imports-alist &key (store nil) (const-eval nil)
+                                                  (before-start nil))
   "Instantiate MODULE per the spec sequence:
   1. resolve + type-check imports (link-error),
   2. allocate funcs/tables/memories/globals (globals evaluate their
@@ -724,8 +725,16 @@ tag: its type's params only, results being empty by construction).
   3. build elem/data segment states,
   4. copy ACTIVE segments into their tables/memories with bounds
      checks (instantiation-error),
-  5. run the start function (traps propagate),
-  6. resolve exports.
+  5. run BEFORE-START, when supplied, with the allocated instance,
+  6. run the start function (traps propagate),
+  7. resolve exports.
+BEFORE-START exists for host ABIs that must reach the instance's own
+memory before any guest code runs — a WASI Preview1 import answers
+from the memory export, and the start section may already call it.
+It is called exactly once, after active segments and exports are in
+place and before the Wasm start function; NIL preserves the previous
+behavior. A condition signalled by the hook unwinds the whole
+instantiation (nothing is returned).
 IMPORTS-ALIST maps ((\"mod\" \"field\") . value)."
   (let* ((resolved (%resolve-imports module imports-alist))
          (inst (%make-module-instance :module module :store store))
@@ -868,6 +877,11 @@ IMPORTS-ALIST maps ((\"mod\" \"field\") . value)."
                                       (:global (svref (module-instance-globals inst) idx))
                                       (:tag (svref (module-instance-tags inst) idx)))
                         collect (cons (wasm-export-name ex) value)))
+            ;; the host ABI's pre-start hook: the allocated instance is
+            ;; complete (imports, memories, active segments, exports) and
+            ;; no guest code has run yet.
+            (when before-start
+              (funcall before-start inst))
             ;; start function: run after exports exist so it may call
             ;; exported paths; traps propagate untouched.
             (when (wasm-module-start module)

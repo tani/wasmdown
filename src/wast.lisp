@@ -35,7 +35,7 @@
            ;; src/component-text.lisp) + the M8 instantiator hook
            ;; (installed by src/component-runtime.lisp).
            #:*component-text-parser* #:component-text-parser
-           #:*store-teardown-hook*
+           #:*store-run-hook*
            #:*component-instantiator* #:component-instantiator
            ;; M9: the component-instance ACTION hook (installed by
            ;; src/component-runtime.lisp alongside the instantiator).
@@ -553,6 +553,21 @@ typed value record, or NIL when NODE is not a value form."
                   (list :float prim bits class)))
               (let ((tk (%one-tok rest k)))
                 (list :num prim (%parse-int-token tk))))))
+       ;; SIMD (loop 24, upstream lane): a v128 constant. The SHAPE
+       ;; token selects the lane interpretation; lanes are kept as
+       ;; TEXT so a float lane's NaN CLASS (nan:canonical /
+       ;; nan:arithmetic) survives to the comparison instead of being
+       ;; frozen to one bit pattern.
+       ((string= k "v128.const")
+        ;; several tokens follow (shape + lanes), so %ONE-TOK does not
+        ;; apply: it insists on exactly one token
+        (let* ((shape-tok (first rest))
+               (shape (and (stoken-p shape-tok)
+                           (string-downcase (stoken-text shape-tok))))
+               (lanes (mapcar (lambda (tk) (stoken-text tk))
+                              (rest rest))))
+          (unless shape (%werr 0 "bad v128.const form"))
+          (list :v128 shape lanes)))
        ((string= k "bool.const")
         ;; (bool.const true|false) — the values suite spells the
         ;; literals as keywords (the reference grammar's boolean
@@ -1077,8 +1092,19 @@ command shape."
 
 (defun %results-of (node)
   "The result value forms of an assert_return (all children after the
-action)."
-  (mapcar #'%const-value (cddr (%node-children node))))
+action). An (either ...) result — the relaxed-SIMD sanctioned-set
+wrapper — becomes (:either SPEC...) with each branch parsed as a
+value form."
+  (mapcar (lambda (n)
+            (if (and (%node-p n)
+                     (let ((h (first (%node-children n))))
+                       (and (stoken-p h)
+                            (string= (string-downcase (stoken-text h))
+                                     "either"))))
+                (cons :either
+                      (mapcar #'%const-value (rest (%node-children n))))
+                (%const-value n)))
+          (cddr (%node-children node))))
 
 (defun %action-or-module (node)
   "The payload of a failure assertion: the first child after the head —
@@ -1640,11 +1666,13 @@ loaded. M7 slice 2.")
   "The installed component text parser (a function) or NIL."
   *component-text-parser*)
 
-(defvar *store-teardown-hook* nil
-  "M13-tok9: the between-script store teardown — set by
-component-runtime's %store-teardown; each .wast script is a
-fresh STORE (the harness model) and a script's parked guest
-threads must not leak into the next script's tick grants.")
+(defvar *store-run-hook* nil
+  "The script-level STORE boundary (PLAN.md step 2). When set, the
+hook receives a thunk running the whole script and is responsible for
+binding a fresh store around it and tearing it down afterwards —
+component-runtime installs exactly that. Several component commands in
+one script therefore share one store, and a script's parked guest
+threads never leak into the next script's tick grants.")
 
 (defvar *component-instantiator* nil
   "The component INSTANTIATOR entry point (installed at load time by
@@ -1855,6 +1883,61 @@ stable order."
 ;;; ---------------------------------------------------------------
 ;;; Value comparison oracle (assert_return).
 
+(defun %v128-lane-count (shape)
+  (cond ((string= shape "i8x16") 16)
+        ((string= shape "i16x8") 8)
+        ((or (string= shape "i32x4") (string= shape "f32x4")) 4)
+        ((or (string= shape "i64x2") (string= shape "f64x2")) 2)
+        (t (error "unknown v128 shape ~a" shape))))
+
+(defun %v128-lane-width (shape)
+  (cond ((string= shape "i8x16") 1)
+        ((string= shape "i16x8") 2)
+        ((or (string= shape "i32x4") (string= shape "f32x4")) 4)
+        (t 8)))
+
+(defun %v128-float-shape-p (shape)
+  (member shape '("f32x4" "f64x2") :test #'string=))
+
+(defun %v128-lane-bits (shape lane)
+  "One lane's integer bit pattern (LANE text) for SHAPE."
+  (if (%v128-float-shape-p shape)
+      (multiple-value-bind (bits class)
+          (if (string= shape "f32x4")
+              (%float-class-and-bits lane 24 127 #x7fffff)
+              (%float-class-and-bits lane 53 1023 #x7ffffffffffff))
+        (declare (ignore class))
+        bits)
+      (logand (1- (ash 1 (* 8 (%v128-lane-width shape))))
+              (%parse-int-token
+               (make-stoken :kind :keyword :text lane
+                            :start 0 :end (length lane))))))
+
+(defun %v128-bytes (shape lanes)
+  "The 16-byte little-endian v128 value of SHAPE's LANES."
+  (let* ((n (%v128-lane-count shape))
+         (w (%v128-lane-width shape))
+         (out (wasmdown.simd:make-v128)))
+    (unless (= n (length lanes))
+      (error "v128.const ~a needs ~a lanes, got ~a" shape n (length lanes)))
+    (loop for lane in lanes
+          for i from 0
+          for base = (* i w)
+          for bits = (%v128-lane-bits shape lane)
+          do (loop for b from 0 below w
+                   do (setf (aref out (+ base b))
+                            (ldb (byte 8 (* 8 b)) bits))))
+    out))
+
+(defun %v128-lane-actual (bytes shape i)
+  "Lane I of BYTES read as SHAPE's integer/bit pattern."
+  (let* ((w (%v128-lane-width shape))
+         (base (* i w))
+         (v 0))
+    (loop for b from 0 below w
+          do (setf (ldb (byte 8 (* 8 b)) v) (aref bytes (+ base b))))
+    v))
+
 (defun %expected-to-lisp (spec)
   "Convert a parsed result spec to a host value for comparison, or a
 comparison directive list."
@@ -1910,7 +1993,13 @@ comparison directive list."
                    (list :ref-func-id (second spec))
                    (list :ref-non-null)))
     (:ref-null (list :ref-null))
-    (:ref-extern (list :ref-extern (second spec)))))
+    (:ref-extern (list :ref-extern (second spec)))
+    ;; SIMD: keep the lanes symbolic so a NaN-class lane matches the
+    ;; sanctioned set rather than one frozen pattern
+    (:v128 (list :v128 (second spec) (third spec)))
+    ;; relaxed SIMD: the spec sanctions SEVERAL results; each branch is
+    ;; a full expectation
+    (:either (cons :either (mapcar #'%expected-to-lisp (rest spec))))))
 
 (defun %arg-to-lisp (spec)
   "Convert a parsed argument spec to the Lisp-domain argument value
@@ -1938,6 +2027,7 @@ per docs/CONTRACTS.md (i32/i64 unsigned, f32/f64 floats, refs)."
     (:bool (if (second spec) 1 0))
     (:char spec)
     (:str spec)
+    (:v128 (%v128-bytes (second spec) (third spec)))
     ;; (values lane) the compound component shapes pass the parsed AST
     ;; through — the component invoker's canonical-ABI lower consumes
     ;; the tagged spec (never the core path, which %component-target-p
@@ -1949,10 +2039,41 @@ per docs/CONTRACTS.md (i32/i64 unsigned, f32/f64 floats, refs)."
     (:ref-null nil)
     (:ref-extern (list 'externref (second spec)))))
 
+
 (defun %value-matches (actual expected)
   "Compare one result value against its expectation directive."
   (ecase (first expected)
     (:exact (equalp actual (second expected)))
+    ;; SIMD: lane-wise v128 comparison; a NaN-CLASS lane accepts any
+    ;; sanctioned NaN of that class at the lane's width
+    (:v128
+     (let* ((shape (second expected))
+            (lanes (third expected))
+            (n (%v128-lane-count shape))
+            (floatp (%v128-float-shape-p shape))
+            (w (%v128-lane-width shape)))
+       (and (wasmdown.simd:v128-p actual)
+            (= n (length lanes))
+            (loop for lane in lanes
+                  for i from 0
+                  for got = (%v128-lane-actual actual shape i)
+                  for want = (%v128-lane-bits shape lane)
+                  do (unless
+                         (if (and floatp
+                                  (search "nan" (string-downcase lane)))
+                             (let ((f (if (= w 4)
+                                          (wasmdown.numops:f32-from-bits got)
+                                          (wasmdown.numops:f64-from-bits got))))
+                               (if (search "arithmetic"
+                                           (string-downcase lane))
+                                   (wasmdown.numops:arithmetic-nan-p f)
+                                   (wasmdown.numops:canonical-nan-p f)))
+                             (= got want))
+                       (return nil))
+                  finally (return t)))))
+    (:either
+     (loop for d in (rest expected)
+           thereis (%value-matches actual d)))
     (:exact-bits
      (etypecase actual
        (single-float
@@ -2298,27 +2419,22 @@ given, receives a JSONL line per result (PLAN.md 12.8)."
                     (format nil "script parse error: ~a" parse-error)
                     nil))
            (t
-            (dolist (cmd cmds)
-              (handler-case
-                  (%execute-command state cmd #'record)
-                (error (c)
-                  (record cmd :harness-error nil
-                          (format nil "unexpected error: ~a" c)
-                          nil))))
-            ;; M13-tok9 THE BETWEEN-SCRIPT STORE TEARDOWN: a
-            ;; script's parked-but-unfinished guest threads (the
-            ;; fixtures' parked-by-design callbacks) stay in the
-            ;; global scheduler after the last command; the NEXT
-            ;; script's rounds then compete with them for each
-            ;; tick's single grant (empty-wait::1 deadlocked only
-            ;; in the LANE — its predecessor's leftovers consumed
-            ;; the grants; alone it passes 6/6). Each script is a
-            ;; fresh STORE per the harness model — release every
-            ;; still-registered thread at the script's end. The
-            ;; hook is late-bound (component-runtime loads after
-            ;; this file — the *component-instantiator* pattern).
-            (when *store-teardown-hook*
-              (funcall *store-teardown-hook*))))))
+            ;; EVERY command of one script runs inside ONE store
+            ;; (the hook late-binds a fresh store and tears it down
+            ;; at the end), so a component built by an earlier
+            ;; command is usable by a later one and nothing leaks
+            ;; into the next script.
+            (flet ((run-commands ()
+                     (dolist (cmd cmds)
+                       (handler-case
+                           (%execute-command state cmd #'record)
+                         (error (c)
+                           (record cmd :harness-error nil
+                                   (format nil "unexpected error: ~a" c)
+                                   nil))))))
+              (if *store-run-hook*
+                  (funcall *store-run-hook* #'run-commands)
+                  (run-commands)))))))
       (nreverse results)))))
 
 (defun %execute-command (state cmd record)
@@ -2626,17 +2742,27 @@ slicing its text from *script-source*."
               ((< (char-code c) 32) (format out "\\u~4,'0x" (char-code c)))
               (t (write-char c out))))))
 
-(defun write-jsonl-line (stream result)
-  "One wasmdown.test-result.v1 JSON object line."
+(defvar *jsonl-suite* "core-spec"
+  "The suite label written into JSONL lines (PLAN.md §12.8): a lane
+that measures a different corpus binds its own name, so the aggregated
+results of two suites stay distinguishable.")
+
+(defun write-jsonl-line (stream result &optional (suite *jsonl-suite*))
+  "One wasmdown.test-result.v1 JSON object line. SUITE names the corpus
+(\"core-spec\", \"component\", \"upstream\", ...) and every line also
+carries the source FILE, so a consumer need not parse CASE-ID."
   (format stream
           "{\"schema\":\"wasmdown.test-result.v1\",~
-           \"suite\":\"core-spec\",~
+           \"suite\":\"~a\",~
+           \"file\":\"~a\",~
            \"case_id\":\"~a::~a\",~
            \"assertion\":\"~a\",~
            \"outcome\":\"~a\",~
            \"expected_failure_phase\":null,~
            \"actual_failure_phase\":\"~a\",~
            \"detail\":\"~a\"}~%"
+          (%json-escape suite)
+          (%json-escape (wast-result-file result))
           (%json-escape (wast-result-file result))
           (wast-result-command-index result)
           (string-downcase (wast-result-command-name result))
@@ -2645,11 +2771,11 @@ slicing its text from *script-source*."
               (string-downcase (wast-result-phase result)) "")
           (%json-escape (wast-result-detail result))))
 
-(defun write-jsonl (results path)
-  "Write RESULTS as a JSONL file at PATH."
+(defun write-jsonl (results path &optional (suite *jsonl-suite*))
+  "Write RESULTS as a JSONL file at PATH under SUITE's label."
   (with-open-file (s path :direction :output
                      :if-exists :supersede :if-does-not-exist :create)
-    (dolist (r results) (write-jsonl-line s r))))
+    (dolist (r results) (write-jsonl-line s r suite))))
 
 (defun summarize-results (results &optional (stream *standard-output*))
   "Print a human summary of results by outcome."
@@ -2660,7 +2786,8 @@ slicing its text from *script-source*."
 ;;; ---------------------------------------------------------------
 ;;; Directory driver.
 
-(defun run-directory (dir &key (pattern "*.wast") (jsonl-path nil))
+(defun run-directory (dir &key (pattern "*.wast") (jsonl-path nil)
+                           (suite *jsonl-suite*))
   "Run every matching .wast file under DIR (sorted). Returns the
 aggregated results list; writes JSONL when JSONL-PATH is given."
   (let* ((files (sort (directory
@@ -2672,7 +2799,7 @@ aggregated results list; writes JSONL when JSONL-PATH is given."
       (let* ((name (file-namestring f))
              (results (run-script f :file name)))
         (setf all (append all results))))
-    (when jsonl-path (write-jsonl all jsonl-path))
+    (when jsonl-path (write-jsonl all jsonl-path suite))
     all))
 
 (defun pathname-as-directory (p)

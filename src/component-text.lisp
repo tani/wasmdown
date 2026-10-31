@@ -1020,9 +1020,10 @@ declarator's own index space) — see %parse-deftype-node."
        ((string= h "alias")
         (multiple-value-bind (alias id)
             (%parse-alias-node node type-scope)
-          (incf (ct-scope-n-type type-scope))
-          (%bind type-scope id :type
-                 (1- (ct-scope-n-type type-scope)))
+          (when (eq (aliasrec-sort alias) :type)
+            (incf (ct-scope-n-type type-scope))
+            (%bind type-scope id :type
+                   (1- (ct-scope-n-type type-scope))))
           (list (make-typedecl :kind :alias :payload alias))))
        ((string= h "export")
         (multiple-value-bind (name attrs et id)
@@ -1046,14 +1047,23 @@ declarator's own index space) — see %parse-deftype-node."
           ;; the desugared :type/:alias entries collected by the sink
           ;; during the parse above (parse order)
           (let ((pre (nreverse (shiftf *type-decl-sink* nil))))
-            ;; an exportdecl introduces a new type index (Binary.md
-            ;; line 274) AND binds its bind-id at the SORT-MATCHING
-            ;; space: an (export "r" (type $r (sub resource))) inside
-            ;; an instance type binds $r for the following declarators
-            ;; (resources.wast ::28/::29/::30, annotated-names ::30)
-            (incf (ct-scope-n-type type-scope))
-            (%bind type-scope id (car et)
-                   (1- (ct-scope-n-type type-scope)))
+            ;; Binary.md line 274: only an export whose externtype is
+            ;; a TYPE BOUND introduces a type index. A func/value/
+            ;; instance/module export does NOT — counting it inserted
+            ;; phantom slots, so every inline type after it got a
+            ;; shifted index (the (func . i) ascriptions then pointed
+            ;; at the wrong slot once the declarator space became
+            ;; spec-shaped). The bind-id of a type export names the
+            ;; new type index (resources.wast ::28/::29/::30).
+            (if (eq (car et) :type)
+                (progn
+                  (incf (ct-scope-n-type type-scope))
+                  (%bind type-scope id (car et)
+                         (1- (ct-scope-n-type type-scope))))
+                ;; a non-type declarator introduces no TYPE index but
+                ;; still occupies its own SORT's index space (the
+                ;; alias projections reference it there)
+                (%alloc type-scope (car et) id))
             (nconc pre
                    (list (make-typedecl :kind :export
                                         :payload (list name attrs
@@ -1073,15 +1083,18 @@ LIST of typedecls (see %parse-instancedecl)."
             ;; into that same space (see the export arm)
             (%parse-importdecl-parts node type-scope type-scope)
           (let ((pre (nreverse (shiftf *type-decl-sink* nil))))
-            ;; an import's bind-id introduces a type index inside the
-            ;; enclosing component/instance TYPE (Binary.md line 274)
-            ;; AND binds at the SORT-MATCHING space: an (instance $i)
-            ;; import's $i is an INSTANCE reference for the following
-            ;; (alias export $i ...) declarators (outer-alias.wast
-            ;; ::13/::14's $i; the Explainer's $fs example)
-            (incf (ct-scope-n-type type-scope))
-            (%bind type-scope id (car et)
-                   (1- (ct-scope-n-type type-scope)))
+            ;; Binary.md line 274: only a TYPE-BOUND import introduces
+            ;; a type index. Every import still binds its bind-id at
+            ;; the SORT-MATCHING space (an (instance $i) import's $i is
+            ;; an INSTANCE reference for later alias declarators:
+            ;; outer-alias.wast ::13/::14) — that binding does not
+            ;; consume a TYPE index.
+            (if (eq (car et) :type)
+                (progn
+                  (incf (ct-scope-n-type type-scope))
+                  (%bind type-scope id (car et)
+                         (1- (ct-scope-n-type type-scope))))
+                (%alloc type-scope (car et) id))
             (nconc pre
                    (list (make-typedecl :kind :import
                                         :payload (list name attrs
@@ -1920,7 +1933,7 @@ position)."
         (%parse-typeidx (second items) scope))
        (t
         (multiple-value-bind (s i)
-            (%parse-projection (sort-of-name (%tok-text head))
+            (%parse-projection (%sort-of-name (%tok-text head))
                                (rest items) scope)
           (declare (ignore s))
           i)))))

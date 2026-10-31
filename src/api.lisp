@@ -219,7 +219,7 @@ instance, or NIL. Computed BEFORE any slot is replaced."
                      (mapcar (lambda (v) (or (compiled-for v) v))
                              (wasmdown.runtime::elem-seg-state-refs seg)))))))
 
-(defun instantiate (module &key (imports nil) (mode :interpret))
+(defun instantiate (module &key (imports nil) (mode :interpret) (before-start nil))
   "Instantiate MODULE: resolve + type-check IMPORTS (link-error),
 allocate, initialize active segments (instantiation-error), run the
 start function (wasm-trap propagates) and resolve exports. MODULE must
@@ -228,10 +228,15 @@ modules and signals validation-error. Returns the module-instance.
 MODE :INTERPRET (default) executes guest code through the reference
 interpreter; :BASELINE compiles the module's functions with the
 wasmdown.codegen backend after instantiation and installs them for
-every subsequent call (host-error if the backend is not loaded)."
+every subsequent call (host-error if the backend is not loaded).
+BEFORE-START, when non-NIL, is called once with the allocated instance
+after active segments/exports exist and before the Wasm start section
+(the WASI Preview1 memory gate). It works with imported and defined
+memory and with both modes."
   (wasmdown.validate:validate-module module)
   (let ((inst (wasmdown.runtime:make-module-instance module
-                                                     (%imports-alist imports))))
+                                                     (%imports-alist imports)
+                                                     :before-start before-start)))
     (ecase mode
       (:interpret inst)
       (:baseline (%install-baseline! module inst) inst))))

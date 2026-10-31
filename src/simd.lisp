@@ -595,6 +595,17 @@ violation. IMM is the entry's imm shape."
                                                             (lane-u v i width))))))
     r))
 
+(defun %fcm2 (a b width lanes f32-p ffn)
+  "Float LANEWISE COMPARISON: the result lanes are MASKS (all-ones on
+true, zero on false), never floats — the old dispatch ran the compare
+through the float map, which fed the 0xFFFFFFFF mask back into
+F32BITS and trapped on the first assertion."
+  (let ((inv (if f32-p #'%f32 #'%f64))
+        (mask (1- (ash 1 width))))
+    (%map2 a b width lanes
+           (lambda (x y)
+             (if (funcall ffn (funcall inv x) (funcall inv y)) mask 0)))))
+
 (defun %fm2 (a b width lanes fbits finv ffn)
   "Map binary float FN over lanes."
   (declare (type (simple-array (unsigned-byte 8) (16)) a b)
@@ -899,12 +910,12 @@ bitmask -> i32) are handled by the interp layer, NOT here."
         (:f-max (f2 #'wasmdown.numops:fmax))
         (:f-pmin (f2 (lambda (x y) (if (< y x) y x))))
         (:f-pmax (f2 (lambda (x y) (if (< x y) y x))))
-        (:f-eq (f2 (lambda (x y) (cmp-mask (= x y)))))
-        (:f-ne (f2 (lambda (x y) (cmp-mask (/= x y)))))
-        (:f-lt (f2 (lambda (x y) (cmp-mask (< x y)))))
-        (:f-gt (f2 (lambda (x y) (cmp-mask (> x y)))))
-        (:f-le (f2 (lambda (x y) (cmp-mask (<= x y)))))
-        (:f-ge (f2 (lambda (x y) (cmp-mask (>= x y)))))
+        (:f-eq (%fcm2 a b width lanes f32-p #'=))
+        (:f-ne (%fcm2 a b width lanes f32-p #'/=))
+        (:f-lt (%fcm2 a b width lanes f32-p #'<))
+        (:f-gt (%fcm2 a b width lanes f32-p #'>))
+        (:f-le (%fcm2 a b width lanes f32-p #'<=))
+        (:f-ge (%fcm2 a b width lanes f32-p #'>=))
         (:f-madd
          ;; relaxed madd: CANONICAL CHOICE = the plain two-rounding
          ;; a*b+c (the spec admits fused single-rounding too).

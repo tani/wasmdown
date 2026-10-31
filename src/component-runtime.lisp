@@ -91,8 +91,26 @@
            ;; embedder that drives one command to completion (the WASI
            ;; `run' entry) tears the whole store down afterwards, so a
            ;; `wasi:cli/exit' cannot leak guest threads.
-           #:store-teardown))
+           #:store-teardown
+           ;; step 2: the store's own lifecycle and ownership surface
+           #:make-component-store
+           #:component-store
+           #:component-store-p
+           #:component-instance-store
+           #:call-with-component-store
+           ;; the store's state accessors an embedder/test reads
+           #:component-store-threads
+           #:component-store-right-ticket
+           #:component-store-right-owner))
 (in-package #:wasmdown.component.runtime)
+
+;;; SB-INTROSPECT is an SBCL contrib (not third-party): the sink-arity
+;;; probe needs it. It MUST be loaded before this file's forms are
+;;; READ, so a fresh `asdf:load-system ... :force t' in a bare SBCL
+;;; can resolve the package-qualified symbol later in the file.
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (require :sb-introspect))
+
 
 ;;; THE ASYNC DYNAMIC CONTEXT: proclaimed SPECIAL at the file's
 ;;; head so EVERY binding site compiles as a dynamic binding
@@ -322,17 +340,120 @@ field -> that instance's export."
   "The enclosing comp-instances for outer alias resolution (innermost
 first; a count of N resolves the Nth entry).")
 
+(defstruct (host-store (:constructor %make-host-store))
+  "One store's host-work state: the completion queue, its lock-free
+gate (WORK), and the context's reactor (NIL = no time/readiness
+capability, exactly the old drain-only behaviour)."
+  (mutex (sb-thread:make-mutex :name "host-store"))
+  (entries nil)                         ; reversed push order
+  (count 0)                             ; queued events (word read)
+  (work 0)                              ; queued events + live pendings
+  (reactor nil))
+
+(defstruct (component-store (:include host-store)
+                            (:constructor %make-component-store))
+  "One store: the host-work state above PLUS the execution ownership
+of one instantiation graph (PLAN.md step 2). Every top-level
+component graph gets exactly one store; nested instances inherit the
+root's. STORE-TEARDOWN / CALL-WITH-COMPONENT-STORE are the lifecycle
+boundary: an instance never outlives its store."
+  ;; step 2: the per-store EXECUTION state that used to be one
+  ;; process global. Each entry is owned by exactly one store.
+  (tok-path-counter 0)
+  (tok-skip-age (make-hash-table :test #'eq))
+  (async-progress 0)
+  (cancel-window-inst nil)
+  (deferred-resume-all-tasks nil)
+  (defer-resume-all nil)
+  (right-handoffs nil)
+  (right-driver nil)
+  (driver-records (make-hash-table :test #'eq))
+  (comp-closure (make-hash-table :test #'equal))
+  (resource-dtor-table (make-hash-table :test #'equal))
+  (ct-defining-inst (make-hash-table :test #'equal))
+  ;; the scheduler registry and the execution RIGHT, per store: a
+  ;; store's guest threads and the thread allowed to run next belong
+  ;; to that instantiation graph, never to the process (PLAN.md
+  ;; step 2). The LOCK serializing right handoffs stays process-wide
+  ;; (*STORE-RIGHT*) — it guards the protocol, not any state.
+  (threads nil)
+  (right-owner nil)
+  (right-ticket nil)
+  (right-owner-os nil)
+)
+
+(defun make-component-store (&key reactor)
+  "A fresh store, optionally with REACTOR installed."
+  (let ((store (%make-component-store)))
+    (when reactor (setf (host-store-reactor store) reactor))
+    store))
+
+(defparameter *global-host-store* (%make-component-store)
+  "The store of a context with NO store binding (a bare host thread,
+a unit test calling a provider directly): today's behaviour — one
+queue, drained at the boundaries, no reactor step.")
+
+(defparameter *current-component-store* nil
+  "The store whose context THIS native thread is executing. Bound in
+every native factory and around a host closure; NIL outside a store.
+The dynamic binding is what routes a pending's completion back to
+the store that owns the call.")
+
+(defparameter *scheduler-mutex* (sb-thread:make-mutex :name "scheduler"))
+
+(defparameter *store-right* (sb-thread:make-mutex :name "store-right")
+  "The lock serializing the right protocol. Process-wide by design:
+it guards the handoff protocol, while the STATE it protects lives in
+the store's own slots.")
+
+;; The store-relative accessors for the scheduler registry and the
+;; execution right. Every read/write goes through (%CS), the store
+;; bound on this thread (else the process fallback store), so two
+;; instantiation graphs never share a registry or a ticket.
+(defmacro %store-threads ()
+  "The live async-thread records of the current store — Store.tick's
+nudge-all walks it. Mutated from multiple guest threads through
+*SCHEDULER-MUTEX*."
+  '(component-store-threads (%cs)))
+
+(defmacro %store-right-owner ()
+  "The thread record holding the current store's right (informational:
+ownership is the mutex itself; this names it for the watchdog dump)."
+  '(component-store-right-owner (%cs)))
+
+(defmacro %store-right-ticket ()
+  "The ONE ticket allowed to run next in the current store — an
+async-thread record whose async-task-seq is the creation path.
+Written only under *STORE-RIGHT*."
+  '(component-store-right-ticket (%cs)))
+
+(defmacro %store-right-owner-os ()
+  "The OS thread of %STORE-RIGHT-OWNER (diagnostics only)."
+  '(component-store-right-owner-os (%cs)))
+
+(defun %cs ()
+  "The store whose state the current code manipulates: the store
+bound on this thread, else the process fallback store (a bare host
+caller with no store context)."
+  (or *current-component-store* *global-host-store*))
+
+(defun %owner-store (&optional inst)
+  "The store a native thread created for INST must bind: the
+instance's own store, else the CALLER's bound store, else the process
+fallback. (An instance built by a bare host caller carries no store,
+and its threads still belong to the caller's scope.)"
+  (or (and inst (%inst-host-store inst))
+      *current-component-store*
+      *global-host-store*))
+
+
+
+
 (defvar *resource-id-counter* 0
   "The runtime resource identity counter (resources are generative
 per instantiation; the counter never resets, mirroring the
 validator's).")
 
-(defvar *resource-dtor-table* (make-hash-table :test #'equal)
-  "M9: (resource-ct . defining-comp-instance) -> the dtor
-func-instance, resolved at the TYPE def walk in the DEFINING
-instance's core-func space. A consumer's resource.drop canon reads
-the ORIGIN's dtor — the ct's payload dtor index is meaningful only
-there.")
 
 ;;; ---- M17: the PER-INSTANCE host-resource destructor registry ----
 ;;; A host capability adopted by an instance is released by THAT
@@ -381,22 +502,7 @@ that instance registered none (the drop path then falls back)."
 (defun %fresh-resource-id ()
   (cons :fresh (incf *resource-id-counter*)))
 
-(defvar *comp-closure* (make-hash-table :test #'equal)
-  "M9 (linking ::233): (exporting-inst . projected-comp) -> the
-SOURCE comp-instance an alias-projected component was exported from.
-The instantiate arm consults it: a child instantiated via an alias
-resolves its depth-1 outer refs through the EXPORTING instance (the
-closure), prepended to the outer chain. No value-shape change — the
-components vector holds the RAW comp (the ::169 export chains see
-exactly what they always did).")
 
-(defvar *ct-defining-inst* (make-hash-table :test #'equal)
-  "M9 (linking ::93): resource-ct -> the comp-instance whose exports
-PROJECTED it (an (alias export $i \"r\" (type)) at the consumer).
-The drop canon's dtor lookup keys the dtor table by the DEFINING
-instance — with two instantiations of the defining component the ct
-object is shared but each instance has its OWN dtor func, so the
-first table hit leaks the wrong instance's counter.")
 
 (defvar *handle-caller-inst* nil
   "M9 (linking ::126): the comp-instance whose handle table an
@@ -430,7 +536,14 @@ calls.")
                     %exec-instance %exec-alias %exec-canon
                     %exec-import %exec-export))
 
-(defun instantiate-component (comp &key (with-args nil) (outer nil))
+(defvar *component-core-mode* :interpret
+  "The execution mode for embedded CORE modules of the component
+graph currently being instantiated (:interpret or :baseline). Bound
+by INSTANTIATE-COMPONENT; :baseline installs the compiled backend on
+every core instance it allocates.")
+
+(defun instantiate-component (comp &key (with-args nil) (outer nil) (store nil)
+                                  (mode :interpret))
   "Execute a VALIDATED comp: walk its defs in file order, allocating
 core instances, nested component instances, lifted funcs and
 exports; run the start functions last (traps propagate untouched).
@@ -444,14 +557,30 @@ Returns the comp-instance."
     ;; store; a top-level instantiation inside a store context joins
     ;; that store; otherwise it opens its own (drain-only until a
     ;; reactor is installed).
-    (setf (%inst-host-store inst)
-          (or (and outer (%inst-host-store (car (last outer))))
-              *current-component-store*
-              (%make-host-store)))
+    ;; Store resolution: an EXPLICIT store wins; a nested graph MUST
+    ;; join its root's store (a mismatch is a link error, never a
+    ;; silent second store); otherwise the thread's bound store; else
+    ;; a fresh one owned by this graph.
+    (let ((root-store (and outer (%inst-host-store (car (last outer))))))
+      (when (and store root-store (not (eq store root-store)))
+        (error 'wasmdown:link-error
+               :message "component instantiation spans two stores"))
+      (setf (%inst-host-store inst)
+            (or store
+                root-store
+                *current-component-store*
+                (%make-component-store))))
     ;; with-args pre-bind: an :import def reads the bound value by name
     (dolist (pair with-args)
       (setf (gethash (car pair) (comp-instance-imports inst)) (cdr pair)))
-    (let ((*outer-instances* (cons inst (or outer *outer-instances*))))
+    ;; The graph's OWN store is bound for the whole walk: every %CS
+    ;; read inside it (alias/type/dtors/canon registration and the
+    ;; start functions) must hit THIS graph's state, never the process
+    ;; fallback. A caller-supplied binding is never replaced: a nested
+    ;; graph inherits exactly one store.
+    (let ((*outer-instances* (cons inst (or outer *outer-instances*)))
+          (*current-component-store* (%inst-host-store inst))
+          (*component-core-mode* mode))
       (loop for d across (comp-defs comp)
             for payload = (compdef-payload d)
             do (case (compdef-kind d)
@@ -478,6 +607,11 @@ Returns the comp-instance."
                   ;; ORIGIN's dtor, never its own space's slot.
                   (when (and (wasmdown.component:ct-resourcetype-p
                               payload)
+                             ;; a HOST-provided resource ct (an
+                             ;; imported interface's resource) has a
+                             ;; NAME payload, not a (dtor-idx ...)
+                             ;; cons: it has no local dtor here
+                             (consp (wasmdown.component:ct-payload payload))
                              (integerp (cdr
                                          (wasmdown.component:ct-payload
                                           payload)))
@@ -486,7 +620,7 @@ Returns the comp-instance."
                                 (length (comp-instance-core-funcs
                                          inst))))
                     (setf (gethash (cons payload inst)
-                                   *resource-dtor-table*)
+                                   (component-store-resource-dtor-table (%cs)))
                           (aref (comp-instance-core-funcs inst)
                                 (cdr (wasmdown.component:ct-payload
                                       payload)))))
@@ -542,7 +676,13 @@ inline-export BAG."
                                                inst)
                                               iidx))))
               (mi (wasmdown.runtime:make-module-instance
-                   module (%core-imports-alist module args))))
+                   module (%core-imports-alist module args)))
+              (_ (when (eq *component-core-mode* :baseline)
+                   (let ((installer (find-symbol "%INSTALL-BASELINE!" :wasmdown)))
+                     (unless (and installer (fboundp installer))
+                       (error 'wasmdown:host-error
+                              :message "baseline codegen backend not loaded"))
+                     (funcall installer module mi)))))
          (%push-core-instance inst mi))))
     (:inline-exports
      (let ((bag (make-hash-table :test #'equal)))
@@ -571,7 +711,7 @@ build an inline-export bag instance."
        ;; source; the depth-1 outer chain prepends it (deeper
        ;; counts walk past it to the enclosing sites). No closure
        ;; record = the plain chain (the ::169 direct defs).
-       (let* ((closure (gethash (cons inst cidx) *comp-closure*))
+       (let* ((closure (gethash (cons inst cidx) (component-store-comp-closure (%cs))))
               (outer (if closure
                          (cons closure *outer-instances*)
                          *outer-instances*))
@@ -620,9 +760,9 @@ sort (the alias introduces one index of its sort)."
            (setf (gethash (cons inst
                                 (length
                                  (comp-instance-types inst)))
-                          *ct-defining-inst*)
+                          (component-store-ct-defining-inst (%cs)))
                  source)
-           (setf (gethash v *ct-defining-inst*) source))
+           (setf (gethash v (component-store-ct-defining-inst (%cs))) source))
          ;; M9 (linking ::233): record the closure for an
          ;; alias-projected COMPONENT — (source inst . comp) -> src
          (when (eq (aliasrec-sort payload) :component)
@@ -633,7 +773,7 @@ sort (the alias introduces one index of its sort)."
            (setf (gethash (cons inst
                                 (length
                                  (comp-instance-components inst)))
-                          *comp-closure*)
+                          (component-store-comp-closure (%cs)))
                  source))
          (%push-sort inst (aliasrec-sort payload) v))))
     (:core-export
@@ -766,21 +906,21 @@ remaining built-ins stay opaque core-func slots (the values slice)."
                           ;; to the first-hit scan (single-instance
                           ;; fixtures) then the local slot
                           (or (gethash (cons ct inst)
-                                       *resource-dtor-table*)
+                                       (component-store-resource-dtor-table (%cs)))
                               ;; M9 (linking ::117): the canon's OWN
                               ;; (instance . type-slot) record — the
                               ;; alias that introduced THIS slot named
                               ;; its source instance
                               (let ((src (gethash (cons inst tidx)
-                                                  *ct-defining-inst*)))
+                                                  (component-store-ct-defining-inst (%cs)))))
                                 (and src
                                      (gethash (cons ct src)
-                                              *resource-dtor-table*)))
+                                              (component-store-resource-dtor-table (%cs)))))
                               (let ((src (gethash ct
-                                                 *ct-defining-inst*)))
+                                                 (component-store-ct-defining-inst (%cs)))))
                                 (and src
                                      (gethash (cons ct src)
-                                              *resource-dtor-table*)))
+                                              (component-store-resource-dtor-table (%cs)))))
                               (block origin
                                 (maphash
                                  (lambda (key val)
@@ -788,10 +928,11 @@ remaining built-ins stay opaque core-func slots (the values slice)."
                                               (wasmdown.runtime:func-instance-p
                                                val))
                                      (return-from origin val)))
-                                 *resource-dtor-table*)
+                                 (component-store-resource-dtor-table (%cs)))
                                 nil)))
                      (and ct
                           (wasmdown.component:ct-resourcetype-p ct)
+                          (consp (wasmdown.component:ct-payload ct))
                           (integerp (cdr (wasmdown.component:ct-payload
                                           ct)))
                           (< (cdr (wasmdown.component:ct-payload ct))
@@ -987,9 +1128,13 @@ arm; the introduced type re-exports the source ct)."
              (:option (%abi-alignment (wasmdown.component:ct-payload c)
                                       inst))
              (:result
+              ;; a result is a VARIANT: alignment = the discriminant's
+              ;; size and the payloads' alignments (the hardcoded 4
+              ;; demanded a 4-aligned retptr for result<enum,error-code>
+              ;; where the ABI — and every adapter — uses 1)
               (let ((ok (car (wasmdown.component:ct-payload c)))
                     (err (cdr (wasmdown.component:ct-payload c))))
-                (max 4 (if ok (%abi-alignment ok inst) 1)
+                (max 1 (if ok (%abi-alignment ok inst) 1)
                      (if err (%abi-alignment err inst) 1))))
              (t 4)))))
     (al vt)))
@@ -1112,14 +1257,19 @@ else 4."
          (let ((sz (+ (* (ceiling ds ma) ma) ps)))
            (* (ceiling sz ma) ma))))
       (:result
-       ;; despecialized: variant(ok, error) — disc 1 + payload
+       ;; despecialized: variant(ok, error) — the FULL variant rule
+       ;; (one-byte discriminant, payload at the join-aligned offset,
+       ;; size aligned): the old formula dropped the discriminant and
+       ;; maxed the payload with 1, so the size and the store disagreed
        (let* ((ok (car (wasmdown.component:ct-payload c)))
               (err (cdr (wasmdown.component:ct-payload c)))
-              (p (max (if ok (%abi-elem-size ok inst) 0)
-                      (if err (%abi-elem-size err inst) 0)))
-              (a (max 1 (if ok (%abi-alignment ok inst) 1)
-                     (if err (%abi-alignment err inst) 1))))
-         (max 1 (* (ceiling p a) a))))
+              (ds 1)
+              (ma (max ds 1 (if ok (%abi-alignment ok inst) 1)
+                       (if err (%abi-alignment err inst) 1)))
+              (ps (max (if ok (%abi-elem-size ok inst) 0)
+                       (if err (%abi-elem-size err inst) 0)))
+              (sz (+ (* (ceiling ds ma) ma) ps)))
+         (* (ceiling sz ma) ma)))
       (t 4))))
 
 ;;; ---- codecs (utf8 / utf16 / latin1) ----
@@ -1506,8 +1656,12 @@ with the TAGGED code-unit count under CX's encoding. Traps on OOB
                            (%abi-elem-size vt (%abi-type-inst cx))))))
       (:enum
        (let ((labels (coerce (wasmdown.component:ct-payload c) 'list)))
-         (let ((idx (or (position v labels :test #'string=) 0)))
-           (%abi-store-int cx idx ptr 1))))
+         ;; the TAGGED domain is (list :enum LABEL) — the label is the
+         ;; SECOND element, not the cdr (whose cdr is a one-element
+         ;; list and compared as a string)
+         (let ((e (if (and (consp v) (eq (car v) :enum)) (second v) v)))
+           (let ((idx (or (position e labels :test #'string=) 0)))
+             (%abi-store-int cx idx ptr 1)))))
       (:option
        ;; the DOMAIN shape (:some . payload) (or the bare :none) —
        ;; unwrap the tag into the variant's ("some" . payload) form;
@@ -1567,13 +1721,24 @@ store each, return (ptr . length)."
           do (%abi-store cx e elem-type (+ ptr (* i es))))
     (cons ptr n)))
 
+(defun %abi-case-index (tag cases)
+  "The discriminant of the case TAG names in CASES. A host domain value
+tags its case with a KEYWORD (a provider returns (:closed . nil)), the
+WIT names the case with a string (\"closed\"), so the match is on the
+normalised name — the old (string= :closed \"closed\") was a type error
+and the position fell through to case 0, which stored the NIL payload
+of the WRONG case's resource slot."
+  (or (position (and tag (string-downcase (string tag)))
+                cases
+                :key (lambda (case) (string-downcase (string (car case))))
+                :test #'string=)
+      0))
+
 (defun %abi-store-variant (cx v c ptr)
   "store_variant (CanonicalABI.md 2787): the discriminant + the
 payload at the join-aligned offset."
   (let* ((cases (coerce (wasmdown.component:ct-payload c) 'list))
-         (idx (or (position (car v) cases
-                            :key #'car :test #'string=)
-                  0))
+         (idx (%abi-case-index (car v) cases))
          (case (nth idx cases))
          (payload (cdr case))
          (ds (%abi-discriminant-size cases))
@@ -1817,7 +1982,7 @@ CoerceValueIter pairs) — NIL outside variants."
       (:enum
        ;; the TAGGED domain (cons :enum label); a bare label accepts
        (let ((labels (coerce (wasmdown.component:ct-payload c) 'list))
-             (e (if (and (consp v) (eq (car v) :enum)) (cdr v) v)))
+             (e (if (and (consp v) (eq (car v) :enum)) (second v) v)))
          (list (or (position e labels :test #'string=) 0))))
       (:option
        (%abi-lower cx
@@ -2171,9 +2336,7 @@ remove is a no-op; a trap mid-call still unwinds through here)."
     (when (eq *sync-lift-owner* task)
       (setf *sync-lift-owner* nil))))
 
-(declaim (special *right-self* *right-driver* *store-right*
-                  *right-ticket* *right-owner*
-                  *driver-records* *current-task* *current-thread*))
+(declaim (special *right-self* *current-task* *current-thread*))
 
 (defun %sync-thunk-run (entry &key inst)
   "M13-tok9: the nested-sync route's executor entry — run ENTRY
@@ -2225,7 +2388,7 @@ the callee module imports blocking built-ins)."
           ((sb-thread:main-thread-p)
            (loop
              with idle-cycles = 0
-             for before = *async-progress*
+             for before = (component-store-async-progress (%cs))
              do (async-thread-resume-all)
                 (sb-thread:with-recursive-lock (dmu)
                   (when done-p (return)))
@@ -2233,7 +2396,7 @@ the callee module imports blocking built-ins)."
                 ;; slice releases the right so the executor can run.
                 (unless done-p
                   (%right-stall (%driver-self) :seconds 0.001))
-                (if (> *async-progress* before)
+                (if (> (component-store-async-progress (%cs)) before)
                     (setf idle-cycles 0)
                     (incf idle-cycles))
              when (>= idle-cycles 200)
@@ -2281,33 +2444,39 @@ reentrance phase checks). The CALLER then waits:
     the executor is registered in the scheduler and gets its slices
     from the same resume-all."
   (multiple-value-bind (task th) (%sync-lift-context lf)
-    (let* ((cell (cons nil nil))
-           (dmu (sb-thread:make-mutex :name "sync-lift"))
-           (done (sb-thread:make-waitqueue :name "sync-lift"))
-           (done-p nil)
-           (oracled nil)
-           (executor
-             (sb-thread:make-thread
-              (lambda ()
-                (let ((*current-task* task)
-                      (*current-thread* th)
-                      (*right-self* th)
-                      (*current-component-store*
-                        (%inst-host-store (lifted-func-inst lf))))
-                  ;; STEP 4: the guest body runs only under the right.
-                  (%right-acquire th)
-                  (unwind-protect
-                       (multiple-value-bind (r e)
-                           (ignore-errors
-                            (apply #'wasmdown.runtime:wasm-call
-                                   core flat-args))
-                         (setf (car cell) r)
-                         (when e (setf (cdr cell) e)))
-                    (sb-thread:with-recursive-lock (dmu)
-                      (setf done-p t)
-                      (sb-thread:condition-broadcast done))
-                    (%right-release-on-exit th))))
-              :name "sync-lift-executor")))
+      (let* ((cell (cons nil nil))
+             (dmu (sb-thread:make-mutex :name "sync-lift"))
+             (done (sb-thread:make-waitqueue :name "sync-lift"))
+             (done-p nil)
+             (oracled nil)
+             (executor
+               (sb-thread:make-thread
+                (lambda ()
+                  (let ((*current-task* task)
+                        (*current-thread* th)
+                        (*right-self* th)
+                        (*current-component-store*
+                          (%owner-store (lifted-func-inst lf))))
+                    ;; STEP 4: the guest body runs only under the right.
+                    (%right-acquire th)
+                    (unwind-protect
+                         (block caught
+                           ;; the handler must sit INSIDE the catcher:
+                           ;; an outer handler-bind never runs when an
+                           ;; inner handler-case (ignore-errors) unwinds
+                           (handler-bind
+                               ((error
+                                  (lambda (c)
+                                    (setf (cdr cell) c)
+                                    (return-from caught nil))))
+                             (setf (car cell)
+                                   (apply #'wasmdown.runtime:wasm-call
+                                          core flat-args))))
+                      (sb-thread:with-recursive-lock (dmu)
+                        (setf done-p t)
+                        (sb-thread:condition-broadcast done))
+                      (%right-release-on-exit th))))
+                :name "sync-lift-executor")))
       (unwind-protect
            (cond
             ((sb-thread:main-thread-p)
@@ -2318,7 +2487,7 @@ reentrance phase checks). The CALLER then waits:
              ;; poll + sleep instead.
              (loop
                with idle-cycles = 0
-               for before = *async-progress*
+               for before = (component-store-async-progress (%cs))
                do (async-thread-resume-all)
                   (sb-thread:with-recursive-lock (dmu)
                     (when done-p (return)))
@@ -2329,7 +2498,7 @@ reentrance phase checks). The CALLER then waits:
                   ;; guest's yields, not on when it lands).
                   (unless done-p
                     (%right-stall (%driver-self) :seconds 0.001))
-                  (if (> *async-progress* before)
+                  (if (> (component-store-async-progress (%cs)) before)
                       (setf idle-cycles 0)
                       (incf idle-cycles))
                when (>= idle-cycles 200)
@@ -2412,7 +2581,17 @@ reentrance phase checks). The CALLER then waits:
   arrives in the CALLER instance's table — lift_own consumes it there
   and re-enters the defining instance's table."
   (let* ((ft (lifted-func-type lf))
-         (core (lifted-func-core lf)))
+         (core (lifted-func-core lf))
+         ;; EVERY invocation runs in the CALLEE instance's store: the
+         ;; guest threads it starts inherit it through %OWNER-STORE,
+         ;; and the right/tick/registry state this call manipulates
+         ;; must be the same store they see. A bare host caller has no
+         ;; binding, so the instance's own store (created at
+         ;; instantiation) is adopted here.
+         (*current-component-store*
+           (or *current-component-store*
+               (and (lifted-func-inst lf)
+                    (%inst-host-store (lifted-func-inst lf))))))
     ;; M16: a HOST-PROVIDER lifted func carries a CL closure that takes
     ;; the component-domain ARGS list and returns the domain value. It
     ;; runs INSTEAD of the flat core path (the provider already speaks
@@ -3213,7 +3392,7 @@ TARGET's space."
                                             ;; dropping anything.
                                             (impl-p
                                               (null (gethash (cons ft-inst rt-idx)
-                                                             *ct-defining-inst*)))
+                                                             (component-store-ct-defining-inst (%cs)))))
                                             ;; M16 slice 3b: a HOST callee's
                                             ;; provider resolves the index
                                             ;; through the dynamic caller's
@@ -3598,7 +3777,6 @@ the callee's progression through the FuncInst protocol."
 ;;; can fall in the waiter's condition-wait registration window —
 ;;; run1's 4th delivery stalled there).
 
-(defparameter *tok-path-counter* 0)
 
 (defun %tok-path-earlier-p (a b)
   "The PATH comparison — the creation-order key's lexicographic
@@ -3620,7 +3798,7 @@ the opts plist, guarded by the scheduler mutex)."
                         (async-task-seq *current-task*)))
            (n (if parent
                   (incf (async-task-tok-child-count *current-task*))
-                  (incf *tok-path-counter*))))
+                  (incf (component-store-tok-path-counter (%cs))))))
       (setf (async-task-seq task)
             (if parent
                 (append parent (list n))
@@ -4103,27 +4281,6 @@ the copy itself, as before."
 ;;; slot read), so an idle store pays one word read and NOTHING
 ;;; else — in particular it never calls the reactor.
 
-(defstruct (host-store (:constructor %make-host-store))
-  "One store's host-work state: the completion queue, its lock-free
-gate (WORK), and the context's reactor (NIL = no time/readiness
-capability, exactly the old drain-only behaviour)."
-  (mutex (sb-thread:make-mutex :name "host-store"))
-  (entries nil)                         ; reversed push order
-  (count 0)                             ; queued events (word read)
-  (work 0)                              ; queued events + live pendings
-  (reactor nil))
-
-(defparameter *global-host-store* (%make-host-store)
-  "The store of a context with NO store binding (a bare host thread,
-a unit test calling a provider directly): today's behaviour — one
-queue, drained at the boundaries, no reactor step.")
-
-(defparameter *current-component-store* nil
-  "The store whose context THIS native thread is executing. Bound in
-every native factory and around a host closure; NIL outside a store.
-The dynamic binding is what routes a pending's completion back to
-the store that owns the call.")
-
 (defun %inst-host-store (inst &optional (create nil))
   "INST's host-store state — the same imports-table provenance slot
 as :HANDLES/:ASYNC/:HANDLE-FREE. NIL for a context with no store
@@ -4134,7 +4291,7 @@ unless CREATE; a bare NIL instance is the global fallback store."
      (or (gethash :host-store (comp-instance-imports inst))
          (and create
               (setf (gethash :host-store (comp-instance-imports inst))
-                    (%make-host-store)))))))
+                    (%make-component-store)))))))
 
 (defun (setf %inst-host-store) (store inst)
   "Install STORE as INST's host state (the store of the instantiation
@@ -4209,7 +4366,7 @@ fallback). Never runs it here — callable from any native thread."
       (incf (host-store-count store))
       (incf (host-store-work store)))
     (sb-thread:with-recursive-lock (*scheduler-mutex*)
-      (incf *async-progress*))
+      (incf (component-store-async-progress (%cs))))
     nil))
 
 (defparameter *host-pumping-store* nil
@@ -5384,7 +5541,7 @@ LIVENESS INVARIANT: a hang means this classification missed a site."
   (or (%thread-blocked-p root)
       (let ((need nil))
         (sb-thread:with-recursive-lock (*scheduler-mutex*)
-          (dolist (t2 *scheduler-threads*)
+          (dolist (t2 (%store-threads))
             (unless (or (eq t2 root) (async-thread-abandoned t2))
               (when (or (and (async-thread-yield-parked t2)
                              ;; a switch caller's park is not a yield
@@ -5410,31 +5567,8 @@ LIVENESS INVARIANT: a hang means this classification missed a site."
 (defparameter *current-thread* nil
   "The current Thread record (CanonicalABI.md current_thread).")
 
-(defparameter *cancel-window-inst* nil
-  "M14 THE PER-INSTANCE CANCEL-WINDOW GATE: the cancelled task's
-instance — during the synchronous-resume wait, the drain's ticks
-(the outer invoke drain's ~2ms grants) must not grant THIS
-instance's OTHER parked callbacks (cancel-targeted-resume ::7/::9's
-worker: its event ready, granted inside the cancel window where
-the fixtures pin the caller's own observation first). The rest of
-the store keeps its grants (the during-sync family's interleave
-depends on the pre-window ticks — the whole-store suppression
-measured as the acs::2 + ctr::5 regressions).")
 
-(defparameter *deferred-resume-all-tasks* nil
-  "M14: the cancel-wait window's deferred propagation queue (drained
-when the window closes).")
 
-(defparameter *defer-resume-all* nil
-  "M14 THE CANCEL-WAIT WINDOW'S TICK DEFERRAL: set around
-%task-request-cancellation's synchronous-resume wait — the resumed
-callee's own task.{return,cancel} M11a propagation (the resume-all)
-would grant OTHER ready threads their turn inside the wait
-(cancel-targeted-resume ::7's worker: ready via its future's event,
-woken by the propagation's broadcast, running its callback and
-delivering the SUBTASK event at the caller's NEXT poll — the row
-pins the worker STAYS PUT until the caller blocks). The deferred
-resume-all runs when the window closes.")
 
 (defparameter *suppress-spawn-fire* nil
   "M14 THE PACK WINDOW'S SPAWN-FIRE SUPPRESSION: dynamically bound
@@ -5531,15 +5665,7 @@ the caller's NEXT blocking op (the fixtures' pinned interleave).")
 ;;; leaf is unavoidable, prove no path holds it and then takes an
 ;;; earlier one.
 
-(defparameter *scheduler-threads* nil
-  "The live async-thread records — Store.tick's nudge-all walks it.
-MUTATED FROM MULTIPLE GUEST THREADS (enter/exit implicit thread):
-every access goes through *SCHEDULER-MUTEX* — a bare pushnew/remove
-races (a lost registration leaves a thread permanently un-nudgable,
-the observed acs deadlock).")
 
-(defparameter *scheduler-mutex* (sb-thread:make-mutex
-                                 :name "scheduler"))
 
 (defun %sync-call-window-enter (inst)
   "Open the SYNC-CALL FIRE WINDOW on INST (its CALLEE instance).
@@ -5600,12 +5726,6 @@ the observed acs deadlock).")
     (and task (plusp (%sync-call-window-depth-of
                       (async-task-inst task))))))
 
-(defparameter *async-progress* 0
-  "M11a liveness counter: bumped on every observable state change
-(a thread waking, a task state transition). The canon_lift caller
-loop uses it as the deadlock oracle (§3539-3542): if a full
-nudge+wait cycle passes with NO progress and the task unresolved,
-no candidate thread can ever make progress — the deadlock trap.")
 
 ;;; ---------------------------------------------------------------
 ;;; STEP 4 — THE STORE RIGHT: ONE GUEST THREAD EXECUTES AT A TIME.
@@ -5716,51 +5836,16 @@ no candidate thread can ever make progress — the deadlock trap.")
 ;;; the M15/M17 oracles already use, so their idle-cycle budgets
 ;;; keep their meaning.
 
-(defparameter *store-right* (sb-thread:make-mutex :name "store-right"))
 
-(defparameter *right-owner* nil
-  "The thread record holding the right (informational: ownership is
-the mutex itself; this names it for the watchdog dump).")
 
-(defparameter *right-ticket* nil
-  "The ONE ticket allowed to run next — an async-thread record whose
-async-task-seq is the creation path. Written only under
-*STORE-RIGHT*.")
 
-(defparameter *right-owner-os* nil
-  "The OS thread of *RIGHT-OWNER* (diagnostics only).")
 
-(defparameter *right-handoffs* nil
-  "The IN-FLIGHT targeted handoffs (%RIGHT-HANDOFF-TO), innermost
-first: a list of (CALLER . TARGET) thread records. The pack's
-STARTED-wait releases the right to ONE callee thread for its first
-turn while the caller observes; the window is NOT a turn for anyone
-else. While a frame is on top: only its TARGET may take the right,
-its TARGET's park/exit names its CALLER as the next ticket
-(%RIGHT-YIELD / %RIGHT-RELEASE-ON-EXIT), and only its CALLER takes
-the right back (after the bounded slice). Every other thread —
-including an OUTER handoff's caller, since the inner pack's
-observation must not be interleaved — defers without renaming the
-ticket. Without this reservation the target's OS thread could lose
-the slice, an outer caller's next turn could release the instance's
-exclusive lock, and the target then STARTED where the reference's
-synchronous start had observed it blocked on backpressure
-(reentrance ::14: an eager RETURNED packed where the fixture pins
-STARTING).")
 
 (defparameter *right-self* nil
   "The thread record of THIS native thread (bound in every guest
 body and every driver loop). NIL outside the store.")
 
-(defparameter *right-driver* nil
-  "The driver ticket currently polling (the runner/drain thread). It
-is ALWAYS a runnable candidate so that a park hands the right back
-to the tick engine, exactly as the pre-permit runtime expected.")
 
-(defparameter *driver-records* (make-hash-table :test #'eq)
-  "Per-OS-thread synthetic ticket for a driver (the runner or a
-nested sync executor): an async-thread whose task's seq is (0), so
-it sorts before every guest path (roots are (1), (2), ...).")
 
 (defparameter +park-slice+ 0.05
   "The bounded condition-wait slice for the broadcast-woken park
@@ -5804,9 +5889,9 @@ wasted handoff, while TAKING the scheduler lock here would build the
 own-park-mutex -> scheduler-mutex edge that completes a cycle with
 resume-all's scheduler-mutex -> peer-park-mutex order (measured:
 SBCL's deadlock detector fired on exactly that pair)."
-  (let ((all *scheduler-threads*))
-    (when (and *right-driver* (not (member *right-driver* all)))
-      (setf all (cons *right-driver* all)))
+  (let ((all (%store-threads)))
+    (when (and (component-store-right-driver (%cs)) (not (member (component-store-right-driver (%cs)) all)))
+      (setf all (cons (component-store-right-driver (%cs)) all)))
     (sort (copy-list all) #'%ticket<)))
 
 (defun %right-runnable-p (th)
@@ -5845,9 +5930,9 @@ not suspended')."
   "Name SELF the ticket holder — the ONLY take path — and mark its
 quantum IN PROGRESS (RIGHT-TURN-P, the mid-turn reservation's key).
 Returns T."
-  (setf *right-ticket* self
-        *right-owner* self
-        *right-owner-os* sb-thread:*current-thread*
+  (setf (%store-right-ticket) self
+        (%store-right-owner) self
+        (%store-right-owner-os) sb-thread:*current-thread*
         (async-thread-right-hops self) 0
         (async-thread-right-turn-p self) t)
   t)
@@ -5882,7 +5967,7 @@ THE THREE ACQUISITION RULES (the quantum, enforced HERE):
           ;; (1) THE TICKET IS RESERVED: its holder is mid-turn, so
           ;; SELF waits WITHOUT renaming it (a rename would hand SELF
           ;; a turn the running quantum has not finished).
-          ((%right-reserved-p *right-ticket* self)
+          ((%right-reserved-p (%store-right-ticket) self)
            (%right-wait-reserved self))
           ;; (1b) THE TARGETED HANDOFF WINDOW (%RIGHT-HANDOFF-TO):
           ;; the pack released the right to ONE callee so its first
@@ -5892,12 +5977,12 @@ THE THREE ACQUISITION RULES (the quantum, enforced HERE):
           ;; CALLER takes the right back when the target parks/
           ;; returns (its park/exit names the caller, see
           ;; %RIGHT-YIELD) or when its bounded slice expires.
-          ((and (consp *right-handoffs*)
-                (eq self (caar *right-handoffs*)))
+          ((and (consp (component-store-right-handoffs (%cs)))
+                (eq self (caar (component-store-right-handoffs (%cs)))))
            (%right-take self)
            (return t))
-          ((and (consp *right-handoffs*)
-                (not (eq self (cdar *right-handoffs*))))
+          ((and (consp (component-store-right-handoffs (%cs)))
+                (not (eq self (cdar (component-store-right-handoffs (%cs))))))
            (%right-wait-reserved self))
           ;; (2) SELF's quantum is still in progress (it released the
           ;; right only for its own %without-right fan-out): take it
@@ -5910,7 +5995,7 @@ THE THREE ACQUISITION RULES (the quantum, enforced HERE):
           ;; (3) THE TICKET ORDER — SELF was named, or nobody else
           ;; can run (the creator may already have yielded before
           ;; this thread registered as a contender).
-          ((or (eq *right-ticket* self)
+          ((or (eq (%store-right-ticket) self)
                (null (%right-successor self)))
            (%right-take self)
            (return t))
@@ -5925,7 +6010,7 @@ the reservation and hand SELF a turn the running quantum has not
 finished) and no wake is owed: the holder re-grabs the mutex within
 microseconds. SELF releases the right and takes one short bounded
 sleep before retrying."
-  (setf *right-owner* nil)
+  (setf (%store-right-owner) nil)
   (sb-thread:release-mutex *store-right*)
   (sleep 0.0002)
   nil)
@@ -5940,7 +6025,7 @@ mutex held; the caller loops back to %right-acquire."
   (let ((m (async-thread-mutex self))
         (q (async-thread-waitqueue self))
         (next (or (%right-successor self) self)))
-    (setf *right-ticket* next
+    (setf (%store-right-ticket) next
           (async-thread-right-turn-p self) nil)
     (cond
      ((not (eq next self))
@@ -5954,7 +6039,7 @@ mutex held; the caller loops back to %right-acquire."
       ;; from a host thread while we sleep, and it must not need us
       ;; to release a mutex we are not using.
       (sb-thread:release-mutex *store-right*)))
-    (setf *right-owner* nil)
+    (setf (%store-right-owner) nil)
     ;; The TURN wait is a bounded poll: its predicate (the ticket)
     ;; is re-tested under the mutex by %right-acquire's loop, so no
     ;; wake bookkeeping is needed — and the durable count is LEFT
@@ -5972,13 +6057,13 @@ re-acquires after its wait; the release is paired with the wait,
 never with the park)."
   (when (or (null self) (not (sb-thread:holding-mutex-p *store-right*)))
     (return-from %right-yield nil))
-  (let ((next (if (and (consp *right-handoffs*)
-                       (eq self (cdar *right-handoffs*)))
-                  (or (caar *right-handoffs*)
+  (let ((next (if (and (consp (component-store-right-handoffs (%cs)))
+                       (eq self (cdar (component-store-right-handoffs (%cs)))))
+                  (or (caar (component-store-right-handoffs (%cs)))
                       (%right-successor self))
                   (%right-successor self))))
-    (setf *right-ticket* (or next self)
-          *right-owner* nil
+    (setf (%store-right-ticket) (or next self)
+          (%store-right-owner) nil
           (async-thread-right-turn-p self) nil)
     (sb-thread:release-mutex *store-right*)
     (when (and next (< (async-thread-right-hops self) 8))
@@ -6040,9 +6125,9 @@ lose the slice, the outer caller's next turn could release the
 instance's exclusive lock, and the target then STARTED where the
 reference's synchronous start observed it blocked on backpressure."
   (when (and self target (sb-thread:holding-mutex-p *store-right*))
-    (setf *right-ticket* target
-          *right-handoffs* (acons self target *right-handoffs*)
-          *right-owner* nil
+    (setf (%store-right-ticket) target
+          (component-store-right-handoffs (%cs)) (acons self target (component-store-right-handoffs (%cs)))
+          (%store-right-owner) nil
           (async-thread-right-turn-p self) nil)
     (sb-thread:release-mutex *store-right*))
   (unwind-protect
@@ -6052,9 +6137,9 @@ reference's synchronous start observed it blocked on backpressure."
     ;; normal path); an abandoned caller leaves it to teardown, which
     ;; abandons every thread anyway
     (when (sb-thread:holding-mutex-p *store-right*)
-      (when (and (consp *right-handoffs*)
-                 (eq (caar *right-handoffs*) self))
-        (pop *right-handoffs*)))))
+      (when (and (consp (component-store-right-handoffs (%cs)))
+                 (eq (caar (component-store-right-handoffs (%cs))) self))
+        (pop (component-store-right-handoffs (%cs)))))))
 
 (defun %right-reserve-self (self)
   "Release the right WITHOUT ending SELF's quantum: name SELF (the
@@ -6062,8 +6147,8 @@ reservation) and KEEP RIGHT-TURN-P, so a peer that grabs the mutex
 in this window defers (%right-reserved-p) instead of taking a turn
 the quantum in progress has not yielded. Used only by
 %without-right."
-  (setf *right-ticket* self
-        *right-owner* nil)
+  (setf (%store-right-ticket) self
+        (%store-right-owner) nil)
   (sb-thread:release-mutex *store-right*))
 
 (defun %without-right (self thunk)
@@ -6095,8 +6180,8 @@ mutex across that grab (SCHED -> RIGHT, the cycle edge)."
 Hands the ticket to the earliest contender first, so a waiting guest
 is named while the driver stops polling. NO wait."
   (when (and self (sb-thread:holding-mutex-p *store-right*))
-    (setf *right-ticket* (%right-successor self)
-          *right-owner* nil
+    (setf (%store-right-ticket) (%right-successor self)
+          (%store-right-owner) nil
           (async-thread-right-turn-p self) nil)
     (sb-thread:release-mutex *store-right*))
   nil)
@@ -6167,17 +6252,17 @@ block at a script boundary)."
              ;; and A3: the teardown never touches the right at all.
              (eq self *right-self*)
              (sb-thread:holding-mutex-p *store-right*))
-    (setf *right-ticket*
-          (if (and (consp *right-handoffs*)
-                   (eq self (cdar *right-handoffs*)))
-              (or (caar *right-handoffs*)
+    (setf (%store-right-ticket)
+          (if (and (consp (component-store-right-handoffs (%cs)))
+                   (eq self (cdar (component-store-right-handoffs (%cs)))))
+              (or (caar (component-store-right-handoffs (%cs)))
                   (%right-successor self))
               (%right-successor self))
-          *right-owner* nil)
+          (%store-right-owner) nil)
     (sb-thread:release-mutex *store-right*))
   (when (and self (eq self *right-self*))
     (sb-thread:with-recursive-lock (*scheduler-mutex*)
-      (remhash self *driver-records*)))
+      (remhash self (component-store-driver-records (%cs)))))
   ;; THE RESUME CREDIT DIES WITH THE THREAD (§458-465): a ready mark
   ;; or a durable count must never outlive its owner — §705 hands the
   ;; record's index to the next task, which MUST start clean (the
@@ -6200,15 +6285,15 @@ thread died somewhere that skipped the task-exit helper. Idempotent
 and NEVER waits."
   (when self
     (sb-thread:with-recursive-lock (*scheduler-mutex*)
-      (setf *scheduler-threads*
-            (remove self *scheduler-threads* :test #'eq))
-      (remhash self *driver-records*))
+      (setf (%store-threads)
+            (remove self (%store-threads) :test #'eq))
+      (remhash self (component-store-driver-records (%cs))))
     (setf (async-thread-right-waiting self) nil)
     (setf (async-thread-right-turn-p self) nil)
     (when (sb-thread:holding-mutex-p *store-right*)
-      (setf *right-ticket* (%right-successor self)
-            *right-owner* nil
-            *right-owner-os* nil)
+      (setf (%store-right-ticket) (%right-successor self)
+            (%store-right-owner) nil
+            (%store-right-owner-os) nil)
       (sb-thread:release-mutex *store-right*))
     ;; the factory exits have no §242-273 handoff post left: the whole
     ;; credit, POST-TO included, dies here (idempotent with
@@ -6224,7 +6309,7 @@ from (async-task-seq, stamped by %tok-stamp-task in the same
 creator) — exists before the new thread can contend. %task-enter-
 implicit-thread's own pushnew is the idempotent second registration."
   (sb-thread:with-recursive-lock (*scheduler-mutex*)
-    (pushnew th *scheduler-threads* :test #'eq))
+    (pushnew th (%store-threads) :test #'eq))
   th)
 
 (defun %driver-self ()
@@ -6233,8 +6318,8 @@ implicit-thread's own pushnew is the idempotent second registration."
 record whose path is (0), i.e. before every guest root (1)."
   (or *right-self*
       (sb-thread:with-recursive-lock (*scheduler-mutex*)
-        (or (gethash sb-thread:*current-thread* *driver-records*)
-            (setf (gethash sb-thread:*current-thread* *driver-records*)
+        (or (gethash sb-thread:*current-thread* (component-store-driver-records (%cs)))
+            (setf (gethash sb-thread:*current-thread* (component-store-driver-records (%cs)))
                   (make-async-thread
                    :task (make-async-task :seq (list 0))))))))
 
@@ -6393,7 +6478,7 @@ iteration can re-wait while holding the right (ledger fact b)."
              (sb-thread:release-mutex m)
              (setf (async-thread-wake-count thread) 0
                    (async-thread-resume-count thread) 0)
-             (incf *async-progress*)
+             (incf (component-store-async-progress (%cs)))
              (return))
             (t
              ;; m is STILL held here: %park performs the bounded
@@ -6585,17 +6670,6 @@ TRANSIENT except the ready-grant (a real wake)."
          (async-thread-suspend-waitqueue thread)))
       (sb-thread:condition-broadcast (async-thread-waitqueue thread)))))
 
-(defparameter *tok-skip-age* (make-hash-table :test #'eq)
-  "M13-tok9 THE AGING COUNTER: per-thread count of consecutive
-grants it was eligible for but did NOT receive. The path order
-(the pinned interleave) holds while every grantable thread's age
-is under the threshold; the moment some thread's age crosses it,
-THAT thread gets the grant (its age resets). The escape fires only
-under a genuine starvation — the candidates' setup thread (parked
-BY DESIGN, resolved, doing live callback work for later rows)
-accumulates age while the active callee runs and gets its turn at
-the threshold; the strict-pin fixtures (whose threads all cycle)
-never accumulate age and keep the deterministic creation order.")
 
 (defparameter *tok-age-threshold* 40
   "M13-tok9: the age at which a skipped thread earns the grant.
@@ -6638,7 +6712,7 @@ the caller's own thread; never a plain suspend-parked thread
 (§494). THE NO-QUANTUM FALLBACK: broadcast-only."
   (sb-thread:with-recursive-lock (*scheduler-mutex*)
     (let* ((sorted
-             (sort (copy-list *scheduler-threads*)
+             (sort (copy-list (%store-threads))
                    (lambda (a b)
                      (let ((pa (and (async-thread-task a)
                                     (async-task-seq
@@ -6692,11 +6766,11 @@ the caller's own thread; never a plain suspend-parked thread
                             ;; ::9: the callback's resume-later'd
                             ;; spawn ran on the HOST drain's tick
                             ;; before subtask.cancel returned).
-                            (not (and *cancel-window-inst*
+                            (not (and (component-store-cancel-window-inst (%cs))
                                       (async-thread-task th)
                                       (eq (async-task-inst
                                            (async-thread-task th))
-                                          *cancel-window-inst*)))
+                                          (component-store-cancel-window-inst (%cs)))))
                             (or (async-thread-suspended-p th)
                                 (and (not *suppress-spawn-fire*)
                                      ;; the CHEAP test first: the
@@ -6723,7 +6797,7 @@ the caller's own thread; never a plain suspend-parked thread
           (let ((starved
                   (find-if
                    (lambda (th)
-                     (>= (or (gethash th *tok-skip-age*) 0)
+                     (>= (or (gethash th (component-store-tok-skip-age (%cs))) 0)
                          *tok-age-threshold*))
                    eligible)))
             (cond
@@ -6740,15 +6814,15 @@ the caller's own thread; never a plain suspend-parked thread
         ;; get this grant ages; the granted one resets
         (dolist (th eligible)
           (if (eq th granted-thread)
-              (setf (gethash th *tok-skip-age*) 0)
-              (incf (gethash th *tok-skip-age* 0))))
+              (setf (gethash th (component-store-tok-skip-age (%cs))) 0)
+              (incf (gethash th (component-store-tok-skip-age (%cs)) 0))))
         ;; GC the ages of threads no longer registered
-        (when (> (hash-table-count *tok-skip-age*) (* 4 (length sorted)))
+        (when (> (hash-table-count (component-store-tok-skip-age (%cs))) (* 4 (length sorted)))
           (let ((live (copy-list sorted)))
             (maphash (lambda (th _)
                        (unless (member th live)
-                         (remhash th *tok-skip-age*)))
-                     *tok-skip-age*)))
+                         (remhash th (component-store-tok-skip-age (%cs)))))
+                     (component-store-tok-skip-age (%cs)))))
         ;; M14 THE TURN GRANT: this resume-all IS a real Store.tick
         ;; (§932 — the drain loops', the blocking-op-driven, the
         ;; switch arms' one-tick) for every thread it touches: mark
@@ -6769,11 +6843,11 @@ the caller's own thread; never a plain suspend-parked thread
                       ;; pre-window ticks — the whole-store
                       ;; suppression measured as the acs::2 +
                       ;; ctr::5 regressions)
-                      (and *cancel-window-inst*
+                      (and (component-store-cancel-window-inst (%cs))
                            (async-thread-task th)
                            (eq (async-task-inst
                                 (async-thread-task th))
-                               *cancel-window-inst*)))
+                               (component-store-cancel-window-inst (%cs)))))
             ;; M15: a grant must WAKE the PARKER it touches — a
             ;; grant whose broadcast never arrives leaves the parker
             ;; in its condition-wait until some later tick's
@@ -6807,13 +6881,13 @@ the caller's own thread; never a plain suspend-parked thread
                         ;; M15 MECHANISM 4 (the fallback's share of
                         ;; the cancel-window fire gate): a nudge
                         ;; FIRES a ready-marked pending spawn
-                        (and *cancel-window-inst*
+                        (and (component-store-cancel-window-inst (%cs))
                              (async-thread-task th)
                              (async-thread-ready-p th)
                              (functionp (async-thread-spawn-thunk th))
                              (eq (async-task-inst
                                   (async-thread-task th))
-                                 *cancel-window-inst*)))
+                                 (component-store-cancel-window-inst (%cs)))))
               (async-thread-nudge th)))))))))
 
 (defun async-thread-yield (thread)
@@ -6988,7 +7062,7 @@ does not exist)."
           ;; see this thread to deliver the nudge)
           (setf (async-task-gate-parked task) t)
           (sb-thread:with-recursive-lock (*scheduler-mutex*)
-            (pushnew th *scheduler-threads* :test #'eq))
+            (pushnew th (%store-threads) :test #'eq))
           ;; M15 GATE-2: a task CANCELLED while waiting at the gate
           ;; must WAKE and deliver CANCELLED_BEFORE_STARTED
           ;; (CanonicalABI.md §681 + §761's deliver_pending_cancel) —
@@ -7013,7 +7087,7 @@ does not exist)."
     ;; atomic step (see %REGISTER-THREAD-INDEX)
     (%register-thread-index inst th)
     (sb-thread:with-recursive-lock (*scheduler-mutex*)
-      (pushnew th *scheduler-threads* :test #'eq))
+      (pushnew th (%store-threads) :test #'eq))
     t))
 
 
@@ -7041,8 +7115,8 @@ through this function, so no dead ticket can ever be the head."
     (sb-thread:with-recursive-lock (*scheduler-mutex*)
       (setf (getf fields :threads)
             (remove th (getf fields :threads)))
-      (setf *scheduler-threads*
-            (remove th *scheduler-threads* :test #'eq)))
+      (setf (%store-threads)
+            (remove th (%store-threads) :test #'eq)))
     (when (and (%task-ft-async-p task)
                (%task-needs-exclusive task))
       (setf (getf fields :exclusive-thread) nil)
@@ -7053,8 +7127,8 @@ through this function, so no dead ticket can ever be the head."
       ;; EXIT follows its task.cancel; the propagation's nudge
       ;; would grant the callee's OTHER ready threads (the ::7
       ;; worker) in the caller's observation window)
-      (if *defer-resume-all*
-          (push task *deferred-resume-all-tasks*)
+      (if (component-store-defer-resume-all (%cs))
+          (push task (component-store-deferred-resume-all-tasks (%cs)))
           (async-thread-resume-all)))
     ;; STEP 4: drop the ticket / hand the right on. NEVER waits.
     (%right-release-on-exit th)
@@ -7197,13 +7271,13 @@ arm's own suspension: the blocks arm therefore also requires
           ;; M14 THE PER-INSTANCE CANCEL-WINDOW: record the cancelled
           ;; task's instance — the drain's ticks must not grant ITS
           ;; parked callbacks while the window is open
-          (setf *cancel-window-inst* (async-task-inst task))
+          (setf (component-store-cancel-window-inst (%cs)) (async-task-inst task))
           ;; M14 THE CANCEL-WAIT WINDOW: defer the M11a propagation
           ;; (the callee's task.{return,cancel} runs on ITS thread
           ;; inside this wait; the propagation's resume-all would
           ;; grant OTHER ready threads — ::7's worker — their turn
           ;; in the caller's observation window). Drain on exit.
-          (setf *defer-resume-all* t)
+          (setf (component-store-defer-resume-all (%cs)) t)
           (unwind-protect
                (let ((self *current-thread*))
                  (loop
@@ -7232,8 +7306,8 @@ arm's own suspension: the blocks arm therefore also requires
                    ;; NEW park (the initial park's flags were cleared
                    ;; at its wake)
                    (%right-stall self :seconds 0.001)))
-            (setf *defer-resume-all* nil
-                  *cancel-window-inst* nil)
+            (setf (component-store-defer-resume-all (%cs)) nil
+                  (component-store-cancel-window-inst (%cs)) nil)
             ;; M14: NO DRAIN — the deferred propagations' RESOLVES
             ;; are already broadcast on the task/waitable waitqueues
             ;; (the wset waiter's durable wake posted by
@@ -7244,7 +7318,7 @@ arm's own suspension: the blocks arm therefore also requires
             ;; runs at the row's final wset.wait, ::9's at the yield
             ;; loop). Draining HERE measured the worker running at
             ;; the caller's NEXT POLL (the row's NONE check).
-            (setf *deferred-resume-all-tasks* nil))))
+            (setf (component-store-deferred-resume-all-tasks (%cs)) nil))))
        (th
         ;; the legacy nudge for the not-ready shapes (a mid-turn
         ;; callee, a stackful block, a suspend park): harmless when
@@ -7291,8 +7365,8 @@ Subtask."
   ;; propagation's broadcast would grant OTHER ready threads in
   ;; the wait's window — the fixture pins the caller's own
   ;; observation first)
-  (if *defer-resume-all*
-      (push task *deferred-resume-all-tasks*)
+  (if (component-store-defer-resume-all (%cs))
+      (push task (component-store-deferred-resume-all-tasks (%cs)))
       (async-thread-resume-all)))
 
 (defun %task-cancel (task)
@@ -7311,8 +7385,8 @@ Subtask."
     (sb-thread:condition-broadcast (async-task-waitqueue task)))
   ;; M11a wake propagation (same as %task-return) — M14: DEFER
   ;; inside the cancel-wait window (see %task-return)
-  (if *defer-resume-all*
-      (push task *deferred-resume-all-tasks*)
+  (if (component-store-defer-resume-all (%cs))
+      (push task (component-store-deferred-resume-all-tasks (%cs)))
       (async-thread-resume-all)))
 
 ;;; ---------------------------------------------------------------
@@ -7486,7 +7560,7 @@ computes the tuple at delivery time)."
                (cond
                 (done
                  (sb-thread:release-mutex m)
-                 (incf *async-progress*)
+                 (incf (component-store-async-progress (%cs)))
                  (return))
                 (t
                  ;; STEP 4 PARK SITE 4: the grant/readiness test runs
@@ -7546,8 +7620,8 @@ computes the tuple at delivery time)."
     ;; OTHER ready threads (the ::7 worker) in the caller's
     ;; observation window; the durable wake-count above already
     ;; reached the resolved subtask's OWN wset waiters)
-    (if *defer-resume-all*
-        (push s *deferred-resume-all-tasks*)
+    (if (component-store-defer-resume-all (%cs))
+        (push s (component-store-deferred-resume-all-tasks (%cs)))
         (async-thread-resume-all))))
 
 (defun %subtask-record-lend (s h)
@@ -7874,7 +7948,7 @@ drop-readable must return index 1 again)."
                (let ((*current-task* task)
                      (*current-thread* th)
                      (*right-self* th)
-                     (*current-component-store* (%inst-host-store inst))
+                     (*current-component-store* (%owner-store inst))
                      (*handle-caller-inst* inst))
                  ;; STEP 4: guest code runs only under the right.
                  (%right-acquire th)
@@ -7915,12 +7989,16 @@ drop-readable must return index 1 again)."
       (declare (ignore guest))
       (let* ((self (%driver-self))
              (*right-self* self)
-             (*right-driver* self)
+             (store (%cs))
+             (saved-driver (component-store-right-driver store))
              ;; A GUEST caller's turn does NOT end at a nested
              ;; synchronous lower's return: the caller keeps the
              ;; store right until its own next park/exit (see the
              ;; cleanup below).
              (keep-right nil))
+        ;; the driver identity is STORE state (step 2), not a dynamic
+        ;; binding: candidate selection reads it for the whole turn
+        (setf (component-store-right-driver store) self)
         (%right-acquire self)
         (let ((nested (and (boundp '*current-thread*) *current-thread*)))
           (%block-enter nested))
@@ -7941,7 +8019,7 @@ drop-readable must return index 1 again)."
                ;; threads are the only parties that can resolve the
                ;; task, and they can only run while the right is
                ;; released
-               do (let* ((before *async-progress*)
+               do (let* ((before (component-store-async-progress (%cs)))
                          (spent (%drain-tick-needed-p th)))
                     (when spent
                       (async-thread-resume-all))
@@ -7951,7 +8029,7 @@ drop-readable must return index 1 again)."
                     ;; no progress is a quiescent cycle (the deadlock
                     ;; fixtures' oracle); a cycle with NO tick spent
                     ;; cannot judge progress (the guest is mid-turn).
-                    (if (> *async-progress* before)
+                    (if (> (component-store-async-progress (%cs)) before)
                         (setf idle-cycles 0)
                         (if spent
                             (incf idle-cycles)
@@ -7995,7 +8073,7 @@ drop-readable must return index 1 again)."
                ;; on their own.
                (let ((inst (async-task-inst task)))
                  (declare (ignore inst))
-                 (dolist (th2 (copy-list *scheduler-threads*))
+                 (dolist (th2 (copy-list (%store-threads)))
                    (when (and (async-thread-task th2)
                               (not (eq th2 th)))
                      (setf (async-thread-suspended-p th2) nil)
@@ -8034,6 +8112,7 @@ drop-readable must return index 1 again)."
                           (eq self *current-thread*)
                           (sb-thread:holding-mutex-p *store-right*))))
           (%block-exit (and (boundp '*current-thread*) *current-thread*))
+          (setf (component-store-right-driver store) saved-driver)
           (unless keep-right
             (%right-release-on-exit self))))
       (etypecase (car cell)
@@ -8495,7 +8574,7 @@ is the valtype."
                                    (cond
                                     (done
                                      (sb-thread:release-mutex m)
-                                     (incf *async-progress*)
+                                     (incf (component-store-async-progress (%cs)))
                                      (return))
                                     (t
                                      ;; STEP 4 PARK SITE 5 (the sync
@@ -8849,9 +8928,9 @@ is the valtype."
                                            (remove th (getf fields
                                                             :threads)
                                                    :test #'eq)))
-                                   (setf *scheduler-threads*
+                                   (setf (%store-threads)
                                          (remove th
-                                                 *scheduler-threads*
+                                                 (%store-threads)
                                                  :test #'eq)))
                                  ;; STEP 4: drop the ticket and hand
                                  ;; the right on (never waits).
@@ -8863,7 +8942,7 @@ is the valtype."
               ;; index assignment, the :threads list + scheduler)
               (%register-thread-index inst th)
               (sb-thread:with-recursive-lock (*scheduler-mutex*)
-                (pushnew th *scheduler-threads* :test #'eq))
+                (pushnew th (%store-threads) :test #'eq))
               (list (async-thread-index th))))))))
     ;; M11b: {stream,future}.forward (§4495-4534): the guards
     ;; (the class, the type match, IDLE, not in a wset), both ends
@@ -9466,7 +9545,7 @@ is the valtype."
                                           ;; the callee owes no drop
                                           (impl-p
                                             (null (gethash (cons ft-inst rt-idx)
-                                                           *ct-defining-inst*)))
+                                                           (component-store-ct-defining-inst (%cs)))))
                                           ;; M16 slice 3b: the same
                                           ;; host-callee rule as the
                                           ;; sync lower — the provider
@@ -9626,8 +9705,8 @@ is the valtype."
                              ;; wait; its resume-all fired the
                              ;; callee instance's ready spawns in the
                              ;; window (::9's $ran check).
-                             (if *defer-resume-all*
-                                 (push subtask *deferred-resume-all-tasks*)
+                             (if (component-store-defer-resume-all (%cs))
+                                 (push subtask (component-store-deferred-resume-all-tasks (%cs)))
                                  (async-thread-resume-all))))
            (setf (async-subtask-task subtask) callee-task)
            (setf (async-subtask-on-cancel subtask) on-cancel))
@@ -9909,7 +9988,7 @@ runs AFTER that mutex is released."
         (threads-to-join nil))
     ;; ---- PHASE 1: SCHEDULER MUTEX ONLY. No store-right touch here.
     (sb-thread:with-recursive-lock (*scheduler-mutex*)
-      (setf threads (copy-list *scheduler-threads*))
+      (setf threads (copy-list (%store-threads)))
       (dolist (th threads)
         (setf (async-thread-suspended-p th) nil)
         (setf (async-thread-yield-parked th) nil)
@@ -9921,14 +10000,14 @@ runs AFTER that mutex is released."
                    (not (eq sb-thread:*current-thread*
                             (async-thread-native th))))
           (push (async-thread-native th) threads-to-join)))
-      (setf *scheduler-threads* nil)
+      (setf (%store-threads) nil)
       ;; a targeted handoff frame must not outlive the store either:
       ;; its caller is being abandoned, and a stale frame would make
       ;; every later thread defer the right forever
-      (setf *right-handoffs* nil)
+      (setf (component-store-right-handoffs (%cs)) nil)
       ;; STEP 4: no ticket survives a teardown (a recycled thread
       ;; object must not alias a dead entry)
-      (clrhash *driver-records*))
+      (clrhash (component-store-driver-records (%cs))))
     ;; ---- PHASE 2: NO SCHEDULER MUTEX. The exit call takes the
     ;; leaving task's peer mutexes AND re-acquires the store right
     ;; (through the M11a resume-all); the broadcasts are peer
@@ -9950,17 +10029,50 @@ runs AFTER that mutex is released."
       (ignore-errors
         (sb-thread:join-thread n :timeout 0.25 :default :timeout)))))
 
-(setf wasmdown.wast:*store-teardown-hook* #'%store-teardown)
+(defun store-teardown (&optional store)
+  "Tear down STORE (default: the store bound on this thread): abandon
++ unblock + unregister every still-registered guest thread and join
+the native threads. A caller-owned store is closed by whoever owns
+it; an argumentless call without a bound store is an error — never a
+process-wide sweep.
+The execution state it clears (the scheduler thread registry, the
+execution right and its ticket, the handoff frames, driver records and
+the tick/aging/progress/cancel gates) is the STORE's own — no process
+global is touched, so two graphs never tear each other down."
+  (let ((store (or store *current-component-store*)))
+    (unless store
+      (error 'wasmdown:host-error
+             :message "store-teardown: no store is bound on this thread"))
+    (unless (host-store-p store)
+      (error 'wasmdown:host-error
+             :message (format nil "store-teardown: ~s is not a store" store)))
+    (%store-teardown)
+    store))
 
-(defun store-teardown ()
-  "Tear down the whole store (CanonicalABI.md §3552: 'trap and tear
-down the whole store'): abandon + unblock + unregister every still
-registered guest thread and join the native threads. The WASI command
-runner calls this at its boundary so a `wasi:cli/exit' — a host
-condition that unwinds the guest's run task — leaves no parked
-thread behind (PLAN.md §9, slice 6 exit semantics). Idempotent: an
-empty scheduler is a no-op."
-  (%store-teardown))
+(defun component-instance-store (instance)
+  "The store owning INSTANCE (NIL for a bare instance)."
+  (and (comp-instance-p instance)
+       (%inst-host-store instance)))
+
+(defmacro call-with-component-store ((store &key (close-p t)) &body body)
+  "Run BODY with STORE bound as the current component store. When
+CLOSE-P (the default) the store is torn down on exit, which abandons
+any guest thread the body left behind. A caller-owned bound store is
+never closed by a nested helper."
+  `(let ((*current-component-store* ,store))
+     ,(if close-p
+          `(unwind-protect (progn ,@body)
+             (store-teardown ,store))
+          `(progn ,@body))))
+
+(setf wasmdown.wast:*store-run-hook*
+      ;; A .wast script's whole run: ONE fresh store for every command
+      ;; of the script, torn down at the end (abandoning anything the
+      ;; script left parked) so the next script starts clean.
+      (lambda (thunk)
+        (call-with-component-store ((make-component-store))
+          (funcall thunk))))
+
 
 (setf wasmdown.wast:*component-instantiator* #'instantiate-component)
 

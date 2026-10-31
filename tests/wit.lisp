@@ -6,6 +6,9 @@
 (defpackage #:wasmdown.test.wit
   (:use #:cl #:wasmdown.test))
 
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (require :sb-posix))
+
 (in-package #:wasmdown.test.wit)
 
 (defmacro %source-file ()
@@ -969,3 +972,80 @@ interface store { get: func() -> u32; }
     (is (search "world `w`" message))
     (is (search "unresolved package version" message))
     (is (search "9.9.9" message))))
+
+;;; ---------------------------------------------------------------
+;;; Multi-file package loading and versioned vendored releases.
+
+(test wit/multi-file-package
+  (let* ((dir (concatenate 'string (sb-posix:mkdtemp "/tmp/wmd-wit-XXXXXX") "/"))
+         (header (merge-pathnames "a-command.wit" (pathname dir)))
+         (continuation (merge-pathnames "b-types.wit" (pathname dir)))
+         (dup (merge-pathnames "c-dup.wit" (pathname dir)))
+         (conflict (merge-pathnames "d-other.wit" (pathname dir))))
+    (ensure-directories-exist header)
+    (unwind-protect
+         (progn
+           (with-open-file (s header :direction :output :if-exists :supersede)
+             (format s "package test:multi@0.2.3;~%interface one { f: func() -> u32; }~%"))
+           ;; a HEADERLESS continuation file contributes more interfaces
+           (with-open-file (s continuation :direction :output :if-exists :supersede)
+             (format s "interface two { use one.{f}; g: func() -> u32; }~%"))
+           (let ((pkg (wasmdown.wit:parse-wit-directory dir)))
+             (is (equal "test:multi" (wasmdown.wit::wit-package-name pkg)))
+             (is (equal "0.2.3" (wasmdown.wit::wit-package-version pkg)))
+             (is (= 2 (length (wasmdown.wit::wit-package-interface-list pkg))))
+             (is (wasmdown.wit:package-interface pkg "two")))
+           ;; a duplicate definition is rejected
+           (with-open-file (s dup :direction :output :if-exists :supersede)
+             (format s "package test:multi@0.2.3;~%interface one { f: func() -> u32; }~%"))
+           (let ((c (handler-case (progn (wasmdown.wit:parse-wit-directory dir) nil)
+                      (wasmdown.wit:wit-error (e) e))))
+             (is c)
+             (is (search "duplicate interface" (wasmdown:wasmdown-error-message c))))
+           (delete-file dup)
+           ;; conflicting package identity is rejected
+           (with-open-file (s conflict :direction :output :if-exists :supersede)
+             (format s "package test:other@0.2.3;~%interface three { f: func() -> u32; }~%"))
+           (let ((c (handler-case (progn (wasmdown.wit:parse-wit-directory dir) nil)
+                      (wasmdown.wit:wit-error (e) e))))
+             (is c)
+             (is (search "conflicting package header" (wasmdown:wasmdown-error-message c))))
+           (delete-file conflict)
+           ;; an empty directory has no package identity
+           (let ((empty (concatenate 'string (sb-posix:mkdtemp "/tmp/wmd-wit-e-XXXXXX") "/")))
+             (ensure-directories-exist (merge-pathnames "x" (pathname empty)))
+             (unwind-protect
+                  (let ((c (handler-case (progn (wasmdown.wit:parse-wit-directory empty) nil)
+                             (wasmdown.wit:wit-error (e) e))))
+                    (is c)
+                    (is (search "no .wit files" (wasmdown:wasmdown-error-message c))))
+               (ignore-errors (sb-posix:rmdir empty)))))
+      (dolist (f (list header continuation dup conflict))
+        (ignore-errors (delete-file f)))
+      (ignore-errors (sb-posix:rmdir dir)))))
+
+(test wit/versioned-wasi-releases
+  ;; every supported release parses through the pinned index, and the
+  ;; surface it declares is version-specific
+  (let ((io (wasmdown.wasi:wasi-package "io" :version "0.2.12")))
+    (is io)
+    (is (wasmdown.wit:package-interface io "streams"))
+    (is (wasmdown.wit:package-interface io "poll")))
+  (let ((cli-12 (wasmdown.wasi:wasi-package "cli" :version "0.2.12"))
+        (cli-0 (wasmdown.wasi:wasi-package "cli" :version "0.2.0")))
+    (is cli-12)
+    (is cli-0)
+    ;; 0.2.12 made exit-with-code stable; 0.2.0 has no such function
+    (let ((exit-12 (wasmdown.wit:package-interface cli-12 "exit"))
+          (exit-0 (wasmdown.wit:package-interface cli-0 "exit")))
+      (is (gethash "exit-with-code" (wasmdown.wit::wit-interface-funcs exit-12)))
+      (is (null (gethash "exit-with-code" (wasmdown.wit::wit-interface-funcs exit-0))))))
+  ;; a headerless continuation file is part of the 0.2.10+ release layout
+  (let ((files (wasmdown.wasi:wasi-package-files "cli" :version "0.2.12")))
+    (is files)
+    (is (every (lambda (p) (not (search "/deps/" (namestring p)))) files)))
+  ;; unknown versions are a link error naming the request
+  (let ((c (handler-case (progn (wasmdown.wasi:wasi-package "io" :version "0.2.99") nil)
+             (wasmdown:link-error (e) e))))
+    (is c)
+    (is (search "0.2.99" (wasmdown:wasmdown-error-message c)))))
