@@ -41,7 +41,87 @@ component-model suite at commit `d095e2f60dd...` per
 `specs/lock.toml`) measures M7-M15: **1631 pass / 0 fail / 0
 unsupported / 0 harness-error** in {binary,validation,
 linking,values,async} minus nyi.txt — FULLY GREEN, and the
-async suite is COMPLETE: **45 of 45 files in the lane**
+async suite is COMPLETE: **45 of 45 files in the lane**.
+`make test-component-census` (RUNS=n, default 30) runs that lane in
+fresh processes and fails unless **every** run is green with the same
+1631-command denominator — a shrinking denominator or any
+fail/harness-error/timeout/skip is RED. Measured 2026-10-31:
+**30/30 green**, 1631 commands each, 9.99–10.39 s per run.
+
+### WASI behaviour lane (`make test-wasi`)
+
+`tools/run-wasi-suite.py` runs a manifest of behavioural cases against
+the **real CLI**, one fresh SBCL guest process per case, and writes
+`tests/wasi-results/latest/results.jsonl` (one `wasmdown.test-result.v1`
+record per case, with fixture SHA-256, runtime/SBCL version, backend and
+elapsed time) plus `CONFORMANCE-WASI.md`. It is a gate, not a
+measurement: a case that cannot run (missing fixture, timeout, harness
+error) is a failure, never a skip, and there is no retry-to-green.
+
+Cases are grouped by ABI and exercise argv (`-version`), stdout exact
+bytes (`42`, `3|13.5`, `alpha,beta,gamma`) and a 20 000-line stdout
+(chunked stream writes), stderr staying separate from stdout with a
+non-zero error status, on-disk persistence across two fresh processes,
+cross-ABI file compatibility (a database written through WASI 0.2 read
+by the Preview1 build), a seeded SQL file read **through a read-only
+preopen**, and denial (no preopen, read-only preopen write: non-zero
+status and no file created). A read-only preopen cannot open a SQLite
+**database**: batch mode opens the file read-write, `-readonly` still
+probes the journal (same `disk I/O error (10)`), and this shell build
+has no `-uri` option, so `file:…?mode=ro` is unavailable — the shell's
+own contract, not a WASI defect; reading a plain file through a
+read-only preopen is the pinned case. The manifest is checked for duplicate case ids, and the summary
+reports a planned/executed census per ABI. The plan's stability command
+`python3 tools/run-wasi-suite.py --abi all --repeat 30
+--output-dir tests/wasi-results/final --commit-summary` measured
+**450/450 pass** over 30 fresh-process runs (preview1 120/120,
+preview2 330/330).
+`--abi preview1|preview2|all`, `--backend interpret|baseline` (sets
+`WASMDOWN_API_MODE` for the guest), `--repeat N` (fresh processes each
+time), `--heap-mb` (default 8192), `--output-dir` and
+`--commit-summary` are supported. Every run writes
+`<output-dir>/summary.md`; the repo-root `CONFORMANCE-WASI.md` is
+written only with `--commit-summary`, so a gate run cannot clobber the
+committed stability artifact.
+
+The baseline backend reaches a component's embedded cores too: the CLI
+threads `WASMDOWN_API_MODE` through `run-component :mode`, so
+`WASMDOWN_API_MODE=baseline make test-wasi` really compiles the guest
+cores instead of setting an unused variable. It is slow (the 6 MB
+SQLite core needs a large compile-time heap and ~200 s per component
+case, hence the runner's 8 GB default), which is why the quick gate is
+the interpret lane. Baseline is currently **RED on
+`p1/disk-persist-reopen`** for an engine reason, not a lane reason:
+reproduced standalone, a baseline-compiled guest reports its rows and
+exits 0, but the file stays at its bare 8192-byte header — the
+interpret build and host `sqlite3` (reference reader) both report
+`no such table`, and `PRAGMA integrity_check` flags page 1. Writes
+therefore never commit under compiled guest code. The lane reports it
+as a failure with the guest's stdout/stderr/exit kept under
+`<output-dir>/failures/` — nothing is skipped.
+
+### Upstream testsuite lane (discovery, never a gate)
+
+`make test-upstream` (`tools/run-upstream-testsuite.py`) fetches the
+aggregated `WebAssembly/testsuite` mirror at an exact commit (the
+`[spec.testsuite-aggregate]` pin, or `--commit`), runs it through the
+WAST runner, and writes `tests/upstream-results.jsonl` (generated, gitignored —
+one JSONL line per command, ~15 MB) plus `CONFORMANCE-UPSTREAM.md`
+(totals, failing files, failure classes; committed).
+It is deliberately separate from the pinned core lane: the mirror
+carries proposal corpora beyond the declared engine scope, so its
+files are never counted with the core suite and nothing is converted
+into a pass. Measured at mirror `63908677d005` (2026-10-31): 65,135
+commands — 61,897 pass, 3,064 fail, 101 harness-error, 73
+unsupported. The lane paid for itself immediately: it found and drove
+the fixes for `v128.const` in WAST scripts, lane-wise v128
+expectations with `nan:canonical`/`nan:arithmetic` lanes, the
+`(either ...)` sanctioned-set wrapper, the module parser's
+`i8x16`/`i16x8` v128 shapes, the six float lane comparisons
+(`f32x4/f64x2 eq/ne/lt/gt/le/ge` had fed their all-ones mask back
+into `f32-bits` and trapped on the first assertion), and the
+load-and-extend lane count (`v128.load16x4_*`/`load32x2_*` wrote 8
+lanes into a 16-byte value instead of 4/2).
 (+2 rows, the last file sync-streams). **M17 CLOSE-OUT (measured, 2026-10-30): the lane reads 0 fail x 30
 consecutive runs on a quiet machine** (`red_runs=0/30,
 fail_commands=0`, walls 9.86-10.53 s over 1631 commands per run),
@@ -256,11 +336,14 @@ harness-errors.
 | Component | `src/component.lisp` | M7 slices 1–5: layer discrimination (magic + version 0x0D + layer byte), the full component binary reader (all 12 sections, WIT value types incl. map 0x63, aliases, canon incl. all 47 async built-ins, value sections), the validator (labels/index/max-size, canonopt lift/lower + unicity + signature checks, semver/canonical-version grammar, externname visibility + type-use walks, annotated resource names, moduletype internals, structural instantiation type matching with per-component type identities + generativity, core-subtype moduletype matching, the de Bruijn outer-alias stack, resource identity/local/canon rules, projection chains), the `(component ...)` script-command family, `make test-component`. |
 | Component text | `src/component-text.lisp` | M7 slices 2–5: the full component TEXT grammar into the same IR (valtypes, functypes, imports/exports + attributes, canon lift/lower + built-ins upright/inverted, core module via `parse-wat`, core instance, aliases incl. outer-alias sugar + projections + declarator bind-ids + type-use externtypes + the sort-aware binding table + moduletype desc shapes, the named-form `(component definition ...)` marker). |
 | Component runtime | `src/component-runtime.lisp` | M8-M11a: component instantiation execution — the comp-instance record (per-sort index vectors in validator order + import/export tables), two-level core-instance linking, component-instance with-args, alias projection, canon lift/lower as real host funcs, resource built-ins with per-instance handle tables + own/borrow transfer + dtor resolution, the outer-aliased core module resolution, the per-instantiation closure side table, start funcs; THE CANONICAL ABI AT RUNTIME (M10: cx.allocate/reallocate with the trap taxonomy, store/load per type — string transcodes (utf8/utf16/latin1+utf16), list/record/variant/flags/enum/option/result, the map despecialization — lift/lower_flat + the MAX_FLAT 16/1 pointer indirection, post-return); THE ASYNC CORE (M11a: the task/thread state machine — the callback event loop with the real-park YIELD + the exclusive-lock-released WAIT, the backpressure gate with pre-park scheduler registration, the deadlock oracle via the progress counter, the async built-ins as real host funcs with the exact trap messages, the packed async lower with the STARTED-wait; the thread/future/stream/error-context canons stay opaque — M11b); the runner's component invoke/get + the compound value literals. |
+| WASI Preview1 | `src/wasi-preview1.lisp` | The complete `wasi_snapshot_preview1` linear-memory ABI: all 46 imports from the pinned WITX (`specs/wasi/preview1/INVENTORY.md`), checked little-endian loads/stores with 32-bit-pointer bounds preflight, an ABI fd table with rights/flags/positions, handle-relative `..`-confined path resolution (symlinks expanded and re-confined), preopens derived from explicit `:permissions`, native descriptors/clocks/entropy/sockets, `poll_oneoff` with normalized per-clock deadlines, and the memory gate installed in `before-start` so a module's start section already sees its memory. `proc_raise` is the named platform limitation (valid → `NOTSUP`, never signals SBCL). |
 | WIT reader | `src/wit.lisp` | M16: tokenizer + recursive-descent reader with type resolution and WIT→component-`ct` conversion; parses all six vendored 0.3.2 packages without error (packages, interfaces, worlds, `use` incl. cross-package, records/enums/variants/flags, resources with constructors/static/async/methods, aliases, `map<K,V>`, `own`/`borrow`/`stream`/`future`, `@since`/`@unstable` parsed and recorded). |
 | WASI providers | `src/wasi.lisp` | M16: the host-provider framework (`parsed iface + impl alist → comp-instance` of `lifted-func`s carrying the WIT functype + a CL closure over the component value domain), the host stream/future ABI, and the `wasi:clocks`, `wasi:random`, `wasi:cli`, `wasi:filesystem`, `wasi:sockets` providers under an explicit `wasi-context` (`wasi:http`, M16 slice 5, was REMOVED at user direction in M17 — the implementation is recoverable from git history and the vendored `specs/wasi/wasi-wit-0.3.2/http/*.wit` remain as reference data only); `run-component` drives `wasi:cli/run`. See *WASI 0.3.2 host providers (M16)* below. |
 
 Not implemented (see `PLAN.md` for the full contract):
-threads/atomics, FASL cache, the WASI 0.1/0.2 compatibility facades,
+threads/atomics, FASL cache, the WASI 0.2 component facades
+(`wasi:io`/`cli`/`filesystem`/`sockets`/`http` at `@0.2.x`) and the
+WASI 0.2 HTTP client/service,
 annotations (an unadopted proposal —
 permanently out of scope per PLAN.md §3.3). SIMD (v128 + relaxed,
 loop 24: the full 236-op v128 family + the 20 relaxed ops with
@@ -476,7 +559,10 @@ after ok/err/exit runs). The Lisp entry point:
               :stderr *error-output*
               :preopens (list (wasmdown.wasi:open-wasi-preopen ".")))))
   (wasmdown.component:validate-component comp)
-  (wasmdown.wasi:run-component comp ctx))
+  (multiple-value-bind (status store) (wasmdown.wasi:run-component comp ctx)
+    ;; STORE is the run's own boundary object; its thread registry must
+    ;; be empty after the teardown
+    (values status (wasmdown.component.runtime:component-store-threads store)))
 ```
 
 ### Residuals (honest, recorded)
@@ -506,7 +592,27 @@ after ok/err/exit runs). The Lisp entry point:
 - **`@unstable` feature gating is parsed but not enforced** (the
   timezone interface is simply not registered).
 - `wasi:sockets` has no `shutdown` in this WIT revision.
-- The **WASI 0.1/0.2 facades** (PLAN.md §8.4) are not implemented.
+- **WASI Preview 1 is implemented** (`wasi_snapshot_preview1`, 46
+  imports, `src/wasi-preview1.lisp`, `--wasi` in the CLI; §Preview1
+  below) and the **WASI 0.2 facade** binds 27 of 31 stable interfaces
+  at exact release names (`src/wasi-preview2.lisp`).
+- **The 0.2 SQLite artifact EXECUTES, in memory and on disk**: the
+  pinned Wasmtime-adapter component decodes, validates, composes all 17
+  versioned providers (chosen from the component's DECLARED imports —
+  `component-command-providers`), instantiates, and its
+  `wasi:cli/run@0.2.12` runs real SQL: `SELECT 6*7` prints `42`
+  (exit 0), a CREATE/INSERT/SELECT script prints `3|13.5`, and with
+  `--dir DIR::/work` the database file is created, reopened by a second
+  process, and read by the Preview1 build too (same file format).
+  Without a preopen the open fails cleanly (exit 1, no file created).
+  Four ABI fixes made this work: variant tag matching
+  (`%abi-case-index`), the `:enum` domain shape (`(list :enum label)`,
+  label is `second`, not `cdr`), and the `result<T,E>` layout —
+  alignment and size had to change together (`result<enum,error-code>`
+  is alignment 1, size 2). The decode→validate→instantiate pipeline is
+  pinned in `tests/wasi-p2-fixtures.lisp`, execution by the CLI spells
+  above, and the behavioural lane below; `specs/lock.toml` `p2-exec`
+  records both.
 - World `include`, `implements`/`external-id`, and nominal resource
   typing are not yet read by the WIT frontend.
 - The component lane's **pre-existing, machine-load-dependent async
@@ -523,6 +629,53 @@ ledger (`async-calls-sync` ::1 ≈7–10% ACCEPTED, `switch-to-ready` ::8,
 `reentrance` ::14, `sync-streams` ::1, `big-interleaving` ::24) — the
 M15 robustness target, not an M16 slice property.
 
+## WASI Preview1 (`wasi_snapshot_preview1`)
+
+**Status: implemented and exercised end to end.** The ABI surface is
+taken from the pinned WITX snapshot (`specs/wasi/preview1/`,
+`specs/lock.toml`): 46 exports, generated into
+`specs/wasi/preview1/INVENTORY.md` by `tools/wasi-inventory.py` (the
+census is the specification, never the implementation table).
+
+```sh
+# a core command module: _start runs once with the explicit capabilities
+printf 'SELECT 6*7;\n' |
+  sbcl --script tools/wasmdown.lisp run tests/fixtures/wasi/sqlite3-p1.wasm \
+       --wasi -- :memory:
+
+# a scripted, persistent database inside an explicit preopen
+printf 'SELECT count(*), sum(score) FROM t;\n' |
+  sbcl --script tools/wasmdown.lisp run tests/fixtures/wasi/sqlite3-p1.wasm \
+       --wasi --dir /tmp/work::/work --env HOME=/work \
+       -- -batch -bail -init /work/empty.sql /work/test.db
+```
+
+Properties the tests pin (see `tests/wasi-preview1.lisp`):
+
+- the ABI memory is bound **before the start section**; a start-section
+  `fd_write` sees both the exported memory and the active data segment;
+- every pointer/count is validated in Lisp integers first
+  (`FAULT`/`INVAL`/`OVERFLOW`), never a Lisp array error;
+- `path_open` with `oflags::creat` may create a missing final component
+  while every other operation requires it to exist;
+- an internal `a/../b` stays inside the preopen root; `..` at the root,
+  absolute guest paths and symlinks whose target leaves the root are
+  `NOTCAPABLE`; a read-only preopen denies creation, writing and
+  stronger inheriting rights;
+- `fd_readdir` lists `.` and `..` and resumes from a cookie, allowing a
+  truncated last dirent;
+- `proc_exit` unwinds through `wasi-exit` (the CLI truncates the raw u32
+  to eight bits) and `proc_raise` returns `NOTSUP` for every valid
+  signal, leaving the hosting SBCL process untouched — the documented
+  in-process limitation, not full POSIX signal semantics;
+- `poll_oneoff` normalizes each subscription against ITS clock
+  (absolute realtime deadlines are converted to monotonic ones) and
+  returns userdata, hangup flags and byte counts in subscription order.
+
+`WASMDOWN_API_MODE=baseline` routes both the core `--invoke` path and
+Preview1 `_start` through the codegen backend. `--` terminates option
+parsing so dash-prefixed guest arguments arrive unchanged.
+
 ## Error/phase taxonomy (PLAN.md §12.2)
 
 `decode-error` (malformed binary; byte offset) → `validation-error`
@@ -536,7 +689,14 @@ These classes are never interchangeable.
 ## Usage
 
 ```sh
-make test                 # full unit/integration suite (481 tests)
+make test                      # full unit/integration suite (608 tests)
+make test-spec-core            # pinned core .wast lane (baseline measurement)
+make test-component            # vendored component suite (release gate)
+make test-component-census RUNS=30   # 30 fresh runs, all must be GREEN
+make test-wasi-preview1        # Preview1 acceptance over the SQLite fixtures
+make test-wasi-preview2        # behaviour lane: real 0.2 SQLite guest, 11 cases
+make test-wasi                 # both ABIs (15 cases); honours WASMDOWN_API_MODE
+make test-upstream             # aggregated testsuite mirror (discovery)
 sbcl --script tools/wasmdown.lisp validate file.wasm
 sbcl --script tools/wasmdown.lisp inspect file.wasm
 sbcl --script tools/wasmdown.lisp run file.wasm --invoke add 42 13
