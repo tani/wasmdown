@@ -287,7 +287,7 @@ parent dir), not the first (the grandparent 'component' — the old
                  f :file (format nil "~a/~a"
                                  (car (last (pathname-directory f) 2))
                                  (file-namestring f))))))
-(when *jsonl* (wasmdown.wast:write-jsonl *results* *jsonl*))
+(when *jsonl* (wasmdown.wast:write-jsonl *results* *jsonl* "component"))
 
 ;;; ---- report ----
 

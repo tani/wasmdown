@@ -4,9 +4,12 @@
 ;;;;   0 ok, 1 guest/compile error, 2 usage error.
 ;;;;
 ;;;; Loads the ASDF system from the repository containing this script.
-;;;; Optional environment variable WASMDOWN_API_MODE selects the
-;;;; execution backend for `run`/`compile`: "baseline" enables the
-;;;; codegen backend when loaded (default: interpreter).
+;;;; WASMDOWN_API_MODE selects the execution backend for core code
+;;;; (`interpret', the default, or `baseline').
+;;;;
+;;;; ONE loading path: the ASDF system is the only definition of the
+;;;; API and CLI (the old direct `load' of src/api + src/cli re-ran
+;;;; obsolete source over the compiled system).
 
 (require :asdf)
 
@@ -15,20 +18,8 @@
 
 (pushnew *script-root* asdf:*central-registry* :test #'equal)
 
-(defvar *extra-files* '("src/api" "src/cli"))
-
 (asdf:load-system :wasmdown)
 
-;; src/api.lisp and src/cli.lisp are not yet in wasmdown.asd's
-;; component list (tracked by the system owner); load them directly
-;; when present so this launcher works from a plain checkout.
-(dolist (f *extra-files*)
-  (let ((p (merge-pathnames (make-pathname :name f :type "lisp")
-                            *script-root*)))
-    (when (probe-file p)
-      (load p))))
-
-(when (find-package :wasmdown.cli)
-  (let ((code (wasmdown.cli:main)))
-    #+sbcl (when (numberp code) (sb-ext:exit :code code))
-    code))
+(let ((code (wasmdown.cli:main)))
+  #+sbcl (when (numberp code) (sb-ext:exit :code code))
+  code)
