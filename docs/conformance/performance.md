@@ -66,7 +66,9 @@ above as a −1.2 % negative result; `(speed 1)` was also measured at the
 16-op scale and is strictly worse — same time, 391 MiB vs 309 MiB consed —
 so lower optimization is not a compile-cost lever either; and emitting the
 temp slots as ONE simple-vector accessed through SYMBOL-MACROLET instead of N
-lexical bindings was measured at the 16-op scale and is strictly WORSE — 42 ms
-and 745 MiB per function vs 13 ms and 305 MiB — so the binding count is not the
-driver either: the cost sits in SBCL compiling the large TAGBODY/GO graph
-itself). Any reduction should be measured against this table.
+lexical bindings is strictly WORSE at the SAME ops in a controlled A/B (20
+functions, both modes, identical bodies): ops=16 lexical 13.2 ms / 201 MiB per
+function vs array 41.5 ms / 497 MiB; ops=64 lexical 169.0 ms / 1574 MiB vs
+array 339.7 ms / 2702 MiB — so the binding count is not the driver either: the
+cost sits in SBCL compiling the large TAGBODY/GO graph itself). Any reduction
+should be measured against this table.
