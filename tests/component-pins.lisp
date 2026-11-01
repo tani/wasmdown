@@ -2965,6 +2965,36 @@ repo root, as a string — the pin runs a fixture row VERBATIM."
                     (core func $lower (canon lower (func $f))))")
                 nil)
             (wasmdown:validation-error (e)
+              (search "memory" (wasmdown:wasmdown-error-message e)))))
+      ;; TWO-level ring (de Bruijn count 2): the compound leaf lives in
+      ;; the grandparent component; the owner switch must survive the
+      ;; extra boundary (positive) and a real string must still reject
+      (is (progn
+            (validate-text
+             "(component definition $C
+                (type $x u32)
+                (type $t (tuple $x))
+                (component
+                  (import \"i\" (instance $i
+                    (type $shadow string)
+                    (export \"f\" (func (param \"x\" $t)))))
+                  (alias export $i \"f\" (func $f))
+                  (core func $lower (canon lower (func $f)))))")
+            t))
+      (is (handler-case
+              (progn
+                (validate-text
+                 "(component definition $C
+                    (type $x string)
+                    (type $t (tuple $x))
+                    (component
+                      (import \"i\" (instance $i
+                        (type $shadow u32)
+                        (export \"f\" (func (param \"x\" $t)))))
+                      (alias export $i \"f\" (func $f))
+                      (core func $lower (canon lower (func $f)))))")
+                nil)
+            (wasmdown:validation-error (e)
               (search "memory" (wasmdown:wasmdown-error-message e))))))))
 
 (test component/type-view-owner-pins

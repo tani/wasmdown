@@ -179,7 +179,7 @@ stdout-only and is listed as `n/a` with `make verify` named as its gate.
   `component/remap-outer-compound-functype-owner` — the exact diagnostic pair
   (decoy-first same-numbered type validates with no memory; the real `string`
   leaf still rejects with a memory requirement), shape checks (`tuple<u32>` vs
-  `tuple<string>`) and result-position companions. Unit 694/0, component
+  `tuple<string>`) and result-position companions, and the count-2 positive/negative pair. Unit 694/0, component
   1,702/0, P3 10/10 ×3 per backend, `make verify` green.
 - **Validator instance type-index space and encoder s33 valtype indices
   (2026-11-02).** Two engine correctness fixes exposed by the WIT-shaped
