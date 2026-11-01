@@ -176,7 +176,14 @@ def main():
         print("\nrelease matrix: %d row(s) missing, red, or from another commit"
               % failures)
         return 1
-    print("\nrelease matrix: all recorded rows green at %s" % commit[:12])
+    sources = sorted({m.group(1) for _, _, detail in rows
+                      for m in [re.search(r"source ([0-9a-f]{12})", detail)]
+                      if m})
+    print("\nrelease matrix: all recorded rows green; tested sources: %s"
+          % ", ".join(sources))
+    if sources != [commit[:12]]:
+        print("  (the compiled WASI row and older artifact rows name earlier "
+              "commits; each row's evidence line states its own source)")
     return 0
 
 

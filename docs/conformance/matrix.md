@@ -52,9 +52,13 @@ function count so compile cost is readable per function.
 
 `make verify-release` (`tools/check-release-matrix.py`) reads the recorded
 artifacts and requires every row above to be present, green, and to carry
-HEAD as its tested source commit: core parity summary, component records for
-both backends, the P2/P3 WASI records, the bench JSON and the inventory.
-P1 is stdout-only and is listed as `n/a` with `make verify` named as its gate.
+a tested source commit that is HEAD or an ancestor of it (the artifacts are
+committed after the run, so a row may record an earlier commit): core parity
+summary, component records for both backends, the P2/P3 WASI records, the
+bench JSON and the inventory. Each row prints its own source, and the
+summary lists every distinct tested commit, so a lagging row (typically the
+~37 min compiled P2 lane) is visible rather than averaged away. P1 is
+stdout-only and is listed as `n/a` with `make verify` named as its gate.
 
 ## Blocked
 
