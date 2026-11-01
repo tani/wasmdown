@@ -79,15 +79,64 @@
 
 (defconstant +p1-rights-all+
   (1- (ash 1 30))
-  "Every right the ABI defines. Authority is DERIVED from the context:
-a preopen opened with the read/write/mutate-directory permissions
-gets exactly these; a read-only preopen only the read half.")
+  "Every right the ABI defines (the authority a fully writable preopen
+grants to descendants; the preopen's OWN base rights are only the
+directory rights below).")
+
+;;; A directory handle is not a byte stream: fd_read/fd_write/fd_seek/
+;;; fd_tell and the file-size rights do not apply to it. The WASI
+;;; convention (shared with wasmtime) separates the two sets: a
+;;; directory's BASE rights are the lookup/listing/metadata rights it
+;;; may use on itself, while its INHERITING rights are the authority a
+;;; path_open below it may request. A preopen with only `read' must not
+;;; advertise write authority, or userlands that derive the host access
+;;; mode from the requested rights (wasi-libc requests
+;;; `max & inheriting') would open directories read-write, which POSIX
+;;; rejects with EISDIR.
 
 (defconstant +p1-rights-dir-read-only+
+  (logior +p1-right-fd-readdir+
+          +p1-right-path-open+
+          +p1-right-path-readlink+
+          +p1-right-path-filestat-get+
+          +p1-right-fd-filestat-get+
+          +p1-right-fd-filestat-set-times+)
+  "Directory base rights for a read-only preopen.")
+
+(defconstant +p1-rights-dir-write+
+  (logior +p1-rights-dir-read-only+
+          +p1-right-path-create-directory+
+          +p1-right-path-create-file+
+          +p1-right-path-link-source+
+          +p1-right-path-link-target+
+          +p1-right-path-rename-source+
+          +p1-right-path-rename-target+
+          +p1-right-path-symlink+
+          +p1-right-path-remove-directory+
+          +p1-right-path-unlink-file+
+          +p1-right-path-filestat-set-size+
+          +p1-right-path-filestat-set-times+)
+  "Directory base rights for a writable, directory-mutating preopen.")
+
+(defconstant +p1-rights-file-read-only+
   (logior +p1-right-fd-read+ +p1-right-fd-seek+ +p1-right-fd-tell+
-          +p1-right-fd-fdstat-set-flags+ +p1-right-fd-readdir+
-          +p1-right-path-open+ +p1-right-path-filestat-get+
-          +p1-right-poll-fd-readwrite+))
+          +p1-right-fd-fdstat-set-flags+ +p1-right-fd-advise+
+          +p1-right-fd-filestat-get+ +p1-right-poll-fd-readwrite+)
+  "File rights a read-only preopen's descendants may request.")
+
+(defconstant +p1-rights-file-write+
+  (logior +p1-rights-file-read-only+
+          +p1-right-fd-datasync+ +p1-right-fd-sync+ +p1-right-fd-write+
+          +p1-right-fd-allocate+ +p1-right-fd-filestat-set-size+
+          +p1-right-fd-filestat-set-times+)
+  "File rights a writable preopen's descendants may request.")
+
+(defconstant +p1-rights-not-on-directory+
+  (logior +p1-right-fd-seek+ +p1-right-fd-tell+
+          +p1-right-fd-allocate+ +p1-right-fd-filestat-set-size+)
+  "Rights that a directory descriptor never carries: the host rejects
+the corresponding operations on a directory (EISDIR/EINVAL), so
+granting them would misdescribe the handle.")
 
 ;;; fdflags (u16).
 (defconstant +p1-fdflag-append+   1)
@@ -149,7 +198,12 @@ gets exactly these; a read-only preopen only the read half.")
 (defconstant +p1-size-filestat+ 64)
 (defconstant +p1-size-prestat+ 8)
 (defconstant +p1-size-event+ 32)
-(defconstant +p1-size-subscription+ 56)
+;; A subscription is userdata (8) + the variant at offset 8: its tag
+;; slot is 8 bytes (the payload is 8-aligned) and the largest payload
+;; (clock: id u32, timeout u64, precision u64, flags u16) is 32 bytes
+;; after alignment, so 8 + 8 + 32 = 48. Using 56 walked the second
+;; subscription into the middle of its own tag/payload.
+(defconstant +p1-size-subscription+ 48)
 
 ;;; ---------------------------------------------------------------
 ;;; ABI abort: a host-side rejection that becomes an `errno` result.
@@ -463,6 +517,33 @@ answer is FBIG."
 (sb-alien:define-alien-routine ("posix_fallocate" %p1-libc-fallocate) sb-alien:int
   (fd sb-alien:int) (offset sb-alien:off-t) (length sb-alien:off-t))
 (sb-alien:define-alien-routine ("sched_yield" %p1-libc-sched-yield) sb-alien:int)
+;; statx(2) is the only portable-in-ABI way to read NANOSECOND
+;; timestamps from a descriptor (SBCL's unix-fstat truncates them to
+;; whole seconds), and the WASI ABI reports timestamps in ns.
+(sb-alien:define-alien-routine ("statx" %p1-libc-statx) sb-alien:int
+  (dirfd sb-alien:int) (path sb-alien:c-string) (flags sb-alien:int)
+  (mask sb-alien:unsigned-int) (buf sb-sys:system-area-pointer))
+
+(defconstant +at-empty-path+ #x1000)
+(defconstant +statx-basic-stats+ #x7ff)
+
+(defun %p1-fstat-times-ns (fd)
+  "The descriptor's atime/mtime/ctime as INTEGER NANOSECONDS, or NIL
+when statx cannot answer (the caller falls back to whole seconds)."
+  (let ((buf (sb-alien:make-alien sb-alien:unsigned-char 256)))
+    (unwind-protect
+         (let ((ret (%p1-libc-statx fd "" +at-empty-path+
+                                    +statx-basic-stats+
+                                    (sb-alien:alien-sap buf))))
+           (when (zerop ret)
+             (let ((sap (sb-alien:alien-sap buf)))
+               ;; struct statx: atime @64, ctime @96, mtime @112;
+               ;; each {s64 tv_sec, u32 tv_nsec, s32 reserved}.
+               (flet ((stamp (base)
+                        (+ (* (sb-sys:sap-ref-64 sap base) 1000000000)
+                           (sb-sys:sap-ref-32 sap (+ base 8)))))
+                 (values (stamp 64) (stamp 112) (stamp 96))))))
+      (sb-alien:free-alien buf))))
 
 (sb-alien:define-alien-type nil
   (sb-alien:struct p1-timespec
@@ -596,11 +677,18 @@ immediately."
 
 (defun %p1-path-components (state addr len)
   "Split a WITX path parameter (POINTER, LENGTH) into components.
-Empty components are dropped; an absolute path is `notcapable'."
+Empty components are dropped; an absolute path is `notcapable'.
+The second value is T when the path ends in `/': POSIX gives a
+trailing slash meaning (the target must be a directory), and the
+final leaf keeps it so the host call sees the same rule."
   (let* ((bytes (%p1-string state addr len))
          (path (%p1-bytes->string bytes)))
     (when (and (plusp (length path)) (char= (char path 0) #\/))
       (%p1-abort +p1-notcapable+))
+    ;; A NUL cannot appear in a path: passing it to a C string routine
+    ;; would silently truncate the name instead of failing.
+    (when (find (code-char 0) path)
+      (%p1-abort +p1-ilseq+))
     (let ((parts '())
           (start 0))
       (loop for i from 0 to (length path)
@@ -609,7 +697,9 @@ Empty components are dropped; an absolute path is `notcapable'."
                    (unless (string= part "")
                      (push part parts))
                    (setf start (1+ i))))
-      (nreverse parts))))
+      (values (nreverse parts)
+              (and (plusp (length path))
+                   (char= (char path (1- (length path))) #\/))))))
 
 (defun %p1-open-dir (dirfd name)
   "openat(NAME) relative to DIRFD as a directory handle, not following
@@ -637,35 +727,68 @@ a symlink in NAME."
 
 (defun %p1-resolve (state entry path-addr path-len follow-final
                     &key create-p)
-  "Resolve PATH-ADDR relative to ENTRY's preopen. Returns
+  "Resolve PATH-ADDR relative to ENTRY's own directory handle. Returns
 (values DIR-FD LEAF) where DIR-FD is the ONLY owned fd the caller must
 close and LEAF is the final component (or \".\"). Every intermediate
 directory fd opened on the way is closed before returning, so a
 multi-component lookup never leaks descriptors.
-Confined: `..` may not climb above the root, symlink targets are
-re-confined and the expansion budget is bounded. CREATE-P allows a
+
+The lookup is HANDLE-relative: `path_filestat_get(dfd, \"x\")' must
+name \"dfd/x\", not \"<preopen>/x\" (a guest that opened a subdirectory
+and stats entries in it is the ordinary case, not an escape). A
+`..' climbs to the parent by opening it; the preopen root is the
+hard floor (compared by host dev/inode), so walking up from any
+handle below it stays confined. Symlink targets are re-confined the
+same way and the expansion budget is bounded. CREATE-P allows a
 MISSING final component (path_open with oflags::creat): resolution
 must not require the file to exist before it is created."
-  ;; The path components are read BEFORE the preopen is duplicated: a
+  ;; The path components are read BEFORE the handle is duplicated: a
   ;; bad pointer or an absolute path (FAULT/NOTCAPABLE) must not leak
   ;; the dup'd directory handle.
-  (let* ((preopen (p1-fd-preopen entry))
-         (todo (%p1-path-components state path-addr path-len))
-         (budget *p1-max-symlink-expansions*)
-         (stack (list (%p1-check (%p1-libc-dup preopen)))))
-    (labels ((fail (errno)
-               (dolist (fd stack) (ignore-errors (%p1-libc-close fd)))
-               (%p1-abort errno))
-             (done (leaf)
-               "Hand DIR=top back to the caller and close every
-                intermediate directory fd below it."
-               (dolist (fd (cdr stack)) (ignore-errors (%p1-libc-close fd)))
-               (values (car stack) leaf))
-             (pop-root ()
-               ;; a `..` at the root would escape: notcapable
-               (if (null (cdr stack))
-                   (fail +p1-notcapable+)
-                   (%p1-libc-close (pop stack))))
+  (multiple-value-bind (todo trailing-slash-p)
+      (%p1-path-components state path-addr path-len)
+    (let* ((preopen (p1-fd-preopen entry))
+           (start (p1-fd-fd entry))
+           (budget *p1-max-symlink-expansions*)
+           (root-id (multiple-value-bind (dev ino) (%p1-fstat preopen)
+                      (cons dev ino)))
+           (floor-id (multiple-value-bind (dev ino) (%p1-fstat start)
+                       (cons dev ino)))
+           (stack (list (if start
+                            (%p1-check (%p1-libc-dup start))
+                            (%p1-abort +p1-badf+)))))
+      (labels ((fail (errno)
+                 (dolist (fd stack) (ignore-errors (%p1-libc-close fd)))
+                 (%p1-abort errno))
+               (done (leaf)
+                 "Hand DIR=top back to the caller and close every
+                  intermediate directory fd below it."
+                 (dolist (fd (cdr stack)) (ignore-errors (%p1-libc-close fd)))
+                 (values (car stack)
+                         (if trailing-slash-p
+                             (concatenate 'string leaf "/")
+                             leaf)))
+               (at-id-p (fd id)
+                 (multiple-value-bind (dev ino) (%p1-fstat fd)
+                   (and (= dev (car id)) (= ino (cdr id)))))
+               (pop-root ()
+                 ;; `..' is confined to the descriptor the path is
+                 ;; resolved against (and, transitively, to the
+                 ;; preopen root): a path may use `..' inside the
+                 ;; handle but may not climb out of it. wasi-testsuite
+                 ;; requires PERM/NOTCAPABLE for such a path rather
+                 ;; than resolving it against the preopen.
+                 (if (or (at-id-p (car stack) floor-id)
+                         (at-id-p (car stack) root-id))
+                     (fail +p1-notcapable+)
+                     (let ((parent (%libc-openat (car stack) ".."
+                                                 (logior +o-path+ +o-directory+
+                                                         +o-cloexec+)
+                                                 0)))
+                       (when (minusp parent)
+                         (fail (%p1-host-errno (sb-alien:get-errno))))
+                       (%p1-libc-close (pop stack))
+                       (push parent stack))))
              (open-probe (name)
                (let ((fd (%libc-openat (car stack) name
                                        (logior +o-path+ +o-nofollow+ +o-cloexec+)
@@ -733,7 +856,7 @@ must not require the file to exist before it is created."
                           (setf todo (append (expand name) (cdr todo))))
                         (progn
                           (push probe stack)
-                          (setf todo (cdr todo)))))))))))))))
+                          (setf todo (cdr todo))))))))))))))))
 
 (defun %p1-path-components-from-string (path)
   (let ((parts '())
@@ -969,14 +1092,18 @@ UTF-8 plus one NUL terminator."
 (%p1-fn %p1-fd-fdstat-set-flags (state fd flags)
   (let ((entry (%p1-require (%p1-lookup-fd state fd) +p1-right-fd-fdstat-set-flags+)))
     (when (logtest flags (lognot +p1-fdflag-all+)) (%p1-abort +p1-inval+))
-    (when (and (eq (p1-fd-kind entry) :socket)
+    (when (and (not (eq (p1-fd-kind entry) :stream))
                (not (minusp (p1-fd-fd entry))))
-      ;; O_NONBLOCK is the only flag with a host effect here.
+      ;; O_APPEND and O_NONBLOCK are the status flags that can be
+      ;; changed after open. Record-only flags left the host handle in
+      ;; append mode forever, so clearing APPEND still appended.
       (let ((cur (%p1-libc-fcntl (p1-fd-fd entry) 3 0))) ; F_GETFL
         (when (minusp cur) (%p1-abort (%p1-host-errno (sb-alien:get-errno))))
-        (let ((want (if (logtest flags +p1-fdflag-nonblock+)
-                        (logior cur +o-nonblock+)
-                        (logandc2 cur +o-nonblock+))))
+        (let ((want (logandc2 cur (logior +o-append+ +o-nonblock+))))
+          (when (logtest flags +p1-fdflag-append+)
+            (setf want (logior want +o-append+)))
+          (when (logtest flags +p1-fdflag-nonblock+)
+            (setf want (logior want +o-nonblock+)))
           (%p1-check (%p1-libc-fcntl (p1-fd-fd entry) 4 want))))) ; F_SETFL
     (setf (p1-fd-flags entry) flags)
     +p1-success+))
@@ -992,18 +1119,20 @@ UTF-8 plus one NUL terminator."
           (p1-fd-rights-inheriting entry) inheriting)
     +p1-success+))
 
-(defun %p1-fill-filestat (state ptr dev ino mode nlink size atim mtim ctim)
+(defun %p1-fill-filestat (state ptr dev ino mode nlink size atim-ns mtim-ns ctim-ns)
   (%p1-check-range state ptr +p1-size-filestat+)
   ;; dev u64 @0, ino u64 @8, filetype u8 @16, nlink u64 @24,
-  ;; size u64 @32, atim @40, mtim @48, ctim @56
+  ;; size u64 @32, atim @40, mtim @48, ctim @56. Timestamps are
+  ;; already NANOSECONDS: truncating them to seconds here made a
+  ;; guest's set-then-get round trip lose the sub-second part.
   (setf (%p1-u64 state ptr) dev
         (%p1-u64 state (+ ptr 8)) ino
         (%p1-u8 state (+ ptr 16)) (%p1-filetype-of-mode mode)
         (%p1-u64 state (+ ptr 24)) nlink
         (%p1-u64 state (+ ptr 32)) size
-        (%p1-u64 state (+ ptr 40)) (* atim 1000000000)
-        (%p1-u64 state (+ ptr 48)) (* mtim 1000000000)
-        (%p1-u64 state (+ ptr 56)) (* ctim 1000000000))
+        (%p1-u64 state (+ ptr 40)) atim-ns
+        (%p1-u64 state (+ ptr 48)) mtim-ns
+        (%p1-u64 state (+ ptr 56)) ctim-ns)
   +p1-success+)
 
 (%p1-fn %p1-fd-filestat-get (state fd ptr)
@@ -1012,13 +1141,29 @@ UTF-8 plus one NUL terminator."
         (%p1-fill-filestat state ptr 0 0 0 1 0 0 0 0)
         (multiple-value-bind (dev ino mode nlink size atim mtim ctim)
             (%p1-fstat (p1-fd-fd entry))
-          (%p1-fill-filestat state ptr dev ino mode nlink size
-                             atim mtim ctim)))))
+          (multiple-value-bind (atim-ns mtim-ns ctim-ns)
+              (%p1-fstat-times-ns (p1-fd-fd entry))
+            (%p1-fill-filestat
+             state ptr dev ino mode nlink size
+             (or atim-ns (* atim 1000000000))
+             (or mtim-ns (* mtim 1000000000))
+             (or ctim-ns (* ctim 1000000000))))))))
 
 (%p1-fn %p1-fd-filestat-set-size (state fd size)
   (let ((entry (%p1-require (%p1-lookup-fd state fd) +p1-right-fd-filestat-set-size+)))
     (%p1-check (%libc-ftruncate (p1-fd-fd entry) (%p1-filesize size)))
     +p1-success+))
+
+(defun %p1-check-fstflags (fstflags)
+  "FSTFLAGS is a 4-bit set, and the atim/atim-now (and mtim/mtim-now)
+pair is mutually exclusive: both set is INVAL, not \"now wins\"."
+  (when (logtest fstflags (lognot 15)) (%p1-abort +p1-inval+))
+  (when (= (logand fstflags (logior +p1-fst-atim+ +p1-fst-atim-now+))
+           (logior +p1-fst-atim+ +p1-fst-atim-now+))
+    (%p1-abort +p1-inval+))
+  (when (= (logand fstflags (logior +p1-fst-mtim+ +p1-fst-mtim-now+))
+           (logior +p1-fst-mtim+ +p1-fst-mtim-now+))
+    (%p1-abort +p1-inval+)))
 
 (defun %p1-timespec-pair (atim mtim fstflags)
   "Build the futimens/utimensat pair: UTIME_NOW / UTIME_OMIT encode
@@ -1049,7 +1194,7 @@ two timespecs (tv_sec, tv_nsec each 64-bit)."
 
 (%p1-fn %p1-fd-filestat-set-times (state fd atim mtim fstflags)
   (let ((entry (%p1-require (%p1-lookup-fd state fd) +p1-right-fd-filestat-set-times+)))
-    (when (logtest fstflags (lognot 15)) (%p1-abort +p1-inval+))
+    (%p1-check-fstflags fstflags)
     (let ((pair (%p1-timespec-pair atim mtim fstflags)))
       (unwind-protect
            (progn (%p1-check (%libc-futimens (p1-fd-fd entry)
@@ -1223,13 +1368,24 @@ positional (pread) transfer. Returns an octet vector."
         (fds (preview1-state-fds state)))
     (when (= from to)
       (return-from %p1-fd-renumber +p1-success+))
+    ;; `to' must be an existing descriptor: dup2-style renumbering to
+    ;; an arbitrary slot is not allowed (EBADF).
     (let ((target (gethash to fds)))
-      (when target (%p1-close-entry target)))
+      (unless target (%p1-abort +p1-badf+))
+      (%p1-close-entry target))
     (remhash from fds)
     (setf (gethash to fds) entry)
     +p1-success+))
 
 ;;; ---- directory reading
+
+(defun %p1-dir-cache-invalidate (entry)
+  "Drop ENTRY's cached listing after an operation changed the
+directory it names; a stale cache would hide the new/removed child
+from a later fd_readdir."
+  (when entry
+    (setf (p1-fd-entries entry) nil
+          (p1-fd-entries-cookie entry) 0)))
 
 (defun %p1-dir-entries (state entry)
   "The cached entry list: (\".\" \"..\" then directory order), each
@@ -1238,6 +1394,11 @@ entry a list (NAME-BYTES INO FILETYPE)."
       (let* ((fd (%p1-check (%p1-libc-dup (p1-fd-fd entry))))
              (dir (%libc-fdopendir fd))
              (names '()))
+        ;; dup(2) shares the open file DESCRIPTION, so the host
+        ;; directory offset is shared with the descriptor. fdopendir
+        ;; does not rewind, so without this seek a second fd_readdir
+        ;; on the same directory would start at EOF and see nothing.
+        (%p1-check (%p1-libc-lseek fd 0 0))
         (when (sb-alien:null-alien dir)
           (%p1-libc-close fd)
           (%p1-abort (%p1-host-errno (sb-alien:get-errno))))
@@ -1260,22 +1421,45 @@ entry a list (NAME-BYTES INO FILETYPE)."
                                             '("." "..") :test #'string=)
                               (push nm names)))))
                (setf names (nreverse names))
-               (let ((full (list (list (%p1-string->bytes ".") 0 +p1-file-directory+)
-                                 (list (%p1-string->bytes "..") 0 +p1-file-directory+))))
-                 (dolist (name names)
-                   (let ((probe (%libc-openat fd (%p1-bytes->string name)
-                                              (logior +o-path+ +o-nofollow+ +o-cloexec+)
-                                              0)))
-                     (when (minusp probe)
-                       (%p1-abort (%p1-host-errno (sb-alien:get-errno))))
-                     (multiple-value-bind (dev ino mode) (%p1-fstat probe)
-                       (declare (ignore dev))
-                       (%p1-libc-close probe)
-                       (setf full (append full
-                                          (list (list name ino
-                                                      (%p1-filetype-of-mode mode))))))))
-                 (setf (p1-fd-entries entry) full))
-               (p1-fd-entries entry))
+               ;; "." must report the directory's OWN inode (guests
+               ;; compare it with fd_filestat_get) and ".." its
+               ;; parent's, not a synthesized 0.
+               (let* ((self (multiple-value-bind (dev ino mode) (%p1-fstat fd)
+                              (declare (ignore mode))
+                              (cons dev ino)))
+                      (parent (let ((probe (%libc-openat fd ".."
+                                                         (logior +o-path+ +o-directory+
+                                                                 +o-cloexec+)
+                                                         0)))
+                                (when (minusp probe)
+                                  (%p1-abort (%p1-host-errno
+                                              (sb-alien:get-errno))))
+                                (unwind-protect
+                                     (multiple-value-bind (dev ino mode)
+                                         (%p1-fstat probe)
+                                       (declare (ignore dev mode))
+                                       ino)
+                                  (%p1-libc-close probe)))))
+                 (let ((full (list (list (%p1-string->bytes ".") (cdr self)
+                                         +p1-file-directory+)
+                                   (list (%p1-string->bytes "..") parent
+                                         +p1-file-directory+))))
+                   (dolist (name names)
+                     (let ((probe (%libc-openat
+                                   fd (%p1-bytes->string name)
+                                   (logior +o-path+ +o-nofollow+ +o-cloexec+)
+                                   0)))
+                       (when (minusp probe)
+                         (%p1-abort (%p1-host-errno (sb-alien:get-errno))))
+                       (multiple-value-bind (dev ino mode) (%p1-fstat probe)
+                         (declare (ignore dev))
+                         (%p1-libc-close probe)
+                         (setf full
+                               (append full
+                                       (list (list name ino
+                                                   (%p1-filetype-of-mode mode))))))))
+                   (setf (p1-fd-entries entry) full)
+                   (p1-fd-entries entry))))
           (%libc-closedir dir)))))
 
 (%p1-fn %p1-fd-readdir (state fd buf buf-len cookie bufused-ptr)
@@ -1284,27 +1468,46 @@ entry a list (NAME-BYTES INO FILETYPE)."
     (%p1-check-range state buf buf-len)
     (let* ((all (%p1-dir-entries state entry))
            (used 0)
-           (remaining buf-len))
-      (loop for rest on (nthcdr (min cookie (length all)) all)
-            for i from cookie
-            while rest
-            do (let* ((e (car rest))
-                      (name (first e)))
-                 (if (< remaining +p1-size-dirent+)
-                     (return)
-                     (let* ((ptr (+ buf used))
-                            (namelen (length name))
-                            (copied (min namelen (- remaining +p1-size-dirent+))))
-                       (setf (%p1-u64 state ptr) (1+ i)
-                             (%p1-u64 state (+ ptr 8)) (second e)
-                             (%p1-u32 state (+ ptr 16)) namelen
-                             (%p1-u8 state (+ ptr 20)) (third e))
+           (remaining buf-len)
+           (header (make-array +p1-size-dirent+
+                               :element-type '(unsigned-byte 8))))
+      ;; A page is EOF only when it is SHORTER than the buffer: a
+      ;; truncated final dirent is written instead of leaving the
+      ;; buffer partly empty, so `bufused = buf_len' means "more
+      ;; entries remain" (the same rule wasi-libc and wasmtime use).
+      (block fill
+        (loop for rest on (nthcdr (min cookie (length all)) all)
+              for i from cookie
+              while rest
+              do (let* ((e (car rest))
+                        (name (first e))
+                        (namelen (length name)))
+                   ;; d_next (u64 @0) and d_ino (u64 @8), little endian
+                   (loop for k below 8
+                         do (setf (aref header k)
+                                  (logand (ash (1+ i) (* -8 k)) #xff)
+                                  (aref header (+ 8 k))
+                                  (logand (ash (second e) (* -8 k)) #xff)))
+                   ;; d_namlen (u32 @16) and d_type (u8 @20)
+                   (setf (aref header 16) (logand namelen #xff)
+                         (aref header 17) (logand (ash namelen -8) #xff)
+                         (aref header 18) (logand (ash namelen -16) #xff)
+                         (aref header 19) (logand (ash namelen -24) #xff)
+                         (aref header 20) (third e))
+                   (let* ((hcopied (min remaining +p1-size-dirent+))
+                          (ptr (+ buf used)))
+                     (replace (%p1-bytes state) header
+                              :start1 ptr :end2 hcopied)
+                     (incf used hcopied)
+                     (decf remaining hcopied)
+                     (when (zerop remaining) (return-from fill))
+                     (let ((copied (min namelen remaining)))
                        (replace (%p1-bytes state) name
-                                :start1 (+ ptr +p1-size-dirent+)
-                                :end2 copied)
-                       (incf used (+ +p1-size-dirent+ copied))
-                       (decf remaining (+ +p1-size-dirent+ copied))
-                       (when (< copied namelen) (return))))))
+                                :start1 (+ ptr hcopied) :end2 copied)
+                       (incf used copied)
+                       (decf remaining copied)
+                       (when (zerop remaining) (return-from fill))
+                       (when (< copied namelen) (return-from fill)))))))
       (setf (%p1-u32 state bufused-ptr) used)
       +p1-success+)))
 
@@ -1314,6 +1517,7 @@ entry a list (NAME-BYTES INO FILETYPE)."
   (let ((entry (%p1-require (%p1-lookup-fd state fd) +p1-right-path-create-directory+)))
     (%p1-with-resolved (dir leaf) (state entry path-addr path-len nil :create-p t)
       (%p1-check (%libc-mkdirat dir leaf #o755))
+      (%p1-dir-cache-invalidate entry)
       +p1-success+)))
 
 (%p1-fn %p1-path-filestat-get (state fd flags path-addr path-len ptr)
@@ -1329,22 +1533,28 @@ entry a list (NAME-BYTES INO FILETYPE)."
         (unwind-protect
              (multiple-value-bind (dev ino mode nlink size atim mtim ctim)
                  (%p1-fstat probe)
-               (%p1-fill-filestat state ptr dev ino mode nlink size
-                                  atim mtim ctim))
+               (multiple-value-bind (atim-ns mtim-ns ctim-ns)
+                   (%p1-fstat-times-ns probe)
+                 (%p1-fill-filestat
+                  state ptr dev ino mode nlink size
+                  (or atim-ns (* atim 1000000000))
+                  (or mtim-ns (* mtim 1000000000))
+                  (or ctim-ns (* ctim 1000000000)))))
           (%p1-libc-close probe))))))
 
 (%p1-fn %p1-path-filestat-set-times (state fd flags path-addr path-len atim mtim fstflags)
   (let* ((entry (%p1-require (%p1-lookup-fd state fd) +p1-right-path-filestat-set-times+))
          (follow (logtest flags +p1-lookup-symlink-follow+)))
-    (when (logtest fstflags (lognot 15)) (%p1-abort +p1-inval+))
+    (%p1-check-fstflags fstflags)
     (let ((pair (%p1-timespec-pair atim mtim fstflags)))
       (unwind-protect
            (progn
              (%p1-with-resolved (dir leaf) (state entry path-addr path-len follow)
+               ;; utimensat accepts only AT_SYMLINK_NOFOLLOW or 0
+               ;; (AT_SYMLINK_FOLLOW is EINVAL there).
                (%p1-check (%libc-utimensat dir leaf
                                            (%p1-timespec-pair-pointer pair)
-                                           (if follow +at-symlink-follow+
-                                               +at-symlink-nofollow+))))
+                                           (if follow 0 +at-symlink-nofollow+))))
              +p1-success+)
         (sb-alien:free-alien pair)))))
 
@@ -1355,9 +1565,11 @@ entry a list (NAME-BYTES INO FILETYPE)."
     (%p1-with-resolved (old-dir old-leaf) (state old-entry old-path old-path-len follow)
       (%p1-with-resolved (new-dir new-leaf) (state new-entry new-path new-path-len nil
                                            :create-p t)
+        ;; linkat accepts only AT_SYMLINK_FOLLOW or 0:
+        ;; AT_SYMLINK_NOFOLLOW (0x100) is EINVAL there.
         (%p1-check (%libc-linkat old-dir old-leaf new-dir new-leaf
-                                 (if follow +at-symlink-follow+
-                                     +at-symlink-nofollow+)))
+                                 (if follow +at-symlink-follow+ 0)))
+        (%p1-dir-cache-invalidate new-entry)
         +p1-success+))))
 
 (defun %p1-rights-fdflags-open (entry oflags fdflags)
@@ -1391,6 +1603,12 @@ from the rights the guest asked for on the new descriptor."
     ;; the result slot is validated BEFORE any host side effect and
     ;; before a guest fd is installed.
     (%p1-check-range state out-ptr 4)
+    ;; The host access mode comes from the rights the guest asked for:
+    ;; a write right means the host open itself must be writable, so
+    ;; `path_open "." O_DIRECTORY (FD_READ|FD_WRITE)' fails with EISDIR
+    ;; exactly as POSIX `open' does. A directory therefore only opens
+    ;; read-only; callers that do not ask for write (the preopen base
+    ;; rights contain none) never make the host demand it.
     (let ((access (cond ((and (logtest rights-base +p1-right-fd-write+)
                                (logtest rights-base +p1-right-fd-read+))
                          +o-rdwr+)
@@ -1411,18 +1629,31 @@ from the rights the guest asked for on the new descriptor."
                   (multiple-value-bind (dev ino mode) (%p1-fstat new-fd)
                     (declare (ignore dev ino))
                     (let* ((filetype (%p1-filetype-of-mode mode))
+                           (dir-p (= filetype +p1-file-directory+))
+                           ;; A directory handle cannot seek, tell, allocate
+                           ;; or be truncated, so those requested rights are
+                           ;; not granted on it (`directory_seek' asserts the
+                           ;; opened directory has no FD_SEEK). The
+                           ;; INHERITING rights are the authority for opens
+                           ;; BELOW the new descriptor and stay intact.
+                           (granted (if dir-p
+                                        (logand rights-base
+                                                (lognot +p1-rights-not-on-directory+))
+                                        rights-base))
                            (new (%make-p1-fd
                                  :fd new-fd
                                  :kind :file
                                  :preopen (p1-fd-preopen entry)
                                  :name ""
-                                 :rights-base rights-base
+                                 :rights-base granted
                                  :rights-inheriting rights-inheriting
                                  :flags fdflags
-                                 :dir-p (= filetype +p1-file-directory+)
+                                 :dir-p dir-p
                                  :filetype filetype)))
                       (setf guest-fd (%p1-add-fd state new))
                       (setf (%p1-u32 state out-ptr) guest-fd)
+                      (when (logtest oflags +p1-oflag-creat+)
+                        (%p1-dir-cache-invalidate entry))
                       +p1-success+))
                 (p1-abort (c)
                   ;; release BOTH the host handle and the ABI slot: a
@@ -1459,6 +1690,7 @@ from the rights the guest asked for on the new descriptor."
       ;; valid unlinkat flag (the kernel answers EINVAL), and removing
       ;; a directory never follows a symlink in the first place.
       (%p1-check (%libc-unlinkat dir leaf +at-removedir+))
+      (%p1-dir-cache-invalidate entry)
       +p1-success+)))
 
 (%p1-fn %p1-path-rename (state fd old-addr old-len new-fd new-addr new-len)
@@ -1468,19 +1700,28 @@ from the rights the guest asked for on the new descriptor."
       (%p1-with-resolved (new-dir new-leaf) (state new-entry new-addr new-len nil
                                            :create-p t)
         (%p1-check (%libc-renameat old-dir old-leaf new-dir new-leaf))
+        (%p1-dir-cache-invalidate old-entry)
+        (%p1-dir-cache-invalidate new-entry)
         +p1-success+))))
 
 (%p1-fn %p1-path-symlink (state old-addr old-len fd new-addr new-len)
   (let ((entry (%p1-require (%p1-lookup-fd state fd) +p1-right-path-symlink+))
         (target (%p1-bytes->string (%p1-string state old-addr old-len))))
+    ;; An absolute target can never be resolved inside the sandbox, so
+    ;; creating it is NOTCAPABLE (the same rule the resolver applies
+    ;; when expanding a link).
+    (when (and (plusp (length target)) (char= (char target 0) #\/))
+      (%p1-abort +p1-notcapable+))
     (%p1-with-resolved (dir leaf) (state entry new-addr new-len nil :create-p t)
       (%p1-check (%libc-symlinkat target dir leaf))
+      (%p1-dir-cache-invalidate entry)
       +p1-success+)))
 
 (%p1-fn %p1-path-unlink-file (state fd path-addr path-len)
   (let ((entry (%p1-require (%p1-lookup-fd state fd) +p1-right-path-unlink-file+)))
     (%p1-with-resolved (dir leaf) (state entry path-addr path-len nil)
       (%p1-check (%libc-unlinkat dir leaf 0))
+      (%p1-dir-cache-invalidate entry)
       +p1-success+)))
 
 ;;; ---- process / scheduling / entropy
@@ -1629,6 +1870,11 @@ from the rights the guest asked for on the new descriptor."
                                       +p1-right-poll-fd-readwrite+)))
              (push (list :index i :userdata userdata :type type
                          :fd fd :entry entry
+                         ;; REVENTS is present from the start: later
+                         ;; `(setf (getf s :revents) ...)' mutates the
+                         ;; shared plist cell. Adding a missing key would
+                         ;; only rebind the loop-local variable.
+                         :revents 0
                          ;; a CL stream has no host fd to poll: the
                          ;; embedder handed us a stream, so readiness is
                          ;; "data is available now" — report it ready
@@ -1829,15 +2075,19 @@ normalized) deadline; an fd subscription when poll reported a revents
     ("sock_shutdown" . %p1-sock-shutdown)))
 
 (defun %p1-preopen-rights (preopen)
-  "The rights a preopen's EXPLICIT permissions grant."
+  "The (values BASE INHERITING) rights a preopen's EXPLICIT
+permissions grant. BASE describes the directory handle itself;
+INHERITING is the authority a path_open below it may request."
   (let ((perms (wasi-preopen-permissions preopen)))
     (cond
       ((and (member "write" perms :test #'string=)
             (member "mutate-directory" perms :test #'string=))
-       +p1-rights-all+)
+       (values +p1-rights-dir-write+
+               (logior +p1-rights-dir-write+ +p1-rights-file-write+)))
       ((member "read" perms :test #'string=)
-       +p1-rights-dir-read-only+)
-      (t 0))))
+       (values +p1-rights-dir-read-only+
+               (logior +p1-rights-dir-read-only+ +p1-rights-file-read-only+)))
+      (t (values 0 0)))))
 
 (defun %p1-install-stdio (state context)
   "Fill the stdio slots from the context's EXPLICIT streams. A stream
@@ -1863,16 +2113,17 @@ the context does not grant leaves its fd invalid."
 (defun %p1-install-preopens (state context)
   (loop for pre in (wasi-context-preopens context)
         for fd from 3
-        do (setf (gethash fd (preview1-state-fds state))
-                 (%make-p1-fd :fd (wasi-preopen-fd pre)
-                             :kind :file
-                             :preopen (wasi-preopen-fd pre)
-                             :name (wasi-preopen-name pre)
-                             :rights-base (%p1-preopen-rights pre)
-                             :rights-inheriting (%p1-preopen-rights pre)
-                             :owned-p nil
-                             :dir-p t
-                             :filetype +p1-file-directory+))))
+        do (multiple-value-bind (base inheriting) (%p1-preopen-rights pre)
+             (setf (gethash fd (preview1-state-fds state))
+                   (%make-p1-fd :fd (wasi-preopen-fd pre)
+                               :kind :file
+                               :preopen (wasi-preopen-fd pre)
+                               :name (wasi-preopen-name pre)
+                               :rights-base base
+                               :rights-inheriting inheriting
+                               :owned-p nil
+                               :dir-p t
+                               :filetype +p1-file-directory+)))))
 
 (defun %p1-install-sockets (state sockets)
   "SOCKETS is an explicit fd -> native-capability alist (an integer

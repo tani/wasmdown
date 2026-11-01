@@ -763,6 +763,8 @@ BACKEND-ENTRY-COUNTS), with the counters reset before the run."
                                (memory (export \"memory\") 1)
                                (data (i32.const 32) \"/etc/passwd\")
                                (data (i32.const 48) \"../../etc/passwd\")
+                               ;; a NUL never appears in a path
+                               (data (i32.const 80) \"a.txt\\00\")
                                (func $try (param i32 i32) (result i32)
                                  (call $open (i32.const 3) (i32.const 1)
                                              (local.get 0) (local.get 1)
@@ -771,12 +773,15 @@ BACKEND-ENTRY-COUNTS), with the counters reset before the run."
                                (func (export \"absolute\") (result i32)
                                  (call $try (i32.const 32) (i32.const 11)))
                                (func (export \"escape\") (result i32)
-                                 (call $try (i32.const 48) (i32.const 17))))"
+                                 (call $try (i32.const 48) (i32.const 16)))
+                               (func (export \"nul\") (result i32)
+                                 (call $try (i32.const 80) (i32.const 6))))"
                              ctx)
              (let ((slots (hash-table-count
                            (wasmdown.wasi::preview1-state-fds state))))
                (is= 76 (p1-call instance "absolute")) ; notcapable
                (is= 76 (p1-call instance "escape"))
+               (is= 25 (p1-call instance "nul"))
                (let ((before (fd-count)))
                  (dotimes (i 100)
                    (is= 76 (p1-call instance "absolute"))
@@ -892,3 +897,145 @@ BACKEND-ENTRY-COUNTS), with the counters reset before the run."
                ;; the same path opens again: no handle or ABI slot survived
                (is= 0 (run (p1-open-then "" :exit-import-p t)))))
         (wasmdown.wasi:close-wasi-preopen preopen)))))
+
+;;; ---------------------------------------------------------------
+;;; Directory authority and handle-relative resolution (upstream
+;;; wasi-testsuite regressions: path_open_dirfd_not_dir family,
+;;; directory_seek, fdopendir-with-access, fd_readdir, poll_oneoff).
+
+(test wasi-preview1/preopen-directory-rights-are-split
+  ;; A preopen's BASE rights describe the directory handle (no byte
+  ;; stream rights); INHERITING is what a path_open below it may ask
+  ;; for. wasi-libc derives the host access mode from the requested
+  ;; rights, so advertising FD_WRITE in base made every `open(dir)'
+  ;; an O_RDWR directory open: EISDIR.
+  (with-temp-dir (dir)
+    (let* ((preopen (wasmdown.wasi:open-wasi-preopen dir :name "/"))
+           (ctx (p1-context :preopens (list preopen))))
+      (unwind-protect
+           (multiple-value-bind (instance state)
+               (p1-instance "(module
+                               (import \"wasi_snapshot_preview1\" \"fd_fdstat_get\"
+                                       (func $fs (param i32 i32) (result i32)))
+                               (import \"wasi_snapshot_preview1\" \"path_open\"
+                                       (func $open (param i32 i32 i32 i32 i32 i64 i64 i32 i32)
+                                             (result i32)))
+                               (memory (export \"memory\") 1)
+                               (data (i32.const 64) \".\")
+                               (func (export \"fdstat\") (result i32)
+                                 (call $fs (i32.const 3) (i32.const 0)))
+                               ;; open \".\" with the preopen's own rights
+                               (func (export \"open-base\") (result i32)
+                                 (i32.store (i32.const 240)
+                                            (call $fs (i32.const 3) (i32.const 0)))
+                                 (call $open (i32.const 3) (i32.const 0)
+                                             (i32.const 64) (i32.const 1)
+                                             (i32.const 2)
+                                             (i64.load (i32.const 8))
+                                             (i64.load (i32.const 16))
+                                             (i32.const 0) (i32.const 200)))
+                               ;; read|write on a directory is EISDIR (31)
+                               (func (export \"open-rw\") (result i32)
+                                 (call $open (i32.const 3) (i32.const 0)
+                                             (i32.const 64) (i32.const 1)
+                                             (i32.const 2) (i64.const 66) (i64.const 0)
+                                             (i32.const 0) (i32.const 200))))"
+                             ctx)
+             (is= 0 (p1-call instance "fdstat"))
+             (let ((base (p1-u64 state 8))
+                   (inh (p1-u64 state 16)))
+               ;; no byte-stream rights on the directory handle itself
+               (is= 0 (logand 64 base))  ; fd_write
+               (is= 0 (logand 2 base))   ; fd_read
+               (is= 0 (logand 4 base))   ; fd_seek
+               ;; but the descendants may request them
+               (is= 64 (logand 64 inh))
+               (is= 2 (logand 2 inh)))
+             (is= 0 (p1-call instance "open-base"))
+             (is= 3 (p1-u32 state 0)) ; fdstat filetype directory
+             ;; the opened directory carries no fd_seek right
+             (is= 0 (logand 4 (p1-u64 state 8)))
+             (is= 31 (p1-call instance "open-rw")))
+        (wasmdown.wasi:close-wasi-preopen preopen)))))
+
+(test wasi-preview1/path-lookup-is-handle-relative
+  ;; path_filestat_get(subdir_fd, "a.txt") must name subdir/a.txt, not
+  ;; <preopen>/a.txt (the fdopendir-with-access regression).
+  (with-temp-dir (dir)
+    (write-text-file (merge-pathnames "a.txt" (pathname dir)) "root")
+    (ensure-directories-exist (merge-pathnames "sub/" (pathname dir)))
+    (write-text-file (merge-pathnames "sub/a.txt" (pathname dir)) "nested!")
+    (let* ((preopen (wasmdown.wasi:open-wasi-preopen dir :name "/"))
+           (ctx (p1-context :preopens (list preopen))))
+      (unwind-protect
+           (multiple-value-bind (instance state)
+               (p1-instance "(module
+                               (import \"wasi_snapshot_preview1\" \"path_open\"
+                                       (func $open (param i32 i32 i32 i32 i32 i64 i64 i32 i32)
+                                             (result i32)))
+                               (import \"wasi_snapshot_preview1\" \"path_filestat_get\"
+                                       (func $pfs (param i32 i32 i32 i32 i32) (result i32)))
+                               (memory (export \"memory\") 1)
+                               (data (i32.const 32) \"sub\")
+                               (data (i32.const 40) \"a.txt\")
+                               (func (export \"stat-through-sub\") (result i32)
+                                 ;; rights: path_open | path_filestat_get
+                                 (i32.store (i32.const 240)
+                                            (call $open (i32.const 3) (i32.const 0)
+                                                        (i32.const 32) (i32.const 3)
+                                                        (i32.const 2) (i64.const 270336)
+                                                        (i64.const 0) (i32.const 0)
+                                                        (i32.const 240)))
+                                 (call $pfs (i32.load (i32.const 240)) (i32.const 0)
+                                            (i32.const 40) (i32.const 5)
+                                            (i32.const 300))))"
+                             ctx)
+             (is= 0 (p1-call instance "stat-through-sub"))
+             ;; size 7 from sub/a.txt, and the open directory fd is
+             ;; itself statable
+             (is= 7 (p1-u64 state (+ 300 32))))
+        (wasmdown.wasi:close-wasi-preopen preopen)))))
+
+  (let* ((ctx (p1-context :stdin (make-string-input-stream "x"))))
+    (multiple-value-bind (instance state)
+        (p1-instance
+         "(module
+            (import \"wasi_snapshot_preview1\" \"poll_oneoff\"
+                    (func $p (param i32 i32 i32 i32) (result i32)))
+            (memory (export \"memory\") 1)
+            (func (export \"go\") (result i32)
+              (i64.store (i32.const 0) (i64.const 0x1111))
+              (i32.store8 (i32.const 8) (i32.const 0))
+              (i32.store (i32.const 16) (i32.const 1))
+              (i64.store (i32.const 24) (i64.const 10000000000))
+              (i64.store (i32.const 32) (i64.const 0))
+              (i32.store16 (i32.const 40) (i32.const 0))
+              (i64.store (i32.const 48) (i64.const 0x2222))
+              (i32.store8 (i32.const 56) (i32.const 1))
+              (i32.store (i32.const 64) (i32.const 0))
+              (call $p (i32.const 0) (i32.const 256)
+                       (i32.const 2) (i32.const 300))))"
+         ctx)
+      (is= 0 (p1-call instance "go"))
+      (is= 1 (p1-u32 state 300))            ; only stdin is ready
+      (is= #x2222 (p1-u64 state 256))       ; its userdata
+      (is= 1 (aref (p1-bytes state) (+ 256 10)))))   ; fd_read event type
+
+(test wasi-preview1/renumber-requires-a-destination
+  ;; fd_renumber may only target an EXISTING descriptor.
+  (with-temp-dir (dir)
+   (let* ((preopen (wasmdown.wasi:open-wasi-preopen dir :name "/"))
+          (ctx (p1-context :preopens (list preopen)))
+         (instance (p1-instance
+                    "(module
+                       (import \"wasi_snapshot_preview1\" \"fd_renumber\"
+                               (func $r (param i32 i32) (result i32)))
+                       (memory (export \"memory\") 1)
+                       (func (export \"bad-dest\") (result i32)
+                         (call $r (i32.const 3) (i32.const 25)))
+                       (func (export \"self\") (result i32)
+                         (call $r (i32.const 3) (i32.const 3))))"
+                    ctx)))
+     (is= 8 (p1-call instance "bad-dest"))   ; badf
+     (is= 0 (p1-call instance "self"))
+     (wasmdown.wasi:close-wasi-preopen preopen))))

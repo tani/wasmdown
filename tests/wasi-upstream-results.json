@@ -1,0 +1,1311 @@
+{
+  "adapter": {
+    "name": "wasmdown",
+    "path": "adapters/wasmdown.py",
+    "timeout_seconds": 60.0,
+    "version": "0.0.1",
+    "wasi_versions": [
+      "wasm32-wasip1",
+      "wasm32-wasip3"
+    ],
+    "wasi_worlds": [
+      "wasi:cli/command"
+    ]
+  },
+  "failures": {
+    "by_kind": {
+      "expectation-mismatch": 2,
+      "link-mixed-release-lines": 23
+    },
+    "entries": [
+      {
+        "kinds": [
+          "link-mixed-release-lines"
+        ],
+        "messages": [
+          "Wait(exit_code=0) failed: expected 0, got 1\n\n==STDERR==\nwasmdown: link error: component mixes WASI release lines (wasi:cli/environment@0.3.2, wasi:io/poll@0.2.9, wasi:clocks/monotonic-clock@0.2.9, wasi:io/error@0.2.9, wasi:io/streams@0.2.9, wasi:cli/stdout@0.2.9, wasi:cli/stderr@0.2.9, wasi:cli/stdin@0.2.9, wasi:cli/environment@0.2.9, wasi:cli/exit@0.2.9, wasi:cli/terminal-input@0.2.9, wasi:cli/terminal-output@0.2.9, wasi:cli/terminal-stdin@0.2.9, wasi:cli/terminal-stdout@0.2.9, wasi:cli/terminal-stderr@0.2.9); no single provider graph applies\n"
+        ],
+        "suite": "WASI Rust tests [wasm32-wasip3]",
+        "test": "cli-env"
+      },
+      {
+        "kinds": [
+          "link-mixed-release-lines"
+        ],
+        "messages": [
+          "Wait(exit_code=0) failed: expected 0, got 1\n\n==STDERR==\nwasmdown: link error: component mixes WASI release lines (wasi:cli/types@0.3.2, wasi:cli/stdin@0.3.2, wasi:cli/stdout@0.3.2, wasi:cli/stderr@0.3.2, wasi:io/poll@0.2.9, wasi:clocks/monotonic-clock@0.2.9, wasi:io/error@0.2.9, wasi:io/streams@0.2.9, wasi:cli/stdout@0.2.9, wasi:cli/stderr@0.2.9, wasi:cli/stdin@0.2.9, wasi:cli/environment@0.2.9, wasi:cli/exit@0.2.9, wasi:cli/terminal-input@0.2.9, wasi:cli/terminal-output@0.2.9, wasi:cli/terminal-stdin@0.2.9, wasi:cli/terminal-stdout@0.2.9, wasi:cli/terminal-stderr@0.2.9); no single provider graph applies\n"
+        ],
+        "suite": "WASI Rust tests [wasm32-wasip3]",
+        "test": "cli-stdio"
+      },
+      {
+        "kinds": [
+          "expectation-mismatch",
+          "link-mixed-release-lines"
+        ],
+        "messages": [
+          "Read(id='stdout', payload='Hello, world!') stdout failed: expected Hello, world!, got ",
+          "\n\n==STDERR==\nwasmdown: link error: component mixes WASI release lines (wasi:cli/types@0.3.2, wasi:cli/stdin@0.3.2, wasi:cli/stdout@0.3.2, wasi:cli/stderr@0.3.2, wasi:io/poll@0.2.9, wasi:clocks/monotonic-clock@0.2.9, wasi:io/error@0.2.9, wasi:io/streams@0.2.9, wasi:cli/stdout@0.2.9, wasi:cli/stderr@0.2.9, wasi:cli/stdin@0.2.9, wasi:cli/environment@0.2.9, wasi:cli/exit@0.2.9, wasi:cli/terminal-input@0.2.9, wasi:cli/terminal-output@0.2.9, wasi:cli/terminal-stdin@0.2.9, wasi:cli/terminal-stdout@0.2.9, wasi:cli/terminal-stderr@0.2.9); no single provider graph applies\n"
+        ],
+        "suite": "WASI Rust tests [wasm32-wasip3]",
+        "test": "cli-stdio-roundtrip"
+      },
+      {
+        "kinds": [
+          "expectation-mismatch",
+          "link-mixed-release-lines"
+        ],
+        "messages": [
+          "Read(id='stdout', payload='READY') stdout failed: expected READY, got ",
+          "\n\n==STDERR==\nwasmdown: link error: component mixes WASI release lines (wasi:cli/types@0.3.2, wasi:cli/stdin@0.3.2, wasi:cli/stdout@0.3.2, wasi:io/poll@0.2.9, wasi:clocks/monotonic-clock@0.2.9, wasi:io/error@0.2.9, wasi:io/streams@0.2.9, wasi:cli/stdout@0.2.9, wasi:cli/stderr@0.2.9, wasi:cli/stdin@0.2.9, wasi:cli/environment@0.2.9, wasi:cli/exit@0.2.9, wasi:cli/terminal-input@0.2.9, wasi:cli/terminal-output@0.2.9, wasi:cli/terminal-stdin@0.2.9, wasi:cli/terminal-stdout@0.2.9, wasi:cli/terminal-stderr@0.2.9); no single provider graph applies\n"
+        ],
+        "suite": "WASI Rust tests [wasm32-wasip3]",
+        "test": "cli-stdout-flush"
+      },
+      {
+        "kinds": [
+          "link-mixed-release-lines"
+        ],
+        "messages": [
+          "Wait(exit_code=0) failed: expected 0, got 1\n\n==STDERR==\nwasmdown: link error: component mixes WASI release lines (wasi:cli/terminal-input@0.3.2, wasi:cli/terminal-output@0.3.2, wasi:cli/terminal-stdin@0.3.2, wasi:cli/terminal-stdout@0.3.2, wasi:cli/terminal-stderr@0.3.2, wasi:io/poll@0.2.9, wasi:clocks/monotonic-clock@0.2.9, wasi:io/error@0.2.9, wasi:io/streams@0.2.9, wasi:cli/stdout@0.2.9, wasi:cli/stderr@0.2.9, wasi:cli/stdin@0.2.9, wasi:cli/environment@0.2.9, wasi:cli/exit@0.2.9, wasi:cli/terminal-input@0.2.9, wasi:cli/terminal-output@0.2.9, wasi:cli/terminal-stdin@0.2.9, wasi:cli/terminal-stdout@0.2.9, wasi:cli/terminal-stderr@0.2.9); no single provider graph applies\n"
+        ],
+        "suite": "WASI Rust tests [wasm32-wasip3]",
+        "test": "cli-terminal"
+      },
+      {
+        "kinds": [
+          "link-mixed-release-lines"
+        ],
+        "messages": [
+          "Wait(exit_code=0) failed: expected 0, got 1\n\n==STDERR==\nwasmdown: link error: component mixes WASI release lines (wasi:clocks/system-clock@0.3.2, wasi:filesystem/types@0.3.2, wasi:filesystem/preopens@0.3.2, wasi:io/poll@0.2.9, wasi:clocks/monotonic-clock@0.2.9, wasi:io/error@0.2.9, wasi:io/streams@0.2.9, wasi:cli/stdout@0.2.9, wasi:cli/stderr@0.2.9, wasi:cli/stdin@0.2.9, wasi:cli/environment@0.2.9, wasi:cli/exit@0.2.9, wasi:cli/terminal-input@0.2.9, wasi:cli/terminal-output@0.2.9, wasi:cli/terminal-stdin@0.2.9, wasi:cli/terminal-stdout@0.2.9, wasi:cli/terminal-stderr@0.2.9); no single provider graph applies\n"
+        ],
+        "suite": "WASI Rust tests [wasm32-wasip3]",
+        "test": "filesystem-advise"
+      },
+      {
+        "kinds": [
+          "link-mixed-release-lines"
+        ],
+        "messages": [
+          "Wait(exit_code=0) failed: expected 0, got 1\n\n==STDERR==\nwasmdown: link error: component mixes WASI release lines (wasi:filesystem/types@0.3.2, wasi:filesystem/preopens@0.3.2, wasi:io/poll@0.2.9, wasi:clocks/monotonic-clock@0.2.9, wasi:io/error@0.2.9, wasi:io/streams@0.2.9, wasi:cli/stdout@0.2.9, wasi:cli/stderr@0.2.9, wasi:cli/stdin@0.2.9, wasi:cli/environment@0.2.9, wasi:cli/exit@0.2.9, wasi:cli/terminal-input@0.2.9, wasi:cli/terminal-output@0.2.9, wasi:cli/terminal-stdin@0.2.9, wasi:cli/terminal-stdout@0.2.9, wasi:cli/terminal-stderr@0.2.9); no single provider graph applies\n"
+        ],
+        "suite": "WASI Rust tests [wasm32-wasip3]",
+        "test": "filesystem-dotdot"
+      },
+      {
+        "kinds": [
+          "link-mixed-release-lines"
+        ],
+        "messages": [
+          "Wait(exit_code=0) failed: expected 0, got 1\n\n==STDERR==\nwasmdown: link error: component mixes WASI release lines (wasi:filesystem/types@0.3.2, wasi:filesystem/preopens@0.3.2, wasi:io/poll@0.2.9, wasi:clocks/monotonic-clock@0.2.9, wasi:io/error@0.2.9, wasi:io/streams@0.2.9, wasi:cli/stdout@0.2.9, wasi:cli/stderr@0.2.9, wasi:cli/stdin@0.2.9, wasi:cli/environment@0.2.9, wasi:cli/exit@0.2.9, wasi:cli/terminal-input@0.2.9, wasi:cli/terminal-output@0.2.9, wasi:cli/terminal-stdin@0.2.9, wasi:cli/terminal-stdout@0.2.9, wasi:cli/terminal-stderr@0.2.9); no single provider graph applies\n"
+        ],
+        "suite": "WASI Rust tests [wasm32-wasip3]",
+        "test": "filesystem-flags-and-type"
+      },
+      {
+        "kinds": [
+          "link-mixed-release-lines"
+        ],
+        "messages": [
+          "Wait(exit_code=0) failed: expected 0, got 1\n\n==STDERR==\nwasmdown: link error: component mixes WASI release lines (wasi:filesystem/types@0.3.2, wasi:filesystem/preopens@0.3.2, wasi:io/poll@0.2.9, wasi:clocks/monotonic-clock@0.2.9, wasi:io/error@0.2.9, wasi:io/streams@0.2.9, wasi:cli/stdout@0.2.9, wasi:cli/stderr@0.2.9, wasi:cli/stdin@0.2.9, wasi:cli/environment@0.2.9, wasi:cli/exit@0.2.9, wasi:cli/terminal-input@0.2.9, wasi:cli/terminal-output@0.2.9, wasi:cli/terminal-stdin@0.2.9, wasi:cli/terminal-stdout@0.2.9, wasi:cli/terminal-stderr@0.2.9); no single provider graph applies\n"
+        ],
+        "suite": "WASI Rust tests [wasm32-wasip3]",
+        "test": "filesystem-hard-links"
+      },
+      {
+        "kinds": [
+          "link-mixed-release-lines"
+        ],
+        "messages": [
+          "Wait(exit_code=0) failed: expected 0, got 1\n\n==STDERR==\nwasmdown: link error: component mixes WASI release lines (wasi:clocks/system-clock@0.3.2, wasi:filesystem/types@0.3.2, wasi:filesystem/preopens@0.3.2, wasi:io/poll@0.2.9, wasi:clocks/monotonic-clock@0.2.9, wasi:io/error@0.2.9, wasi:io/streams@0.2.9, wasi:cli/stdout@0.2.9, wasi:cli/stderr@0.2.9, wasi:cli/stdin@0.2.9, wasi:cli/environment@0.2.9, wasi:cli/exit@0.2.9, wasi:cli/terminal-input@0.2.9, wasi:cli/terminal-output@0.2.9, wasi:cli/terminal-stdin@0.2.9, wasi:cli/terminal-stdout@0.2.9, wasi:cli/terminal-stderr@0.2.9); no single provider graph applies\n"
+        ],
+        "suite": "WASI Rust tests [wasm32-wasip3]",
+        "test": "filesystem-io"
+      },
+      {
+        "kinds": [
+          "link-mixed-release-lines"
+        ],
+        "messages": [
+          "Wait(exit_code=0) failed: expected 0, got 1\n\n==STDERR==\nwasmdown: link error: component mixes WASI release lines (wasi:filesystem/types@0.3.2, wasi:filesystem/preopens@0.3.2, wasi:io/poll@0.2.9, wasi:clocks/monotonic-clock@0.2.9, wasi:io/error@0.2.9, wasi:io/streams@0.2.9, wasi:cli/stdout@0.2.9, wasi:cli/stderr@0.2.9, wasi:cli/stdin@0.2.9, wasi:cli/environment@0.2.9, wasi:cli/exit@0.2.9, wasi:cli/terminal-input@0.2.9, wasi:cli/terminal-output@0.2.9, wasi:cli/terminal-stdin@0.2.9, wasi:cli/terminal-stdout@0.2.9, wasi:cli/terminal-stderr@0.2.9); no single provider graph applies\n"
+        ],
+        "suite": "WASI Rust tests [wasm32-wasip3]",
+        "test": "filesystem-is-same-object"
+      },
+      {
+        "kinds": [
+          "link-mixed-release-lines"
+        ],
+        "messages": [
+          "Wait(exit_code=0) failed: expected 0, got 1\n\n==STDERR==\nwasmdown: link error: component mixes WASI release lines (wasi:clocks/system-clock@0.3.2, wasi:filesystem/types@0.3.2, wasi:filesystem/preopens@0.3.2, wasi:io/poll@0.2.9, wasi:clocks/monotonic-clock@0.2.9, wasi:io/error@0.2.9, wasi:io/streams@0.2.9, wasi:cli/stdout@0.2.9, wasi:cli/stderr@0.2.9, wasi:cli/stdin@0.2.9, wasi:cli/environment@0.2.9, wasi:cli/exit@0.2.9, wasi:cli/terminal-input@0.2.9, wasi:cli/terminal-output@0.2.9, wasi:cli/terminal-stdin@0.2.9, wasi:cli/terminal-stdout@0.2.9, wasi:cli/terminal-stderr@0.2.9); no single provider graph applies\n"
+        ],
+        "suite": "WASI Rust tests [wasm32-wasip3]",
+        "test": "filesystem-metadata-hash"
+      },
+      {
+        "kinds": [
+          "link-mixed-release-lines"
+        ],
+        "messages": [
+          "Wait(exit_code=0) failed: expected 0, got 1\n\n==STDERR==\nwasmdown: link error: component mixes WASI release lines (wasi:filesystem/types@0.3.2, wasi:filesystem/preopens@0.3.2, wasi:io/poll@0.2.9, wasi:clocks/monotonic-clock@0.2.9, wasi:io/error@0.2.9, wasi:io/streams@0.2.9, wasi:cli/stdout@0.2.9, wasi:cli/stderr@0.2.9, wasi:cli/stdin@0.2.9, wasi:cli/environment@0.2.9, wasi:cli/exit@0.2.9, wasi:cli/terminal-input@0.2.9, wasi:cli/terminal-output@0.2.9, wasi:cli/terminal-stdin@0.2.9, wasi:cli/terminal-stdout@0.2.9, wasi:cli/terminal-stderr@0.2.9); no single provider graph applies\n"
+        ],
+        "suite": "WASI Rust tests [wasm32-wasip3]",
+        "test": "filesystem-mkdir-rmdir"
+      },
+      {
+        "kinds": [
+          "link-mixed-release-lines"
+        ],
+        "messages": [
+          "Wait(exit_code=0) failed: expected 0, got 1\n\n==STDERR==\nwasmdown: link error: component mixes WASI release lines (wasi:filesystem/types@0.3.2, wasi:filesystem/preopens@0.3.2, wasi:io/poll@0.2.9, wasi:clocks/monotonic-clock@0.2.9, wasi:io/error@0.2.9, wasi:io/streams@0.2.9, wasi:cli/stdout@0.2.9, wasi:cli/stderr@0.2.9, wasi:cli/stdin@0.2.9, wasi:cli/environment@0.2.9, wasi:cli/exit@0.2.9, wasi:cli/terminal-input@0.2.9, wasi:cli/terminal-output@0.2.9, wasi:cli/terminal-stdin@0.2.9, wasi:cli/terminal-stdout@0.2.9, wasi:cli/terminal-stderr@0.2.9); no single provider graph applies\n"
+        ],
+        "suite": "WASI Rust tests [wasm32-wasip3]",
+        "test": "filesystem-open-errors"
+      },
+      {
+        "kinds": [
+          "link-mixed-release-lines"
+        ],
+        "messages": [
+          "Wait(exit_code=0) failed: expected 0, got 1\n\n==STDERR==\nwasmdown: link error: component mixes WASI release lines (wasi:filesystem/types@0.3.2, wasi:filesystem/preopens@0.3.2, wasi:io/poll@0.2.9, wasi:clocks/monotonic-clock@0.2.9, wasi:io/error@0.2.9, wasi:io/streams@0.2.9, wasi:cli/stdout@0.2.9, wasi:cli/stderr@0.2.9, wasi:cli/stdin@0.2.9, wasi:cli/environment@0.2.9, wasi:cli/exit@0.2.9, wasi:cli/terminal-input@0.2.9, wasi:cli/terminal-output@0.2.9, wasi:cli/terminal-stdin@0.2.9, wasi:cli/terminal-stdout@0.2.9, wasi:cli/terminal-stderr@0.2.9); no single provider graph applies\n"
+        ],
+        "suite": "WASI Rust tests [wasm32-wasip3]",
+        "test": "filesystem-read-directory"
+      },
+      {
+        "kinds": [
+          "link-mixed-release-lines"
+        ],
+        "messages": [
+          "Wait(exit_code=0) failed: expected 0, got 1\n\n==STDERR==\nwasmdown: link error: component mixes WASI release lines (wasi:filesystem/types@0.3.2, wasi:filesystem/preopens@0.3.2, wasi:io/poll@0.2.9, wasi:clocks/monotonic-clock@0.2.9, wasi:io/error@0.2.9, wasi:io/streams@0.2.9, wasi:cli/stdout@0.2.9, wasi:cli/stderr@0.2.9, wasi:cli/stdin@0.2.9, wasi:cli/environment@0.2.9, wasi:cli/exit@0.2.9, wasi:cli/terminal-input@0.2.9, wasi:cli/terminal-output@0.2.9, wasi:cli/terminal-stdin@0.2.9, wasi:cli/terminal-stdout@0.2.9, wasi:cli/terminal-stderr@0.2.9); no single provider graph applies\n"
+        ],
+        "suite": "WASI Rust tests [wasm32-wasip3]",
+        "test": "filesystem-rename"
+      },
+      {
+        "kinds": [
+          "link-mixed-release-lines"
+        ],
+        "messages": [
+          "Wait(exit_code=0) failed: expected 0, got 1\n\n==STDERR==\nwasmdown: link error: component mixes WASI release lines (wasi:clocks/system-clock@0.3.2, wasi:filesystem/types@0.3.2, wasi:filesystem/preopens@0.3.2, wasi:io/poll@0.2.9, wasi:clocks/monotonic-clock@0.2.9, wasi:io/error@0.2.9, wasi:io/streams@0.2.9, wasi:cli/stdout@0.2.9, wasi:cli/stderr@0.2.9, wasi:cli/stdin@0.2.9, wasi:cli/environment@0.2.9, wasi:cli/exit@0.2.9, wasi:cli/terminal-input@0.2.9, wasi:cli/terminal-output@0.2.9, wasi:cli/terminal-stdin@0.2.9, wasi:cli/terminal-stdout@0.2.9, wasi:cli/terminal-stderr@0.2.9); no single provider graph applies\n"
+        ],
+        "suite": "WASI Rust tests [wasm32-wasip3]",
+        "test": "filesystem-set-size"
+      },
+      {
+        "kinds": [
+          "link-mixed-release-lines"
+        ],
+        "messages": [
+          "Wait(exit_code=0) failed: expected 0, got 1\n\n==STDERR==\nwasmdown: link error: component mixes WASI release lines (wasi:clocks/system-clock@0.3.2, wasi:filesystem/types@0.3.2, wasi:filesystem/preopens@0.3.2, wasi:io/poll@0.2.9, wasi:clocks/monotonic-clock@0.2.9, wasi:io/error@0.2.9, wasi:io/streams@0.2.9, wasi:cli/stdout@0.2.9, wasi:cli/stderr@0.2.9, wasi:cli/stdin@0.2.9, wasi:cli/environment@0.2.9, wasi:cli/exit@0.2.9, wasi:cli/terminal-input@0.2.9, wasi:cli/terminal-output@0.2.9, wasi:cli/terminal-stdin@0.2.9, wasi:cli/terminal-stdout@0.2.9, wasi:cli/terminal-stderr@0.2.9); no single provider graph applies\n"
+        ],
+        "suite": "WASI Rust tests [wasm32-wasip3]",
+        "test": "filesystem-stat"
+      },
+      {
+        "kinds": [
+          "link-mixed-release-lines"
+        ],
+        "messages": [
+          "Wait(exit_code=0) failed: expected 0, got 1\n\n==STDERR==\nwasmdown: link error: component mixes WASI release lines (wasi:filesystem/types@0.3.2, wasi:filesystem/preopens@0.3.2, wasi:io/poll@0.2.9, wasi:clocks/monotonic-clock@0.2.9, wasi:io/error@0.2.9, wasi:io/streams@0.2.9, wasi:cli/stdout@0.2.9, wasi:cli/stderr@0.2.9, wasi:cli/stdin@0.2.9, wasi:cli/environment@0.2.9, wasi:cli/exit@0.2.9, wasi:cli/terminal-input@0.2.9, wasi:cli/terminal-output@0.2.9, wasi:cli/terminal-stdin@0.2.9, wasi:cli/terminal-stdout@0.2.9, wasi:cli/terminal-stderr@0.2.9); no single provider graph applies\n"
+        ],
+        "suite": "WASI Rust tests [wasm32-wasip3]",
+        "test": "filesystem-unlink-errors"
+      },
+      {
+        "kinds": [
+          "link-mixed-release-lines"
+        ],
+        "messages": [
+          "Wait(exit_code=0) failed: expected 0, got 1\n\n==STDERR==\nwasmdown: link error: component mixes WASI release lines (wasi:clocks/types@0.3.2, wasi:clocks/monotonic-clock@0.3.2, wasi:io/poll@0.2.9, wasi:clocks/monotonic-clock@0.2.9, wasi:io/error@0.2.9, wasi:io/streams@0.2.9, wasi:cli/stdout@0.2.9, wasi:cli/stderr@0.2.9, wasi:cli/stdin@0.2.9, wasi:cli/environment@0.2.9, wasi:cli/exit@0.2.9, wasi:cli/terminal-input@0.2.9, wasi:cli/terminal-output@0.2.9, wasi:cli/terminal-stdin@0.2.9, wasi:cli/terminal-stdout@0.2.9, wasi:cli/terminal-stderr@0.2.9); no single provider graph applies\n"
+        ],
+        "suite": "WASI Rust tests [wasm32-wasip3]",
+        "test": "monotonic-clock"
+      },
+      {
+        "kinds": [
+          "link-mixed-release-lines"
+        ],
+        "messages": [
+          "Wait(exit_code=0) failed: expected 0, got 1\n\n==STDERR==\nwasmdown: link error: component mixes WASI release lines (wasi:clocks/monotonic-clock@0.3.2, wasi:io/poll@0.2.9, wasi:clocks/monotonic-clock@0.2.9, wasi:io/error@0.2.9, wasi:io/streams@0.2.9, wasi:cli/stdout@0.2.9, wasi:cli/stderr@0.2.9, wasi:cli/stdin@0.2.9, wasi:cli/environment@0.2.9, wasi:cli/exit@0.2.9, wasi:cli/terminal-input@0.2.9, wasi:cli/terminal-output@0.2.9, wasi:cli/terminal-stdin@0.2.9, wasi:cli/terminal-stdout@0.2.9, wasi:cli/terminal-stderr@0.2.9); no single provider graph applies\n"
+        ],
+        "suite": "WASI Rust tests [wasm32-wasip3]",
+        "test": "multi-clock-wait"
+      },
+      {
+        "kinds": [
+          "link-mixed-release-lines"
+        ],
+        "messages": [
+          "Wait(exit_code=0) failed: expected 0, got 1\n\n==STDERR==\nwasmdown: link error: component mixes WASI release lines (wasi:random/random@0.3.2, wasi:random/insecure@0.3.2, wasi:random/insecure-seed@0.3.2, wasi:io/poll@0.2.9, wasi:clocks/monotonic-clock@0.2.9, wasi:io/error@0.2.9, wasi:io/streams@0.2.9, wasi:cli/stdout@0.2.9, wasi:cli/stderr@0.2.9, wasi:cli/stdin@0.2.9, wasi:cli/environment@0.2.9, wasi:cli/exit@0.2.9, wasi:cli/terminal-input@0.2.9, wasi:cli/terminal-output@0.2.9, wasi:cli/terminal-stdin@0.2.9, wasi:cli/terminal-stdout@0.2.9, wasi:cli/terminal-stderr@0.2.9); no single provider graph applies\n"
+        ],
+        "suite": "WASI Rust tests [wasm32-wasip3]",
+        "test": "random"
+      },
+      {
+        "kinds": [
+          "link-mixed-release-lines"
+        ],
+        "messages": [
+          "Wait(exit_code=0) failed: expected 0, got 1\n\n==STDERR==\nwasmdown: link error: component mixes WASI release lines (wasi:clocks/types@0.3.2, wasi:clocks/system-clock@0.3.2, wasi:io/poll@0.2.9, wasi:clocks/monotonic-clock@0.2.9, wasi:io/error@0.2.9, wasi:io/streams@0.2.9, wasi:cli/stdout@0.2.9, wasi:cli/stderr@0.2.9, wasi:cli/stdin@0.2.9, wasi:cli/environment@0.2.9, wasi:cli/exit@0.2.9, wasi:cli/terminal-input@0.2.9, wasi:cli/terminal-output@0.2.9, wasi:cli/terminal-stdin@0.2.9, wasi:cli/terminal-stdout@0.2.9, wasi:cli/terminal-stderr@0.2.9); no single provider graph applies\n"
+        ],
+        "suite": "WASI Rust tests [wasm32-wasip3]",
+        "test": "wall-clock"
+      }
+    ]
+  },
+  "schema": "wasmdown.wasi-upstream.v1",
+  "skips": {
+    "by_category": {
+      "legacy-network-imports": 2,
+      "proposal-http": 18,
+      "proposal-sockets": 12
+    },
+    "declared_reasons": {
+      "legacy-network-imports": "network communication is outside the declared support profile; the four legacy wasi_snapshot_preview1 sock_* imports are excluded (2026-11-02)",
+      "proposal-http": "wasi:http is unsupported by design (permanent exclusion, 2026-11-02; PLAN.md M16 slice 5 / M17) - not an implementation gap",
+      "proposal-sockets": "network communication (wasi:sockets TCP/UDP/DNS) is outside the declared support profile (permanent exclusion, 2026-11-02)"
+    },
+    "entries": [
+      {
+        "category": "legacy-network-imports",
+        "reason": "network communication is outside the declared support profile; the four legacy wasi_snapshot_preview1 sock_* imports are excluded (2026-11-02)",
+        "suite": "WASI C tests [wasm32-wasip1]",
+        "test": "sock_shutdown-invalid_fd"
+      },
+      {
+        "category": "legacy-network-imports",
+        "reason": "network communication is outside the declared support profile; the four legacy wasi_snapshot_preview1 sock_* imports are excluded (2026-11-02)",
+        "suite": "WASI C tests [wasm32-wasip1]",
+        "test": "sock_shutdown-not_sock"
+      },
+      {
+        "category": "proposal-http",
+        "reason": "wasi:http is unsupported by design (permanent exclusion, 2026-11-02; PLAN.md M16 slice 5 / M17) - not an implementation gap",
+        "suite": "WASI Rust tests [wasm32-wasip3]",
+        "test": "http-client"
+      },
+      {
+        "category": "proposal-http",
+        "reason": "wasi:http is unsupported by design (permanent exclusion, 2026-11-02; PLAN.md M16 slice 5 / M17) - not an implementation gap",
+        "suite": "WASI Rust tests [wasm32-wasip3]",
+        "test": "http-client-chunked"
+      },
+      {
+        "category": "proposal-http",
+        "reason": "wasi:http is unsupported by design (permanent exclusion, 2026-11-02; PLAN.md M16 slice 5 / M17) - not an implementation gap",
+        "suite": "WASI Rust tests [wasm32-wasip3]",
+        "test": "http-client-headers"
+      },
+      {
+        "category": "proposal-http",
+        "reason": "wasi:http is unsupported by design (permanent exclusion, 2026-11-02; PLAN.md M16 slice 5 / M17) - not an implementation gap",
+        "suite": "WASI Rust tests [wasm32-wasip3]",
+        "test": "http-client-method"
+      },
+      {
+        "category": "proposal-http",
+        "reason": "wasi:http is unsupported by design (permanent exclusion, 2026-11-02; PLAN.md M16 slice 5 / M17) - not an implementation gap",
+        "suite": "WASI Rust tests [wasm32-wasip3]",
+        "test": "http-client-path"
+      },
+      {
+        "category": "proposal-http",
+        "reason": "wasi:http is unsupported by design (permanent exclusion, 2026-11-02; PLAN.md M16 slice 5 / M17) - not an implementation gap",
+        "suite": "WASI Rust tests [wasm32-wasip3]",
+        "test": "http-client-path-none"
+      },
+      {
+        "category": "proposal-http",
+        "reason": "wasi:http is unsupported by design (permanent exclusion, 2026-11-02; PLAN.md M16 slice 5 / M17) - not an implementation gap",
+        "suite": "WASI Rust tests [wasm32-wasip3]",
+        "test": "http-client-send-errors"
+      },
+      {
+        "category": "proposal-http",
+        "reason": "wasi:http is unsupported by design (permanent exclusion, 2026-11-02; PLAN.md M16 slice 5 / M17) - not an implementation gap",
+        "suite": "WASI Rust tests [wasm32-wasip3]",
+        "test": "http-client-sent"
+      },
+      {
+        "category": "proposal-http",
+        "reason": "wasi:http is unsupported by design (permanent exclusion, 2026-11-02; PLAN.md M16 slice 5 / M17) - not an implementation gap",
+        "suite": "WASI Rust tests [wasm32-wasip3]",
+        "test": "http-client-status"
+      },
+      {
+        "category": "proposal-http",
+        "reason": "wasi:http is unsupported by design (permanent exclusion, 2026-11-02; PLAN.md M16 slice 5 / M17) - not an implementation gap",
+        "suite": "WASI Rust tests [wasm32-wasip3]",
+        "test": "http-client-trailer-error"
+      },
+      {
+        "category": "proposal-http",
+        "reason": "wasi:http is unsupported by design (permanent exclusion, 2026-11-02; PLAN.md M16 slice 5 / M17) - not an implementation gap",
+        "suite": "WASI Rust tests [wasm32-wasip3]",
+        "test": "http-client-trailers"
+      },
+      {
+        "category": "proposal-http",
+        "reason": "wasi:http is unsupported by design (permanent exclusion, 2026-11-02; PLAN.md M16 slice 5 / M17) - not an implementation gap",
+        "suite": "WASI Rust tests [wasm32-wasip3]",
+        "test": "http-fields"
+      },
+      {
+        "category": "proposal-http",
+        "reason": "wasi:http is unsupported by design (permanent exclusion, 2026-11-02; PLAN.md M16 slice 5 / M17) - not an implementation gap",
+        "suite": "WASI Rust tests [wasm32-wasip3]",
+        "test": "http-request"
+      },
+      {
+        "category": "proposal-http",
+        "reason": "wasi:http is unsupported by design (permanent exclusion, 2026-11-02; PLAN.md M16 slice 5 / M17) - not an implementation gap",
+        "suite": "WASI Rust tests [wasm32-wasip3]",
+        "test": "http-request-options"
+      },
+      {
+        "category": "proposal-http",
+        "reason": "wasi:http is unsupported by design (permanent exclusion, 2026-11-02; PLAN.md M16 slice 5 / M17) - not an implementation gap",
+        "suite": "WASI Rust tests [wasm32-wasip3]",
+        "test": "http-response"
+      },
+      {
+        "category": "proposal-http",
+        "reason": "wasi:http is unsupported by design (permanent exclusion, 2026-11-02; PLAN.md M16 slice 5 / M17) - not an implementation gap",
+        "suite": "WASI Rust tests [wasm32-wasip3]",
+        "test": "http-service"
+      },
+      {
+        "category": "proposal-http",
+        "reason": "wasi:http is unsupported by design (permanent exclusion, 2026-11-02; PLAN.md M16 slice 5 / M17) - not an implementation gap",
+        "suite": "WASI Rust tests [wasm32-wasip3]",
+        "test": "http-service-echo"
+      },
+      {
+        "category": "proposal-http",
+        "reason": "wasi:http is unsupported by design (permanent exclusion, 2026-11-02; PLAN.md M16 slice 5 / M17) - not an implementation gap",
+        "suite": "WASI Rust tests [wasm32-wasip3]",
+        "test": "http-service-uri"
+      },
+      {
+        "category": "proposal-sockets",
+        "reason": "network communication (wasi:sockets TCP/UDP/DNS) is outside the declared support profile (permanent exclusion, 2026-11-02)",
+        "suite": "WASI Rust tests [wasm32-wasip3]",
+        "test": "sockets-echo"
+      },
+      {
+        "category": "proposal-sockets",
+        "reason": "network communication (wasi:sockets TCP/UDP/DNS) is outside the declared support profile (permanent exclusion, 2026-11-02)",
+        "suite": "WASI Rust tests [wasm32-wasip3]",
+        "test": "sockets-tcp-bind"
+      },
+      {
+        "category": "proposal-sockets",
+        "reason": "network communication (wasi:sockets TCP/UDP/DNS) is outside the declared support profile (permanent exclusion, 2026-11-02)",
+        "suite": "WASI Rust tests [wasm32-wasip3]",
+        "test": "sockets-tcp-connect"
+      },
+      {
+        "category": "proposal-sockets",
+        "reason": "network communication (wasi:sockets TCP/UDP/DNS) is outside the declared support profile (permanent exclusion, 2026-11-02)",
+        "suite": "WASI Rust tests [wasm32-wasip3]",
+        "test": "sockets-tcp-listen"
+      },
+      {
+        "category": "proposal-sockets",
+        "reason": "network communication (wasi:sockets TCP/UDP/DNS) is outside the declared support profile (permanent exclusion, 2026-11-02)",
+        "suite": "WASI Rust tests [wasm32-wasip3]",
+        "test": "sockets-tcp-properties"
+      },
+      {
+        "category": "proposal-sockets",
+        "reason": "network communication (wasi:sockets TCP/UDP/DNS) is outside the declared support profile (permanent exclusion, 2026-11-02)",
+        "suite": "WASI Rust tests [wasm32-wasip3]",
+        "test": "sockets-tcp-receive"
+      },
+      {
+        "category": "proposal-sockets",
+        "reason": "network communication (wasi:sockets TCP/UDP/DNS) is outside the declared support profile (permanent exclusion, 2026-11-02)",
+        "suite": "WASI Rust tests [wasm32-wasip3]",
+        "test": "sockets-tcp-send"
+      },
+      {
+        "category": "proposal-sockets",
+        "reason": "network communication (wasi:sockets TCP/UDP/DNS) is outside the declared support profile (permanent exclusion, 2026-11-02)",
+        "suite": "WASI Rust tests [wasm32-wasip3]",
+        "test": "sockets-udp-bind"
+      },
+      {
+        "category": "proposal-sockets",
+        "reason": "network communication (wasi:sockets TCP/UDP/DNS) is outside the declared support profile (permanent exclusion, 2026-11-02)",
+        "suite": "WASI Rust tests [wasm32-wasip3]",
+        "test": "sockets-udp-connect"
+      },
+      {
+        "category": "proposal-sockets",
+        "reason": "network communication (wasi:sockets TCP/UDP/DNS) is outside the declared support profile (permanent exclusion, 2026-11-02)",
+        "suite": "WASI Rust tests [wasm32-wasip3]",
+        "test": "sockets-udp-properties"
+      },
+      {
+        "category": "proposal-sockets",
+        "reason": "network communication (wasi:sockets TCP/UDP/DNS) is outside the declared support profile (permanent exclusion, 2026-11-02)",
+        "suite": "WASI Rust tests [wasm32-wasip3]",
+        "test": "sockets-udp-receive"
+      },
+      {
+        "category": "proposal-sockets",
+        "reason": "network communication (wasi:sockets TCP/UDP/DNS) is outside the declared support profile (permanent exclusion, 2026-11-02)",
+        "suite": "WASI Rust tests [wasm32-wasip3]",
+        "test": "sockets-udp-send"
+      }
+    ]
+  },
+  "suites": [
+    {
+      "failed": 0,
+      "name": "WASI AssemblyScript tests [wasm32-wasip1]",
+      "passed": 12,
+      "runtime": {
+        "name": "wasmdown",
+        "version": "0.0.1"
+      },
+      "skipped": 0,
+      "tests": [
+        {
+          "executed": true,
+          "name": "args_get-multiple-arguments",
+          "outcome": "pass"
+        },
+        {
+          "executed": true,
+          "name": "args_sizes_get-multiple-arguments",
+          "outcome": "pass"
+        },
+        {
+          "executed": true,
+          "name": "args_sizes_get-no-arguments",
+          "outcome": "pass"
+        },
+        {
+          "executed": true,
+          "name": "environ_get-multiple-variables",
+          "outcome": "pass"
+        },
+        {
+          "executed": true,
+          "name": "environ_sizes_get-multiple-variables",
+          "outcome": "pass"
+        },
+        {
+          "executed": true,
+          "name": "environ_sizes_get-no-variables",
+          "outcome": "pass"
+        },
+        {
+          "executed": true,
+          "name": "fd_write-to-invalid-fd",
+          "outcome": "pass"
+        },
+        {
+          "executed": true,
+          "name": "fd_write-to-stdout",
+          "outcome": "pass"
+        },
+        {
+          "executed": true,
+          "name": "proc_exit-failure",
+          "outcome": "pass"
+        },
+        {
+          "executed": true,
+          "name": "proc_exit-success",
+          "outcome": "pass"
+        },
+        {
+          "executed": true,
+          "name": "random_get-non-zero-length",
+          "outcome": "pass"
+        },
+        {
+          "executed": true,
+          "name": "random_get-zero-length",
+          "outcome": "pass"
+        }
+      ],
+      "xfailed": 0,
+      "xpassed": 0
+    },
+    {
+      "failed": 0,
+      "name": "WASI C tests [wasm32-wasip1]",
+      "passed": 12,
+      "runtime": {
+        "name": "wasmdown",
+        "version": "0.0.1"
+      },
+      "skipped": 2,
+      "tests": [
+        {
+          "executed": true,
+          "name": "clock_getres-monotonic",
+          "outcome": "pass"
+        },
+        {
+          "executed": true,
+          "name": "clock_getres-realtime",
+          "outcome": "pass"
+        },
+        {
+          "executed": true,
+          "name": "clock_gettime-monotonic",
+          "outcome": "pass"
+        },
+        {
+          "executed": true,
+          "name": "clock_gettime-realtime",
+          "outcome": "pass"
+        },
+        {
+          "executed": true,
+          "name": "fdopendir-with-access",
+          "outcome": "pass"
+        },
+        {
+          "executed": true,
+          "name": "fopen-with-access",
+          "outcome": "pass"
+        },
+        {
+          "executed": true,
+          "name": "fopen-with-no-access",
+          "outcome": "pass"
+        },
+        {
+          "executed": true,
+          "name": "lseek",
+          "outcome": "pass"
+        },
+        {
+          "executed": true,
+          "name": "pread-with-access",
+          "outcome": "pass"
+        },
+        {
+          "executed": true,
+          "name": "pwrite-with-access",
+          "outcome": "pass"
+        },
+        {
+          "executed": true,
+          "name": "pwrite-with-append",
+          "outcome": "pass"
+        },
+        {
+          "executed": false,
+          "name": "sock_shutdown-invalid_fd",
+          "outcome": "skip"
+        },
+        {
+          "executed": false,
+          "name": "sock_shutdown-not_sock",
+          "outcome": "skip"
+        },
+        {
+          "executed": true,
+          "name": "stat-dev-ino",
+          "outcome": "pass"
+        }
+      ],
+      "xfailed": 0,
+      "xpassed": 0
+    },
+    {
+      "failed": 0,
+      "name": "WASI Rust tests [wasm32-wasip1]",
+      "passed": 46,
+      "runtime": {
+        "name": "wasmdown",
+        "version": "0.0.1"
+      },
+      "skipped": 0,
+      "tests": [
+        {
+          "executed": true,
+          "name": "big_random_buf",
+          "outcome": "pass"
+        },
+        {
+          "executed": true,
+          "name": "clock_time_get",
+          "outcome": "pass"
+        },
+        {
+          "executed": true,
+          "name": "close_preopen",
+          "outcome": "pass"
+        },
+        {
+          "executed": true,
+          "name": "dangling_fd",
+          "outcome": "pass"
+        },
+        {
+          "executed": true,
+          "name": "dangling_symlink",
+          "outcome": "pass"
+        },
+        {
+          "executed": true,
+          "name": "dir_fd_op_failures",
+          "outcome": "pass"
+        },
+        {
+          "executed": true,
+          "name": "directory_seek",
+          "outcome": "pass"
+        },
+        {
+          "executed": true,
+          "name": "fd_advise",
+          "outcome": "pass"
+        },
+        {
+          "executed": true,
+          "name": "fd_fdstat_set_rights",
+          "outcome": "pass"
+        },
+        {
+          "executed": true,
+          "name": "fd_filestat_set",
+          "outcome": "pass"
+        },
+        {
+          "executed": true,
+          "name": "fd_flags_set",
+          "outcome": "pass"
+        },
+        {
+          "executed": true,
+          "name": "fd_readdir",
+          "outcome": "pass"
+        },
+        {
+          "executed": true,
+          "name": "file_allocate",
+          "outcome": "pass"
+        },
+        {
+          "executed": true,
+          "name": "file_pread_pwrite",
+          "outcome": "pass"
+        },
+        {
+          "executed": true,
+          "name": "file_seek_tell",
+          "outcome": "pass"
+        },
+        {
+          "executed": true,
+          "name": "file_truncation",
+          "outcome": "pass"
+        },
+        {
+          "executed": true,
+          "name": "file_unbuffered_write",
+          "outcome": "pass"
+        },
+        {
+          "executed": true,
+          "name": "fstflags_validate",
+          "outcome": "pass"
+        },
+        {
+          "executed": true,
+          "name": "interesting_paths",
+          "outcome": "pass"
+        },
+        {
+          "executed": true,
+          "name": "isatty",
+          "outcome": "pass"
+        },
+        {
+          "executed": true,
+          "name": "nofollow_errors",
+          "outcome": "pass"
+        },
+        {
+          "executed": true,
+          "name": "overwrite_preopen",
+          "outcome": "pass"
+        },
+        {
+          "executed": true,
+          "name": "path_exists",
+          "outcome": "pass"
+        },
+        {
+          "executed": true,
+          "name": "path_filestat",
+          "outcome": "pass"
+        },
+        {
+          "executed": true,
+          "name": "path_link",
+          "outcome": "pass"
+        },
+        {
+          "executed": true,
+          "name": "path_open_create_existing",
+          "outcome": "pass"
+        },
+        {
+          "executed": true,
+          "name": "path_open_dirfd_not_dir",
+          "outcome": "pass"
+        },
+        {
+          "executed": true,
+          "name": "path_open_missing",
+          "outcome": "pass"
+        },
+        {
+          "executed": true,
+          "name": "path_open_nonblock",
+          "outcome": "pass"
+        },
+        {
+          "executed": true,
+          "name": "path_open_preopen",
+          "outcome": "pass"
+        },
+        {
+          "executed": true,
+          "name": "path_open_read_write",
+          "outcome": "pass"
+        },
+        {
+          "executed": true,
+          "name": "path_rename",
+          "outcome": "pass"
+        },
+        {
+          "executed": true,
+          "name": "path_rename_dir_trailing_slashes",
+          "outcome": "pass"
+        },
+        {
+          "executed": true,
+          "name": "path_symlink_trailing_slashes",
+          "outcome": "pass"
+        },
+        {
+          "executed": true,
+          "name": "poll_oneoff_stdio",
+          "outcome": "pass"
+        },
+        {
+          "executed": true,
+          "name": "readlink",
+          "outcome": "pass"
+        },
+        {
+          "executed": true,
+          "name": "remove_directory_trailing_slashes",
+          "outcome": "pass"
+        },
+        {
+          "executed": true,
+          "name": "remove_nonempty_directory",
+          "outcome": "pass"
+        },
+        {
+          "executed": true,
+          "name": "renumber",
+          "outcome": "pass"
+        },
+        {
+          "executed": true,
+          "name": "sched_yield",
+          "outcome": "pass"
+        },
+        {
+          "executed": true,
+          "name": "stdio",
+          "outcome": "pass"
+        },
+        {
+          "executed": true,
+          "name": "symlink_create",
+          "outcome": "pass"
+        },
+        {
+          "executed": true,
+          "name": "symlink_filestat",
+          "outcome": "pass"
+        },
+        {
+          "executed": true,
+          "name": "symlink_loop",
+          "outcome": "pass"
+        },
+        {
+          "executed": true,
+          "name": "truncation_rights",
+          "outcome": "pass"
+        },
+        {
+          "executed": true,
+          "name": "unlink_file_trailing_slashes",
+          "outcome": "pass"
+        }
+      ],
+      "xfailed": 0,
+      "xpassed": 0
+    },
+    {
+      "failed": 23,
+      "name": "WASI Rust tests [wasm32-wasip3]",
+      "passed": 2,
+      "runtime": {
+        "name": "wasmdown",
+        "version": "0.0.1"
+      },
+      "skipped": 30,
+      "tests": [
+        {
+          "executed": true,
+          "failure_kind": [
+            "link-mixed-release-lines"
+          ],
+          "failures": [
+            "Wait(exit_code=0) failed: expected 0, got 1\n\n==STDERR==\nwasmdown: link error: component mixes WASI release lines (wasi:cli/environment@0.3.2, wasi:io/poll@0.2.9, wasi:clocks/monotonic-clock@0.2.9, wasi:io/error@0.2.9, wasi:io/streams@0.2.9, wasi:cli/stdout@0.2.9, wasi:cli/stderr@0.2.9, wasi:cli/stdin@0.2.9, wasi:cli/environment@0.2.9, wasi:cli/exit@0.2.9, wasi:cli/terminal-input@0.2.9, wasi:cli/terminal-output@0.2.9, wasi:cli/terminal-stdin@0.2.9, wasi:cli/terminal-stdout@0.2.9, wasi:cli/terminal-stderr@0.2.9); no single provider graph applies\n"
+          ],
+          "name": "cli-env",
+          "outcome": "fail"
+        },
+        {
+          "executed": true,
+          "name": "cli-exit",
+          "outcome": "pass"
+        },
+        {
+          "executed": true,
+          "failure_kind": [
+            "link-mixed-release-lines"
+          ],
+          "failures": [
+            "Wait(exit_code=0) failed: expected 0, got 1\n\n==STDERR==\nwasmdown: link error: component mixes WASI release lines (wasi:cli/types@0.3.2, wasi:cli/stdin@0.3.2, wasi:cli/stdout@0.3.2, wasi:cli/stderr@0.3.2, wasi:io/poll@0.2.9, wasi:clocks/monotonic-clock@0.2.9, wasi:io/error@0.2.9, wasi:io/streams@0.2.9, wasi:cli/stdout@0.2.9, wasi:cli/stderr@0.2.9, wasi:cli/stdin@0.2.9, wasi:cli/environment@0.2.9, wasi:cli/exit@0.2.9, wasi:cli/terminal-input@0.2.9, wasi:cli/terminal-output@0.2.9, wasi:cli/terminal-stdin@0.2.9, wasi:cli/terminal-stdout@0.2.9, wasi:cli/terminal-stderr@0.2.9); no single provider graph applies\n"
+          ],
+          "name": "cli-stdio",
+          "outcome": "fail"
+        },
+        {
+          "executed": true,
+          "failure_kind": [
+            "expectation-mismatch",
+            "link-mixed-release-lines"
+          ],
+          "failures": [
+            "Read(id='stdout', payload='Hello, world!') stdout failed: expected Hello, world!, got ",
+            "\n\n==STDERR==\nwasmdown: link error: component mixes WASI release lines (wasi:cli/types@0.3.2, wasi:cli/stdin@0.3.2, wasi:cli/stdout@0.3.2, wasi:cli/stderr@0.3.2, wasi:io/poll@0.2.9, wasi:clocks/monotonic-clock@0.2.9, wasi:io/error@0.2.9, wasi:io/streams@0.2.9, wasi:cli/stdout@0.2.9, wasi:cli/stderr@0.2.9, wasi:cli/stdin@0.2.9, wasi:cli/environment@0.2.9, wasi:cli/exit@0.2.9, wasi:cli/terminal-input@0.2.9, wasi:cli/terminal-output@0.2.9, wasi:cli/terminal-stdin@0.2.9, wasi:cli/terminal-stdout@0.2.9, wasi:cli/terminal-stderr@0.2.9); no single provider graph applies\n"
+          ],
+          "name": "cli-stdio-roundtrip",
+          "outcome": "fail"
+        },
+        {
+          "executed": true,
+          "failure_kind": [
+            "expectation-mismatch",
+            "link-mixed-release-lines"
+          ],
+          "failures": [
+            "Read(id='stdout', payload='READY') stdout failed: expected READY, got ",
+            "\n\n==STDERR==\nwasmdown: link error: component mixes WASI release lines (wasi:cli/types@0.3.2, wasi:cli/stdin@0.3.2, wasi:cli/stdout@0.3.2, wasi:io/poll@0.2.9, wasi:clocks/monotonic-clock@0.2.9, wasi:io/error@0.2.9, wasi:io/streams@0.2.9, wasi:cli/stdout@0.2.9, wasi:cli/stderr@0.2.9, wasi:cli/stdin@0.2.9, wasi:cli/environment@0.2.9, wasi:cli/exit@0.2.9, wasi:cli/terminal-input@0.2.9, wasi:cli/terminal-output@0.2.9, wasi:cli/terminal-stdin@0.2.9, wasi:cli/terminal-stdout@0.2.9, wasi:cli/terminal-stderr@0.2.9); no single provider graph applies\n"
+          ],
+          "name": "cli-stdout-flush",
+          "outcome": "fail"
+        },
+        {
+          "executed": true,
+          "failure_kind": [
+            "link-mixed-release-lines"
+          ],
+          "failures": [
+            "Wait(exit_code=0) failed: expected 0, got 1\n\n==STDERR==\nwasmdown: link error: component mixes WASI release lines (wasi:cli/terminal-input@0.3.2, wasi:cli/terminal-output@0.3.2, wasi:cli/terminal-stdin@0.3.2, wasi:cli/terminal-stdout@0.3.2, wasi:cli/terminal-stderr@0.3.2, wasi:io/poll@0.2.9, wasi:clocks/monotonic-clock@0.2.9, wasi:io/error@0.2.9, wasi:io/streams@0.2.9, wasi:cli/stdout@0.2.9, wasi:cli/stderr@0.2.9, wasi:cli/stdin@0.2.9, wasi:cli/environment@0.2.9, wasi:cli/exit@0.2.9, wasi:cli/terminal-input@0.2.9, wasi:cli/terminal-output@0.2.9, wasi:cli/terminal-stdin@0.2.9, wasi:cli/terminal-stdout@0.2.9, wasi:cli/terminal-stderr@0.2.9); no single provider graph applies\n"
+          ],
+          "name": "cli-terminal",
+          "outcome": "fail"
+        },
+        {
+          "executed": true,
+          "failure_kind": [
+            "link-mixed-release-lines"
+          ],
+          "failures": [
+            "Wait(exit_code=0) failed: expected 0, got 1\n\n==STDERR==\nwasmdown: link error: component mixes WASI release lines (wasi:clocks/system-clock@0.3.2, wasi:filesystem/types@0.3.2, wasi:filesystem/preopens@0.3.2, wasi:io/poll@0.2.9, wasi:clocks/monotonic-clock@0.2.9, wasi:io/error@0.2.9, wasi:io/streams@0.2.9, wasi:cli/stdout@0.2.9, wasi:cli/stderr@0.2.9, wasi:cli/stdin@0.2.9, wasi:cli/environment@0.2.9, wasi:cli/exit@0.2.9, wasi:cli/terminal-input@0.2.9, wasi:cli/terminal-output@0.2.9, wasi:cli/terminal-stdin@0.2.9, wasi:cli/terminal-stdout@0.2.9, wasi:cli/terminal-stderr@0.2.9); no single provider graph applies\n"
+          ],
+          "name": "filesystem-advise",
+          "outcome": "fail"
+        },
+        {
+          "executed": true,
+          "failure_kind": [
+            "link-mixed-release-lines"
+          ],
+          "failures": [
+            "Wait(exit_code=0) failed: expected 0, got 1\n\n==STDERR==\nwasmdown: link error: component mixes WASI release lines (wasi:filesystem/types@0.3.2, wasi:filesystem/preopens@0.3.2, wasi:io/poll@0.2.9, wasi:clocks/monotonic-clock@0.2.9, wasi:io/error@0.2.9, wasi:io/streams@0.2.9, wasi:cli/stdout@0.2.9, wasi:cli/stderr@0.2.9, wasi:cli/stdin@0.2.9, wasi:cli/environment@0.2.9, wasi:cli/exit@0.2.9, wasi:cli/terminal-input@0.2.9, wasi:cli/terminal-output@0.2.9, wasi:cli/terminal-stdin@0.2.9, wasi:cli/terminal-stdout@0.2.9, wasi:cli/terminal-stderr@0.2.9); no single provider graph applies\n"
+          ],
+          "name": "filesystem-dotdot",
+          "outcome": "fail"
+        },
+        {
+          "executed": true,
+          "failure_kind": [
+            "link-mixed-release-lines"
+          ],
+          "failures": [
+            "Wait(exit_code=0) failed: expected 0, got 1\n\n==STDERR==\nwasmdown: link error: component mixes WASI release lines (wasi:filesystem/types@0.3.2, wasi:filesystem/preopens@0.3.2, wasi:io/poll@0.2.9, wasi:clocks/monotonic-clock@0.2.9, wasi:io/error@0.2.9, wasi:io/streams@0.2.9, wasi:cli/stdout@0.2.9, wasi:cli/stderr@0.2.9, wasi:cli/stdin@0.2.9, wasi:cli/environment@0.2.9, wasi:cli/exit@0.2.9, wasi:cli/terminal-input@0.2.9, wasi:cli/terminal-output@0.2.9, wasi:cli/terminal-stdin@0.2.9, wasi:cli/terminal-stdout@0.2.9, wasi:cli/terminal-stderr@0.2.9); no single provider graph applies\n"
+          ],
+          "name": "filesystem-flags-and-type",
+          "outcome": "fail"
+        },
+        {
+          "executed": true,
+          "failure_kind": [
+            "link-mixed-release-lines"
+          ],
+          "failures": [
+            "Wait(exit_code=0) failed: expected 0, got 1\n\n==STDERR==\nwasmdown: link error: component mixes WASI release lines (wasi:filesystem/types@0.3.2, wasi:filesystem/preopens@0.3.2, wasi:io/poll@0.2.9, wasi:clocks/monotonic-clock@0.2.9, wasi:io/error@0.2.9, wasi:io/streams@0.2.9, wasi:cli/stdout@0.2.9, wasi:cli/stderr@0.2.9, wasi:cli/stdin@0.2.9, wasi:cli/environment@0.2.9, wasi:cli/exit@0.2.9, wasi:cli/terminal-input@0.2.9, wasi:cli/terminal-output@0.2.9, wasi:cli/terminal-stdin@0.2.9, wasi:cli/terminal-stdout@0.2.9, wasi:cli/terminal-stderr@0.2.9); no single provider graph applies\n"
+          ],
+          "name": "filesystem-hard-links",
+          "outcome": "fail"
+        },
+        {
+          "executed": true,
+          "failure_kind": [
+            "link-mixed-release-lines"
+          ],
+          "failures": [
+            "Wait(exit_code=0) failed: expected 0, got 1\n\n==STDERR==\nwasmdown: link error: component mixes WASI release lines (wasi:clocks/system-clock@0.3.2, wasi:filesystem/types@0.3.2, wasi:filesystem/preopens@0.3.2, wasi:io/poll@0.2.9, wasi:clocks/monotonic-clock@0.2.9, wasi:io/error@0.2.9, wasi:io/streams@0.2.9, wasi:cli/stdout@0.2.9, wasi:cli/stderr@0.2.9, wasi:cli/stdin@0.2.9, wasi:cli/environment@0.2.9, wasi:cli/exit@0.2.9, wasi:cli/terminal-input@0.2.9, wasi:cli/terminal-output@0.2.9, wasi:cli/terminal-stdin@0.2.9, wasi:cli/terminal-stdout@0.2.9, wasi:cli/terminal-stderr@0.2.9); no single provider graph applies\n"
+          ],
+          "name": "filesystem-io",
+          "outcome": "fail"
+        },
+        {
+          "executed": true,
+          "failure_kind": [
+            "link-mixed-release-lines"
+          ],
+          "failures": [
+            "Wait(exit_code=0) failed: expected 0, got 1\n\n==STDERR==\nwasmdown: link error: component mixes WASI release lines (wasi:filesystem/types@0.3.2, wasi:filesystem/preopens@0.3.2, wasi:io/poll@0.2.9, wasi:clocks/monotonic-clock@0.2.9, wasi:io/error@0.2.9, wasi:io/streams@0.2.9, wasi:cli/stdout@0.2.9, wasi:cli/stderr@0.2.9, wasi:cli/stdin@0.2.9, wasi:cli/environment@0.2.9, wasi:cli/exit@0.2.9, wasi:cli/terminal-input@0.2.9, wasi:cli/terminal-output@0.2.9, wasi:cli/terminal-stdin@0.2.9, wasi:cli/terminal-stdout@0.2.9, wasi:cli/terminal-stderr@0.2.9); no single provider graph applies\n"
+          ],
+          "name": "filesystem-is-same-object",
+          "outcome": "fail"
+        },
+        {
+          "executed": true,
+          "failure_kind": [
+            "link-mixed-release-lines"
+          ],
+          "failures": [
+            "Wait(exit_code=0) failed: expected 0, got 1\n\n==STDERR==\nwasmdown: link error: component mixes WASI release lines (wasi:clocks/system-clock@0.3.2, wasi:filesystem/types@0.3.2, wasi:filesystem/preopens@0.3.2, wasi:io/poll@0.2.9, wasi:clocks/monotonic-clock@0.2.9, wasi:io/error@0.2.9, wasi:io/streams@0.2.9, wasi:cli/stdout@0.2.9, wasi:cli/stderr@0.2.9, wasi:cli/stdin@0.2.9, wasi:cli/environment@0.2.9, wasi:cli/exit@0.2.9, wasi:cli/terminal-input@0.2.9, wasi:cli/terminal-output@0.2.9, wasi:cli/terminal-stdin@0.2.9, wasi:cli/terminal-stdout@0.2.9, wasi:cli/terminal-stderr@0.2.9); no single provider graph applies\n"
+          ],
+          "name": "filesystem-metadata-hash",
+          "outcome": "fail"
+        },
+        {
+          "executed": true,
+          "failure_kind": [
+            "link-mixed-release-lines"
+          ],
+          "failures": [
+            "Wait(exit_code=0) failed: expected 0, got 1\n\n==STDERR==\nwasmdown: link error: component mixes WASI release lines (wasi:filesystem/types@0.3.2, wasi:filesystem/preopens@0.3.2, wasi:io/poll@0.2.9, wasi:clocks/monotonic-clock@0.2.9, wasi:io/error@0.2.9, wasi:io/streams@0.2.9, wasi:cli/stdout@0.2.9, wasi:cli/stderr@0.2.9, wasi:cli/stdin@0.2.9, wasi:cli/environment@0.2.9, wasi:cli/exit@0.2.9, wasi:cli/terminal-input@0.2.9, wasi:cli/terminal-output@0.2.9, wasi:cli/terminal-stdin@0.2.9, wasi:cli/terminal-stdout@0.2.9, wasi:cli/terminal-stderr@0.2.9); no single provider graph applies\n"
+          ],
+          "name": "filesystem-mkdir-rmdir",
+          "outcome": "fail"
+        },
+        {
+          "executed": true,
+          "failure_kind": [
+            "link-mixed-release-lines"
+          ],
+          "failures": [
+            "Wait(exit_code=0) failed: expected 0, got 1\n\n==STDERR==\nwasmdown: link error: component mixes WASI release lines (wasi:filesystem/types@0.3.2, wasi:filesystem/preopens@0.3.2, wasi:io/poll@0.2.9, wasi:clocks/monotonic-clock@0.2.9, wasi:io/error@0.2.9, wasi:io/streams@0.2.9, wasi:cli/stdout@0.2.9, wasi:cli/stderr@0.2.9, wasi:cli/stdin@0.2.9, wasi:cli/environment@0.2.9, wasi:cli/exit@0.2.9, wasi:cli/terminal-input@0.2.9, wasi:cli/terminal-output@0.2.9, wasi:cli/terminal-stdin@0.2.9, wasi:cli/terminal-stdout@0.2.9, wasi:cli/terminal-stderr@0.2.9); no single provider graph applies\n"
+          ],
+          "name": "filesystem-open-errors",
+          "outcome": "fail"
+        },
+        {
+          "executed": true,
+          "failure_kind": [
+            "link-mixed-release-lines"
+          ],
+          "failures": [
+            "Wait(exit_code=0) failed: expected 0, got 1\n\n==STDERR==\nwasmdown: link error: component mixes WASI release lines (wasi:filesystem/types@0.3.2, wasi:filesystem/preopens@0.3.2, wasi:io/poll@0.2.9, wasi:clocks/monotonic-clock@0.2.9, wasi:io/error@0.2.9, wasi:io/streams@0.2.9, wasi:cli/stdout@0.2.9, wasi:cli/stderr@0.2.9, wasi:cli/stdin@0.2.9, wasi:cli/environment@0.2.9, wasi:cli/exit@0.2.9, wasi:cli/terminal-input@0.2.9, wasi:cli/terminal-output@0.2.9, wasi:cli/terminal-stdin@0.2.9, wasi:cli/terminal-stdout@0.2.9, wasi:cli/terminal-stderr@0.2.9); no single provider graph applies\n"
+          ],
+          "name": "filesystem-read-directory",
+          "outcome": "fail"
+        },
+        {
+          "executed": true,
+          "failure_kind": [
+            "link-mixed-release-lines"
+          ],
+          "failures": [
+            "Wait(exit_code=0) failed: expected 0, got 1\n\n==STDERR==\nwasmdown: link error: component mixes WASI release lines (wasi:filesystem/types@0.3.2, wasi:filesystem/preopens@0.3.2, wasi:io/poll@0.2.9, wasi:clocks/monotonic-clock@0.2.9, wasi:io/error@0.2.9, wasi:io/streams@0.2.9, wasi:cli/stdout@0.2.9, wasi:cli/stderr@0.2.9, wasi:cli/stdin@0.2.9, wasi:cli/environment@0.2.9, wasi:cli/exit@0.2.9, wasi:cli/terminal-input@0.2.9, wasi:cli/terminal-output@0.2.9, wasi:cli/terminal-stdin@0.2.9, wasi:cli/terminal-stdout@0.2.9, wasi:cli/terminal-stderr@0.2.9); no single provider graph applies\n"
+          ],
+          "name": "filesystem-rename",
+          "outcome": "fail"
+        },
+        {
+          "executed": true,
+          "failure_kind": [
+            "link-mixed-release-lines"
+          ],
+          "failures": [
+            "Wait(exit_code=0) failed: expected 0, got 1\n\n==STDERR==\nwasmdown: link error: component mixes WASI release lines (wasi:clocks/system-clock@0.3.2, wasi:filesystem/types@0.3.2, wasi:filesystem/preopens@0.3.2, wasi:io/poll@0.2.9, wasi:clocks/monotonic-clock@0.2.9, wasi:io/error@0.2.9, wasi:io/streams@0.2.9, wasi:cli/stdout@0.2.9, wasi:cli/stderr@0.2.9, wasi:cli/stdin@0.2.9, wasi:cli/environment@0.2.9, wasi:cli/exit@0.2.9, wasi:cli/terminal-input@0.2.9, wasi:cli/terminal-output@0.2.9, wasi:cli/terminal-stdin@0.2.9, wasi:cli/terminal-stdout@0.2.9, wasi:cli/terminal-stderr@0.2.9); no single provider graph applies\n"
+          ],
+          "name": "filesystem-set-size",
+          "outcome": "fail"
+        },
+        {
+          "executed": true,
+          "failure_kind": [
+            "link-mixed-release-lines"
+          ],
+          "failures": [
+            "Wait(exit_code=0) failed: expected 0, got 1\n\n==STDERR==\nwasmdown: link error: component mixes WASI release lines (wasi:clocks/system-clock@0.3.2, wasi:filesystem/types@0.3.2, wasi:filesystem/preopens@0.3.2, wasi:io/poll@0.2.9, wasi:clocks/monotonic-clock@0.2.9, wasi:io/error@0.2.9, wasi:io/streams@0.2.9, wasi:cli/stdout@0.2.9, wasi:cli/stderr@0.2.9, wasi:cli/stdin@0.2.9, wasi:cli/environment@0.2.9, wasi:cli/exit@0.2.9, wasi:cli/terminal-input@0.2.9, wasi:cli/terminal-output@0.2.9, wasi:cli/terminal-stdin@0.2.9, wasi:cli/terminal-stdout@0.2.9, wasi:cli/terminal-stderr@0.2.9); no single provider graph applies\n"
+          ],
+          "name": "filesystem-stat",
+          "outcome": "fail"
+        },
+        {
+          "executed": true,
+          "failure_kind": [
+            "link-mixed-release-lines"
+          ],
+          "failures": [
+            "Wait(exit_code=0) failed: expected 0, got 1\n\n==STDERR==\nwasmdown: link error: component mixes WASI release lines (wasi:filesystem/types@0.3.2, wasi:filesystem/preopens@0.3.2, wasi:io/poll@0.2.9, wasi:clocks/monotonic-clock@0.2.9, wasi:io/error@0.2.9, wasi:io/streams@0.2.9, wasi:cli/stdout@0.2.9, wasi:cli/stderr@0.2.9, wasi:cli/stdin@0.2.9, wasi:cli/environment@0.2.9, wasi:cli/exit@0.2.9, wasi:cli/terminal-input@0.2.9, wasi:cli/terminal-output@0.2.9, wasi:cli/terminal-stdin@0.2.9, wasi:cli/terminal-stdout@0.2.9, wasi:cli/terminal-stderr@0.2.9); no single provider graph applies\n"
+          ],
+          "name": "filesystem-unlink-errors",
+          "outcome": "fail"
+        },
+        {
+          "executed": false,
+          "name": "http-client",
+          "outcome": "skip"
+        },
+        {
+          "executed": false,
+          "name": "http-client-chunked",
+          "outcome": "skip"
+        },
+        {
+          "executed": false,
+          "name": "http-client-headers",
+          "outcome": "skip"
+        },
+        {
+          "executed": false,
+          "name": "http-client-method",
+          "outcome": "skip"
+        },
+        {
+          "executed": false,
+          "name": "http-client-path",
+          "outcome": "skip"
+        },
+        {
+          "executed": false,
+          "name": "http-client-path-none",
+          "outcome": "skip"
+        },
+        {
+          "executed": false,
+          "name": "http-client-send-errors",
+          "outcome": "skip"
+        },
+        {
+          "executed": false,
+          "name": "http-client-sent",
+          "outcome": "skip"
+        },
+        {
+          "executed": false,
+          "name": "http-client-status",
+          "outcome": "skip"
+        },
+        {
+          "executed": false,
+          "name": "http-client-trailer-error",
+          "outcome": "skip"
+        },
+        {
+          "executed": false,
+          "name": "http-client-trailers",
+          "outcome": "skip"
+        },
+        {
+          "executed": false,
+          "name": "http-fields",
+          "outcome": "skip"
+        },
+        {
+          "executed": false,
+          "name": "http-request",
+          "outcome": "skip"
+        },
+        {
+          "executed": false,
+          "name": "http-request-options",
+          "outcome": "skip"
+        },
+        {
+          "executed": false,
+          "name": "http-response",
+          "outcome": "skip"
+        },
+        {
+          "executed": false,
+          "name": "http-service",
+          "outcome": "skip"
+        },
+        {
+          "executed": false,
+          "name": "http-service-echo",
+          "outcome": "skip"
+        },
+        {
+          "executed": false,
+          "name": "http-service-uri",
+          "outcome": "skip"
+        },
+        {
+          "executed": true,
+          "failure_kind": [
+            "link-mixed-release-lines"
+          ],
+          "failures": [
+            "Wait(exit_code=0) failed: expected 0, got 1\n\n==STDERR==\nwasmdown: link error: component mixes WASI release lines (wasi:clocks/types@0.3.2, wasi:clocks/monotonic-clock@0.3.2, wasi:io/poll@0.2.9, wasi:clocks/monotonic-clock@0.2.9, wasi:io/error@0.2.9, wasi:io/streams@0.2.9, wasi:cli/stdout@0.2.9, wasi:cli/stderr@0.2.9, wasi:cli/stdin@0.2.9, wasi:cli/environment@0.2.9, wasi:cli/exit@0.2.9, wasi:cli/terminal-input@0.2.9, wasi:cli/terminal-output@0.2.9, wasi:cli/terminal-stdin@0.2.9, wasi:cli/terminal-stdout@0.2.9, wasi:cli/terminal-stderr@0.2.9); no single provider graph applies\n"
+          ],
+          "name": "monotonic-clock",
+          "outcome": "fail"
+        },
+        {
+          "executed": true,
+          "failure_kind": [
+            "link-mixed-release-lines"
+          ],
+          "failures": [
+            "Wait(exit_code=0) failed: expected 0, got 1\n\n==STDERR==\nwasmdown: link error: component mixes WASI release lines (wasi:clocks/monotonic-clock@0.3.2, wasi:io/poll@0.2.9, wasi:clocks/monotonic-clock@0.2.9, wasi:io/error@0.2.9, wasi:io/streams@0.2.9, wasi:cli/stdout@0.2.9, wasi:cli/stderr@0.2.9, wasi:cli/stdin@0.2.9, wasi:cli/environment@0.2.9, wasi:cli/exit@0.2.9, wasi:cli/terminal-input@0.2.9, wasi:cli/terminal-output@0.2.9, wasi:cli/terminal-stdin@0.2.9, wasi:cli/terminal-stdout@0.2.9, wasi:cli/terminal-stderr@0.2.9); no single provider graph applies\n"
+          ],
+          "name": "multi-clock-wait",
+          "outcome": "fail"
+        },
+        {
+          "executed": true,
+          "failure_kind": [
+            "link-mixed-release-lines"
+          ],
+          "failures": [
+            "Wait(exit_code=0) failed: expected 0, got 1\n\n==STDERR==\nwasmdown: link error: component mixes WASI release lines (wasi:random/random@0.3.2, wasi:random/insecure@0.3.2, wasi:random/insecure-seed@0.3.2, wasi:io/poll@0.2.9, wasi:clocks/monotonic-clock@0.2.9, wasi:io/error@0.2.9, wasi:io/streams@0.2.9, wasi:cli/stdout@0.2.9, wasi:cli/stderr@0.2.9, wasi:cli/stdin@0.2.9, wasi:cli/environment@0.2.9, wasi:cli/exit@0.2.9, wasi:cli/terminal-input@0.2.9, wasi:cli/terminal-output@0.2.9, wasi:cli/terminal-stdin@0.2.9, wasi:cli/terminal-stdout@0.2.9, wasi:cli/terminal-stderr@0.2.9); no single provider graph applies\n"
+          ],
+          "name": "random",
+          "outcome": "fail"
+        },
+        {
+          "executed": true,
+          "name": "run-with-err",
+          "outcome": "pass"
+        },
+        {
+          "executed": false,
+          "name": "sockets-echo",
+          "outcome": "skip"
+        },
+        {
+          "executed": false,
+          "name": "sockets-tcp-bind",
+          "outcome": "skip"
+        },
+        {
+          "executed": false,
+          "name": "sockets-tcp-connect",
+          "outcome": "skip"
+        },
+        {
+          "executed": false,
+          "name": "sockets-tcp-listen",
+          "outcome": "skip"
+        },
+        {
+          "executed": false,
+          "name": "sockets-tcp-properties",
+          "outcome": "skip"
+        },
+        {
+          "executed": false,
+          "name": "sockets-tcp-receive",
+          "outcome": "skip"
+        },
+        {
+          "executed": false,
+          "name": "sockets-tcp-send",
+          "outcome": "skip"
+        },
+        {
+          "executed": false,
+          "name": "sockets-udp-bind",
+          "outcome": "skip"
+        },
+        {
+          "executed": false,
+          "name": "sockets-udp-connect",
+          "outcome": "skip"
+        },
+        {
+          "executed": false,
+          "name": "sockets-udp-properties",
+          "outcome": "skip"
+        },
+        {
+          "executed": false,
+          "name": "sockets-udp-receive",
+          "outcome": "skip"
+        },
+        {
+          "executed": false,
+          "name": "sockets-udp-send",
+          "outcome": "skip"
+        },
+        {
+          "executed": true,
+          "failure_kind": [
+            "link-mixed-release-lines"
+          ],
+          "failures": [
+            "Wait(exit_code=0) failed: expected 0, got 1\n\n==STDERR==\nwasmdown: link error: component mixes WASI release lines (wasi:clocks/types@0.3.2, wasi:clocks/system-clock@0.3.2, wasi:io/poll@0.2.9, wasi:clocks/monotonic-clock@0.2.9, wasi:io/error@0.2.9, wasi:io/streams@0.2.9, wasi:cli/stdout@0.2.9, wasi:cli/stderr@0.2.9, wasi:cli/stdin@0.2.9, wasi:cli/environment@0.2.9, wasi:cli/exit@0.2.9, wasi:cli/terminal-input@0.2.9, wasi:cli/terminal-output@0.2.9, wasi:cli/terminal-stdin@0.2.9, wasi:cli/terminal-stdout@0.2.9, wasi:cli/terminal-stderr@0.2.9); no single provider graph applies\n"
+          ],
+          "name": "wall-clock",
+          "outcome": "fail"
+        }
+      ],
+      "xfailed": 0,
+      "xpassed": 0
+    }
+  ],
+  "totals": {
+    "failed": 23,
+    "passed": 72,
+    "skipped": 32,
+    "xfailed": 0,
+    "xpassed": 0
+  },
+  "upstream": {
+    "branch": "prod/testsuite-base",
+    "commit": "9d84631e427729802085c3d172d0a63cd360a1fa",
+    "repo": "https://github.com/WebAssembly/wasi-testsuite"
+  }
+}

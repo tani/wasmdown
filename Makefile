@@ -200,3 +200,15 @@ repl:
 	$(SBCL) --eval '(require :asdf)' \
 	  --eval "(pushnew #P\"$(ROOT)/\" asdf:*central-registry*)" \
 	  --eval '(asdf:load-system :wasmdown)'
+
+# Upstream WASI testsuite lane (docs/design/PLAN.md §9.3 F1): the registered
+# adapter adapters/wasmdown.py runs the pinned precompiled guests
+# (WebAssembly/wasi-testsuite, commit in specs/lock.toml) and writes
+# tests/wasi-upstream-results.json + tests/wasi-upstream-summary.md. The tree
+# is never vendored: point WASI_TESTSuite_DIR (or WASI_TESTSUITE_DIR) at a
+# checkout whose HEAD is the pin. Without one the target exits 2 with the
+# recorded blocker; with one it exits 1 while the lane records failures (this
+# is evidence, never a release gate, and it is not part of `verify`).
+.PHONY: test-wasi-upstream
+test-wasi-upstream:
+	python3 tools/run-wasi-testsuite.py
