@@ -42,3 +42,25 @@ must come from the emitted form itself (temp-slot count / tagbody size),
 not from SBCL policy settings. The SQLite fixture's ~98 ms/function is the
 same phenomenon at real sizes (2039 functions, 8 GiB), so this microbench
 is the cheap proxy for that work.
+
+## Compile-cost scaling with function size
+
+`tools/compile-cost.lisp --functions 30 --repeat 2 --ops N` varies the
+number of repeated statement blocks per generated function (each block:
+an add/mul into a local accumulator, a conditional store and a store8):
+
+| ops/body | bytes | time/function | consed/function |
+|---:|---:|---:|---:|
+| 1 | 7,922 (for 100 funcs) | 0.7 ms | 0.72 MiB |
+| 4 | — | 2.3 ms | 2.21 MiB |
+| 16 | — | 13.2 ms | 10.3 MiB |
+| 64 | — | 175 ms | 80.4 MiB |
+
+The cost per statement RISES with body size (0.72 MiB at 1 op →
+1.25 MiB/op at 64 ops, and ~16× the time for 4× the ops between 16 and 64),
+so the SBCL compile cost is superlinear in the emitted form. This is the
+quantified form of the SQLite observation (~98 ms/function, 8 GiB for 2,039
+functions): the lever is the emitted form's size (temp bindings and tagbody
+length), not SBCL policy (the `(debug 0)(space 3)` experiment is recorded
+above as a −1.2 % negative result). Any reduction should be measured
+against this table.

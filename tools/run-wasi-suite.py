@@ -222,8 +222,10 @@ CASES = [
         "expect": {"exit_nonzero": True, "absent": ["x.db"]},
     },
     # ---------------- WASI 0.3.2 ----------------
-    # No pinned @0.3.2 guest exists yet: this case FAILS with a missing
-    # fixture rather than letting the P3 ABI look covered.
+    # Six hand-authored @0.3.2 guests are pinned (tools/build-p3-fixtures.lisp,
+    # P3-CHECKSUMS): a missing fixture is a FAILURE, never a skip, so the P3
+    # ABI cannot look covered by absence. This first case is only the
+    # no-import smoke; the provider cases below are the coverage.
     {
         "id": "p3/guest-smoke",
         "abi": "preview3",
