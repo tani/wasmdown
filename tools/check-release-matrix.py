@@ -87,9 +87,16 @@ def check_rows(commit):
             ("component/compiled", "tests/component-compiled-results.jsonl")):
         full = os.path.join(ROOT, path)
         if os.path.exists(full):
-            counts, total = outcomes(full)
-            add(row, counts.get("pass", 0) == total and total > 0,
-                "%d commands, %s" % (total, counts))
+            records = jsonl(full)
+            counts = {}
+            for rec in records:
+                counts[rec.get("outcome")] = counts.get(rec.get("outcome"), 0) + 1
+            total = len(records)
+            same = all(rec.get("source_commit") == commit for rec in records)
+            add(row, same and counts.get("pass", 0) == total and total > 0,
+                "%d commands, %s, source %s"
+                % (total, counts,
+                   (records[0].get("source_commit", "?")[:12] if records else "?")))
         else:
             add(row, False, "missing " + path)
 
