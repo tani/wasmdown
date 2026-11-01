@@ -413,17 +413,18 @@ WASI 0.2 keeps its own canonical interfaces and `wasi:io` resource semantics, ma
 > preopens/open-at/read-via-stream/errors. The retained internal
 > sockets provider still has its unit pins (`wasi/reactor-tcp-loopback`,
 > `wasi/sockets-{accept,recv,send}-reactor-readiness`), but they are
-> composition evidence, not network support. Remaining residuals are
-> maintained, per row and with exit evidence, in **§9.3**: upstream
-> toolchain/suite evidence and per-interface CLI guest coverage (the filesystem
-> link/symlink and advanced-metadata/time paths remain open). The blocked-stdio
-> executor audit, the deterministic async property lane, and the former
-> descriptor dtor/lend, compound error-result and validator type-use rows are
-> resolved (2026-11-02; see §9.3). The WASI 0.1/0.2
-> facades stay separate (§8.4).
+> composition evidence, not network support. The per-row evidence is in
+> **§9.3**: every defect and interface-coverage row is resolved (filesystem
+> full pinned surface, async property lane, blocked-stdio/DNS executor audit,
+> nested async payload ownership, dtor/lend reclamation, compound-result audit,
+> validator type-use limits, `@unstable` gating). The pinned upstream
+> wasi-testsuite lane is green (95 pass / 0 fail / 32 declared exclusions).
+> The only remaining §12.11 item is a locally generated @0.3.2 toolchain
+> guest: no toolchain in this environment emits that component ABI, so
+> `declared_support` stays `partial` under the blocked-by-environment rule.
+> The WASI 0.1/0.2 facades stay separate (§8.4).
 > HTTP and network communication remain **out of scope, not pending**.
 > See `docs/usage/wasi.md` and ADR-003.
-> `declared_support` stays `partial`.
 
 A **0.3-line** component that declares a `wasi:sockets` import (any 0.3.x
 interface/version) is refused at link time with this exact message; the separate
@@ -944,7 +945,7 @@ completed milestones. Evidence lives in `docs/status.md`,
 
 | Milestone | State in this tree | Remaining for a full-support claim |
 | --- | --- | --- |
-| M0 | Implemented: pinned suites/WIT, source-identity artifact contract, `make verify`, `make verify-release` | Upstream 0.3 suite adapter registration (§12.5) |
+| M0 | Implemented: pinned suites/WIT, source-identity artifact contract, `make verify`, `make verify-release`, upstream 0.3 adapter (§12.5) and green lane | None for the adapter; the toolchain-generated guest is blocked under M9/F1 |
 | M1–M2 | Implemented: stable func-instance identity, prepare/start ordering, shared call/tail/EH protocol | Preserve regressions; deeper EH/reentry properties are tracked, not blocking P3 |
 | M3 | Recorded green core parity (21,260 matches, 0 refusals) + property/fuzz lane | Independent semantic oracle beyond differential agreement (plan-level) |
 | M4 | P1 46 imports bound; non-network acceptance lane green incl. compiled. The four legacy `sock_*` imports are excluded from the declared support profile (network exclusion, 2026-11-02) | Behavioural audit items stay in their own rows; the claim is explicitly the NON-NETWORK P1 surface |
@@ -952,9 +953,9 @@ completed milestones. Evidence lives in `docs/status.md`,
 | M6 | P2 behaviour lane green after readiness/permit fixes | Version matrix beyond 0.2.12 is an explicit non-claim today |
 | M7 | Compiled lowering covers interpreter families | Generated/upstream tests remain plan-level; not a P3 blocker |
 | M8 | Reactor/scheduler/borrow checks; resume-safe, cancelled and deadline-waiting guests pinned. The drain oracle now counts pending host work plus an armed one-shot reactor deadline as possible progress (fd readiness excluded), so a 200 ms `wait-for` completes; genuine deadlock fixtures still trap. The deterministic fake-reactor/fake-executor property lane and the executor thread-affinity/boundedness audit landed 2026-11-02 (`make test-async-property`, §9.3) | No remaining async-assurance item |
-| M9 | Ten hand-authored @0.3.2 CLI guests (incl. random, deadline-wait, cli stdin/env/stderr/terminal and filesystem preopens/read/write/directory/error), 30/30 x3 both backends; text→binary encoder + round-trip guard | Upstream toolchain guest; network communication is excluded |
-| M10 | Cost data, profiles, release matrix; compile cost accepted by owner | Bounded cheap compiled P3 gate already exists (10-case lane); stress matrix per §12.7 |
-| M11 | Quick gates + repeated lanes + release matrix checker | Security/portability fuzzing programme remains plan-level |
+| M9 | Ten hand-authored @0.3.2 CLI guests (incl. random, deadline-wait, cli stdin/env/stderr/terminal and the full filesystem surface), 30/30 x3 both backends; text→binary encoder + round-trip guard; pinned upstream suite 95/0/32 | Upstream toolchain-generated guest blocked (no cargo/rustc/wasm-tools); network communication is excluded |
+| M10 | Cost data, profiles, release matrix; compile cost accepted by owner | Bounded compiled P3 gate, censuses and repeated lanes exist; any larger stress matrix is plan-level, not a 0.3-profile release item |
+| M11 | Quick gates + repeated lanes + release matrix checker; differential core fuzz and deterministic async property lane green | A broader security/portability fuzzing programme remains plan-level (not a 0.3-profile blocker) |
 | M12 | Not started (threads/atomics option) | Out of scope unless explicitly enabled |
 
 **Full-support sequence (F-series; orthogonal to the historical M numbering).**
