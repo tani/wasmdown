@@ -54,9 +54,9 @@ baseline runs are report evidence rather than a gate.
   toolchain emits the 0.3.2 component ABI here, so this is ABI coverage, not
   real-toolchain integration evidence.
 - **Async-lifted command through the CLI.** The tiny stdout fixture in
-  `tests/wasi.lisp` is not resume-safe (its body writes unconditionally), so a
-  reactor-driven resume re-executes it; that is a fixture limitation, recorded
-  in `docs/status.md`. The fixture is exercised at the `run-component` level
+  `tests/wasi.lisp` keeps no resume state (its body writes unconditionally),
+  so a callback re-invocation after a reactor wake re-emits its output; that
+  is a fixture limitation, recorded in `docs/status.md`. The fixture is exercised at the `run-component` level
   and the P3 CLI lane uses the sync command.
   `tools/run-wasi-suite.py --abi preview3` selects that ABI explicitly and
   FAILS on the missing fixture (never skips); `--abi all` covers the two

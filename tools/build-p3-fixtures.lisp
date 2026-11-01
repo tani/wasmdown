@@ -5,14 +5,14 @@
 ;;;; grammar (section ids and encodings in specs/Binary.md and
 ;;;; src/component.lisp). It is a real command component, not a stub:
 ;;;;
-;;;;   import wasi:cli/stdout@0.3.2
-;;;;   core module run: stream.new, write "hi" through a stream,
-;;;;                    future.read the end, task.return(ok)
-;;;;   export `run' (the command runner's direct-export fallback)
+;;;;   no imports; core `run` () -> i32 returning 0
+;;;;   component functype () -> (result<_,_>), canon lift, and the
+;;;;   `wasi:cli/run@0.3.2' export (the command world's success status)
 ;;;;
-;;;; The same construction lives in tests/wasi.lisp
-;;;; (wasi/e2e-command-component-binary); the lane runs THIS pinned file
-;;;; through the real CLI so the fixture is exercised as a guest.
+;;;; A richer stdout-importing async command lives in tests/wasi.lisp
+;;;; (wasi/e2e-command-component-binary); its body is not resume-safe, so
+;;;; it is exercised at the run-component level and not pinned as a CLI
+;;;; guest (see docs/status.md, "Known gaps").
 ;;;;
 ;;;; This is ABI coverage, not evidence of real-toolchain integration:
 ;;;; no pinned @0.3.2 guest from an upstream toolchain exists here.
@@ -56,100 +56,6 @@
 
 ;;; ---------------------------------------------------------------
 ;;; The guest.
-
-(defun p3-guest-bytes ()
-  "A command-world component importing wasi:cli/stdout@0.3.2. It writes
-\"hi\" through a stream and task.returns ok."
-  (let* ((memmod (b-wat "(module (memory (export \"mem\") 1))"))
-         (mmod
-           (b-wat
-            "(module
-               (import \"env\" \"mem\" (memory 1))
-               (import \"env\" \"task.return\" (func $tr (param i32)))
-               (import \"env\" \"stream.new\" (func $snew (result i64)))
-               (import \"env\" \"stream.write\"
-                       (func $swrite (param i32 i32 i32) (result i32)))
-               (import \"env\" \"stream.drop-writable\" (func $sdropw (param i32)))
-               (import \"env\" \"future.read\"
-                       (func $fread (param i32 i32) (result i32)))
-               (import \"env\" \"write-via-stream\" (func $wvs (param i32) (result i32)))
-               (global $fut (mut i32) (i32.const 0))
-               (func (export \"run\") (result i32)
-                 (local $p i64) (local $rx i32) (local $tx i32)
-                 (local $ret i32)
-                 (local.set $p (call $snew))
-                 (local.set $rx (i32.wrap_i64 (local.get $p)))
-                 (local.set $tx
-                   (i32.wrap_i64 (i64.shr_u (local.get $p) (i64.const 32))))
-                 (i32.store16 (i32.const 16) (i32.const 0x6968))
-                 (global.set $fut (call $wvs (local.get $rx)))
-                 (local.set $ret
-                   (call $swrite (local.get $tx) (i32.const 16) (i32.const 2)))
-                 (if (i32.and (local.get $ret) (i32.const 15)) (then unreachable))
-                 (call $sdropw (local.get $tx))
-                 (local.set $ret
-                   (call $fread (global.get $fut) (i32.const 32)))
-                 (if (i32.and (local.get $ret) (i32.const 15)) (then unreachable))
-                 (call $tr (i32.const 0))
-                 (i32.const 0))
-               (func (export \"run-cb\") (param i32 i32 i32) (result i32)
-                 (i32.const 0)))"))
-         (types
-           (b-vec
-            (b-cat (b-bytes #x6d 3) (b-name "io")
-                   (b-name "illegal-byte-sequence") (b-name "pipe"))
-            (b-bytes #x66 1 #x7d)                 ; stream<u8>
-            (b-bytes #x6a 0 1 0)                  ; result<_,_>
-            (b-bytes #x65 1 2)                    ; enum error-code
-            (b-cat (b-bytes #x40 1) (b-name "data") (b-bytes 1) (b-bytes 0 3))
-            (b-cat (b-bytes #x42 7)               ; instance: stdout iface
-                   (b-bytes #x02 #x03 #x02 #x01 #x00)
-                   (b-cat (b-bytes #x04) (b-nameattrs "error-code")
-                          (b-bytes #x03 #x00 #x00))
-                   (b-bytes #x01 #x6a #x00 #x01 #x00)
-                   (b-bytes #x01 #x65 #x01 #x02)
-                   (b-bytes #x01 #x66 #x01 #x7d)
-                   (b-cat (b-bytes #x01 #x40 #x01) (b-name "data")
-                          (b-bytes #x04 #x00 #x03))
-                   (b-cat (b-bytes #x04) (b-nameattrs "write-via-stream")
-                          (b-bytes #x01 #x05)))
-            (b-bytes #x6a 0 0)
-            (b-cat (b-bytes #x43 0) (b-bytes 0 6))))
-         (import (b-vec (b-cat (b-nameattrs "wasi:cli/stdout@0.3.2")
-                               (b-bytes #x05 5))))
-         (env-bag
-           (b-cat (b-bytes #x01 7)
-                  (b-cat (b-name "mem") (b-bytes #x02 0))
-                  (b-cat (b-name "task.return") (b-bytes #x00 0))
-                  (b-cat (b-name "stream.new") (b-bytes #x00 1))
-                  (b-cat (b-name "stream.write") (b-bytes #x00 2))
-                  (b-cat (b-name "stream.drop-writable") (b-bytes #x00 3))
-                  (b-cat (b-name "future.read") (b-bytes #x00 4))
-                  (b-cat (b-name "write-via-stream") (b-bytes #x00 5)))))
-    (b-cat (b-bytes 0 #x61 #x73 #x6d #x0d 0 1 0)   ; magic/version/layer
-           (b-sec 7 types)
-           (b-sec 10 import)
-           (b-sec 1 memmod)
-           (b-sec 1 mmod)
-           (b-sec 2 (b-vec (b-bytes #x00 0 0)))
-           (b-sec 6 (b-vec (b-cat (b-bytes #x00 #x02 #x01 0) (b-name "mem"))))
-           (b-sec 6 (b-vec (b-cat (b-bytes #x01 #x00 0)
-                                  (b-name "write-via-stream"))))
-           (b-sec 8 (b-vec (b-bytes #x09 #x00 6 #x00)        ; task.return
-                           (b-bytes #x0e 1)                  ; stream.new
-                           (b-bytes #x10 1 #x01 #x03 0)      ; stream.write
-                           (b-bytes #x14 1)                  ; drop-writable
-                           (b-bytes #x16 3 #x01 #x03 0)      ; future.read
-                           (b-bytes #x01 #x00 0 #x00)))      ; lower stdout
-           (b-sec 2 (b-vec env-bag
-                           (b-cat (b-bytes #x00 1 1) (b-name "env")
-                                  (b-bytes #x12 1))))
-           (b-sec 6 (b-vec (b-cat (b-bytes #x00 #x00 #x01 2) (b-name "run"))
-                           (b-cat (b-bytes #x00 #x00 #x01 2)
-                                  (b-name "run-cb"))))
-           (b-sec 8 (b-vec (b-bytes #x00 #x00 6 #x02 #x06 #x07 7 7)))
-           (b-sec 11 (b-vec (b-cat (b-nameattrs "run")
-                                   (b-bytes #x01 1) (b-bytes 0)))))))
 
 ;;; ---------------------------------------------------------------
 ;;; The SYNC command guest the lane drives through the CLI: no imports,

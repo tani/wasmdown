@@ -36,7 +36,7 @@ deliberately incomplete, and what will not be built. Measurements live in
 | WASI | Preview 1 (`wasi_snapshot_preview1`) | Full | All 46 pinned imports are provided over an explicit capability context. The whole acceptance lane (in-memory and on-disk SQLite, rollback, bail, preopen denial, read-only, escape) passes with compiled guest cores too. |
 | WASI | 0.3.2 providers | Partial | The CLI now owns a reactor (clock deadlines and socket readiness are servable); what remains partial is the provider surface itself — blocking DNS/stdio executors and the `@unstable` gates. |
 | WASI | 0.2 facade | Partial | 27 of 31 stable interfaces are bound at exact release names. |
-| WASI | 0.3.2 guest lane | Partial | A hand-authored @0.3.2 command runs through the real CLI in both backends (`make test-wasi-preview3`); no upstream toolchain input exists here, and an async-lifted command under a reactor is a recorded defect. |
+| WASI | 0.3.2 guest lane | Partial | A hand-authored @0.3.2 command runs through the real CLI in both backends (`make test-wasi-preview3`); no upstream toolchain input exists here, and the async-lifted variant is not resume-safe (see Known gaps). |
 | WASI | `wasi:http` | Out of scope | Removed from the runtime by decision and not planned, recoverable from git history. |
 
 ## Declared limits
@@ -63,13 +63,14 @@ and neither is a validation rule (ADR-005).
 - Descriptor destructors and lend lists accumulate in long-lived hosts.
 - `@unstable` is parsed and recorded but not enforced; the affected interfaces
   are simply not registered.
-- The async-lifted command fixture in `tests/wasi.lisp` is not
-  resume-safe: its core body writes unconditionally, so when the CLI's
-  reactor resumes the task the body re-executes (stdout repeats, then the
-  deadlock oracle). That is a property of the tiny fixture, not of the
-  scheduler: a real async command keeps its state in memory and resumes.
-  It is green through `run-component` without a reactor; the P3 CLI lane
-  uses the sync command until a resume-safe async guest is pinned.
+- The async-lifted command fixture in `tests/wasi.lisp` is not resume-safe.
+  Under the canonical async ABI a resumed task re-enters its callback and a
+  stateful guest resumes from the state it kept in memory; this
+  four-instruction fixture keeps none and writes unconditionally, so each
+  re-entry emits `hi` again (stdout repeats, then the deadlock oracle).
+  That is a property of the fixture, not of the scheduler: it is green
+  through `run-component` without a reactor, and the P3 CLI lane uses the
+  sync command until a resume-safe async guest is pinned.
 - WASI 0.2 (shared by both backends, found by the behavioural audit):
   end-of-input is reported as `stream-error::closed` rather than `ok([])`;
   `write`/`write-zeroes` do not enforce the `check-write` permit; the UDP
