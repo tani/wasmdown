@@ -120,7 +120,7 @@ From Lisp:
 
 ## Verification
 
-Every lane is measured, not asserted. Latest numbers (2026-11-01):
+Every lane is measured, not asserted. Latest numbers (2026-11-02):
 
 | Lane | Kind | Measured | Docs |
 | --- | --- | --- | --- |
@@ -130,7 +130,7 @@ Every lane is measured, not asserted. Latest numbers (2026-11-01):
 | `make report-component-compiled` | report | 1 702 pass / 0 fail under `:compiled` | `tests/component-compiled/component.md` |
 | `make test-backend-parity` | gate | 21 260 / 21 260 core commands agree across both backends | [`backends.md`](docs/conformance/backends.md) |
 | `make test-wasi` | gate | 450/450 cases over 30 fresh-process runs | [`wasi.md`](docs/conformance/wasi.md) |
-| `make test-wasi-preview3` | gate (explicit) | 6 hand-authored 0.3.2 guests × 3 repeats, both backends | — |
+| `make test-wasi-preview3` | gate (explicit) | 7 hand-authored 0.3.2 guests × 3 repeats (21/21), both backends | — |
 | Network communication (TCP/UDP/DNS) | excluded | not verified, not claimed: component imports are refused at link time; the canonical message is in [`specs/wasi/MANIFEST.md`](specs/wasi/MANIFEST.md) | — |
 | `make test-property` | gate | 2 000 generated modules, both backends agree | — |
 | `make test-upstream` | discovery | aggregated proposal corpus, never a gate | [`upstream.md`](docs/conformance/upstream.md) |

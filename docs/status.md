@@ -34,16 +34,33 @@ deliberately incomplete, and what will not be built. Measurements live in
 | Component model | Async execution | Partial | The task/subtask state machine, cancellations and resource lifetimes run the whole async suite in both backends. Live-borrow accounting traps `task.return`/`task.cancel` with outstanding borrows; residual ABI/lifetime gaps are listed under Known gaps. |
 | Component model | Backend parity | Full | The whole component lane (1,702 commands) is green with every defined core compiled before its start section (`make report-component-compiled`). |
 | WASI | Preview 1 (`wasi_snapshot_preview1`) | Partial (network imports excluded) | All 46 pinned imports are provided over an explicit capability context; the whole acceptance lane (in-memory and on-disk SQLite, rollback, bail, preopen denial, read-only, escape) passes with compiled guest cores too. The four legacy `sock_*` imports remain implemented and legacy-tested, but network communication is excluded from the declared support profile (2026-11-02; see the `wasi:sockets@0.3.2` row), so the P1 claim is explicitly the NON-NETWORK P1 surface; no network behaviour is claimed. |
-| WASI | 0.3.2 providers | Partial | The CLI owns a reactor (clock deadlines and stream readiness are servable); what remains partial is the provider surface itself — the `@unstable` gates, the blocked-stdio executor audit, and the canonical-ABI/lifetime residuals listed under Known gaps. `wasi:sockets` is excluded, not partial; see the `wasi:sockets@0.3.2` row. |
+| WASI | 0.3.2 providers | Partial | The CLI owns a reactor (clock deadlines and stream readiness are servable); what remains partial is the provider surface itself — the blocked-stdio executor audit and the canonical-ABI/lifetime residuals listed under Known gaps. Declared `@unstable` imports are refused at link time (see Known gaps), so stability gating is no longer a missing piece. `wasi:sockets` is excluded, not partial; see the `wasi:sockets@0.3.2` row. |
 | WASI | 0.2 facade | Partial | 27 of 31 stable interfaces are bound at exact release names. The bound `wasi:sockets/*` interfaces are legacy-tested through the embedding API only; the CLI refuses `--net/--listen/--dns` for every run, so no P2 sockets path exists through the CLI. Network communication is excluded from the declared support profile (see the `wasi:sockets@0.3.2` row) and no P2 network behaviour is claimed. |
 | WASI | `wasi:http` | Unsupported by design (not a gap, not planned) | Deliberate, permanent exclusion by user decision (2026-11-02); removed in M17 and recoverable from git history. The vendored `specs/wasi/wasi-wit-0.3.2/http/*.wit` is reference data only. An import is refused with `wasi:http is not supported by this runtime by design (removed in M17); the pinned HTTP WIT is reference data only. See docs/usage/wasi.md and specs/wasi/MANIFEST.md.` See [`specs/wasi/MANIFEST.md`](../specs/wasi/MANIFEST.md) § “Unsupported by design (not pending)”. Not counted as an incomplete interface. |
 | WASI | `wasi:sockets@0.3.2` | Unsupported by design (not a gap, not planned) | TCP, UDP and DNS are excluded permanently by user decision (2026-11-02); there is no `wasi:sockets` provider for guests. The vendored `specs/wasi/wasi-wit-0.3.2/sockets/sockets.wit` is reference data only. A **0.3-line** component-declared import (`types`, `ip-name-lookup`, any 0.3.x version) is refused at link time with `Network communication (TCP, UDP and DNS) is not supported by this design; there is no wasi:sockets provider for guests. See docs/usage/wasi.md and specs/wasi/MANIFEST.md.` The pinned `wasi:cli/command` world imports sockets itself, so a 0.3.2 sockets provider is retained internally for that composition only. See [`specs/wasi/MANIFEST.md`](../specs/wasi/MANIFEST.md) § “Network communication: `wasi:sockets` (excluded)”. Not counted as an incomplete interface. |
-| WASI | 0.3.2 guest lane | Partial | Six hand-authored @0.3.2 commands run through the real CLI in both backends (`make test-wasi-preview3`, 3 repeats): a no-import smoke; a `wasi:cli/exit@0.3.2` importer (exit 7); a `wasi:clocks/monotonic-clock@0.3.2` importer; a resume-safe async callback command; a `write-via-stream` stdout command printing `hi`; and a cancelled-subtask command. The stream guest is authored in TEXT and encoded by `tools/component-encode.lisp`, guarded by `wasi/component-text-encoder-roundtrip`. The lane stays Partial because no upstream @0.3.2 toolchain guest exists here; provider behaviour is measured by this lane and the component tests. The former TCP loopback socket command was removed with the network exclusion (2026-11-02); network is not part of this lane. |
+| WASI | 0.3.2 guest lane | Partial | Seven hand-authored @0.3.2 commands run through the real CLI in both backends (`make test-wasi-preview3`, 3 repeats, 21/21 per backend): a no-import smoke; a `wasi:cli/exit@0.3.2` importer (exit 7); a `wasi:clocks/monotonic-clock@0.3.2` importer; a resume-safe async callback command; a `write-via-stream` stdout command printing `hi`; a cancelled-subtask command; and a `wasi:random/random@0.3.2` guest with `insecure`/`insecure-seed` (two 16-byte reads must have exact lengths and differ; `get-random-u64`/seed must complete), lowering the list returns through memory+realloc. The stream and random guests are authored in TEXT and encoded by `tools/component-encode.lisp`, guarded by `wasi/component-text-encoder-roundtrip`. The lane stays Partial because no upstream @0.3.2 toolchain guest exists here; provider behaviour is measured by this lane and the component tests. The former TCP loopback socket command was removed with the network exclusion (2026-11-02); network is not part of this lane. |
+
+## Known gaps and accepted limits
+
 - Nested `option<stream<u8>>` passed through a host lower resolves in the
   provider's table instead of the caller's.
 - Descriptor destructors and lend lists accumulate in long-lived hosts.
-- `@unstable` is parsed and recorded but not enforced; the affected interfaces
-  are simply not registered.
+- `@unstable` imports are **enforced at link time**. The 0.3 composition path
+  checks every declared `wasi:` import through the WIT selection gate
+  (`wit-import-surface-status`) before anything is composed: if the target
+  interface is `@unstable(feature = …)` and that feature is not enabled by the
+  selected stable surface, the run is refused with a `link-error` naming the
+  import and the feature, for example:
+
+  ```
+  wasi:clocks/timezone@0.3.2 is @unstable(feature = clocks-timezone) and that feature is not enabled; unstable interfaces are outside the selected stable WASI 0.3.2 surface (see docs/usage/wasi.md and specs/wasi/MANIFEST.md).
+  ```
+
+  Stable imports are unaffected. **No CLI flag enables a feature today**; the
+  gate is refusal-only. Pinned by
+  `wasi/component-unstable-declared-import-is-link-error`,
+  `wit/selection-import-surface-query` and
+  `wit/selection-command-world-timezone-import`.
 - The four-instruction async fixture in `tests/wasi.lisp`
   (`wasi/e2e-command-component-binary`) is not resume-safe: it writes
   unconditionally, so under a reactor-driven resume each re-entry emits `hi`
@@ -95,12 +112,12 @@ deliberately incomplete, and what will not be built. Measurements live in
   `async` canon option — it flattens to `(i64)->i32`; without it the lower
   flattens to `(i64)->()` and fails the core-import signature check.
 - No **upstream-toolchain** WASI 0.3.2 guest is pinned (no toolchain here
-  emits the 0.3.2 component ABI). The lane runs a hand-authored command
+  emits the 0.3.2 component ABI). The lane runs hand-authored commands
   generated by `tools/build-p3-fixtures.lisp` and pinned by
   `P3-CHECKSUMS` (the binary itself is untracked and regenerated);
   `--abi preview3` is explicit-only and `--abi all` covers the two released
   ABIs. Provider-level 0.3.2 coverage is measured by the component lane and
-  unit pins, not by that guest.
+  unit pins, not by that lane.
 
 ## Roadmap
 

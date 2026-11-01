@@ -22,6 +22,12 @@
 ;;;;                          list-returning funcs with (memory ...) and
 ;;;;                          (realloc ...), and traps unless two 16-byte
 ;;;;                          reads have exact lengths and differ
+;;;;   p3-deadline-guest.wasm lowers the clock's async wait-for (50 ms),
+;;;;                          joins the subtask into a waitable set and
+;;;;                          returns WAIT; the reactor's callback loop
+;;;;                          parks until the deadline fires, and the
+;;;;                          resumed callback traps unless the subtask
+;;;;                          returned after at least 50 ms of clock time
 ;;;;
 ;;;; The importing guest is the provider-importing evidence the no-import
 ;;;; smoke cannot give: the runner composes the provider from the
@@ -493,6 +499,7 @@
            (b-sec 1 core)
            builtins alias-export lower bag m-inst aliases lift compinst export)))
 
+
 ;;; ---------------------------------------------------------------
 ;;; Fixture 7: wasi:random. TEXT authored (tools/component-encode) rather
 ;;; than byte-assembled: the list results need a memory and a realloc,
@@ -629,6 +636,122 @@
   (component-encode:encode-component
    (wasmdown.component.text::parse-component-text *p3-random-text*)))
 
+;;; ---------------------------------------------------------------
+;;; Fixture 8: async DEADLINE COMPLETION — the guest OBSERVES the
+;;; clock wait finishing through the CLI reactor, rather than
+;;; cancelling it (fixture 6) or only reading `now` (fixture 3).
+;;;
+;;; The callback lowers wasi:clocks/monotonic-clock@0.3.2's
+;;; `wait-for: async func(how-long: duration)` with the `async`
+;;; canonopt, records `now` as t0, joins the pending subtask into a
+;;; fresh waitable set, and returns WAIT (callback code 2, the set
+;;; handle in the high bits). The reactor's callback loop then parks
+;;; the task (wait_from_callback) until the deadline fires and the
+;;; subtask resolves RETURNED; the resumed callback requires the
+;;; event to be SUBTASK(1)/RETURNED(2) of ITS subtask, reads `now`
+;;; again and traps unless t1 - t0 >= the 50 ms it asked for. A
+;;; wait that completes early is a trap, never a pass.
+;;;
+;;; No memory is needed: the WAIT protocol hands the event to the
+;;; callback as core arguments (the event STORE belongs only to a
+;;; guest-called waitable-set.wait, which this guest never makes).
+;;;
+;;; 50 ms keeps the fixture quick AND deterministic: the async lift's
+;;; CLI caller drain declares a deadlock after 50 quiescent 2 ms poll
+;;; slices (~100 ms without progress), so a longer park would trip
+;;; that trap instead of observing the deadline (measured: 100 ms
+;;; passes, 150 ms deadlock-traps). The elapsed check only requires
+;;; >= 50 ms, so an overshoot (a loaded machine) still passes.
+(defparameter *p3-deadline-text*
+  (format nil "~{~a~%~}"
+          (list
+           "(component"
+   "  (import \"wasi:clocks/monotonic-clock@0.3.2\""
+   "    (instance $clock"
+   "      (export \"now\" (func (result u64)))"
+   "      (export \"wait-for\" (func async (param \"how-long\" u64)))))"
+   "  (alias export $clock \"now\" (func $now))"
+   "  (alias export $clock \"wait-for\" (func $waitfor))"
+   ;; wait-for is async: MAX_FLAT_ASYNC_PARAMS keeps the single i64
+   ;; argument flat, so the lowered core func is (param i64) -> i32
+   ;; (the packed subtask state) with no memory/realloc option.
+   "  (core func $now-lowered (canon lower (func $now)))"
+   "  (core func $waitfor-lowered (canon lower (func $waitfor) async))"
+   "  (canon task.return (result (result)) (core func $tr))"
+   "  (canon waitable-set.new (core func $wsnew))"
+   "  (canon waitable.join (core func $join))"
+   "  (canon waitable-set.drop (core func $wsdrop))"
+   "  (canon subtask.drop (core func $subdrop))"
+   "  (core module $M"
+   "    (import \"env\" \"task.return\" (func $tr (param i32)))"
+   "    (import \"env\" \"now\" (func $now (result i64)))"
+   "    (import \"env\" \"wait-for\" (func $waitfor (param i64) (result i32)))"
+   "    (import \"env\" \"waitable-set.new\" (func $wsnew (result i32)))"
+   "    (import \"env\" \"waitable.join\" (func $join (param i32 i32)))"
+   "    (import \"env\" \"waitable-set.drop\" (func $wsdrop (param i32)))"
+   "    (import \"env\" \"subtask.drop\" (func $subdrop (param i32)))"
+   "    (global $t0 (mut i64) (i64.const 0))"
+   "    (global $sub (mut i32) (i32.const 0))"
+   "    (global $ws (mut i32) (i32.const 0))"
+   ;; YIELD once: the callback loop then enters the callback with the
+   ;; no-event tuple (0 0 0)
+   "    (func (export \"run\") (result i32) (i32.const 1))"
+   "    (func (export \"run-cb\")"
+   "          (param $code i32) (param $si i32) (param $payload i32)"
+   "          (result i32)"
+   "      (local $p i32) (local $t1 i64)"
+   "      (if (i32.eqz (local.get $code))"
+   "          (then"
+   "            (global.set $t0 (call $now))"
+   "            (local.set $p (call $waitfor (i64.const 50000000)))"
+   ;; a 50 ms wait must still be pending: STARTING(0) or STARTED(1);
+   ;; RETURNED(2) or a cancelled state is a premature completion
+   "            (if (i32.gt_u (i32.and (local.get $p) (i32.const 15))"
+   "                          (i32.const 1))"
+   "                (then unreachable))"
+   "            (global.set $sub (i32.shr_u (local.get $p) (i32.const 4)))"
+   "            (global.set $ws (call $wsnew))"
+   "            (call $join (global.get $sub) (global.get $ws))"
+   ;; WAIT (code 2) on the set: the reactor parks until the deadline
+   ;; fires and the subtask resolves
+   "            (return (i32.or (i32.shl (global.get $ws) (i32.const 4))"
+   "                            (i32.const 2)))))"
+   ;; resumed WITH an event: only SUBTASK(1)/RETURNED(2) for OUR
+   ;; subtask may complete the wait
+   "      (if (i32.ne (local.get $code) (i32.const 1)) (then unreachable))"
+   "      (if (i32.ne (local.get $payload) (i32.const 2)) (then unreachable))"
+   "      (if (i32.ne (local.get $si) (global.get $sub)) (then unreachable))"
+   "      (local.set $t1 (call $now))"
+   "      (if (i64.lt_u (i64.sub (local.get $t1) (global.get $t0))"
+   "                    (i64.const 50000000))"
+   "          (then unreachable))"
+   "      (call $join (global.get $sub) (i32.const 0))"
+   "      (call $subdrop (global.get $sub))"
+   "      (call $wsdrop (global.get $ws))"
+   "      (call $tr (i32.const 0))"
+   "      (i32.const 0)))"
+   "  (core instance $m"
+   "    (instantiate $M"
+   "      (with \"env\""
+   "        (instance"
+   "          (export \"task.return\" (func $tr))"
+   "          (export \"now\" (func $now-lowered))"
+   "          (export \"wait-for\" (func $waitfor-lowered))"
+   "          (export \"waitable-set.new\" (func $wsnew))"
+   "          (export \"waitable.join\" (func $join))"
+   "          (export \"waitable-set.drop\" (func $wsdrop))"
+   "          (export \"subtask.drop\" (func $subdrop))))))"
+   "  (func $run (export \"run\") async (result (result))"
+   "    (canon lift (core func $m \"run\") async"
+   "                (callback (core func $m \"run-cb\"))))"
+   "  (instance $runiface (export \"run\" (func $run)))"
+   "  (export \"wasi:cli/run@0.3.2\" (instance $runiface)"
+   "    (instance (export \"run\" (func async (result (result)))))))")))
+
+(defun p3-deadline-guest-bytes ()
+  (component-encode:encode-component
+   (wasmdown.component.text::parse-component-text *p3-deadline-text*)))
+
 (defparameter *fixtures*
   (list (list "p3-guest.wasm" #'p3-sync-guest-bytes 0 "")
         (list "p3-import-guest.wasm" #'p3-import-guest-bytes 7 "")
@@ -636,7 +759,8 @@
         (list "p3-async-guest.wasm" #'p3-async-guest-bytes 0 "")
         (list "p3-stream-guest.wasm" #'p3-stream-guest-bytes 0 (format nil "hi~%"))
         (list "p3-cancel-guest.wasm" #'p3-cancel-guest-bytes 0 "")
-        (list "p3-random-guest.wasm" #'p3-random-guest-bytes 0 "")))
+        (list "p3-random-guest.wasm" #'p3-random-guest-bytes 0 "")
+        (list "p3-deadline-guest.wasm" #'p3-deadline-guest-bytes 0 "")))
 
 ;;; ---------------------------------------------------------------
 ;;; Verify through this project's own decoder/validator/runner, then

@@ -220,6 +220,7 @@
         (:waitable-set-new (by #x1f))
         (:waitable-set-wait (cat (by #x20 0) (u32 a)))
         (:waitable-set-poll (cat (by #x21 0) (u32 a)))
+        (:waitable-set-drop (by #x22))
         (t (error "unsupported builtin ~s" name))))))
 
 (defun enc-sortidx (si)

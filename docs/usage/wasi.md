@@ -61,7 +61,7 @@ dispatch is by the `@0.3.2` suffix of the import name.
 
 | Package | Delivered |
 | --- | --- |
-| `wasi:clocks` | `monotonic-clock` `now` / `get-resolution`, `system-clock` `now` / `get-resolution`, `types.duration`. The async `wait-until` / `wait-for` park on the context's reactor. `clocks-timezone` is gated off (`@unstable`). |
+| `wasi:clocks` | `monotonic-clock` `now` / `get-resolution`, `system-clock` `now` / `get-resolution`, `types.duration`. The async `wait-until` / `wait-for` park on the context's reactor. `clocks-timezone` is `@unstable` and is refused at link time (see “Stability gating”). |
 | `wasi:random` | `get-random-bytes`, `get-random-u64`, and the insecure `get-insecure-random-bytes` / `-u64` / `get-insecure-seed` — all from OS entropy, never the Lisp RNG. Zero-length requests return an empty list; a single request is capped at 1 MiB. |
 | `wasi:cli` | `environment` (`get-environment`, `get-arguments`, `get-initial-cwd`), `exit` (`exit`, `exit-with-code` via the `wasi-exit` condition), `stdin`/`stdout`/`stderr` as real streams, the `terminal-*` interfaces (`isatty` answers `some` or `none`, never a fabricated handle), and the command world's `run`. |
 | `wasi:filesystem` | The `descriptor` resource (own/borrow, destructors, non-owning preopens), all non-stream descriptor methods with the errno → `error-code` table, `preopens.get-directories`, `read-via-stream` / `write-via-stream` / `append-via-stream` / `read-directory`, and flag gating that reports `not-permitted` / `read-only` through the interface's `result` rather than throwing. |
@@ -94,12 +94,29 @@ and DNS are permanently out of scope, as are the CLI network options.
 Coverage is enforced at construction: an unimplemented function of a
 bound interface is a `host-error`, never a trapping stub.
 
+### Stability gating
+
+`@unstable` is enforced, not just recorded. On the 0.3 path the runtime
+checks every `wasi:` import a component **declares** against the WIT
+selection surface before composing anything; if the target interface carries
+`@unstable(feature = …)` and that feature is not enabled, the run is a
+link error naming the import and the feature:
+
+```
+wasi:clocks/timezone@0.3.2 is @unstable(feature = clocks-timezone) and that feature is not enabled; unstable interfaces are outside the selected stable WASI 0.3.2 surface (see docs/usage/wasi.md and specs/wasi/MANIFEST.md).
+```
+
+There is **no CLI flag that enables a feature today**, so the selected
+surface is the stable one and the gate is refusal-only. Stable imports
+are unaffected; the pinned `wasi:cli/command` world's own composition is
+not a declared guest import and is not gated by this check.
+
 ## Declared limits
 
 | Limit | Effect |
 | --- | --- |
 | No reactor in the default context | The CLI builds no reactor, so `clocks.wait-until` / `wait-for` signal `host-error`. An embedder that supplies `:reactor` gets both. |
-| `@unstable` gating | Annotations are parsed and recorded but not enforced as a feature switch; a gated-off interface (`wasi:clocks/timezone`) simply has no provider, so a world importing it is refused. |
+| `@unstable` gating | Enforced at link time on the 0.3 path: a declared import of a gated interface whose feature is not enabled is a link error naming the import and the feature (see “Stability gating”). No CLI flag enables a feature, so unstable interfaces stay outside the selected profile. |
 | `proc_raise` (Preview 1) | A valid signal returns `errno::notsup`; an invalid one `errno::inval`. The hosting SBCL process is never signalled. |
 
 ## WASI Preview 1

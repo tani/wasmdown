@@ -384,8 +384,10 @@ print exactly `hi\n`).
   seven guests, 3 repeats each (21/21 per backend), with a suite-side echo
   server and --net for the socket case.
   *(Superseded 2026-11-02: network communication became out of scope; the
-  socket guest and its fixture were removed and the lane is six guests. Kept as
-  history, not as a current support claim.)* The component binary grammar details
+  socket guest and its fixture were removed and the lane dropped to six
+  guests. It returned to seven the same day when the random guest landed
+  (see “Stability gate and the seven-guest P3 lane”). Kept as history, not as
+  a current support claim.)* The component binary grammar details
   that mattered: type indices
   inside an instance type are local to that type's declarations, the lower's
   core func must be defined before the bag that exports it, and imported
@@ -395,7 +397,7 @@ print exactly `hi\n`).
 
 - Numbering convention: engine-slice loops 18–24 and Component Model milestones M7–M17 ran in parallel; neither series renumbers the other.
 - Remaining work named at the M17 close, none of it inside the lane: provider step 5/6 (DNS and blocking-stdio bounded executors, and socket accept/recv/send registering a reactor watch instead of reporting would-block to a caller that then waits); step 1's last item (the two canon-lower wrappers' positional stream/future/borrow arms, where deletion needs the verification-set fixtures in the probe set first — `%abi-load`'s memory-path transfer arms stay out as a measured negative); borrow-side lifetime pins (a live borrow held across `task.return` must trap; borrow-in-awaitable-set), reusing the guest-drop pin's shape; and one parked delta with a measured verdict, `wip/type-view` (at parity in a clean window, not landed because a green lane's bar is "no measured cost"). `wip/reactor-wiring` was closed as superseded: its driver pump and context reactor landed as the store driver, its socket plumbing as the executor slice with a strictly stronger keying scheme, so it was never rebased or re-measured.
-- Residual security/ABI honesty items recorded with M16: no socket or timer reactor, so a guest cannot be woken later and `clocks.wait-until`/`wait-for` stay declared-unsupported; the nested `option<stream<u8>>` through a host lower resolves the async end in the provider's table instead of the caller's; descriptor-destructor and lend-list accumulation for long-lived hosts; `%abi-lower`'s top-level error-result discriminant for compound outer shapes; pre-existing text/validator limits around imported-instance functypes with outer compound refs (the runtime lifts with the real WIT functype, so fixtures work around the validator, not the ABI); `@unstable` gating parsed but not enforced (the timezone interface is simply not registered); `wasi:sockets` has no `shutdown` in this WIT revision; and world `include`, `implements`/`external-id` and nominal resource typing are not read by the WIT frontend.
+- Residual security/ABI honesty items recorded with M16: no socket or timer reactor, so a guest cannot be woken later and `clocks.wait-until`/`wait-for` stay declared-unsupported; the nested `option<stream<u8>>` through a host lower resolves the async end in the provider's table instead of the caller's; descriptor-destructor and lend-list accumulation for long-lived hosts; `%abi-lower`'s top-level error-result discriminant for compound outer shapes; pre-existing text/validator limits around imported-instance functypes with outer compound refs (the runtime lifts with the real WIT functype, so fixtures work around the validator, not the ABI); `@unstable` gating parsed but not enforced (the timezone interface is simply not registered; enforced 2026-11-02 — see “Stability gate and the seven-guest P3 lane”); `wasi:sockets` has no `shutdown` in this WIT revision; and world `include`, `implements`/`external-id` and nominal resource typing are not read by the WIT frontend.
 - Items open since the M7-era measurement: the compiler-backend parity matrix (§12.3's `:optimized`/`:aot` plus the differential oracle), the property/fuzz lanes (§12.6), and the remaining CI lanes (M11). Threads/atomics and the FASL cache were never started.
 
 ## Network communication excluded (2026-11-02)
@@ -421,7 +423,9 @@ What changed in the tree:
   before building any authority; no network authority exists in the CLI.
 - The seventh P3 CLI guest — the TCP loopback socket command, previously run
   against a suite-side echo server with `--net` — was removed. The P3
-  hand-authored lane is now **six** guests (18/18 ×3 per backend).
+  hand-authored lane dropped to **six** guests (18/18 ×3 per backend); later
+  the same day it returned to seven when the random guest landed (see
+  “Stability gate and the seven-guest P3 lane” below).
 - The 0.3.2 `wasi:sockets` provider remains in the runtime **only** because
   the pinned `wasi:cli/command` world imports
   `wasi:sockets/types@0.3.2` and `wasi:sockets/ip-name-lookup@0.3.2` itself;
@@ -435,3 +439,53 @@ The declared profile is therefore `conformant for the declared WASI 0.3.2
 profile (wasi:http and wasi:sockets excluded)` at most, and `partial` until
 the §2.1 conditions hold. The canonical network message above is the only
 refusal text for this surface; the canonical HTTP message is unchanged.
+
+## Stability gate and the seven-guest P3 lane (2026-11-02)
+
+Two §9.3 rows closed in the same change: `@unstable` is now **enforced**, and
+the P3 CLI lane gained a **random** guest, taking it to seven hand-authored
+@0.3.2 commands (21/21 ×3, both backends).
+
+**`@unstable` refusal.** The 0.3 composition path checks every `wasi:` import
+a component *declares* before anything is composed. It does not re-read
+annotations: it delegates to the WIT selection surface
+(`wit-import-surface-status`), which already answers “stable / unstable
+feature / other reason” from the pinned package set and the enabled feature
+set. A declared import whose target interface is `@unstable(feature = …)` and
+whose feature the selected surface does not enable is a `link-error` naming
+the import and the feature:
+
+```
+wasi:clocks/timezone@0.3.2 is @unstable(feature = clocks-timezone) and that feature is not enabled; unstable interfaces are outside the selected stable WASI 0.3.2 surface (see docs/usage/wasi.md and specs/wasi/MANIFEST.md).
+```
+
+Stable and unknown names pass through untouched, so the 0.3 command world
+composes exactly as before; the 0.2 line is untouched. **No feature flag was
+added** — the CLI has no way to enable a feature, so the gate is
+refusal-only. Ordering is deliberate: the unstable check runs before the
+sockets-import refusal, and both require a component with no 0.2 imports, so
+they never race with the mixed-release-line refusal. Pins:
+`wasi/component-unstable-declared-import-is-link-error`,
+`wit/selection-import-surface-query` and
+`wit/selection-command-world-timezone-import`.
+
+**Random guest.** `p3/random-bytes` (`p3-random-guest.wasm`, authored in TEXT
+and encoded by `tools/component-encode.lisp`, with the builder self-checking
+it) imports `wasi:random/random@0.3.2` plus `wasi:random/insecure@0.3.2` and
+`wasi:random/insecure-seed@0.3.2`. It exits 0 only when two 16-byte secure
+reads have exact lengths and differ and the `u64`/seed calls complete; any
+failure traps to a nonzero exit. The list-returning functions exercise the
+memory+`realloc` lowering path. The lane remains seven guests — smoke, exit
+importer, monotonic-clock `now`, resume-safe async callback, stdout
+`write-via-stream`, cancelled subtask, and random — at 21/21 ×3 in both
+backends. The socket command stays removed: network communication is excluded
+and is not lane coverage.
+
+**Encoder fix.** `tools/component-encode.lisp` grew the inline-export path for
+component instances: the decoder keeps an export name as `(name attrs)`
+(Binary.md nameattributes), and the encoder now unwraps that cell and re-emits
+the `0x00` attrs prefix instead of encoding a cons as a string. This was the
+previously unexercised instance-`run` shape.
+
+Evidence at the change: unit tests 685/0, `make verify` green, canonical
+`tests/wasi-results/p3-*` re-recorded.
