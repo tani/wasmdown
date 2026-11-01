@@ -74,3 +74,13 @@ the whole representation space: it changes both storage and every access, so it
 cannot isolate binding count from access cost. The leading, UNPROVEN hypothesis
 remains that the cost is SBCL compiling the large TAGBODY/GO graph; any
 reduction must be measured against this table.
+
+## Duplicate static validation on the compiled path (measured, not removed)
+
+`instantiate` validates the module and then `compile-module-functions`
+validates it again (a standalone guard at the public entry). Measured on the
+SQLite Preview1 fixture: one `validate-module` costs **0.07 s and 33.5 MiB**
+(median of 5, GC-preceded). Against the compiled lane's ~200 s / ~8 GiB for
+2,039 functions that is 0.035 % of time and 0.4 % of consing, so the duplicate
+is left in place: the standalone guard is part of the public contract and the
+saving is immaterial.
