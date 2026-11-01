@@ -25,7 +25,8 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 LOGDIR="${ROOT}/tmp-census"
 mkdir -p "${LOGDIR}"
 
-EXPECTED=1631        # pinned executed count (docs/design/PLAN.md §12.9 baseline)
+EXPECTED=1702        # pinned executed count (docs/design/PLAN.md §12.9 baseline;
+                     # 1631 + values/post-return.wast's 71 commands)
 failures=0
 printf '%-6s %-10s %-8s %-6s %-6s %-8s\n' run executed fail herr tout wall
 printf '%-6s %-10s %-8s %-6s %-6s %-8s\n' ---- -------- ---- ---- ---- ----

@@ -10,6 +10,9 @@ tmp-census/
 .env
 .env.*
 tests/upstream-testsuite/
+# local artifacts of gate runs (report runs write committed files)
+tests/backend-parity/
+tests/component-baseline/
 tests/upstream-results.jsonl
 tests/wasi-results/
 tests/fixtures/wasi/*.wasm

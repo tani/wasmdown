@@ -124,3 +124,4 @@
       (wasmdown.component.runtime:store-teardown b))
     (is (eq th (first (wasmdown.component.runtime:component-store-threads
                        a))))))
+

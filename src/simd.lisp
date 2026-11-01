@@ -30,7 +30,7 @@
            #:entry-results #:entry-imm #:entry-class
            #:entry-lane-width #:entry-lanes #:entry-float-p
            #:text-op-p #:plain-op-names #:memarg-op-entries
-           #:exec #:validate-lane-imms #:lane-imm-p
+           #:exec #:execute-op #:validate-lane-imms #:lane-imm-p
            #:decode-simd-imms #:encode-simd-imms))
 
 (in-package #:wasmdown.simd)
@@ -522,8 +522,9 @@ violation. IMM is the entry's imm shape."
 ;;;
 ;;; Argument order: values arrive in push order (last pushed = LAST
 ;;; param); EXEC takes (args...) in WAT operand order a b c.
-;;; Address-based ops (loads/stores) are handled by the interp layer
-;;; (they need the memory instance); EXEC handles only pure compute.
+;;; Address-based ops (loads/stores) and the immediate-shaped classes
+;;; are handled by EXECUTE-OP below (loads/stores need the memory
+;;; instance); EXEC handles only pure compute.
 
 (declaim (inline i8-s i16-s i32-s i64-s))
 (defun i8-s (x) (if (>= x #x80) (- x #x100) x))
@@ -680,9 +681,9 @@ F32BITS and trapped on the first assertion."
 A B C. Operand convention: WAT order — A is the first operand. Pure
 lane ops receive v128 byte vectors; the scalar-shaped ops (splat,
 extract/replace, shifts, shuffle) receive their scalars through the
-ENTRY's class dispatch (the interp passes them; see EXEC-OP for the
-imms plumbing). Loads/stores and the reductions (all_true/any_true/
-bitmask -> i32) are handled by the interp layer, NOT here."
+ENTRY's class dispatch (EXECUTE-OP supplies them; see that function
+for the imms plumbing). Loads/stores and the reductions (all_true/
+any_true/bitmask -> i32) are handled by EXECUTE-OP, NOT here."
   (let* ((class (simd-entry-class entry))
          (width (or (simd-entry-lane-width entry) 128))
          (lanes (or (simd-entry-lanes entry) 1))
@@ -705,7 +706,7 @@ bitmask -> i32) are handled by the interp layer, NOT here."
         ((:mem :const :shuffle :swizzle :splat :extract :extract-s
                :extract-u :replace :any-true :all-true :bitmask
                :r-swizzle)
-         ;; handled by the interp layer (memory / immediates /
+         ;; handled by EXECUTE-OP (memory / immediates /
          ;; reductions / splat-replace plumbing)
          (error "simd exec: class ~a not a pure lane op" class))
         ;; ---- integer lanewise ----
@@ -1066,6 +1067,241 @@ bitmask -> i32) are handled by the interp layer, NOT here."
         ;; handled by width above (32/64 = the f32x4/f64x2 shapes).
         (:extract (error "simd exec: extract via interp"))
         (:replace (error "simd exec: replace via interp"))))))
+
+;;; ---------------------------------------------------------------
+;;; EXECUTE-OP: the ONE value-level semantics of a SIMD instruction.
+;;; Both backends call it — wasmdown.interp's EXEC-SIMD for every
+;;; 0xFD instruction and wasmdown.codegen, which emits a direct call
+;;; per instruction. OP is the IR keyword, IMMS its immediate plist,
+;;; ARGS the operands in WAT/push order (first operand first) and
+;;; MEMORY the memory-instance for the memarg families (NIL
+;;; elsewhere; the caller resolves the memidx immediate against its
+;;; module instance). Returns the RESULTS LIST in WAT order (empty
+;;; for the stores). Pure lane compute delegates to EXEC above.
+
+;;; The runtime memory primitives live in WASMDOWN.RUNTIME, which this
+;;; file precedes in the ASDF serial order; the FTYPEs keep the
+;;; compile clean and pin the audited call shapes.
+(declaim (ftype (function (t t t) t) wasmdown.runtime:memory-load)
+         (ftype (function (t t t t) t) wasmdown.runtime:memory-store)
+         (ftype (function (t) t) wasmdown.runtime:memory-instance-bytes))
+
+(defun %simd-trap (format-control &rest args)
+  "Signal the same trap the reference interpreter raises for a
+malformed SIMD operand."
+  (error 'wasmdown:wasm-trap :kind :unreachable
+         :message (apply #'format nil format-control args)))
+
+(defun %v128-bytes-of (x op)
+  (if (v128-p x)
+      (v128-bytes x)
+      (%simd-trap "SIMD operand of ~a is not a v128" op)))
+
+(defun %float-bits (value width)
+  "The bit pattern of a float scalar for a WIDTH-bit SIMD lane."
+  (ecase width
+    (32 (wasmdown.numops:f32-bits value))
+    (64 (wasmdown.numops:f64-bits value))))
+
+(defun %float-from-bits (bits width)
+  "The float scalar a WIDTH-bit SIMD lane holds."
+  (ecase width
+    (32 (wasmdown.numops:f32-from-bits bits))
+    (64 (wasmdown.numops:f64-from-bits bits))))
+
+(defun execute-op (op imms args memory)
+  "Execute one SIMD instruction value-level: see the section comment."
+  (let* ((entry (entry-of op))
+         (class (simd-entry-class entry))
+         (imm (simd-entry-imm entry))
+         (width (or (simd-entry-lane-width entry) 128))
+         (lanes (or (simd-entry-lanes entry) 1)))
+    (flet ((bytes (x) (%v128-bytes-of x op))
+           (ea () (+ (first args) (getf imms :offset 0)))
+           (mem ()
+             (or memory
+                 (%simd-trap "SIMD memory op ~a without a memory instance" op))))
+      (cond
+       ;; ---- const ----
+       ((eq op :v128.const)
+        (list (make-v128-from-bytes (getf imms :bytes))))
+       ;; ---- pure memarg loads/stores ----
+       ((and (consp imm) (eq (first imm) :memarg))
+        (ecase op
+          (:v128.load
+           (let* ((m (mem)) (a (ea)))
+             ;; bounds-check the full 16-byte span (traps OOB)
+             (wasmdown.runtime:memory-load m a 16)
+             (list (make-v128-from-bytes
+                    (wasmdown.runtime:memory-instance-bytes m) a))))
+          (:v128.store
+           (let ((m (mem)) (a (ea)) (v (bytes (second args))))
+             ;; bounds-check the full 16-byte span then copy
+             (wasmdown.runtime:memory-load m a 16)
+             (let ((b (wasmdown.runtime:memory-instance-bytes m)))
+               (loop for i below 16
+                     do (setf (aref b (+ a i)) (aref v i))))
+             nil))
+          ;; load-and-extend: 8 source bytes -> 8 lanes of 2x width
+          ((:v128.load8x8_s :v128.load8x8_u
+            :v128.load16x4_s :v128.load16x4_u
+            :v128.load32x2_s :v128.load32x2_u)
+           (let* ((m (mem))
+                  (a (ea))
+                  (name (string-downcase (string op)))
+                  (sw (cond ((search "load8x8" name) 8)
+                            ((search "load16x4" name) 16)
+                            (t 32)))
+                  (signed (search "_s" name))
+                  (r (make-v128)))
+             ;; the SOURCE is always 8 bytes: 8 bytes / (sw/8)
+             ;; bytes-per-lane lanes (8 for load8x8, 4 for
+             ;; load16x4, 2 for load32x2)
+             (loop for i below (/ 64 sw)
+                   do (let ((x (wasmdown.runtime:memory-load
+                                m (+ a (* i (/ sw 8)))
+                                (/ sw 8))))
+                        (set-lane-u
+                         r i (* sw 2)
+                         (if signed
+                             (mod (if (>= x (ash 1 (1- sw)))
+                                      (- x (ash 1 sw))
+                                      x)
+                                  (ash 1 (* 2 sw)))
+                             x))))
+             (list r)))
+          ;; splat loads
+          ((:v128.load8_splat :v128.load16_splat
+            :v128.load32_splat :v128.load64_splat)
+           (let* ((m (mem))
+                  (a (ea))
+                  (name (string-downcase (string op)))
+                  (w (cond ((search "load8" name) 8)
+                           ((search "load16" name) 16)
+                           ((search "load32" name) 32)
+                           (t 64)))
+                  (x (wasmdown.runtime:memory-load m a (/ w 8)))
+                  (r (make-v128)))
+             (loop for i below (/ 128 w)
+                   do (set-lane-u r i w x))
+             (list r)))
+          ;; zero-padded loads
+          ((:v128.load32_zero :v128.load64_zero)
+           (let* ((m (mem))
+                  (a (ea))
+                  (w (if (eq op :v128.load32_zero) 4 8))
+                  (x (wasmdown.runtime:memory-load m a w))
+                  (r (make-v128)))
+             (set-lane-u r 0 (* 8 w) x)
+             (list r)))))
+       ;; ---- load/store lane pairs (memarg + laneidx) ----
+       ((and (consp imm) (eq (first imm) :memarg-lane))
+        (let ((lane (getf imms :lane))
+              (lw (ecase (second imm) (1 8) (2 16) (4 32) (8 64))))
+          (ecase op
+            ((:v128.load8_lane :v128.load16_lane
+              :v128.load32_lane :v128.load64_lane)
+             (let ((v (bytes (second args)))
+                   (m (mem))
+                   (a (ea)))
+               (let ((x (wasmdown.runtime:memory-load m a (/ lw 8))))
+                 (set-lane-u v lane lw x)
+                 (list v))))
+            ((:v128.store8_lane :v128.store16_lane
+              :v128.store32_lane :v128.store64_lane)
+             (let ((v (bytes (second args)))
+                   (m (mem))
+                   (a (ea)))
+               (let ((x (lane-u v lane lw)))
+                 (wasmdown.runtime:memory-store m a (/ lw 8) x))
+               nil)))))
+       ;; ---- shuffle / swizzle ----
+       ((eq op :i8x16.shuffle)
+        (let ((b (bytes (second args)))
+              (a (bytes (first args)))
+              (r (make-v128))
+              (sel (getf imms :lanes)))
+          (loop for i below 16
+                do (setf (aref r i)
+                         (if (< (svref sel i) 16)
+                             (aref a (svref sel i))
+                             (aref b (- (svref sel i) 16)))))
+          (list r)))
+       ((or (eq op :i8x16.swizzle) (eq op :i8x16.relaxed_swizzle))
+        (let ((sel (bytes (second args)))
+              (a (bytes (first args)))
+              ;; canonical relaxed choice: OOB indices (16..255)
+              ;; give 0 (the non-relaxed swizzle admits only 0; the
+              ;; relaxed variant additionally admits a[s%16] for
+              ;; 16..127).
+              (r (make-v128)))
+          (loop for i below 16
+                do (let ((idx (aref sel i)))
+                     (setf (aref r i)
+                           (if (< idx 16) (aref a idx) 0))))
+          (list r)))
+       ;; ---- splats ----
+       ;; The FLOAT lanes take a float scalar: store its BITS, never the
+       ;; float object (set-lane-u is an integer operation, and a shared
+       ;; backend means one rule for both engines).
+       ((eq class :splat)
+        (let ((x (if (simd-entry-float-p entry)
+                     (%float-bits (first args) width)
+                     (first args)))
+              (r (make-v128)))
+          (loop for i below lanes
+                do (set-lane-u r i width x))
+          (list r)))
+       ;; ---- extract/replace lanes ----
+       ((member class '(:extract :extract-s :extract-u))
+        (let* ((v (bytes (first args)))
+               (lane (getf imms :lane))
+               (x (lane-u v lane width)))
+          (list (ecase class
+                  (:extract (if (simd-entry-float-p entry)
+                                (%float-from-bits x width)
+                                x))
+                  (:extract-s (mod (if (>= x (ash 1 (1- width)))
+                                       (- x (ash 1 width))
+                                       x)
+                                   #x100000000))
+                  (:extract-u x)))))
+       ((eq class :replace)
+        (let* ((v (bytes (first args)))
+               (x (if (simd-entry-float-p entry)
+                      (%float-bits (second args) width)
+                      (second args)))
+               (r (make-v128-from-bytes v)))
+          (set-lane-u r (getf imms :lane) width x)
+          (list r)))
+       ;; ---- shifts (the second operand is a scalar i32) ----
+       ((member class '(:i-shl :i-shr-s :i-shr-u))
+        (list (exec entry (bytes (first args)) (second args))))
+       ;; ---- scalar reductions ----
+       ((eq class :any-true)
+        (let ((v (bytes (first args))))
+          (list (if (loop for i below 16 thereis (/= (aref v i) 0))
+                    1 0))))
+       ((eq class :all-true)
+        (let ((v (bytes (first args))))
+          (list (if (loop for i below lanes
+                          always (/= (lane-u v i width) 0))
+                    1 0))))
+       ((eq class :bitmask)
+        (let ((v (bytes (first args))))
+          (list (loop for i below lanes
+                      for x = (lane-u v i width)
+                      when (>= x (ash 1 (1- width)))
+                        sum (ash 1 i)))))
+       ;; ---- everything else: pure lane compute via exec ----
+       (t
+        (ecase (length (simd-entry-params entry))
+          (1 (list (exec entry (bytes (first args)))))
+          (2 (list (exec entry (bytes (first args))
+                         (bytes (second args)))))
+          (3 (list (exec entry (bytes (first args))
+                         (bytes (second args))
+                         (bytes (third args)))))))))))
 
 ;;; ---------------------------------------------------------------
 ;;; Binary immediate decoding (the 0xFD family's operand grammar,

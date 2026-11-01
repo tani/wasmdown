@@ -4,13 +4,10 @@
 ;;;; FUNCTIONS, installed into the same instance, and invoked again;
 ;;;; results must agree (EQUALP) and traps must agree in kind.
 ;;;;
-;;;; Excluded on purpose: signed sub-word loads/stores (i32.load8_s and
-;;;; friends) and f32/f64 load/store fixtures. The interpreter currently
-;;;; sign-extends to the load width instead of the result width and
-;;;; passes raw bits at float memory boundaries (known interp.lisp
-;;;; bugs, reported separately); codegen implements the CONTRACTS.md
-;;;; shape, so the two engines disagree and parity would fail through
-;;;; no fault of the backend. Main re-adds these after the interp fix.
+;;;; Formerly excluded and now COVERED (the interpreter was fixed to the
+;;;; CONTRACTS.md shape): signed sub-word loads (i32/i64 loadN_s) and
+;;;; f32/f64 load/store at the memory boundary. The pins at the end of
+;;;; this file fail if either engine drifts back to the old behaviour.
 
 (defpackage #:wasmdown.test.codegen
   (:use #:cl #:wasmdown.types #:wasmdown.runtime)
@@ -70,51 +67,19 @@
       (cons :ok (apply #'call-export inst name args)))))
 
 (defun %install-compiled! (mod inst compiled)
-  "Replace the instance's interpreter-backed :wasm func-instances with
-  host instances wrapping the COMPILED closures (absolute funcidx =
-  imported funcs + defined index), then refresh the value surfaces that
-  captured the old instances: function exports, table elements and
-  element-segment refs (same contract as api.lisp's baseline mode)."
-  (let* ((nimp (count :func (wasm-module-imports mod)
-                      :key #'wasm-import-kind))
-         (funcs (module-instance-funcs inst))
-         (types (wasm-module-types mod)))
-    (flet ((compiled-for (v)
-             "The compiled host func-instance replacing V, or NIL."
-             (and (func-instance-p v)
-                  (eq (func-instance-kind v) :wasm)
-                  (eq (func-instance-module v) inst)
-                  (< (func-instance-wasm-funcidx v) (length compiled))
-                  (make-host-func-instance
-                   (svref types (wasm-func-typeidx
-                                 (svref (wasm-module-funcs mod)
-                                        (func-instance-wasm-funcidx v))))
-                   (svref compiled (func-instance-wasm-funcidx v))))))
-      (loop for j below (length compiled)
-            do (let ((f (svref (wasm-module-funcs mod) j)))
-                 (setf (svref funcs (+ nimp j))
-                       (make-host-func-instance
-                        (svref types (wasm-func-typeidx f))
-                        (svref compiled j)))))
-      ;; refresh function exports from the export section (absolute
-      ;; funcidx = funcs-vector index)
-      (loop for ex across (wasm-module-exports mod)
-            when (eq (wasm-export-kind ex) :func)
-              do (let ((cell (assoc (wasm-export-name ex)
-                                    (module-instance-exports inst)
-                                    :test #'equal)))
-                   (setf (cdr cell)
-                         (svref funcs (wasm-export-index ex)))))
-      ;; call_indirect targets captured in tables + elem-seg refs
-      (loop for tab across (module-instance-tables inst)
-            do (let ((elems (table-instance-elems tab)))
-                 (loop for j below (length elems)
-                       for c = (compiled-for (svref elems j))
-                       when c do (setf (svref elems j) c))))
-      (loop for seg across (wasmdown.runtime::module-instance-elem-segs inst)
-            do (setf (wasmdown.runtime::elem-seg-state-refs seg)
-                     (mapcar (lambda (v) (or (compiled-for v) v))
-                             (wasmdown.runtime::elem-seg-state-refs seg)))))))
+  "Install COMPILED entries on the instance's DEFINED :wasm
+func-instances (absolute funcidx = imported funcs + defined index).
+Only BACKEND/COMPILED-ENTRY change: exports, table elements, element
+segments and other modules' imports keep the same reference objects
+(the M1 contract api.lisp's :baseline mode uses)."
+  (declare (ignorable mod))
+  (let ((nimp (count :func (wasm-module-imports (module-instance-module inst))
+                     :key #'wasm-import-kind)))
+    (loop for j below (length compiled)
+          for f = (svref (module-instance-funcs inst) (+ nimp j))
+          do (setf (func-instance-backend f) :baseline
+                   (func-instance-compiled-entry f) (svref compiled j)))
+    inst))
 
 
 (defun parity (mod &key imports (name "f") args emit)
@@ -693,3 +658,724 @@ functions, and require the same result (EQUALP)."
     (wasmdown.test:is (equalp (call-export inst "f" 1024) '(42)))
     (wasmdown.test:is (= 42 (aref (memory-instance-bytes mem) 1024)))
     (wasmdown.test:is (= 0 (aref (memory-instance-bytes mem) 42)))))
+
+;;; -----------------------------------------------------------------
+;;; M2: one guest call protocol for both backends.
+;;;
+;;; The trampoline lives in wasmdown.runtime (INVOKE-WASM): assembled
+;;; code and interpreter bodies both run through it, so return_call* is
+;;; a transfer that keeps the frame (constant host stack and constant
+;;; guest depth), non-tail recursion still traps, and the uncaught-
+;;; exception boundary is backend-independent.
+
+(defun %instantiate-wat (text &key (mode :interpret) imports)
+  (wasmdown:instantiate (wasmdown:validate-module
+                         (wasmdown.text:parse-wat text))
+                        :mode mode :imports imports))
+
+(defparameter *tail-count-module*
+  "(module (func $count (param i32) (result i32)
+             (if (result i32) (i32.eqz (local.get 0))
+                 (then (i32.const 0))
+                 (else (return_call $count
+                         (i32.sub (local.get 0) (i32.const 1))))))
+           (func (export \"count\") (param i32) (result i32)
+             (return_call $count (local.get 0))))")
+
+(wasmdown.test:test codegen/return-call-constant-stack
+  (dolist (mode '(:interpret :baseline))
+    (let ((inst (%instantiate-wat *tail-count-module* :mode mode)))
+      (wasmdown.test:is (equal '(0) (wasmdown:invoke inst "count" 200000)))
+      (wasmdown.test:is (zerop wasmdown.runtime:*guest-depth*)))))
+
+(defparameter *tail-indirect-module*
+  "(module (type $t (func (param i32) (result i32)))
+           (table 1 funcref)
+           (elem (i32.const 0) $count)
+           (func $count (type $t)
+             (if (result i32) (i32.eqz (local.get 0))
+                 (then (i32.const 0))
+                 (else (return_call_indirect (type $t)
+                         (i32.sub (local.get 0) (i32.const 1))
+                         (i32.const 0)))))
+           (func (export \"count\") (param i32) (result i32)
+             (return_call_indirect (type $t) (local.get 0) (i32.const 0))))")
+
+(wasmdown.test:test codegen/return-call-indirect-constant-stack
+  (dolist (mode '(:interpret :baseline))
+    (let ((inst (%instantiate-wat *tail-indirect-module* :mode mode)))
+      (wasmdown.test:is (equal '(0) (wasmdown:invoke inst "count" 200000)))
+      (wasmdown.test:is (zerop wasmdown.runtime:*guest-depth*)))))
+
+(defparameter *tail-ref-module*
+  "(module (type $t (func (param i32) (result i32)))
+           (func $count (type $t)
+             (if (result i32) (i32.eqz (local.get 0))
+                 (then (i32.const 0))
+                 (else (return_call_ref (type $t)
+                         (i32.sub (local.get 0) (i32.const 1))
+                         (ref.func $count)))))
+           (export \"raw\" (func $count))
+           (func (export \"count\") (param i32) (result i32)
+             (return_call_ref (type $t) (local.get 0) (ref.func $count))))")
+
+(wasmdown.test:test codegen/return-call-ref-constant-stack
+  (dolist (mode '(:interpret :baseline))
+    (let ((inst (%instantiate-wat *tail-ref-module* :mode mode)))
+      (wasmdown.test:is (equal '(0) (wasmdown:invoke inst "count" 200000)))
+      (wasmdown.test:is (zerop wasmdown.runtime:*guest-depth*)))))
+
+(defparameter *non-tail-module*
+  "(module (func $spin (param i32)
+             (call $spin (i32.add (local.get 0) (i32.const 1))))
+           (func (export \"spin\") (call $spin (i32.const 0))))")
+
+(wasmdown.test:test codegen/non-tail-recursion-traps-in-both-backends
+  (dolist (mode '(:interpret :baseline))
+    (let ((inst (%instantiate-wat *non-tail-module* :mode mode)))
+      (wasmdown.test:assert-trap :call-stack-exhausted
+        (wasmdown:invoke inst "spin"))
+      ;; the protocol unwinds its own binding: a deep trap never leaves
+      ;; the counter inflated for the next invocation.
+      (wasmdown.test:is (zerop wasmdown.runtime:*guest-depth*)))))
+
+(wasmdown.test:test codegen/mixed-backend-call-graphs
+  ;; compiled -> interpreted and interpreted -> compiled through the
+  ;; same trampoline; each function keeps its defining backend.
+  (let* ((compiled (%instantiate-wat
+                    "(module (func $f (result i32) (i32.const 11))
+                              (func (export \"f\") (result i32) (call $f)))"
+                    :mode :baseline))
+         (interped (%instantiate-wat
+                    "(module (func $g (result i32) (i32.const 31))
+                              (func (export \"g\") (result i32) (call $g)))"
+                    :mode :interpret))
+         (fv (wasmdown:instance-export compiled "f"))
+         (gv (wasmdown:instance-export interped "g"))
+         (mixed (%instantiate-wat
+                 "(module (import \"a\" \"f\" (func $f (result i32)))
+                          (import \"i\" \"g\" (func $g (result i32)))
+                          (func (export \"sum\") (result i32)
+                            (i32.add (call $f) (call $g))))"
+                 :mode :baseline
+                 :imports (list (cons '("a" "f") fv) (cons '("i" "g") gv)))))
+    (wasmdown.test:is (equal '(42) (wasmdown:invoke mixed "sum")))
+    (wasmdown.test:is (eq :baseline (wasmdown.runtime:func-instance-backend fv)))
+    (wasmdown.test:is (eq :interpret (wasmdown.runtime:func-instance-backend gv)))))
+
+(wasmdown.test:test codegen/uncaught-exception-boundary
+  ;; an uncaught guest exception traps at the host<->guest edge in the
+  ;; interpreter; the compiled backend refuses `throw` explicitly until
+  ;; the EH lowering lands (M7) - never a silent interpreter fallback.
+  (handler-case
+      (progn (wasmdown:invoke
+              (%instantiate-wat "(module (tag $e)
+                                        (func (export \"boom\") (throw $e)))")
+              "boom")
+             (wasmdown.test:is nil))
+    (wasmdown:wasm-trap (c)
+      (wasmdown.test:is (eq :uncaught-exception (wasmdown:wasm-trap-kind c)))))
+  ;; the compiled backend lowers throw/try_table, so an uncaught guest
+  ;; exception crosses the same boundary as in the interpreter.
+  (handler-case
+      (progn (wasmdown:invoke
+              (%instantiate-wat "(module (tag $e)
+                                        (func (export \"boom\") (throw $e)))"
+                                :mode :baseline)
+              "boom")
+             (wasmdown.test:is nil))
+    (wasmdown:wasm-trap (c)
+      (wasmdown.test:is (eq :uncaught-exception (wasmdown:wasm-trap-kind c))))))
+
+;;; -----------------------------------------------------------------
+;;; M3: saved operand views, arms, and cross-table copying.
+
+(defun %parity-modes (text name &rest args)
+  "Run NAME in both explicitly selected backends and require equal
+results (and equal trap kinds). Uses the public instantiate path."
+  (let ((i (apply #'wasmdown:invoke
+                                   (%instantiate-wat text :mode :interpret)
+                                   name args))
+        (b-in (handler-case
+                  (list :ok (apply #'wasmdown:invoke
+                                   (%instantiate-wat text :mode :baseline)
+                                   name args))
+                (wasmdown:wasm-trap (c) (list :trap (wasmdown:wasm-trap-kind c))))))
+    (wasmdown.test:is (equal (list :ok i) b-in))
+    b-in))
+
+(wasmdown.test:test codegen/mutable-local-in-saved-block-tail
+  ;; an operand pushed from a local BELOW an open block keeps the value
+  ;; it was read with even when the block writes that local: the saved
+  ;; tail of every open frame is part of the audit.
+  (%parity-modes
+   "(module (func (export \"f\") (result i32)
+              (local $x i32)
+              (local.set $x (i32.const 10))
+              (local.get $x)
+              (block (result i32)
+                (local.set $x (i32.const 99))
+                (i32.const 1))
+              (i32.add)))"
+   "f")
+  (wasmdown.test:is (equal '(:ok (11))
+                          (%parity-modes
+                           "(module (func (export \"f\") (result i32)
+                                      (local $x i32)
+                                      (local.set $x (i32.const 10))
+                                      (local.get $x)
+                                      (block (result i32)
+                                        (local.set $x (i32.const 99))
+                                        (i32.const 1))
+                                      (i32.add)))"
+                           "f"))))
+
+(wasmdown.test:test codegen/cross-table-copy
+  ;; table.copy across two tables: each span is bounds-checked against
+  ;; its own table, then call_indirect resolves through the destination.
+  (wasmdown.test:is
+   (equal '(:ok (2))
+          (%parity-modes
+           "(module
+              (type $t (func (result i32)))
+              (table $a 4 funcref)
+              (table $b 4 funcref)
+              (elem (table $a) (i32.const 0) func $one $two)
+              (func $one (type $t) (i32.const 1))
+              (func $two (type $t) (i32.const 2))
+              (func (export \"f\") (result i32)
+                (table.copy $b $a (i32.const 0) (i32.const 0) (i32.const 2))
+                (call_indirect $b (type $t) (i32.const 1))))"
+           "f"))))
+
+(wasmdown.test:test codegen/if-arms-share-one-entry-state
+  ;; the then arm's unreachable tail must not corrupt the else arm: both
+  ;; arms rebuild their operand stack from the same saved entry state.
+  (let ((r (%parity-modes
+            "(module (func (export \"f\") (param i32) (result i32)
+                       (i32.const 5)
+                       (if (result i32) (local.get 0)
+                           (then (i32.const 1) (br 0) (drop))
+                           (else (i32.const 3)))
+                       (i32.add)))"
+            "f" 1)))
+    (wasmdown.test:is (equal '(:ok (6)) r))))
+
+;;; -----------------------------------------------------------------
+;;; M4: SIMD (v128 + relaxed) and GC/typed references.
+;;;
+;;; Both families share their value-level semantics with the reference
+;;; interpreter (WASMDOWN.SIMD:EXECUTE-OP and the WASMDOWN.RUNTIME GC
+;;; helpers), so these fixtures are differential: every case runs the
+;;; SAME module through wasmdown:instantiate in :interpret and
+;;; :baseline and requires equal results and equal trap kinds.
+
+(defun %parity-modes-equalp (text name &rest args)
+  "Like %PARITY-MODES, but a trap is an OBSERVABLE of both backends
+(compared by kind) and results compare with EQUALP — v128 results are
+byte vectors, which EQUAL would distinguish by identity."
+  (flet ((run (mode)
+           (handler-case
+               (list :ok (apply #'wasmdown:invoke
+                                (%instantiate-wat text :mode mode) name args))
+             (wasmdown:wasm-trap (c)
+               (list :trap (wasmdown:wasm-trap-kind c))))))
+    (let ((i (run :interpret))
+          (b (run :baseline)))
+      (wasmdown.test:is (equalp i b))
+      b)))
+
+(wasmdown.test:test codegen/simd-const-and-lane-extract
+  ;; v128.const + a lane extract: the compiled value is a v128, the
+  ;; extract reads the same lane the interpreter does.
+  (wasmdown.test:is
+   (equal '(:ok (3))
+          (%parity-modes-equalp
+           "(module
+              (func (export \"f\") (result i32)
+                (i32x4.extract_lane 2 (v128.const i32x4 1 2 3 4))))"
+           "f")))
+  ;; a v128 RESULT crosses the host boundary as the 16-byte value
+  (wasmdown.test:is
+   (equalp '(:ok (#(1 0 0 0 2 0 0 0 3 0 0 0 4 0 0 0)))
+          (%parity-modes-equalp
+           "(module
+              (func (export \"f\") (result v128)
+                (v128.const i32x4 1 2 3 4)))"
+           "f")))
+  ;; i64x2 lane extract keeps the 64-bit lane value
+  (wasmdown.test:is
+   (equal '(:ok (4294967297))
+          (%parity-modes-equalp
+           "(module
+              (func (export \"f\") (result i64)
+                (i64x2.extract_lane 0
+                  (v128.const i64x2 4294967297 1))))"
+           "f"))))
+
+(wasmdown.test:test codegen/simd-i8x16-arithmetic-and-shuffle
+  (wasmdown.test:is
+   (equal '(:ok (17))
+          (%parity-modes-equalp
+           "(module
+              (func (export \"f\") (result i32)
+                (i8x16.extract_lane_u 0
+                  (i8x16.add
+                    (v128.const i8x16 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16)
+                    (v128.const i8x16 16 15 14 13 12 11 10 9 8 7 6 5 4 3 2 1)))))"
+           "f")))
+  ;; i8x16.shuffle selects across BOTH operands (indices 16..31 name
+  ;; the second vector)
+  (wasmdown.test:is
+   (equalp '(:ok (#(0 17 2 19 4 21 6 23 8 25 10 27 12 29 14 31)))
+          (%parity-modes-equalp
+           "(module
+              (func (export \"f\") (result v128)
+                (i8x16.shuffle 0 17 2 19 4 21 6 23 8 25 10 27 12 29 14 31
+                  (v128.const i8x16 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15)
+                  (v128.const i8x16 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31))))"
+           "f")))
+  ;; swizzle zeroes out-of-range indices
+  (wasmdown.test:is
+   (equalp '(:ok (#(10 11 0 0 0 0 0 0 0 0 0 0 0 0 0 0)))
+          (%parity-modes-equalp
+           "(module
+              (func (export \"f\") (result v128)
+                (i8x16.swizzle
+                  (v128.const i8x16 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25)
+                  (v128.const i8x16 0 1 16 17 18 19 20 21 22 23 24 25 26 27 28 29))))"
+           "f"))))
+
+(wasmdown.test:test codegen/simd-memory-and-lane-memory
+  ;; v128.store then v128.load round-trips through the instance memory
+  ;; with the full 16-byte span bounds-checked by the shared loader.
+  (wasmdown.test:is
+   (equal '(:ok (2055))
+          (%parity-modes-equalp
+           "(module
+              (memory 1)
+              (func (export \"f\") (result i32)
+                (v128.store (i32.const 0)
+                  (v128.const i8x16 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16))
+                (i16x8.extract_lane_u 3 (v128.load (i32.const 0)))))"
+           "f")))
+  ;; load32_lane writes one lane of the operand vector from memory
+  (wasmdown.test:is
+   (equal '(:ok (305419896))
+          (%parity-modes-equalp
+           "(module
+              (memory 1)
+              (func (export \"f\") (result i32)
+                (i32.store (i32.const 32) (i32.const 305419896))
+                (i32x4.extract_lane 1
+                  (v128.load32_lane offset=0 1 (i32.const 32)
+                    (v128.const i32x4 7 8 9 10)))))"
+           "f")))
+  ;; store8_lane writes exactly one lane byte
+  (wasmdown.test:is
+   (equal '(:ok (77))
+          (%parity-modes-equalp
+           "(module
+              (memory 1)
+              (func (export \"f\") (result i32)
+                (v128.store8_lane offset=0 5 (i32.const 48)
+                  (v128.const i8x16 0 0 0 0 0 77 0 0 0 0 0 0 0 0 0 0))
+                (i32.load8_u (i32.const 48))))"
+           "f")))
+  ;; an out-of-bounds v128.load traps the SAME way in both backends
+  (wasmdown.test:is
+   (equal '(:trap :out-of-bounds-memory)
+          (%parity-modes-equalp
+           "(module
+              (memory 1)
+              (func (export \"f\") (result i32)
+                (i32x4.extract_lane 0 (v128.load (i32.const 65535)))))"
+           "f")))
+  ;; a splat load and a zero-padded load
+  (wasmdown.test:is
+   (equalp '(:ok (#(9 9 9 9 9 9 9 9 9 9 9 9 9 9 9 9)))
+          (%parity-modes-equalp
+           "(module
+              (memory 1)
+              (func (export \"f\") (result v128)
+                (i32.store8 (i32.const 0) (i32.const 9))
+                (v128.load8_splat (i32.const 0))))"
+           "f")))
+  (wasmdown.test:is
+   (equalp '(:ok (#(1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0)))
+          (%parity-modes-equalp
+           "(module
+              (memory 1)
+              (func (export \"f\") (result v128)
+                (i32.store8 (i32.const 0) (i32.const 1))
+                (v128.load32_zero (i32.const 0))))"
+           "f"))))
+
+(wasmdown.test:test codegen/simd-relaxed
+  ;; relaxed swizzle (canonical: OOB -> 0) and relaxed q15mulr
+  (wasmdown.test:is
+   (equalp '(:ok (#(10 11 12 13 14 15 16 17 0 0 0 0 0 0 0 0)))
+          (%parity-modes-equalp
+           "(module
+              (func (export \"f\") (result v128)
+                (i8x16.relaxed_swizzle
+                  (v128.const i8x16 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25)
+                  (v128.const i8x16 0 1 2 3 4 5 6 7 200 201 202 203 204 205 206 207))))"
+           "f")))
+  (wasmdown.test:is
+   (equal '(:ok (1))
+          (%parity-modes-equalp
+           "(module
+              (func (export \"f\") (result i32)
+                (i16x8.extract_lane_u 0
+                  (i16x8.relaxed_q15mulr_s
+                    (v128.const i16x8 16384 2 3 4 5 6 7 8)
+                    (v128.const i16x8 2 2 3 4 5 6 7 8)))))"
+           "f"))))
+
+(wasmdown.test:test codegen/gc-struct-new-get-set-packed
+  ;; struct.new normalizes a 200 into the i8 field; get_u/get_s read
+  ;; width-wrapped and sign-extended respectively.
+  (wasmdown.test:is
+   (equal '(:ok (200))
+          (%parity-modes-equalp
+           "(module
+              (type $p (struct (field i32) (field i8)))
+              (func (export \"f\") (result i32)
+                (struct.get_u $p 1
+                  (struct.new $p (i32.const 1) (i32.const 200)))))"
+           "f")))
+  (wasmdown.test:is
+   (equal '(:ok (4294967240))
+          (%parity-modes-equalp
+           "(module
+              (type $p (struct (field i32) (field i8)))
+              (func (export \"f\") (result i32)
+                (struct.get_s $p 1
+                  (struct.new $p (i32.const 1) (i32.const 200)))))"
+           "f")))
+  ;; struct.new_default zeroes fields; struct.set wraps on store.
+  (wasmdown.test:is
+   (equal '(:ok (4294967240))
+          (%parity-modes-equalp
+           "(module
+              (type $p (struct (field i32) (field (mut i8))))
+              (func (export \"f\") (result i32)
+                (local $s (ref null $p))
+                (local.set $s (struct.new_default $p))
+                (struct.set $p 1 (local.get $s) (i32.const 200))
+                (struct.get_s $p 1 (local.get $s))))"
+           "f")))
+  ;; a null struct.get traps :null-reference in both backends
+  (wasmdown.test:is
+   (equal '(:trap :null-reference)
+          (%parity-modes-equalp
+           "(module
+              (type $p (struct (field i32)))
+              (func (export \"f\") (result i32)
+                (struct.get $p 0 (ref.null $p))))"
+           "f"))))
+
+(wasmdown.test:test codegen/gc-array-new-get-len
+  (wasmdown.test:is
+   (equal '(:ok (513))
+          (%parity-modes-equalp
+           "(module
+              (type $a (array (mut i16)))
+              (func (export \"f\") (result i32)
+                (array.get_u $a
+                  (array.new $a (i32.const 513) (i32.const 3))
+                  (i32.const 2))))"
+           "f")))
+  (wasmdown.test:is
+   (equal '(:ok (4))
+          (%parity-modes-equalp
+           "(module
+              (type $a (array (mut i16)))
+              (func (export \"f\") (result i32)
+                (array.len (array.new_default $a (i32.const 4)))))"
+           "f")))
+  ;; new_fixed + get_s, then fill + init_data in the same module
+  (wasmdown.test:is
+   (equal '(:ok (7))
+          (%parity-modes-equalp
+           "(module
+              (type $a (array (mut i8)))
+              (func (export \"f\") (result i32)
+                (array.get_u $a
+                  (array.new_fixed $a 3 (i32.const 5) (i32.const 6) (i32.const 7))
+                  (i32.const 2))))"
+           "f")))
+  (wasmdown.test:is
+   (equal '(:ok (9))
+          (%parity-modes-equalp
+           "(module
+              (type $a (array (mut i8)))
+              (func (export \"f\") (result i32)
+                (local $x (ref null $a))
+                (local.set $x (array.new_default $a (i32.const 4)))
+                (array.fill $a (local.get $x) (i32.const 0) (i32.const 9)
+                            (i32.const 2))
+                (array.get_u $a (local.get $x) (i32.const 1))))"
+           "f")))
+  (wasmdown.test:is
+   (equal '(:ok (2))
+          (%parity-modes-equalp
+           "(module
+              (type $a (array (mut i8)))
+              (data \"\\01\\02\\03\")
+              (func (export \"f\") (result i32)
+                (array.get_u $a
+                  (array.new_data $a 0 (i32.const 1) (i32.const 2))
+                  (i32.const 0))))"
+           "f")))
+  ;; array.copy and array.init_data mutate an existing array
+  (wasmdown.test:is
+   (equal '(:ok (5))
+          (%parity-modes-equalp
+           "(module
+              (type $a (array (mut i8)))
+              (data \"\\05\\06\\07\")
+              (func (export \"f\") (result i32)
+                (local $x (ref null $a))
+                (local $y (ref null $a))
+                (local.set $x (array.new_fixed $a 3 (i32.const 5) (i32.const 6) (i32.const 7)))
+                (local.set $y (array.new_default $a (i32.const 3)))
+                (array.copy $a $a (local.get $y) (i32.const 0)
+                            (local.get $x) (i32.const 0) (i32.const 3))
+                (array.get_u $a (local.get $y) (i32.const 0))))"
+           "f")))
+  ;; out-of-bounds array.get traps with the TABLE kind in both
+  (wasmdown.test:is
+   (equal '(:trap :out-of-bounds-table)
+          (%parity-modes-equalp
+           "(module
+              (type $a (array (mut i8)))
+              (func (export \"f\") (result i32)
+                (array.get $a (array.new_default $a (i32.const 1))
+                           (i32.const 1))))"
+           "f"))))
+
+(wasmdown.test:test codegen/gc-i31
+  (wasmdown.test:is
+   (equal '(:ok (4294967295))
+          (%parity-modes-equalp
+           "(module
+              (func (export \"f\") (result i32)
+                (i31.get_s (ref.i31 (i32.const -1)))))"
+           "f")))
+  (wasmdown.test:is
+   (equal '(:ok (2147483647))
+          (%parity-modes-equalp
+           "(module
+              (func (export \"f\") (result i32)
+                (i31.get_u (ref.i31 (i32.const 2147483647)))))"
+           "f")))
+  ;; a null i31 traps :null-reference
+  (wasmdown.test:is
+   (equal '(:trap :null-reference)
+          (%parity-modes-equalp
+           "(module
+              (func (export \"f\") (result i32)
+                (i31.get_s (ref.null i31))))"
+           "f"))))
+
+(wasmdown.test:test codegen/gc-ref-test-and-cast
+  ;; ref.test true and false against concrete struct types
+  (wasmdown.test:is
+   (equal '(:ok (1))
+          (%parity-modes-equalp
+           "(module (type $a (struct (field i32))) (type $b (struct))
+              (func (export \"f\") (result i32)
+                (ref.test (ref $a) (struct.new $a (i32.const 1)))))"
+           "f")))
+  (wasmdown.test:is
+   (equal '(:ok (0))
+          (%parity-modes-equalp
+           "(module (type $a (struct (field i32))) (type $b (struct))
+              (func (export \"f\") (result i32)
+                (ref.test (ref $b) (struct.new $a (i32.const 1)))))"
+           "f")))
+  ;; ref.cast succeeds and yields the value
+  (wasmdown.test:is
+   (equal '(:ok (9))
+          (%parity-modes-equalp
+           "(module (type $a (struct (field i32)))
+              (func (export \"f\") (result i32)
+                (struct.get $a 0
+                  (ref.cast (ref $a) (struct.new $a (i32.const 9))))))"
+           "f")))
+  ;; ref.cast failure traps :cast-failure in both backends
+  (wasmdown.test:is
+   (equal '(:trap :cast-failure)
+          (%parity-modes-equalp
+           "(module (type $a (struct (field i32))) (type $b (struct))
+              (func (export \"f\") (result i32)
+                (ref.cast (ref $b) (struct.new $a (i32.const 1)))
+                (drop)
+                (i32.const 0)))"
+           "f")))
+  ;; null is only accepted against a NULLABLE target
+  (wasmdown.test:is
+   (equal '(:ok (1 0))
+          (%parity-modes-equalp
+           "(module (type $a (struct))
+              (func (export \"f\") (result i32 i32)
+                (ref.test (ref null $a) (ref.null none))
+                (ref.test (ref $a) (ref.null none))))"
+           "f"))))
+
+(wasmdown.test:test codegen/gc-br-on-cast
+  ;; br_on_cast branches WITH the value on success, falls through with
+  ;; it on failure; br_on_cast_fail mirrors. Same module shape as the
+  ;; interpreter's cast-family fixture.
+  (wasmdown.test:is
+   (equal '(:ok (1))
+          (%parity-modes-equalp
+           "(module (type $a (struct))
+              (func (export \"f\") (result i32)
+                (block $l (result (ref $a))
+                  (br_on_cast $l anyref (ref $a) (struct.new_default $a))
+                  (drop)
+                  (i32.const 0)
+                  (return))
+                (drop)
+                (i32.const 1)))"
+           "f")))
+  (wasmdown.test:is
+   (equal '(:ok (0))
+          (%parity-modes-equalp
+           "(module (type $a (struct))
+              (func (export \"f\") (result i32)
+                (block $l (result (ref $a))
+                  (br_on_cast $l anyref (ref $a) (ref.null none))
+                  (drop)
+                  (i32.const 0)
+                  (return))
+                (drop)
+                (i32.const 1)))"
+           "f")))
+  (wasmdown.test:is
+   (equal '(:ok (1))
+          (%parity-modes-equalp
+           "(module (type $a (struct))
+              (func (export \"f\") (result i32)
+                (block $l (result anyref)
+                  (br_on_cast_fail $l anyref (ref $a) (struct.new_default $a))
+                  (drop)
+                  (i32.const 1)
+                  (return))
+                (drop)
+                (i32.const 0)))"
+           "f")))
+  (wasmdown.test:is
+   (equal '(:ok (0))
+          (%parity-modes-equalp
+           "(module (type $a (struct))
+              (func (export \"f\") (result i32)
+                (block $l (result anyref)
+                  (br_on_cast_fail $l anyref (ref $a) (ref.null none))
+                  (drop)
+                  (i32.const 1)
+                  (return))
+                (drop)
+                (i32.const 0)))"
+           "f"))))
+
+(wasmdown.test:test codegen/gc-ref-eq-and-conversions
+  ;; ref.eq is reference IDENTITY: equal i31 payloads are the same
+  ;; value, two fresh structs are not.
+  (wasmdown.test:is
+   (equal '(:ok (1 0 0))
+          (%parity-modes-equalp
+           "(module (type $a (struct))
+              (func (export \"f\") (result i32 i32 i32)
+                (ref.eq (ref.i31 (i32.const 5)) (ref.i31 (i32.const 5)))
+                (ref.eq (ref.i31 (i32.const 5)) (ref.i31 (i32.const 6)))
+                (ref.eq (struct.new_default $a) (struct.new_default $a))))"
+           "f")))
+  ;; any <-> extern round trip preserves the value, and null stays null
+  (wasmdown.test:is
+   (equal '(:ok (1 1))
+          (%parity-modes-equalp
+           "(module (type $a (struct))
+              (func (export \"f\") (result i32 i32)
+                (ref.test (ref $a)
+                  (any.convert_extern (extern.convert_any (struct.new_default $a))))
+                (ref.is_null
+                  (any.convert_extern (extern.convert_any (ref.null none))))))"
+           "f"))))
+
+(wasmdown.test:test codegen/refusal-names-the-opcode
+  ;; Every opcode the decoder and validator can produce now has a
+  ;; lowering, so no valid module reaches the refusal. The path must
+  ;; still exist and stay a wasmdown:codegen-error (never an
+  ;; interpreter fallback): pinned at the emitter boundary with an
+  ;; opcode no layer produces today.
+  (let ((wasmdown.codegen::*current-function-index* 3))
+    (handler-case
+        (progn
+          (wasmdown.codegen::%emit-instr
+           (wasmdown.codegen::make-cctx)
+           (make-wasm-instr :i32.not-an-opcode '(:value 1) #() 7))
+          (wasmdown.test:is nil))
+      (wasmdown:codegen-error (c)
+        (wasmdown.test:is (eq :i32.not-an-opcode (wasmdown:codegen-error-op c)))
+        (wasmdown.test:is (eql 3 (wasmdown:codegen-error-function-index c)))
+        (wasmdown.test:is (eql 7 (wasmdown:codegen-error-offset c)))
+        (wasmdown.test:is (search "no lowering"
+                                  (wasmdown:wasmdown-error-message c)))))))
+
+;;; -----------------------------------------------------------------
+;;; Formerly-excluded parity: signed sub-word loads and float
+;;; load/store at the memory boundary.
+
+(wasmdown.test:test codegen/signed-subword-loads
+  ;; sign extension goes to the RESULT width, not the load width.
+  (dolist (case '(("(module (memory 1) (func (export \"f\") (result i32)
+                       (i32.store8 (i32.const 0) (i32.const 255))
+                       (i32.load8_s (i32.const 0))))"
+                   4294967295)
+                 ("(module (memory 1) (func (export \"f\") (result i32)
+                       (i32.store16 (i32.const 0) (i32.const 65535))
+                       (i32.load16_s (i32.const 0))))"
+                   4294967295)
+                 ("(module (memory 1) (func (export \"f\") (result i64)
+                       (i64.store32 (i32.const 0) (i64.const 4294967295))
+                       (i64.load32_s (i32.const 0))))"
+                   18446744073709551615)))
+    (destructuring-bind (wat expected) case
+      (wasmdown.test:is (equal (list :ok (list expected))
+                              (%parity-modes wat "f"))))))
+
+(wasmdown.test:test codegen/float-memory-boundary
+  ;; floats cross the memory boundary as floats, never raw bits.
+  (dolist (case '(("(module (memory 1) (func (export \"f\") (result f32)
+                       (f32.store (i32.const 0) (f32.const 1.5))
+                       (f32.load (i32.const 0))))" 1.5)
+                 ("(module (memory 1) (func (export \"f\") (result f64)
+                       (f64.store (i32.const 0) (f64.const -2.25))
+                       (f64.load (i32.const 0))))" -2.25d0)))
+    (destructuring-bind (wat expected) case
+      (let ((r (%parity-modes wat "f")))
+        (wasmdown.test:is (eq :ok (first r)))
+        (wasmdown.test:is (eql expected (first (second r))))))))
+
+(wasmdown.test:test codegen/float-simd-lanes
+  ;; float lanes carry FLOAT scalars: splat/extract/replace convert at
+  ;; the boundary, in both backends (shared wasmdown.simd:execute-op).
+  (dolist (case '(("(module (func (export \"f\") (result f32)
+                        (f32x4.extract_lane 0 (f32x4.splat (f32.const 1.5)))))"
+                   1.5)
+                  ("(module (func (export \"f\") (result f64)
+                        (f64x2.extract_lane 1 (f64x2.splat (f64.const 2.25)))))"
+                   2.25d0)
+                  ("(module (func (export \"f\") (result f32)
+                        (f32x4.extract_lane 2
+                          (f32x4.replace_lane 2 (v128.const i32x4 0 0 0 0)
+                                             (f32.const 3.5)))))"
+                   3.5)))
+    (destructuring-bind (wat expected) case
+      (let ((r (%parity-modes wat "f")))
+        (wasmdown.test:is (eq :ok (first r)))
+        (wasmdown.test:is (eql expected (first (second r))))))))

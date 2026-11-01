@@ -220,6 +220,86 @@ a 16-byte value instead of 4/2), plus 2 rows in the last file, `sync-streams`.
 - The WASI 0.2 facade reached 27 of 31 stable interfaces bound at exact release names, and its pinned SQLite artifact *executes*: the Wasmtime-adapter component decodes, validates, composes all 17 versioned providers chosen from the component's declared imports, instantiates, and `wasi:cli/run@0.2.12` runs real SQL (`SELECT 6*7` → `42`; a CREATE/INSERT/SELECT script → `3|13.5`; with `--dir DIR::/work` the database is created, reopened by a second process, and read by the Preview1 build). Four ABI fixes made that work: variant tag matching (`%abi-case-index`), the `:enum` domain shape (`(list :enum label)`, label is `second`), and the `result<T,E>` layout, where alignment and size had to change together (`result<enum,error-code>` is alignment 1, size 2).
 - Preview1 landed the complete `wasi_snapshot_preview1` linear-memory ABI — all 46 imports from the pinned WITX, with the memory gate installed before the start section, pointer/count validation in Lisp integers first (`FAULT`/`INVAL`/`OVERFLOW`), the `..`-confined path rules, `fd_readdir` cookies, and `poll_oneoff` normalizing each subscription against its own clock. `proc_raise` returns `NOTSUP` for every valid signal: the documented in-process limitation, leaving the hosting SBCL untouched.
 
+## Backend parity program (2026-11-01)
+
+Two explicitly selected guest backends — `:interpret` (the reference) and
+`:baseline` (every defined function compiled before the start section) — were
+brought to observable agreement, and the mechanism record lives here because
+the ADRs are amended, not rewritten.
+
+- **Function identity.** Compilation no longer allocates replacement
+  `:host` func-instances. `func-instance` gained `backend` / `compiled-entry`;
+  the entry is filled on the defined function's existing `:wasm` reference, so
+  exports, tables, element segments, `ref.func` constants and other modules'
+  imports keep the same object, and an imported function keeps the backend of
+  its defining instance. ADR-004 carries the dated amendment note.
+- **Instantiation order.** `make-module-instance` gained a `:prepare` hook
+  (allocation and segment states done, active segments unapplied, no guest
+  code run). `:baseline` compiles there, so a `codegen-error` precedes every
+  guest-visible effect and the start section itself runs compiled.
+- **One call protocol.** `runtime:invoke-wasm` owns guest depth
+  (`*guest-depth*` / `*guest-depth-limit*` 1000), the tail-transfer trampoline
+  (`*tail-call-tag*` + `tail-transfer`, used by `return_call`,
+  `return_call_indirect`, `return_call_ref` and by a tail landing on a host
+  import) and the outermost exception boundary. The interpreter's
+  `interp-invoke` became a body runner (`interp-run-body`), so depth is counted
+  once and the two backends cannot drift apart on frame accounting.
+- **Lowering repairs.** Parallel branch moves (`psetf`), independent if/else
+  arms from one saved entry state, block `tail` copies plus a `%capture-pending`
+  audit over every saved view, canonical `func-type-match-p` callee checks with
+  module contexts (a host callee compares against an empty module), cross-table
+  `table.copy` through `runtime:table-copy2`, and the `table.grow` operand-order
+  bug (ref, delta) that made `table_grow`/`table_size` diverge.
+- **EH lowering.** `try_table` is a block frame plus `handler-bind`; a matching
+  clause moves payload (plus the exception object for the `_ref` forms) to the
+  target label with the same parallel move a branch uses. `throw` signals
+  `wasmdown:wasm-exception`; `throw_ref` re-signals a non-null one. Tag objects
+  are resolved at entry (the guarding module), because the handler runs while
+  the thrower's frame is current.
+- **Extension lowering.** 285 opcodes the interpreter implemented and the
+  compiler refused: all 255 SIMD entries (now one value-level
+  `simd:execute-op`, which the interpreter also calls), and the 30 GC/typed-ref
+  opcodes (struct/array/i31/cast/eq/conversions) through value-level
+  `wasmdown.runtime` helpers. Float SIMD lanes convert at the splat/extract/
+  replace boundary (`f32x4.splat` used to pass a float to an integer lane
+  writer, in BOTH backends). The formerly excluded signed sub-word load and
+  float memory-boundary fixtures now pass on both engines.
+- **Measured outcome.** Pinned core suite: 21,260 / 21,260 commands agree in
+  outcome and phase (0 divergences, 0 compile refusals), `make report-backend-parity`.
+  Component lane: 1,631 / 1,631 under `:interpret` (gate) and again under
+  `:baseline` (report). WASI P1: the start section and `_start` both run through
+  the selected backend (`backend-entry-count` proves it). The FULL P1
+  acceptance lane passes under `:baseline` (14 checks across smoke,
+  persistence, reopen, rollback, bail, no-preopen, read-only and escape;
+  821 s of compile-heavy wall time), and two P2 cases are byte-identical
+  across backends at ~200 s per compiled case.
+- **Post-return isolation.** The lift binds `*post-return-context*` around the
+  post-return call; cross-instance imports, `resource.new`/`resource.drop` and
+  the async builtin family trap "cannot leave component instance", while
+  `resource.rep`, `context.*` and `backpressure.*` stay callable. The vendored
+  `values/post-return.wast` moved from 62 pass / 9 fail to **71 / 71**: the
+  remaining two commands call `context.get`/`context.set` from a post-return,
+  so the sync lift now hands the per-call task/thread to the post-return call
+  (the same storage the body wrote). With the file green it left
+  `tests/component/nyi.txt`, growing the component lane from 1,631 to 1,702
+  commands (gate, baseline report and census pin all moved together).
+- **The extension work also moved the interpreter lane.** Re-running the
+  aggregated mirror (pin `63908677d005`) after the SIMD/GC/float-lane fixes
+  reads 62,156 pass / 2,821 fail / 85 harness-error / 73 unsupported of 65,135
+  commands, against the 3,064 / 101 recorded at the M17 close: the shared
+  value-level semantics removed real failures, not just backend differences.
+- **The released WASI lanes run in both backends.** The full P2 behaviour lane
+  (11 cases) and the full P1 acceptance lane pass with compiled guest cores;
+  each case asserts the same exact stdout/status as the interpret run, so the
+  two backends satisfy identical expectations rather than merely agreeing with
+  each other.
+- **Cost picture** (`make report-backends-bench`, medians): on the synthetic
+  kernels `:baseline` runs 7–17x faster than `:interpret` (fib 9.4 ms vs 91 ms,
+  memory fill 159 ms vs 671 ms), and eager compilation costs 0.4–1.5 ms and
+  0.3–1.3 MiB per small module. A 6 MB guest (SQLite) needs ~8 GiB of SBCL
+  heap and ~200 s to compile, which is why the WASI lane's baseline runs are
+  report-mode evidence rather than a gate.
+
 ## Roadmap-era notes
 
 - Numbering convention: engine-slice loops 18–24 and Component Model milestones M7–M17 ran in parallel; neither series renumbers the other.

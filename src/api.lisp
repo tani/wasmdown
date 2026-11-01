@@ -172,74 +172,77 @@ capability probe — no stub."
                :message "baseline codegen backend not loaded (src/codegen.lisp)"))))
 
 (defun %install-baseline! (module inst)
-  "Replace the instance's interpreter-backed :wasm func-instances with
-compiled closures. Absolute funcidx = number of imported functions +
-defined index, matching module-instance-funcs layout (imports first,
-then defined). Also refreshes function exports, table elements and
-element-segment refs that point at this instance so call_indirect and
-table.init see the compiled functions. The start function has already
-run (through the interpreter) inside make-module-instance."
+  "Install compiled entries into MODULE's DEFINED func-instances.
+
+Absolute funcidx = imported-func count + defined index, matching the
+module-instance-funcs layout (imports first, then defined). The
+func-instance OBJECTS are not replaced: compilation only fills
+BACKEND and COMPILED-ENTRY, so exports, table elements, element-segment
+refs, ref.func constants and other modules' imports keep pointing at the
+same reference. IMPORTED func-instances belong to their defining
+instance and are left untouched, so an imported Wasm function keeps its
+own backend.
+
+Called from the instantiation PREPARE hook, before active segments and
+before the start section; a codegen-error unwinds instantiation, so no
+guest code and no segment mutation happened."
   (let* ((compiled (%baseline-compile module inst))
          (nimp (loop for im across (wasmdown.types:wasm-module-imports module)
                      count (eq (wasmdown.types:wasm-import-kind im) :func)))
-         (funcs (wasmdown.runtime:module-instance-funcs inst))
-         (types (wasmdown.types:wasm-module-types module)))
-    (labels ((defined-index-of (v)
-             "The defined-func index of a :wasm func-instance of THIS
-instance, or NIL. Computed BEFORE any slot is replaced."
-             (and (wasmdown.runtime:func-instance-p v)
-                  (eq (wasmdown.runtime:func-instance-kind v) :wasm)
-                  (eq (wasmdown.runtime:func-instance-module v) inst)
-                  (wasmdown.runtime:func-instance-wasm-funcidx v)))
-           (host-instance-for (i)
-             (let* ((fn (svref (wasmdown.types:wasm-module-funcs module) i))
-                    (ty (svref types (wasmdown.types:wasm-func-typeidx fn))))
-               (wasmdown.runtime:make-host-func-instance
-                ty (svref compiled i))))
-           (compiled-for (v)
-             "The compiled HOST func-instance replacing V, or NIL."
-             (let ((i (defined-index-of v)))
-               (and i (< i (length compiled)) (host-instance-for i)))))
-      ;; defined functions: absolute funcidx = nimp + defined index
-      (loop for i below (length compiled)
-            do (setf (svref funcs (+ nimp i)) (host-instance-for i)))
-      ;; exports still pointing at the replaced :wasm instances
-      (dolist (cell (wasmdown.runtime:module-instance-exports inst))
-        (let ((c (compiled-for (cdr cell))))
-          (when c (setf (cdr cell) c))))
-      ;; call_indirect targets captured in tables
-      (loop for tab across (wasmdown.runtime:module-instance-tables inst)
-            do (let ((elems (wasmdown.runtime:table-instance-elems tab)))
-                 (loop for j below (length elems)
-                       for c = (compiled-for (svref elems j))
-                       when c do (setf (svref elems j) c))))
-      ;; element segment refs (table.init sources)
-      (loop for seg across (wasmdown.runtime::module-instance-elem-segs inst)
-            do (setf (wasmdown.runtime::elem-seg-state-refs seg)
-                     (mapcar (lambda (v) (or (compiled-for v) v))
-                             (wasmdown.runtime::elem-seg-state-refs seg)))))))
+         (funcs (wasmdown.runtime:module-instance-funcs inst)))
+    (unless (= (length compiled)
+               (- (length funcs) nimp))
+      (error 'host-error
+             :message "baseline: compiled entry count does not match defined functions"))
+    (loop for i below (length compiled)
+          for fi = (wasmdown.runtime:func-instance-kind (svref funcs (+ nimp i)))
+          ;; a defined slot always holds a :wasm instance of THIS module
+          do (unless (eq fi :wasm)
+               (error 'host-error
+                      :message "baseline: defined function slot is not a :wasm func-instance"))
+             (let ((f (svref funcs (+ nimp i))))
+               (setf (wasmdown.runtime:func-instance-backend f) :baseline
+                     (wasmdown.runtime:func-instance-compiled-entry f)
+                     (svref compiled i))))
+    inst))
 
 (defun instantiate (module &key (imports nil) (mode :interpret) (before-start nil))
-  "Instantiate MODULE: resolve + type-check IMPORTS (link-error),
-allocate, initialize active segments (instantiation-error), run the
-start function (wasm-trap propagates) and resolve exports. MODULE must
-pass static validation — instantiate refuses to execute unvalidated
-modules and signals validation-error. Returns the module-instance.
-MODE :INTERPRET (default) executes guest code through the reference
-interpreter; :BASELINE compiles the module's functions with the
-wasmdown.codegen backend after instantiation and installs them for
-every subsequent call (host-error if the backend is not loaded).
+  "Instantiate MODULE and return the module-instance.
+
+Order: static validation (validation-error) -> import resolution
+(link-error) -> allocation -> elem/data segment preparation -> MODE
+backend installation -> active segments (instantiation-error) ->
+exports -> BEFORE-START -> the Wasm start section (wasm-trap
+propagates).
+
+MODE is explicit and applies to the functions THIS module defines:
+
+  :INTERPRET (default) - the reference interpreter executes them.
+  :BASELINE           - every defined function is compiled before the
+                        start section runs; a function the compiler
+                        cannot lower signals codegen-error, so guest
+                        code never runs and there is no interpreter
+                        fallback. host-error when the backend is not
+                        loaded.
+
+Imported Wasm functions keep the backend of their defining instance
+(the func-instance object is shared), and the reference objects are
+never replaced by compilation.
+
 BEFORE-START, when non-NIL, is called once with the allocated instance
 after active segments/exports exist and before the Wasm start section
 (the WASI Preview1 memory gate). It works with imported and defined
 memory and with both modes."
   (wasmdown.validate:validate-module module)
-  (let ((inst (wasmdown.runtime:make-module-instance module
-                                                     (%imports-alist imports)
-                                                     :before-start before-start)))
-    (ecase mode
-      (:interpret inst)
-      (:baseline (%install-baseline! module inst) inst))))
+  (flet ((prepare (inst)
+           (when (eq mode :baseline) (%install-baseline! module inst))))
+    (let ((inst (wasmdown.runtime:make-module-instance
+                 module (%imports-alist imports)
+                 :before-start before-start
+                 :prepare (and (eq mode :baseline) #'prepare))))
+      (ecase mode
+        (:interpret inst)
+        (:baseline inst)))))
 
 ;;; ---------------------------------------------------------------
 ;;; Invocation and inspection.

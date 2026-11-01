@@ -21,15 +21,15 @@ The denominator printed below is the number of commands EXECUTED.
 
 | Outcome | Count |
 | --- | --- |
-| pass | 1631 |
+| pass | 1702 |
 | fail | 0 |
 | skip | 0 |
 | unsupported | 0 |
 | timeout | 0 |
 | harness-error | 0 |
-| **total** | **1631** |
+| **total** | **1702** |
 
-Executed: 1631 commands; pass rate 100.0%.
+Executed: 1702 commands; pass rate 100.0%.
 
 ## Per-file counts
 
@@ -101,6 +101,7 @@ Executed: 1631 commands; pass rate 100.0%.
 | component/alignment.wast | 25 | 0 | 0 | 0 |
 | component/concat.wast | 46 | 0 | 0 | 0 |
 | component/numerics.wast | 26 | 0 | 0 | 0 |
+| component/post-return.wast | 71 | 0 | 0 | 0 |
 | component/realloc.wast | 16 | 0 | 0 | 0 |
 | component/strings.wast | 17 | 0 | 0 | 0 |
 | component/transcode.wast | 10 | 0 | 0 | 0 |

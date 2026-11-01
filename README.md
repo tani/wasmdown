@@ -32,7 +32,7 @@ Requires **SBCL** (developed against 2.6.4); Python 3 only for the WASI
 behaviour lane, Nix only to rebuild the pinned WASI fixtures.
 
 ```sh
-make test-unit                  # unit + integration suite (612 tests, ~7 s)
+make test-unit                  # unit + integration suite (663 tests, ~8 s)
 sbcl --script tools/wasmdown.lisp help
 ```
 
@@ -68,12 +68,14 @@ Every lane is measured, not asserted. Latest numbers (2026-11-01):
 
 | Lane | Kind | Measured | Docs |
 | --- | --- | --- | --- |
-| `make test-unit` | gate | 612 pass / 0 fail | — |
+| `make test-unit` | gate | 663 pass / 0 fail | — |
 | `make test-spec-core` | baseline | 21 187 pass / 0 fail / 73 unsupported of 21 260 | [`core.md`](docs/conformance/core.md) |
-| `make test-component` | gate | 1 631 pass / 0 fail / 0 unsupported | [`component.md`](docs/conformance/component.md) |
-| `make test-component-census` | gate | 30/30 runs green | [`component.md`](docs/conformance/component.md) |
+| `make test-component` | gate | 1 702 pass / 0 fail / 0 unsupported | [`component.md`](docs/conformance/component.md) |
+| `make report-component-baseline` | report | 1 702 pass / 0 fail under `:baseline` | `tests/component-baseline/component.md` |
+| `make test-backend-parity` | gate | 21 260 / 21 260 core commands agree across both backends | [`backends.md`](docs/conformance/backends.md) |
 | `make test-wasi` | gate | 450/450 cases over 30 fresh-process runs | [`wasi.md`](docs/conformance/wasi.md) |
 | `make test-upstream` | discovery | aggregated proposal corpus, never a gate | [`upstream.md`](docs/conformance/upstream.md) |
+| `make report-backends-bench` | report | per-backend cost medians | [`performance.md`](docs/conformance/performance.md) |
 
 ## Documentation
 

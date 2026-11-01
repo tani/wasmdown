@@ -1049,3 +1049,129 @@ interface store { get: func() -> u32; }
              (wasmdown:link-error (e) e))))
     (is c)
     (is (search "0.2.99" (wasmdown:wasmdown-error-message c)))))
+
+;;; ---------------------------------------------------------------
+;;; Pinned-grammar completion: includes-of-includes, nominal resource
+;;; identity across interfaces, and the reader's stability gate.
+
+(test wit/parser-include-of-includes-vendored
+  ;; The 0.2.0 release is the vendored snapshot that actually uses
+  ;; `include': wasi:cli/command includes the same package's `imports'
+  ;; world, which in turn includes five external `imports' worlds.
+  (let* ((pkgs (mapcar (lambda (name)
+                         (wasmdown.wasi:wasi-package name :version "0.2.0"))
+                       '("cli" "clocks" "filesystem" "sockets" "random" "io")))
+         (cli (first pkgs))
+         (command (gethash "command" (wasmdown.wit:wit-package-worlds cli)))
+         (imports (gethash "imports" (wasmdown.wit:wit-package-worlds cli)))
+         (resolved (wasmdown.wit:resolve-wit-world cli "command"
+                                                   :packages pkgs)))
+    (is command)
+    (is imports)
+    ;; command -> imports (one local include)
+    (is (= 1 (length (wasmdown.wit:wit-world-includes command))))
+    ;; imports -> clocks/filesystem/sockets/random/io (five includes)
+    (is (= 5 (length (wasmdown.wit:wit-world-includes imports))))
+    (is (equal (mapcar (lambda (inc)
+                         (second (wasmdown.wit:wit-world-include-target inc)))
+                       (wasmdown.wit:wit-world-includes imports))
+               '("clocks" "filesystem" "sockets" "random" "io")))
+    ;; the nested union lands in the resolved command world: five
+    ;; external worlds' imports plus cli's own eight imports/exports
+    (is (= 26 (length (wasmdown.wit:wit-world-imports resolved))))
+    (is (= 1 (length (wasmdown.wit:wit-world-exports resolved))))
+    (flet ((imported (name)
+             (find name (wasmdown.wit:wit-world-imports resolved)
+                   :key #'wasmdown.wit:wit-world-item-interface
+                   :test #'string=)))
+      (is (imported "monotonic-clock"))    ; clocks
+      (is (imported "types"))              ; filesystem
+      (is (imported "network"))            ; sockets
+      (is (imported "random"))             ; random
+      (is (imported "streams"))            ; io
+      (is (imported "environment")))))     ; cli's own import
+
+(test wit/parser-resource-nominal-identity-across-interfaces
+  ;; Resources are nominal: same-named resources in different
+  ;; interfaces are different handle types; a `use' (with or without
+  ;; an alias) keeps the DECLARING interface's one identity.
+  (let* ((pkg (wasmdown.wit:parse-wit-string
+               "package test:nominal@0.1.0;
+
+interface a { resource r; }
+interface b { resource r; }
+interface c { use a.{r}; type h = own<r>; }
+interface d { use a.{r as alias}; type h = borrow<alias>; }
+"))
+         (a (iface pkg "a"))
+         (b (iface pkg "b"))
+         (c (iface pkg "c"))
+         (d (iface pkg "d"))
+         (ra (wasmdown.component:ct-payload
+              (wasmdown.wit:wit-type->ct a '(:own "r"))))
+         (rb (wasmdown.component:ct-payload
+              (wasmdown.wit:wit-type->ct b '(:own "r"))))
+         (rc (wasmdown.component:ct-payload
+              (wasmdown.wit:wit-type->ct c '(:name "h"))))
+         (rd (wasmdown.component:ct-payload
+              (wasmdown.wit:wit-type->ct d '(:name "h")))))
+    (is (eq (wasmdown.component:ct-kind ra) :resource))
+    (is (eq (wasmdown.component:ct-kind rb) :resource))
+    ;; different interfaces never unify
+    (is (not (eq ra rb)))
+    ;; own/borrow through `use' and an alias keep a's identity
+    (is (eq ra rc))
+    (is (eq ra rd))
+    ;; and a's own and borrow forms share it too
+    (is (eq ra (wasmdown.component:ct-payload
+                (wasmdown.wit:wit-type->ct a '(:borrow "r")))))))
+
+(test wit/reader-stable-only-vendored-clock-timezone
+  ;; The reader's stability gate proves itself on the vendored
+  ;; clocks-timezone feature: off by default, on by name.
+  (let* ((path (wit-file "clocks/clocks.wit"))
+         (raw (wasmdown.wit:parse-wit-file path))
+         (stable (wasmdown.wit:parse-wit-file path :stable-only t))
+         (with-feature (wasmdown.wit:parse-wit-file
+                        path :stable-only t
+                        :features '("clocks-timezone"))))
+    (is (wasmdown.wit:package-interface raw "timezone"))
+    (is (null (wasmdown.wit:package-interface stable "timezone")))
+    (is (wasmdown.wit:package-interface with-feature "timezone"))
+    ;; types + monotonic-clock + system-clock remain; timezone is gone
+    (is (= 4 (hash-table-count
+              (wasmdown.wit:wit-package-interfaces raw))))
+    (is (= 3 (hash-table-count
+              (wasmdown.wit:wit-package-interfaces stable))))
+    ;; a world item gated by the same feature disappears with it
+    (let ((w (gethash "imports" (wasmdown.wit:wit-package-worlds stable))))
+      (is w)
+      (is (null (find "timezone"
+                      (wasmdown.wit:wit-world-imports w)
+                      :key #'wasmdown.wit:wit-world-item-interface
+                      :test #'string=))))
+    ;; the stable gate is opt-in: the default read is unchanged
+    (is (string= (wasmdown.wit:wit-package-version raw) "0.3.2"))
+    (is (wasmdown.wit:package-interface raw "timezone"))))
+
+(test wit/reader-stable-only-inline-surface
+  (let* ((text "package test:gate@0.2.0;
+
+@unstable(feature = experimental)
+interface hidden {
+  type t = u32;
+}
+
+interface shown {
+  type s = u32;
+}
+")
+         (raw (wasmdown.wit:parse-wit-string text))
+         (stable (wasmdown.wit:parse-wit-string text :stable-only t))
+         (on (wasmdown.wit:parse-wit-string
+              text :stable-only t :features '("experimental"))))
+    (is (wasmdown.wit:package-interface raw "hidden"))
+    (is (null (wasmdown.wit:package-interface stable "hidden")))
+    (is (wasmdown.wit:package-interface stable "shown"))
+    (is (wasmdown.wit:package-interface on "hidden"))
+    (is (wasmdown.wit:package-interface on "shown"))))

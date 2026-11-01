@@ -13,6 +13,10 @@
 ;;;;   WASMDOWN_WAST_JSONL     output path, default
 ;;;;                           "tests/upstream-results.jsonl"
 ;;;;   WASMDOWN_WAST_LABEL     suite label for messages
+;;;;   WASMDOWN_WAST_MODE      interpret (default) or baseline: the guest
+;;;;                           backend for every module the scripts
+;;;;                           instantiate; a baseline compile refusal
+;;;;                           classifies :fail/:compile, never a skip.
 ;;;;
 ;;;; The exit code is ALWAYS 0: a measurement lane never converts an
 ;;;; unsupported/timeout/harness-error into a pass, and never fails a
@@ -34,6 +38,12 @@
 (defparameter *pattern* (%env "WASMDOWN_WAST_PATTERN" "tests/spec-core/*.wast"))
 (defparameter *jsonl* (%env "WASMDOWN_WAST_JSONL" "tests/upstream-results.jsonl"))
 (defparameter *label* (%env "WASMDOWN_WAST_LABEL" "upstream"))
+(defparameter *mode* (%env "WASMDOWN_WAST_MODE" "interpret"))
+(unless (member *mode* '("interpret" "baseline") :test #'string=)
+  (format t "~&WASMDOWN_WAST_MODE must be interpret or baseline, got ~s~%" *mode*)
+  (sb-ext:exit :code 2))
+(setf wasmdown.wast:*instantiate-mode*
+      (if (string= *mode* "baseline") :baseline :interpret))
 
 (defparameter *results*
   (wasmdown.wast:run-directory *root*
@@ -61,7 +71,15 @@
   ;; 60k lines to see where the corpus stands
   (let* ((by-file (make-hash-table :test #'equal))
          (by-detail (make-hash-table :test #'equal))
-         (out (merge-pathnames "docs/conformance/upstream.md" *root*)))
+         ;; only the full mirror lane writes the committed report; an
+         ;; ad-hoc pattern (a subset or a proposal branch) writes beside
+         ;; its JSONL, so it can never overwrite the pinned artifact.
+         (out (merge-pathnames
+               (or (%env "WASMDOWN_WAST_REPORT" "")
+                   (if (string= *label* "upstream")
+                       "docs/conformance/upstream.md"
+                       "tests/upstream-lane/report.md"))
+               *root*)))
     (ensure-directories-exist out)
     (dolist (r *results*)
       (when (eq (wasmdown.wast:wast-result-outcome r) :fail)

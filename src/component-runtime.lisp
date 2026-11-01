@@ -966,7 +966,11 @@ remaining built-ins stay opaque core-func slots (the values slice)."
               rt)
          (%push-core-func
           inst
-          (%resource-builtin-host-func inst rkind rt dtor)))
+          (%guard-post-return-builtin
+           (%resource-builtin-host-func inst rkind rt dtor)
+           ;; resource.rep is allowed inside post-return; resource.new
+           ;; and resource.drop are not (the allow-list decides).
+           rkind)))
         ((eq kind :builtin)
          ;; M11a: the ASYNC builtins become REAL host funcs
          ;; (task.return/cancel, context.get/set, backpressure,
@@ -989,7 +993,9 @@ remaining built-ins stay opaque core-func slots (the values slice)."
                           imms)))
            (%push-core-func
             inst
-            (%builtin-async-host-func inst rkind imms))))
+            (%guard-post-return-builtin
+             (%builtin-async-host-func inst rkind imms)
+             rkind))))
         (t (%push-core-func inst nil)))))))
 
 ;;; ---- import ----
@@ -2425,7 +2431,7 @@ the callee module imports blocking built-ins)."
     (when failure (error failure))
     result))
 
-(defun %sync-lift-run (lf core flat-args)
+(defun %sync-lift-run (lf core flat-args &optional task-th-cell)
   "The SYNC-LIFT MINI-SCHEDULER (§3538-3543): a sync lift runs its
 core call on a FRESH executor SBCL thread — the implicit thread of
 the per-call Task (§572: EVERY component-export call creates one) —
@@ -2444,6 +2450,10 @@ reentrance phase checks). The CALLER then waits:
     the executor is registered in the scheduler and gets its slices
     from the same resume-all."
   (multiple-value-bind (task th) (%sync-lift-context lf)
+      ;; the caller keeps the per-call task/thread so a POST-RETURN
+      ;; function (which runs after the lift returns) still has the
+      ;; context its sync built-ins read (context.get/set).
+      (when task-th-cell (setf (car task-th-cell) task (cdr task-th-cell) th))
       (let* ((cell (cons nil nil))
              (dmu (sb-thread:make-mutex :name "sync-lift"))
              (done (sb-thread:make-waitqueue :name "sync-lift"))
@@ -2570,6 +2580,45 @@ reentrance phase checks). The CALLER then waits:
       (when (cdr cell) (error (cdr cell)))
       (car cell))))
 
+(defparameter *post-return-allowed-kinds*
+  '(:context-get :context-set :backpressure-inc :backpressure-dec
+    :resource-rep)
+  "Built-in kinds a post-return function MAY call. Everything else the
+canon `:builtin` arm can produce traps inside a post-return function
+(CanonicalABI's post-return isolation): the async families
+(task.*, thread.*, waitable*, subtask.*, stream.*, future.*) and
+`resource.new`/`resource.drop`. The allow-list form means a newly added
+builtin is isolated by default instead of silently callable; misspelled
+or renamed kinds cannot slip through the way an explicit forbid-list
+let `:yield` do (the runtime spells it `:thread-yield`).")
+
+(defvar *post-return-context* nil
+  "True while a canon lift runs its post-return function. The canonical
+ABI runs post-return with the instance already left (§3405): re-entering
+the component or calling an async/resource built-in from there traps
+'cannot leave component instance'. Bound by the lift path, checked by
+LIFTED-FUNC-CALL and by the guarded built-in wrappers.")
+
+(defun %post-return-forbidden (what)
+  (when *post-return-context*
+    (error 'wasmdown:wasm-trap :kind :generic
+           :message (format nil
+                            "cannot leave component instance: ~a from a post-return function"
+                            what))))
+
+(defun %guard-post-return-builtin (fi what)
+  "Wrap a canon built-in's host func-instance when WHAT is a forbidden
+kind, so a call from inside a post-return function traps instead of
+reaching the built-in."
+  (if (or (null fi) (member what *post-return-allowed-kinds*))
+      fi
+      (let ((fn (wasmdown.runtime:func-instance-host-fn fi))
+            (ty (wasmdown.runtime:func-instance-type fi)))
+        (wasmdown.runtime:make-host-func-instance
+         ty (lambda (args)
+              (%post-return-forbidden what)
+              (funcall fn args))))))
+
 (defun lifted-func-call (lf &rest args)
   "canon_lift (CanonicalABI.md 3389): the ASYNC-TYPED functype lifts
   route through the task state machine (%canon-lift-async — the
@@ -2580,6 +2629,7 @@ reentrance phase checks). The CALLER then waits:
   core results). M9 (linking ::126): an OWN/BORROW param index
   arrives in the CALLER instance's table — lift_own consumes it there
   and re-enters the defining instance's table."
+  (%post-return-forbidden "calling an imported function")
   (let* ((ft (lifted-func-type lf))
          (core (lifted-func-core lf))
          ;; EVERY invocation runs in the CALLEE instance's store: the
@@ -2760,7 +2810,8 @@ reentrance phase checks). The CALLER then waits:
           ;; test 10's phase checks) and the borrowed-context exit
           ;; unregistering the caller mid-turn (the empty-scheduler
           ;; starvation).
-          (let ((res (%sync-lift-run lf core flat-args)))
+          (let* ((task-th-cell (cons nil nil))
+                 (res (%sync-lift-run lf core flat-args task-th-cell)))
             (let ((vi (make-array 16 :fill-pointer 0 :adjustable t)))
               (loop for r in (coerce res 'list)
                     for rt in (result-core-types lf result)
@@ -2817,7 +2868,19 @@ reentrance phase checks). The CALLER then waits:
                                            (lifted-func-inst lf))
                                           (second pr)))))
                       (when prf
-                        (apply #'wasmdown.runtime:wasm-call prf res)))))
+                        ;; post-return runs ONCE, after the results are
+                        ;; lifted, with the SAME flat core results; the
+                        ;; instance is already left, so re-entry traps.
+                        (let ((*post-return-context* t)
+                              ;; the lift's own per-call task/thread:
+                              ;; the post-return is still part of this
+                              ;; call, so context.* read the SAME
+                              ;; storage the body wrote.
+                              (*current-task*
+                                (or *current-task* (car task-th-cell)))
+                              (*current-thread*
+                                (or *current-thread* (cdr task-th-cell))))
+                          (apply #'wasmdown.runtime:wasm-call prf res))))))
                 (first lifted)))))))))
 
 (defun result-core-types (lf result)
@@ -10074,7 +10137,13 @@ never closed by a nested helper."
           (funcall thunk))))
 
 
-(setf wasmdown.wast:*component-instantiator* #'instantiate-component)
+(setf wasmdown.wast:*component-instantiator*
+      ;; the runner selects a guest backend for the CORE MODULES a
+      ;; component instantiates; :baseline compiles their defined
+      ;; functions with the same eager rule as a bare core module.
+      (lambda (comp)
+        (instantiate-component comp
+                               :mode wasmdown.wast:*instantiate-mode*)))
 
 ;;; M9: the runner's component-instance ACTION hook (the contract
 ;;; documented at wasmdown.wast:*component-invoker*).

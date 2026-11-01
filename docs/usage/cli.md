@@ -80,6 +80,21 @@ component:
 
 See [`lisp-api.md`](lisp-api.md) for its caveats.
 
+## Heap for the compiled backend
+
+`sbcl --script tools/wasmdown.lisp` starts with SBCL's default dynamic
+space, which is not enough to compile a multi-megabyte guest (the pinned
+SQLite fixture needs roughly 8 GiB at compile time). Run a `--wasi`
+component under `:baseline` with an explicit heap:
+
+```sh
+WASMDOWN_API_MODE=baseline sbcl --dynamic-space-size 8192 \
+  --script tools/wasmdown.lisp run app.wasm --wasi -- /work/db
+```
+
+Compilation is eager (every defined function before the start section), so
+this is a compile-time cost, not an execution-tier switch.
+
 ## Exit codes
 
 | Code | Meaning |

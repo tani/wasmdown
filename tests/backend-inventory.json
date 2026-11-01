@@ -1,0 +1,4170 @@
+{
+ "schema": "wasmdown.inventory.v1",
+ "generated_at": "2026-11-01T05:57:03Z",
+ "sbcl_version": "2.6.4",
+ "source_commit": "426064e53a5512708dd3cfd223954ce48ae1661e",
+ "pins": {
+  "core_spec_commit": "b0ec1f3f449525c217dbff3f1dfab435a756ea92",
+  "wasi_release": "v0.3.2",
+  "wasi_release_date": "2026-10-13",
+  "wasi_release_sha256": "2e918e047c6ad251a44b4d1141359495a27219058fd7090f8b8142f6bc0ec311",
+  "preview1_commit": "fae981bae14809d91f9bc2d63852d461f331d161",
+  "preview1_sha256_wasi_snapshot_preview1_witx": "30e31a9b830d3fad998701fc9439a5506af4dbb8f01202854c8af46d436de679",
+  "preview2_default": "0.2.12",
+  "preview2_release_range": "0.2.0 .. 0.2.12 (exact package versions; mixed imports legal)",
+  "lock_file": "specs/lock.toml"
+ },
+ "definitions": {
+  "pinned_interfaces": "every interface parsed out of the vendored release tree by wasmdown.wit",
+  "pinned_stable": "pinned_interfaces without an @unstable(feature = ...) annotation",
+  "bound": "present in the runtime registry for that exact release (p2-builder-table / %wasi-provider-builders)",
+  "excluded": "pinned but withheld by an explicit decision (wasi:http removed; @unstable feature-gated off)",
+  "export_only": "the world EXPORTS the interface, so it is not an import and never gets a provider entry",
+  "missing": "pinned, stable, and neither bound nor excluded nor an export",
+  "types_only": "interface declares no function and no resource; a guest resolves its types structurally"
+ },
+ "P1": {
+  "pinned": [
+   "args_get",
+   "args_sizes_get",
+   "clock_res_get",
+   "clock_time_get",
+   "environ_get",
+   "environ_sizes_get",
+   "fd_advise",
+   "fd_allocate",
+   "fd_close",
+   "fd_datasync",
+   "fd_fdstat_get",
+   "fd_fdstat_set_flags",
+   "fd_fdstat_set_rights",
+   "fd_filestat_get",
+   "fd_filestat_set_size",
+   "fd_filestat_set_times",
+   "fd_pread",
+   "fd_prestat_dir_name",
+   "fd_prestat_get",
+   "fd_pwrite",
+   "fd_read",
+   "fd_readdir",
+   "fd_renumber",
+   "fd_seek",
+   "fd_sync",
+   "fd_tell",
+   "fd_write",
+   "path_create_directory",
+   "path_filestat_get",
+   "path_filestat_set_times",
+   "path_link",
+   "path_open",
+   "path_readlink",
+   "path_remove_directory",
+   "path_rename",
+   "path_symlink",
+   "path_unlink_file",
+   "poll_oneoff",
+   "proc_exit",
+   "proc_raise",
+   "random_get",
+   "sched_yield",
+   "sock_accept",
+   "sock_recv",
+   "sock_send",
+   "sock_shutdown"
+  ],
+  "provided": [
+   "args_get",
+   "args_sizes_get",
+   "clock_res_get",
+   "clock_time_get",
+   "environ_get",
+   "environ_sizes_get",
+   "fd_advise",
+   "fd_allocate",
+   "fd_close",
+   "fd_datasync",
+   "fd_fdstat_get",
+   "fd_fdstat_set_flags",
+   "fd_fdstat_set_rights",
+   "fd_filestat_get",
+   "fd_filestat_set_size",
+   "fd_filestat_set_times",
+   "fd_pread",
+   "fd_prestat_dir_name",
+   "fd_prestat_get",
+   "fd_pwrite",
+   "fd_read",
+   "fd_readdir",
+   "fd_renumber",
+   "fd_seek",
+   "fd_sync",
+   "fd_tell",
+   "fd_write",
+   "path_create_directory",
+   "path_filestat_get",
+   "path_filestat_set_times",
+   "path_link",
+   "path_open",
+   "path_readlink",
+   "path_remove_directory",
+   "path_rename",
+   "path_symlink",
+   "path_unlink_file",
+   "poll_oneoff",
+   "proc_exit",
+   "proc_raise",
+   "random_get",
+   "sched_yield",
+   "sock_accept",
+   "sock_recv",
+   "sock_send",
+   "sock_shutdown"
+  ],
+  "missing_in_runtime": [],
+  "extra_in_runtime": [],
+  "signature_only": [],
+  "implementation_only": []
+ },
+ "P2": {
+  "version": "0.2.12",
+  "pinned_interfaces": [
+   "wasi:cli/environment@0.2.12",
+   "wasi:cli/exit@0.2.12",
+   "wasi:cli/run@0.2.12",
+   "wasi:cli/stderr@0.2.12",
+   "wasi:cli/stdin@0.2.12",
+   "wasi:cli/stdout@0.2.12",
+   "wasi:cli/terminal-input@0.2.12",
+   "wasi:cli/terminal-output@0.2.12",
+   "wasi:cli/terminal-stderr@0.2.12",
+   "wasi:cli/terminal-stdin@0.2.12",
+   "wasi:cli/terminal-stdout@0.2.12",
+   "wasi:clocks/monotonic-clock@0.2.12",
+   "wasi:clocks/timezone@0.2.12",
+   "wasi:clocks/wall-clock@0.2.12",
+   "wasi:filesystem/preopens@0.2.12",
+   "wasi:filesystem/types@0.2.12",
+   "wasi:http/incoming-handler@0.2.12",
+   "wasi:http/outgoing-handler@0.2.12",
+   "wasi:http/types@0.2.12",
+   "wasi:io/error@0.2.12",
+   "wasi:io/poll@0.2.12",
+   "wasi:io/streams@0.2.12",
+   "wasi:random/insecure-seed@0.2.12",
+   "wasi:random/insecure@0.2.12",
+   "wasi:random/random@0.2.12",
+   "wasi:sockets/instance-network@0.2.12",
+   "wasi:sockets/ip-name-lookup@0.2.12",
+   "wasi:sockets/network@0.2.12",
+   "wasi:sockets/tcp-create-socket@0.2.12",
+   "wasi:sockets/tcp@0.2.12",
+   "wasi:sockets/udp-create-socket@0.2.12",
+   "wasi:sockets/udp@0.2.12"
+  ],
+  "pinned_stable": [
+   "wasi:cli/environment@0.2.12",
+   "wasi:cli/exit@0.2.12",
+   "wasi:cli/run@0.2.12",
+   "wasi:cli/stderr@0.2.12",
+   "wasi:cli/stdin@0.2.12",
+   "wasi:cli/stdout@0.2.12",
+   "wasi:cli/terminal-input@0.2.12",
+   "wasi:cli/terminal-output@0.2.12",
+   "wasi:cli/terminal-stderr@0.2.12",
+   "wasi:cli/terminal-stdin@0.2.12",
+   "wasi:cli/terminal-stdout@0.2.12",
+   "wasi:clocks/monotonic-clock@0.2.12",
+   "wasi:clocks/wall-clock@0.2.12",
+   "wasi:filesystem/preopens@0.2.12",
+   "wasi:filesystem/types@0.2.12",
+   "wasi:http/incoming-handler@0.2.12",
+   "wasi:http/outgoing-handler@0.2.12",
+   "wasi:http/types@0.2.12",
+   "wasi:io/error@0.2.12",
+   "wasi:io/poll@0.2.12",
+   "wasi:io/streams@0.2.12",
+   "wasi:random/insecure-seed@0.2.12",
+   "wasi:random/insecure@0.2.12",
+   "wasi:random/random@0.2.12",
+   "wasi:sockets/instance-network@0.2.12",
+   "wasi:sockets/ip-name-lookup@0.2.12",
+   "wasi:sockets/network@0.2.12",
+   "wasi:sockets/tcp-create-socket@0.2.12",
+   "wasi:sockets/tcp@0.2.12",
+   "wasi:sockets/udp-create-socket@0.2.12",
+   "wasi:sockets/udp@0.2.12"
+  ],
+  "bound": [
+   "wasi:cli/environment@0.2.12",
+   "wasi:cli/exit@0.2.12",
+   "wasi:cli/stderr@0.2.12",
+   "wasi:cli/stdin@0.2.12",
+   "wasi:cli/stdout@0.2.12",
+   "wasi:cli/terminal-input@0.2.12",
+   "wasi:cli/terminal-output@0.2.12",
+   "wasi:cli/terminal-stderr@0.2.12",
+   "wasi:cli/terminal-stdin@0.2.12",
+   "wasi:cli/terminal-stdout@0.2.12",
+   "wasi:clocks/monotonic-clock@0.2.12",
+   "wasi:clocks/wall-clock@0.2.12",
+   "wasi:filesystem/preopens@0.2.12",
+   "wasi:filesystem/types@0.2.12",
+   "wasi:io/error@0.2.12",
+   "wasi:io/poll@0.2.12",
+   "wasi:io/streams@0.2.12",
+   "wasi:random/insecure-seed@0.2.12",
+   "wasi:random/insecure@0.2.12",
+   "wasi:random/random@0.2.12",
+   "wasi:sockets/instance-network@0.2.12",
+   "wasi:sockets/ip-name-lookup@0.2.12",
+   "wasi:sockets/network@0.2.12",
+   "wasi:sockets/tcp-create-socket@0.2.12",
+   "wasi:sockets/tcp@0.2.12",
+   "wasi:sockets/udp-create-socket@0.2.12",
+   "wasi:sockets/udp@0.2.12"
+  ],
+  "missing": [],
+  "excluded": [
+   "wasi:http/incoming-handler@0.2.12",
+   "wasi:http/outgoing-handler@0.2.12",
+   "wasi:http/types@0.2.12"
+  ],
+  "unstable": [
+   "wasi:clocks/timezone@0.2.12"
+  ],
+  "export_only": [
+   "wasi:cli/run@0.2.12"
+  ],
+  "unbound_stable": [
+   "wasi:cli/run@0.2.12",
+   "wasi:http/incoming-handler@0.2.12",
+   "wasi:http/outgoing-handler@0.2.12",
+   "wasi:http/types@0.2.12"
+  ],
+  "releases": [
+   {
+    "version": "0.2.0",
+    "pinned_interfaces": [
+     "wasi:cli/environment@0.2.0",
+     "wasi:cli/exit@0.2.0",
+     "wasi:cli/run@0.2.0",
+     "wasi:cli/stderr@0.2.0",
+     "wasi:cli/stdin@0.2.0",
+     "wasi:cli/stdout@0.2.0",
+     "wasi:cli/terminal-input@0.2.0",
+     "wasi:cli/terminal-output@0.2.0",
+     "wasi:cli/terminal-stderr@0.2.0",
+     "wasi:cli/terminal-stdin@0.2.0",
+     "wasi:cli/terminal-stdout@0.2.0",
+     "wasi:clocks/monotonic-clock@0.2.0",
+     "wasi:clocks/wall-clock@0.2.0",
+     "wasi:filesystem/preopens@0.2.0",
+     "wasi:filesystem/types@0.2.0",
+     "wasi:http/incoming-handler@0.2.0",
+     "wasi:http/outgoing-handler@0.2.0",
+     "wasi:http/types@0.2.0",
+     "wasi:io/error@0.2.0",
+     "wasi:io/poll@0.2.0",
+     "wasi:io/streams@0.2.0",
+     "wasi:random/insecure-seed@0.2.0",
+     "wasi:random/insecure@0.2.0",
+     "wasi:random/random@0.2.0",
+     "wasi:sockets/instance-network@0.2.0",
+     "wasi:sockets/ip-name-lookup@0.2.0",
+     "wasi:sockets/network@0.2.0",
+     "wasi:sockets/tcp-create-socket@0.2.0",
+     "wasi:sockets/tcp@0.2.0",
+     "wasi:sockets/udp-create-socket@0.2.0",
+     "wasi:sockets/udp@0.2.0"
+    ],
+    "pinned_stable": [
+     "wasi:cli/environment@0.2.0",
+     "wasi:cli/exit@0.2.0",
+     "wasi:cli/run@0.2.0",
+     "wasi:cli/stderr@0.2.0",
+     "wasi:cli/stdin@0.2.0",
+     "wasi:cli/stdout@0.2.0",
+     "wasi:cli/terminal-input@0.2.0",
+     "wasi:cli/terminal-output@0.2.0",
+     "wasi:cli/terminal-stderr@0.2.0",
+     "wasi:cli/terminal-stdin@0.2.0",
+     "wasi:cli/terminal-stdout@0.2.0",
+     "wasi:clocks/monotonic-clock@0.2.0",
+     "wasi:clocks/wall-clock@0.2.0",
+     "wasi:filesystem/preopens@0.2.0",
+     "wasi:filesystem/types@0.2.0",
+     "wasi:http/incoming-handler@0.2.0",
+     "wasi:http/outgoing-handler@0.2.0",
+     "wasi:http/types@0.2.0",
+     "wasi:io/error@0.2.0",
+     "wasi:io/poll@0.2.0",
+     "wasi:io/streams@0.2.0",
+     "wasi:random/insecure-seed@0.2.0",
+     "wasi:random/insecure@0.2.0",
+     "wasi:random/random@0.2.0",
+     "wasi:sockets/instance-network@0.2.0",
+     "wasi:sockets/ip-name-lookup@0.2.0",
+     "wasi:sockets/network@0.2.0",
+     "wasi:sockets/tcp-create-socket@0.2.0",
+     "wasi:sockets/tcp@0.2.0",
+     "wasi:sockets/udp-create-socket@0.2.0",
+     "wasi:sockets/udp@0.2.0"
+    ],
+    "bound": [
+     "wasi:cli/environment@0.2.0",
+     "wasi:cli/exit@0.2.0",
+     "wasi:cli/stderr@0.2.0",
+     "wasi:cli/stdin@0.2.0",
+     "wasi:cli/stdout@0.2.0",
+     "wasi:cli/terminal-input@0.2.0",
+     "wasi:cli/terminal-output@0.2.0",
+     "wasi:cli/terminal-stderr@0.2.0",
+     "wasi:cli/terminal-stdin@0.2.0",
+     "wasi:cli/terminal-stdout@0.2.0",
+     "wasi:clocks/monotonic-clock@0.2.0",
+     "wasi:clocks/wall-clock@0.2.0",
+     "wasi:filesystem/preopens@0.2.0",
+     "wasi:filesystem/types@0.2.0",
+     "wasi:io/error@0.2.0",
+     "wasi:io/poll@0.2.0",
+     "wasi:io/streams@0.2.0",
+     "wasi:random/insecure-seed@0.2.0",
+     "wasi:random/insecure@0.2.0",
+     "wasi:random/random@0.2.0",
+     "wasi:sockets/instance-network@0.2.0",
+     "wasi:sockets/ip-name-lookup@0.2.0",
+     "wasi:sockets/network@0.2.0",
+     "wasi:sockets/tcp-create-socket@0.2.0",
+     "wasi:sockets/tcp@0.2.0",
+     "wasi:sockets/udp-create-socket@0.2.0",
+     "wasi:sockets/udp@0.2.0"
+    ],
+    "unbound_stable": [
+     "wasi:cli/run@0.2.0",
+     "wasi:http/incoming-handler@0.2.0",
+     "wasi:http/outgoing-handler@0.2.0",
+     "wasi:http/types@0.2.0"
+    ],
+    "missing": [],
+    "excluded": [
+     "wasi:http/incoming-handler@0.2.0",
+     "wasi:http/outgoing-handler@0.2.0",
+     "wasi:http/types@0.2.0"
+    ],
+    "unstable": [],
+    "export_only": [
+     "wasi:cli/run@0.2.0"
+    ],
+    "interfaces": [
+     {
+      "interface": "wasi:cli/environment@0.2.0",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/exit@0.2.0",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/run@0.2.0",
+      "status": "export_only",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/stderr@0.2.0",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/stdin@0.2.0",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/stdout@0.2.0",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/terminal-input@0.2.0",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/terminal-output@0.2.0",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/terminal-stderr@0.2.0",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/terminal-stdin@0.2.0",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/terminal-stdout@0.2.0",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:clocks/monotonic-clock@0.2.0",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:clocks/wall-clock@0.2.0",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:filesystem/preopens@0.2.0",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:filesystem/types@0.2.0",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:http/incoming-handler@0.2.0",
+      "status": "excluded",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:http/outgoing-handler@0.2.0",
+      "status": "excluded",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:http/types@0.2.0",
+      "status": "excluded",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:io/error@0.2.0",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:io/poll@0.2.0",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:io/streams@0.2.0",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:random/insecure-seed@0.2.0",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:random/insecure@0.2.0",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:random/random@0.2.0",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/instance-network@0.2.0",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/ip-name-lookup@0.2.0",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/network@0.2.0",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/tcp-create-socket@0.2.0",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/tcp@0.2.0",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/udp-create-socket@0.2.0",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/udp@0.2.0",
+      "status": "bound",
+      "stability": "stable"
+     }
+    ]
+   },
+   {
+    "version": "0.2.1",
+    "pinned_interfaces": [
+     "wasi:cli/environment@0.2.1",
+     "wasi:cli/exit@0.2.1",
+     "wasi:cli/run@0.2.1",
+     "wasi:cli/stderr@0.2.1",
+     "wasi:cli/stdin@0.2.1",
+     "wasi:cli/stdout@0.2.1",
+     "wasi:cli/terminal-input@0.2.1",
+     "wasi:cli/terminal-output@0.2.1",
+     "wasi:cli/terminal-stderr@0.2.1",
+     "wasi:cli/terminal-stdin@0.2.1",
+     "wasi:cli/terminal-stdout@0.2.1",
+     "wasi:clocks/monotonic-clock@0.2.1",
+     "wasi:clocks/timezone@0.2.1",
+     "wasi:clocks/wall-clock@0.2.1",
+     "wasi:filesystem/preopens@0.2.1",
+     "wasi:filesystem/types@0.2.1",
+     "wasi:http/incoming-handler@0.2.1",
+     "wasi:http/outgoing-handler@0.2.1",
+     "wasi:http/types@0.2.1",
+     "wasi:io/error@0.2.1",
+     "wasi:io/poll@0.2.1",
+     "wasi:io/streams@0.2.1",
+     "wasi:random/insecure-seed@0.2.1",
+     "wasi:random/insecure@0.2.1",
+     "wasi:random/random@0.2.1",
+     "wasi:sockets/instance-network@0.2.1",
+     "wasi:sockets/ip-name-lookup@0.2.1",
+     "wasi:sockets/network@0.2.1",
+     "wasi:sockets/tcp-create-socket@0.2.1",
+     "wasi:sockets/tcp@0.2.1",
+     "wasi:sockets/udp-create-socket@0.2.1",
+     "wasi:sockets/udp@0.2.1"
+    ],
+    "pinned_stable": [
+     "wasi:cli/environment@0.2.1",
+     "wasi:cli/exit@0.2.1",
+     "wasi:cli/run@0.2.1",
+     "wasi:cli/stderr@0.2.1",
+     "wasi:cli/stdin@0.2.1",
+     "wasi:cli/stdout@0.2.1",
+     "wasi:cli/terminal-input@0.2.1",
+     "wasi:cli/terminal-output@0.2.1",
+     "wasi:cli/terminal-stderr@0.2.1",
+     "wasi:cli/terminal-stdin@0.2.1",
+     "wasi:cli/terminal-stdout@0.2.1",
+     "wasi:clocks/monotonic-clock@0.2.1",
+     "wasi:clocks/wall-clock@0.2.1",
+     "wasi:filesystem/preopens@0.2.1",
+     "wasi:filesystem/types@0.2.1",
+     "wasi:http/incoming-handler@0.2.1",
+     "wasi:http/outgoing-handler@0.2.1",
+     "wasi:http/types@0.2.1",
+     "wasi:io/error@0.2.1",
+     "wasi:io/poll@0.2.1",
+     "wasi:io/streams@0.2.1",
+     "wasi:random/insecure-seed@0.2.1",
+     "wasi:random/insecure@0.2.1",
+     "wasi:random/random@0.2.1",
+     "wasi:sockets/instance-network@0.2.1",
+     "wasi:sockets/ip-name-lookup@0.2.1",
+     "wasi:sockets/network@0.2.1",
+     "wasi:sockets/tcp-create-socket@0.2.1",
+     "wasi:sockets/tcp@0.2.1",
+     "wasi:sockets/udp-create-socket@0.2.1",
+     "wasi:sockets/udp@0.2.1"
+    ],
+    "bound": [
+     "wasi:cli/environment@0.2.1",
+     "wasi:cli/exit@0.2.1",
+     "wasi:cli/stderr@0.2.1",
+     "wasi:cli/stdin@0.2.1",
+     "wasi:cli/stdout@0.2.1",
+     "wasi:cli/terminal-input@0.2.1",
+     "wasi:cli/terminal-output@0.2.1",
+     "wasi:cli/terminal-stderr@0.2.1",
+     "wasi:cli/terminal-stdin@0.2.1",
+     "wasi:cli/terminal-stdout@0.2.1",
+     "wasi:clocks/monotonic-clock@0.2.1",
+     "wasi:clocks/wall-clock@0.2.1",
+     "wasi:filesystem/preopens@0.2.1",
+     "wasi:filesystem/types@0.2.1",
+     "wasi:io/error@0.2.1",
+     "wasi:io/poll@0.2.1",
+     "wasi:io/streams@0.2.1",
+     "wasi:random/insecure-seed@0.2.1",
+     "wasi:random/insecure@0.2.1",
+     "wasi:random/random@0.2.1",
+     "wasi:sockets/instance-network@0.2.1",
+     "wasi:sockets/ip-name-lookup@0.2.1",
+     "wasi:sockets/network@0.2.1",
+     "wasi:sockets/tcp-create-socket@0.2.1",
+     "wasi:sockets/tcp@0.2.1",
+     "wasi:sockets/udp-create-socket@0.2.1",
+     "wasi:sockets/udp@0.2.1"
+    ],
+    "unbound_stable": [
+     "wasi:cli/run@0.2.1",
+     "wasi:http/incoming-handler@0.2.1",
+     "wasi:http/outgoing-handler@0.2.1",
+     "wasi:http/types@0.2.1"
+    ],
+    "missing": [],
+    "excluded": [
+     "wasi:http/incoming-handler@0.2.1",
+     "wasi:http/outgoing-handler@0.2.1",
+     "wasi:http/types@0.2.1"
+    ],
+    "unstable": [
+     "wasi:clocks/timezone@0.2.1"
+    ],
+    "export_only": [
+     "wasi:cli/run@0.2.1"
+    ],
+    "interfaces": [
+     {
+      "interface": "wasi:cli/environment@0.2.1",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/exit@0.2.1",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/run@0.2.1",
+      "status": "export_only",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/stderr@0.2.1",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/stdin@0.2.1",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/stdout@0.2.1",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/terminal-input@0.2.1",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/terminal-output@0.2.1",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/terminal-stderr@0.2.1",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/terminal-stdin@0.2.1",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/terminal-stdout@0.2.1",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:clocks/monotonic-clock@0.2.1",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:clocks/timezone@0.2.1",
+      "status": "unstable",
+      "stability": "unstable"
+     },
+     {
+      "interface": "wasi:clocks/wall-clock@0.2.1",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:filesystem/preopens@0.2.1",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:filesystem/types@0.2.1",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:http/incoming-handler@0.2.1",
+      "status": "excluded",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:http/outgoing-handler@0.2.1",
+      "status": "excluded",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:http/types@0.2.1",
+      "status": "excluded",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:io/error@0.2.1",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:io/poll@0.2.1",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:io/streams@0.2.1",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:random/insecure-seed@0.2.1",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:random/insecure@0.2.1",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:random/random@0.2.1",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/instance-network@0.2.1",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/ip-name-lookup@0.2.1",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/network@0.2.1",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/tcp-create-socket@0.2.1",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/tcp@0.2.1",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/udp-create-socket@0.2.1",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/udp@0.2.1",
+      "status": "bound",
+      "stability": "stable"
+     }
+    ]
+   },
+   {
+    "version": "0.2.2",
+    "pinned_interfaces": [
+     "wasi:cli/environment@0.2.2",
+     "wasi:cli/exit@0.2.2",
+     "wasi:cli/run@0.2.2",
+     "wasi:cli/stderr@0.2.2",
+     "wasi:cli/stdin@0.2.2",
+     "wasi:cli/stdout@0.2.2",
+     "wasi:cli/terminal-input@0.2.2",
+     "wasi:cli/terminal-output@0.2.2",
+     "wasi:cli/terminal-stderr@0.2.2",
+     "wasi:cli/terminal-stdin@0.2.2",
+     "wasi:cli/terminal-stdout@0.2.2",
+     "wasi:clocks/monotonic-clock@0.2.2",
+     "wasi:clocks/timezone@0.2.2",
+     "wasi:clocks/wall-clock@0.2.2",
+     "wasi:filesystem/preopens@0.2.2",
+     "wasi:filesystem/types@0.2.2",
+     "wasi:http/incoming-handler@0.2.2",
+     "wasi:http/outgoing-handler@0.2.2",
+     "wasi:http/types@0.2.2",
+     "wasi:io/error@0.2.2",
+     "wasi:io/poll@0.2.2",
+     "wasi:io/streams@0.2.2",
+     "wasi:random/insecure-seed@0.2.2",
+     "wasi:random/insecure@0.2.2",
+     "wasi:random/random@0.2.2",
+     "wasi:sockets/instance-network@0.2.2",
+     "wasi:sockets/ip-name-lookup@0.2.2",
+     "wasi:sockets/network@0.2.2",
+     "wasi:sockets/tcp-create-socket@0.2.2",
+     "wasi:sockets/tcp@0.2.2",
+     "wasi:sockets/udp-create-socket@0.2.2",
+     "wasi:sockets/udp@0.2.2"
+    ],
+    "pinned_stable": [
+     "wasi:cli/environment@0.2.2",
+     "wasi:cli/exit@0.2.2",
+     "wasi:cli/run@0.2.2",
+     "wasi:cli/stderr@0.2.2",
+     "wasi:cli/stdin@0.2.2",
+     "wasi:cli/stdout@0.2.2",
+     "wasi:cli/terminal-input@0.2.2",
+     "wasi:cli/terminal-output@0.2.2",
+     "wasi:cli/terminal-stderr@0.2.2",
+     "wasi:cli/terminal-stdin@0.2.2",
+     "wasi:cli/terminal-stdout@0.2.2",
+     "wasi:clocks/monotonic-clock@0.2.2",
+     "wasi:clocks/wall-clock@0.2.2",
+     "wasi:filesystem/preopens@0.2.2",
+     "wasi:filesystem/types@0.2.2",
+     "wasi:http/incoming-handler@0.2.2",
+     "wasi:http/outgoing-handler@0.2.2",
+     "wasi:http/types@0.2.2",
+     "wasi:io/error@0.2.2",
+     "wasi:io/poll@0.2.2",
+     "wasi:io/streams@0.2.2",
+     "wasi:random/insecure-seed@0.2.2",
+     "wasi:random/insecure@0.2.2",
+     "wasi:random/random@0.2.2",
+     "wasi:sockets/instance-network@0.2.2",
+     "wasi:sockets/ip-name-lookup@0.2.2",
+     "wasi:sockets/network@0.2.2",
+     "wasi:sockets/tcp-create-socket@0.2.2",
+     "wasi:sockets/tcp@0.2.2",
+     "wasi:sockets/udp-create-socket@0.2.2",
+     "wasi:sockets/udp@0.2.2"
+    ],
+    "bound": [
+     "wasi:cli/environment@0.2.2",
+     "wasi:cli/exit@0.2.2",
+     "wasi:cli/stderr@0.2.2",
+     "wasi:cli/stdin@0.2.2",
+     "wasi:cli/stdout@0.2.2",
+     "wasi:cli/terminal-input@0.2.2",
+     "wasi:cli/terminal-output@0.2.2",
+     "wasi:cli/terminal-stderr@0.2.2",
+     "wasi:cli/terminal-stdin@0.2.2",
+     "wasi:cli/terminal-stdout@0.2.2",
+     "wasi:clocks/monotonic-clock@0.2.2",
+     "wasi:clocks/wall-clock@0.2.2",
+     "wasi:filesystem/preopens@0.2.2",
+     "wasi:filesystem/types@0.2.2",
+     "wasi:io/error@0.2.2",
+     "wasi:io/poll@0.2.2",
+     "wasi:io/streams@0.2.2",
+     "wasi:random/insecure-seed@0.2.2",
+     "wasi:random/insecure@0.2.2",
+     "wasi:random/random@0.2.2",
+     "wasi:sockets/instance-network@0.2.2",
+     "wasi:sockets/ip-name-lookup@0.2.2",
+     "wasi:sockets/network@0.2.2",
+     "wasi:sockets/tcp-create-socket@0.2.2",
+     "wasi:sockets/tcp@0.2.2",
+     "wasi:sockets/udp-create-socket@0.2.2",
+     "wasi:sockets/udp@0.2.2"
+    ],
+    "unbound_stable": [
+     "wasi:cli/run@0.2.2",
+     "wasi:http/incoming-handler@0.2.2",
+     "wasi:http/outgoing-handler@0.2.2",
+     "wasi:http/types@0.2.2"
+    ],
+    "missing": [],
+    "excluded": [
+     "wasi:http/incoming-handler@0.2.2",
+     "wasi:http/outgoing-handler@0.2.2",
+     "wasi:http/types@0.2.2"
+    ],
+    "unstable": [
+     "wasi:clocks/timezone@0.2.2"
+    ],
+    "export_only": [
+     "wasi:cli/run@0.2.2"
+    ],
+    "interfaces": [
+     {
+      "interface": "wasi:cli/environment@0.2.2",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/exit@0.2.2",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/run@0.2.2",
+      "status": "export_only",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/stderr@0.2.2",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/stdin@0.2.2",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/stdout@0.2.2",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/terminal-input@0.2.2",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/terminal-output@0.2.2",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/terminal-stderr@0.2.2",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/terminal-stdin@0.2.2",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/terminal-stdout@0.2.2",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:clocks/monotonic-clock@0.2.2",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:clocks/timezone@0.2.2",
+      "status": "unstable",
+      "stability": "unstable"
+     },
+     {
+      "interface": "wasi:clocks/wall-clock@0.2.2",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:filesystem/preopens@0.2.2",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:filesystem/types@0.2.2",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:http/incoming-handler@0.2.2",
+      "status": "excluded",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:http/outgoing-handler@0.2.2",
+      "status": "excluded",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:http/types@0.2.2",
+      "status": "excluded",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:io/error@0.2.2",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:io/poll@0.2.2",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:io/streams@0.2.2",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:random/insecure-seed@0.2.2",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:random/insecure@0.2.2",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:random/random@0.2.2",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/instance-network@0.2.2",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/ip-name-lookup@0.2.2",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/network@0.2.2",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/tcp-create-socket@0.2.2",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/tcp@0.2.2",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/udp-create-socket@0.2.2",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/udp@0.2.2",
+      "status": "bound",
+      "stability": "stable"
+     }
+    ]
+   },
+   {
+    "version": "0.2.3",
+    "pinned_interfaces": [
+     "wasi:cli/environment@0.2.3",
+     "wasi:cli/exit@0.2.3",
+     "wasi:cli/run@0.2.3",
+     "wasi:cli/stderr@0.2.3",
+     "wasi:cli/stdin@0.2.3",
+     "wasi:cli/stdout@0.2.3",
+     "wasi:cli/terminal-input@0.2.3",
+     "wasi:cli/terminal-output@0.2.3",
+     "wasi:cli/terminal-stderr@0.2.3",
+     "wasi:cli/terminal-stdin@0.2.3",
+     "wasi:cli/terminal-stdout@0.2.3",
+     "wasi:clocks/monotonic-clock@0.2.3",
+     "wasi:clocks/timezone@0.2.3",
+     "wasi:clocks/wall-clock@0.2.3",
+     "wasi:filesystem/preopens@0.2.3",
+     "wasi:filesystem/types@0.2.3",
+     "wasi:http/incoming-handler@0.2.3",
+     "wasi:http/outgoing-handler@0.2.3",
+     "wasi:http/types@0.2.3",
+     "wasi:io/error@0.2.3",
+     "wasi:io/poll@0.2.3",
+     "wasi:io/streams@0.2.3",
+     "wasi:random/insecure-seed@0.2.3",
+     "wasi:random/insecure@0.2.3",
+     "wasi:random/random@0.2.3",
+     "wasi:sockets/instance-network@0.2.3",
+     "wasi:sockets/ip-name-lookup@0.2.3",
+     "wasi:sockets/network@0.2.3",
+     "wasi:sockets/tcp-create-socket@0.2.3",
+     "wasi:sockets/tcp@0.2.3",
+     "wasi:sockets/udp-create-socket@0.2.3",
+     "wasi:sockets/udp@0.2.3"
+    ],
+    "pinned_stable": [
+     "wasi:cli/environment@0.2.3",
+     "wasi:cli/exit@0.2.3",
+     "wasi:cli/run@0.2.3",
+     "wasi:cli/stderr@0.2.3",
+     "wasi:cli/stdin@0.2.3",
+     "wasi:cli/stdout@0.2.3",
+     "wasi:cli/terminal-input@0.2.3",
+     "wasi:cli/terminal-output@0.2.3",
+     "wasi:cli/terminal-stderr@0.2.3",
+     "wasi:cli/terminal-stdin@0.2.3",
+     "wasi:cli/terminal-stdout@0.2.3",
+     "wasi:clocks/monotonic-clock@0.2.3",
+     "wasi:clocks/wall-clock@0.2.3",
+     "wasi:filesystem/preopens@0.2.3",
+     "wasi:filesystem/types@0.2.3",
+     "wasi:http/incoming-handler@0.2.3",
+     "wasi:http/outgoing-handler@0.2.3",
+     "wasi:http/types@0.2.3",
+     "wasi:io/error@0.2.3",
+     "wasi:io/poll@0.2.3",
+     "wasi:io/streams@0.2.3",
+     "wasi:random/insecure-seed@0.2.3",
+     "wasi:random/insecure@0.2.3",
+     "wasi:random/random@0.2.3",
+     "wasi:sockets/instance-network@0.2.3",
+     "wasi:sockets/ip-name-lookup@0.2.3",
+     "wasi:sockets/network@0.2.3",
+     "wasi:sockets/tcp-create-socket@0.2.3",
+     "wasi:sockets/tcp@0.2.3",
+     "wasi:sockets/udp-create-socket@0.2.3",
+     "wasi:sockets/udp@0.2.3"
+    ],
+    "bound": [
+     "wasi:cli/environment@0.2.3",
+     "wasi:cli/exit@0.2.3",
+     "wasi:cli/stderr@0.2.3",
+     "wasi:cli/stdin@0.2.3",
+     "wasi:cli/stdout@0.2.3",
+     "wasi:cli/terminal-input@0.2.3",
+     "wasi:cli/terminal-output@0.2.3",
+     "wasi:cli/terminal-stderr@0.2.3",
+     "wasi:cli/terminal-stdin@0.2.3",
+     "wasi:cli/terminal-stdout@0.2.3",
+     "wasi:clocks/monotonic-clock@0.2.3",
+     "wasi:clocks/wall-clock@0.2.3",
+     "wasi:filesystem/preopens@0.2.3",
+     "wasi:filesystem/types@0.2.3",
+     "wasi:io/error@0.2.3",
+     "wasi:io/poll@0.2.3",
+     "wasi:io/streams@0.2.3",
+     "wasi:random/insecure-seed@0.2.3",
+     "wasi:random/insecure@0.2.3",
+     "wasi:random/random@0.2.3",
+     "wasi:sockets/instance-network@0.2.3",
+     "wasi:sockets/ip-name-lookup@0.2.3",
+     "wasi:sockets/network@0.2.3",
+     "wasi:sockets/tcp-create-socket@0.2.3",
+     "wasi:sockets/tcp@0.2.3",
+     "wasi:sockets/udp-create-socket@0.2.3",
+     "wasi:sockets/udp@0.2.3"
+    ],
+    "unbound_stable": [
+     "wasi:cli/run@0.2.3",
+     "wasi:http/incoming-handler@0.2.3",
+     "wasi:http/outgoing-handler@0.2.3",
+     "wasi:http/types@0.2.3"
+    ],
+    "missing": [],
+    "excluded": [
+     "wasi:http/incoming-handler@0.2.3",
+     "wasi:http/outgoing-handler@0.2.3",
+     "wasi:http/types@0.2.3"
+    ],
+    "unstable": [
+     "wasi:clocks/timezone@0.2.3"
+    ],
+    "export_only": [
+     "wasi:cli/run@0.2.3"
+    ],
+    "interfaces": [
+     {
+      "interface": "wasi:cli/environment@0.2.3",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/exit@0.2.3",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/run@0.2.3",
+      "status": "export_only",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/stderr@0.2.3",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/stdin@0.2.3",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/stdout@0.2.3",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/terminal-input@0.2.3",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/terminal-output@0.2.3",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/terminal-stderr@0.2.3",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/terminal-stdin@0.2.3",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/terminal-stdout@0.2.3",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:clocks/monotonic-clock@0.2.3",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:clocks/timezone@0.2.3",
+      "status": "unstable",
+      "stability": "unstable"
+     },
+     {
+      "interface": "wasi:clocks/wall-clock@0.2.3",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:filesystem/preopens@0.2.3",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:filesystem/types@0.2.3",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:http/incoming-handler@0.2.3",
+      "status": "excluded",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:http/outgoing-handler@0.2.3",
+      "status": "excluded",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:http/types@0.2.3",
+      "status": "excluded",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:io/error@0.2.3",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:io/poll@0.2.3",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:io/streams@0.2.3",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:random/insecure-seed@0.2.3",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:random/insecure@0.2.3",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:random/random@0.2.3",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/instance-network@0.2.3",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/ip-name-lookup@0.2.3",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/network@0.2.3",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/tcp-create-socket@0.2.3",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/tcp@0.2.3",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/udp-create-socket@0.2.3",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/udp@0.2.3",
+      "status": "bound",
+      "stability": "stable"
+     }
+    ]
+   },
+   {
+    "version": "0.2.4",
+    "pinned_interfaces": [
+     "wasi:cli/environment@0.2.4",
+     "wasi:cli/exit@0.2.4",
+     "wasi:cli/run@0.2.4",
+     "wasi:cli/stderr@0.2.4",
+     "wasi:cli/stdin@0.2.4",
+     "wasi:cli/stdout@0.2.4",
+     "wasi:cli/terminal-input@0.2.4",
+     "wasi:cli/terminal-output@0.2.4",
+     "wasi:cli/terminal-stderr@0.2.4",
+     "wasi:cli/terminal-stdin@0.2.4",
+     "wasi:cli/terminal-stdout@0.2.4",
+     "wasi:clocks/monotonic-clock@0.2.4",
+     "wasi:clocks/timezone@0.2.4",
+     "wasi:clocks/wall-clock@0.2.4",
+     "wasi:filesystem/preopens@0.2.4",
+     "wasi:filesystem/types@0.2.4",
+     "wasi:http/incoming-handler@0.2.3",
+     "wasi:http/outgoing-handler@0.2.3",
+     "wasi:http/types@0.2.3",
+     "wasi:io/error@0.2.4",
+     "wasi:io/poll@0.2.4",
+     "wasi:io/streams@0.2.4",
+     "wasi:random/insecure-seed@0.2.4",
+     "wasi:random/insecure@0.2.4",
+     "wasi:random/random@0.2.4",
+     "wasi:sockets/instance-network@0.2.4",
+     "wasi:sockets/ip-name-lookup@0.2.4",
+     "wasi:sockets/network@0.2.4",
+     "wasi:sockets/tcp-create-socket@0.2.4",
+     "wasi:sockets/tcp@0.2.4",
+     "wasi:sockets/udp-create-socket@0.2.4",
+     "wasi:sockets/udp@0.2.4"
+    ],
+    "pinned_stable": [
+     "wasi:cli/environment@0.2.4",
+     "wasi:cli/exit@0.2.4",
+     "wasi:cli/run@0.2.4",
+     "wasi:cli/stderr@0.2.4",
+     "wasi:cli/stdin@0.2.4",
+     "wasi:cli/stdout@0.2.4",
+     "wasi:cli/terminal-input@0.2.4",
+     "wasi:cli/terminal-output@0.2.4",
+     "wasi:cli/terminal-stderr@0.2.4",
+     "wasi:cli/terminal-stdin@0.2.4",
+     "wasi:cli/terminal-stdout@0.2.4",
+     "wasi:clocks/monotonic-clock@0.2.4",
+     "wasi:clocks/wall-clock@0.2.4",
+     "wasi:filesystem/preopens@0.2.4",
+     "wasi:filesystem/types@0.2.4",
+     "wasi:http/incoming-handler@0.2.3",
+     "wasi:http/outgoing-handler@0.2.3",
+     "wasi:http/types@0.2.3",
+     "wasi:io/error@0.2.4",
+     "wasi:io/poll@0.2.4",
+     "wasi:io/streams@0.2.4",
+     "wasi:random/insecure-seed@0.2.4",
+     "wasi:random/insecure@0.2.4",
+     "wasi:random/random@0.2.4",
+     "wasi:sockets/instance-network@0.2.4",
+     "wasi:sockets/ip-name-lookup@0.2.4",
+     "wasi:sockets/network@0.2.4",
+     "wasi:sockets/tcp-create-socket@0.2.4",
+     "wasi:sockets/tcp@0.2.4",
+     "wasi:sockets/udp-create-socket@0.2.4",
+     "wasi:sockets/udp@0.2.4"
+    ],
+    "bound": [
+     "wasi:cli/environment@0.2.4",
+     "wasi:cli/exit@0.2.4",
+     "wasi:cli/stderr@0.2.4",
+     "wasi:cli/stdin@0.2.4",
+     "wasi:cli/stdout@0.2.4",
+     "wasi:cli/terminal-input@0.2.4",
+     "wasi:cli/terminal-output@0.2.4",
+     "wasi:cli/terminal-stderr@0.2.4",
+     "wasi:cli/terminal-stdin@0.2.4",
+     "wasi:cli/terminal-stdout@0.2.4",
+     "wasi:clocks/monotonic-clock@0.2.4",
+     "wasi:clocks/wall-clock@0.2.4",
+     "wasi:filesystem/preopens@0.2.4",
+     "wasi:filesystem/types@0.2.4",
+     "wasi:io/error@0.2.4",
+     "wasi:io/poll@0.2.4",
+     "wasi:io/streams@0.2.4",
+     "wasi:random/insecure-seed@0.2.4",
+     "wasi:random/insecure@0.2.4",
+     "wasi:random/random@0.2.4",
+     "wasi:sockets/instance-network@0.2.4",
+     "wasi:sockets/ip-name-lookup@0.2.4",
+     "wasi:sockets/network@0.2.4",
+     "wasi:sockets/tcp-create-socket@0.2.4",
+     "wasi:sockets/tcp@0.2.4",
+     "wasi:sockets/udp-create-socket@0.2.4",
+     "wasi:sockets/udp@0.2.4"
+    ],
+    "unbound_stable": [
+     "wasi:cli/run@0.2.4",
+     "wasi:http/incoming-handler@0.2.3",
+     "wasi:http/outgoing-handler@0.2.3",
+     "wasi:http/types@0.2.3"
+    ],
+    "missing": [],
+    "excluded": [
+     "wasi:http/incoming-handler@0.2.3",
+     "wasi:http/outgoing-handler@0.2.3",
+     "wasi:http/types@0.2.3"
+    ],
+    "unstable": [
+     "wasi:clocks/timezone@0.2.4"
+    ],
+    "export_only": [
+     "wasi:cli/run@0.2.4"
+    ],
+    "interfaces": [
+     {
+      "interface": "wasi:cli/environment@0.2.4",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/exit@0.2.4",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/run@0.2.4",
+      "status": "export_only",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/stderr@0.2.4",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/stdin@0.2.4",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/stdout@0.2.4",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/terminal-input@0.2.4",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/terminal-output@0.2.4",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/terminal-stderr@0.2.4",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/terminal-stdin@0.2.4",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/terminal-stdout@0.2.4",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:clocks/monotonic-clock@0.2.4",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:clocks/timezone@0.2.4",
+      "status": "unstable",
+      "stability": "unstable"
+     },
+     {
+      "interface": "wasi:clocks/wall-clock@0.2.4",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:filesystem/preopens@0.2.4",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:filesystem/types@0.2.4",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:http/incoming-handler@0.2.3",
+      "status": "excluded",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:http/outgoing-handler@0.2.3",
+      "status": "excluded",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:http/types@0.2.3",
+      "status": "excluded",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:io/error@0.2.4",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:io/poll@0.2.4",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:io/streams@0.2.4",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:random/insecure-seed@0.2.4",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:random/insecure@0.2.4",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:random/random@0.2.4",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/instance-network@0.2.4",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/ip-name-lookup@0.2.4",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/network@0.2.4",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/tcp-create-socket@0.2.4",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/tcp@0.2.4",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/udp-create-socket@0.2.4",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/udp@0.2.4",
+      "status": "bound",
+      "stability": "stable"
+     }
+    ]
+   },
+   {
+    "version": "0.2.5",
+    "pinned_interfaces": [
+     "wasi:cli/environment@0.2.5",
+     "wasi:cli/exit@0.2.5",
+     "wasi:cli/run@0.2.5",
+     "wasi:cli/stderr@0.2.5",
+     "wasi:cli/stdin@0.2.5",
+     "wasi:cli/stdout@0.2.5",
+     "wasi:cli/terminal-input@0.2.5",
+     "wasi:cli/terminal-output@0.2.5",
+     "wasi:cli/terminal-stderr@0.2.5",
+     "wasi:cli/terminal-stdin@0.2.5",
+     "wasi:cli/terminal-stdout@0.2.5",
+     "wasi:clocks/monotonic-clock@0.2.5",
+     "wasi:clocks/timezone@0.2.5",
+     "wasi:clocks/wall-clock@0.2.5",
+     "wasi:filesystem/preopens@0.2.5",
+     "wasi:filesystem/types@0.2.5",
+     "wasi:http/incoming-handler@0.2.5",
+     "wasi:http/outgoing-handler@0.2.5",
+     "wasi:http/types@0.2.5",
+     "wasi:io/error@0.2.5",
+     "wasi:io/poll@0.2.5",
+     "wasi:io/streams@0.2.5",
+     "wasi:random/insecure-seed@0.2.5",
+     "wasi:random/insecure@0.2.5",
+     "wasi:random/random@0.2.5",
+     "wasi:sockets/instance-network@0.2.5",
+     "wasi:sockets/ip-name-lookup@0.2.5",
+     "wasi:sockets/network@0.2.5",
+     "wasi:sockets/tcp-create-socket@0.2.5",
+     "wasi:sockets/tcp@0.2.5",
+     "wasi:sockets/udp-create-socket@0.2.5",
+     "wasi:sockets/udp@0.2.5"
+    ],
+    "pinned_stable": [
+     "wasi:cli/environment@0.2.5",
+     "wasi:cli/exit@0.2.5",
+     "wasi:cli/run@0.2.5",
+     "wasi:cli/stderr@0.2.5",
+     "wasi:cli/stdin@0.2.5",
+     "wasi:cli/stdout@0.2.5",
+     "wasi:cli/terminal-input@0.2.5",
+     "wasi:cli/terminal-output@0.2.5",
+     "wasi:cli/terminal-stderr@0.2.5",
+     "wasi:cli/terminal-stdin@0.2.5",
+     "wasi:cli/terminal-stdout@0.2.5",
+     "wasi:clocks/monotonic-clock@0.2.5",
+     "wasi:clocks/wall-clock@0.2.5",
+     "wasi:filesystem/preopens@0.2.5",
+     "wasi:filesystem/types@0.2.5",
+     "wasi:http/incoming-handler@0.2.5",
+     "wasi:http/outgoing-handler@0.2.5",
+     "wasi:http/types@0.2.5",
+     "wasi:io/error@0.2.5",
+     "wasi:io/poll@0.2.5",
+     "wasi:io/streams@0.2.5",
+     "wasi:random/insecure-seed@0.2.5",
+     "wasi:random/insecure@0.2.5",
+     "wasi:random/random@0.2.5",
+     "wasi:sockets/instance-network@0.2.5",
+     "wasi:sockets/ip-name-lookup@0.2.5",
+     "wasi:sockets/network@0.2.5",
+     "wasi:sockets/tcp-create-socket@0.2.5",
+     "wasi:sockets/tcp@0.2.5",
+     "wasi:sockets/udp-create-socket@0.2.5",
+     "wasi:sockets/udp@0.2.5"
+    ],
+    "bound": [
+     "wasi:cli/environment@0.2.5",
+     "wasi:cli/exit@0.2.5",
+     "wasi:cli/stderr@0.2.5",
+     "wasi:cli/stdin@0.2.5",
+     "wasi:cli/stdout@0.2.5",
+     "wasi:cli/terminal-input@0.2.5",
+     "wasi:cli/terminal-output@0.2.5",
+     "wasi:cli/terminal-stderr@0.2.5",
+     "wasi:cli/terminal-stdin@0.2.5",
+     "wasi:cli/terminal-stdout@0.2.5",
+     "wasi:clocks/monotonic-clock@0.2.5",
+     "wasi:clocks/wall-clock@0.2.5",
+     "wasi:filesystem/preopens@0.2.5",
+     "wasi:filesystem/types@0.2.5",
+     "wasi:io/error@0.2.5",
+     "wasi:io/poll@0.2.5",
+     "wasi:io/streams@0.2.5",
+     "wasi:random/insecure-seed@0.2.5",
+     "wasi:random/insecure@0.2.5",
+     "wasi:random/random@0.2.5",
+     "wasi:sockets/instance-network@0.2.5",
+     "wasi:sockets/ip-name-lookup@0.2.5",
+     "wasi:sockets/network@0.2.5",
+     "wasi:sockets/tcp-create-socket@0.2.5",
+     "wasi:sockets/tcp@0.2.5",
+     "wasi:sockets/udp-create-socket@0.2.5",
+     "wasi:sockets/udp@0.2.5"
+    ],
+    "unbound_stable": [
+     "wasi:cli/run@0.2.5",
+     "wasi:http/incoming-handler@0.2.5",
+     "wasi:http/outgoing-handler@0.2.5",
+     "wasi:http/types@0.2.5"
+    ],
+    "missing": [],
+    "excluded": [
+     "wasi:http/incoming-handler@0.2.5",
+     "wasi:http/outgoing-handler@0.2.5",
+     "wasi:http/types@0.2.5"
+    ],
+    "unstable": [
+     "wasi:clocks/timezone@0.2.5"
+    ],
+    "export_only": [
+     "wasi:cli/run@0.2.5"
+    ],
+    "interfaces": [
+     {
+      "interface": "wasi:cli/environment@0.2.5",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/exit@0.2.5",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/run@0.2.5",
+      "status": "export_only",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/stderr@0.2.5",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/stdin@0.2.5",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/stdout@0.2.5",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/terminal-input@0.2.5",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/terminal-output@0.2.5",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/terminal-stderr@0.2.5",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/terminal-stdin@0.2.5",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/terminal-stdout@0.2.5",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:clocks/monotonic-clock@0.2.5",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:clocks/timezone@0.2.5",
+      "status": "unstable",
+      "stability": "unstable"
+     },
+     {
+      "interface": "wasi:clocks/wall-clock@0.2.5",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:filesystem/preopens@0.2.5",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:filesystem/types@0.2.5",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:http/incoming-handler@0.2.5",
+      "status": "excluded",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:http/outgoing-handler@0.2.5",
+      "status": "excluded",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:http/types@0.2.5",
+      "status": "excluded",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:io/error@0.2.5",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:io/poll@0.2.5",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:io/streams@0.2.5",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:random/insecure-seed@0.2.5",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:random/insecure@0.2.5",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:random/random@0.2.5",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/instance-network@0.2.5",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/ip-name-lookup@0.2.5",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/network@0.2.5",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/tcp-create-socket@0.2.5",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/tcp@0.2.5",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/udp-create-socket@0.2.5",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/udp@0.2.5",
+      "status": "bound",
+      "stability": "stable"
+     }
+    ]
+   },
+   {
+    "version": "0.2.6",
+    "pinned_interfaces": [
+     "wasi:cli/environment@0.2.6",
+     "wasi:cli/exit@0.2.6",
+     "wasi:cli/run@0.2.6",
+     "wasi:cli/stderr@0.2.6",
+     "wasi:cli/stdin@0.2.6",
+     "wasi:cli/stdout@0.2.6",
+     "wasi:cli/terminal-input@0.2.6",
+     "wasi:cli/terminal-output@0.2.6",
+     "wasi:cli/terminal-stderr@0.2.6",
+     "wasi:cli/terminal-stdin@0.2.6",
+     "wasi:cli/terminal-stdout@0.2.6",
+     "wasi:clocks/monotonic-clock@0.2.6",
+     "wasi:clocks/timezone@0.2.6",
+     "wasi:clocks/wall-clock@0.2.6",
+     "wasi:filesystem/preopens@0.2.6",
+     "wasi:filesystem/types@0.2.6",
+     "wasi:http/incoming-handler@0.2.6",
+     "wasi:http/outgoing-handler@0.2.6",
+     "wasi:http/types@0.2.6",
+     "wasi:io/error@0.2.6",
+     "wasi:io/poll@0.2.6",
+     "wasi:io/streams@0.2.6",
+     "wasi:random/insecure-seed@0.2.6",
+     "wasi:random/insecure@0.2.6",
+     "wasi:random/random@0.2.6",
+     "wasi:sockets/instance-network@0.2.6",
+     "wasi:sockets/ip-name-lookup@0.2.6",
+     "wasi:sockets/network@0.2.6",
+     "wasi:sockets/tcp-create-socket@0.2.6",
+     "wasi:sockets/tcp@0.2.6",
+     "wasi:sockets/udp-create-socket@0.2.6",
+     "wasi:sockets/udp@0.2.6"
+    ],
+    "pinned_stable": [
+     "wasi:cli/environment@0.2.6",
+     "wasi:cli/exit@0.2.6",
+     "wasi:cli/run@0.2.6",
+     "wasi:cli/stderr@0.2.6",
+     "wasi:cli/stdin@0.2.6",
+     "wasi:cli/stdout@0.2.6",
+     "wasi:cli/terminal-input@0.2.6",
+     "wasi:cli/terminal-output@0.2.6",
+     "wasi:cli/terminal-stderr@0.2.6",
+     "wasi:cli/terminal-stdin@0.2.6",
+     "wasi:cli/terminal-stdout@0.2.6",
+     "wasi:clocks/monotonic-clock@0.2.6",
+     "wasi:clocks/wall-clock@0.2.6",
+     "wasi:filesystem/preopens@0.2.6",
+     "wasi:filesystem/types@0.2.6",
+     "wasi:http/incoming-handler@0.2.6",
+     "wasi:http/outgoing-handler@0.2.6",
+     "wasi:http/types@0.2.6",
+     "wasi:io/error@0.2.6",
+     "wasi:io/poll@0.2.6",
+     "wasi:io/streams@0.2.6",
+     "wasi:random/insecure-seed@0.2.6",
+     "wasi:random/insecure@0.2.6",
+     "wasi:random/random@0.2.6",
+     "wasi:sockets/instance-network@0.2.6",
+     "wasi:sockets/ip-name-lookup@0.2.6",
+     "wasi:sockets/network@0.2.6",
+     "wasi:sockets/tcp-create-socket@0.2.6",
+     "wasi:sockets/tcp@0.2.6",
+     "wasi:sockets/udp-create-socket@0.2.6",
+     "wasi:sockets/udp@0.2.6"
+    ],
+    "bound": [
+     "wasi:cli/environment@0.2.6",
+     "wasi:cli/exit@0.2.6",
+     "wasi:cli/stderr@0.2.6",
+     "wasi:cli/stdin@0.2.6",
+     "wasi:cli/stdout@0.2.6",
+     "wasi:cli/terminal-input@0.2.6",
+     "wasi:cli/terminal-output@0.2.6",
+     "wasi:cli/terminal-stderr@0.2.6",
+     "wasi:cli/terminal-stdin@0.2.6",
+     "wasi:cli/terminal-stdout@0.2.6",
+     "wasi:clocks/monotonic-clock@0.2.6",
+     "wasi:clocks/wall-clock@0.2.6",
+     "wasi:filesystem/preopens@0.2.6",
+     "wasi:filesystem/types@0.2.6",
+     "wasi:io/error@0.2.6",
+     "wasi:io/poll@0.2.6",
+     "wasi:io/streams@0.2.6",
+     "wasi:random/insecure-seed@0.2.6",
+     "wasi:random/insecure@0.2.6",
+     "wasi:random/random@0.2.6",
+     "wasi:sockets/instance-network@0.2.6",
+     "wasi:sockets/ip-name-lookup@0.2.6",
+     "wasi:sockets/network@0.2.6",
+     "wasi:sockets/tcp-create-socket@0.2.6",
+     "wasi:sockets/tcp@0.2.6",
+     "wasi:sockets/udp-create-socket@0.2.6",
+     "wasi:sockets/udp@0.2.6"
+    ],
+    "unbound_stable": [
+     "wasi:cli/run@0.2.6",
+     "wasi:http/incoming-handler@0.2.6",
+     "wasi:http/outgoing-handler@0.2.6",
+     "wasi:http/types@0.2.6"
+    ],
+    "missing": [],
+    "excluded": [
+     "wasi:http/incoming-handler@0.2.6",
+     "wasi:http/outgoing-handler@0.2.6",
+     "wasi:http/types@0.2.6"
+    ],
+    "unstable": [
+     "wasi:clocks/timezone@0.2.6"
+    ],
+    "export_only": [
+     "wasi:cli/run@0.2.6"
+    ],
+    "interfaces": [
+     {
+      "interface": "wasi:cli/environment@0.2.6",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/exit@0.2.6",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/run@0.2.6",
+      "status": "export_only",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/stderr@0.2.6",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/stdin@0.2.6",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/stdout@0.2.6",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/terminal-input@0.2.6",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/terminal-output@0.2.6",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/terminal-stderr@0.2.6",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/terminal-stdin@0.2.6",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/terminal-stdout@0.2.6",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:clocks/monotonic-clock@0.2.6",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:clocks/timezone@0.2.6",
+      "status": "unstable",
+      "stability": "unstable"
+     },
+     {
+      "interface": "wasi:clocks/wall-clock@0.2.6",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:filesystem/preopens@0.2.6",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:filesystem/types@0.2.6",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:http/incoming-handler@0.2.6",
+      "status": "excluded",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:http/outgoing-handler@0.2.6",
+      "status": "excluded",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:http/types@0.2.6",
+      "status": "excluded",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:io/error@0.2.6",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:io/poll@0.2.6",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:io/streams@0.2.6",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:random/insecure-seed@0.2.6",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:random/insecure@0.2.6",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:random/random@0.2.6",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/instance-network@0.2.6",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/ip-name-lookup@0.2.6",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/network@0.2.6",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/tcp-create-socket@0.2.6",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/tcp@0.2.6",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/udp-create-socket@0.2.6",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/udp@0.2.6",
+      "status": "bound",
+      "stability": "stable"
+     }
+    ]
+   },
+   {
+    "version": "0.2.7",
+    "pinned_interfaces": [
+     "wasi:cli/environment@0.2.7",
+     "wasi:cli/exit@0.2.7",
+     "wasi:cli/run@0.2.7",
+     "wasi:cli/stderr@0.2.7",
+     "wasi:cli/stdin@0.2.7",
+     "wasi:cli/stdout@0.2.7",
+     "wasi:cli/terminal-input@0.2.7",
+     "wasi:cli/terminal-output@0.2.7",
+     "wasi:cli/terminal-stderr@0.2.7",
+     "wasi:cli/terminal-stdin@0.2.7",
+     "wasi:cli/terminal-stdout@0.2.7",
+     "wasi:clocks/monotonic-clock@0.2.7",
+     "wasi:clocks/timezone@0.2.7",
+     "wasi:clocks/wall-clock@0.2.7",
+     "wasi:filesystem/preopens@0.2.7",
+     "wasi:filesystem/types@0.2.7",
+     "wasi:http/incoming-handler@0.2.7",
+     "wasi:http/outgoing-handler@0.2.7",
+     "wasi:http/types@0.2.7",
+     "wasi:io/error@0.2.7",
+     "wasi:io/poll@0.2.7",
+     "wasi:io/streams@0.2.7",
+     "wasi:random/insecure-seed@0.2.7",
+     "wasi:random/insecure@0.2.7",
+     "wasi:random/random@0.2.7",
+     "wasi:sockets/instance-network@0.2.7",
+     "wasi:sockets/ip-name-lookup@0.2.7",
+     "wasi:sockets/network@0.2.7",
+     "wasi:sockets/tcp-create-socket@0.2.7",
+     "wasi:sockets/tcp@0.2.7",
+     "wasi:sockets/udp-create-socket@0.2.7",
+     "wasi:sockets/udp@0.2.7"
+    ],
+    "pinned_stable": [
+     "wasi:cli/environment@0.2.7",
+     "wasi:cli/exit@0.2.7",
+     "wasi:cli/run@0.2.7",
+     "wasi:cli/stderr@0.2.7",
+     "wasi:cli/stdin@0.2.7",
+     "wasi:cli/stdout@0.2.7",
+     "wasi:cli/terminal-input@0.2.7",
+     "wasi:cli/terminal-output@0.2.7",
+     "wasi:cli/terminal-stderr@0.2.7",
+     "wasi:cli/terminal-stdin@0.2.7",
+     "wasi:cli/terminal-stdout@0.2.7",
+     "wasi:clocks/monotonic-clock@0.2.7",
+     "wasi:clocks/wall-clock@0.2.7",
+     "wasi:filesystem/preopens@0.2.7",
+     "wasi:filesystem/types@0.2.7",
+     "wasi:http/incoming-handler@0.2.7",
+     "wasi:http/outgoing-handler@0.2.7",
+     "wasi:http/types@0.2.7",
+     "wasi:io/error@0.2.7",
+     "wasi:io/poll@0.2.7",
+     "wasi:io/streams@0.2.7",
+     "wasi:random/insecure-seed@0.2.7",
+     "wasi:random/insecure@0.2.7",
+     "wasi:random/random@0.2.7",
+     "wasi:sockets/instance-network@0.2.7",
+     "wasi:sockets/ip-name-lookup@0.2.7",
+     "wasi:sockets/network@0.2.7",
+     "wasi:sockets/tcp-create-socket@0.2.7",
+     "wasi:sockets/tcp@0.2.7",
+     "wasi:sockets/udp-create-socket@0.2.7",
+     "wasi:sockets/udp@0.2.7"
+    ],
+    "bound": [
+     "wasi:cli/environment@0.2.7",
+     "wasi:cli/exit@0.2.7",
+     "wasi:cli/stderr@0.2.7",
+     "wasi:cli/stdin@0.2.7",
+     "wasi:cli/stdout@0.2.7",
+     "wasi:cli/terminal-input@0.2.7",
+     "wasi:cli/terminal-output@0.2.7",
+     "wasi:cli/terminal-stderr@0.2.7",
+     "wasi:cli/terminal-stdin@0.2.7",
+     "wasi:cli/terminal-stdout@0.2.7",
+     "wasi:clocks/monotonic-clock@0.2.7",
+     "wasi:clocks/wall-clock@0.2.7",
+     "wasi:filesystem/preopens@0.2.7",
+     "wasi:filesystem/types@0.2.7",
+     "wasi:io/error@0.2.7",
+     "wasi:io/poll@0.2.7",
+     "wasi:io/streams@0.2.7",
+     "wasi:random/insecure-seed@0.2.7",
+     "wasi:random/insecure@0.2.7",
+     "wasi:random/random@0.2.7",
+     "wasi:sockets/instance-network@0.2.7",
+     "wasi:sockets/ip-name-lookup@0.2.7",
+     "wasi:sockets/network@0.2.7",
+     "wasi:sockets/tcp-create-socket@0.2.7",
+     "wasi:sockets/tcp@0.2.7",
+     "wasi:sockets/udp-create-socket@0.2.7",
+     "wasi:sockets/udp@0.2.7"
+    ],
+    "unbound_stable": [
+     "wasi:cli/run@0.2.7",
+     "wasi:http/incoming-handler@0.2.7",
+     "wasi:http/outgoing-handler@0.2.7",
+     "wasi:http/types@0.2.7"
+    ],
+    "missing": [],
+    "excluded": [
+     "wasi:http/incoming-handler@0.2.7",
+     "wasi:http/outgoing-handler@0.2.7",
+     "wasi:http/types@0.2.7"
+    ],
+    "unstable": [
+     "wasi:clocks/timezone@0.2.7"
+    ],
+    "export_only": [
+     "wasi:cli/run@0.2.7"
+    ],
+    "interfaces": [
+     {
+      "interface": "wasi:cli/environment@0.2.7",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/exit@0.2.7",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/run@0.2.7",
+      "status": "export_only",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/stderr@0.2.7",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/stdin@0.2.7",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/stdout@0.2.7",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/terminal-input@0.2.7",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/terminal-output@0.2.7",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/terminal-stderr@0.2.7",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/terminal-stdin@0.2.7",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/terminal-stdout@0.2.7",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:clocks/monotonic-clock@0.2.7",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:clocks/timezone@0.2.7",
+      "status": "unstable",
+      "stability": "unstable"
+     },
+     {
+      "interface": "wasi:clocks/wall-clock@0.2.7",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:filesystem/preopens@0.2.7",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:filesystem/types@0.2.7",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:http/incoming-handler@0.2.7",
+      "status": "excluded",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:http/outgoing-handler@0.2.7",
+      "status": "excluded",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:http/types@0.2.7",
+      "status": "excluded",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:io/error@0.2.7",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:io/poll@0.2.7",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:io/streams@0.2.7",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:random/insecure-seed@0.2.7",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:random/insecure@0.2.7",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:random/random@0.2.7",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/instance-network@0.2.7",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/ip-name-lookup@0.2.7",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/network@0.2.7",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/tcp-create-socket@0.2.7",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/tcp@0.2.7",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/udp-create-socket@0.2.7",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/udp@0.2.7",
+      "status": "bound",
+      "stability": "stable"
+     }
+    ]
+   },
+   {
+    "version": "0.2.8",
+    "pinned_interfaces": [
+     "wasi:cli/environment@0.2.8",
+     "wasi:cli/exit@0.2.8",
+     "wasi:cli/run@0.2.8",
+     "wasi:cli/stderr@0.2.8",
+     "wasi:cli/stdin@0.2.8",
+     "wasi:cli/stdout@0.2.8",
+     "wasi:cli/terminal-input@0.2.8",
+     "wasi:cli/terminal-output@0.2.8",
+     "wasi:cli/terminal-stderr@0.2.8",
+     "wasi:cli/terminal-stdin@0.2.8",
+     "wasi:cli/terminal-stdout@0.2.8",
+     "wasi:clocks/monotonic-clock@0.2.8",
+     "wasi:clocks/timezone@0.2.8",
+     "wasi:clocks/wall-clock@0.2.8",
+     "wasi:filesystem/preopens@0.2.8",
+     "wasi:filesystem/types@0.2.8",
+     "wasi:http/incoming-handler@0.2.8",
+     "wasi:http/outgoing-handler@0.2.8",
+     "wasi:http/types@0.2.8",
+     "wasi:io/error@0.2.8",
+     "wasi:io/poll@0.2.8",
+     "wasi:io/streams@0.2.8",
+     "wasi:random/insecure-seed@0.2.8",
+     "wasi:random/insecure@0.2.8",
+     "wasi:random/random@0.2.8",
+     "wasi:sockets/instance-network@0.2.8",
+     "wasi:sockets/ip-name-lookup@0.2.8",
+     "wasi:sockets/network@0.2.8",
+     "wasi:sockets/tcp-create-socket@0.2.8",
+     "wasi:sockets/tcp@0.2.8",
+     "wasi:sockets/udp-create-socket@0.2.8",
+     "wasi:sockets/udp@0.2.8"
+    ],
+    "pinned_stable": [
+     "wasi:cli/environment@0.2.8",
+     "wasi:cli/exit@0.2.8",
+     "wasi:cli/run@0.2.8",
+     "wasi:cli/stderr@0.2.8",
+     "wasi:cli/stdin@0.2.8",
+     "wasi:cli/stdout@0.2.8",
+     "wasi:cli/terminal-input@0.2.8",
+     "wasi:cli/terminal-output@0.2.8",
+     "wasi:cli/terminal-stderr@0.2.8",
+     "wasi:cli/terminal-stdin@0.2.8",
+     "wasi:cli/terminal-stdout@0.2.8",
+     "wasi:clocks/monotonic-clock@0.2.8",
+     "wasi:clocks/wall-clock@0.2.8",
+     "wasi:filesystem/preopens@0.2.8",
+     "wasi:filesystem/types@0.2.8",
+     "wasi:http/incoming-handler@0.2.8",
+     "wasi:http/outgoing-handler@0.2.8",
+     "wasi:http/types@0.2.8",
+     "wasi:io/error@0.2.8",
+     "wasi:io/poll@0.2.8",
+     "wasi:io/streams@0.2.8",
+     "wasi:random/insecure-seed@0.2.8",
+     "wasi:random/insecure@0.2.8",
+     "wasi:random/random@0.2.8",
+     "wasi:sockets/instance-network@0.2.8",
+     "wasi:sockets/ip-name-lookup@0.2.8",
+     "wasi:sockets/network@0.2.8",
+     "wasi:sockets/tcp-create-socket@0.2.8",
+     "wasi:sockets/tcp@0.2.8",
+     "wasi:sockets/udp-create-socket@0.2.8",
+     "wasi:sockets/udp@0.2.8"
+    ],
+    "bound": [
+     "wasi:cli/environment@0.2.8",
+     "wasi:cli/exit@0.2.8",
+     "wasi:cli/stderr@0.2.8",
+     "wasi:cli/stdin@0.2.8",
+     "wasi:cli/stdout@0.2.8",
+     "wasi:cli/terminal-input@0.2.8",
+     "wasi:cli/terminal-output@0.2.8",
+     "wasi:cli/terminal-stderr@0.2.8",
+     "wasi:cli/terminal-stdin@0.2.8",
+     "wasi:cli/terminal-stdout@0.2.8",
+     "wasi:clocks/monotonic-clock@0.2.8",
+     "wasi:clocks/wall-clock@0.2.8",
+     "wasi:filesystem/preopens@0.2.8",
+     "wasi:filesystem/types@0.2.8",
+     "wasi:io/error@0.2.8",
+     "wasi:io/poll@0.2.8",
+     "wasi:io/streams@0.2.8",
+     "wasi:random/insecure-seed@0.2.8",
+     "wasi:random/insecure@0.2.8",
+     "wasi:random/random@0.2.8",
+     "wasi:sockets/instance-network@0.2.8",
+     "wasi:sockets/ip-name-lookup@0.2.8",
+     "wasi:sockets/network@0.2.8",
+     "wasi:sockets/tcp-create-socket@0.2.8",
+     "wasi:sockets/tcp@0.2.8",
+     "wasi:sockets/udp-create-socket@0.2.8",
+     "wasi:sockets/udp@0.2.8"
+    ],
+    "unbound_stable": [
+     "wasi:cli/run@0.2.8",
+     "wasi:http/incoming-handler@0.2.8",
+     "wasi:http/outgoing-handler@0.2.8",
+     "wasi:http/types@0.2.8"
+    ],
+    "missing": [],
+    "excluded": [
+     "wasi:http/incoming-handler@0.2.8",
+     "wasi:http/outgoing-handler@0.2.8",
+     "wasi:http/types@0.2.8"
+    ],
+    "unstable": [
+     "wasi:clocks/timezone@0.2.8"
+    ],
+    "export_only": [
+     "wasi:cli/run@0.2.8"
+    ],
+    "interfaces": [
+     {
+      "interface": "wasi:cli/environment@0.2.8",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/exit@0.2.8",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/run@0.2.8",
+      "status": "export_only",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/stderr@0.2.8",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/stdin@0.2.8",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/stdout@0.2.8",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/terminal-input@0.2.8",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/terminal-output@0.2.8",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/terminal-stderr@0.2.8",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/terminal-stdin@0.2.8",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/terminal-stdout@0.2.8",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:clocks/monotonic-clock@0.2.8",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:clocks/timezone@0.2.8",
+      "status": "unstable",
+      "stability": "unstable"
+     },
+     {
+      "interface": "wasi:clocks/wall-clock@0.2.8",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:filesystem/preopens@0.2.8",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:filesystem/types@0.2.8",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:http/incoming-handler@0.2.8",
+      "status": "excluded",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:http/outgoing-handler@0.2.8",
+      "status": "excluded",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:http/types@0.2.8",
+      "status": "excluded",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:io/error@0.2.8",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:io/poll@0.2.8",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:io/streams@0.2.8",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:random/insecure-seed@0.2.8",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:random/insecure@0.2.8",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:random/random@0.2.8",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/instance-network@0.2.8",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/ip-name-lookup@0.2.8",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/network@0.2.8",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/tcp-create-socket@0.2.8",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/tcp@0.2.8",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/udp-create-socket@0.2.8",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/udp@0.2.8",
+      "status": "bound",
+      "stability": "stable"
+     }
+    ]
+   },
+   {
+    "version": "0.2.9",
+    "pinned_interfaces": [
+     "wasi:cli/environment@0.2.9",
+     "wasi:cli/exit@0.2.9",
+     "wasi:cli/run@0.2.9",
+     "wasi:cli/stderr@0.2.9",
+     "wasi:cli/stdin@0.2.9",
+     "wasi:cli/stdout@0.2.9",
+     "wasi:cli/terminal-input@0.2.9",
+     "wasi:cli/terminal-output@0.2.9",
+     "wasi:cli/terminal-stderr@0.2.9",
+     "wasi:cli/terminal-stdin@0.2.9",
+     "wasi:cli/terminal-stdout@0.2.9",
+     "wasi:clocks/monotonic-clock@0.2.9",
+     "wasi:clocks/timezone@0.2.9",
+     "wasi:clocks/wall-clock@0.2.9",
+     "wasi:filesystem/preopens@0.2.9",
+     "wasi:filesystem/types@0.2.9",
+     "wasi:http/incoming-handler@0.2.9",
+     "wasi:http/outgoing-handler@0.2.9",
+     "wasi:http/types@0.2.9",
+     "wasi:io/error@0.2.9",
+     "wasi:io/poll@0.2.9",
+     "wasi:io/streams@0.2.9",
+     "wasi:random/insecure-seed@0.2.9",
+     "wasi:random/insecure@0.2.9",
+     "wasi:random/random@0.2.9",
+     "wasi:sockets/instance-network@0.2.9",
+     "wasi:sockets/ip-name-lookup@0.2.9",
+     "wasi:sockets/network@0.2.9",
+     "wasi:sockets/tcp-create-socket@0.2.9",
+     "wasi:sockets/tcp@0.2.9",
+     "wasi:sockets/udp-create-socket@0.2.9",
+     "wasi:sockets/udp@0.2.9"
+    ],
+    "pinned_stable": [
+     "wasi:cli/environment@0.2.9",
+     "wasi:cli/exit@0.2.9",
+     "wasi:cli/run@0.2.9",
+     "wasi:cli/stderr@0.2.9",
+     "wasi:cli/stdin@0.2.9",
+     "wasi:cli/stdout@0.2.9",
+     "wasi:cli/terminal-input@0.2.9",
+     "wasi:cli/terminal-output@0.2.9",
+     "wasi:cli/terminal-stderr@0.2.9",
+     "wasi:cli/terminal-stdin@0.2.9",
+     "wasi:cli/terminal-stdout@0.2.9",
+     "wasi:clocks/monotonic-clock@0.2.9",
+     "wasi:clocks/wall-clock@0.2.9",
+     "wasi:filesystem/preopens@0.2.9",
+     "wasi:filesystem/types@0.2.9",
+     "wasi:http/incoming-handler@0.2.9",
+     "wasi:http/outgoing-handler@0.2.9",
+     "wasi:http/types@0.2.9",
+     "wasi:io/error@0.2.9",
+     "wasi:io/poll@0.2.9",
+     "wasi:io/streams@0.2.9",
+     "wasi:random/insecure-seed@0.2.9",
+     "wasi:random/insecure@0.2.9",
+     "wasi:random/random@0.2.9",
+     "wasi:sockets/instance-network@0.2.9",
+     "wasi:sockets/ip-name-lookup@0.2.9",
+     "wasi:sockets/network@0.2.9",
+     "wasi:sockets/tcp-create-socket@0.2.9",
+     "wasi:sockets/tcp@0.2.9",
+     "wasi:sockets/udp-create-socket@0.2.9",
+     "wasi:sockets/udp@0.2.9"
+    ],
+    "bound": [
+     "wasi:cli/environment@0.2.9",
+     "wasi:cli/exit@0.2.9",
+     "wasi:cli/stderr@0.2.9",
+     "wasi:cli/stdin@0.2.9",
+     "wasi:cli/stdout@0.2.9",
+     "wasi:cli/terminal-input@0.2.9",
+     "wasi:cli/terminal-output@0.2.9",
+     "wasi:cli/terminal-stderr@0.2.9",
+     "wasi:cli/terminal-stdin@0.2.9",
+     "wasi:cli/terminal-stdout@0.2.9",
+     "wasi:clocks/monotonic-clock@0.2.9",
+     "wasi:clocks/wall-clock@0.2.9",
+     "wasi:filesystem/preopens@0.2.9",
+     "wasi:filesystem/types@0.2.9",
+     "wasi:io/error@0.2.9",
+     "wasi:io/poll@0.2.9",
+     "wasi:io/streams@0.2.9",
+     "wasi:random/insecure-seed@0.2.9",
+     "wasi:random/insecure@0.2.9",
+     "wasi:random/random@0.2.9",
+     "wasi:sockets/instance-network@0.2.9",
+     "wasi:sockets/ip-name-lookup@0.2.9",
+     "wasi:sockets/network@0.2.9",
+     "wasi:sockets/tcp-create-socket@0.2.9",
+     "wasi:sockets/tcp@0.2.9",
+     "wasi:sockets/udp-create-socket@0.2.9",
+     "wasi:sockets/udp@0.2.9"
+    ],
+    "unbound_stable": [
+     "wasi:cli/run@0.2.9",
+     "wasi:http/incoming-handler@0.2.9",
+     "wasi:http/outgoing-handler@0.2.9",
+     "wasi:http/types@0.2.9"
+    ],
+    "missing": [],
+    "excluded": [
+     "wasi:http/incoming-handler@0.2.9",
+     "wasi:http/outgoing-handler@0.2.9",
+     "wasi:http/types@0.2.9"
+    ],
+    "unstable": [
+     "wasi:clocks/timezone@0.2.9"
+    ],
+    "export_only": [
+     "wasi:cli/run@0.2.9"
+    ],
+    "interfaces": [
+     {
+      "interface": "wasi:cli/environment@0.2.9",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/exit@0.2.9",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/run@0.2.9",
+      "status": "export_only",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/stderr@0.2.9",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/stdin@0.2.9",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/stdout@0.2.9",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/terminal-input@0.2.9",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/terminal-output@0.2.9",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/terminal-stderr@0.2.9",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/terminal-stdin@0.2.9",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/terminal-stdout@0.2.9",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:clocks/monotonic-clock@0.2.9",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:clocks/timezone@0.2.9",
+      "status": "unstable",
+      "stability": "unstable"
+     },
+     {
+      "interface": "wasi:clocks/wall-clock@0.2.9",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:filesystem/preopens@0.2.9",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:filesystem/types@0.2.9",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:http/incoming-handler@0.2.9",
+      "status": "excluded",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:http/outgoing-handler@0.2.9",
+      "status": "excluded",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:http/types@0.2.9",
+      "status": "excluded",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:io/error@0.2.9",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:io/poll@0.2.9",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:io/streams@0.2.9",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:random/insecure-seed@0.2.9",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:random/insecure@0.2.9",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:random/random@0.2.9",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/instance-network@0.2.9",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/ip-name-lookup@0.2.9",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/network@0.2.9",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/tcp-create-socket@0.2.9",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/tcp@0.2.9",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/udp-create-socket@0.2.9",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/udp@0.2.9",
+      "status": "bound",
+      "stability": "stable"
+     }
+    ]
+   },
+   {
+    "version": "0.2.10",
+    "pinned_interfaces": [
+     "wasi:cli/environment@0.2.10",
+     "wasi:cli/exit@0.2.10",
+     "wasi:cli/run@0.2.10",
+     "wasi:cli/stderr@0.2.10",
+     "wasi:cli/stdin@0.2.10",
+     "wasi:cli/stdout@0.2.10",
+     "wasi:cli/terminal-input@0.2.10",
+     "wasi:cli/terminal-output@0.2.10",
+     "wasi:cli/terminal-stderr@0.2.10",
+     "wasi:cli/terminal-stdin@0.2.10",
+     "wasi:cli/terminal-stdout@0.2.10",
+     "wasi:clocks/monotonic-clock@0.2.10",
+     "wasi:clocks/timezone@0.2.10",
+     "wasi:clocks/wall-clock@0.2.10",
+     "wasi:filesystem/preopens@0.2.10",
+     "wasi:filesystem/types@0.2.10",
+     "wasi:http/incoming-handler@0.2.10",
+     "wasi:http/outgoing-handler@0.2.10",
+     "wasi:http/types@0.2.10",
+     "wasi:io/error@0.2.10",
+     "wasi:io/poll@0.2.10",
+     "wasi:io/streams@0.2.10",
+     "wasi:random/insecure-seed@0.2.10",
+     "wasi:random/insecure@0.2.10",
+     "wasi:random/random@0.2.10",
+     "wasi:sockets/instance-network@0.2.10",
+     "wasi:sockets/ip-name-lookup@0.2.10",
+     "wasi:sockets/network@0.2.10",
+     "wasi:sockets/tcp-create-socket@0.2.10",
+     "wasi:sockets/tcp@0.2.10",
+     "wasi:sockets/udp-create-socket@0.2.10",
+     "wasi:sockets/udp@0.2.10"
+    ],
+    "pinned_stable": [
+     "wasi:cli/environment@0.2.10",
+     "wasi:cli/exit@0.2.10",
+     "wasi:cli/run@0.2.10",
+     "wasi:cli/stderr@0.2.10",
+     "wasi:cli/stdin@0.2.10",
+     "wasi:cli/stdout@0.2.10",
+     "wasi:cli/terminal-input@0.2.10",
+     "wasi:cli/terminal-output@0.2.10",
+     "wasi:cli/terminal-stderr@0.2.10",
+     "wasi:cli/terminal-stdin@0.2.10",
+     "wasi:cli/terminal-stdout@0.2.10",
+     "wasi:clocks/monotonic-clock@0.2.10",
+     "wasi:clocks/wall-clock@0.2.10",
+     "wasi:filesystem/preopens@0.2.10",
+     "wasi:filesystem/types@0.2.10",
+     "wasi:http/incoming-handler@0.2.10",
+     "wasi:http/outgoing-handler@0.2.10",
+     "wasi:http/types@0.2.10",
+     "wasi:io/error@0.2.10",
+     "wasi:io/poll@0.2.10",
+     "wasi:io/streams@0.2.10",
+     "wasi:random/insecure-seed@0.2.10",
+     "wasi:random/insecure@0.2.10",
+     "wasi:random/random@0.2.10",
+     "wasi:sockets/instance-network@0.2.10",
+     "wasi:sockets/ip-name-lookup@0.2.10",
+     "wasi:sockets/network@0.2.10",
+     "wasi:sockets/tcp-create-socket@0.2.10",
+     "wasi:sockets/tcp@0.2.10",
+     "wasi:sockets/udp-create-socket@0.2.10",
+     "wasi:sockets/udp@0.2.10"
+    ],
+    "bound": [
+     "wasi:cli/environment@0.2.10",
+     "wasi:cli/exit@0.2.10",
+     "wasi:cli/stderr@0.2.10",
+     "wasi:cli/stdin@0.2.10",
+     "wasi:cli/stdout@0.2.10",
+     "wasi:cli/terminal-input@0.2.10",
+     "wasi:cli/terminal-output@0.2.10",
+     "wasi:cli/terminal-stderr@0.2.10",
+     "wasi:cli/terminal-stdin@0.2.10",
+     "wasi:cli/terminal-stdout@0.2.10",
+     "wasi:clocks/monotonic-clock@0.2.10",
+     "wasi:clocks/wall-clock@0.2.10",
+     "wasi:filesystem/preopens@0.2.10",
+     "wasi:filesystem/types@0.2.10",
+     "wasi:io/error@0.2.10",
+     "wasi:io/poll@0.2.10",
+     "wasi:io/streams@0.2.10",
+     "wasi:random/insecure-seed@0.2.10",
+     "wasi:random/insecure@0.2.10",
+     "wasi:random/random@0.2.10",
+     "wasi:sockets/instance-network@0.2.10",
+     "wasi:sockets/ip-name-lookup@0.2.10",
+     "wasi:sockets/network@0.2.10",
+     "wasi:sockets/tcp-create-socket@0.2.10",
+     "wasi:sockets/tcp@0.2.10",
+     "wasi:sockets/udp-create-socket@0.2.10",
+     "wasi:sockets/udp@0.2.10"
+    ],
+    "unbound_stable": [
+     "wasi:cli/run@0.2.10",
+     "wasi:http/incoming-handler@0.2.10",
+     "wasi:http/outgoing-handler@0.2.10",
+     "wasi:http/types@0.2.10"
+    ],
+    "missing": [],
+    "excluded": [
+     "wasi:http/incoming-handler@0.2.10",
+     "wasi:http/outgoing-handler@0.2.10",
+     "wasi:http/types@0.2.10"
+    ],
+    "unstable": [
+     "wasi:clocks/timezone@0.2.10"
+    ],
+    "export_only": [
+     "wasi:cli/run@0.2.10"
+    ],
+    "interfaces": [
+     {
+      "interface": "wasi:cli/environment@0.2.10",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/exit@0.2.10",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/run@0.2.10",
+      "status": "export_only",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/stderr@0.2.10",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/stdin@0.2.10",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/stdout@0.2.10",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/terminal-input@0.2.10",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/terminal-output@0.2.10",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/terminal-stderr@0.2.10",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/terminal-stdin@0.2.10",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/terminal-stdout@0.2.10",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:clocks/monotonic-clock@0.2.10",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:clocks/timezone@0.2.10",
+      "status": "unstable",
+      "stability": "unstable"
+     },
+     {
+      "interface": "wasi:clocks/wall-clock@0.2.10",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:filesystem/preopens@0.2.10",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:filesystem/types@0.2.10",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:http/incoming-handler@0.2.10",
+      "status": "excluded",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:http/outgoing-handler@0.2.10",
+      "status": "excluded",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:http/types@0.2.10",
+      "status": "excluded",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:io/error@0.2.10",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:io/poll@0.2.10",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:io/streams@0.2.10",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:random/insecure-seed@0.2.10",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:random/insecure@0.2.10",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:random/random@0.2.10",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/instance-network@0.2.10",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/ip-name-lookup@0.2.10",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/network@0.2.10",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/tcp-create-socket@0.2.10",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/tcp@0.2.10",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/udp-create-socket@0.2.10",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/udp@0.2.10",
+      "status": "bound",
+      "stability": "stable"
+     }
+    ]
+   },
+   {
+    "version": "0.2.11",
+    "pinned_interfaces": [
+     "wasi:cli/environment@0.2.11",
+     "wasi:cli/exit@0.2.11",
+     "wasi:cli/run@0.2.11",
+     "wasi:cli/stderr@0.2.11",
+     "wasi:cli/stdin@0.2.11",
+     "wasi:cli/stdout@0.2.11",
+     "wasi:cli/terminal-input@0.2.11",
+     "wasi:cli/terminal-output@0.2.11",
+     "wasi:cli/terminal-stderr@0.2.11",
+     "wasi:cli/terminal-stdin@0.2.11",
+     "wasi:cli/terminal-stdout@0.2.11",
+     "wasi:clocks/monotonic-clock@0.2.11",
+     "wasi:clocks/timezone@0.2.11",
+     "wasi:clocks/wall-clock@0.2.11",
+     "wasi:filesystem/preopens@0.2.11",
+     "wasi:filesystem/types@0.2.11",
+     "wasi:http/incoming-handler@0.2.11",
+     "wasi:http/outgoing-handler@0.2.11",
+     "wasi:http/types@0.2.11",
+     "wasi:io/error@0.2.11",
+     "wasi:io/poll@0.2.11",
+     "wasi:io/streams@0.2.11",
+     "wasi:random/insecure-seed@0.2.11",
+     "wasi:random/insecure@0.2.11",
+     "wasi:random/random@0.2.11",
+     "wasi:sockets/instance-network@0.2.11",
+     "wasi:sockets/ip-name-lookup@0.2.11",
+     "wasi:sockets/network@0.2.11",
+     "wasi:sockets/tcp-create-socket@0.2.11",
+     "wasi:sockets/tcp@0.2.11",
+     "wasi:sockets/udp-create-socket@0.2.11",
+     "wasi:sockets/udp@0.2.11"
+    ],
+    "pinned_stable": [
+     "wasi:cli/environment@0.2.11",
+     "wasi:cli/exit@0.2.11",
+     "wasi:cli/run@0.2.11",
+     "wasi:cli/stderr@0.2.11",
+     "wasi:cli/stdin@0.2.11",
+     "wasi:cli/stdout@0.2.11",
+     "wasi:cli/terminal-input@0.2.11",
+     "wasi:cli/terminal-output@0.2.11",
+     "wasi:cli/terminal-stderr@0.2.11",
+     "wasi:cli/terminal-stdin@0.2.11",
+     "wasi:cli/terminal-stdout@0.2.11",
+     "wasi:clocks/monotonic-clock@0.2.11",
+     "wasi:clocks/wall-clock@0.2.11",
+     "wasi:filesystem/preopens@0.2.11",
+     "wasi:filesystem/types@0.2.11",
+     "wasi:http/incoming-handler@0.2.11",
+     "wasi:http/outgoing-handler@0.2.11",
+     "wasi:http/types@0.2.11",
+     "wasi:io/error@0.2.11",
+     "wasi:io/poll@0.2.11",
+     "wasi:io/streams@0.2.11",
+     "wasi:random/insecure-seed@0.2.11",
+     "wasi:random/insecure@0.2.11",
+     "wasi:random/random@0.2.11",
+     "wasi:sockets/instance-network@0.2.11",
+     "wasi:sockets/ip-name-lookup@0.2.11",
+     "wasi:sockets/network@0.2.11",
+     "wasi:sockets/tcp-create-socket@0.2.11",
+     "wasi:sockets/tcp@0.2.11",
+     "wasi:sockets/udp-create-socket@0.2.11",
+     "wasi:sockets/udp@0.2.11"
+    ],
+    "bound": [
+     "wasi:cli/environment@0.2.11",
+     "wasi:cli/exit@0.2.11",
+     "wasi:cli/stderr@0.2.11",
+     "wasi:cli/stdin@0.2.11",
+     "wasi:cli/stdout@0.2.11",
+     "wasi:cli/terminal-input@0.2.11",
+     "wasi:cli/terminal-output@0.2.11",
+     "wasi:cli/terminal-stderr@0.2.11",
+     "wasi:cli/terminal-stdin@0.2.11",
+     "wasi:cli/terminal-stdout@0.2.11",
+     "wasi:clocks/monotonic-clock@0.2.11",
+     "wasi:clocks/wall-clock@0.2.11",
+     "wasi:filesystem/preopens@0.2.11",
+     "wasi:filesystem/types@0.2.11",
+     "wasi:io/error@0.2.11",
+     "wasi:io/poll@0.2.11",
+     "wasi:io/streams@0.2.11",
+     "wasi:random/insecure-seed@0.2.11",
+     "wasi:random/insecure@0.2.11",
+     "wasi:random/random@0.2.11",
+     "wasi:sockets/instance-network@0.2.11",
+     "wasi:sockets/ip-name-lookup@0.2.11",
+     "wasi:sockets/network@0.2.11",
+     "wasi:sockets/tcp-create-socket@0.2.11",
+     "wasi:sockets/tcp@0.2.11",
+     "wasi:sockets/udp-create-socket@0.2.11",
+     "wasi:sockets/udp@0.2.11"
+    ],
+    "unbound_stable": [
+     "wasi:cli/run@0.2.11",
+     "wasi:http/incoming-handler@0.2.11",
+     "wasi:http/outgoing-handler@0.2.11",
+     "wasi:http/types@0.2.11"
+    ],
+    "missing": [],
+    "excluded": [
+     "wasi:http/incoming-handler@0.2.11",
+     "wasi:http/outgoing-handler@0.2.11",
+     "wasi:http/types@0.2.11"
+    ],
+    "unstable": [
+     "wasi:clocks/timezone@0.2.11"
+    ],
+    "export_only": [
+     "wasi:cli/run@0.2.11"
+    ],
+    "interfaces": [
+     {
+      "interface": "wasi:cli/environment@0.2.11",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/exit@0.2.11",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/run@0.2.11",
+      "status": "export_only",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/stderr@0.2.11",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/stdin@0.2.11",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/stdout@0.2.11",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/terminal-input@0.2.11",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/terminal-output@0.2.11",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/terminal-stderr@0.2.11",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/terminal-stdin@0.2.11",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/terminal-stdout@0.2.11",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:clocks/monotonic-clock@0.2.11",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:clocks/timezone@0.2.11",
+      "status": "unstable",
+      "stability": "unstable"
+     },
+     {
+      "interface": "wasi:clocks/wall-clock@0.2.11",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:filesystem/preopens@0.2.11",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:filesystem/types@0.2.11",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:http/incoming-handler@0.2.11",
+      "status": "excluded",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:http/outgoing-handler@0.2.11",
+      "status": "excluded",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:http/types@0.2.11",
+      "status": "excluded",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:io/error@0.2.11",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:io/poll@0.2.11",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:io/streams@0.2.11",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:random/insecure-seed@0.2.11",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:random/insecure@0.2.11",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:random/random@0.2.11",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/instance-network@0.2.11",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/ip-name-lookup@0.2.11",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/network@0.2.11",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/tcp-create-socket@0.2.11",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/tcp@0.2.11",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/udp-create-socket@0.2.11",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/udp@0.2.11",
+      "status": "bound",
+      "stability": "stable"
+     }
+    ]
+   },
+   {
+    "version": "0.2.12",
+    "pinned_interfaces": [
+     "wasi:cli/environment@0.2.12",
+     "wasi:cli/exit@0.2.12",
+     "wasi:cli/run@0.2.12",
+     "wasi:cli/stderr@0.2.12",
+     "wasi:cli/stdin@0.2.12",
+     "wasi:cli/stdout@0.2.12",
+     "wasi:cli/terminal-input@0.2.12",
+     "wasi:cli/terminal-output@0.2.12",
+     "wasi:cli/terminal-stderr@0.2.12",
+     "wasi:cli/terminal-stdin@0.2.12",
+     "wasi:cli/terminal-stdout@0.2.12",
+     "wasi:clocks/monotonic-clock@0.2.12",
+     "wasi:clocks/timezone@0.2.12",
+     "wasi:clocks/wall-clock@0.2.12",
+     "wasi:filesystem/preopens@0.2.12",
+     "wasi:filesystem/types@0.2.12",
+     "wasi:http/incoming-handler@0.2.12",
+     "wasi:http/outgoing-handler@0.2.12",
+     "wasi:http/types@0.2.12",
+     "wasi:io/error@0.2.12",
+     "wasi:io/poll@0.2.12",
+     "wasi:io/streams@0.2.12",
+     "wasi:random/insecure-seed@0.2.12",
+     "wasi:random/insecure@0.2.12",
+     "wasi:random/random@0.2.12",
+     "wasi:sockets/instance-network@0.2.12",
+     "wasi:sockets/ip-name-lookup@0.2.12",
+     "wasi:sockets/network@0.2.12",
+     "wasi:sockets/tcp-create-socket@0.2.12",
+     "wasi:sockets/tcp@0.2.12",
+     "wasi:sockets/udp-create-socket@0.2.12",
+     "wasi:sockets/udp@0.2.12"
+    ],
+    "pinned_stable": [
+     "wasi:cli/environment@0.2.12",
+     "wasi:cli/exit@0.2.12",
+     "wasi:cli/run@0.2.12",
+     "wasi:cli/stderr@0.2.12",
+     "wasi:cli/stdin@0.2.12",
+     "wasi:cli/stdout@0.2.12",
+     "wasi:cli/terminal-input@0.2.12",
+     "wasi:cli/terminal-output@0.2.12",
+     "wasi:cli/terminal-stderr@0.2.12",
+     "wasi:cli/terminal-stdin@0.2.12",
+     "wasi:cli/terminal-stdout@0.2.12",
+     "wasi:clocks/monotonic-clock@0.2.12",
+     "wasi:clocks/wall-clock@0.2.12",
+     "wasi:filesystem/preopens@0.2.12",
+     "wasi:filesystem/types@0.2.12",
+     "wasi:http/incoming-handler@0.2.12",
+     "wasi:http/outgoing-handler@0.2.12",
+     "wasi:http/types@0.2.12",
+     "wasi:io/error@0.2.12",
+     "wasi:io/poll@0.2.12",
+     "wasi:io/streams@0.2.12",
+     "wasi:random/insecure-seed@0.2.12",
+     "wasi:random/insecure@0.2.12",
+     "wasi:random/random@0.2.12",
+     "wasi:sockets/instance-network@0.2.12",
+     "wasi:sockets/ip-name-lookup@0.2.12",
+     "wasi:sockets/network@0.2.12",
+     "wasi:sockets/tcp-create-socket@0.2.12",
+     "wasi:sockets/tcp@0.2.12",
+     "wasi:sockets/udp-create-socket@0.2.12",
+     "wasi:sockets/udp@0.2.12"
+    ],
+    "bound": [
+     "wasi:cli/environment@0.2.12",
+     "wasi:cli/exit@0.2.12",
+     "wasi:cli/stderr@0.2.12",
+     "wasi:cli/stdin@0.2.12",
+     "wasi:cli/stdout@0.2.12",
+     "wasi:cli/terminal-input@0.2.12",
+     "wasi:cli/terminal-output@0.2.12",
+     "wasi:cli/terminal-stderr@0.2.12",
+     "wasi:cli/terminal-stdin@0.2.12",
+     "wasi:cli/terminal-stdout@0.2.12",
+     "wasi:clocks/monotonic-clock@0.2.12",
+     "wasi:clocks/wall-clock@0.2.12",
+     "wasi:filesystem/preopens@0.2.12",
+     "wasi:filesystem/types@0.2.12",
+     "wasi:io/error@0.2.12",
+     "wasi:io/poll@0.2.12",
+     "wasi:io/streams@0.2.12",
+     "wasi:random/insecure-seed@0.2.12",
+     "wasi:random/insecure@0.2.12",
+     "wasi:random/random@0.2.12",
+     "wasi:sockets/instance-network@0.2.12",
+     "wasi:sockets/ip-name-lookup@0.2.12",
+     "wasi:sockets/network@0.2.12",
+     "wasi:sockets/tcp-create-socket@0.2.12",
+     "wasi:sockets/tcp@0.2.12",
+     "wasi:sockets/udp-create-socket@0.2.12",
+     "wasi:sockets/udp@0.2.12"
+    ],
+    "unbound_stable": [
+     "wasi:cli/run@0.2.12",
+     "wasi:http/incoming-handler@0.2.12",
+     "wasi:http/outgoing-handler@0.2.12",
+     "wasi:http/types@0.2.12"
+    ],
+    "missing": [],
+    "excluded": [
+     "wasi:http/incoming-handler@0.2.12",
+     "wasi:http/outgoing-handler@0.2.12",
+     "wasi:http/types@0.2.12"
+    ],
+    "unstable": [
+     "wasi:clocks/timezone@0.2.12"
+    ],
+    "export_only": [
+     "wasi:cli/run@0.2.12"
+    ],
+    "interfaces": [
+     {
+      "interface": "wasi:cli/environment@0.2.12",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/exit@0.2.12",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/run@0.2.12",
+      "status": "export_only",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/stderr@0.2.12",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/stdin@0.2.12",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/stdout@0.2.12",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/terminal-input@0.2.12",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/terminal-output@0.2.12",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/terminal-stderr@0.2.12",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/terminal-stdin@0.2.12",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:cli/terminal-stdout@0.2.12",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:clocks/monotonic-clock@0.2.12",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:clocks/timezone@0.2.12",
+      "status": "unstable",
+      "stability": "unstable"
+     },
+     {
+      "interface": "wasi:clocks/wall-clock@0.2.12",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:filesystem/preopens@0.2.12",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:filesystem/types@0.2.12",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:http/incoming-handler@0.2.12",
+      "status": "excluded",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:http/outgoing-handler@0.2.12",
+      "status": "excluded",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:http/types@0.2.12",
+      "status": "excluded",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:io/error@0.2.12",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:io/poll@0.2.12",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:io/streams@0.2.12",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:random/insecure-seed@0.2.12",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:random/insecure@0.2.12",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:random/random@0.2.12",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/instance-network@0.2.12",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/ip-name-lookup@0.2.12",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/network@0.2.12",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/tcp-create-socket@0.2.12",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/tcp@0.2.12",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/udp-create-socket@0.2.12",
+      "status": "bound",
+      "stability": "stable"
+     },
+     {
+      "interface": "wasi:sockets/udp@0.2.12",
+      "status": "bound",
+      "stability": "stable"
+     }
+    ]
+   }
+  ]
+ },
+ "P3": [
+  {
+   "package": "wasi:clocks",
+   "version": "0.3.2",
+   "interfaces": [
+    "wasi:clocks/monotonic-clock@0.3.2",
+    "wasi:clocks/system-clock@0.3.2",
+    "wasi:clocks/timezone@0.3.2",
+    "wasi:clocks/types@0.3.2"
+   ],
+   "provided": [
+    "wasi:clocks/monotonic-clock@0.3.2",
+    "wasi:clocks/system-clock@0.3.2",
+    "wasi:clocks/types@0.3.2"
+   ],
+   "missing": [],
+   "excluded": [
+    "wasi:clocks/timezone@0.3.2"
+   ],
+   "export_only": [],
+   "types_only": [],
+   "rows": [
+    {
+     "interface": "wasi:clocks/monotonic-clock@0.3.2",
+     "status": "bound",
+     "stability": "stable",
+     "surface": "has-surface"
+    },
+    {
+     "interface": "wasi:clocks/system-clock@0.3.2",
+     "status": "bound",
+     "stability": "stable",
+     "surface": "has-surface"
+    },
+    {
+     "interface": "wasi:clocks/timezone@0.3.2",
+     "status": "unstable",
+     "stability": "unstable",
+     "surface": "has-surface"
+    },
+    {
+     "interface": "wasi:clocks/types@0.3.2",
+     "status": "bound",
+     "stability": "stable",
+     "surface": "types-only"
+    }
+   ]
+  },
+  {
+   "package": "wasi:random",
+   "version": "0.3.2",
+   "interfaces": [
+    "wasi:random/insecure-seed@0.3.2",
+    "wasi:random/insecure@0.3.2",
+    "wasi:random/random@0.3.2"
+   ],
+   "provided": [
+    "wasi:random/insecure-seed@0.3.2",
+    "wasi:random/insecure@0.3.2",
+    "wasi:random/random@0.3.2"
+   ],
+   "missing": [],
+   "excluded": [],
+   "export_only": [],
+   "types_only": [],
+   "rows": [
+    {
+     "interface": "wasi:random/insecure-seed@0.3.2",
+     "status": "bound",
+     "stability": "stable",
+     "surface": "has-surface"
+    },
+    {
+     "interface": "wasi:random/insecure@0.3.2",
+     "status": "bound",
+     "stability": "stable",
+     "surface": "has-surface"
+    },
+    {
+     "interface": "wasi:random/random@0.3.2",
+     "status": "bound",
+     "stability": "stable",
+     "surface": "has-surface"
+    }
+   ]
+  },
+  {
+   "package": "wasi:cli",
+   "version": "0.3.2",
+   "interfaces": [
+    "wasi:cli/environment@0.3.2",
+    "wasi:cli/exit@0.3.2",
+    "wasi:cli/run@0.3.2",
+    "wasi:cli/stderr@0.3.2",
+    "wasi:cli/stdin@0.3.2",
+    "wasi:cli/stdout@0.3.2",
+    "wasi:cli/terminal-input@0.3.2",
+    "wasi:cli/terminal-output@0.3.2",
+    "wasi:cli/terminal-stderr@0.3.2",
+    "wasi:cli/terminal-stdin@0.3.2",
+    "wasi:cli/terminal-stdout@0.3.2",
+    "wasi:cli/types@0.3.2"
+   ],
+   "provided": [
+    "wasi:cli/environment@0.3.2",
+    "wasi:cli/exit@0.3.2",
+    "wasi:cli/stderr@0.3.2",
+    "wasi:cli/stdin@0.3.2",
+    "wasi:cli/stdout@0.3.2",
+    "wasi:cli/terminal-input@0.3.2",
+    "wasi:cli/terminal-output@0.3.2",
+    "wasi:cli/terminal-stderr@0.3.2",
+    "wasi:cli/terminal-stdin@0.3.2",
+    "wasi:cli/terminal-stdout@0.3.2"
+   ],
+   "missing": [],
+   "excluded": [],
+   "export_only": [
+    "wasi:cli/run@0.3.2"
+   ],
+   "types_only": [
+    "wasi:cli/types@0.3.2"
+   ],
+   "rows": [
+    {
+     "interface": "wasi:cli/environment@0.3.2",
+     "status": "bound",
+     "stability": "stable",
+     "surface": "has-surface"
+    },
+    {
+     "interface": "wasi:cli/exit@0.3.2",
+     "status": "bound",
+     "stability": "stable",
+     "surface": "has-surface"
+    },
+    {
+     "interface": "wasi:cli/run@0.3.2",
+     "status": "export_only",
+     "stability": "stable",
+     "surface": "has-surface"
+    },
+    {
+     "interface": "wasi:cli/stderr@0.3.2",
+     "status": "bound",
+     "stability": "stable",
+     "surface": "has-surface"
+    },
+    {
+     "interface": "wasi:cli/stdin@0.3.2",
+     "status": "bound",
+     "stability": "stable",
+     "surface": "has-surface"
+    },
+    {
+     "interface": "wasi:cli/stdout@0.3.2",
+     "status": "bound",
+     "stability": "stable",
+     "surface": "has-surface"
+    },
+    {
+     "interface": "wasi:cli/terminal-input@0.3.2",
+     "status": "bound",
+     "stability": "stable",
+     "surface": "has-surface"
+    },
+    {
+     "interface": "wasi:cli/terminal-output@0.3.2",
+     "status": "bound",
+     "stability": "stable",
+     "surface": "has-surface"
+    },
+    {
+     "interface": "wasi:cli/terminal-stderr@0.3.2",
+     "status": "bound",
+     "stability": "stable",
+     "surface": "has-surface"
+    },
+    {
+     "interface": "wasi:cli/terminal-stdin@0.3.2",
+     "status": "bound",
+     "stability": "stable",
+     "surface": "has-surface"
+    },
+    {
+     "interface": "wasi:cli/terminal-stdout@0.3.2",
+     "status": "bound",
+     "stability": "stable",
+     "surface": "has-surface"
+    },
+    {
+     "interface": "wasi:cli/types@0.3.2",
+     "status": "types_only",
+     "stability": "stable",
+     "surface": "types-only"
+    }
+   ]
+  },
+  {
+   "package": "wasi:filesystem",
+   "version": "0.3.2",
+   "interfaces": [
+    "wasi:filesystem/preopens@0.3.2",
+    "wasi:filesystem/types@0.3.2"
+   ],
+   "provided": [
+    "wasi:filesystem/preopens@0.3.2",
+    "wasi:filesystem/types@0.3.2"
+   ],
+   "missing": [],
+   "excluded": [],
+   "export_only": [],
+   "types_only": [],
+   "rows": [
+    {
+     "interface": "wasi:filesystem/preopens@0.3.2",
+     "status": "bound",
+     "stability": "stable",
+     "surface": "has-surface"
+    },
+    {
+     "interface": "wasi:filesystem/types@0.3.2",
+     "status": "bound",
+     "stability": "stable",
+     "surface": "has-surface"
+    }
+   ]
+  },
+  {
+   "package": "wasi:sockets",
+   "version": "0.3.2",
+   "interfaces": [
+    "wasi:sockets/ip-name-lookup@0.3.2",
+    "wasi:sockets/types@0.3.2"
+   ],
+   "provided": [
+    "wasi:sockets/ip-name-lookup@0.3.2",
+    "wasi:sockets/types@0.3.2"
+   ],
+   "missing": [],
+   "excluded": [],
+   "export_only": [],
+   "types_only": [],
+   "rows": [
+    {
+     "interface": "wasi:sockets/ip-name-lookup@0.3.2",
+     "status": "bound",
+     "stability": "stable",
+     "surface": "has-surface"
+    },
+    {
+     "interface": "wasi:sockets/types@0.3.2",
+     "status": "bound",
+     "stability": "stable",
+     "surface": "has-surface"
+    }
+   ]
+  },
+  {
+   "package": "wasi:http",
+   "version": "0.3.2",
+   "interfaces": [
+    "wasi:http/client@0.3.2",
+    "wasi:http/handler@0.3.2",
+    "wasi:http/types@0.3.2"
+   ],
+   "provided": [],
+   "missing": [],
+   "excluded": [
+    "wasi:http/client@0.3.2",
+    "wasi:http/handler@0.3.2",
+    "wasi:http/types@0.3.2"
+   ],
+   "export_only": [],
+   "types_only": [],
+   "rows": [
+    {
+     "interface": "wasi:http/client@0.3.2",
+     "status": "excluded",
+     "stability": "stable",
+     "surface": "has-surface"
+    },
+    {
+     "interface": "wasi:http/handler@0.3.2",
+     "status": "excluded",
+     "stability": "stable",
+     "surface": "has-surface"
+    },
+    {
+     "interface": "wasi:http/types@0.3.2",
+     "status": "excluded",
+     "stability": "stable",
+     "surface": "has-surface"
+    }
+   ]
+  }
+ ],
+ "opcodes": {
+  "source": "tests/backend-parity-results.jsonl",
+  "status": "present",
+  "pairs": 21260,
+  "refusals": 0,
+  "refused_opcodes": []
+ }
+}

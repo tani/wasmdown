@@ -1036,9 +1036,16 @@ A duplicate definition is a wit-error naming the collision."
 ;;; ---------------------------------------------------------------
 ;;; Public entry points.
 
-(defun parse-wit-string (string &key (path nil))
-  "Parse one WIT source unit (one package) into a wit-package."
-  (%parse-package (make-wit-reader* string :path path)))
+(defun parse-wit-string (string &key (path nil) stable-only features)
+  "Parse one WIT source unit (one package) into a wit-package.
+
+With STABLE-ONLY, the declared surface is run through the stability
+selection with FEATURES enabled: `@unstable(feature = ...)' interfaces
+and items whose feature is not listed are omitted, and so are items
+whose `@since' is newer than the package's declared version. The
+default (NIL) returns the full declared surface, annotations intact."
+  (%apply-stability (%parse-package (make-wit-reader* string :path path))
+                    stable-only features))
 
 (defun read-file-string (path)
   (with-open-file (in path :direction :input
@@ -1049,10 +1056,13 @@ A duplicate definition is a wit-error naming the collision."
             while line
             do (write-string line out) (terpri out)))))
 
-(defun parse-wit-file (path)
-  "Parse the WIT file at PATH into a wit-package."
+(defun parse-wit-file (path &key stable-only features)
+  "Parse the WIT file at PATH into a wit-package. See
+PARSE-WIT-STRING for STABLE-ONLY and FEATURES."
   (parse-wit-string (read-file-string path)
-                    :path (namestring path)))
+                    :path (namestring path)
+                    :stable-only stable-only
+                    :features features))
 
 ;;; ---------------------------------------------------------------
 ;;; Multi-file packages.
@@ -1100,13 +1110,16 @@ itself when it names a file."
           (and tk (string= "package" (wit-token-text tk)))))
     (error () nil)))
 
-(defun parse-wit-directory (path)
+(defun parse-wit-directory (path &key stable-only features)
   "Load a WIT package spread over one or more .wit files. Returns the
 wit-package. Errors: no usable file, no package identity, conflicting
-package headers, duplicate definitions."
-  (parse-wit-files (%wit-source-files path) :origin (namestring path)))
+package headers, duplicate definitions. See PARSE-WIT-STRING for
+STABLE-ONLY and FEATURES."
+  (parse-wit-files (%wit-source-files path) :origin (namestring path)
+                                          :stable-only stable-only
+                                          :features features))
 
-(defun parse-wit-files (files &key (origin nil))
+(defun parse-wit-files (files &key (origin nil) stable-only features)
   "Load the WIT package whose source files are FILES (already in the
 intended order). See PARSE-WIT-DIRECTORY."
   (let* ((readers '())
@@ -1142,7 +1155,7 @@ intended order). See PARSE-WIT-DIRECTORY."
              :message (format nil "no `package' header in ~a" (or origin "the given file list"))))
     (dolist (r (nreverse readers))
       (%parse-package-declarations r package))
-    (%finish-package package)))
+    (%apply-stability (%finish-package package) stable-only features)))
 
 ;;; ---------------------------------------------------------------
 ;;; Node lookups.
@@ -2088,6 +2101,17 @@ with VALIDATE-WIT-PACKAGE; selection is purely local to PACKAGE."
                        (%select-world world selection target))))
              (wit-package-worlds package))
     out))
+
+(defun %apply-stability (package stable-only features)
+  "The reader's opt-in stability gate. With STABLE-ONLY, PACKAGE's
+declared surface is narrowed by SELECT-WIT-PACKAGE using FEATURES (the
+enabled @unstable feature names); otherwise PACKAGE is returned
+unchanged. Kept separate from parsing so the default AST is always the
+full declared surface."
+  (if stable-only
+      (select-wit-package package
+                          (make-wit-selection :enabled-features features))
+      package))
 
 ;;; ---------------------------------------------------------------
 ;;; World resolution (plan step 3, parser half).

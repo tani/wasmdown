@@ -21,6 +21,22 @@ host functions — without one clobbering the other.
 - Const-expr evaluation at instantiation goes through the analogous
   `*const-expr-evaluator*` hook.
 
+## Amendment (2026-11-01)
+
+*Compiled functions no longer enter as replacement host func-instances.*
+`func-instance` now carries `backend` and `compiled-entry`; instantiation
+fills the entry on the defined function's **existing** `:wasm` reference,
+so exports, tables, element segments, `ref.func` constants and other
+modules' imports keep the same object, and an imported function keeps the
+backend of its defining instance. The single call point is still
+`wasmdown.runtime:wasm-call`, now through `invoke-wasm`, which also owns
+guest depth, the tail-transfer trampoline and the outermost exception
+boundary for both backends. The consequence noted below (one extra
+`funcall` on a compiled→guest edge) is unchanged. The migration record is
+in [`../history.md`](../history.md); current behaviour is documented in
+[`../usage/lisp-api.md`](../usage/lisp-api.md). The decision above stands;
+this note records the mechanism it now takes.
+
 ## Consequences
 
 +: Interp and codegen can be parity-tested on identical instances

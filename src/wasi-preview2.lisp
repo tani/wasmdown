@@ -119,12 +119,30 @@ Real lowering always passes an index."
 
 ;;; ---- pollable ---------------------------------------------------
 
+(defconstant +p2-poll-slice-ns+ 50000000
+  "How long `poll`/`pollable.block` waits on one pollable before
+re-scanning the whole set. `poll' must report EVERY ready input, and a
+host without a real epoll cannot watch several fds at once, so it waits
+in short slices: at most ~50 ms of extra latency, no busy spin.")
+
 (defstruct (p2-pollable (:constructor %make-p2-pollable (&key ready-p block)))
   "A wasi:io/poll pollable: READY-P answers readiness now, BLOCK waits
-(bounded by the context's reactor when one exists) and returns T when
-the event fired."
+(up to a caller-supplied timeout in ns, NIL = until ready) and returns
+T when the event fired."
   (ready-p (lambda () t) :type function)
   (block nil))
+
+(defun p2-pollable-wait (rep timeout-ns)
+  "Wait on one pollable until it is ready or TIMEOUT-NS expires.
+Returns T when ready. A pollable with no BLOCK sleeps one slice so a
+never-ready source can never spin the host."
+  (if (funcall (p2-pollable-ready-p rep))
+      t
+      (let ((block (p2-pollable-block rep)))
+        (if block
+            (not (null (funcall block timeout-ns)))
+            (progn (sleep (/ (or timeout-ns +p2-poll-slice-ns+) 1000000000.0))
+                   nil)))))
 
 (defun p2-pollable-from-deadline (deadline-ns)
   "A pollable that becomes ready at DEADLINE-NS on the monotonic
@@ -375,6 +393,20 @@ positional offset (write-via-stream) or append semantics."
   (appending nil)
   (closed nil))
 
+(defconstant +p2-io-chunk+ (* 1024 1024)
+  "The largest single host buffer a P2 stream operation allocates (1
+MiB). The WIT lets `read' return fewer bytes than `len' and
+`check-write' cap a `write', so a guest asking for more is served in
+bounded chunks; allocating the caller's u64 directly would abort the
+host on the SBCL heap instead of answering the guest.")
+
+(defconstant +p2-write-permit+ +p2-io-chunk+
+  "The byte count `output-stream.check-write` reports: the largest
+single `write` this host hands to a sink in one call. `write` itself
+stays lenient (it accepts any list the canonical ABI already copied),
+so a guest that ignores the permit still makes progress; a guest that
+honours it chunks at this size.")
+
 (defun p2-closed-error ()
   "The WIT `stream-error::closed` value."
   (cons :closed nil))
@@ -387,34 +419,80 @@ allocates the handle when it lowers the result), never a bare rep."
         (list :own-handle (p2-error-ct version) (p2-error message))))
 
 
+(defun %p2-char->octets (char)
+  "The octets a character contributes to an input-stream: one octet in
+the Latin-1 range (so a byte pipe such as stdin round-trips
+unchanged), the UTF-8 encoding above it (the WIT's rule for a text
+source)."
+  (if (< (char-code char) 256)
+      (vector (char-code char))
+      (sb-ext:string-to-octets (string char) :external-format :utf-8)))
+
+(defun %p2-read-text (stream len)
+  "Read up to LEN octets from a TEXT stream. Returns an octet vector,
+:closed at end of input. A character that does not fit the request is
+pushed back; only a first character wider than the whole request is
+truncated (the guest asked for fewer octets than the code point)."
+  (let ((out (make-array 0 :element-type '(unsigned-byte 8)
+                           :adjustable t :fill-pointer 0)))
+    (loop while (< (fill-pointer out) len)
+          do (let ((c (read-char stream nil nil)))
+               (unless c (return))
+               (let* ((bytes (%p2-char->octets c))
+                      (room (- len (fill-pointer out))))
+                 (cond
+                   ((<= (length bytes) room)
+                    (loop for b across bytes
+                          do (vector-push-extend b out)))
+                   ((zerop (fill-pointer out))
+                    (loop for i from 0 below room
+                          do (vector-push-extend (aref bytes i) out)))
+                   (t (unread-char c stream)
+                      (return))))))
+    (if (zerop (fill-pointer out))
+        :closed
+        (coerce out '(vector (unsigned-byte 8))))))
+
 (defun p2-in-read (rep len)
-  "Read at most LEN octets from an input-stream rep. Returns an octet
-vector, or :closed at end of input."
-  (cond
-    ((p2-input-stream-closed rep) :closed)
-    ((p2-input-stream-stream rep)
-     (let ((stream (p2-input-stream-stream rep)))
-       (if (plusp len)
-           (let ((buf (make-array len :element-type '(unsigned-byte 8))))
-             (let ((n (read-sequence buf stream)))
-               (if (zerop n) :closed (subseq buf 0 n))))
-           (if (listen stream) #() :closed))))
-    ((not (minusp (p2-input-stream-fd rep)))
-     (let* ((buf (make-array len :element-type '(unsigned-byte 8)))
-            (off (p2-input-stream-position-offset rep))
-            (n (if off
-                   (%libc-pread (p2-input-stream-fd rep)
-                                (sb-alien:sap-alien (sb-sys:vector-sap buf)
-                                                    (* sb-alien:unsigned-char))
-                                len off)
-                   (%p1-libc-read (p2-input-stream-fd rep)
-                                  (sb-sys:vector-sap buf) len))))
-       (when (and off (plusp n))
-         (incf (p2-input-stream-position-offset rep) n))
-       (cond ((minusp n) (cons :failed (sb-alien:get-errno)))
-             ((zerop n) :closed)
-             (t (subseq buf 0 n)))))
-    (t :closed)))
+  "Read at most LEN octets from an input-stream rep, in one bounded
+chunk. Returns an octet vector, :closed at end of input, or
+\(:failed . errno) when the host read itself failed."
+  (let ((len (min len +p2-io-chunk+)))
+    (cond
+      ((p2-input-stream-closed rep) :closed)
+      ((p2-input-stream-stream rep)
+       (let ((stream (p2-input-stream-stream rep)))
+         (cond
+           ((zerop len)
+            (if (listen stream) #() :closed))
+           ((subtypep (stream-element-type stream) '(unsigned-byte 8))
+            (let ((buf (make-array len :element-type '(unsigned-byte 8))))
+              (let ((n (read-sequence buf stream)))
+                (if (zerop n) :closed (subseq buf 0 n)))))
+           ;; a TEXT stream (the CLI hands P2 stdin as a character
+           ;; stream): reading into a ub8 vector raises TYPE-ERROR, so
+           ;; the characters are mapped octet by octet instead
+           (t (%p2-read-text stream len)))))
+      ((not (minusp (p2-input-stream-fd rep)))
+       (cond
+         ;; a zero-length read is a liveness probe, not an eof probe
+         ((zerop len) #())
+         (t
+          (let* ((buf (make-array len :element-type '(unsigned-byte 8)))
+                 (off (p2-input-stream-position-offset rep))
+                 (n (if off
+                        (%libc-pread (p2-input-stream-fd rep)
+                                     (sb-alien:sap-alien (sb-sys:vector-sap buf)
+                                                         (* sb-alien:unsigned-char))
+                                     len off)
+                        (%p1-libc-read (p2-input-stream-fd rep)
+                                       (sb-sys:vector-sap buf) len))))
+            (when (and off (plusp n))
+              (incf (p2-input-stream-position-offset rep) n))
+            (cond ((minusp n) (cons :failed (sb-alien:get-errno)))
+                  ((zerop n) :closed)
+                  (t (subseq buf 0 n)))))))
+      (t :closed))))
 
 (defun p2-in-skip (rep len)
   "Consume at most LEN octets. Returns the count consumed, :closed, or
@@ -424,42 +502,144 @@ vector, or :closed at end of input."
           ((and (consp data) (eq (car data) :failed)) data)
           (t (length data)))))
 
-(defun p2-out-write (rep bytes)
-  "Write BYTES to an output-stream rep. Returns T, or NIL when the
-stream is closed."
+(defun p2-out-write-n (rep bytes)
+  "One host write of BYTES to REP. Returns (values OCTETS-WRITTEN
+STATE) with STATE :ok, :closed, or (:failed . errno). An APPENDING rep
+positions at the end first (append-via-stream is the WIT's \"write with
+O_APPEND\", whatever the descriptor's own flags are)."
   (cond
-    ((p2-output-stream-closed rep) nil)
+    ((p2-output-stream-closed rep) (values 0 :closed))
     ((p2-output-stream-stream rep)
-     (let ((stream (p2-output-stream-stream rep)))
+     (let ((stream (p2-output-stream-stream rep))
+           (vec (coerce bytes '(vector (unsigned-byte 8)))))
        (if (subtypep (stream-element-type stream) '(unsigned-byte 8))
-           (write-sequence (coerce bytes '(vector (unsigned-byte 8))) stream)
-           (write-string (map 'string #'code-char bytes) stream))
-       t))
+           (write-sequence vec stream)
+           (write-string (map 'string #'code-char vec) stream))
+       (values (length vec) :ok)))
     ((not (minusp (p2-output-stream-fd rep)))
      (let* ((vec (coerce bytes '(vector (unsigned-byte 8))))
             (off (p2-output-stream-position-offset rep))
-            (n (cond (off
-                      (%libc-pwrite (p2-output-stream-fd rep)
-                                    (sb-alien:sap-alien (sb-sys:vector-sap vec)
-                                                        (* sb-alien:unsigned-char))
-                                    (length vec) off))
-                     ((p2-output-stream-appending rep)
-                      (%p1-libc-write (p2-output-stream-fd rep)
-                                      (sb-sys:vector-sap vec)
-                                      (length vec)))
-                     (t (%p1-libc-write (p2-output-stream-fd rep)
-                                        (sb-sys:vector-sap vec)
-                                        (length vec))))))
-       (when (and off (not (minusp n)))
-         (incf (p2-output-stream-position-offset rep) n))
-       (not (minusp n))))
-    (t nil)))
+            (fd (p2-output-stream-fd rep)))
+       (when (and (p2-output-stream-appending rep) (minusp (%p1-libc-lseek fd 0 2)))
+         (return-from p2-out-write-n (values 0 (cons :failed (sb-alien:get-errno)))))
+       (let ((n (if off
+                    (%libc-pwrite fd
+                                  (sb-alien:sap-alien (sb-sys:vector-sap vec)
+                                                      (* sb-alien:unsigned-char))
+                                  (length vec) off)
+                    (%p1-libc-write fd (sb-sys:vector-sap vec) (length vec)))))
+         (if (minusp n)
+             (values 0 (cons :failed (sb-alien:get-errno)))
+             (progn (when off (incf (p2-output-stream-position-offset rep) n))
+                    (values n :ok))))))
+    (t (values 0 :closed))))
+
+(defun p2-out-write (rep bytes)
+  "Write BYTES to an output-stream rep (one host write; a short write
+is reported through P2-OUT-WRITE-N). Returns T on success, :closed
+when the stream is already closed, or (:failed . errno) when the HOST
+write itself failed. The two are distinct WIT values (`closed' vs
+`last-operation-failed'), so a broken sink is never reported as a
+closed stream."
+  (multiple-value-bind (n state) (p2-out-write-n rep bytes)
+    (declare (ignore n))
+    (if (eq state :ok) t state)))
 
 (defun p2-out-flush (rep)
-  (cond ((p2-output-stream-closed rep) nil)
+  "Flush REP. Returns T, :closed (stream already closed), or
+\(:failed . errno) when the host flush failed."
+  (cond ((p2-output-stream-closed rep) :closed)
         ((p2-output-stream-stream rep)
-         (force-output (p2-output-stream-stream rep)) t)
+         (let ((stream (p2-output-stream-stream rep)))
+           (handler-case (progn (force-output stream) t)
+             (stream-error () (cons :failed nil)))))
         (t t)))
+
+(defun p2-out-sink-result (value version what)
+  "The `result<_, stream-error>` for an output-stream operation whose
+sink helper returned VALUE: T = ok, :closed = stream-error::closed,
+\(:failed . errno) = stream-error::last-operation-failed carrying a
+downcastable error."
+  (cond
+    ((eq value t) (cons :ok nil))
+    ((eq value :closed) (cons :err (p2-closed-error)))
+    (t (cons :err
+             (p2-failed-error
+              (if (cdr value)
+                  (format nil "~a failed (errno ~a)" what (cdr value))
+                  (format nil "~a failed" what))
+              version)))))
+
+(defun p2-out-write-zeroes (rep len)
+  "Write LEN zero octets to REP in bounded chunks (never allocating
+LEN). Returns T, :closed, or (:failed . errno)."
+  (let ((chunk (make-array 4096 :element-type '(unsigned-byte 8)
+                                :initial-element 0)))
+    (loop with remaining = len
+          while (plusp remaining)
+          do (let* ((n (min remaining (length chunk)))
+                    (r (p2-out-write rep (if (= n (length chunk))
+                                             chunk
+                                             (subseq chunk 0 n)))))
+               (unless (eq r t) (return r))
+               (decf remaining n))
+          finally (return t))))
+
+(defun p2-blocking-in (rep len)
+  "The shared body of `blocking-read'/`blocking-skip'/`blocking-splice':
+read LEN octets, waiting for the source when the host fd is
+nonblocking (EAGAIN) instead of reporting `last-operation-failed'. A
+source that has ended still answers :closed."
+  (loop
+    (let ((r (p2-in-read rep len)))
+      (cond
+        ((and (consp r) (eq (car r) :failed)
+              ;; EAGAIN / EWOULDBLOCK: the fd is nonblocking and no
+              ;; bytes are promptly available — wait, then retry
+              (member (cdr r) '(11 35)))
+         (let ((p (p2-input-subscribe-pollable rep)))
+           (loop until (funcall (p2-pollable-ready-p p))
+                 do (p2-pollable-wait p +p2-poll-slice-ns+))))
+        (t (return r))))))
+
+(defun p2-blocking-in-skip (rep len)
+  "`blocking-skip' / `skip' over the blocking read path."
+  (let ((data (p2-blocking-in rep len)))
+    (cond ((eq data :closed) :closed)
+          ((and (consp data) (eq (car data) :failed)) data)
+          (t (length data)))))
+
+(defun p2-blocking-out-write (rep bytes)
+  "Write ALL of BYTES to REP: a short write is resumed, and a
+nonblocking sink (EAGAIN) is waited for. `blocking-write-and-flush'
+promises every byte is written before it returns."
+  (let ((vec (coerce bytes '(vector (unsigned-byte 8)))))
+    (loop with offset = 0
+          do (multiple-value-bind (n state)
+                 (p2-out-write-n rep (if (zerop offset) vec (subseq vec offset)))
+               (cond
+                 ((eq state :ok)
+                  (incf offset n)
+                  (when (>= offset (length vec)) (return t)))
+                 ((and (consp state) (eq (car state) :failed)
+                       (member (cdr state) '(11 35)))
+                  (let ((p (p2-output-subscribe-pollable rep)))
+                    (loop until (funcall (p2-pollable-ready-p p))
+                          do (p2-pollable-wait p +p2-poll-slice-ns+))))
+                 (t (return state)))))))
+
+(defun p2-out-write-zeroes-blocking (rep len)
+  "P2-OUT-WRITE-ZEROES with the blocking write path."
+  (let ((chunk (make-array 4096 :element-type '(unsigned-byte 8)
+                                :initial-element 0)))
+    (loop with remaining = len
+          while (plusp remaining)
+          do (let* ((n (min remaining (length chunk)))
+                    (r (p2-blocking-out-write
+                        rep (if (= n (length chunk)) chunk (subseq chunk 0 n)))))
+               (unless (eq r t) (return r))
+               (decf remaining n))
+          finally (return t))))
 
 (defun p2-error-instance (version)
   "wası:io/error — the `error` resource with to-debug-string."
@@ -475,30 +655,73 @@ stream is closed."
 
 (defun p2-poll-instance (context version)
   "wası:io/poll — the pollable resource and the interface `poll'."
+  (declare (ignore context))
   (let ((ct (p2-pollable-ct version)))
-    (provider-instance
-     (p2-interface "io" "poll" version)
-     (list (cons "ready"
-                 (lambda (self)
-                   (let ((rep (p2-resource-rep ct self "pollable.ready")))
-                     (not (null (funcall (p2-pollable-ready-p rep)))))))
-           (cons "block"
-                 (lambda (self)
-                   (let ((rep (p2-resource-rep ct self "pollable.block")))
-                     (let ((block (p2-pollable-block rep)))
-                       (if block (not (null (funcall block nil))) t)))))
-           (cons "poll"
-                 (lambda (handles)
-                   ;; return every ready input index, in INPUT ORDER,
-                   ;; duplicates included
-                   (let ((i 0) (out '()))
-                     (dolist (h handles (nreverse out))
-                       (let ((rep (p2-resource-rep ct h "poll")))
-                         (when (funcall (p2-pollable-ready-p rep))
-                           (push i out)))
-                       (incf i))))))
-     :packages (p2-packages version)
-     :include #'p2-stable-node-p)))
+    (labels ((rep (self what) (p2-resource-rep ct self what)))
+      (provider-instance
+       (p2-interface "io" "poll" version)
+       (list (cons "ready"
+                   (lambda (self)
+                     (not (null (funcall (p2-pollable-ready-p
+                                          (rep self "pollable.ready")))))))
+             (cons "block"
+                   ;; `block' returns only once the pollable is ready
+                   (lambda (self)
+                     (let ((r (rep self "pollable.block")))
+                       (loop until (funcall (p2-pollable-ready-p r))
+                             do (p2-pollable-wait r +p2-poll-slice-ns+))
+                       t)))
+             (cons "poll"
+                   (lambda (handles)
+                     ;; WIT: "This function traps if ... the list is
+                     ;; empty", and it waits until at least one input is
+                     ;; ready (a timeout is a CLOCK pollable in the same
+                     ;; list, never an argument).
+                     (when (null handles)
+                       (error 'wasmdown:wasm-trap
+                              :message "wasi:io/poll.poll: the pollable list is empty"))
+                     (let ((reps (mapcar (lambda (h) (rep h "poll")) handles)))
+                       (loop
+                         ;; report every ready input index, in INPUT
+                         ;; ORDER, duplicates included
+                         (let ((ready (loop for r in reps
+                                            for i from 0
+                                            when (funcall (p2-pollable-ready-p r))
+                                              collect i)))
+                           (when ready (return ready)))
+                         (let ((blocker (find-if #'p2-pollable-block reps)))
+                           (unless blocker
+                             (error 'wasmdown:wasm-trap
+                                    :message "wasi:io/poll.poll: no pollable can be waited on"))
+                           (p2-pollable-wait blocker +p2-poll-slice-ns+)))))))
+       :packages (p2-packages version)
+       :include #'p2-stable-node-p))))
+
+(defun p2-input-subscribe-pollable (rep)
+  "A pollable for an input-stream rep: resolves when the host fd has
+bytes available or reached hangup/error, or when the stream is closed.
+A CL-backed stream has no readiness probe, so it stays always-ready
+(claiming otherwise would deadlock a waiting guest)."
+  (if (or (p2-input-stream-closed rep)
+          (minusp (p2-input-stream-fd rep)))
+      (%make-p2-pollable
+       :ready-p (lambda () t)
+       :block (lambda (timeout) (declare (ignore timeout)) t))
+      (%p2-pollable-from-fd
+       (p2-input-stream-fd rep)
+       (logior +pollin+ +pollhup+ +pollerr+ +pollnval+))))
+
+(defun p2-output-subscribe-pollable (rep)
+  "A pollable for an output-stream rep: resolves when the sink can
+accept bytes again, and is always ready once the stream is closed."
+  (if (or (p2-output-stream-closed rep)
+          (minusp (p2-output-stream-fd rep)))
+      (%make-p2-pollable
+       :ready-p (lambda () t)
+       :block (lambda (timeout) (declare (ignore timeout)) t))
+      (%p2-pollable-from-fd
+       (p2-output-stream-fd rep)
+       (logior +pollout+ +pollhup+ +pollerr+ +pollnval+))))
 
 (defun p2-streams-instance (context version)
   "wası:io/streams — input-stream/output-stream resources."
@@ -509,9 +732,6 @@ stream is closed."
                (p2-resource-rep in-ct self what))
              (out (self what)
                (p2-resource-rep out-ct self what))
-             (pollable ()
-               (%make-p2-pollable :ready-p (lambda () t)
-                                  :block (lambda (timeout) (declare (ignore timeout)) t)))
              (wrap-read (result)
                (cond
                  ((eq result :closed) (cons :err (p2-closed-error)))
@@ -519,7 +739,14 @@ stream is closed."
                   (cons :err (p2-failed-error
                               (format nil "read failed (errno ~a)" (cdr result))
                               version)))
-                 (t (cons :ok (coerce result 'list))))))
+                 (t (cons :ok (coerce result 'list)))))
+             (wrap-skip (result)
+               (cond ((eq result :closed) (cons :err (p2-closed-error)))
+                     ((and (consp result) (eq (car result) :failed))
+                      (cons :err (p2-failed-error
+                                  (format nil "skip failed (errno ~a)" (cdr result))
+                                  version)))
+                     (t (cons :ok result)))))
       (declare (ignore context))
       (provider-instance
        (p2-interface "io" "streams" version)
@@ -528,29 +755,17 @@ stream is closed."
         (cons "read"
               (lambda (self len) (wrap-read (p2-in-read (in self "read") len))))
         (cons "blocking-read"
-              (lambda (self len) (wrap-read (p2-in-read (in self "blocking-read") len))))
-        (cons "skip"
               (lambda (self len)
-                (let ((n (p2-in-skip (in self "skip") len)))
-                  (cond ((eq n :closed) (cons :err (p2-closed-error)))
-                        ((and (consp n) (eq (car n) :failed))
-                         (cons :err (p2-failed-error
-                                     (format nil "skip failed (errno ~a)" (cdr n))
-                                     version)))
-                        (t (cons :ok n))))))
+                (wrap-read (p2-blocking-in (in self "blocking-read") len))))
+        (cons "skip"
+              (lambda (self len) (wrap-skip (p2-in-skip (in self "skip") len))))
         (cons "blocking-skip"
               (lambda (self len)
-                (let ((n (p2-in-skip (in self "blocking-skip") len)))
-                  (cond ((eq n :closed) (cons :err (p2-closed-error)))
-                        ((and (consp n) (eq (car n) :failed))
-                         (cons :err (p2-failed-error
-                                     (format nil "skip failed (errno ~a)" (cdr n))
-                                     version)))
-                        (t (cons :ok n))))))
+                (wrap-skip (p2-blocking-in-skip (in self "blocking-skip") len))))
         (cons "[method]input-stream.subscribe"
               (lambda (self)
-                (declare (ignore self))
-                (list :own-handle poll-ct (pollable))))
+                (list :own-handle poll-ct
+                      (p2-input-subscribe-pollable (in self "subscribe")))))
         ;; ---- output-stream
         (cons "check-write"
               (lambda (self)
@@ -560,59 +775,76 @@ stream is closed."
                       (cons :ok +p2-write-permit+)))))
         (cons "write"
               (lambda (self bytes)
-                (if (p2-out-write (out self "write") bytes)
-                    (cons :ok nil)
-                    (cons :err (p2-closed-error)))))
+                (p2-out-sink-result (p2-out-write (out self "write") bytes)
+                                    version "write")))
         (cons "blocking-write-and-flush"
               (lambda (self bytes)
-                (let ((rep (out self "blocking-write-and-flush")))
-                  (if (and (p2-out-write rep bytes) (p2-out-flush rep))
-                      (cons :ok nil)
-                      (cons :err (p2-closed-error))))))
+                (let* ((rep (out self "blocking-write-and-flush"))
+                       (w (p2-blocking-out-write rep bytes)))
+                  (if (eq w t)
+                      (p2-out-sink-result (p2-out-flush rep) version "flush")
+                      (p2-out-sink-result w version "write")))))
         (cons "flush"
               (lambda (self)
-                (if (p2-out-flush (out self "flush"))
-                    (cons :ok nil)
-                    (cons :err (p2-closed-error)))))
+                (p2-out-sink-result (p2-out-flush (out self "flush"))
+                                    version "flush")))
         (cons "blocking-flush"
               (lambda (self)
-                (if (p2-out-flush (out self "blocking-flush"))
-                    (cons :ok nil)
-                    (cons :err (p2-closed-error)))))
+                (p2-out-sink-result (p2-out-flush (out self "blocking-flush"))
+                                    version "flush")))
         (cons "[method]output-stream.subscribe"
               (lambda (self)
-                (declare (ignore self))
-                (list :own-handle poll-ct (pollable))))
+                (list :own-handle poll-ct
+                      (p2-output-subscribe-pollable (out self "subscribe")))))
         (cons "write-zeroes"
               (lambda (self len)
-                (let ((rep (out self "write-zeroes")))
-                  (if (p2-out-write rep (make-array len :element-type '(unsigned-byte 8)))
-                      (cons :ok nil)
-                      (cons :err (p2-closed-error))))))
+                (p2-out-sink-result (p2-out-write-zeroes (out self "write-zeroes")
+                                                         len)
+                                    version "write-zeroes")))
         (cons "blocking-write-zeroes-and-flush"
               (lambda (self len)
-                (let ((rep (out self "blocking-write-zeroes-and-flush")))
-                  (if (and (p2-out-write rep (make-array len :element-type '(unsigned-byte 8)))
-                           (p2-out-flush rep))
-                      (cons :ok nil)
-                      (cons :err (p2-closed-error))))))
+                (let* ((rep (out self "blocking-write-zeroes-and-flush"))
+                       (w (p2-out-write-zeroes-blocking rep len)))
+                  (if (eq w t)
+                      (p2-out-sink-result (p2-out-flush rep) version "flush")
+                      (p2-out-sink-result w version "write-zeroes")))))
         (cons "splice"
               (lambda (self src len)
                 (let* ((src-rep (p2-resource-rep in-ct src "splice"))
+                       (dst (out self "splice"))
                        (data (p2-in-read src-rep len)))
-                  (cond ((eq data :closed) (cons :ok 0))
-                        ((p2-out-write (out self "splice") data)
-                         (cons :ok (length data)))
-                        (t (cons :err (p2-closed-error)))))))
+                  (cond
+                    ;; a source that has just ended transfers 0 bytes;
+                    ;; splice reports a COUNT, not the read's own error
+                    ((eq data :closed) (cons :ok 0))
+                    ((and (consp data) (eq (car data) :failed))
+                     (cons :err (p2-failed-error
+                                 (format nil "splice: read failed (errno ~a)"
+                                         (cdr data))
+                                 version)))
+                    (t (let ((w (p2-out-write dst data)))
+                         (if (eq w t)
+                             (cons :ok (length data))
+                             (p2-out-sink-result w version "splice"))))))))
         (cons "blocking-splice"
               (lambda (self src len)
                 (let* ((src-rep (p2-resource-rep in-ct src "blocking-splice"))
-                       (data (p2-in-read src-rep len)))
-                  (cond ((eq data :closed) (cons :ok 0))
-                        ((and (p2-out-write (out self "blocking-splice") data)
-                              (p2-out-flush (out self "blocking-splice")))
-                         (cons :ok (length data)))
-                        (t (cons :err (p2-closed-error))))))))
+                       (dst (out self "blocking-splice"))
+                       (data (p2-blocking-in src-rep len)))
+                  (cond
+                    ((eq data :closed) (cons :ok 0))
+                    ((and (consp data) (eq (car data) :failed))
+                     (cons :err (p2-failed-error
+                                 (format nil "blocking-splice: read failed (errno ~a)"
+                                         (cdr data))
+                                 version)))
+                    (t (let ((w (p2-blocking-out-write dst data)))
+                         (if (eq w t)
+                             (let ((f (p2-out-flush dst)))
+                               (if (eq f t)
+                                   (cons :ok (length data))
+                                   (p2-out-sink-result f version "flush")))
+                             (p2-out-sink-result w version "splice")))))))))
        :packages (p2-packages version)
        :include #'p2-stable-node-p))))
 
@@ -991,13 +1223,21 @@ timestamp(datetime) = the given instant."
               (lambda (self length offset)
                 (let ((d (desc self)))
                   (handler-case
-                      (let* ((buf (make-array length :element-type '(unsigned-byte 8)))
+                      (let* (;; the caller's `length' is a filesize (u64);
+                             ;; allocating it would abort the host, and
+                             ;; the WIT allows a short result, so the
+                             ;; buffer is one bounded chunk
+                             (want (min length +p2-io-chunk+))
+                             (buf (make-array want :element-type '(unsigned-byte 8)))
                              (n (%libc-pread (%descriptor-fd d)
-                                             (sb-sys:vector-sap buf) length offset)))
+                                             (sb-sys:vector-sap buf) want offset)))
                         (when (minusp n)
                           (%fs-error (errno->error-code (sb-alien:get-errno))))
+                        ;; the eof flag is "this attempt got fewer bytes
+                        ;; than it asked for", never "fewer than the
+                        ;; caller's (possibly clamped) length"
                         (cons :ok (list (coerce (subseq buf 0 n) 'list)
-                                        (< n length))))
+                                        (< n want))))
                     (wasi-fs-error (c) (cons :err (%p2-enum (wasi-fs-error-code c))))))))
         (cons "write"
               (lambda (self buffer offset)
@@ -1208,6 +1448,31 @@ wrapped."
       (cons :ok (cdr result))
       (cons :err (%p2-sock-enum (cdr result)))))
 
+(defparameter +p2-net-error-kinds+
+  '("access-denied" "not-supported" "invalid-argument" "out-of-memory"
+    "timeout" "concurrency-conflict" "not-in-progress" "would-block"
+    "invalid-state" "new-socket-limit" "address-not-bindable"
+    "address-in-use" "remote-unreachable" "connection-refused"
+    "connection-reset" "connection-aborted" "datagram-too-large"
+    "name-unresolvable" "temporary-resolver-failure"
+    "permanent-resolver-failure")
+  "The `wasi:sockets/network.error-code' case names, in WIT order.
+`network-error-code' answers `some(case)' only for one of these; any
+other error has no network information and answers `none'.")
+
+(defun p2-network-error-code (version err)
+  "wası:sockets/network.network-error-code: `option<error-code>' (NOT
+a result) extracted from an io/error handle. The payload the 0.2
+streams put in `last-operation-failed' is one of these errors; an error
+whose kind is not a sockets case carries no network information."
+  (let ((rep (cond ((p2-error-p err) err)
+                   (t (wasmdown.component.runtime:host-resource-rep
+                       (p2-error-ct version) err)))))
+    (if (and (p2-error-p rep)
+             (member (p2-error-kind rep) +p2-net-error-kinds+ :test #'string=))
+        (cons :some (%p2-sock-enum (p2-error-kind rep)))
+        :none)))
+
 (defstruct (p2-resolve-stream (:constructor %make-p2-resolve-stream (addresses)))
   (addresses '() :type list)
   (cursor 0 :type integer))
@@ -1223,12 +1488,17 @@ wrapped."
   (remote nil))
 
 (defun %p2-pollable-from-fd (fd events)
-  "A pollable ready when FD reports EVENTS (POLLIN/POLLOUT)."
+  "A pollable ready when FD reports EVENTS (POLLIN/POLLOUT). BLOCK
+waits: it honours a timeout in ns, and NIL (until ready) waits in
+bounded 1 s slices instead of spinning non-blocking poll(2) calls."
   (%make-p2-pollable
    :ready-p (lambda () (not (null (%poll-fd fd events 0))))
    :block (lambda (timeout)
-            (let ((ms (if timeout (ceiling timeout 1000000) 0)))
-              (not (null (%poll-fd fd events (min ms 1000))))))))
+            (if timeout
+                (not (null (%poll-fd fd events
+                                     (max 0 (ceiling timeout 1000000)))))
+                (loop (let ((revents (%poll-fd fd events 1000)))
+                        (when revents (return t))))))))
 
 (defun %p2-tcp-streams (fd version)
   "The (input-stream, output-stream) own handles over a connected
@@ -1256,6 +1526,30 @@ other."
            (error 'wasmdown:host-error
                   :message (format nil "~a: no live rep for handle ~a" what value))))))
 
+(defun %p2-network-of (context value version)
+  "The network a `borrow<network>' argument denotes. A real call passes
+a handle INDEX, which must resolve to a live network resource of THIS
+context; a direct CL call may pass the rep. The argument is never
+ignored in favour of the context's default network: a forged handle, or
+one naming another context's network, is a host error, so naming a
+handle the guest was not given can never widen its authority."
+  (let* ((ct (p2-network-ct version))
+         (rep (cond ((and (consp value) (eq (car value) :own-handle)) (third value))
+                    ((not (integerp value)) value)
+                    (t (or (wasmdown.component.runtime:host-resource-rep ct value)
+                           (error 'wasmdown:host-error
+                                  :message
+                                  (format nil
+                                          "network: no live resource rep for handle ~a"
+                                          value)))))))
+    ;; a NIL rep is what instance-network vends in a context with no
+    ;; network authority: callers deny the operation (access-denied)
+    (when rep
+      (unless (member rep (wasi-context-networks context) :test #'eq)
+        (error 'wasmdown:host-error
+               :message "network: the handle names a network this context did not grant")))
+    rep))
+
 (defun p2-tcp-instance (context version)
   "wası:sockets/tcp — the tcp-socket resource."
   (let* ((net (first (wasi-context-networks context)))
@@ -1273,8 +1567,11 @@ other."
        (list
         (cons "start-bind"
               (lambda (self network-value addr)
-                (declare (ignore network-value))
-                (set-op self (list :bind addr))
+                ;; the network argument is the authority the bind runs
+                ;; under; it is resolved (never ignored) and recorded
+                ;; for finish-bind
+                (set-op self (list :bind (%p2-network-of context network-value version)
+                                   addr))
                 (cons :ok nil)))
         (cons "finish-bind"
               (lambda (self)
@@ -1282,20 +1579,20 @@ other."
                   (if (and pending-op (eq (first pending-op) :bind))
                       (progn
                         (clear-op self)
-                        (with-brand (tcp-bind context net (sock self)
-                                              (second pending-op))))
+                        (with-brand (tcp-bind context (second pending-op) (sock self)
+                                              (third pending-op))))
                       (cons :err (%p2-sock-enum "not-in-progress"))))))
         (cons "start-connect"
               (lambda (self network-value addr)
-                (declare (ignore network-value))
-                (set-op self (list :connect addr))
+                (set-op self (list :connect (%p2-network-of context network-value version)
+                                   addr))
                 (cons :ok nil)))
         (cons "finish-connect"
               (lambda (self)
                 (let ((pending-op (op self)))
                   (if (and pending-op (eq (first pending-op) :connect))
-                      (let ((r (tcp-connect context net (sock self)
-                                            (second pending-op))))
+                      (let ((r (tcp-connect context (second pending-op) (sock self)
+                                            (third pending-op))))
                         (clear-op self)
                         (if (eq (car (%p2-sock-wrap r)) :ok)
                             (cons :ok (%p2-tcp-streams
@@ -1343,14 +1640,18 @@ other."
                               (if (member errno '(11 35)) ; EAGAIN/EWOULDBLOCK
                                   (%p2-sock-enum "would-block")
                                   (%p2-sock-enum (%socket-errno-code errno)))))
-                      (let ((new (make-wasi-tcp-socket
-                                  :fd fd :network net
-                                  :family (wasi-tcp-socket-family s)
-                                  :state :connected)))
+                      (let* ((new (make-wasi-tcp-socket
+                                   :fd fd :network net
+                                   :family (wasi-tcp-socket-family s)
+                                   :state :connected))
+                             ;; ONE dup pair for the two stream
+                             ;; handles: calling %P2-TCP-STREAMS twice
+                             ;; leaked two fds per accepted connection
+                             (streams (%p2-tcp-streams fd version)))
                         (cons :ok
                               (list (list :own-handle ct new)
-                                    (first (%p2-tcp-streams fd version))
-                                    (second (%p2-tcp-streams fd version)))))))))
+                                    (first streams)
+                                    (second streams))))))))
         (cons "local-address"
               (lambda (self)
                 (%p2-sock-wrap (tcp-get-local-address context net (sock self)
@@ -1453,17 +1754,17 @@ other."
        (list
         (cons "start-bind"
               (lambda (self network-value addr)
-                (declare (ignore network-value))
-                (set-op self (list :bind addr))
+                (set-op self (list :bind (%p2-network-of context network-value version)
+                                   addr))
                 (cons :ok nil)))
         (cons "finish-bind"
               (lambda (self)
                 (let ((pending-op (op self)))
                   (if (and pending-op (eq (first pending-op) :bind))
                       (progn (clear-op self)
-                             (%p2-sock-wrap (udp-bind context net (sock self)
-                                                      (second pending-op)
-                                                     )))
+                             (%p2-sock-wrap (udp-bind context (second pending-op)
+                                                      (sock self)
+                                                      (third pending-op))))
                       (cons :err (%p2-sock-enum "not-in-progress"))))))
         (cons "[method]udp-socket.stream"
               (lambda (self remote)
@@ -1589,25 +1890,26 @@ other."
 
 (defun p2-ip-name-lookup-instance (context version)
   "wası:sockets/ip-name-lookup."
-  (let* ((net (first (wasi-context-networks context)))
-         (ct (p2-resolve-stream-ct version)))
+  (let ((ct (p2-resolve-stream-ct version)))
     (provider-instance
      (p2-interface "sockets" "ip-name-lookup" version)
      (list
       (cons "resolve-addresses"
             (lambda (network-value name)
-              (declare (ignore network-value))
-              (cond
-                ((null net)
-                 (cons :err (%p2-sock-enum "access-denied")))
-                ((not (wasi-network-allows-dns-p net name))
-                 (cons :err (%p2-sock-enum "access-denied")))
-                (t
-                 (let ((r (%lookup-result name 0)))
-                   (if (eq (car r) :ok)
-                       (cons :ok (list :own-handle ct
-                                       (%make-p2-resolve-stream (cdr r))))
-                       (cons :err (%p2-sock-code-domain (cdr r)))))))))
+              ;; the DNS authority is the one on the NETWORK the guest
+              ;; names (resolved, not the context's default)
+              (let ((net (%p2-network-of context network-value version)))
+                (cond
+                  ((null net)
+                   (cons :err (%p2-sock-enum "access-denied")))
+                  ((not (wasi-network-allows-dns-p net name))
+                   (cons :err (%p2-sock-enum "access-denied")))
+                  (t
+                   (let ((r (%lookup-result name 0)))
+                     (if (eq (car r) :ok)
+                         (cons :ok (list :own-handle ct
+                                         (%make-p2-resolve-stream (cdr r))))
+                         (cons :err (%p2-sock-code-domain (cdr r))))))))))
       (cons "[method]resolve-address-stream.resolve-next-address"
             (lambda (self)
               (let ((rep (%p2-desc-for self ct "resolve-address-stream")))
@@ -1642,18 +1944,18 @@ other."
 
 (defun p2-network-instance (context version)
   "wası:sockets/network: the network resource and its error downcast."
-  (let ((ct (p2-network-ct version)))
-    (provider-instance
-     (p2-interface "sockets" "network" version)
-     (list (cons "[method]network-error-code"
-                 (lambda (self)
-                   (declare (ignore self))
-                   (cons :err (%p2-sock-enum "unknown"))))
-           ;; the NETWORK resource is created by instance-network; this
-           ;; interface only adds the downcast method
-           )
-     :packages (p2-packages version)
-     :include #'p2-stable-node-p)))
+  (declare (ignore context))
+  (provider-instance
+   (p2-interface "sockets" "network" version)
+   (list
+    ;; `network-error-code' is `@unstable(feature = network-error-code)'
+    ;; at 0.2.12, so the stability gate keeps it out of this exact
+    ;; release's surface; when a release makes it stable it must export
+    ;; under its PLAIN name with the option<error-code> shape.
+    (cons "network-error-code"
+          (lambda (err) (p2-network-error-code version err))))
+   :packages (p2-packages version)
+   :include #'p2-stable-node-p))
 
 (defun p2-tcp-create-instance (context version)
   (let* ((net (first (wasi-context-networks context))))

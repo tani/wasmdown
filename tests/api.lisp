@@ -415,3 +415,169 @@
                                      (eq 1 code)))))
       (when (probe-file path) (delete-file path))
       (when (probe-file out) (delete-file out)))))
+
+;;; -----------------------------------------------------------------
+;;; M1: backend identity and instantiation ordering.
+;;;
+;;; The selected backend is a property of the FUNCTION, not of a
+;;; replacement object: instantiation fills BACKEND/COMPILED-ENTRY on
+;;; the defined func-instances and runs the Wasm start section through
+;;; that backend. A refusal is a codegen-error raised before the start
+;;; section and before active segments are applied.
+
+(defun %wat-instance (text &key (mode :interpret) imports before-start)
+  (wasmdown:instantiate (wasmdown:validate-module
+                         (wasmdown.text:parse-wat text))
+                        :mode mode :imports imports
+                        :before-start before-start))
+
+(when *codegen-present-p*
+  (wasmdown.test:test api/baseline-start-section-runs-compiled
+    ;; the start function sets a global; backend entry counters prove it
+    ;; executed through the compiled entry, not the interpreter.
+    (wasmdown.runtime:reset-backend-entry-counts)
+    (let ((inst (%wat-instance
+                 "(module (global $g (mut i32) (i32.const 0))
+                          (func $init (global.set $g (i32.const 7)))
+                          (start $init)
+                          (func (export \"get\") (result i32)
+                            (global.get $g)))"
+                 :mode :baseline)))
+      (wasmdown.test:is (equal '(7) (wasmdown:invoke inst "get")))
+      (wasmdown.test:is (= 0 (wasmdown.runtime:backend-entry-count :interpret)))
+      (wasmdown.test:is (>= (wasmdown.runtime:backend-entry-count :baseline) 2))
+      (wasmdown.test:is (eq :baseline
+                            (wasmdown.runtime:func-instance-backend
+                             (wasmdown:instance-export inst "get"))))))
+
+  (wasmdown.test:test api/baseline-compilation-precedes-start-and-segments
+    ;; every defined function is compiled BEFORE the start section
+    ;; runs: the start function's memory write is the observable, and
+    ;; the v128 function (formerly the canonical compiler refusal) is
+    ;; installed as compiled code and answers like the interpreter.
+    (let* ((text "(module (import \"env\" \"mem\" (memory 1))
+                         (func $init (i32.store (i32.const 4) (i32.const 1)))
+                         (start $init)
+                         (func (export \"f\") (result v128)
+                           (v128.const i32x4 1 2 3 4)))")
+           (module (wasmdown:validate-module (wasmdown.text:parse-wat text)))
+           (mem (wasmdown.runtime:make-memory-instance
+                 (wasmdown.types:make-wasm-limits 1)))
+           (inst (wasmdown:instantiate module :mode :baseline
+                                       :imports (list (cons '("env" "mem") mem)))))
+      (wasmdown.test:is (= 1 (aref (wasmdown.runtime:memory-instance-bytes mem) 4)))
+      (wasmdown.test:is (eq :baseline
+                            (wasmdown.runtime:func-instance-backend
+                             (wasmdown:instance-export inst "f"))))
+      (wasmdown.test:is (equalp '(#(1 0 0 0 2 0 0 0 3 0 0 0 4 0 0 0))
+                                (wasmdown:invoke inst "f")))))
+
+  (wasmdown.test:test api/baseline-lowers-formerly-refused-simd-and-gc
+    ;; the M4 coverage closure: v128.const and struct.new used to make
+    ;; :mode :baseline refuse the whole module at instantiation. Both
+    ;; backends now agree on the values. (The codegen-error path itself
+    ;; is pinned in tests/codegen.lisp; every opcode the decoder and
+    ;; validator can produce is lowered, so no valid module reaches it.)
+    (let* ((text "(module (type $s (struct (field i32)))
+                         (func (export \"f\") (result i32 v128)
+                           (struct.get $s 0 (struct.new $s (i32.const 7)))
+                           (v128.const i32x4 1 2 3 4)))")
+           (i (wasmdown:invoke (%wat-instance text :mode :interpret) "f"))
+           (b (wasmdown:invoke (%wat-instance text :mode :baseline) "f")))
+      (wasmdown.test:is (equalp i b))))
+
+  (wasmdown.test:test api/baseline-keeps-function-identity
+    ;; one func-instance object serves the export, the table element and
+    ;; ref.func; compilation fills its entry instead of replacing it.
+    (let* ((inst (%wat-instance
+                  "(module (table 2 funcref)
+                           (elem (i32.const 0) $f)
+                           (func $f (result i32) (i32.const 9))
+                           (export \"f\" (func $f)))"
+                  :mode :baseline))
+           (exported (wasmdown:instance-export inst "f"))
+           (tab (svref (wasmdown.runtime:module-instance-tables inst) 0)))
+      (wasmdown.test:is (eq exported (wasmdown.runtime:table-get tab 0)))
+      (wasmdown.test:is (eq :baseline
+                            (wasmdown.runtime:func-instance-backend exported)))
+      (wasmdown.test:is (functionp
+                         (wasmdown.runtime:func-instance-compiled-entry exported)))))
+
+  (wasmdown.test:test api/imported-wasm-function-keeps-its-backend
+    (let* ((a (%wat-instance "(module (func (export \"f\") (result i32)
+                                          (i32.const 5)))"
+                             :mode :baseline))
+           (fv (wasmdown:instance-export a "f")))
+      (wasmdown.test:is (eq :baseline (wasmdown.runtime:func-instance-backend fv)))
+      (wasmdown.runtime:reset-backend-entry-counts)
+      (let ((b (%wat-instance
+                "(module (import \"a\" \"f\" (func $f (result i32)))
+                         (func (export \"g\") (result i32) (call $f)))"
+                :mode :interpret
+                :imports (list (cons '("a" "f") fv)))))
+        (wasmdown.test:is (equal '(5) (wasmdown:invoke b "g")))
+        ;; the imported object was not recompiled: it keeps its own
+        ;; backend, while B's own function stays interpreted.
+        (wasmdown.test:is (eq :interpret
+                              (wasmdown.runtime:func-instance-backend
+                               (wasmdown:instance-export b "g"))))
+        (wasmdown.test:is (eq :baseline
+                              (wasmdown.runtime:func-instance-backend fv)))
+        (wasmdown.test:is (>= (wasmdown.runtime:backend-entry-count :baseline) 1)))))
+
+  (wasmdown.test:test api/before-start-runs-once-before-start
+    (dolist (mode '(:interpret :baseline))
+      (let ((calls 0))
+        (let ((inst (%wat-instance
+                     "(module (global $g (mut i32) (i32.const 0))
+                              (func $init (global.set $g (i32.const 1)))
+                              (start $init)
+                              (func (export \"get\") (result i32)
+                                (global.get $g)))"
+                     :mode mode
+                     :before-start (lambda (i)
+                                     (declare (ignorable i))
+                                     (incf calls)))))
+          (wasmdown.test:is (= 1 calls))
+          (wasmdown.test:is (equal '(1) (wasmdown:invoke inst "get")))))))
+)
+
+;;; -----------------------------------------------------------------
+;;; CLI capability context ownership (M8): the CLI builds (and closes)
+;;; its own reactor, so clock waits and socket readiness have a watch to
+;;; register on instead of failing for want of a capability.
+
+(defun %cli-options (&rest tokens)
+  "Parse TOKENS the way the `run' subcommand does."
+  (multiple-value-bind (file invokes options guest-args)
+      (wasmdown.cli::%parse-run-args tokens)
+    (declare (ignore invokes))
+    (values file options guest-args)))
+
+(wasmdown.test:test api/cli-component-context-owns-a-reactor
+  (multiple-value-bind (context reactor)
+      (multiple-value-bind (file options guest-args)
+          (%cli-options "app.wasm" "--wasi" "--" "arg")
+        (wasmdown.cli::%component-context options guest-args file))
+    (wasmdown.test:is (not (null reactor)))
+    (wasmdown.test:is (eq reactor
+                          (wasmdown.wasi:wasi-context-reactor context)))
+    (unwind-protect
+         ;; a live reactor can arm a deadline and be pumped once
+         (let ((fired nil))
+           (wasmdown.wasi:reactor-watch-deadline
+            reactor 0 (lambda () (setf fired t)))
+           (multiple-value-bind (progress pending)
+               (wasmdown.wasi:reactor-step reactor 0)
+             (declare (ignore pending))
+             (wasmdown.test:is (not (null progress))))
+           (wasmdown.test:is (eq t fired)))
+      (wasmdown.wasi:reactor-close reactor)))
+  ;; without --wasi there is no capability, hence no reactor
+  (multiple-value-bind (file options guest-args)
+      (%cli-options "app.wasm")
+    (declare (ignore file guest-args))
+    (multiple-value-bind (context reactor)
+        (wasmdown.cli::%component-context options nil "app.wasm")
+      (declare (ignore context))
+      (wasmdown.test:is (null reactor)))))

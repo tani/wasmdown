@@ -7,18 +7,18 @@ counted together with the pinned core suite. Unsupported/timeout/
 harness-error outcomes are reported as themselves, never converted.
 
 - Suite label: `upstream@63908677d005`
-- Source: the pin fetched by the adapter (/home/tani/ghq/github.com/tani/wasmdown/tests/upstream-results.jsonl)
+- Source: the pin fetched by the adapter (tests/upstream-results.jsonl)
 
 ## Aggregate outcome counts
 
 | Outcome | Count |
 | --- | --- |
-| pass | 61897 |
-| fail | 3064 |
+| pass | 62156 |
+| fail | 2821 |
 | skip | 0 |
 | unsupported | 73 |
 | timeout | 0 |
-| harness-error | 101 |
+| harness-error | 85 |
 | expected-fail | 0 |
 | **total** | **65135** |
 
@@ -32,25 +32,23 @@ harness-error outcomes are reported as themselves, never converted.
 | simd_f64x2_pmin_pmax.wast | 176 |
 | simd_f32x4_pmin_pmax.wast | 176 |
 | memory_trap64.wast | 159 |
-| simd_lane.wast | 156 |
 | memory_init64.wast | 127 |
 | type-subtyping.wast | 119 |
 | ref_eq.wast | 82 |
-| simd_splat.wast | 73 |
 | table_fill64.wast | 71 |
 | ref_test.wast | 70 |
 | simd_i32x4_trunc_sat_f64x2.wast | 67 |
 | float_memory64.wast | 66 |
 | i31.wast | 63 |
-| simd_load_splat.wast | 54 |
 | simd_store8_lane.wast | 51 |
 | simd_load8_lane.wast | 51 |
+| simd_lane.wast | 49 |
 | memory64.wast | 49 |
 | array_init_data.wast | 44 |
 | ref_cast.wast | 42 |
-| table_copy64.wast | 40 |
 | array_copy.wast | 40 |
 | table_size64.wast | 37 |
+| table_copy64.wast | 36 |
 | simd_store16_lane.wast | 35 |
 | simd_load16_lane.wast | 35 |
 | array_init_elem.wast | 35 |
@@ -68,9 +66,9 @@ harness-error outcomes are reported as themselves, never converted.
 | simd_const.wast | 23 |
 | struct.wast | 22 |
 | table_set64.wast | 19 |
-| table_copy.wast | 18 |
 | simd_store64_lane.wast | 15 |
 | simd_load64_lane.wast | 15 |
+| simd_splat.wast | 13 |
 | table_get64.wast | 10 |
 | memory64-imports.wast | 8 |
 | relaxed_dot_product.wast | 7 |
@@ -97,19 +95,19 @@ harness-error outcomes are reported as themselves, never converted.
 | Detail | Count |
 | --- | --- |
 | wasmdown: host error: no module to act on (no module instant | 1682 |
-| result 0: got #(0 0 0 0 0 0 244 127 ...) | 89 |
-| result 0: got #(0 0 0 0 0 0 244 255 ...) | 89 |
+| result 0: got #(0 0 0 0 0 0 244 127 ...) | 90 |
+| result 0: got #(0 0 0 0 0 0 244 255 ...) | 90 |
 | result 0: got #(0 0 160 127 0 0 160 127 ...) | 89 |
 | result 0: got #(0 0 160 255 0 0 160 255 ...) | 89 |
 | rec type: unknown type definition sub | 34 |
 | module unexpectedly succeeded | 30 |
+| expected a trap but the action returned | 27 |
 | element segment 0: offset type must be i32, got I64 | 27 |
-| result 0: got 0 | 25 |
+| result 0: got 0 | 24 |
 | wasmdown: link error: unknown export: get | 23 |
 | phase DECODE, want VALIDATE: type: unknown type definition s | 22 |
 | data segment 0: offset type must be i32, got I64 | 20 |
 | wasmdown: link error: unknown export: i64.load | 18 |
-| expected a trap but the action returned | 17 |
 | type: unknown type definition sub | 17 |
 | phase DECODE, want VALIDATE: bad or missing immediates for v | 16 |
 | wasmdown: link error: unknown export: f64.load | 16 |
@@ -117,13 +115,10 @@ harness-error outcomes are reported as themselves, never converted.
 | wasmdown: link error: unknown export: i64.store | 16 |
 | no module to register | 12 |
 | trap kind OUT-OF-BOUNDS-TABLE, want OUT-OF-BOUNDS-MEMORY | 12 |
-| result 0: got #(1 2 3 4 5 6 7 8 ...) | 11 |
 | result 0: got #(0 0 0 0 1 0 0 0 ...) | 10 |
 | memory needs limits | 9 |
 | elem item must be an expression | 9 |
 | unexpected trap: no default for type V128 | 9 |
-| result 0: got #(2 3 4 5 6 7 8 9 ...) | 8 |
-| result 0: got #(0 1 2 3 4 5 6 7 ...) | 8 |
 | phase DECODE, want VALIDATE: invalid lane index 2 (max 1) | 8 |
 | phase DECODE, want VALIDATE: invalid lane index 4 (max 3) | 8 |
 | wasmdown: link error: unknown export: i64.load32_u | 8 |
@@ -133,34 +128,16 @@ harness-error outcomes are reported as themselves, never converted.
 | wasmdown: link error: unknown export: i64.store32 | 8 |
 | wasmdown: link error: unknown export: f32.store | 8 |
 | wasmdown: link error: unknown export: i32.store | 8 |
-| result 0: got 7 | 6 |
-| result 0: got 5 | 6 |
-| The value   #<DOUBLE-FLOAT quiet NaN> is not of type   INTEG | 6 |
 | result 0: got #(0 0 0 0 29 0 0 0 ...) | 6 |
 | :I64 fell through ECASE expression. Wanted one of (:I8 :I16  | 6 |
 | NIL fell through ECASE expression. Wanted one of (:EXACT :V1 | 6 |
 | wasmdown: link error: unknown export: new | 6 |
 | phase DECODE, want LINK: type: unknown type definition sub | 5 |
-| result 0: got 2 | 5 |
-| result 0: got #(3 4 5 6 7 8 9 10 ...) | 5 |
 | phase DECODE, want VALIDATE: invalid lane index 8 (max 7) | 5 |
-| The value   1.23456789d27 is not of type   INTEGER | 5 |
 | The value   16 is not of type   (UNSIGNED-BYTE 4) | 5 |
 | type mismatch at offset 0: expected I32, got I64 | 4 |
-| unexpected trap: call_indirect on null reference 26 | 4 |
-| unexpected trap: call_indirect on null reference 25 | 4 |
-| unexpected trap: call_indirect on null reference 24 | 4 |
-| unexpected trap: call_indirect on null reference 23 | 4 |
-| unexpected trap: call_indirect on null reference 22 | 4 |
 | phase DECODE, want VALIDATE: invalid lane index 255 (max 1) | 4 |
 | phase DECODE, want VALIDATE: invalid lane index 255 (max 3) | 4 |
-| The value   1.3754889325393114d24 is not of type   INTEGER | 4 |
-| The value   1.23456789d8 is not of type   INTEGER | 4 |
-| The value   0.0d0 is not of type   INTEGER | 4 |
-| The value   1.2345679e27 is not of type   INTEGER | 4 |
-| The value   8.198553e16 is not of type   INTEGER | 4 |
-| The value   1.2345679e8 is not of type   INTEGER | 4 |
-| The value   #<SINGLE-FLOAT quiet NaN> is not of type   INTEG | 4 |
 | result 0: got #(0 0 0 0 255 255 255 255 ...) | 4 |
 | global 0 init: instruction V128.CONST is not constant | 4 |
 | wasmdown: link error: unknown export: i64.load16_u | 4 |
@@ -184,23 +161,9 @@ harness-error outcomes are reported as themselves, never converted.
 | global 0 init: instruction ARRAY.NEW is not constant | 4 |
 | phase DECODE, want LINK: rec type: unknown type definition s | 3 |
 | phase DECODE, want VALIDATE: rec type: unknown type definiti | 3 |
-| The value   -1.0d0 is not of type   INTEGER | 3 |
-| result 0: got #(15 0 0 0 0 0 0 0 ...) | 3 |
-| unexpected trap: out of bounds memory access: 65532 + 8 not  | 3 |
-| unexpected trap: out of bounds memory access: 65534 + 8 not  | 3 |
-| unexpected trap: out of bounds memory access: 65535 + 8 not  | 3 |
 | phase DECODE, want VALIDATE: invalid lane index 255 (max 7) | 3 |
 | phase DECODE, want VALIDATE: invalid lane index 255 (max 15) | 3 |
 | phase DECODE, want VALIDATE: invalid lane index 16 (max 15) | 3 |
-| The value   #.DOUBLE-FLOAT-POSITIVE-INFINITY is not of type  | 3 |
-| The value   #.DOUBLE-FLOAT-NEGATIVE-INFINITY is not of type  | 3 |
-| The value   2.2250738585072014d-308 is not of type   INTEGER | 3 |
-| The value   -2.2250738585072014d-308 is not of type   INTEGE | 3 |
-| The value   1.7976931348623157d308 is not of type   INTEGER | 3 |
-| The value   -1.7976931348623157d308 is not of type   INTEGER | 3 |
-| The value   -0.0d0 is not of type   INTEGER | 3 |
-| The value   3.14 is not of type   INTEGER | 3 |
-| result 0: got 9218868437227405311 | 3 |
 | result 0: got #(255 255 255 255 0 0 0 0 ...) | 3 |
 | result 0: got #(0 0 0 0 0 0 0 0 ...) | 3 |
 | result 0: got #(0 0 0 0 27 0 0 0 ...) | 3 |
@@ -208,32 +171,11 @@ harness-error outcomes are reported as themselves, never converted.
 | wasmdown: link error: unknown export: copy | 3 |
 | global 0 init: instruction REF.I31 is not constant | 3 |
 | unexpected trap: out of bounds array.new_data: [1,3) not wit | 3 |
+| result 0: got 5 | 2 |
+| result 0: got 7 | 2 |
 | unexpected trap: call_indirect on null reference 13 | 2 |
 | wasmdown: link error: unknown export: run | 2 |
-| The value   #<DOUBLE-FLOAT trapping NaN> is not of type   IN | 2 |
-| The value   0.5d0 is not of type   INTEGER | 2 |
-| The value   1.1 is not of type   INTEGER | 2 |
-| The value   0.0 is not of type   INTEGER | 2 |
 | bad or missing immediates for v128.load8_lane | 2 |
-| The value   1.5637499e11 is not of type   INTEGER | 2 |
-| The value   4.298403e22 is not of type   INTEGER | 2 |
-| The value   -1.7014118e38 is not of type   INTEGER | 2 |
-| The value   -3.4028235e38 is not of type   INTEGER | 2 |
-| The value   -1.0e38 is not of type   INTEGER | 2 |
-| The value   #.SINGLE-FLOAT-NEGATIVE-INFINITY is not of type  | 2 |
-| The value   -53.0 is not of type   INTEGER | 2 |
-| The value   1.7014118e38 is not of type   INTEGER | 2 |
-| The value   3.4028235e38 is not of type   INTEGER | 2 |
-| The value   1.0e38 is not of type   INTEGER | 2 |
-| The value   #.SINGLE-FLOAT-POSITIVE-INFINITY is not of type  | 2 |
-| The value   53.0 is not of type   INTEGER | 2 |
-| result 0: got 18442240474082181119 | 2 |
-| The value   9221120237041090560 is not of type   FLOAT | 2 |
-| The value   18444492273895866368 is not of type   FLOAT | 2 |
-| result 0: got 9218868437227405312 | 2 |
-| result 0: got 18442240474082181120 | 2 |
-| result 0: got 4503599627370496 | 2 |
-| The value   2143289344 is not of type   FLOAT | 2 |
 | phase DECODE, want VALIDATE: bad or missing immediates for i | 2 |
 | bad or missing immediates for i8x16.abs | 2 |
 | result 0: got #(0 0 0 0 255 223 1 0 ...) | 2 |
@@ -262,6 +204,7 @@ harness-error outcomes are reported as themselves, never converted.
 | wasmdown: host error: invoke: export set_get expects 2 argum | 2 |
 | wasmdown: link error: unknown export: len | 2 |
 | type mismatch at offset 0: expected I64, got I32 | 1 |
+| result 0: got 2 | 1 |
 | unknown import: spectest.table64 | 1 |
 | invalid limits for table 0: min 0, max 18446744073709551615 | 1 |
 | invalid limits for table 0: min 18446744073709551615, max no | 1 |
@@ -300,34 +243,8 @@ harness-error outcomes are reported as themselves, never converted.
 | wasmdown: link error: unknown export: as-local_set-value1 | 1 |
 | wasmdown: link error: unknown export: as-return-value1 | 1 |
 | wasmdown: link error: unknown export: as-br-value1 | 1 |
-| The value   1.0 is not of type   INTEGER | 1 |
-| The value   0.25 is not of type   INTEGER | 1 |
-| The value   -1.125 is not of type   INTEGER | 1 |
-| The value   1.5d0 is not of type   INTEGER | 1 |
-| The value   -0.25 is not of type   INTEGER | 1 |
-| The value   1.5 is not of type   INTEGER | 1 |
-| The value   2.6235369349275807d18 is not of type   INTEGER | 1 |
-| The value   7.211523414631705d29 is not of type   INTEGER | 1 |
-| The value   -6.283185307179586d0 is not of type   INTEGER | 1 |
-| The value   6.283185307179586d0 is not of type   INTEGER | 1 |
-| The value   1.0d0 is not of type   INTEGER | 1 |
-| The value   -0.5d0 is not of type   INTEGER | 1 |
-| The value   -4.9406564584124654d-324 is not of type   INTEGE | 1 |
-| The value   4.9406564584124654d-324 is not of type   INTEGER | 1 |
-| The value   -1.1d0 is not of type   INTEGER | 1 |
-| The value   1.1d0 is not of type   INTEGER | 1 |
-| The value   #<SINGLE-FLOAT trapping NaN> is not of type   IN | 1 |
-| The value   -1.1 is not of type   INTEGER | 1 |
-| result 0: got #(5 6 7 8 9 10 0 0 ...) | 1 |
-| result 0: got #(4 5 6 7 8 9 10 0 ...) | 1 |
-| result 0: got #(11 12 13 14 15 0 0 0 ...) | 1 |
-| result 0: got #(10 11 12 13 14 15 0 0 ...) | 1 |
-| result 0: got #(9 10 11 12 13 14 15 0 ...) | 1 |
-| result 0: got #(8 9 10 11 12 13 14 15 ...) | 1 |
-| result 0: got #(7 8 9 10 11 12 13 14 ...) | 1 |
-| result 0: got #(6 7 8 9 10 11 12 13 ...) | 1 |
-| result 0: got #(5 6 7 8 9 10 11 12 ...) | 1 |
-| result 0: got #(4 5 6 7 8 9 10 11 ...) | 1 |
+| result 0: got #(255 255 255 127 255 255 255 127 ...) | 1 |
+| result 0: got #(1 0 128 127 1 0 128 127 ...) | 1 |
 | bad or missing immediates for v128.load64_lane | 1 |
 | bad or missing immediates for v128.load32_lane | 1 |
 | bad or missing immediates for v128.load16_lane | 1 |
@@ -340,45 +257,8 @@ harness-error outcomes are reported as themselves, never converted.
 | wasmdown: link error: unknown export: as-local_set-value | 1 |
 | wasmdown: link error: unknown export: as-return-value-1 | 1 |
 | wasmdown: link error: unknown export: as-if-condition-value | 1 |
-| The value   3.14d0 is not of type   INTEGER | 1 |
-| The value   2.5d0 is not of type   INTEGER | 1 |
-| The value   1.25 is not of type   INTEGER | 1 |
 | phase DECODE, want VALIDATE: invalid lane index 255 (max 31) | 1 |
 | phase DECODE, want VALIDATE: invalid lane index 16 (max 7) | 1 |
-| The value   1.23456789d-11 is not of type   INTEGER | 1 |
-| The value   -2.25d0 is not of type   INTEGER | 1 |
-| The value   2.25d0 is not of type   INTEGER | 1 |
-| The value   -1.25d0 is not of type   INTEGER | 1 |
-| The value   1.25d0 is not of type   INTEGER | 1 |
-| result 0: got 1 | 1 |
-| result 0: got 4503599627370495 | 1 |
-| result 0: got 13835058055282163712 | 1 |
-| result 0: got 4611686018427387904 | 1 |
-| result 0: got 9223372036854775808 | 1 |
-| result 0: got 4968090884938317023 | 1 |
-| result 0: got 4728057454347157504 | 1 |
-| result 0: got 13835621005235585024 | 1 |
-| result 0: got 4612248968380809216 | 1 |
-| result 0: got 4882522492018277599 | 1 |
-| result 0: got 5012481849648991189 | 1 |
-| result 0: got 9227875636482146304 | 1 |
-| result 0: got 3638571412512157 | 1 |
-| result 0: got 9227010608267287965 | 1 |
-| result 0: got 4609434218613702656 | 1 |
-| result 0: got 13832806255468478464 | 1 |
-| result 0: got 1536271028 | 1 |
-| result 0: got 1290500515 | 1 |
-| result 0: got 4286578688 | 1 |
-| result 0: got 4278190080 | 1 |
-| result 0: got 4286578687 | 1 |
-| result 0: got 4271273625 | 1 |
-| result 0: got 1376887476 | 1 |
-| result 0: got 1820282235 | 1 |
-| result 0: got 2139095040 | 1 |
-| result 0: got 2130706432 | 1 |
-| result 0: got 2139095039 | 1 |
-| result 0: got 2123789977 | 1 |
-| result 0: got 3231711232 | 1 |
 | result 0: got #(255 255 255 255 19 0 0 0 ...) | 1 |
 | result 0: got #(255 255 255 255 1 0 0 0 ...) | 1 |
 | result 0: got #(255 255 255 127 19 0 0 0 ...) | 1 |

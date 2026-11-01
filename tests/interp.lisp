@@ -304,7 +304,7 @@
         (call-export inst "spin" 0))
       ;; host survived: the depth counter is clean and a fresh
       ;; (shallow) guest call still executes.
-      (expect (symbol-value 'wasmdown.interp::*call-depth*) 0)
+      (expect wasmdown.runtime:*guest-depth* 0)
       (expect (call-export inst "answer") '(42)))))
 
 (wasmdown.test:test interp/call-mutual

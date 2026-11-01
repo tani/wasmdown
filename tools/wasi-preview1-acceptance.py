@@ -18,6 +18,13 @@ Cases
   escape           a path escaping the preopen root is refused
 
 Usage: tools/wasi-preview1-acceptance.py [--verbose]
+       [--backend interpret|baseline] [--heap-mb N]
+
+--backend baseline runs the same cases with WASMDOWN_API_MODE=baseline:
+every guest core is compiled before its start section, which needs a much
+larger SBCL heap (~8 GiB for the 6 MB SQLite fixture) and roughly 200 s
+of compile time per fresh process. The lane stays exact about stdout,
+status and host effects; nothing is retried on the other backend.
 Exit status: 0 when every case passes.
 """
 import os
@@ -31,14 +38,34 @@ FIXTURE = os.path.join(ROOT, "tests", "fixtures", "wasi", "sqlite3-p1.wasm")
 LAUNCHER = os.path.join(ROOT, "tools", "wasmdown.lisp")
 VERBOSE = "--verbose" in sys.argv[1:]
 
+
+def _arg(flag, default):
+    argv = sys.argv[1:]
+    if flag in argv and argv.index(flag) + 1 < len(argv):
+        return argv[argv.index(flag) + 1]
+    return default
+
+
+BACKEND = _arg("--backend", os.environ.get("WASMDOWN_BACKEND", "interpret"))
+HEAP_MB = int(_arg("--heap-mb", "8192" if BACKEND == "baseline" else "0"))
+CASE_TIMEOUT = 900 if BACKEND == "baseline" else 240
+if BACKEND not in ("interpret", "baseline"):
+    print(f"unknown --backend {BACKEND!r}")
+    sys.exit(2)
+
 failures = []
 
 
-def run_cli(args, stdin_text, env=None, timeout=240):
-    command = ["sbcl", "--script", LAUNCHER, "run", FIXTURE, "--wasi"] + args
+def run_cli(args, stdin_text, env=None, timeout=None):
+    heap = ["--dynamic-space-size", str(HEAP_MB)] if HEAP_MB else []
+    command = (["sbcl"] + heap
+               + ["--script", LAUNCHER, "run", FIXTURE, "--wasi"] + args)
     environment = dict(os.environ)
+    if BACKEND == "baseline":
+        environment["WASMDOWN_API_MODE"] = "baseline"
     if env:
         environment.update(env)
+    timeout = CASE_TIMEOUT if timeout is None else timeout
     proc = subprocess.run(command, input=stdin_text, text=True,
                           capture_output=True, timeout=timeout, cwd=ROOT,
                           env=environment)

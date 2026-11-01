@@ -116,13 +116,29 @@ records why the shape matters.
 
 ## Execution backends
 
-`wasmdown.runtime:wasm-call` is the only call trampoline. Host functions are
-applied directly; Wasm functions dispatch through the `*invoke-wasm-func*`
-hook that the interpreter installs. The baseline backend does not replace that
-hook: it compiles each function into a closure with the host-function shape,
-so interpreted and compiled functions compose in one call graph and can be
-compared on identical instances. See
-[`adr/ADR-004`](adr/ADR-004-codegen-bridge.md).
+The backend is selected explicitly at instantiation — `:interpret` (default)
+or `:baseline` — and applies to the functions the module defines. It is a
+property of the func-instance (`backend`, `compiled-entry`), not a replacement
+object: compilation fills the entry, so exports, tables, element segments,
+`ref.func` and other modules' imports keep the same reference, and an imported
+Wasm function keeps the backend of the instance that defined it.
+
+`wasmdown.runtime:wasm-call` is the single entry to the guest call protocol
+(`invoke-wasm`). It owns guest depth (`*guest-depth*`, limit
+`*guest-depth-limit*`, `:call-stack-exhausted`), the tail-transfer trampoline
+(`return_call`, `return_call_indirect` and `return_call_ref` transfer the
+callee to the current trampoline instead of calling, so neither host stack nor
+guest depth grows) and the outermost exception boundary (an uncaught guest
+exception traps there). Bodies are backend-specific: an interpreter body
+(`*invoke-wasm-body*`) or the compiled closure in `compiled-entry`. Host
+functions bypass both and are applied directly.
+
+`instantiate` fixes the order: validation, import resolution, allocation,
+backend installation (compilation), active segments, exports, `before-start`,
+start section. A `codegen-error` therefore precedes every guest-visible effect,
+and the start section runs through the selected backend. See
+[`adr/ADR-004`](adr/ADR-004-codegen-bridge.md) and
+[`usage/lisp-api.md`](usage/lisp-api.md).
 
 ## Host edge
 

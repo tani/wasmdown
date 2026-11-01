@@ -4,7 +4,10 @@ SBCL ?= sbcl
 ROOT := $(patsubst %/,%,$(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
 LISP_FILES := $(wildcard src/*.lisp)
 
-.PHONY: all test test-unit test-spec-core test-component test-component-census \
+.PHONY: all test test-unit test-spec-core test-component test-component-census report-component-baseline \
+        test-backend-parity report-backend-parity \
+        report-backend-inventory test-backend-inventory \
+        report-backends-bench \
         test-upstream test-wasi-preview1 test-wasi-preview2 test-wasi \
         report-conformance clean \
         load-system repl wasi-fixtures
@@ -28,6 +31,33 @@ test-unit:
 # feature files are classified, never silently passed.
 test-spec-core:
 	$(SBCL) --control-stack-size 16 --dynamic-space-size 2048 --script tools/run-spec-core.lisp
+
+# Backend parity gate: every pinned core script once through :interpret and
+# once through :baseline, paired by case id. Exits non-zero on any divergence,
+# baseline compile refusal, timeout/harness error, or command-count mismatch.
+# Baseline compilation needs more heap than the interpreter-only lane.
+test-backend-parity:
+	$(SBCL) --control-stack-size 16 --dynamic-space-size 8192 --script tools/run-backend-parity.lisp --mode gate
+
+# Backend parity report (always exits zero): regenerates
+# docs/conformance/backends.md plus the JSONL/summary artifacts.
+report-backend-parity:
+	$(SBCL) --control-stack-size 16 --dynamic-space-size 8192 --script tools/run-backend-parity.lisp --mode report --commit
+
+# Backend cost bench: decode / validate / instantiate(+compile) / run for
+# synthetic kernels and an optional real module, medians over --repeat runs.
+# Writes docs/conformance/performance.md and tests/bench-backends.json.
+report-backends-bench:
+	$(SBCL) --control-stack-size 32 --dynamic-space-size 4096 --script tools/bench-backends.lisp --repeat 3 --commit --json tests/bench-backends.json
+
+# Backend/ABI inventory: enumerate the pinned WASI surfaces from the runtime's
+# real registration tables and reconcile them with the pinned census; writes
+# tests/backend-inventory.json and docs/conformance/inventory.md.
+report-backend-inventory:
+	python3 tools/backend-inventory.py
+
+test-backend-inventory:
+	python3 tools/backend-inventory.py --check
 
 # Component suite lane (docs/design/PLAN.md §12.7, M7): tests/component/{binary,
 # validation} minus nyi.txt through the component-aware WAST runner.
@@ -54,9 +84,16 @@ test-wasi-preview2:
 test-wasi:
 	python3 tools/run-wasi-suite.py --abi all
 
+# Component suite under the BASELINE backend: the same corpus with every
+# defined core function compiled before its start section. Report mode (a
+# refusal is data here); writes tests/component-baseline/ and
+# tests/component-baseline-results.jsonl.
+report-component-baseline:
+	$(SBCL) --control-stack-size 16 --dynamic-space-size 8192 --script tools/run-component-suite.lisp --backend baseline --mode report
+
 # Component-lane census (docs/design/PLAN.md §12.7): RUNS full lane executions in
 # fresh processes, each required to be GATE: GREEN with the pinned
-# 1631-command denominator. A shrinking denominator or any fail/herr/
+# 1702-command denominator. A shrinking denominator or any fail/herr/
 # timeout/skip fails the census. Default 30 runs; override with RUNS=n.
 RUNS ?= 30
 test-component-census:

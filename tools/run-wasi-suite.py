@@ -44,6 +44,12 @@ FAILURE_DIR = None  # set by main() to <output-dir>/failures
 FIXTURES = ROOT / "tests" / "fixtures" / "wasi"
 P1 = "sqlite3-p1.wasm"
 P2 = "sqlite3-p2.wasm"
+# A WASI 0.3.2 (@0.3.2 imports, Component Model async) command guest.
+# No such guest is pinned in this repository yet: no toolchain in the
+# development environment produces the 0.3.2 component ABI. The lane
+# selects preview3 ONLY when asked, and a missing fixture is a FAILURE
+# (never a skip), so nothing can pass silently.
+P3 = "p3-guest.wasm"
 
 # ---- the cases -----------------------------------------------------
 # expect.stdout_equals  : exact stdout (list of lines, joined by \n, one
@@ -190,6 +196,17 @@ CASES = [
         "stdin": ".bail on\nCREATE TABLE z(x);\n",
         "expect": {"exit_nonzero": True, "absent": ["x.db"]},
     },
+    # ---------------- WASI 0.3.2 ----------------
+    # No pinned @0.3.2 guest exists yet: this case FAILS with a missing
+    # fixture rather than letting the P3 ABI look covered.
+    {
+        "id": "p3/guest-smoke",
+        "abi": "preview3",
+        "fixture": P3,
+        "argv": ["--version"],
+        "stdin": "",
+        "expect": {"exit": 0},
+    },
     # ---------------- Preview 1 ----------------
     {
         "id": "p1/select-memory",
@@ -235,6 +252,9 @@ CASES = [
 ]
 
 ABI_FILTERS = {"preview1": {"preview1"}, "preview2": {"preview2"},
+               "preview3": {"preview3"},
+               # "all" is the released-ABI gate; preview3 stays explicit
+               # until a pinned @0.3.2 guest exists.
                "all": {"preview1", "preview2"}}
 
 
@@ -380,7 +400,9 @@ def main() -> int:
         sys.exit(f"duplicate case ids in the manifest: {', '.join(dupes)}")
     selected = [c for c in CASES if c["abi"] in ABI_FILTERS[args.abi]]
     if not selected:
-        sys.exit("no cases selected")
+        # selecting an ABI with no cases is a configuration error, never
+        # a silent "0/0 pass"
+        sys.exit(f"no cases selected for --abi {args.abi}")
     if args.list:
         for c in selected:
             print(c["id"])

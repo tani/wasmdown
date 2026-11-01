@@ -646,10 +646,13 @@ Confined: `..` may not climb above the root, symlink targets are
 re-confined and the expansion budget is bounded. CREATE-P allows a
 MISSING final component (path_open with oflags::creat): resolution
 must not require the file to exist before it is created."
+  ;; The path components are read BEFORE the preopen is duplicated: a
+  ;; bad pointer or an absolute path (FAULT/NOTCAPABLE) must not leak
+  ;; the dup'd directory handle.
   (let* ((preopen (p1-fd-preopen entry))
+         (todo (%p1-path-components state path-addr path-len))
          (budget *p1-max-symlink-expansions*)
-         (stack (list (%p1-check (%p1-libc-dup preopen))))
-         (todo (%p1-path-components state path-addr path-len)))
+         (stack (list (%p1-check (%p1-libc-dup preopen)))))
     (labels ((fail (errno)
                (dolist (fd stack) (ignore-errors (%p1-libc-close fd)))
                (%p1-abort errno))
@@ -769,12 +772,16 @@ a Lisp integer (overflow beyond the 32-bit address space is FAULT)."
 
 (defun %p1-scatter (state iovs count bytes)
   "Write BYTES across COUNT iovecs in order; return the number of
-bytes actually placed (bytes beyond the iovecs are dropped)."
+bytes actually placed (bytes beyond the iovecs are dropped). Every
+data span is re-validated at USE time: the descriptor table may
+overlap the destination, so an earlier scatter write can change a
+later iovec."
   (let ((offset 0))
     (dotimes (i count)
       (let* ((base (+ iovs (* i +p1-size-iovec+)))
              (ptr (%p1-u32 state base))
              (len (%p1-u32 state (+ base 4))))
+        (%p1-check-range state ptr len)
         (when (< offset (length bytes))
           (let ((n (min len (- (length bytes) offset))))
             (replace (%p1-bytes state) bytes
@@ -783,7 +790,8 @@ bytes actually placed (bytes beyond the iovecs are dropped)."
     offset))
 
 (defun %p1-gather (state iovs count)
-  "A contiguous octet vector of the COUNT iovecs' contents."
+  "A contiguous octet vector of the COUNT iovecs' contents. Each span
+is validated again at copy time (the descriptors may alias the data)."
   (let* ((total (%p1-iov-length state iovs count))
          (out (make-array total :element-type '(unsigned-byte 8))))
     (let ((offset 0))
@@ -791,6 +799,7 @@ bytes actually placed (bytes beyond the iovecs are dropped)."
         (let* ((base (+ iovs (* i +p1-size-iovec+)))
                (ptr (%p1-u32 state base))
                (len (%p1-u32 state (+ base 4))))
+          (%p1-check-range state ptr len)
           (replace out (%p1-bytes state) :start1 offset :start2 ptr :end2 (+ ptr len))
           (incf offset len))))
     out))
@@ -1379,6 +1388,9 @@ from the rights the guest asked for on the new descriptor."
       (%p1-require entry +p1-right-path-create-file+))
     (when (logtest oflags +p1-oflag-trunc+)
       (%p1-require entry +p1-right-path-filestat-set-size+))
+    ;; the result slot is validated BEFORE any host side effect and
+    ;; before a guest fd is installed.
+    (%p1-check-range state out-ptr 4)
     (let ((access (cond ((and (logtest rights-base +p1-right-fd-write+)
                                (logtest rights-base +p1-right-fd-read+))
                          +o-rdwr+)
@@ -1394,29 +1406,37 @@ from the rights the guest asked for on the new descriptor."
           (let ((new-fd (%libc-openat dir leaf host-flags #o644)))
             (when (minusp new-fd)
               (%p1-abort (%p1-host-errno (sb-alien:get-errno))))
-            (handler-case
-                (multiple-value-bind (dev ino mode) (%p1-fstat new-fd)
-                  (declare (ignore dev ino))
-                  (let* ((filetype (%p1-filetype-of-mode mode))
-                         (new (%make-p1-fd
-                               :fd new-fd
-                               :kind :file
-                               :preopen (p1-fd-preopen entry)
-                               :name ""
-                               :rights-base rights-base
-                               :rights-inheriting rights-inheriting
-                               :flags fdflags
-                               :dir-p (= filetype +p1-file-directory+)
-                               :filetype filetype))
-                         (guest-fd (%p1-add-fd state new)))
-                    (setf (%p1-u32 state out-ptr) guest-fd)
-                    +p1-success+))
-              (p1-abort (c)
-                (%p1-libc-close new-fd)
-                (error c)))))))))
+            (let ((guest-fd nil))
+              (handler-case
+                  (multiple-value-bind (dev ino mode) (%p1-fstat new-fd)
+                    (declare (ignore dev ino))
+                    (let* ((filetype (%p1-filetype-of-mode mode))
+                           (new (%make-p1-fd
+                                 :fd new-fd
+                                 :kind :file
+                                 :preopen (p1-fd-preopen entry)
+                                 :name ""
+                                 :rights-base rights-base
+                                 :rights-inheriting rights-inheriting
+                                 :flags fdflags
+                                 :dir-p (= filetype +p1-file-directory+)
+                                 :filetype filetype)))
+                      (setf guest-fd (%p1-add-fd state new))
+                      (setf (%p1-u32 state out-ptr) guest-fd)
+                      +p1-success+))
+                (p1-abort (c)
+                  ;; release BOTH the host handle and the ABI slot: a
+                  ;; failed call must not leave a usable-looking fd
+                  (when guest-fd (%p1-drop-fd state guest-fd))
+                  (%p1-libc-close new-fd)
+                  (error c))))))))))
 
 (%p1-fn %p1-path-readlink (state fd path-addr path-len buf buf-len bufused-ptr)
   (let ((entry (%p1-require (%p1-lookup-fd state fd) +p1-right-path-readlink+)))
+    ;; the guest buffer is validated BEFORE the host read and before the
+    ;; scratch allocation (a huge BUF-LEN can otherwise size an alien
+    ;; buffer from a bogus span).
+    (%p1-check-range state buf buf-len)
     (%p1-with-resolved (dir leaf) (state entry path-addr path-len nil)
       (let* ((alien (sb-alien:make-alien sb-alien:unsigned-char (max 1 buf-len))))
         (unwind-protect
@@ -1494,6 +1514,9 @@ from the rights the guest asked for on the new descriptor."
 (%p1-fn %p1-sock-accept (state fd flags out-ptr)
   (let ((entry (%p1-require (%p1-lookup-fd state fd) +p1-right-sock-accept+)))
     (unless (zerop (logandc2 flags +p1-fdflag-nonblock+)) (%p1-abort +p1-inval+))
+    ;; the result slot is validated before accept(2) and before a guest
+    ;; fd is installed.
+    (%p1-check-range state out-ptr 4)
     (let ((new-fd (%libc-accept4 (p1-fd-fd entry) (sb-sys:int-sap 0) (sb-sys:int-sap 0)
                                  (if (logtest flags +p1-fdflag-nonblock+) +o-nonblock+ 0))))
       (when (minusp new-fd)
@@ -1503,37 +1526,48 @@ from the rights the guest asked for on the new descriptor."
                               :rights-inheriting (p1-fd-rights-inheriting entry)
                               :flags flags
                               :filetype +p1-file-socket-stream+))
-             (guest-fd (%p1-add-fd state new)))
-        (setf (%p1-u32 state out-ptr) guest-fd)
-        +p1-success+))))
+             (guest-fd nil))
+        (handler-case
+            (progn
+              (setf guest-fd (%p1-add-fd state new))
+              (setf (%p1-u32 state out-ptr) guest-fd)
+              +p1-success+)
+          (p1-abort (c)
+            (when guest-fd (%p1-drop-fd state guest-fd))
+            (%p1-libc-close new-fd)
+            (error c)))))))
 
 (%p1-fn %p1-sock-recv (state fd iovs count ri-flags datalen-ptr roflags-ptr)
   (let* ((entry (%p1-require (%p1-lookup-fd state fd) +p1-right-fd-read+))
          (total (%p1-iov-length state iovs count))
-         (alien (sb-alien:make-alien sb-alien:unsigned-char (max 1 total)))
          (flags (logior (if (logtest ri-flags +p1-riflag-peek+) 2 0) ; MSG_PEEK
                         (if (logtest ri-flags +p1-riflag-waitall+) #x100 :0)))) ; MSG_WAITALL
+    ;; flags are validated BEFORE the scratch buffer exists: a rejection
+    ;; here must not leak the alien allocation.
     (when (logtest ri-flags (lognot 3)) (%p1-abort +p1-inval+))
-    (unwind-protect
-         (let ((n (%libc-recv (p1-fd-fd entry) (sb-alien:alien-sap alien) total flags)))
-           (when (minusp n)
-             (%p1-abort (%p1-host-errno (sb-alien:get-errno))))
-           (let ((data (make-array n :element-type '(unsigned-byte 8))))
-             (loop for i below n
-                   do (setf (aref data i)
-                            (sb-sys:sap-ref-8 (sb-alien:alien-sap alien) i)))
-             (setf (%p1-u32 state datalen-ptr) (%p1-scatter state iovs count data)
-                   (%p1-u16 state roflags-ptr) 0)
-             +p1-success+))
-      (sb-alien:free-alien alien))))
+    (let ((alien (sb-alien:make-alien sb-alien:unsigned-char (max 1 total))))
+      (unwind-protect
+           (let ((n (%libc-recv (p1-fd-fd entry) (sb-alien:alien-sap alien) total flags)))
+             (when (minusp n)
+               (%p1-abort (%p1-host-errno (sb-alien:get-errno))))
+             (let ((data (make-array n :element-type '(unsigned-byte 8))))
+               (loop for i below n
+                     do (setf (aref data i)
+                              (sb-sys:sap-ref-8 (sb-alien:alien-sap alien) i)))
+               (setf (%p1-u32 state datalen-ptr) (%p1-scatter state iovs count data)
+                     (%p1-u16 state roflags-ptr) 0)
+               +p1-success+))
+        (sb-alien:free-alien alien)))))
 
 (%p1-fn %p1-sock-send (state fd iovs count si-flags datalen-ptr)
-  (let* ((entry (%p1-require (%p1-lookup-fd state fd) +p1-right-fd-write+))
-         (data (%p1-gather state iovs count)))
+  (let ((entry (%p1-require (%p1-lookup-fd state fd) +p1-right-fd-write+)))
+    ;; flags first: nothing is copied out of guest memory for a request
+    ;; the ABI rejects.
     (when (plusp si-flags) (%p1-abort +p1-inval+))
-    (setf (%p1-u32 state datalen-ptr)
-          (%p1-write-from entry data))
-    +p1-success+))
+    (let ((data (%p1-gather state iovs count)))
+      (setf (%p1-u32 state datalen-ptr)
+            (%p1-write-from entry data))
+      +p1-success+)))
 
 (%p1-fn %p1-sock-shutdown (state fd how)
   (let ((entry (%p1-require (%p1-lookup-fd state fd) +p1-right-sock-shutdown+)))
@@ -1936,15 +1970,22 @@ alist. MODE is :INTERPRET (default) or :BASELINE."
     (%p1-install-stdio state context)
     (%p1-install-preopens state context)
     (%p1-install-sockets state sockets)
+    ;; MODE is installed in the PREPARE hook, not after instantiation:
+    ;; PREPARE runs with every object allocated and no guest code yet, so
+    ;; in :BASELINE the START SECTION itself runs compiled. Installing
+    ;; afterwards would silently interpret the start section.
+    (ecase mode
+      (:interpret)
+      (:baseline))
     (let ((inst (wasmdown.runtime:make-module-instance
                  module
                  (wasmdown::imports-table-entries table)
                  :before-start (lambda (instance)
-                                 (%p1-attach-memory state instance)))))
+                                 (%p1-attach-memory state instance))
+                 :prepare (when (eq mode :baseline)
+                            (lambda (instance)
+                              (wasmdown::%install-baseline! module instance))))))
       (setf (preview1-state-instance state) inst)
-      (ecase mode
-        (:interpret)
-        (:baseline (wasmdown::%install-baseline! module inst)))
       (values inst state))))
 
 (defun close-preview1-state (state)

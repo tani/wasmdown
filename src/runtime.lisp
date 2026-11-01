@@ -63,12 +63,22 @@ element/data segment drop state and retained contents."
   "A function reference. KIND :WASM: WASM-FUNCIDX indexes the module's
 DEFINED funcs vector (wasm-module-funcs), MODULE is the backpointer to
 its module-instance. KIND :HOST: HOST-FN is a Lisp function of the
-individual arguments returning a results list."
+individual arguments returning a results list.
+
+BACKEND / COMPILED-ENTRY belong to KIND :WASM only and change nothing
+about the reference: an imported, exported, table-held or ref.func'd
+func-instance IS the same object in both backends, so identity is
+stable across instantiation modes. COMPILED-ENTRY, when non-NIL, is a
+closure (lambda (args) results) used instead of the interpreter hook;
+an IMPORTED function keeps the backend of its defining instance, because
+the object itself is shared."
   (kind :wasm :type (member :wasm :host))
   (wasm-funcidx 0 :type (integer 0))
   module
   host-fn
-  type)
+  type
+  (backend :interpret :type (member :interpret :baseline))
+  compiled-entry)
 
 (defstruct (memory-instance (:constructor %make-memory-instance))
   "Linear memory: BYTES is a (vector (unsigned-byte 8)) of PAGES
@@ -233,6 +243,258 @@ memory/table')."
            "out of bounds array access: [~d,~d) not within ~d"
            start end (length (wasm-array-instance-contents array)))))
 
+;;; ---------------------------------------------------------------
+;;; Value-level GC semantics (loop 22) shared by BOTH backends. The
+;;; reference interpreter calls these directly; the baseline compiler
+;;; emits one call per GC instruction, so the packed normalization,
+;;; field defaults, bounds checks and cast rules have exactly ONE
+;;; implementation.
+
+(defun packed-normalize (value storage-type)
+  "The STORE side of packed normalization: an :I8/:I16 storage wraps
+VALUE to its width; every other storage keeps it (the validator proved
+the type)."
+  (case storage-type
+    (:i8 (mod value #x100))
+    (:i16 (mod value #x10000))
+    (t value)))
+
+(defun packed-extend (value storage-type signedp)
+  "The LOAD side of packed normalization: SIGNEDP (struct.get_s /
+array.get_s) sign-extends a packed storage to the i32 unsigned
+domain; the plain and _u variants return the stored (width-wrapped)
+value."
+  (case storage-type
+    (:i8 (if signedp
+             (mod (if (>= value #x80) (- value #x100) value) #x100000000)
+             value))
+    (:i16 (if signedp
+              (mod (if (>= value #x8000) (- value #x10000) value)
+                   #x100000000)
+              value))
+    (t value)))
+
+(defun default-valtype-value (valtype)
+  "The default value of VALTYPE: numeric zero, packed zero, NIL for
+every reference type (the null bottom; the validator proves no
+non-nullable local is read before its set)."
+  (case valtype
+    (:i32 0) (:i64 0)
+    (:i8 0) (:i16 0)
+    (:f32 (wasmdown.numops:f32-from-bits 0))
+    (:f64 (wasmdown.numops:f64-from-bits 0))
+    (:funcref nil) (:externref nil) (:exnref nil)
+    (t (if (and (consp valtype) (eq (first valtype) :ref))
+           nil
+           (%trap :unreachable "no default for type ~a" valtype)))))
+
+(defun value-heap (v)
+  "The HEAP of a runtime reference value for the dynamic cast check:
+a func-instance -> :func; a struct/array value -> its concrete
+typeuse; an i31 payload -> :i31; a host object -> :extern; null ->
+the null bottom :none."
+  (cond
+    ((func-instance-p v) :func)
+    ((wasm-struct-instance-p v)
+     (list :type (wasm-struct-instance-typeidx v)))
+    ((wasm-array-instance-p v)
+     (list :type (wasm-array-instance-typeidx v)))
+    ((i31-p v) :i31)
+    ((null v) :none)
+    (t :extern)))
+
+(defun cast-succeeds-p (v heap nullable module)
+  "The DYNAMIC cast rule: whether V's shape is <: the target
+(REF NULL? HEAP) in MODULE's type vector. Null succeeds only against
+NULLABLE targets; concrete shapes go through the L2 lattice
+(WASMDOWN.TYPES:REFTYPE-SUB-P), the same relation the validator uses."
+  (cond
+    ((null v) (and nullable t))
+    (t (reftype-sub-p (list :ref (value-heap v))
+                      (if nullable
+                          (list :ref 'null heap)
+                          (list :ref heap))
+                      (wasm-module-types module)))))
+
+(defun %comptype-of (instance typeidx)
+  (wasm-rec-type-comptype
+   (svref (wasm-module-types (module-instance-module instance)) typeidx)))
+
+(defun %field-storage-type (instance typeidx fieldidx)
+  (first (nth fieldidx (wasm-comptype-fields (%comptype-of instance typeidx)))))
+
+(defun %array-element-type (instance typeidx)
+  (first (first (wasm-comptype-fields (%comptype-of instance typeidx)))))
+
+(defun struct-new-value (instance typeidx values)
+  "Allocate a struct from VALUES (push order): normalize packed
+fields on store."
+  (let ((fs (wasm-comptype-fields (%comptype-of instance typeidx))))
+    (make-wasm-struct-value
+     typeidx
+     (loop for v in values
+           for f in fs
+           collect (packed-normalize v (first f))))))
+
+(defun struct-new-default-value (instance typeidx)
+  (make-wasm-struct-value
+   typeidx
+   (loop for f in (wasm-comptype-fields (%comptype-of instance typeidx))
+         collect (default-valtype-value (first f)))))
+
+(defun struct-get-value (instance typeidx fieldidx ref signedp)
+  "Field FIELDidx of REF; a null REF traps, packed loads extend."
+  (when (null ref)
+    (%trap :null-reference "null struct reference"))
+  (packed-extend (struct-field-get ref fieldidx)
+                 (%field-storage-type instance typeidx fieldidx)
+                 signedp))
+
+(defun struct-set-value (instance typeidx fieldidx ref value)
+  (when (null ref)
+    (%trap :null-reference "null struct reference"))
+  (struct-field-set ref fieldidx
+                    (packed-normalize
+                     value (%field-storage-type instance typeidx fieldidx)))
+  (values))
+
+(defun array-new-value (instance typeidx value len)
+  (make-wasm-array-value
+   typeidx
+   (make-list (or len 0)
+              :initial-element
+              (packed-normalize value (%array-element-type instance typeidx)))))
+
+(defun array-new-default-value (instance typeidx len)
+  (make-wasm-array-value
+   typeidx
+   (make-list (or len 0)
+              :initial-element
+              (default-valtype-value (%array-element-type instance typeidx)))))
+
+(defun array-new-fixed-value (instance typeidx values)
+  (let ((st (%array-element-type instance typeidx)))
+    (make-wasm-array-value
+     typeidx
+     (mapcar (lambda (v) (packed-normalize v st)) values))))
+
+(defun %load-lanes-le (bytes ea width)
+  "A little-endian WIDTH-byte read at EA from a data segment's BYTES
+\(array.new_data/array.init_data fill sources; bounds checked by the
+caller)."
+  (loop for i below width
+        sum (ash (aref bytes (+ ea i)) (* 8 i))))
+
+(defun array-new-data-value (instance typeidx offset length dataidx)
+  "A new array of LENGTH elements read from data segment DATAIDX at
+OFFSET (both in elements of the packed storage width)."
+  (let* ((st (%array-element-type instance typeidx))
+         (width (ecase st (:i8 1) (:i16 2) (:i32 4)))
+         (bytes (take-data-bytes instance dataidx)))
+    (unless (<= (+ offset length) (/ (length bytes) width))
+      (%trap :out-of-bounds-table
+             "out of bounds array.new_data: [~d,~d) not within ~d"
+             offset length (/ (length bytes) width)))
+    (make-wasm-array-value
+     typeidx
+     (loop for i below length
+           collect (packed-normalize
+                    (%load-lanes-le bytes (* (+ offset i) width) width)
+                    st)))))
+
+(defun array-new-elem-value (instance typeidx offset length elemidx)
+  (let ((refs (take-elem-ref instance elemidx)))
+    (unless (<= (+ offset length) (length refs))
+      (%trap :out-of-bounds-table
+             "out of bounds array.new_elem: [~d,~d) not within ~d"
+             offset length (length refs)))
+    (make-wasm-array-value typeidx (subseq refs offset (+ offset length)))))
+
+(defun array-get-value (instance typeidx ref idx signedp)
+  (when (null ref)
+    (%trap :null-reference "null array reference"))
+  (packed-extend (array-element-get ref idx)
+                 (%array-element-type instance typeidx)
+                 signedp))
+
+(defun array-set-value (instance typeidx ref idx value)
+  (when (null ref)
+    (%trap :null-reference "null array reference"))
+  (array-element-set ref idx
+                     (packed-normalize
+                      value (%array-element-type instance typeidx)))
+  (values))
+
+(defun array-len-value (ref)
+  (when (null ref)
+    (%trap :null-reference "null array reference"))
+  (array-length ref))
+
+(defun array-fill-value (instance typeidx ref offset value length)
+  (when (null ref)
+    (%trap :null-reference "null array reference"))
+  (let ((st (%array-element-type instance typeidx)))
+    (unless (<= (+ offset length) (array-length ref))
+      (%trap :out-of-bounds-table
+             "out of bounds array.fill: [~d,~d) not within ~d"
+             offset length (array-length ref)))
+    (loop for i from offset below (+ offset length)
+          do (array-element-set ref i (packed-normalize value st)))
+    (values)))
+
+(defun array-copy-value (dst dst-offset src src-offset length)
+  (when (null dst)
+    (%trap :null-reference "null array reference"))
+  (when (null src)
+    (%trap :null-reference "null array reference"))
+  (unless (<= (+ src-offset length) (array-length src))
+    (%trap :out-of-bounds-table "out of bounds array.copy source"))
+  (unless (<= (+ dst-offset length) (array-length dst))
+    (%trap :out-of-bounds-table "out of bounds array.copy destination"))
+  (loop for i below length
+        do (array-element-set dst (+ dst-offset i)
+                              (array-element-get src (+ src-offset i))))
+  (values))
+
+(defun array-init-data-value (instance typeidx ref dst-index offset length
+                                       dataidx)
+  (when (null ref)
+    (%trap :null-reference "null array reference"))
+  (let* ((st (%array-element-type instance typeidx))
+         (width (ecase st (:i8 1) (:i16 2) (:i32 4)))
+         (bytes (take-data-bytes instance dataidx)))
+    (unless (<= (+ offset length) (/ (length bytes) width))
+      (%trap :out-of-bounds-table
+             "out of bounds array.init_data source"))
+    (unless (<= (+ dst-index length) (array-length ref))
+      (%trap :out-of-bounds-table
+             "out of bounds array.init_data destination"))
+    (loop for i below length
+          do (array-element-set
+              ref (+ dst-index i)
+              (packed-normalize
+               (%load-lanes-le bytes (* (+ offset i) width) width)
+               st)))
+    (values)))
+
+(defun array-init-elem-value (instance typeidx ref dst-index offset length
+                                       elemidx)
+  (declare (ignore typeidx))
+  (when (null ref)
+    (%trap :null-reference "null array reference"))
+  (let ((refs (take-elem-ref instance elemidx)))
+    (unless (<= (+ offset length) (length refs))
+      (%trap :out-of-bounds-table
+             "out of bounds array.init_elem source"))
+    (unless (<= (+ dst-index length) (array-length ref))
+      (%trap :out-of-bounds-table
+             "out of bounds array.init_elem destination"))
+    (loop for i below length
+          do (array-element-set ref (+ dst-index i)
+                                (nth (+ offset i) refs)))
+    (values)))
+
+
 (defun global-value (g) (global-instance-value g))
 (defun (setf global-value) (v g) (setf (global-instance-value g) v))
 (defun global-set-value (g v) (setf (global-instance-value g) v))
@@ -298,7 +560,111 @@ Elements initialize to the null reference (NIL)."
   (lambda (func args)
     (declare (ignore func args))
     (error 'wasmdown:host-error
-           :message "no wasm function executor installed (load wasmdown.interp)")))
+           :message "no wasm function executor installed (load wasmdown.interp)"))
+  "Compatibility entry point: the interpreter trampoline. WASM-CALL now
+goes through INVOKE-WASM, which drives *INVOKE-WASM-BODY* itself.")
+
+(defparameter *invoke-wasm-body*
+  (lambda (func args)
+    (declare (ignore func args))
+    (error 'wasmdown:host-error
+           :message "no wasm function body executor installed (load wasmdown.interp)"))
+  "Executes ONE guest function body and returns its results list. It
+does not manage depth, does not catch tail transfers and does not
+convert uncaught exceptions: those belong to INVOKE-WASM, so the
+interpreter and the compiled backend share one call protocol. A
+return_call throws *TAIL-CALL-TAG* with a TAIL-TRANSFER instead of
+calling:
+    (throw *tail-call-tag* (make-tail-transfer callee args))")
+
+;;; ---------------------------------------------------------------
+;;; The guest call protocol. ONE boundary for both backends.
+;;;
+;;; INVOKE-WASM owns what a compiled closure and an interpreter body must
+;;; not each reimplement:
+;;;
+;;;   - guest call depth (*GUEST-DEPTH*), which a TAIL transfer does not
+;;;     grow;
+;;;   - the tail-transfer trampoline, so return_call/return_call_indirect/
+;;;     return_call_ref need neither SBCL TCO nor a growing host stack;
+;;;   - the outermost exception boundary (an uncaught guest exception
+;;;     traps here, at the host<->guest edge).
+;;;
+;;; A body selected by the func-instance's COMPILED-ENTRY or by
+;;; *INVOKE-WASM-BODY* implements only "run this function once".
+
+(defparameter *tail-call-tag* 'wasmdown-tail-transfer
+  "Catch tag for a tail transfer; the payload is a TAIL-TRANSFER.")
+
+(defstruct (tail-transfer (:constructor make-tail-transfer (callee args)))
+  callee
+  args)
+
+(defun tail-call (callee args)
+  "Tail-transfer CALLEE with ARGS from the current guest body. Never
+returns: the transfer unwinds this body (and only this body) to the
+INVOKE-WASM trampoline that entered it. Compiled code calls this for
+return_call/return_call_indirect/return_call_ref."
+  (throw *tail-call-tag* (make-tail-transfer callee args)))
+
+(defvar *guest-depth* 0
+  "Guest call frames currently executing. Bound per INVOKE-WASM; a tail
+transfer keeps the frame it replaces, so only non-tail calls grow it.")
+
+(defvar *guest-depth-limit* 1000
+  "Maximum guest call nesting before :call-stack-exhausted. It bounds
+the HOST stack both backends consume per frame (interpreter body or
+compiled closure) plus the protocol frames; re-measure whenever the
+per-frame shape changes. See docs/status.md for the declared limit.")
+
+(declaim (inline %guest-depth-enter))
+(defun %guest-depth-enter (depth)
+  (when (>= depth *guest-depth-limit*)
+    (%trap :call-stack-exhausted
+           "call depth limit ~d exceeded" *guest-depth-limit*))
+  depth)
+
+(defun %run-guest-body (func args)
+  "Run one body of FUNC with the backend its func-instance selects."
+  (let ((entry (func-instance-compiled-entry func)))
+    (if entry
+        (progn (%count-backend-entry :baseline)
+               (funcall entry args))
+        (progn (%count-backend-entry :interpret)
+               (funcall *invoke-wasm-body* func args)))))
+
+(defun invoke-wasm (func args)
+  "Call a :wasm FUNC with ARGS (push order) and return its results list.
+The single protocol boundary shared by both backends."
+  (let* ((depth (%guest-depth-enter (1+ *guest-depth*)))
+         (*guest-depth* depth))
+    (let ((outermost-p (= depth 1)))
+      (handler-bind
+          ((wasmdown:wasm-exception
+             (lambda (ex)
+               ;; the boundary is the host<->guest edge: a nested call's
+               ;; exception must reach the CALLER's try_table handlers,
+               ;; so only the outermost invocation converts it.
+               (declare (ignore ex))
+               (when outermost-p
+                 (error 'wasmdown:wasm-trap
+                        :kind :uncaught-exception
+                        :message "uncaught exception")))))
+        (loop with f = func
+              with a = args
+              do (cond
+                   ;; a tail transfer landing on a HOST import has no
+                   ;; guest frame to replace: its results ARE this
+                   ;; invocation's results.
+                   ((eq (func-instance-kind f) :host)
+                    (return (funcall (func-instance-host-fn f) a)))
+                   (t
+                    (let ((outcome (catch *tail-call-tag*
+                                     (%run-guest-body f a))))
+                      (if (tail-transfer-p outcome)
+                          (setf f (tail-transfer-callee outcome)
+                                a (tail-transfer-args outcome))
+                          (return outcome))))))))))
 
 (defparameter *const-expr-evaluator*
   (lambda (instance expr)
@@ -464,6 +830,21 @@ possible (distinct backings)."
   (let ((elems (table-instance-elems table)))
     (loop for i from dst below (+ dst len)
           do (setf (svref elems i) ref))))
+
+(defun table-copy2 (dst-table src-table dst src len)
+  "table.copy across TWO tables: each table's span is bounds-checked
+against its own backing, and the copy is memmove-safe (delegating to
+TABLE-COPY when both indices name the same table)."
+  (if (eq dst-table src-table)
+      (table-copy dst-table dst src len)
+      (progn
+        (%check-table-span dst-table dst (+ dst len))
+        (%check-table-span src-table src (+ src len))
+        (replace (table-instance-elems dst-table)
+                 (table-instance-elems src-table)
+                 :start1 dst :end1 (+ dst len)
+                 :start2 src :end2 (+ src len))
+        dst-table)))
 
 (defun table-copy (table dst src len)
   "table.copy within one table, memmove semantics."
@@ -673,16 +1054,44 @@ tag: its type's params only, results being empty by construction).
         collect (cons import (cdr entry))))
 
 ;;; ---------------------------------------------------------------
+;;; Backend bookkeeping. The counters record which backend actually
+;;; executed each Wasm call, so a lane can prove that a start section or
+;;; a nested core in a component really ran compiled (or interpreted)
+;;; instead of trusting the requested mode.
+
+(defparameter *backend-entry-counts* (make-hash-table :test #'eq)
+  "Backend keyword -> number of Wasm function entries executed.")
+
+(defun reset-backend-entry-counts ()
+  "Zero the backend entry counters (test/lane hygiene)."
+  (clrhash *backend-entry-counts*)
+  (values))
+
+(defun backend-entry-count (backend)
+  "Entries executed by BACKEND (:INTERPRET or :BASELINE) since the last
+reset; NIL for any other value."
+  (gethash backend *backend-entry-counts* 0))
+
+(defun backend-entry-counts ()
+  "An alist of (backend . count) in :interpret, :baseline order."
+  (loop for k in '(:interpret :baseline)
+        collect (cons k (gethash k *backend-entry-counts* 0))))
+
+(defun %count-backend-entry (backend)
+  (incf (gethash backend *backend-entry-counts* 0)))
+
+;;; ---------------------------------------------------------------
 ;;; The shared call trampoline.
 
 (defun wasm-call (func &rest args)
   "Call a func-instance. :HOST functions receive the ARGS as one list
- and return a results list; :WASM functions go through the
- *INVOKE-WASM-FUNC* hook (the interpreter by default; codegen replaces
- it) which receives (func args-list) and returns a results list."
+ and return a results list. :WASM functions run through COMPILED-ENTRY
+ when one is installed (the :baseline backend), otherwise through the
+ *INVOKE-WASM-FUNC* hook (the interpreter). The func-instance OBJECT is
+ the same in both cases: compilation only fills the entry."
   (ecase (func-instance-kind func)
     (:host (funcall (func-instance-host-fn func) args))
-    (:wasm (funcall *invoke-wasm-func* func args))))
+    (:wasm (invoke-wasm func args))))
 
 (defun export-value (instance name)
   "The instance object exported as NAME (a string); signals a
@@ -716,18 +1125,28 @@ tag: its type's params only, results being empty by construction).
         collect (%const-eval const-eval inst expr)))
 
 (defun make-module-instance (module imports-alist &key (store nil) (const-eval nil)
-                                                  (before-start nil))
+                                                  (before-start nil) (prepare nil))
   "Instantiate MODULE per the spec sequence:
   1. resolve + type-check imports (link-error),
   2. allocate funcs/tables/memories/globals (globals evaluate their
      init constant expressions; imported globals referenced there are
      already in place),
   3. build elem/data segment states,
-  4. copy ACTIVE segments into their tables/memories with bounds
+  4. run PREPARE, when supplied, with the fully allocated instance,
+  5. copy ACTIVE segments into their tables/memories with bounds
      checks (instantiation-error),
-  5. run BEFORE-START, when supplied, with the allocated instance,
-  6. run the start function (traps propagate),
-  7. resolve exports.
+  6. publish exports,
+  7. run BEFORE-START, when supplied, with the allocated instance,
+  8. run the start function (traps propagate).
+
+PREPARE is the backend-installation point: every object the module owns
+(functions, tables, memories, globals, segment states and their refs)
+exists, no guest code has run, and the active segments are still
+unapplied. Compiling there means a compile failure precedes both the
+start section and any table/memory mutation, and the start section then
+runs through the selected backend. A condition signalled by PREPARE
+unwinds the instantiation entirely (nothing is returned). It is called
+exactly once.
 BEFORE-START exists for host ABIs that must reach the instance's own
 memory before any guest code runs — a WASI Preview1 import answers
 from the memory export, and the start section may already call it.
@@ -817,6 +1236,9 @@ IMPORTS-ALIST maps ((\"mod\" \"field\") . value)."
                            'vector)))
             (setf (module-instance-elem-segs inst) (coerce estates 'vector)
                   (module-instance-data-segs inst) (coerce dstates 'vector))
+            ;; the backend-installation point (see the docstring):
+            ;; allocation is complete, active segments are not applied.
+            (when prepare (funcall prepare inst))
             ;; active element segments -> tables
             (loop for elem across (wasm-module-elems module)
                   for state across estates

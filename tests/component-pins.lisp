@@ -6247,3 +6247,64 @@ THE LOCK ORDER rule (b): those are RIGHT acquisitions, and a held
            (= 4 (wasmdown.component.runtime::%abi-alignment res32 inst)))
           (wasmdown.test:is
            (= 8 (wasmdown.component.runtime::%abi-elem-size res32 inst))))))))
+
+;;; -----------------------------------------------------------------
+;;; Canonical ABI: compound RESULT shapes at the top level.
+;;;
+;;; The error-result discriminant must survive compound payloads: a
+;;; nested result, a record payload in the ok arm, and a compound
+;;; payload in the err arm all lower flat and store/load through the
+;;; canonical layout with the same discriminant.
+
+(test component/abi-compound-result-lowering
+  (let* ((mk (symbol-function 'wasmdown.component.runtime::make-ct*))
+         (inst (wasmdown.component.runtime:make-comp-instance))
+         (cx (wasmdown.component.runtime::make-abi-cx
+              :inst inst :type-inst inst :memory nil)))
+    (flet ((c (&rest a) (apply mk a))
+           (lower (v vt)
+             (wasmdown.component.runtime::%abi-lower cx v vt)))
+      ;; result<result<u32,u32>, u32>: the OUTER discriminant leads, the
+      ;; INNER one follows the join arity.
+      (let* ((inner (c :result (cons (c :prim :u32) (c :prim :u32))))
+             (outer (c :result (cons inner (c :prim :u32)))))
+        (is (equal '(0 0 5) (lower (cons :ok (cons :ok 5)) outer)))
+        (is (equal '(0 1 6) (lower (cons :ok (cons :err 6)) outer)))
+        (is (equal '(1 7 0) (lower (cons :err 7) outer))))
+      ;; a record in the ok arm flattens through the join
+      (let* ((rec (c :record (vector (cons "a" (c :prim :u32))
+                                     (cons "b" (c :prim :u32)))))
+             (r (c :result (cons rec (c :prim :u32)))))
+        (is (equal '(0 1 2)
+                   (lower (cons :ok (list (cons "a" 1) (cons "b" 2))) r)))
+        (is (equal '(1 9 0) (lower (cons :err 9) r))))
+      ;; a list in the err arm keeps the pointer+length join
+      (let* ((lst (c :list (cons (c :prim :u8) nil)))
+             (r (c :result (cons (c :prim :u32) lst))))
+        (is (equal '(0 3 0) (lower (cons :ok 3) r)))))))
+
+(test component/abi-compound-result-store-load
+  ;; the canonical LAYOUT (not just the flat path): discriminant byte,
+  ;; join-aligned payload, and the exact round trip for both arms.
+  (let* ((mk (symbol-function 'wasmdown.component.runtime::make-ct*))
+         (inst (wasmdown.component.runtime:make-comp-instance))
+         (mem (wasmdown.runtime:make-memory-instance
+               (wasmdown.types:make-wasm-limits 1)))
+         (cx (wasmdown.component.runtime::make-abi-cx
+              :inst inst :type-inst inst :memory mem)))
+    (flet ((c (&rest a) (apply mk a)))
+      (let* ((rec (c :record (vector (cons "a" (c :prim :u32))
+                                     (cons "b" (c :prim :u8)))))
+             (r (c :result (cons rec (c :prim :u32))))
+             (val (cons :ok (list (cons "a" 7) (cons "b" 9)))))
+        (wasmdown.component.runtime::%abi-store cx val r 0)
+        (is (= 0 (wasmdown.component.runtime::%abi-load-int cx 0 1)))
+        (is (equal val
+                   (wasmdown.component.runtime::%abi-load cx r 0))))
+      (let* ((rec (c :record (vector (cons "a" (c :prim :u32)))))
+             (r (c :result (cons (c :prim :u32) rec)))
+             (val (cons :err (list (cons "a" 5)))))
+        (wasmdown.component.runtime::%abi-store cx val r 32)
+        (is (= 1 (wasmdown.component.runtime::%abi-load-int cx 32 1)))
+        (is (equal val
+                   (wasmdown.component.runtime::%abi-load cx r 32)))))))

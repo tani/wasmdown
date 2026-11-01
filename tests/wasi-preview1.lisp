@@ -17,12 +17,13 @@
 ;;; ---------------------------------------------------------------
 ;;; helpers
 
-(defun p1-instance (wat context &key sockets)
-  "Parse WAT and instantiate it with the Preview1 imports. Returns
-(values INSTANCE STATE)."
+(defun p1-instance (wat context &key sockets (mode :interpret))
+  "Parse WAT and instantiate it with the Preview1 imports in MODE.
+Returns (values INSTANCE STATE)."
   (wasmdown.wasi:make-preview1-instance
    (funcall (find-symbol "PARSE-WAT" '#:wasmdown.text) wat)
    context
+   :mode mode
    :sockets sockets))
 
 (defun p1-state-memory (state)
@@ -646,3 +647,248 @@ contents then showed up in the readdir listing."
     (is= 8 (p1-call instance "recv-on-unknown"))
     (is= 8 (p1-call instance "send-on-unknown"))
     (is= 8 (p1-call instance "shutdown-on-unknown"))))
+
+;;; ---------------------------------------------------------------
+;;; Backend evidence: the host providers are the SAME for both backends,
+;;; and the ABI memory is re-resolved per operation, so a guest that
+;;; grows memory between two host calls is still correct.
+
+(test wasi-preview1/memory-grow-between-host-calls
+  ;; fd_write, memory.grow, then fd_write again from the NEW page: the
+  ;; second call must see the grown memory (a cached byte vector would
+  ;; answer FAULT for a span the guest legitimately owns).
+  (dolist (mode '(:interpret :baseline))
+    (let* ((out (make-string-output-stream))
+           (ctx (p1-context :arguments '("x") :stdout out)))
+      (multiple-value-bind (instance state)
+          (p1-instance "(module
+                          (import \"wasi_snapshot_preview1\" \"fd_write\"
+                                  (func $w (param i32 i32 i32 i32) (result i32)))
+                          (memory (export \"memory\") 1 4)
+                          (data (i32.const 64) \"a\\n\")
+                          (func (export \"go\") (result i32)
+                            (i32.store (i32.const 0) (i32.const 64))
+                            (i32.store (i32.const 4) (i32.const 2))
+                            (drop (call $w (i32.const 1) (i32.const 0)
+                                          (i32.const 1) (i32.const 8)))
+                            (drop (memory.grow (i32.const 1)))
+                            (i32.store8 (i32.const 65536) (i32.const 98))
+                            (i32.store8 (i32.const 65537) (i32.const 10))
+                            (i32.store (i32.const 0) (i32.const 65536))
+                            (call $w (i32.const 1) (i32.const 0)
+                                     (i32.const 1) (i32.const 8))))"
+                        ctx :mode mode)
+        (declare (ignore state))
+        (is= 0 (p1-call instance "go"))
+        (is (string= (format nil "a~%b~%") (get-output-stream-string out)))))))
+
+(defun p1-parity-probe (mode)
+  "Run the start-section/`_start' host-call probe in MODE against a
+fresh stdout stream. Returns (values STDOUT ERRNO-RESULTS
+BACKEND-ENTRY-COUNTS), with the counters reset before the run."
+  (wasmdown.runtime:reset-backend-entry-counts)
+  (let* ((out (make-string-output-stream))
+         (ctx (p1-context :arguments '("x") :stdout out)))
+    (multiple-value-bind (instance state)
+        (p1-instance "(module
+                        (import \"wasi_snapshot_preview1\" \"fd_write\"
+                                (func $w (param i32 i32 i32 i32) (result i32)))
+                        (memory (export \"memory\") 1)
+                        (data (i32.const 64) \"start\\n\")
+                        (data (i32.const 72) \"main\\n\")
+                        (func $emit (param i32 i32) (result i32)
+                          (i32.store (i32.const 0) (local.get 0))
+                          (i32.store (i32.const 4) (local.get 1))
+                          (call $w (i32.const 1) (i32.const 0)
+                                   (i32.const 1) (i32.const 8)))
+                        (func $start (drop (call $emit (i32.const 64) (i32.const 6))))
+                        (start $start)
+                        (func (export \"_start\")
+                          (drop (call $emit (i32.const 72) (i32.const 5))))
+                        (func (export \"bad-fd\") (result i32)
+                          (i32.store (i32.const 0) (i32.const 64))
+                          (i32.store (i32.const 4) (i32.const 2))
+                          (call $w (i32.const 77) (i32.const 0)
+                                   (i32.const 1) (i32.const 8)))
+                        (func (export \"bad-iovec\") (result i32)
+                          (call $w (i32.const 1) (i32.const 4294967040)
+                                   (i32.const 1) (i32.const 8))))"
+                      ctx :mode mode)
+      (declare (ignore state))
+      ;; the START section already ran during instantiation, through host
+      ;; calls that read the iovec/data written by guest code
+      (let ((start-bytes (get-output-stream-string out)))
+        (p1-call instance "_start")
+        (values (concatenate 'string start-bytes (get-output-stream-string out))
+                (list (p1-call instance "bad-fd")
+                      (p1-call instance "bad-iovec"))
+                (wasmdown.runtime:backend-entry-counts))))))
+
+(test wasi-preview1/backend-parity-start-section-and-host-memory
+  (multiple-value-bind (i-out i-errnos i-counts)
+      (p1-parity-probe :interpret)
+    (multiple-value-bind (b-out b-errnos b-counts)
+        (p1-parity-probe :baseline)
+      ;; identical guest-visible results from the same host providers
+      (is (string= (format nil "start~%main~%") i-out))
+      (is (string= i-out b-out))
+      (is (equal '(8 21) i-errnos))          ; badf, fault
+      (is (equal i-errnos b-errnos))
+      ;; the counters prove WHICH backend executed: the interpreted lane
+      ;; never enters a compiled entry, and the compiled lane runs the
+      ;; START SECTION and `_start' as compiled code with zero
+      ;; interpreted entries (no silent fallback).
+      (is= 0 (cdr (assoc :baseline i-counts)))
+      (is (plusp (cdr (assoc :interpret i-counts))))
+      (is= 0 (cdr (assoc :interpret b-counts)))
+      (is (>= (cdr (assoc :baseline b-counts)) 2)))))
+
+;;; ---------------------------------------------------------------
+;;; host-resource accounting: handles are released on success, trap,
+;;; exit and on every rejected call
+
+(test wasi-preview1/dir-handle-released-on-rejected-path
+  ;; %P1-RESOLVE duplicates the preopen before it walks the path. A
+  ;; rejected path (absolute, or `..' escaping the root) must not leak
+  ;; that duplicate.
+  (with-temp-dir (dir)
+    (let* ((preopen (wasmdown.wasi:open-wasi-preopen dir))
+           (ctx (p1-context :preopens (list preopen))))
+      (unwind-protect
+           (multiple-value-bind (instance state)
+               (p1-instance "(module
+                               (import \"wasi_snapshot_preview1\" \"path_open\"
+                                       (func $open (param i32 i32 i32 i32 i32 i64 i64 i32 i32)
+                                             (result i32)))
+                               (memory (export \"memory\") 1)
+                               (data (i32.const 32) \"/etc/passwd\")
+                               (data (i32.const 48) \"../../etc/passwd\")
+                               (func $try (param i32 i32) (result i32)
+                                 (call $open (i32.const 3) (i32.const 1)
+                                             (local.get 0) (local.get 1)
+                                             (i32.const 0) (i64.const 0) (i64.const 0)
+                                             (i32.const 0) (i32.const 200)))
+                               (func (export \"absolute\") (result i32)
+                                 (call $try (i32.const 32) (i32.const 11)))
+                               (func (export \"escape\") (result i32)
+                                 (call $try (i32.const 48) (i32.const 17))))"
+                             ctx)
+             (let ((slots (hash-table-count
+                           (wasmdown.wasi::preview1-state-fds state))))
+               (is= 76 (p1-call instance "absolute")) ; notcapable
+               (is= 76 (p1-call instance "escape"))
+               (let ((before (fd-count)))
+                 (dotimes (i 100)
+                   (is= 76 (p1-call instance "absolute"))
+                   (is= 76 (p1-call instance "escape")))
+                 (is (<= (fd-count) (+ before 2))))
+               (is= slots (hash-table-count
+                           (wasmdown.wasi::preview1-state-fds state)))))
+        (wasmdown.wasi:close-wasi-preopen preopen)))))
+
+(test wasi-preview1/path-open-rejected-out-pointer-releases-the-fd
+  (with-temp-dir (dir)
+    (write-text-file (merge-pathnames "f.txt" (pathname dir)) "0123")
+    (let* ((preopen (wasmdown.wasi:open-wasi-preopen dir))
+           (ctx (p1-context :preopens (list preopen))))
+      (unwind-protect
+           (multiple-value-bind (instance state)
+               (p1-instance "(module
+                               (import \"wasi_snapshot_preview1\" \"path_open\"
+                                       (func $open (param i32 i32 i32 i32 i32 i64 i64 i32 i32)
+                                             (result i32)))
+                               (memory (export \"memory\") 1)
+                               (data (i32.const 32) \"f.txt\")
+                               (func $try (param i32) (result i32)
+                                 (call $open (i32.const 3) (i32.const 1)
+                                             (i32.const 32) (i32.const 5)
+                                             (i32.const 0) (i64.const 0) (i64.const 0)
+                                             (i32.const 0) (local.get 0)))
+                               (func (export \"bad-out\") (result i32)
+                                 (call $try (i32.const 4294967295)))
+                               (func (export \"good\") (result i32)
+                                 (call $try (i32.const 200))))"
+                             ctx)
+             (let* ((fds (wasmdown.wasi::preview1-state-fds state))
+                    (slots (hash-table-count fds))
+                    (before (fd-count)))
+               ;; the out pointer is preflighted: FAULT, no host open, no
+               ;; ABI slot installed
+               (is= 21 (p1-call instance "bad-out"))
+               (is= slots (hash-table-count fds))
+               (dotimes (i 50) (is= 21 (p1-call instance "bad-out")))
+               (is (<= (fd-count) (+ before 2)))
+               ;; the same path still opens normally
+               (is= 0 (p1-call instance "good"))
+               (is (gethash (p1-u32 state 200) fds))
+               (is= (1+ slots) (hash-table-count fds)))
+        (wasmdown.wasi:close-wasi-preopen preopen))))))
+
+(test wasi-preview1/path-readlink-preflights-its-buffer
+  (with-temp-dir (dir)
+    (write-text-file (merge-pathnames "f.txt" (pathname dir)) "x")
+    (let* ((preopen (wasmdown.wasi:open-wasi-preopen dir))
+           (ctx (p1-context :preopens (list preopen))))
+      (unwind-protect
+           (multiple-value-bind (instance state)
+               (p1-instance "(module
+                               (import \"wasi_snapshot_preview1\" \"path_readlink\"
+                                       (func $rl (param i32 i32 i32 i32 i32 i32) (result i32)))
+                               (memory (export \"memory\") 1)
+                               (data (i32.const 32) \"f.txt\")
+                               (func (export \"huge\") (result i32)
+                                 ;; buffer and length both outside the memory
+                                 (call $rl (i32.const 3) (i32.const 32) (i32.const 5)
+                                           (i32.const 4294901760) (i32.const 4294967295)
+                                           (i32.const 0))))"
+                             ctx)
+             (declare (ignore state))
+             (is= 21 (p1-call instance "huge"))) ; fault, before any read
+        (wasmdown.wasi:close-wasi-preopen preopen)))))
+
+(defun p1-open-then (tail &key exit-import-p)
+  "A command module that path_opens \"f.txt\" through the preopen at fd
+3 and then runs TAIL (a WAT instruction string)."
+  (format nil "(module
+                 (import \"wasi_snapshot_preview1\" \"path_open\"
+                         (func $open (param i32 i32 i32 i32 i32 i64 i64 i32 i32) (result i32)))
+                 ~a
+                 (memory (export \"memory\") 1)
+                 (data (i32.const 32) \"f.txt\")
+                 (func (export \"_start\")
+                   (drop (call $open (i32.const 3) (i32.const 1) (i32.const 32)
+                                     (i32.const 5) (i32.const 0) (i64.const 0)
+                                     (i64.const 0) (i32.const 0) (i32.const 200)))
+                   ~a))"
+          (if exit-import-p
+              "(import \"wasi_snapshot_preview1\" \"proc_exit\" (func $exit (param i32)))"
+              "")
+          tail))
+
+(test wasi-preview1/descriptors-released-on-trap-and-exit
+  (with-temp-dir (dir)
+    (write-text-file (merge-pathnames "f.txt" (pathname dir)) "0123")
+    (let* ((preopen (wasmdown.wasi:open-wasi-preopen dir))
+           (ctx (p1-context :preopens (list preopen)
+                            :arguments '("x")
+                            :stdout (make-string-output-stream))))
+      (unwind-protect
+           (dolist (mode '(:interpret :baseline))
+             (flet ((run (wat)
+                      (wasmdown.wasi:run-preview1
+                       (funcall (find-symbol "PARSE-WAT" '#:wasmdown.text) wat)
+                       ctx :mode mode)))
+               ;; TRAP after the open: the descriptor is still released
+               (let ((before (fd-count)))
+                 (is (handler-case (progn (run (p1-open-then "(unreachable)")) nil)
+                       (wasmdown:wasm-trap () t)))
+                 (is (<= (fd-count) (+ before 2))))
+               ;; proc_exit after the open: a distinct path, never a trap,
+               ;; and the descriptor is released by the owning runner
+               (let ((before (fd-count)))
+                 (is= 7 (run (p1-open-then "(call $exit (i32.const 7))"
+                                         :exit-import-p t)))
+                 (is (<= (fd-count) (+ before 2))))
+               ;; the same path opens again: no handle or ABI slot survived
+               (is= 0 (run (p1-open-then "" :exit-import-p t)))))
+        (wasmdown.wasi:close-wasi-preopen preopen)))))

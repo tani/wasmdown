@@ -367,15 +367,23 @@ component path as argv[0]) are the explicitly configured ones."
       (%usage-error "run: --dir/--env/--net/--listen/--dns require --wasi"))
     (when (and (not wasi) guest-args)
       (%usage-error "run: guest arguments require --wasi"))
-    (let ((network (%run-network options)))
-      (wasmdown.wasi:make-wasi-context
-       :arguments (if wasi (cons file guest-args) nil)
-       :environment (mapcar #'%env-pair (%run-collect options "--env"))
-       :stdin (and wasi *standard-input*)
-       :stdout (and wasi *standard-output*)
-       :stderr (and wasi *error-output*)
-       :preopens (mapcar #'%dir-preopen (%run-collect options "--dir"))
-       :networks (and network (list network))))))
+    (let* ((network (%run-network options))
+           ;; The CLI OWNS its reactor: clock waits and socket readiness
+           ;; are then servable by the store driver, instead of every
+           ;; wait failing for want of a watch. NIL without --wasi
+           ;; (no capabilities, nothing to wait on).
+           (reactor (and wasi (wasmdown.wasi:make-wasi-reactor))))
+      (values
+       (wasmdown.wasi:make-wasi-context
+        :arguments (if wasi (cons file guest-args) nil)
+        :environment (mapcar #'%env-pair (%run-collect options "--env"))
+        :stdin (and wasi *standard-input*)
+        :stdout (and wasi *standard-output*)
+        :stderr (and wasi *error-output*)
+        :preopens (mapcar #'%dir-preopen (%run-collect options "--dir"))
+        :networks (and network (list network))
+        :reactor reactor)
+       reactor))))
 
 (defun %run-component-file (bytes options guest-args file)
   "Decode + validate a component binary and drive its command world."
@@ -383,7 +391,7 @@ component path as argv[0]) are the explicitly configured ones."
     (wasmdown.component:validate-component comp)
     ;; the capability context (and its preopen fds) exists only once
     ;; the component is known to be a valid command
-    (let ((context (%component-context options guest-args file)))
+    (multiple-value-bind (context reactor) (%component-context options guest-args file)
       (unwind-protect
            ;; providers follow the component's DECLARED imports: a 0.2
            ;; command gets the versioned P2 tables, a 0.3 one the
@@ -398,7 +406,10 @@ component path as argv[0]) are the explicitly configured ones."
                         context comp))
         ;; the preopen handles belong to the CLI invocation
         (dolist (preopen (wasmdown.wasi:wasi-context-preopens context))
-          (ignore-errors (wasmdown.wasi:close-wasi-preopen preopen)))))))
+          (ignore-errors (wasmdown.wasi:close-wasi-preopen preopen)))
+        ;; the reactor is the CLI's own: closing it cancels every
+        ;; remaining watch and releases the self-pipe.
+        (when reactor (ignore-errors (wasmdown.wasi:reactor-close reactor)))))))
 
 (defun %cmd-run (args)
   (multiple-value-bind (file invokes options guest-args) (%parse-run-args args)

@@ -2730,7 +2730,6 @@
 # touched). THE M14 HAND-OFF — the class-fix queue's head
 # candidate.
 ./validation/kebab.wast
-./values/post-return.wast
 ./values/variants.wast
 # ---- M12 session 12 (2026-10-27): THE ATOMIC EXIT LANDED (a
 # strictly-safer read) — the flake class did NOT collapse; THE

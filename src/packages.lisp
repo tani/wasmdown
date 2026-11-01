@@ -20,6 +20,10 @@
            #:wasm-exception-payload
            #:resource-exhausted
            #:host-error
+           #:codegen-error
+           #:codegen-error-function-index
+           #:codegen-error-offset
+           #:codegen-error-op
            ;; API (implemented in src/api.lisp)
            #:read-module
            #:module-bytes
@@ -185,7 +189,7 @@
   (:export
    #:make-instance-store
    #:make-module-instance
-   #:module-instance
+   #:module-instance #:module-instance-p
            #:module-instance-memories #:module-instance-tables
            #:module-instance-globals #:module-instance-funcs
            #:module-instance-tags
@@ -196,6 +200,8 @@
    #:func-instance-type #:func-instance-module
    #:func-instance-kind #:func-instance-wasm-funcidx
    #:func-instance-host-fn
+   #:func-instance-backend #:func-instance-compiled-entry
+   #:backend-entry-count #:backend-entry-counts #:reset-backend-entry-counts
    #:make-wasm-func-instance #:make-host-func-instance
    #:memory-instance #:memory-instance-p
    #:memory-instance-bytes #:memory-instance-pages
@@ -208,7 +214,7 @@
    #:table-instance-elems #:table-instance-type #:table-instance-max
    #:table-instance-has-max-p
    #:make-table-instance #:table-get #:table-set #:table-grow
-   #:table-size #:table-fill #:table-copy #:table-init
+   #:table-size #:table-fill #:table-copy #:table-copy2 #:table-init
    #:drop-elem #:drop-data #:elem-dropped-p #:data-dropped-p
    #:take-elem-ref #:take-data-bytes
    #:global-instance #:global-instance-p
@@ -223,8 +229,30 @@
    #:make-wasm-array-value #:array-length
    #:array-element-get #:array-element-set
    #:make-i31 #:i31-get-s #:i31-get-u #:i31-p
+   ;; value-level GC semantics shared by the interpreter and codegen
+   #:packed-normalize #:packed-extend #:default-valtype-value
+   #:value-heap #:cast-succeeds-p
+   #:struct-new-value #:struct-new-default-value
+   #:struct-get-value #:struct-set-value
+   #:array-new-value #:array-new-default-value #:array-new-fixed-value
+   #:array-new-data-value #:array-new-elem-value
+   #:array-get-value #:array-set-value #:array-len-value
+   #:array-fill-value #:array-copy-value
+   #:array-init-data-value #:array-init-elem-value
    #:export-value
-   #:wasm-call))
+   #:wasm-call
+   ;; one guest call protocol shared by both backends
+   #:invoke-wasm
+   #:tail-call
+   #:tail-transfer
+   #:tail-transfer-p
+   #:tail-transfer-callee
+   #:tail-transfer-args
+   #:make-tail-transfer
+   #:*tail-call-tag*
+   #:*invoke-wasm-body*
+   #:*guest-depth*
+   #:*guest-depth-limit*))
 
 (defpackage #:wasmdown.interp
   (:use #:cl #:wasmdown.types #:wasmdown.numops)

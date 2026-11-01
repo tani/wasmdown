@@ -18,6 +18,7 @@
 (defpackage #:wasmdown.wast
   (:use #:cl)
   (:export #:run-script #:run-directory #:make-spectest-instance
+           #:*instantiate-mode*
            #:spectest-calls #:wast-result #:wast-result-outcome
            #:wast-result-file #:wast-result-command-index
            #:wast-result-command-name #:wast-result-phase
@@ -1645,6 +1646,11 @@ instantiate/execute. Returns (values outcome phase detail instance)."
       (values :fail :link (wasmdown:wasmdown-error-message c) nil))
     (wasmdown:instantiation-error (c)
       (values :fail :instantiate
+              (wasmdown:wasmdown-error-message c) nil))
+    ;; a backend that refuses to compile is a COMPILE failure, never a
+    ;; validation failure and never a silent interpreter fallback
+    (wasmdown:codegen-error (c)
+      (values :fail :compile
               (wasmdown:wasmdown-error-message c) nil))
     (wasmdown:wasm-trap (c)
       (values :fail :execute (wasmdown:wasmdown-error-message c) nil))))

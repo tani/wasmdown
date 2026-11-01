@@ -52,6 +52,9 @@
 (defvar *temp-counter* 0
   "Gensym counter for emitted temporaries; RESET-CODEGEN clears it.")
 
+(defvar *current-function-index* nil
+  "Defined-function index being emitted, so a refusal names the function.")
+
 (defun reset-codegen ()
   "Reset the emitted-temporary counter (test hygiene only)."
   (setf *temp-counter* 0)
@@ -388,6 +391,17 @@ domain (CONTRACTS.md unsigned storage; spec load semantics)."
 ;;; target tag: block/if tags sit AFTER the body (forward exit), loop
 ;;; tags BEFORE it (backedge). A depth past every block is :return.
 
+(defun %emit-parallel-move (cctx pairs)
+  "Emit target/source assignments as ONE parallel move (PSETF), so a
+branch that swaps loop parameters or reorders multi-values cannot
+clobber a source it has not read yet."
+  (let ((live (remove-if (lambda (p) (eq (car p) (cdr p))) pairs)))
+    (case (length live)
+      (0 nil)
+      (1 (%emit cctx `(setf ,(caar live) ,(cdar live))))
+      (t (%emit cctx `(psetf ,@(loop for (target . source) in live
+                                     append (list target source))))))))
+
 (defun %emit-br (cctx depth)
   (let* ((frame (nth depth (cctx-blocks cctx)))
          (loop-p (eq (block-state-kind frame) :loop))
@@ -396,9 +410,9 @@ domain (CONTRACTS.md unsigned storage; spec load semantics)."
          (targets (if loop-p (block-state-entry-temps frame)
                       (block-state-results frame)))
          (vals (%pop-n cctx arity)))
-    (loop for v in vals
-          for tt in targets
-          do (%emit cctx `(setf ,tt ,v)))
+    (%emit-parallel-move cctx (loop for v in vals
+                                    for tt in targets
+                                    collect (cons tt v)))
     (%emit cctx `(go ,(block-state-entry-tag frame)))
     ;; Dead region: fill with the target's phis atop nils down to the
     ;; target frame's base height, so any residual (unreachable)
@@ -547,7 +561,6 @@ its :end)."
          (idx (%pop cctx))
          (params (%pop-n cctx (length eparams)))  ; push order
          (ref (%temp cctx "ref"))
-         (actual (%temp cctx "ft"))
          (results (loop for r in eresults collect (%result-temp cctx)))
          (list-sym (%temp cctx "ci-args")))
     ;; table type must be funcref (interp parity)
@@ -558,17 +571,8 @@ its :end)."
                           "call_indirect on non-funcref table")))
     (%emit cctx `(setf ,ref (wasmdown.runtime:table-get
                              ,(%table cctx (getf imms :table)) ,idx)))
-    (%emit cctx `(unless (wasmdown.runtime:func-instance-p ,ref)
-                   (%trap :null-reference
-                          "call_indirect on null reference")))
-    (%emit cctx `(setf ,actual (wasmdown.runtime:func-instance-type ,ref)))
-    (%emit cctx
-           `(unless (and (equal ',eparams
-                                (wasm-func-type-params ,actual))
-                         (equal ',eresults
-                                (wasm-func-type-results ,actual)))
-              (%trap :indirect-call-type-mismatch
-                     "call_indirect type mismatch")))
+    ;; null + canonical functype equivalence (module contexts included)
+    (%emit-type-check cctx ref typeidx)
     (%emit cctx `(setf ,list-sym (list ,@params)))
     (%emit cctx `(multiple-value-setq (,@results)
                    (values-list
@@ -632,7 +636,8 @@ its :end)."
                                   ,(%table cctx (getf imms :table)))))
          (%push cctx tmp)))
       (:table.grow
-       (destructuring-bind (delta ref) (funcall two)
+       ;; stack order is [init-value, delta]: delta is on top
+       (destructuring-bind (ref delta) (funcall two)
          (let ((tmp (%result-temp cctx)))
            (%emit cctx `(setf ,tmp (wasmdown.runtime:table-grow
                                     ,(%table cctx (getf imms :table))
@@ -644,12 +649,13 @@ its :end)."
                        ,(%table cctx (getf imms :table)) ,dst ,ref ,len))))
       (:table.copy
        (destructuring-bind (dst src len) (funcall three)
-         (let ((dst-idx (getf imms :dst 0)) (src-idx (getf imms :src 0)))
-           (unless (= dst-idx src-idx)
-             (error 'wasmdown:validation-error
-                    :message "table.copy across distinct tables"))
-           (%emit cctx `(wasmdown.runtime:table-copy
-                         ,(%table cctx dst-idx) ,dst ,src ,len)))))
+         ;; src/dst tables are distinct immediates; TABLE-COPY2 checks
+         ;; each span against its own table and keeps memmove semantics
+         ;; when both indices name the same one.
+         (%emit cctx `(wasmdown.runtime:table-copy2
+                       ,(%table cctx (getf imms :dst 0))
+                       ,(%table cctx (getf imms :src 0))
+                       ,dst ,src ,len))))
       (:table.init
        (destructuring-bind (dst src len) (funcall three)
          (%emit cctx `(wasmdown.runtime:table-init
@@ -688,7 +694,7 @@ its :end)."
                               :results result-temps
                               :entry-temps entry-temps
                               :stack-height base
-                              :tail (cctx-operands cctx))
+                              :tail (copy-list (cctx-operands cctx)))
             (cctx-blocks cctx))
       (%emit-seq cctx (wasm-instr-body instr))
       ;; the DEAD code after a branch may have consumed operands; the
@@ -725,7 +731,7 @@ its :end)."
                               :results result-temps
                               :entry-temps entry-temps
                               :stack-height base
-                              :tail (cctx-operands cctx))
+                              :tail (copy-list (cctx-operands cctx)))
             (cctx-blocks cctx))
       (%emit-seq cctx (wasm-instr-body instr))
       (pop (cctx-blocks cctx))
@@ -740,6 +746,10 @@ its :end)."
                       (cctx-operands cctx)))))))
 
 (defun %emit-if (cctx instr)
+  "If/else lowering. Both arms start from the SAME entry state: the
+base operands (below the block parameters) are captured once, and each
+arm rebuilds its operand stack from a private copy, so the then arm's
+dead code can never leak into the else arm."
   (multiple-value-bind (nparams nresults)
       (%blocktype-shape cctx (getf (wasm-instr-imms instr) :bt))
     (let* ((cond-v (%pop cctx))
@@ -748,54 +758,506 @@ its :end)."
            (result-temps (loop repeat nresults collect (%temp cctx "br")))
            (tag (gensym "I"))
            (else-tag (gensym "ELSE"))
-           (base (length (cctx-operands cctx))))
+           (entry-tail (copy-list (cctx-operands cctx))))
       (loop for p in params
             for tp in entry-temps
             do (%emit cctx `(setf ,tp ,p)))
       (%emit-flush cctx)
       (%emit cctx `(unless (plusp ,cond-v) (go ,else-tag)))
-      ;; then arm
-      (setf (cctx-operands cctx)
-            (append (reverse entry-temps) (cctx-operands cctx)))
-      (push (make-block-state :kind :block :entry-tag tag
-                              :nparams nparams :nresults nresults
-                              :results result-temps
-                              :entry-temps entry-temps
-                              :stack-height base
-                              :tail (cctx-operands cctx))
-            (cctx-blocks cctx))
-      (%emit-seq cctx (wasm-instr-body instr))
-      (pop (cctx-blocks cctx))
-      (let ((then-vals (%pop-n cctx nresults)))
-        (loop for tv in then-vals
-              for rt in result-temps
-              do (%emit cctx `(setf ,rt ,tv))))
-      (%emit cctx `(go ,tag))
-      ;; else arm
-      (%emit-tag cctx else-tag)
-      (setf (cctx-operands cctx)
-            (append (reverse entry-temps)
-                    (cctx-operands cctx)))
-      (push (make-block-state :kind :block :entry-tag tag
-                              :nparams nparams :nresults nresults
-                              :results result-temps
-                              :entry-temps entry-temps
-                              :stack-height base
-                              :tail (cctx-operands cctx))
-            (cctx-blocks cctx))
-      (%emit-seq cctx (or (getf (wasm-instr-imms instr) :else-body) #()))
-      (pop (cctx-blocks cctx))
-      (let ((else-vals (%pop-n cctx nresults)))
-        (loop for ev in else-vals
-              for rt in result-temps
-              do (%emit cctx `(setf ,rt ,ev))))
+      (labels ((arm (body)
+                 (setf (cctx-operands cctx)
+                       (append (reverse entry-temps) (copy-list entry-tail)))
+                 (push (make-block-state :kind :block :entry-tag tag
+                                         :nparams nparams :nresults nresults
+                                         :results result-temps
+                                         :entry-temps entry-temps
+                                         :stack-height (length entry-tail)
+                                         :tail (copy-list entry-tail))
+                       (cctx-blocks cctx))
+                 (%emit-seq cctx body)
+                 (pop (cctx-blocks cctx))
+                 (let ((vals (%pop-n cctx nresults)))
+                   (%emit-parallel-move
+                    cctx (loop for v in vals
+                               for rt in result-temps
+                               collect (cons rt v))))))
+        ;; then arm
+        (arm (wasm-instr-body instr))
+        (%emit cctx `(go ,tag))
+        ;; else arm
+        (%emit-tag cctx else-tag)
+        (arm (or (getf (wasm-instr-imms instr) :else-body) #())))
       (%emit-tag cctx tag)
       (setf (cctx-operands cctx)
-            (append (reverse result-temps)
-                    (cctx-operands cctx))))))
+            (append (reverse result-temps) entry-tail)))))
+
+(defun %tag-ref (cctx idx)
+  "Emitted form resolving TAG index IDX in this module's instance."
+  `(svref (wasmdown.runtime:module-instance-tags ,(%inst cctx)) ,idx))
+
+(defun %tag-type (cctx idx)
+  "The functype of TAG index IDX in the combined index space (imported
+tags first, then this module's defined tags; wasm-module-tags holds
+only the latter's type indices)."
+  (let* ((module (cctx-module cctx))
+         (imported (loop for im across (wasm-module-imports module)
+                         when (eq (wasm-import-kind im) :tag)
+                           collect im)))
+    (svref (wasm-module-types module)
+           (if (< idx (length imported))
+               (wasm-import-type (nth idx imported))
+               (svref (wasm-module-tags module) (- idx (length imported)))))))
+
+(defun %emit-throw (cctx tagidx)
+  (let* ((type (%tag-type cctx tagidx))
+         (args (%pop-n cctx (length (wasm-func-type-params type)))))
+    (%emit cctx `(progn
+                   (signal 'wasmdown:wasm-exception
+                           :tag ,(%tag-ref cctx tagidx)
+                           :payload (list ,@args))
+                   ;; signal returned: nothing handled it inside this
+                   ;; function, so it is uncaught here.
+                   (%trap :uncaught-exception "uncaught exception")))
+    (setf (cctx-operands cctx) nil)))
+
+(defun %emit-throw-ref (cctx)
+  (let ((ref (%pop cctx)) (tmp (%temp cctx "exn")))
+    (%emit cctx `(setf ,tmp ,ref))
+    (%emit cctx `(unless (typep ,tmp 'wasmdown:wasm-exception)
+                   (%trap :null-reference
+                          "throw_ref of a null exception reference")))
+    (%emit cctx `(progn
+                   (signal 'wasmdown:wasm-exception
+                           :tag (wasmdown:wasm-exception-tag ,tmp)
+                           :payload (wasmdown:wasm-exception-payload ,tmp))
+                   (%trap :uncaught-exception "uncaught exception")))
+    (setf (cctx-operands cctx) nil)))
+
+(defun %emit-try-table (cctx instr)
+  "try_table: a label frame like a block, with SBCL handler-bind
+catching guest exceptions and transferring to the clause's target
+label. Tag objects are resolved at ENTRY (the guarding module's index
+space), because a handler runs while the thrower's dynamic frame is
+still current. Payload/exception values reach the target through the
+same parallel moves a branch uses, so the label's arity is the only
+contract."
+  (multiple-value-bind (nparams nresults)
+      (%blocktype-shape cctx (getf (wasm-instr-imms instr) :bt))
+    (let* ((imms (wasm-instr-imms instr))
+           (params (%pop-n cctx nparams))
+           (entry-temps (loop repeat nparams collect (%temp cctx "tp")))
+           (result-temps (loop repeat nresults collect (%temp cctx "tr")))
+           (tag (gensym "TRY"))
+           (entry-tail (copy-list (cctx-operands cctx)))
+           (catches (coerce (getf imms :catches) 'vector)))
+      (loop for p in params
+            for tp in entry-temps
+            do (%emit cctx `(setf ,tp ,p)))
+      (setf (cctx-operands cctx)
+            (append (reverse entry-temps) (copy-list entry-tail)))
+      (push (make-block-state :kind :block :entry-tag tag
+                              :nparams nparams :nresults nresults
+                              :results result-temps
+                              :entry-temps entry-temps
+                              :stack-height (length entry-tail)
+                              :tail (copy-list entry-tail))
+            (cctx-blocks cctx))
+      (let* ((child (copy-structure cctx))
+             (handler-forms '()))
+        (setf (cctx-pending child) nil
+              (cctx-tagbody child) nil)
+        (labels ((target (depth)
+                   (or (nth depth (cctx-blocks cctx))
+                       (error 'wasmdown:codegen-error
+                              :function-index *current-function-index*
+                              :message "try_table catch targets a missing label")))
+                 (transfer (frame values)
+                   ;; parallel move into the target's phis, then go
+                   (let* ((loop-p (eq (block-state-kind frame) :loop))
+                          (tgts (if loop-p
+                                    (block-state-entry-temps frame)
+                                    (block-state-results frame)))
+                          (pairs (loop for v in values
+                                       for tt in tgts
+                                       collect (cons tt v))))
+                     (append
+                      (when pairs
+                        (list `(psetf ,@(loop for (tt . v) in pairs
+                                              append (list tt v)))))
+                      (list `(go ,(block-state-entry-tag frame)))))))
+          (loop for clause across catches
+                do (let* ((kind (first clause))
+                          (label (cond ((member kind '(:catch :catch-ref))
+                                        (third clause))
+                                       (t (second clause))))
+                          (frame (target label)))
+                     (case kind
+                       ((:catch :catch-ref)
+                        (let* ((tagidx (second clause))
+                               (type (%tag-type cctx tagidx))
+                               (arity (length (wasm-func-type-params type)))
+                               (transfer-forms
+                                 (transfer frame
+                                           (if (eq kind :catch-ref)
+                                               (append
+                                                (loop for i below arity
+                                                      collect `(nth ,i p))
+                                                (list 'e))
+                                               (loop for i below arity
+                                                     collect `(nth ,i p))))))
+                          (push `(when (eq (wasmdown:wasm-exception-tag e)
+                                           ,(%tag-ref cctx tagidx))
+                                   (let ((p (wasmdown:wasm-exception-payload e)))
+                                     ,@transfer-forms))
+                                handler-forms)))
+                       (:catch-all
+                        (dolist (f (transfer frame '()))
+                          (push f handler-forms)))
+                       (:catch-all-ref
+                        (dolist (f (transfer frame (list 'e)))
+                          (push f handler-forms)))
+                       (t (error 'wasmdown:codegen-error
+                                 :function-index *current-function-index*
+                                 :message (format nil
+                                                  "try_table clause ~a is not lowered"
+                                                  kind)))))))
+          (%emit-seq child (wasm-instr-body instr))
+          (%emit-flush child)
+          ;; one handler-bind around the body: a matching clause leaves
+          ;; through the target label; anything else declines and keeps
+          ;; propagating to an outer handler or the invoke boundary.
+          (%emit cctx
+                 `(handler-bind ((wasmdown:wasm-exception
+                                   (lambda (e)
+                                     ,@(nreverse handler-forms)
+                                     nil)))
+                    (tagbody ,@(nreverse (cctx-tagbody child))))))
+      (pop (cctx-blocks cctx))
+      (let ((fallthrough (%pop-n cctx nresults)))
+        (%emit-parallel-move cctx (loop for v in fallthrough
+                                        for rt in result-temps
+                                        collect (cons rt v))))
+      (%emit-tag cctx tag)
+      (setf (cctx-operands cctx)
+            (append (reverse result-temps) entry-tail)))))
+
+(defun %emit-tail-transfer (cctx callee args)
+  "Emit a TAIL transfer of CALLEE with ARGS (push order): the runtime
+trampoline executes the callee in this function's place, so no guest
+depth or host stack is consumed and SBCL tail-call optimization is not
+relied on. TERMINATES this instruction sequence."
+  (%emit cctx `(wasmdown.runtime:tail-call ,callee (list ,@args)))
+  (setf (cctx-operands cctx) nil))
+
+(defun %func-functype (cctx funcidx)
+  "The wasm-func-type of FUNCIDX, imported or defined."
+  (let* ((module (cctx-module cctx))
+         (imported (loop for im across (wasm-module-imports module)
+                         when (eq (wasm-import-kind im) :func)
+                           collect im)))
+    (if (< funcidx (length imported))
+        (svref (wasm-module-types module)
+               (wasm-import-type (nth funcidx imported)))
+        (svref (wasm-module-types module)
+               (wasm-func-typeidx
+                (svref (wasm-module-funcs module) (- funcidx (length imported))))))))
+
+(defun %callee-shape (cctx typeidx)
+  "(values params results) of the functype TYPEIDX in this module."
+  (let ((ft (svref (wasm-module-types (cctx-module cctx)) typeidx)))
+    (values (wasm-func-type-params ft)
+            (wasm-func-type-results ft))))
+
+(defun %emit-type-check (cctx ref typeidx)
+  "Emit the runtime check for a callee reached through a reference:
+null traps :null-reference; a functype that is not equivalent to the
+call site's TYPEIDX traps :indirect-call-type-mismatch. The comparison
+is the canonical iso-recursive rule (WASMDOWN.TYPES:FUNC-TYPE-MATCH-P),
+so recursive/typed references compare correctly and a different
+defining module is resolved through its own context. A host
+func-instance has no module-instance, hence the NIL context."
+  (let ((actual (%temp cctx "ft"))
+        (holder (%temp cctx "fti")))
+    (%emit cctx `(unless (wasmdown.runtime:func-instance-p ,ref)
+                   (%trap :null-reference "null function reference")))
+    (%emit cctx `(setf ,actual (wasmdown.runtime:func-instance-type ,ref)
+                       ,holder (wasmdown.runtime:func-instance-module ,ref)))
+    (%emit cctx
+           `(unless (wasmdown.types:func-type-match-p
+                     (svref (wasmdown.types:wasm-module-types
+                             (wasmdown.runtime:module-instance-module
+                              ,(%inst cctx)))
+                            ,typeidx)
+                     ,actual
+                     (wasmdown.runtime:module-instance-module ,(%inst cctx))
+                     ;; a HOST callee has no module-instance; the
+                     ;; comparator takes an empty module there (same
+                     ;; dummy the interpreter uses).
+                     (or (and (wasmdown.runtime:module-instance-p ,holder)
+                              (wasmdown.runtime:module-instance-module ,holder))
+                         (wasmdown.types:make-wasm-module)))
+              (%trap :indirect-call-type-mismatch
+                     "callee functype is not equivalent to the call site's type")))))
+
+(defun %emit-tail-call-direct (cctx funcidx)
+  (let* ((type (%func-functype cctx funcidx))
+         (args (%pop-n cctx (length (wasm-func-type-params type)))))
+    (%emit-tail-transfer cctx (%func cctx funcidx) args)))
+
+(defun %emit-tail-call-indirect (cctx instr)
+  (let* ((imms (wasm-instr-imms instr))
+         (typeidx (getf imms :type))
+         (idx (%pop cctx))
+         (ref (%temp cctx "tail-ref")))
+    (multiple-value-bind (eparams eresults) (%callee-shape cctx typeidx)
+      (declare (ignore eparams eresults))
+      (let ((params (%pop-n cctx (length (wasm-func-type-params
+                                          (svref (wasm-module-types
+                                                  (cctx-module cctx))
+                                                 typeidx))))))
+        (%emit cctx `(setf ,ref (wasmdown.runtime:table-get
+                                  ,(%table cctx (getf imms :table)) ,idx)))
+        (%emit-type-check cctx ref typeidx)
+        (%emit-tail-transfer cctx ref params)))))
+
+(defun %emit-tail-call-ref (cctx instr)
+  (let* ((imms (wasm-instr-imms instr))
+         (typeidx (getf imms :type))
+         (ref (%pop cctx))
+         (params (%pop-n cctx (length (wasm-func-type-params
+                                       (svref (wasm-module-types
+                                               (cctx-module cctx))
+                                              typeidx))))))
+    (%emit-type-check cctx ref typeidx)
+    (%emit-tail-transfer cctx ref params)))
 
 ;;; ---------------------------------------------------------------
-;;; Main instruction dispatcher.
+;;; SIMD and GC/typed-reference lowering.
+;;;
+;;; Both families emit a call to the ONE value-level implementation:
+;;; WASMDOWN.SIMD:EXECUTE-OP for the 0xFD family and the exported
+;;; WASMDOWN.RUNTIME GC helpers (the same functions the reference
+;;; interpreter calls). The compiler still decides the operand
+;;; arity and the memidx/immediate plumbing at compile time, but no
+;;; semantics is re-implemented here — and nothing falls back to the
+;;; interpreter.
+
+(defun %emit-value (cctx form)
+  "Emit FORM as the single result value of the current instruction."
+  (let ((tmp (%result-temp cctx)))
+    (%emit cctx `(setf ,tmp ,form))
+    (%push cctx tmp)))
+
+(defun %emit-simd (cctx instr)
+  "Lower one SIMD instruction to a call to WASMDOWN.SIMD:EXECUTE-OP.
+The memarg families pass the instance's memory resolved at run time
+from the instruction's memidx, so the shared implementation performs
+the memory access and the full-span bounds check."
+  (let* ((op (wasm-instr-op instr))
+         (imms (wasm-instr-imms instr))
+         (entry (wasmdown.simd:entry-of op))
+         (nparams (length (wasmdown.simd:simd-entry-params entry)))
+         (nresults (length (wasmdown.simd:simd-entry-results entry)))
+         (args (%pop-n cctx nparams))
+         (imm (wasmdown.simd:simd-entry-imm entry))
+         (memory (if (and (consp imm)
+                          (member (first imm) '(:memarg :memarg-lane)))
+                     (%mem cctx (getf imms :memidx 0))
+                     nil))
+         (call `(wasmdown.simd:execute-op
+                 ,op ',imms (list ,@args) ,memory)))
+    (case nresults
+      (0 (%emit cctx call))
+      (1 (%emit-value cctx `(first ,call)))
+      (t
+       ;; no 0xFD op has more than one result today; keep the general
+       ;; shape so a future multi-result entry cannot silently lose
+       ;; one.
+       (let ((tmps (loop repeat nresults collect (%result-temp cctx))))
+         (%emit cctx `(multiple-value-setq (,@tmps) (values-list ,call)))
+         (dolist (tmp tmps) (%push cctx tmp)))))))
+
+(defparameter *gc-ops*
+  '(:struct.new :struct.new-default
+    :struct.get :struct.get-s :struct.get-u :struct.set
+    :array.new :array.new-default :array.new-fixed
+    :array.new-data :array.new-elem
+    :array.get :array.get-s :array.get-u :array.set :array.len
+    :array.fill :array.copy :array.init-data :array.init-elem
+    :ref.test :ref.cast :br-on-cast :br-on-cast-fail
+    :ref.eq :any.convert-extern :extern.convert-any
+    :ref.i31 :i31.get-s :i31.get-u)
+  "GC / typed-reference opcodes with a baseline lowering.")
+
+(defun %comptype (cctx typeidx)
+  (wasm-rec-type-comptype
+   (svref (wasm-module-types (cctx-module cctx)) typeidx)))
+
+(defun %emit-br-on-cast (cctx instr)
+  "br_on_cast / br_on_cast_fail: the shared cast check decides branch
+vs fallthrough. Both variants branch WITH the reference (the target
+type differs); the else path keeps the original value on the stack."
+  (let* ((op (wasm-instr-op instr))
+         (imms (wasm-instr-imms instr))
+         (depth (getf imms :label))
+         (frame (and (< depth (length (cctx-blocks cctx)))
+                     (nth depth (cctx-blocks cctx))))
+         (on-success (eq op :br-on-cast))
+         (v (%pop cctx))
+         (ok (%temp cctx "cast"))
+         (cond-form (if on-success ok `(not ,ok))))
+    (%emit cctx `(setf ,ok (wasmdown.runtime:cast-succeeds-p
+                            ,v ',(getf imms :dst)
+                            ,(if (getf imms :dst-nullable) t nil)
+                            (wasmdown.runtime:module-instance-module
+                             ,(%inst cctx)))))
+    (if (null frame)
+        ;; the label names the function body
+        (let* ((nresults (length (wasm-func-type-results
+                                  (cctx-type cctx))))
+               (vals (%pop-n cctx (1- nresults)))
+               (dup (copy-list vals))
+               (full (append dup (list v))))
+          (%emit-flush cctx)
+          (%emit cctx `(when ,cond-form
+                         (return-from ,(cctx-fn-sym cctx)
+                           (list ,@full))))
+          (dolist (x dup) (%push cctx x))
+          (%push cctx v))
+        (let* ((loop-p (eq (block-state-kind frame) :loop))
+               (arity (if loop-p (block-state-nparams frame)
+                          (block-state-nresults frame)))
+               (targets (if loop-p (block-state-entry-temps frame)
+                            (block-state-results frame)))
+               (vals (%pop-n cctx (1- arity)))
+               (dup (copy-list vals))
+               (full (append dup (list v))))
+          (%emit-flush cctx)
+          (%emit cctx `(when ,cond-form
+                         ,@(loop for x in full
+                                 for tt in targets
+                                 collect `(setf ,tt ,x))
+                         (go ,(block-state-entry-tag frame))))
+          (dolist (x dup) (%push cctx x))
+          (%push cctx v)))))
+
+(defun %emit-gc (cctx instr)
+  "Lower one GC / typed-reference instruction to the shared
+WASMDOWN.RUNTIME value-level helper the interpreter uses."
+  (let* ((op (wasm-instr-op instr))
+         (imms (wasm-instr-imms instr))
+         (inst (%inst cctx))
+         (typeidx (getf imms :type)))
+    (cond
+      ((eq op :struct.new)
+       (let* ((n (length (wasm-comptype-fields (%comptype cctx typeidx))))
+              (vals (%pop-n cctx n)))
+         (%emit-value cctx `(wasmdown.runtime:struct-new-value
+                             ,inst ,typeidx (list ,@vals)))))
+      ((eq op :struct.new-default)
+       (%emit-value cctx `(wasmdown.runtime:struct-new-default-value
+                           ,inst ,typeidx)))
+      ((member op '(:struct.get :struct.get-s :struct.get-u))
+       (let ((ref (%pop cctx)))
+         (%emit-value cctx `(wasmdown.runtime:struct-get-value
+                             ,inst ,typeidx ,(getf imms :field) ,ref
+                             ,(if (eq op :struct.get-s) t nil)))))
+      ((eq op :struct.set)
+       (let ((v (%pop cctx)) (ref (%pop cctx)))
+         (%emit cctx `(wasmdown.runtime:struct-set-value
+                       ,inst ,typeidx ,(getf imms :field) ,ref ,v))))
+      ((eq op :array.new)
+       (let ((len (%pop cctx)) (v (%pop cctx)))
+         (%emit-value cctx `(wasmdown.runtime:array-new-value
+                             ,inst ,typeidx ,v ,len))))
+      ((eq op :array.new-default)
+       (let ((len (%pop cctx)))
+         (%emit-value cctx `(wasmdown.runtime:array-new-default-value
+                             ,inst ,typeidx ,len))))
+      ((eq op :array.new-fixed)
+       (let* ((n (getf imms :count))
+              (vals (%pop-n cctx n)))
+         (%emit-value cctx `(wasmdown.runtime:array-new-fixed-value
+                             ,inst ,typeidx (list ,@vals)))))
+      ((eq op :array.new-data)
+       (let ((len (%pop cctx)) (off (%pop cctx)))
+         (%emit-value cctx `(wasmdown.runtime:array-new-data-value
+                             ,inst ,typeidx ,off ,len
+                             ,(getf imms :data)))))
+      ((eq op :array.new-elem)
+       (let ((len (%pop cctx)) (off (%pop cctx)))
+         (%emit-value cctx `(wasmdown.runtime:array-new-elem-value
+                             ,inst ,typeidx ,off ,len
+                             ,(getf imms :elem)))))
+      ((member op '(:array.get :array.get-s :array.get-u))
+       (let ((idx (%pop cctx)) (ref (%pop cctx)))
+         (%emit-value cctx `(wasmdown.runtime:array-get-value
+                             ,inst ,typeidx ,ref ,idx
+                             ,(if (eq op :array.get-s) t nil)))))
+      ((eq op :array.set)
+       (let ((v (%pop cctx)) (idx (%pop cctx)) (ref (%pop cctx)))
+         (%emit cctx `(wasmdown.runtime:array-set-value
+                       ,inst ,typeidx ,ref ,idx ,v))))
+      ((eq op :array.len)
+       (let ((ref (%pop cctx)))
+         (%emit-value cctx `(wasmdown.runtime:array-len-value ,ref))))
+      ((eq op :array.fill)
+       (let ((len (%pop cctx)) (v (%pop cctx))
+             (off (%pop cctx)) (ref (%pop cctx)))
+         (%emit cctx `(wasmdown.runtime:array-fill-value
+                       ,inst ,typeidx ,ref ,off ,v ,len))))
+      ((eq op :array.copy)
+       (let ((len (%pop cctx)) (src-off (%pop cctx)) (src (%pop cctx))
+             (dst-off (%pop cctx)) (dst (%pop cctx)))
+         (%emit cctx `(wasmdown.runtime:array-copy-value
+                       ,dst ,dst-off ,src ,src-off ,len))))
+      ((eq op :array.init-data)
+       (let ((len (%pop cctx)) (off (%pop cctx))
+             (dst-idx (%pop cctx)) (ref (%pop cctx)))
+         (%emit cctx `(wasmdown.runtime:array-init-data-value
+                       ,inst ,typeidx ,ref ,dst-idx ,off ,len
+                       ,(getf imms :data)))))
+      ((eq op :array.init-elem)
+       (let ((len (%pop cctx)) (off (%pop cctx))
+             (dst-idx (%pop cctx)) (ref (%pop cctx)))
+         (%emit cctx `(wasmdown.runtime:array-init-elem-value
+                       ,inst ,typeidx ,ref ,dst-idx ,off ,len
+                       ,(getf imms :elem)))))
+      ((member op '(:ref.test :ref.cast))
+       (let ((v (%pop cctx)) (ok (%temp cctx "cast")))
+         (%emit cctx `(setf ,ok (wasmdown.runtime:cast-succeeds-p
+                                 ,v ',(getf imms :type)
+                                 ,(if (getf imms :nullable) t nil)
+                                 (wasmdown.runtime:module-instance-module
+                                  ,inst))))
+         (if (eq op :ref.test)
+             (let ((tmp (%result-temp cctx)))
+               (%emit cctx `(setf ,tmp (if ,ok 1 0)))
+               (%push cctx tmp))
+             (progn
+               (%emit cctx `(unless ,ok
+                              (%trap :cast-failure "cast failure")))
+               (let ((tmp (%result-temp cctx)))
+                 (%emit cctx `(setf ,tmp ,v))
+                 (%push cctx tmp))))))
+      ((member op '(:br-on-cast :br-on-cast-fail))
+       (%emit-br-on-cast cctx instr))
+      ((eq op :ref.eq)
+       (let ((b (%pop cctx)) (a (%pop cctx)))
+         (%emit-value cctx `(if (eql ,a ,b) 1 0))))
+      ((member op '(:any.convert-extern :extern.convert-any))
+       ;; value-preserving: only the STATIC typing changes.
+       nil)
+      ((eq op :ref.i31)
+       (let ((v (%pop cctx)))
+         (%emit-value cctx `(wasmdown.runtime:make-i31 ,v))))
+      ((member op '(:i31.get-s :i31.get-u))
+       (let ((v (%pop cctx)))
+         (%emit cctx `(when (null ,v)
+                        (%trap :null-reference "null i31 reference")))
+         (%emit-value cctx (if (eq op :i31.get-s)
+                               `(wasmdown.runtime:i31-get-s ,v)
+                               `(wasmdown.runtime:i31-get-u ,v))))))))
 
 (defun %emit-instr (cctx instr)
   (let* ((op (wasm-instr-op instr))
@@ -959,9 +1421,9 @@ its :end)."
                             (block-state-entry-tag frame)))))
            (flet ((arm-form (depth)
                     (multiple-value-bind (tgts tag) (arm depth)
-                      `(,@(loop for v in saved
-                                for tt in tgts
-                                collect `(setf ,tt ,v))
+                      `((psetf ,@(loop for v in saved
+                                       for tt in tgts
+                                       append (list tt v)))
                         (go ,tag)))))
              (%emit cctx
                     `(case ,idx
@@ -988,37 +1450,21 @@ its :end)."
               (params (%pop-n cctx (length eparams)))
               (results (loop for r in eresults collect (%result-temp cctx)))
               (list-sym (%temp cctx "cr-args")))
-         (%emit cctx `(unless (wasmdown.runtime:func-instance-p ,ref)
-                        (%trap :null-reference
-                               "null function reference")))
+         (%emit-type-check cctx ref typeidx)
          (%emit cctx `(setf ,list-sym (list ,@params)))
          (%emit cctx `(multiple-value-setq (,@results)
                         (values-list
                          (apply #'wasmdown.runtime:wasm-call ,ref ,list-sym))))
          (dolist (r results) (%push cctx r))))
+      ((eq op :try-table) (%emit-try-table cctx instr))
+      ((eq op :throw) (%emit-throw cctx (getf imms :tag)))
+      ((eq op :throw-ref) (%emit-throw-ref cctx))
+      ((eq op :return-call)
+       (%emit-tail-call-direct cctx (getf imms :func)))
+      ((eq op :return-call-indirect)
+       (%emit-tail-call-indirect cctx instr))
       ((eq op :return-call-ref)
-       ;; return_call_ref: same call, then return its results from the
-       ;; function (the host-stack depth difference of a true tail call
-       ;; is not observable here: wasmdown's invoke is not recursive
-       ;; per wasm frame in compiled mode).
-       (let* ((typeidx (getf imms :type))
-              (expected (svref (wasm-module-types (cctx-module cctx))
-                               typeidx))
-              (eparams (wasm-func-type-params expected))
-              (eresults (wasm-func-type-results expected))
-              (ref (%pop cctx))
-              (params (%pop-n cctx (length eparams)))
-              (results (loop for r in eresults collect (%result-temp cctx)))
-              (list-sym (%temp cctx "rtc-args")))
-         (%emit cctx `(unless (wasmdown.runtime:func-instance-p ,ref)
-                        (%trap :null-reference
-                               "null function reference")))
-         (%emit cctx `(setf ,list-sym (list ,@params)))
-         (%emit cctx `(multiple-value-setq (,@results)
-                        (values-list
-                         (apply #'wasmdown.runtime:wasm-call ,ref ,list-sym))))
-         (%emit cctx `(return-from ,(cctx-fn-sym cctx) (list ,@results)))
-         (setf (cctx-operands cctx) nil)))
+       (%emit-tail-call-ref cctx instr))
       ((eq op :ref.null)
        (let ((tmp (%result-temp cctx)))
          (%emit cctx `(setf ,tmp nil))
@@ -1048,9 +1494,15 @@ its :end)."
        (if (search "STORE" (symbol-name op))
            (%emit-store cctx instr)
            (%emit-load cctx instr)))
+      ((wasmdown.simd:simd-op-p op) (%emit-simd cctx instr))
+      ((member op *gc-ops*) (%emit-gc cctx instr))
       ((getf *numop-map* op) (%emit-numop cctx op))
-      (t (error 'wasmdown:host-error
-                :message (format nil "codegen: unimplemented opcode ~a"
+      (t (error 'wasmdown:codegen-error
+                :op op
+                :offset (wasm-instr-offset instr)
+                :function-index *current-function-index*
+                :message (format nil
+                                 "no lowering for opcode ~a (baseline does not fall back to the interpreter)"
                                  op))))))
 
 ;;; ---------------------------------------------------------------
@@ -1064,16 +1516,27 @@ its :end)."
     (t nil)))
 
 (defun %capture-pending (cctx sym)
-  "Replace every operand-stack reference to SYM with a fresh temp holding
-SYM's CURRENT value. Called just before a write to SYM so that operands
-already pushed from that local keep the value they were read with."
+  "Replace every LIVE reference to SYM with a fresh temp holding SYM's
+CURRENT value. Called just before a write to SYM so that operands
+already pushed from that local keep the value they were read with.
+
+The live views are not only the operand stack: each open block frame
+saved the operands BELOW its parameters (BLOCK-STATE-TAIL), and those
+symbols are still consumed after the block closes. A local written
+inside the block would otherwise rewrite the saved view too (the audit
+M3 required). Each frame holds a private copy of that tail, so the
+replacement is emitted once and applies to every view."
   (let ((tmp nil))
-    (loop for tail on (cctx-operands cctx)
-          do (when (eq (car tail) sym)
-               (unless tmp
-                 (setf tmp (%result-temp cctx))
-                 (%emit cctx `(setf ,tmp ,sym)))
-               (setf (car tail) tmp)))
+    (flet ((repair (list)
+             (loop for tail on list
+                   do (when (eq (car tail) sym)
+                        (unless tmp
+                          (setf tmp (%result-temp cctx))
+                          (%emit cctx `(setf ,tmp ,sym)))
+                        (setf (car tail) tmp)))))
+      (repair (cctx-operands cctx))
+      (dolist (frame (cctx-blocks cctx))
+        (repair (block-state-tail frame))))
     tmp))
 
 (defun %expand-local-types (fn type)
@@ -1171,7 +1634,8 @@ given. *PRINT-CIRCLE* is required: the emitted form embeds the instance
 as a quoted constant and module-instances are circular (their :wasm
 func-instances backpoint to the instance), so a plain pprint would
 recurse until the host stack runs out. Returns the compiled closure."
-  (let* ((form (%build-func-form module instance funcidx))
+  (let* ((*current-function-index* funcidx)
+         (form (%build-func-form module instance funcidx))
          (closure (compile nil form)))
     (when stream
       (let ((*print-circle* t))
