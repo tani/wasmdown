@@ -43,8 +43,10 @@ segments and before the start section; there is no interpreter fallback.
 decode / validate / instantiate(+compile) / run per backend. On the synthetic
 kernels `:compiled` runs 7–17x faster than the interpreter, and eager
 compilation costs 0.4–1.5 ms and 0.3–1.3 MiB per small module. A 6 MB guest
-(SQLite) needs ~8 GiB of SBCL heap and ~200 s to compile, which is why WASI
-compiled runs are report evidence rather than a gate.
+(SQLite, 2 039 defined functions) needs ~8 GiB of SBCL heap and ~200 s to
+compile — about 98 ms per function — which is why WASI compiled runs are
+report evidence rather than a gate. The bench table carries each fixture's
+function count so compile cost is readable per function.
 
 ## Blocked
 

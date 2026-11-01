@@ -10,15 +10,33 @@ LISP_FILES := $(wildcard src/*.lisp)
         report-backends-bench \
         test-upstream test-wasi-preview1 test-wasi-preview2 test-wasi \
         report-conformance p3-fixtures test-wasi-preview3 verify \
+        test-property test-p1-repeat \
         clean \
         load-system repl wasi-fixtures
 
 # Reproducible quick gate: the deterministic lanes that must be green on
 # any change. Compiled large-guest lanes stay report-only. ~2.5 min.
 verify: test-unit test-component test-backend-parity test-backend-inventory \
-	test-wasi test-wasi-preview3
+	test-wasi test-wasi-preview3 test-property
 	$(SBCL) --script tools/build-p3-fixtures.lisp --check
 	@echo "verify: all quick gates green"
+
+# Differential property/fuzz lane: generated core modules run under both
+# backends; results, trap kinds and observable memory must agree. A failure
+# prints its seed for reproduction. ITERATIONS overrides the default.
+ITERATIONS ?= 2000
+test-property:
+	$(SBCL) --control-stack-size 32 --dynamic-space-size 4096 --script tools/fuzz-backends.lisp --iterations $(ITERATIONS)
+
+# P1 acceptance repeated in fresh processes (the plan's "P1 guest tests pass
+# twice"). Interpret mode; the compiled form is report evidence, not a repeat
+# gate. RUNS overrides the default.
+RUNS ?= 3
+test-p1-repeat:
+	@for i in $$(seq 1 $(RUNS)); do \
+	  echo "P1 acceptance run $$i/$(RUNS)"; \
+	  python3 tools/wasi-preview1-acceptance.py || exit 1; \
+	done
 
 all: test
 

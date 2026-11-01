@@ -629,11 +629,16 @@ def main():
     check = "--check" in sys.argv[1:]
     doc = build_document(parse_records(run_helper()))
     if check and os.path.exists(JSON_OUT):
-        # generated_at is the only non-reproducible field; reuse the one
-        # already committed so --check compares content, not wall clock
+        # the volatile fields (wall clock, and the source identity of the
+        # tree doing the check) are reused from the committed document so
+        # --check compares CONTENT: running it from a dirty or different
+        # tree must not report the inventory stale.
         with open(JSON_OUT) as fh:
-            doc["generated_at"] = json.load(fh).get("generated_at",
-                                                     doc["generated_at"])
+            old_doc = json.load(fh)
+        for key in ("generated_at", "source_commit", "source_tree",
+                    "clean_tree"):
+            if key in old_doc:
+                doc[key] = old_doc[key]
     js = json.dumps(doc, indent=1, sort_keys=False) + "\n"
     md = render_markdown(doc)
     stale = []

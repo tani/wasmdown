@@ -183,6 +183,7 @@ decode identical bytes (the WAT parse itself is not being measured)."
                       :result (format nil "~s" result))
                 rows))))
     (list :fixture label
+          :functions (length (wasmdown.types:wasm-module-funcs module))
           :decode_seconds (float t-decode 1d0)
           :validate_seconds (float t-validate 1d0)
           :backends (nreverse rows))))
@@ -199,7 +200,8 @@ values (decode/validate of a tiny module is not 0 ms)."
         (format nil "~,2f ms" ms))))
 
 (defun %print-row (row)
-  (destructuring-bind (&key fixture decode_seconds validate_seconds backends) row
+  (destructuring-bind (&key fixture functions decode_seconds validate_seconds backends) row
+    (declare (ignore functions))
     (format t "~&~a  decode ~a  validate ~a~%"
             fixture (%ms decode_seconds) (%ms validate_seconds))
     (dolist (b backends)
@@ -221,13 +223,13 @@ values (decode/validate of a tiny module is not 0 ms)."
     (format s "`:compiled` instantiate time INCLUDES compiling every defined function:~%")
     (format s "compilation is eager and happens before the start section, so it is a~%")
     (format s "one-shot cost per instantiation, not part of the run.~%~%")
-    (format s "| Fixture | Backend | decode | validate | instantiate+compile | consed | run | result |~%")
-    (format s "| --- | --- | --- | --- | --- | --- | --- | --- |~%")
+    (format s "| Fixture | funcs | Backend | decode | validate | instantiate+compile | consed | run | result |~%")
+    (format s "| --- | --- | --- | --- | --- | --- | --- | --- | --- |~%")
     (dolist (row rows)
-      (destructuring-bind (&key fixture decode_seconds validate_seconds backends) row
+      (destructuring-bind (&key fixture functions decode_seconds validate_seconds backends) row
         (dolist (b backends)
-          (format s "| ~a | ~a | ~a | ~a | ~a | ~a MiB | ~a | `~a` |~%"
-                  fixture (getf b :mode)
+          (format s "| ~a | ~d | ~a | ~a | ~a | ~a | ~a MiB | ~a | `~a` |~%"
+                  fixture (or (getf row :functions) 0) (getf b :mode)
                   (%ms decode_seconds) (%ms validate_seconds)
                   (%ms (getf b :instantiate_seconds))
                   (format nil "~,1f"
@@ -279,8 +281,9 @@ so instead of naming a commit that does not contain the code."
       (loop for row in rows
             for first = t then nil
             do (unless first (format s ","))
-               (format s "{\"fixture\":~a,\"decode_s\":~,6f,\"validate_s\":~,6f,\"backends\":["
+               (format s "{\"fixture\":~a,\"functions\":~d,\"decode_s\":~,6f,\"validate_s\":~,6f,\"backends\":["
                        (%json-str (getf row :fixture))
+                       (or (getf row :functions) 0)
                        (getf row :decode_seconds)
                        (getf row :validate_seconds))
                (loop for b in (getf row :backends)
