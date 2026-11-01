@@ -51,6 +51,7 @@ P2 = "sqlite3-p2.wasm"
 # (never a skip), so nothing can pass silently.
 P3 = "p3-guest.wasm"
 P3_IMPORT = "p3-import-guest.wasm"
+P3_CLOCK = "p3-clock-guest.wasm"
 
 # ---- the cases -----------------------------------------------------
 # expect.stdout_equals  : exact stdout (list of lines, joined by \n, one
@@ -219,6 +220,16 @@ CASES = [
         # imports wasi:cli/exit@0.3.2, lowers exit-with-code, calls it with
         # 7: the command runner maps the WASI exit to the process status.
         "expect": {"stdout_equals": [], "exit": 7},
+    },
+    {
+        "id": "p3/clock-monotonic",
+        "abi": "preview3",
+        "fixture": P3_CLOCK,
+        "argv": [],
+        "stdin": "",
+        # imports wasi:clocks/monotonic-clock@0.3.2, calls now() twice and
+        # traps unless the second call is >= the first.
+        "expect": {"stdout_equals": [], "exit": 0},
     },
     # ---------------- Preview 1 ----------------
     {

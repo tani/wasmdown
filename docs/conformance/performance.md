@@ -9,17 +9,17 @@ one-shot cost per instantiation, not part of the run.
 
 | Fixture | funcs | Backend | decode | validate | instantiate+compile | consed | run | result |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| loop-sum | 1 | INTERPRET | 2.0 us | 25.0 us | 2.0 us | 0.0 MiB | 640.23 ms | `(2839207360)` |
-| loop-sum | 1 | COMPILED | 2.0 us | 25.0 us | 464.0 us | 0.3 MiB | 40.20 ms | `(2839207360)` |
-| tail-count | 2 | INTERPRET | 2.0 us | 4.0 us | 5.0 us | 0.0 MiB | 539.83 ms | `(0)` |
-| tail-count | 2 | COMPILED | 2.0 us | 4.0 us | 676.0 us | 0.6 MiB | 46.98 ms | `(0)` |
-| fib-recursive | 2 | INTERPRET | 4.0 us | 3.0 us | 3.0 us | 0.0 MiB | 89.64 ms | `(75025)` |
-| fib-recursive | 2 | COMPILED | 4.0 us | 3.0 us | 1.04 ms | 0.9 MiB | 9.41 ms | `(75025)` |
-| memory-fill-sum | 1 | INTERPRET | 3.0 us | 3.0 us | 22.0 us | 1.1 MiB | 627.88 ms | `(1783293664)` |
-| memory-fill-sum | 1 | COMPILED | 3.0 us | 3.0 us | 1.02 ms | 1.6 MiB | 138.12 ms | `(1783293664)` |
-| f64-accumulate | 1 | INTERPRET | 2.0 us | 3.0 us | 2.0 us | 0.0 MiB | 186.13 ms | `(2147483647)` |
-| f64-accumulate | 1 | COMPILED | 2.0 us | 3.0 us | 513.0 us | 0.4 MiB | 12.47 ms | `(2147483647)` |
-| indirect-call | 2 | INTERPRET | 3.0 us | 5.0 us | 4.0 us | 0.0 MiB | 308.27 ms | `(500000)` |
-| indirect-call | 2 | COMPILED | 3.0 us | 5.0 us | 1.56 ms | 1.3 MiB | 97.79 ms | `(500000)` |
+| loop-sum | 1 | INTERPRET | 2.0 us | 25.0 us | 2.0 us | 0.0 MiB | 647.54 ms | `(2839207360)` |
+| loop-sum | 1 | COMPILED | 2.0 us | 25.0 us | 436.0 us | 0.3 MiB | 40.28 ms | `(2839207360)` |
+| tail-count | 2 | INTERPRET | 3.0 us | 4.0 us | 4.0 us | 0.0 MiB | 537.89 ms | `(0)` |
+| tail-count | 2 | COMPILED | 3.0 us | 4.0 us | 611.0 us | 0.6 MiB | 46.57 ms | `(0)` |
+| fib-recursive | 2 | INTERPRET | 2.0 us | 4.0 us | 3.0 us | 0.0 MiB | 89.12 ms | `(75025)` |
+| fib-recursive | 2 | COMPILED | 2.0 us | 4.0 us | 982.0 us | 0.9 MiB | 9.39 ms | `(75025)` |
+| memory-fill-sum | 1 | INTERPRET | 3.0 us | 4.0 us | 19.0 us | 1.1 MiB | 625.85 ms | `(1783293664)` |
+| memory-fill-sum | 1 | COMPILED | 3.0 us | 4.0 us | 850.0 us | 1.6 MiB | 137.94 ms | `(1783293664)` |
+| f64-accumulate | 1 | INTERPRET | 3.0 us | 3.0 us | 3.0 us | 0.0 MiB | 184.79 ms | `(2147483647)` |
+| f64-accumulate | 1 | COMPILED | 3.0 us | 3.0 us | 479.0 us | 0.4 MiB | 12.83 ms | `(2147483647)` |
+| indirect-call | 2 | INTERPRET | 3.0 us | 4.0 us | 4.0 us | 0.0 MiB | 307.39 ms | `(500000)` |
+| indirect-call | 2 | COMPILED | 3.0 us | 4.0 us | 1.40 ms | 1.3 MiB | 97.13 ms | `(500000)` |
 
 Regenerate: `sbcl --script tools/bench-backends.lisp --commit`

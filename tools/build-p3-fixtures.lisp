@@ -137,9 +137,66 @@
                                    ;; defined run instance is instance 1
                                    (b-bytes #x05 1) (b-bytes 0)))))))
 
+;;; ---------------------------------------------------------------
+;;; Fixture 3: imports wasi:clocks/monotonic-clock@0.3.2 and checks the
+;;; clock is monotonic across two calls (a broken provider traps).
+
+(defun p3-clock-guest-bytes ()
+  (let* ((core
+           (b-wat "(module
+                      (import \"env\" \"now\" (func $now (result i64)))
+                      (func (export \"run\") (result i32)
+                        (local $a i64) (local $b i64)
+                        (local.set $a (call $now))
+                        (local.set $b (call $now))
+                        (if (i64.lt_u (local.get $b) (local.get $a))
+                            (then unreachable))
+                        (i32.const 0)))"))
+         (result-type (b-bytes #x6a #x00 #x00))            ; result<_,_>
+         (run-ft (b-cat (b-bytes #x40) (b-vec)              ; functype () ->
+                        (b-bytes #x00) (b-bytes 0)))        ; result type 0
+         ;; mark is a u64 alias in the pinned WIT; the provider's func is
+         ;; flat `() -> i64`, so the instance type declares that functype.
+         (now-ft (b-cat (b-bytes #x40) (b-vec)
+                        (b-bytes #x00) (b-bytes #x77)))     ; -> u64
+         (clock-itype
+           (b-cat (b-bytes #x42)
+                  (b-vec (b-cat (b-bytes #x01) now-ft)      ; local type 0
+                         (b-cat (b-bytes #x04)
+                                (b-nameattrs "now")
+                                (b-bytes #x01 0)))))
+         (types (b-vec result-type run-ft clock-itype))
+         (import (b-vec (b-cat (b-nameattrs
+                                "wasi:clocks/monotonic-clock@0.3.2")
+                               (b-bytes #x05 2))))
+         (bag (b-cat (b-bytes #x01)
+                     (b-vec (b-cat (b-name "now")
+                                   (b-bytes #x00 0)))))      ; core func 0
+         (m-inst (b-cat (b-bytes #x00 0)
+                        (b-vec (b-cat (b-name "env")
+                                      (b-bytes #x12 0))))))
+    (b-cat (b-bytes 0 #x61 #x73 #x6d #x0d 0 1 0)
+           (b-sec 7 types)
+           (b-sec 10 import)
+           (b-sec 1 core)
+           (b-sec 6 (b-vec (b-cat (b-bytes #x01 #x00 0)
+                                  (b-name "now"))))
+           (b-sec 8 (b-vec (b-bytes #x01 #x00 0 0)))        ; lower now
+           (b-sec 2 (b-vec bag))
+           (b-sec 2 (b-vec m-inst))
+           (b-sec 6 (b-vec (b-cat (b-bytes #x00 #x00 #x01 1)
+                                  (b-name "run"))))
+           (b-sec 8 (b-vec (b-bytes #x00 #x00 1 0 1)))      ; lift run: type 1
+           (b-sec 5 (b-vec (b-cat (b-bytes #x01 1)
+                                  (b-nameattrs "run")
+                                  (b-bytes #x01 1))))
+           (b-sec 11 (b-vec (b-cat (b-nameattrs "wasi:cli/run@0.3.2")
+                                   (b-bytes #x05 1) (b-bytes 0)))))))
+
 (defparameter *fixtures*
   (list (list "p3-guest.wasm" #'p3-sync-guest-bytes 0 "")
-        (list "p3-import-guest.wasm" #'p3-import-guest-bytes 7 "")))
+        (list "p3-import-guest.wasm" #'p3-import-guest-bytes 7 "")
+        (list "p3-clock-guest.wasm" #'p3-clock-guest-bytes 0 "")))
 
 ;;; ---------------------------------------------------------------
 ;;; Verify through this project's own decoder/validator/runner, then
