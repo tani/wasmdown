@@ -334,8 +334,10 @@ CASES = [
 
 ABI_FILTERS = {"preview1": {"preview1"}, "preview2": {"preview2"},
                "preview3": {"preview3"},
-               # "all" is the released-ABI gate; preview3 stays explicit
-               # until a pinned @0.3.2 guest exists.
+               # "all" is the released-ABI gate (preview1 + preview2).
+               # preview3 is a hand-authored ABI lane with no upstream
+               # toolchain input, so it stays explicit (--abi preview3) and
+               # `make test-wasi-preview3` runs it in both backends.
                "all": {"preview1", "preview2"}}
 
 
