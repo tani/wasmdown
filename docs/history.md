@@ -463,8 +463,10 @@ Stable and unknown names pass through untouched, so the 0.3 command world
 composes exactly as before; the 0.2 line is untouched. **No feature flag was
 added** — the CLI has no way to enable a feature, so the gate is
 refusal-only. Ordering is deliberate: the unstable check runs before the
-sockets-import refusal, and both require a component with no 0.2 imports, so
-they never race with the mixed-release-line refusal. Pins:
+sockets-import refusal. On the 0.3-only path both see every declared
+`wasi:` import; on a mixed component they run over the 0.3-line subset only
+(the 0.2 line stays with the P2 tables), so neither path can hand a gated
+import a provider. Pins:
 `wasi/component-unstable-declared-import-is-link-error`,
 `wit/selection-import-surface-query` and
 `wit/selection-command-world-timezone-import`.
@@ -861,3 +863,172 @@ filesystem evidence row), but both are real correctness fixes with the P3
 filesystem fixture/lane as the regression witness; no separate named pin
 exists for them. Unit 694/0, component 1,702/0, P3 30/30 ×3 both backends,
 `make verify` green; only the filesystem fixture hash changed.
+
+## Deterministic async property lane and executor audit (2026-11-02)
+
+F4's async-assurance item landed as a real gate rather than more manual
+probes. `tests/async-property.lisp` (runner `tools/run-async-property.lisp`,
+target `make test-async-property`) drives the runtime's own primitives with
+fixed xorshift64* seeds `1,2,3,5,8,13,21,34` x3 repeats (14,071 checks, 0
+failures; `ASYNC_SEEDS`/`ASYNC_REPEATS` override the corpus). The random walk
+interleaves terminalise/cancel/ack/continuation/pump for `host-pending`,
+resolve/drop/cancel/pump for the one-shot `host-future-watch`, and
+stage/copy/poll/cancel/drop for stream/future ends; deterministic arms cover
+`task.return`/`task.cancel`, subtask resolve/deliver/drop, lend return,
+armed-event preservation under cancel, stale `host-end-ready` generations, and
+the host sink/source parked copy. A scripted fake reactor consumes one thunk
+per `%store-tick`, and the lane asserts the idle gate, the 1 ms budget clamp
+and the deadline-readiness oracle. Worker synchronisation is
+semaphore/condition based; every bounded wait that expires is a failure, and
+no test sleeps.
+
+The checks are invariants, not golden outputs: terminal outcome first-wins,
+exactly-once continuation/event/delivery, no double resolve, monotone
+task/subtask/end/watch states, the store-work unit released exactly once,
+buffer/progress and copy-generation monotonicity, backpressure admission and
+exclusive-slot serialisation. `make test-async-property-negative` deliberately
+double-delivers a pending continuation and requires the same checkers to
+report it (negative control). A wider 40-seed x4 sweep (92,358 checks) was
+green.
+
+The executor audit used the same lane plus the existing `tests/wasi.lisp` pins
+(`wasi/host-executor-budget-and-close`, `...-close-never-joins`,
+`...-separate-budgets`, `wasi/stdio-blocking-{sink,source}`,
+`wasi/dns-async-pending-and-detach`): DNS and blocked stdio are separate
+`host-executor` services with fixed construction-time budgets (2 workers each,
+never grown), jobs run only on the service's named worker threads, active jobs
+never exceed the budget, a blocked fd's span is copied into a worker-owned
+vector, `%executor-close` drops queued jobs/refuses new submissions without
+joining an in-flight job, and `close-wasi-context` marks the context closed so
+`%context-work-gate` rejects new DNS/stdio work and detaches both services.
+Guest stdio is the P3 `p3/cli-stdin-env-stderr-terminal` and
+`p3/stream-stdout` evidence: 30/30 x3 in both backends. Unit 695/0, component
+1,702/0, `make verify` green.
+
+## Upstream `wasi-testsuite` adapter lane — green (2026-11-02)
+
+`adapters/wasmdown.py` now implements the upstream runtime-adapter contract
+(`get_name`/`get_version`/`get_wasi_versions`/`get_wasi_worlds`/
+`get_timeout_seconds`/`compute_argv`) for `wasm32-wasip1` + `wasm32-wasip3`,
+`wasi:cli/command` only. Each guest is one fresh
+`sbcl --script tools/wasmdown.lisp run … --wasi` process; `root` becomes
+`--dir ABS::/`, the run env becomes `--env K=V`, and proposal-tagged tests
+raise instead of running unsupported (the driver excludes them by declared
+rule). `tools/run-wasi-testsuite.py` (`make test-wasi-upstream`) is the lane:
+it resolves the checkout (`--dir`, `WASI_TESTSuite_DIR`/`WASI_TESTSUITE_DIR`,
+default `third_party/wasi-testsuite`), requires `git rev-parse HEAD` to equal
+the new `specs/lock.toml [suite.wasi-testsuite]` pin
+(`9d84631e427729802085c3d172d0a63cd360a1fa`, branch `prod/testsuite-base`,
+2026-10-30), regenerates `tests/wasi-upstream-expectations.toml` from the tree,
+runs upstream `run-tests`, and writes a deterministic
+`tests/wasi-upstream-results.json` plus `tests/wasi-upstream-summary.md`.
+Expected skips are compared against the runner's actual skips and the
+denominator against the `*.wasm` count, so a new upstream test with a
+proposal cannot be silently skipped; a missing/mismatched checkout exits 2
+with the fetch recipe.
+
+Measured after the 2026-11-02 mixed-release and host-contract fixes:
+**127 guests, 95 pass / 0 fail / 32 declared skips** (28 / 67 when first
+measured, 72 / 23 before the mixed-release composition). Skips: 18
+`proposal-http`, 12 `proposal-sockets`, 2 P1 legacy `sock_shutdown-*` (network
+communication is excluded by decision) — no failing test is skipped.
+
+- **wasm32-wasip3 — clean: 25 pass / 0 fail / 30 declared skips.** The 23
+  tests that were LINK-refused are admitted by the composed mixed-release
+  graph (below); the host-contract defects they then exposed are fixed:
+  - **CLI `argv[0]` is the basename.** The upstream `cli-env` guest compares
+    `get-arguments()[0]` with `cli-env.wasm`; wasmtime supplies the module's
+    file name, not the path. `%component-context` now sets argv[0] from
+    `file-namestring`, and the P3 lane's `{fixture}` placeholder expands to
+    the same file name (the pinned `p3-cli-guest` still asserts the supplied
+    argv[0] byte for byte).
+  - **Empty path is `no-entry`.** POSIX resolves an empty path to ENOENT for
+    every `*at` call, and the upstream filesystem tests assert it. The old
+    conservative "empty -> invalid" short-circuit is gone from
+    `%path-components`; NUL stays `invalid`.
+  - **Directory `get-flags`.** A directory reports `read` plus the rights it
+    has (`mutate-directory`), never the file-only `write`; a directory opened
+    with no descriptor flags reports `read`. A file's flags are the
+    EFFECTIVE access mode: an explicit `write` without `read` is write-only,
+    while `create`/`truncate` imply write without suppressing the read
+    default.
+  - **`advise` on a directory is `bad-descriptor`** (posix_fadvise applies to
+    files; the test asserts the refusal).
+  - **`set-size`** no longer invents `read-only` (the test accepts
+    invalid/bad-descriptor/access and rejects read-only): the kernel decides,
+    and a `filesize` beyond off_t is `file-too-large` instead of a host type
+    error. `pread`/`pwrite` offsets at or above 2^63 are `invalid`.
+  - **`stat` timestamps** are the struct's own atime/mtime/ctime slots; the
+    record used to echo the mtime for all three, so the access timestamp
+    could not be read back after `set-times-at`.
+  - **`insecure-seed` is stable per provider instance.** The WIT says the
+    function is called once and will become a value import; the reference
+    runtime answers a second call with the first value, and the test asserts
+    `a == a1`.
+  - **Zero-length host reads complete.** A zero-length `read-via-stream`
+    buffer against a host source used to park forever (the canonical
+    End.copy "other end has no buffer" case); the host source now answers
+    COMPLETED with progress 0, which is what the guest's empty-buffer read
+    means.
+  - **Newest exported `run` wins.** A wasip3 component exports both
+    `wasi:cli/run@0.2.0` (a compatibility shim whose core entry is the test's
+    `main`, i.e. `unreachable!()`) and the real `wasi:cli/run@0.3.2`.
+    `component-run-export` used to take whichever the export hash visited
+    first; it now sorts the versioned `wasi:cli/run` exports (WIT version
+    order) and drives the newest, falling back to an unversioned instance or
+    a direct `run` export.
+- **wasm32-wasip1 — clean: 70 pass / 0 fail / 2 declared skips.** AssemblyScript
+  12/12, C 12/12 (the two `sock_shutdown-*` tests are declared skips), Rust
+  46/46. The fixes behind the jump from 26/44: preopen BASE rights are now the
+  directory rights only while INHERITING carries the file authority (a
+  directory base no longer advertises `fd_write`, so wasi-libc's
+  `max & inheriting` no longer makes an `O_DIRECTORY` open `O_RDWR`/`EISDIR`);
+  path lookup is handle-relative instead of always resolving from the preopen
+  (with `..` confined to the handle); directory descriptors drop
+  seek/tell/allocate/truncate rights; `fd_readdir` rewinds the shared
+  directory offset, reports the real `.`/`..` inodes and pages by truncating
+  the last dirent; filestats read nanosecond timestamps via `statx`;
+  `poll_oneoff` uses the 48-byte subscription stride and mutates revents in
+  the shared plist; `linkat`/`utimensat` no longer receive
+  `AT_SYMLINK_NOFOLLOW`/`AT_SYMLINK_FOLLOW` where the kernel rejects them;
+  paths containing NUL are `ILSEQ`, absolute symlink targets are
+  `NOTCAPABLE`, and `fd_renumber` requires an existing destination.
+
+### The mixed-release provider graph (2026-11-02)
+
+The upstream precompiled wasip3 guests declare BOTH release lines in one
+component: their `@0.3.2` imports (`wasi:cli/{environment,stdin,stdout,
+stderr,exit,terminal-*}`, `wasi:clocks/*`, `wasi:filesystem/*`,
+`wasi:random/*`) come from the 0.3.2 world, while the wit-bindgen p2
+compatibility layer adds `@0.2.9` (occasionally `@0.2.0`) imports of
+`wasi:io/{poll,error,streams}` and the `wasi:cli/*` façade. The runtime used
+to refuse that shape (`component mixes WASI release lines …; no single
+provider graph applies`) because no single world describes it.
+
+`component-command-providers` now composes ONE graph
+(`%compose-mixed-release-providers`):
+
+* the declared imports that are NOT exact `0.2.x` names are the 0.3 line and
+  are bound from `%wasi-provider-builders`, in declaration order, after the
+  0.3 gates: `@unstable` feature refusal, `wasi:http` (canonical message) and
+  `wasi:sockets` (canonical message) — no provider is built for a refused
+  import;
+* the exact-version `0.2.x` imports are bound from the P2 tables
+  (`preview2-command-provider`) per DISTINCT patch version, exactly as the
+  0.2-only path always did;
+* both are merged in the component's declaration order into one `with-args`
+  alist. A types-only 0.3 import needs no entry (as in world composition); an
+  import neither line can serve is still a construction-time `WIT-ERROR`
+  naming it. Nothing is invented to make a mix compose, and the 0.3-only path
+  still composes the whole command world, the 0.2-only path still its
+  version-exact tables (pinned by
+  `wasi/component-pure-lines-are-unchanged-by-mixed-support`).
+
+Pins: `wasi/component-mixed-lines-compose-one-graph` (both line names bound,
+distinct provider instances, nothing undeclared), `...-keep-declaration-order`,
+`...-sockets-declared-import-still-refused`, `...-http-declared-import-still-refused`
+(0.2 and 0.3 spellings), `...-unstable-declared-import-still-refused`,
+`...-unknown-line-import-is-construction-error`.
+
+The lane is evidence, never a release gate (it is not part of `verify`), and
+`declared_support` stays `partial`.

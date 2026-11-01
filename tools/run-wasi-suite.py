@@ -82,8 +82,10 @@ P3_FS = "p3-fs-guest.wasm"
 
 # ---- the cases -----------------------------------------------------
 # env                   : `K=V' pairs passed with --env (a `{fixture}'
-#                         placeholder expands to the fixture path, i.e.
-#                         the argv[0] the runner supplies)
+#                         placeholder expands to the argv[0] the runner
+#                         supplies, i.e. the fixture's FILE NAME: the CLI
+#                         sets argv[0] to the basename, as the reference
+#                         runtime does)
 # expect.stdout_equals  : exact stdout (list of lines, joined by \n, one
 #                         trailing newline tolerated)
 # expect.stdout_contains: every string must appear in stdout
@@ -554,10 +556,11 @@ def run_case(case, backend, groupdir, heap_mb):
         else:
             argv += ["--dir", f"{workdir}::{spec}"]
     # --env takes K=V before `--': the pairs reach wasi:cli/environment,
-    # and `{fixture}' expands to the path the runner hands the guest as
-    # argv[0], so a case can assert on that exact string.
+    # and `{fixture}' expands to the argv[0] the runner hands the guest
+    # (the fixture's file name, since argv[0] is the basename), so a case
+    # can assert on that exact string.
     for spec in case.get("env", []):
-        argv += ["--env", spec.replace("{fixture}", str(fixture))]
+        argv += ["--env", spec.replace("{fixture}", fixture.name)]
     guest_argv = []
     for a in case.get("argv", []):
         guest_argv.append(str(workdir / "host-denied.db")

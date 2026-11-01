@@ -24,9 +24,9 @@ one run at the pinned upstream commit.
 | WASI AssemblyScript tests [wasm32-wasip1] | 12 pass / 0 fail / 0 skip / 0 xfail / 0 xpass |
 | WASI C tests [wasm32-wasip1] | 12 pass / 0 fail / 2 skip / 0 xfail / 0 xpass |
 | WASI Rust tests [wasm32-wasip1] | 46 pass / 0 fail / 0 skip / 0 xfail / 0 xpass |
-| WASI Rust tests [wasm32-wasip3] | 2 pass / 23 fail / 30 skip / 0 xfail / 0 xpass |
+| WASI Rust tests [wasm32-wasip3] | 25 pass / 0 fail / 30 skip / 0 xfail / 0 xpass |
 
-Total: **72 pass / 23 fail / 32 skip / 0 xfail / 0 xpass** over 127 pinned tests.
+Total: **95 pass / 0 fail / 32 skip / 0 xfail / 0 xpass** over 127 pinned tests.
 
 ## Skips (declared exclusions only)
 
@@ -41,45 +41,7 @@ skips differ from it; no failing test is skipped.
 
 ## Failures
 
-| Kind | Tests |
-| --- | --- |
-| `expectation-mismatch` | 2 |
-| `link-mixed-release-lines` | 23 |
-
-## Recorded blocker: mixed WASI release lines
-
-23 of 23 failing tests are refused by the linker because the upstream precompiled @0.3.2 guests import interfaces from more than one WASI release line (the runtime refuses a mixed provider graph by design).
-
-Release lines observed in the link errors: `0.2.9`, `0.3.2`.
-
-Representative message:
-
-```
-Wait(exit_code=0) failed: expected 0, got 1
-
-==STDERR==
-wasmdown: link error: component mixes WASI release lines (wasi:cli/environment@0.3.2, wasi:io/poll@0.2.9, wasi:clocks/monotonic-clock@0.2.9, wasi:io/error@0.2.9, wasi:io/streams@0.2.9, wasi:cli/stdout@0.2.9, wasi:cli/stderr@0.2.9, wasi:cli/stdin@0.2.9, wasi:cli/environment@0.2.9, wasi:cli/exit@0.2.9, wasi:cli/terminal-input@0.2.9, wasi:cli/terminal-output@0.2.9, wasi:cli/terminal-stdin@0.2.9, wasi:cli/terminal-stdout@0.2.9, wasi:cli/terminal-stderr@0.2.9); no single provider graph applies
-
-```
-
-## Failure signatures
-
-Identical diagnostics grouped (digits masked); a repeated
-signature is one root cause, not N defects.
-
-| Tests | Signature |
-| --- | --- |
-| 9 | `Wait(exit_code=#) failed: expected #, got # ==STDERR== wasmdown: link error: component mixes WASI release lines (wasi:filesystem/types@#.#.#, wasi:filesystem/pr` |
-| 5 | `Wait(exit_code=#) failed: expected #, got # ==STDERR== wasmdown: link error: component mixes WASI release lines (wasi:clocks/system-clock@#.#.#, wasi:filesystem` |
-| 1 | `Read(id='stdout', payload='Hello, world!') stdout failed: expected Hello, world!, got ==STDERR== wasmdown: link error: component mixes WASI release lines (wasi:` |
-| 1 | `Read(id='stdout', payload='READY') stdout failed: expected READY, got ==STDERR== wasmdown: link error: component mixes WASI release lines (wasi:cli/types@#.#.#,` |
-| 1 | `Wait(exit_code=#) failed: expected #, got # ==STDERR== wasmdown: link error: component mixes WASI release lines (wasi:cli/environment@#.#.#, wasi:io/poll@#.#.#,` |
-| 1 | `Wait(exit_code=#) failed: expected #, got # ==STDERR== wasmdown: link error: component mixes WASI release lines (wasi:cli/terminal-input@#.#.#, wasi:cli/termina` |
-| 1 | `Wait(exit_code=#) failed: expected #, got # ==STDERR== wasmdown: link error: component mixes WASI release lines (wasi:cli/types@#.#.#, wasi:cli/stdin@#.#.#, was` |
-| 1 | `Wait(exit_code=#) failed: expected #, got # ==STDERR== wasmdown: link error: component mixes WASI release lines (wasi:clocks/monotonic-clock@#.#.#, wasi:io/poll` |
-| 1 | `Wait(exit_code=#) failed: expected #, got # ==STDERR== wasmdown: link error: component mixes WASI release lines (wasi:clocks/types@#.#.#, wasi:clocks/monotonic-` |
-| 1 | `Wait(exit_code=#) failed: expected #, got # ==STDERR== wasmdown: link error: component mixes WASI release lines (wasi:clocks/types@#.#.#, wasi:clocks/system-clo` |
-| 1 | `Wait(exit_code=#) failed: expected #, got # ==STDERR== wasmdown: link error: component mixes WASI release lines (wasi:random/random@#.#.#, wasi:random/insecure@` |
+None.
 
 ## Notes
 

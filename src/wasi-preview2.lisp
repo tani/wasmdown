@@ -345,8 +345,7 @@ host binding."
           ;; message instead of a generic "no provider".
           ((%wasi-http-import-name-p name)
            (error 'wasmdown.wit:wit-error
-                  :message
-                  "wasi:http is not supported by this runtime by design (removed in M17); the pinned HTTP WIT is reference data only. See docs/usage/wasi.md and specs/wasi/MANIFEST.md."))
+                  :message +wasi-http-unsupported-message+))
           (hit (push (cons name (funcall (cdr hit))) providers))
           ;; a types-only import carries no host binding
           ((let ((iface (p2-interface-by-name name)))

@@ -358,10 +358,14 @@ mutation through the root are denied by the derived ABI rights."
 (defun %component-context (options guest-args file)
   "The capability context a component run is configured with. Without
 --wasi every capability is withdrawn (docs/design/PLAN.md §9.1: the default is
-empty); with it, the process streams and the guest arguments (the
-component path as argv[0]) are the explicitly configured ones. The
-context never carries a network authority: network options are already
-refused by `%parse-run-args'."
+empty); with it, the process streams and the guest arguments are the
+explicitly configured ones. argv[0] is FILE's file name (the basename),
+never its path: POSIX argv[0] is the program name, the reference
+runtime's `wasi:cli' command entry sets it that way, and the upstream
+testsuite asserts it (a guest reading `get-arguments' sees
+`cli-env.wasm', not `/some/dir/cli-env.wasm'). The context never
+carries a network authority: network options are already refused by
+`%parse-run-args'."
   (let ((wasi (assoc "--wasi" options)))
     (when (and (not wasi)
                (or (%run-collect options "--dir")
@@ -376,7 +380,7 @@ refused by `%parse-run-args'."
           (reactor (and wasi (wasmdown.wasi:make-wasi-reactor))))
       (values
        (wasmdown.wasi:make-wasi-context
-        :arguments (if wasi (cons file guest-args) nil)
+        :arguments (if wasi (cons (file-namestring file) guest-args) nil)
         :environment (mapcar #'%env-pair (%run-collect options "--env"))
         :stdin (and wasi *standard-input*)
         :stdout (and wasi *standard-output*)

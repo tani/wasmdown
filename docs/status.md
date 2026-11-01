@@ -31,14 +31,14 @@ deliberately incomplete, and what will not be built. Measurements live in
 | Component model | Instantiation and linking | Full | Two-level core-instance linking, component `with`-args and alias projection execute. |
 | Component model | Canonical ABI | Full | Lift/lower, flattening, string transcoding, `map` despecialization and post-return run at runtime. |
 | Component model | Resources | Full | Per-instance handle tables, own/borrow transfer, destructors and method dispatch. |
-| Component model | Async execution | Partial | The task/subtask state machine, cancellations and resource lifetimes run the whole async suite in both backends. Live-borrow accounting traps `task.return`/`task.cancel` with outstanding borrows; the store-retirement limits under Known gaps bound long-lived reuse. |
+| Component model | Async execution | Partial | The task/subtask state machine, cancellations and resource lifetimes run the whole async suite in both backends. Live-borrow accounting traps `task.return`/`task.cancel` with outstanding borrows. A deterministic property lane (`make test-async-property`, 14,071 checks over fixed seeds 1,2,3,5,8,13,21,34 x3, plus a negative control) drives the real host-pending, stream/future/cancel, task/subtask and backpressure primitives and checks exactly-once delivery, no double resolve, monotone states, work accounting and cancel/close races; no wall-clock sleeps. The store-retirement limits under Known gaps still bound long-lived reuse. |
 | Component model | Backend parity | Full | The whole component lane (1,702 commands) is green with every defined core compiled before its start section (`make report-component-compiled`). |
 | WASI | Preview 1 (`wasi_snapshot_preview1`) | Partial (network imports excluded) | All 46 pinned imports are provided over an explicit capability context; the whole acceptance lane (in-memory and on-disk SQLite, rollback, bail, preopen denial, read-only, escape) passes with compiled guest cores too. The four legacy `sock_*` imports remain implemented and legacy-tested, but network communication is excluded from the declared support profile (2026-11-02; see the `wasi:sockets@0.3.2` row), so the P1 claim is explicitly the NON-NETWORK P1 surface; no network behaviour is claimed. |
-| WASI | 0.3.2 providers | Partial | The CLI owns a reactor (clock deadlines and stream readiness are servable; a 200 ms `wait-for` completion is guest-evidenced by `p3/deadline-wait`); what remains partial is the provider surface itself — the blocked-stdio executor audit and the store-retirement limits listed under Known gaps. Declared `@unstable` imports are refused at link time (see Known gaps), so stability gating is no longer a missing piece. `wasi:sockets` is excluded, not partial; see the `wasi:sockets@0.3.2` row. |
+| WASI | 0.3.2 providers | Partial | The CLI owns a reactor (clock deadlines and stream readiness are servable; a 200 ms `wait-for` completion is guest-evidenced by `p3/deadline-wait`); what remains partial is the provider surface itself — the store-retirement limits listed under Known gaps. The blocked-stdio executor audit is closed (2026-11-02): separate fixed 2-worker DNS/stdio services, worker affinity, bounded active jobs, close refuses new work and detaches without joining, and the span is copied to the worker; evidenced by `tests/async-property.lisp`, the `tests/wasi.lisp` executor/stdio pins, and guest stdio through `p3/cli-stdin-env-stderr-terminal`/`p3/stream-stdout`. Declared `@unstable` imports are refused at link time (see Known gaps), so stability gating is no longer a missing piece. `wasi:sockets` is excluded, not partial; see the `wasi:sockets@0.3.2` row. |
 | WASI | 0.2 facade | Partial | 27 of 31 stable interfaces are bound at exact release names. The bound `wasi:sockets/*` interfaces are legacy-tested through the embedding API only; the CLI refuses `--net/--listen/--dns` for every run, so no P2 sockets path exists through the CLI. Network communication is excluded from the declared support profile (see the `wasi:sockets@0.3.2` row) and no P2 network behaviour is claimed. |
 | WASI | `wasi:http` | Unsupported by design (not a gap, not planned) | Deliberate, permanent exclusion by user decision (2026-11-02); removed in M17 and recoverable from git history. The vendored `specs/wasi/wasi-wit-0.3.2/http/*.wit` is reference data only. An import is refused with `wasi:http is not supported by this runtime by design (removed in M17); the pinned HTTP WIT is reference data only. See docs/usage/wasi.md and specs/wasi/MANIFEST.md.` See [`specs/wasi/MANIFEST.md`](../specs/wasi/MANIFEST.md) § “Unsupported by design (not pending)”. Not counted as an incomplete interface. |
 | WASI | `wasi:sockets@0.3.2` | Unsupported by design (not a gap, not planned) | TCP, UDP and DNS are excluded permanently by user decision (2026-11-02); there is no `wasi:sockets` provider for guests. The vendored `specs/wasi/wasi-wit-0.3.2/sockets/sockets.wit` is reference data only. A **0.3-line** component-declared import (`types`, `ip-name-lookup`, any 0.3.x version) is refused at link time with `Network communication (TCP, UDP and DNS) is not supported by this design; there is no wasi:sockets provider for guests. See docs/usage/wasi.md and specs/wasi/MANIFEST.md.` The pinned `wasi:cli/command` world imports sockets itself, so a 0.3.2 sockets provider is retained internally for that composition only. See [`specs/wasi/MANIFEST.md`](../specs/wasi/MANIFEST.md) § “Network communication: `wasi:sockets` (excluded)”. Not counted as an incomplete interface. |
-| WASI | 0.3.2 guest lane | Partial | Ten hand-authored @0.3.2 commands run through the real CLI in both backends (`make test-wasi-preview3`, 3 repeats, 30/30 per backend): a no-import smoke; a `wasi:cli/exit@0.3.2` importer (exit 7); a `wasi:clocks/monotonic-clock@0.3.2` importer; a resume-safe async callback command; a `write-via-stream` stdout command printing `hi`; a cancelled-subtask command; a `wasi:random/random@0.3.2` guest with `insecure`/`insecure-seed` (two 16-byte reads must have exact lengths and differ; `get-random-u64`/seed must complete), lowering the list returns through memory+realloc; a clock-deadline guest (`p3/deadline-wait`) whose async `wait-for` asks for 200 ms and must return only after at least that much clock time, parked in a waitable set until the CLI's owned reactor fires; a `wasi:cli/{stdin,environment,stderr,terminal-stdout}@0.3.2` guest (`p3/cli-stdin-env-stderr-terminal`) asserting argv[0]/marker, an `--env` pair and the option-typed initial cwd, `terminal-stdout` = `none` on a non-tty, reading exactly `stdin-probe\n` from real stdin through `read-via-stream` with the explicit DROPPED EOF result and a paired future that reads back ok, and writing `p3-cli-guest: stderr probe` through stderr's `write-via-stream` in canonical future order; and a `wasi:filesystem/{types,preopens}@0.3.2` guest (`p3/filesystem-preopens-read`) that lists the `/work` preopen, opens the seeded `hello.txt` through it (async `open-at`, waited as a subtask), reads exactly 17 bytes via `read-via-stream`+`stream.read`, creates `out.txt`, writes at explicit offsets and appends at EOF with `stat` (regular-file, link-count 1, size 22) and a byte-exact read-back, gets `error-code::read-only` (case 32) for a write through the read-only descriptor, exercises `create-directory-at`/`stat-at`/`read-directory` (enumerating `hello.txt`, `out.txt`, `subdir`, `temp.txt`)/`rename-at`/`unlink-file-at`/`remove-directory-at`, requires err `no-entry` (never a trap) for missing paths, and drops every handle. The 200 ms bound sits past the async lift's former ~100 ms quiescence budget and is the regression proof for the liveness-oracle fix: pending host work plus an armed one-shot reactor deadline is possible progress, a bare fd-readiness watch is not, and the component suite's genuine deadlock fixtures (`component/deadlock.wast`, `dont-block-start`) still trap. Unit pin: `wasi/reactor-pending-deadline-p`. The stream, random, deadline, cli and filesystem guests are authored in TEXT and encoded by `tools/component-encode.lisp`, guarded by `wasi/component-text-encoder-roundtrip`. The lane stays Partial because no upstream @0.3.2 toolchain guest exists here; provider behaviour is measured by this lane and the component tests. The former TCP loopback socket command was removed with the network exclusion (2026-11-02); network is not part of this lane. |
+| WASI | 0.3.2 guest lane | Partial | Ten hand-authored @0.3.2 commands run through the real CLI in both backends (`make test-wasi-preview3`, 3 repeats, 30/30 per backend): a no-import smoke; a `wasi:cli/exit@0.3.2` importer (exit 7); a `wasi:clocks/monotonic-clock@0.3.2` importer; a resume-safe async callback command; a `write-via-stream` stdout command printing `hi`; a cancelled-subtask command; a `wasi:random/random@0.3.2` guest with `insecure`/`insecure-seed` (two 16-byte reads must have exact lengths and differ; `get-random-u64`/seed must complete), lowering the list returns through memory+realloc; a clock-deadline guest (`p3/deadline-wait`) whose async `wait-for` asks for 200 ms and must return only after at least that much clock time, parked in a waitable set until the CLI's owned reactor fires; a `wasi:cli/{stdin,environment,stderr,terminal-stdout}@0.3.2` guest (`p3/cli-stdin-env-stderr-terminal`) asserting argv[0]/marker, an `--env` pair and the option-typed initial cwd, `terminal-stdout` = `none` on a non-tty, reading exactly `stdin-probe\n` from real stdin through `read-via-stream` with the explicit DROPPED EOF result and a paired future that reads back ok, and writing `p3-cli-guest: stderr probe` through stderr's `write-via-stream` in canonical future order; and a `wasi:filesystem/{types,preopens}@0.3.2` guest (`p3/filesystem-preopens-read`) that lists the `/work` preopen, opens the seeded `hello.txt` through it (async `open-at`, waited as a subtask), reads exactly 17 bytes via `read-via-stream`+`stream.read`, creates `out.txt`, writes at explicit offsets and appends at EOF with `stat` (regular-file, link-count 1, size 22) and a byte-exact read-back, gets `error-code::read-only` (case 32) for a write through the read-only descriptor, exercises `create-directory-at`/`stat-at`/`read-directory` (enumerating `hello.txt`, `out.txt`, `subdir`, `temp.txt`)/`rename-at`/`unlink-file-at`/`remove-directory-at`, requires err `no-entry` (never a trap) for missing paths, and drops every handle. The 200 ms bound sits past the async lift's former ~100 ms quiescence budget and is the regression proof for the liveness-oracle fix: pending host work plus an armed one-shot reactor deadline is possible progress, a bare fd-readiness watch is not, and the component suite's genuine deadlock fixtures (`component/deadlock.wast`, `dont-block-start`) still trap. Unit pin: `wasi/reactor-pending-deadline-p`. The stream, random, deadline, cli and filesystem guests are authored in TEXT and encoded by `tools/component-encode.lisp`, guarded by `wasi/component-text-encoder-roundtrip`. The lane stays Partial because no upstream @0.3.2 toolchain guest exists here; provider behaviour is measured by this lane and the component tests. The former TCP loopback socket command was removed with the network exclusion (2026-11-02); network is not part of this lane. **Upstream `wasi-testsuite` lane green (2026-11-02, F1):** the pinned adapter (`make test-wasi-upstream`) measures 95 pass / 0 fail / 32 declared skips over 127 guests; `wasm32-wasip3` is 25 pass / 0 fail / 30 skips after a component declaring both release lines is admitted by composing its `@0.3.2`-line providers from the 0.3 command builders with its exact-version `@0.2.x` P2 providers under one `with-args` alist (exclusions unchanged: HTTP, 0.3 sockets, `@unstable`). The newly admitted tests exposed and pinned several host-contract fixes (argv[0] basename, empty-path `no-entry`, directory `get-flags`, `advise`, `set-size`, `stat` timestamps, `insecure-seed` stability, zero-length host reads, unrepresentable offsets, newest exported `run`); see `tests/wasi-upstream-summary.md`. |
 
 ## Known gaps and accepted limits
 
@@ -148,26 +148,18 @@ deliberately incomplete, and what will not be built. Measurements live in
   `descriptor-stat`/`directory-entry` slot from a later declarator), and no
   valtype index reached 64, where `u32` and `s33` agree. Unit 694/0,
   component 1,702/0, P3 30/30 ×3 both backends.
-- The P3 filesystem guest now covers the **read, write and directory
-  paths**: `preopens`, `open-at` (incl. an err `no-entry`), `read-via-stream`
-  + `stream.read` (byte-exact, DROPPED EOF), `write-via-stream` at explicit
-  offsets (including zero-fill extension) and `append-via-stream` at EOF,
-  parked write futures resolving ok, `stat` (type regular-file, link-count 1,
-  size 22), and a same-descriptor read-back compared byte-exactly; the suite
-  also asserts the host-side file bytes. A write through the read-only
-  `hello.txt` descriptor resolves err `error-code::read-only` (case 32)
-  through the paired future, never a trap. The directory surface is
-  guest-evidenced on the same preopen: `create-directory-at`, `open-at` of
-  the directory, `stat` reporting `directory` (case 2), `read-directory`
-  enumerating `hello.txt`, `out.txt`, `subdir` and `temp.txt` with an ok
-  paired future, `rename-at` (`temp.txt` → `moved.txt`) followed by
-  `stat-at` (regular-file, size 0), `unlink-file-at`, `remove-directory-at`,
-  and `stat-at(subdir)` err `no-entry`; the suite adds a host-side `absent`
-  witness for the removed objects. Still open: the link/symlink operations
-  (`link-at`, `symlink-at`, `readlink-at`) and the `stat`/`stat-at`
-  symlink-follow policy; `advise`/`sync`/`sync-data`/`set-size`/`set-times`,
-  `get-flags`/`get-type`/`metadata-hash`/`is-same-object` and stat
-  timestamps. There is no seek API in 0.3.2 (offsets are stream args).
+- **Resolved (2026-11-02): the P3 filesystem guest covers the full pinned
+  `wasi:filesystem/types@0.3.2` surface.** `p3/filesystem-preopens-read`
+  exercises preopens/open-at (read/write/directory), read/write/append
+  streams at explicit offsets, `advise`, `set-size`, `set-times`/`-at`,
+  `get-flags`, `get-type`, `sync`/`sync-data`, `metadata-hash`/`-at`,
+  `is-same-object`, `link-at`, `symlink-at`/`readlink-at`, `stat`/`stat-at`
+  with and without symlink follow, and directory create/read/enumerate/
+  rename/unlink/remove. Error cases are checked as err results (no-entry,
+  read-only case 32, invalid readlink, not-permitted absolute symlink),
+  every handle is dropped, and the suite carries host-side byte/absence
+  witnesses. 30/30 x3 both backends. (0.3.2 has no seek API.) Pinned by
+  `p3/filesystem-preopens-read`; the row is closed.
 - Provider variant lowering accepts a bare label only for a **payload-less**
   case. Giving a bare label to a case that carries a payload is now a
   `host-error` (`a bare variant label (...) names a case with a payload; pass
@@ -240,13 +232,49 @@ deliberately incomplete, and what will not be built. Measurements live in
   reader to race). Encoding note: lowering an async function needs the
   `async` canon option — it flattens to `(i64)->i32`; without it the lower
   flattens to `(i64)->()` and fails the core-import signature check.
-- No **upstream-toolchain** WASI 0.3.2 guest is pinned (no toolchain here
-  emits the 0.3.2 component ABI). The lane runs hand-authored commands
-  generated by `tools/build-p3-fixtures.lisp` and pinned by
-  `P3-CHECKSUMS` (the binary itself is untracked and regenerated);
+- No **locally built** upstream-toolchain WASI 0.3.2 guest is pinned (no
+  toolchain here emits the 0.3.2 component ABI). The behaviour lane runs
+  hand-authored commands generated by `tools/build-p3-fixtures.lisp` and
+  pinned by `P3-CHECKSUMS` (the binary itself is untracked and regenerated);
   `--abi preview3` is explicit-only and `--abi all` covers the two released
-  ABIs. Provider-level 0.3.2 coverage is measured by the component lane and
-  unit pins, not by that lane.
+  ABIs. The **upstream precompiled** wasip3 guests do run now (see the lane
+  bullet below), so 0.3.2 provider coverage is measured both by the component
+  lane/unit pins and by the pinned upstream suite.
+- **Upstream `wasi-testsuite` lane (2026-11-02, F1): registered, measured,
+  GREEN at the pinned commit.** `adapters/wasmdown.py` +
+  `tools/run-wasi-testsuite.py` (`make test-wasi-upstream`) run the
+  precompiled guests at the commit pinned in `specs/lock.toml
+  [suite.wasi-testsuite]` (`9d84631e427729802085c3d172d0a63cd360a1fa`,
+  `prod/testsuite-base`; the driver refuses any other HEAD) and write
+  `tests/wasi-upstream-results.json` + `tests/wasi-upstream-summary.md`.
+  Measured over all 127 pinned guests: **95 pass / 0 fail / 32 declared
+  skips** (28 / 67 when first measured; 72 / 23 before the mixed-release
+  composition). The skips are only the declared exclusions (P3 `http` 18,
+  `sockets` 12; P1 legacy `sock_shutdown-*` 2), regenerated from the tree,
+  never added to hide a failure. `wasm32-wasip3` is **clean: 25 pass / 0
+  fail / 30 declared skips**: a component may declare BOTH release lines,
+  and the graph composes its 0.3-line imports from the 0.3 command builders
+  with its exact-version 0.2 imports from the P2 tables under one
+  `with-args` alist (HTTP at any line, 0.3 sockets, `@unstable` gating and
+  the P2 version-exact selection remain in force; no provider is invented).
+  The newly admitted tests exposed host-contract defects, now fixed and
+  pinned: CLI argv[0] is the guest program's file name; an empty path is
+  `no-entry`; a directory's `get-flags` never reports the file-only `write`
+  and reports `read`; `advise` on a directory is `bad-descriptor`;
+  `set-size` maps a size or offset beyond `off_t` to `file-too-large` /
+  `invalid`; `stat` reports atime, mtime and ctime separately; the
+  `insecure-seed` provider is stable per instance; a zero-length read of a
+  host-backed stream completes immediately; a `pread`/`pwrite` offset above
+  2^63-1 is `invalid`; and a component exporting several `wasi:cli/run`
+  versions is driven through the newest. `wasm32-wasip1` is also **clean:
+  70 pass / 0 fail / 2 declared skips** (AssemblyScript 12/12, C 12/12,
+  Rust 46/46), after the runtime fixed the preopen base/inheriting rights
+  split (a directory base no longer advertises `fd_write`, so an
+  `O_DIRECTORY` open is not forced to `O_RDWR`), handle-relative path
+  resolution, directory-fd rights, `fd_readdir` paging/`.`-inode, ns
+  timestamps, the `poll_oneoff` subscription stride and revents, and
+  `AT_SYMLINK_*` flag misuse in `linkat`/`utimensat`.
+  Neither lane is a release gate.
 - **Reactor liveness is deadline-based, by design.** The drain oracle treats
   an armed one-shot clock deadline (plus pending host work) as possible
   progress, so a `wait-for`/`wait-until` longer than any fixed budget

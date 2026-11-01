@@ -15,6 +15,10 @@ links are generated.
 | WASI Preview 1 acceptance (in-memory and on-disk SQLite) | 14/14 checks pass | 14/14 checks pass: smoke, persistence (two processes), reopen, rollback, bail, no-preopen, read-only, escape — 821 s of compile-heavy wall time. The lane asserts exact stdout/status per case, so both backends meet identical expectations | `tools/wasi-preview1-acceptance.py [--backend compiled]` |
 | WASI 0.2 behaviour lane (11 cases) | 11/11 pass | 11/11 pass (11 x ~200 s compile wall time). Each case's manifest entry asserts exact stdout bytes and exact status, so both backends satisfy the SAME byte-level expectations — stronger than a post-hoc sha diff. Per-case records live under `tests/wasi-results/` (`latest/` for interpret, the compiled run's `--output-dir`), distinguished by the `backend` field | `tools/run-wasi-suite.py --abi preview2 [--backend compiled]` |
 | WASI 0.3.2 providers | unit/provider pins, component async suite | same providers; component suite green under `:compiled` | [`inventory.md`](inventory.md), `tests/wasi*.lisp` |
+| Upstream `wasi-testsuite` (pinned `9d84631e`, 127 precompiled guests) | **green**: 95 pass / 0 fail / 32 declared skips. `wasm32-wasip3`: 25 pass / 0 fail / 30 skips — a component that declares BOTH release lines is admitted by composing its 0.3-line declared imports from the 0.3 command builders with its exact-version 0.2 imports from the P2 tables (HTTP, 0.3 sockets and `@unstable` still refused; no provider invented). `wasm32-wasip1`: 70 pass / 0 fail / 2 skips (AssemblyScript 12, C 12, Rust 46) | not measured; the adapter runs the CLI's default backend, and the admitted tests exercise host providers, not codegen | `tests/wasi-upstream-summary.md`, `tests/wasi-upstream-results.json`, `make test-wasi-upstream` (checkout not vendored) |
+| `wasm32-wasip1` declared profile (non-network) | Same measured lane above: 70 pass / 0 fail / 2 declared skips; the four legacy `sock_*` imports stay outside the declared profile, so the two `sock_shutdown-*` C tests are declared skips | same | `tests/wasi-upstream-expectations.toml` (generated), `docs/status.md` |
+| Async property lane (task/subtask, stream/future/cancel, host-pending) | 14,071 checks / 0 failures over 8 fixed seeds x3 (`make test-async-property`); negative control detects an injected double delivery (`make test-async-property-negative`) | same host-side lane (backend-independent: the scheduler/executor is shared by both guest backends) | stdout; `tests/async-property.lisp` |
+| Blocked-stdio / DNS executor audit | fixed 2-worker budgets, worker-only execution and affinity, max active <= budget, close drops queued jobs and refuses new submissions without joining, `close-wasi-context` rejects/detaches; guest stdio green in both backends | same (host-side) | `tests/async-property.lisp`, `tests/wasi.lisp`; P3 lanes |
 | 0.3.2 sockets provider (internal composition only) | unit pins incl. `wasi/e2e-tcp-echo-component` PASS | same test binary, host listener + echo thread | `make test-unit`; `tests/wasi.lisp` |
 | Pinned 0.3.2 guests (hand-authored) | 10/10 pass ×3 repeats (30/30): no-import success smoke, a `wasi:cli/exit@0.3.2` importer (exit 7), a `wasi:clocks/monotonic-clock@0.3.2` importer (monotonic `now()`), a resume-safe async command (callback `task.return`), a `write-via-stream` stdout command (`hi`), a cancelled-subtask command, a `wasi:random/random@0.3.2` guest (`insecure`/`insecure-seed`: exact 16-byte lengths, differing secure reads, `u64`/seed calls; `realloc`-lowered lists), a clock-deadline guest (`wait-for` 200 ms completes through the CLI reactor; the 200 ms bound is the liveness-oracle regression proof), a `wasi:cli/{stdin,environment,stderr,terminal-stdout}@0.3.2` guest (argv[0]/marker, `--env` pair, option-typed initial cwd, `terminal-stdout` = `none` on a non-tty, real stdin `stdin-probe\n` with explicit DROPPED EOF and an ok paired future, stderr through `write-via-stream`), and a `wasi:filesystem/{types,preopens}@0.3.2` guest (`/work` preopen, async `open-at` of seeded `hello.txt`, exactly 17 bytes through `read-via-stream`+`stream.read`, writes at explicit offsets and appends at EOF with `stat` and a byte-exact read-back, err `read-only` (case 32), `create-directory-at`/`stat-at`/`read-directory` enumeration/`rename-at`/`unlink-file-at`/`remove-directory-at`, missing path = err `no-entry`, every handle dropped) | 10/10 pass, same cases and repeats (30/30); the nested core runs compiled (`backend-entry-count`) | `make test-wasi-preview3`, `tools/build-p3-fixtures.lisp`, `wasi/command-component-runs-the-selected-backend`, `wasi/reactor-pending-deadline-p` |
 
@@ -105,10 +109,12 @@ stdout-only and is listed as `n/a` with `make verify` named as its gate.
   enumerating `hello.txt`/`out.txt`/`subdir`/`temp.txt` with an ok future,
   `rename-at` → `moved.txt` followed by `stat-at` (regular-file, size 0),
   `unlink-file-at`, `remove-directory-at`, and `stat-at(subdir)` err
-  `no-entry`; the suite adds a host-side `absent` witness. The deadline and
-  cli rows are closed; the filesystem row stays partial for link/symlink
-  operations and the stat symlink-follow policy, advanced metadata/time
-  calls and stat timestamps.
+  `no-entry`; the suite adds a host-side `absent` witness. The guest was
+  then extended to the FULL pinned surface: `link-at`, `symlink-at`/
+  `readlink-at` and stat with/without symlink follow, `advise`, `set-size`,
+  `set-times`/`-at`, `get-flags`, `get-type`, `sync`/`sync-data`,
+  `metadata-hash`/`-at` and `is-same-object`, with err-case witnesses. The
+  deadline, cli and filesystem rows are closed.
 - **Nested `option<stream<u8>>` payload ownership (2026-11-02).** `%abi-load`
   implements the loading spec's `stream`/`future` rows through
   `%lift-async-end`: a memory slot indexes the **loading (caller) instance's**
@@ -202,16 +208,8 @@ stdout-only and is listed as `n/a` with `make verify` named as its gate.
 
 ## Still open
 
-- **Filesystem link/symlink and advanced metadata paths.** The P3 filesystem
-  guest now covers preopens/open/read/write/append/offsets/stat/stat-at/
-  directory operations and the read-only error (including host-side
-  file-contents and absent-object witnesses). Remaining: `link-at`,
-  `symlink-at`, `readlink-at` and the stat symlink-follow policy;
-  `advise`/`sync`/`sync-data`/`set-size`/`set-times`/`get-flags`/`get-type`/
-  `metadata-hash`/`is-same-object` and stat timestamps. Seek does not exist
-  in 0.3.2.
-- **Blocked-stdio executor audit** and upstream toolchain/suite evidence (see
-  Blocked below).
+- No open test row. The upstream suite is green (95/0/32 declared
+  exclusions); only the real-toolchain guest remains blocked (see Blocked).
 
 ## Blocked
 

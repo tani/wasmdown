@@ -1056,8 +1056,11 @@ removes NAMES (an evaluated list, so callers quote it) and the root."
              (=> "not-permitted"
                  (fs-error-code-of
                   (wasmdown.wasi:fs-stat-at ctx d nil "sub/../../etc")))
-             ;; empty + NUL are invalid, never a host-side surprise
-             (=> "invalid" (fs-error-code-of (wasmdown.wasi:fs-stat-at ctx d nil "")))
+             ;; empty is ENOENT (POSIX resolves an empty path to
+             ;; no-entry for every *at call; the upstream wasip3
+             ;; filesystem tests assert it), NUL is invalid
+             (=> "no-entry"
+                 (fs-error-code-of (wasmdown.wasi:fs-stat-at ctx d nil "")))
              (=> "invalid"
                  (fs-error-code-of
                   (wasmdown.wasi:fs-stat-at ctx d nil (format nil "a~cx" (code-char 0)))))
@@ -5303,24 +5306,158 @@ the payloads need no resolvable extern types."
         (is (every #'wasmdown.component.runtime:comp-instance-p
                    (mapcar #'cdr providers)))))))
 
-(test wasi/component-mixed-line-keeps-mixed-refusal
-  ;; deterministic precedence, documented in COMPONENT-COMMAND-PROVIDERS:
-  ;; the sockets check applies to the 0.3 path only (`v2' empty), so a
-  ;; component declaring BOTH a 0.2 import and a sockets import keeps
-  ;; the mixed-release-line refusal — the 0.2 path is unchanged.
+(test wasi/component-mixed-lines-compose-one-graph
+  ;; A component declaring BOTH release lines gets ONE composed graph:
+  ;; the 0.3-line declared imports from the 0.3 command builders and the
+  ;; exact-version 0.2 imports from the P2 tables, in declaration order,
+  ;; under one with-args alist. Nothing the component did not declare is
+  ;; bound (the 0.3 command world is NOT composed wholesale here).
+  (let* ((ctx (wasmdown.wasi:make-wasi-context))
+         (names '("wasi:cli/environment@0.3.2"
+                  "wasi:cli/types@0.3.2"
+                  "wasi:clocks/monotonic-clock@0.3.2"
+                  "wasi:io/poll@0.2.9"
+                  "wasi:io/streams@0.2.9"
+                  "wasi:cli/stdout@0.2.9"
+                  "wasi:cli/environment@0.2.9"))
+         (providers (wasmdown.wasi:component-command-providers
+                     ctx (apply #'%synthetic-import-comp names))))
+    ;; every provider is bound under an EXACT declared name, in order;
+    ;; only the types-only 0.3 import composes no entry
+    (is (equal '("wasi:cli/environment@0.3.2"
+                 "wasi:clocks/monotonic-clock@0.3.2"
+                 "wasi:io/poll@0.2.9"
+                 "wasi:io/streams@0.2.9"
+                 "wasi:cli/stdout@0.2.9"
+                 "wasi:cli/environment@0.2.9")
+               (mapcar #'car providers)))
+    (is (every #'wasmdown.component.runtime:comp-instance-p
+               (mapcar #'cdr providers)))
+    ;; both lines are real providers with DISTINCT instances: the same
+    ;; short interface at two release lines is never one graph reused
+    (let ((env3 (cdr (assoc "wasi:cli/environment@0.3.2" providers
+                            :test #'string=)))
+          (env2 (cdr (assoc "wasi:cli/environment@0.2.9" providers
+                            :test #'string=))))
+      (is env3)
+      (is env2)
+      (is (not (eq env3 env2))))
+    ;; nothing beyond the declared contract is bound
+    (dolist (undeclared '("wasi:sockets/types@0.3.2"
+                          "wasi:sockets/ip-name-lookup@0.3.2"
+                          "wasi:filesystem/types@0.3.2"
+                          "wasi:filesystem/preopens@0.3.2"
+                          "wasi:random/random@0.3.2"))
+      (is (not (assoc undeclared providers :test #'string=))))))
+
+(test wasi/component-mixed-lines-keep-declaration-order
+  ;; The composed alist follows the component's own declaration order,
+  ;; interleaving the two lines: the order is not per-line grouping.
+  (let* ((ctx (wasmdown.wasi:make-wasi-context))
+         (providers (wasmdown.wasi:component-command-providers
+                     ctx (%synthetic-import-comp
+                          "wasi:io/poll@0.2.9"
+                          "wasi:clocks/system-clock@0.3.2"
+                          "wasi:cli/stdout@0.2.9"
+                          "wasi:random/random@0.3.2"))))
+    (is (equal '("wasi:io/poll@0.2.9"
+                 "wasi:clocks/system-clock@0.3.2"
+                 "wasi:cli/stdout@0.2.9"
+                 "wasi:random/random@0.3.2")
+               (mapcar #'car providers)))))
+
+(test wasi/component-mixed-sockets-declared-import-still-refused
+  ;; Admission of the mixed graph does NOT admit a 0.3 sockets
+  ;; declaration: the canonical sockets refusal (never the mixed-line
+  ;; text, never a generic no-provider error) is raised from the 0.3
+  ;; subset, before any provider is built.
+  (let ((ctx (wasmdown.wasi:make-wasi-context)))
+    (dolist (name '("wasi:sockets/types@0.3.2"
+                    "wasi:sockets/ip-name-lookup@0.3.2"))
+      (let ((condition nil))
+        (handler-case
+            (progn (wasmdown.wasi:component-command-providers
+                    ctx (%synthetic-import-comp
+                         name "wasi:io/streams@0.2.9"))
+                   nil)
+          (wasmdown:link-error (c) (setf condition c)))
+        (is condition)
+        (is (string= (wasmdown:wasmdown-error-message condition)
+                     wasmdown.wasi::+wasi-sockets-unsupported-message+))))))
+
+(test wasi/component-mixed-http-declared-import-still-refused
+  ;; wasi:http is refused at ANY line in a mixed component: the 0.3
+  ;; declaration by the composed graph's canonical http rule, and the
+  ;; 0.2 declaration by the P2 table's own exclusion.
+  (let ((ctx (wasmdown.wasi:make-wasi-context)))
+    (dolist (pair '(("wasi:http/types@0.3.2" "wasi:io/streams@0.2.9")
+                    ("wasi:http/types@0.2.12" "wasi:clocks/system-clock@0.3.2")))
+      (let ((message nil))
+        (handler-case
+            (progn (wasmdown.wasi:component-command-providers
+                    ctx (apply #'%synthetic-import-comp pair))
+                   nil)
+          (wasmdown.wit:wit-error (c)
+            (setf message (wasmdown:wasmdown-error-message c))))
+        (is message)
+        (is (string= wasmdown.wasi::+wasi-http-unsupported-message+ message))
+        (is (not (search "no provider" message)))))))
+
+(test wasi/component-mixed-unstable-declared-import-still-refused
+  ;; the 0.3 @unstable gate keeps applying to the 0.3 subset of a mixed
+  ;; component: timezone names import and feature, and never composes.
   (let ((condition nil))
     (handler-case
         (progn (wasmdown.wasi:component-command-providers
                 (wasmdown.wasi:make-wasi-context)
-                (%synthetic-import-comp "wasi:cli/run@0.2.12"
-                                        "wasi:sockets/types@0.3.2"))
+                (%synthetic-import-comp
+                 "wasi:clocks/timezone@0.3.2" "wasi:io/poll@0.2.9"))
                nil)
       (wasmdown:link-error (c) (setf condition c)))
     (is condition)
-    (is (search "mixes WASI release lines"
-                (wasmdown:wasmdown-error-message condition)))
-    (is (not (string= (wasmdown:wasmdown-error-message condition)
-                      wasmdown.wasi::+wasi-sockets-unsupported-message+)))))
+    (let ((message (wasmdown:wasmdown-error-message condition)))
+      (is (search "wasi:clocks/timezone@0.3.2" message))
+      (is (search "@unstable(feature = clocks-timezone)" message))
+      (is (not (search "mixes WASI release lines" message))))))
+
+(test wasi/component-mixed-unknown-line-import-is-construction-error
+  ;; no provider is INVENTED for the mixed graph: a declared import the
+  ;; 0.3 builders do not serve (an unknown interface or a version the
+  ;; pinned packages do not contain) stays a construction-time
+  ;; WIT-ERROR naming it, alongside a served 0.2 import.
+  (let ((ctx (wasmdown.wasi:make-wasi-context)))
+    (dolist (name '("wasi:filesystem/types@0.3.0"
+                    "wasi:bogus/x@0.3.2"
+                    "wasi:clocks/monotonic-clock"))
+      (let ((message nil))
+        (handler-case
+            (progn (wasmdown.wasi:component-command-providers
+                    ctx (%synthetic-import-comp name "wasi:io/poll@0.2.9"))
+                   nil)
+          (wasmdown.wit:wit-error (c)
+            (setf message (wasmdown:wasmdown-error-message c))))
+        (is message)
+        (is (search name message))
+        (is (search "no provider" message))))))
+
+(test wasi/component-pure-lines-are-unchanged-by-mixed-support
+  ;; Regression: a 0.2-only component still gets exactly the P2 graph for
+  ;; its declared imports (no 0.3 entry), and a 0.3-only component still
+  ;; gets the whole command world entry for entry.
+  (let ((ctx (wasmdown.wasi:make-wasi-context)))
+    (let* ((names '("wasi:io/poll@0.2.9" "wasi:cli/stdout@0.2.9"))
+           (providers (wasmdown.wasi:component-command-providers
+                       ctx (apply #'%synthetic-import-comp names)))
+           (expected (wasmdown.wasi:preview2-command-provider
+                      ctx :version "0.2.9" :imports names)))
+      (is (equal (sort (mapcar #'car providers) #'string<)
+                 (sort (mapcar #'car expected) #'string<)))
+      (is (notany (lambda (pair) (search "@0.3" (car pair))) providers)))
+    (let ((providers (wasmdown.wasi:component-command-providers
+                      ctx (%synthetic-import-comp
+                           "wasi:clocks/system-clock@0.3.2"))))
+      (is (equal (mapcar #'car (wasmdown.wasi:command-provider ctx))
+                 (mapcar #'car providers))))))
 
 (test wasi/component-unstable-declared-import-is-link-error
   ;; a 0.3 component DECLARING `wasi:clocks/timezone@0.3.2' is refused
@@ -5468,3 +5605,102 @@ the payloads need no resolvable extern types."
           (is (eql 0 (wasmdown.wasi:run-component
                       (wasmdown.component:decode-component bytes)
                       (wasmdown.wasi:make-wasi-context) :mode mode))))))))
+
+;;; ---------------------------------------------------------------
+;;; The mixed-release graph and the host behaviours the upstream
+;;; wasip3 lane (tests/wasi-upstream-results.json) pins.
+
+(test wasi/insecure-seed-is-stable-per-provider-instance
+  ;; wasi:random/insecure-seed is a value in every practical sense: the
+  ;; WIT says it is called once and will become a value import, the
+  ;; reference runtime answers a second call with the first value, and
+  ;; the upstream wasip3 random test asserts both halves. ONE provider
+  ;; instance therefore answers one seed on every call.
+  (let ((instance (wasmdown.wasi:insecure-seed-instance)))
+    (let ((a (call-provider instance "get-insecure-seed"))
+          (b (call-provider instance "get-insecure-seed")))
+      (is (equal a b))
+      (is (= 2 (length a)))
+      (is (every (lambda (u) (and (integerp u) (<= 0 u) (< u (ash 1 64))))
+                 a)))))
+
+(test wasi/fs-stat-reports-distinct-timestamps
+  ;; descriptor-stat's three instant fields are the stat struct's own
+  ;; atime/mtime/ctime slots. A record that echoed one timestamp for
+  ;; all three cannot answer the upstream filesystem-stat test (which
+  ;; sets access 42 and modification 69 and reads them back).
+  (let ((record (wasmdown.wasi::%stat-record 1 2 0 1 0 69 42 7)))
+    (flet ((seconds (key)
+             ;; the field is (:some (seconds . N) (nanoseconds . 0))
+             (cdr (assoc "seconds"
+                         (cddr (assoc key record :test #'string=))
+                         :test #'string=))))
+      (=> 42 (seconds "data-access-timestamp"))
+      (=> 69 (seconds "data-modification-timestamp"))
+      (=> 7 (seconds "status-change-timestamp")))))
+
+(test wasi/fs-host-contract
+  ;; The host-side rules the newly admitted upstream filesystem tests
+  ;; pin, exercised through the provider entry points:
+  ;;  * a DIRECTORY's get-flags never reports the file-only `write'
+  ;;    mode, and a directory opened with no flags reports `read';
+  ;;  * advise on a directory is bad-descriptor;
+  ;;  * a filesize beyond off_t is file-too-large, not a host error;
+  ;;  * CREATE implies WRITE in the effective access mode.
+  (with-fs-root (root "fs-host-contract" '("plain.txt"))
+    (fs-write! (fs-p root "plain.txt") "x")
+    (let* ((pre (wasmdown.wasi:open-wasi-preopen root :name "/r"))
+           (ctx (wasmdown.wasi:make-wasi-context :preopens (list pre)))
+           (d (wasmdown.wasi:wasi-preopen-descriptor pre)))
+      (unwind-protect
+           (progn
+             ;; a read/write preopen directory: READ | MUTATE_DIRECTORY
+             (let ((flags (cdr (fs-ok-value
+                                (wasmdown.wasi:fs-get-flags ctx d)))))
+               (is (member "read" flags :test #'string=))
+               (is (member "mutate-directory" flags :test #'string=))
+               (is (not (member "write" flags :test #'string=)))
+               (is (= 1 (count "read" flags :test #'string=))))
+             ;; opened with no descriptor flags: read, never `write'
+             (let* ((opened (fs-ok-value
+                             (wasmdown.wasi:fs-open-at ctx d nil "." nil nil)))
+                    (dir-desc (third opened)))
+               (=> '("read")
+                   (cdr (fs-ok-value
+                         (wasmdown.wasi:fs-get-flags ctx dir-desc)))))
+             ;; advise is file-only: a directory is bad-descriptor
+             (=> "bad-descriptor"
+                 (fs-error-code-of
+                  (wasmdown.wasi:fs-advise ctx d 0 0 (cons :enum "normal"))))
+             ;; CREATE with no descriptor flags: READ | WRITE, and a
+             ;; size off_t cannot hold is file-too-large
+             (let* ((opened (fs-ok-value
+                             (wasmdown.wasi:fs-open-at
+                              ctx d nil "made.txt"
+                              (cons :flags '("create")) nil)))
+                    (made (third opened)))
+               (=> '("read" "write")
+                   (cdr (fs-ok-value
+                         (wasmdown.wasi:fs-get-flags ctx made))))
+               (=> "file-too-large"
+                   (fs-error-code-of
+                    (wasmdown.wasi:fs-set-size ctx made (1- (ash 1 64)))))))
+        (wasmdown.wasi:close-wasi-preopen pre)
+        (ignore-errors (delete-file (fs-p root "made.txt")))))))
+
+(test wasi/cli-argv0-is-the-file-name
+  ;; argv[0] is the guest program's FILE NAME (POSIX's program name),
+  ;; not the path handed to the CLI: the reference runtime does the same,
+  ;; and the pinned upstream wasip3 cli-env test asserts `cli-env.wasm'.
+  (dolist (file '("/tmp/some/dir/prog.wasm" "prog.wasm"))
+    (multiple-value-bind (parsed-file invokes options guest-args)
+        (wasmdown.cli::%parse-run-args
+         (list file "--wasi" "--" "a" "b"))
+      (declare (ignore invokes))
+      (is (string= file parsed-file))
+      (multiple-value-bind (ctx reactor)
+          (wasmdown.cli::%component-context options guest-args file)
+        (unwind-protect
+             (=> '("prog.wasm" "a" "b")
+                 (wasmdown.wasi::wasi-context-arguments ctx))
+          (when reactor (wasmdown.wasi:reactor-close reactor)))))))

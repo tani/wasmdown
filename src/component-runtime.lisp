@@ -5273,9 +5273,18 @@ advances it."
     buffer stays parked on READER with the attempt's generation, and
     host-end-ready resumes it.
 
-RETRY keeps the parked attempt's generation."
-  (if (async-end-host-eof-p peer)
-      (progn (setf (async-end-buffer reader) nil) (%host-drop peer))
+RETRY keeps the parked attempt's generation. A ZERO-LENGTH read
+buffer completes immediately with progress 0 (CanonicalABI.md End.copy
+case 5): there is nothing to fill, and parking it would wait for a
+writer that is the HOST, not the guest's peer — the deadlock a
+zero-length `read-via-stream' read hit."
+  (cond
+    ((zerop (%buffer-remain buffer))
+     (setf (async-end-buffer reader) nil)
+     (%end-notify reader 0))
+    ((async-end-host-eof-p peer)
+     (setf (async-end-buffer reader) nil) (%host-drop peer))
+    (t
       (let ((copy (async-end-host-copy peer)))
         (unless (and retry copy
                      (eq (host-copy-kind copy) :source)
@@ -5308,7 +5317,7 @@ RETRY keeps the parked attempt's generation."
               (t
                ;; (NIL NIL) or an empty non-EOF sequence: WOULD-BLOCK
                (setf (async-end-buffer reader) buffer)
-               (setf (async-end-host-copy peer) copy))))))))
+               (setf (async-end-host-copy peer) copy)))))))))
 
 ;;; ---- THE ONE-SHOT FUTURE WATCH ----
 ;;; A provider that must observe a HOST-OWNED readable future

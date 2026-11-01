@@ -852,10 +852,17 @@ fewer bytes than requested; a bounded read also bounds the host).")
    :packages (list package)))
 
 (defun insecure-seed-instance (&key (package (wasi-package "random")))
-  (provider-instance
-   (wasmdown.wit:package-interface package "insecure-seed")
-   (list (cons "get-insecure-seed" #'insecure-seed))
-   :packages (list package)))
+  "The insecure-seed provider: ONE 128-bit value per provider instance,
+returned unchanged on every call. The WIT says the function is
+intended to be called once and will become a value import so that
+callers cannot get different seeds; the reference runtime answers a
+second call with the first value, and the upstream wasip3 random test
+asserts it. The value is still host entropy, drawn once."
+  (let ((seed (insecure-seed)))
+    (provider-instance
+     (wasmdown.wit:package-interface package "insecure-seed")
+     (list (cons "get-insecure-seed" (lambda () (copy-list seed))))
+     :packages (list package))))
 
 (defun random-provider (&key (package (wasi-package "random")))
   (list
@@ -1991,14 +1998,17 @@ bare list, or NIL."
 
 (defun %path-components (path)
   "PATH's components after dropping empty and `.' pieces. Signals the
-WIT's capability errors: empty -> invalid, absolute -> not-permitted,
-NUL -> invalid, `..' -> not-permitted (the conservative rule: the
-guest may never climb, so no symbolic-link or `..' step can leave the
-preopen)."
+WIT's capability errors: empty -> no-entry, absolute ->
+not-permitted, NUL -> invalid, `..' -> not-permitted (the conservative
+rule: the guest may never climb, so no symbolic-link or `..' step can
+leave the preopen). An empty path is what POSIX resolves to ENOENT
+(`openat', `mkdirat', `unlinkat', `linkat' all return ENOENT), so the
+WIT's `no-entry' case is the honest answer; the upstream wasip3
+filesystem tests assert exactly that."
   (unless (stringp path)
     (%fs-error "invalid"))
   (when (zerop (length path))
-    (%fs-error "invalid"))
+    (%fs-error "no-entry"))
   (when (char= (char path 0) #\/)
     (%fs-error "not-permitted"))
   (when (find (code-char 0) path)
@@ -2160,19 +2170,23 @@ borrowed directory fd on exit."
 ;;; Handle-relative primitives.
 
 (defun %fstat (fd)
-  "FD's (values dev ino mode nlink size mtime). SBCL's unix-fstat
-returns (t dev ino mode nlink uid gid rdev size atime mtime ctime
-blksize blocks) on success and (nil errno) on failure — the second
-slot is DEV, not an errno (a shift here made every type read as
-`other')."
+  "FD's (values dev ino mode nlink size mtime atime ctime). SBCL's
+unix-fstat returns (t dev ino mode nlink uid gid rdev size atime mtime
+ctime blksize blocks) on success and (nil errno) on failure — the
+second slot is DEV, not an errno (a shift here made every type read as
+`other'). The THREE timestamps are distinct slots of the stat struct
+and are reported as such: a stat that echoed the mtime for all three
+cannot answer the WIT's access/modification/change timestamps (the
+upstream filesystem-stat test sets them to different values and reads
+them back)."
   (multiple-value-bind (ok dev ino mode nlink uid gid rdev
                         size atime mtime ctime blksize blocks)
       (sb-unix:unix-fstat fd)
-    (declare (ignore uid gid rdev atime ctime blksize blocks))
+    (declare (ignore uid gid rdev blksize blocks))
     (unless ok
       ;; on failure the second value is the errno
       (%fs-error (errno->error-code dev)))
-    (values dev ino mode nlink size mtime)))
+    (values dev ino mode nlink size mtime atime ctime)))
 
 (defun %mode->type (mode)
   "The descriptor-type VARIANT domain value: (case-name . payload)."
@@ -2189,15 +2203,18 @@ slot is DEV, not an errno (a shift here made every type read as
 (defun %instant (seconds nanoseconds)
   (list (cons "seconds" seconds) (cons "nanoseconds" nanoseconds)))
 
-(defun %stat-record (dev ino mode nlink size mtime)
-  "The WIT descriptor-stat domain value for the fstat tuple."
+(defun %stat-record (dev ino mode nlink size mtime atime ctime)
+  "The WIT descriptor-stat domain value for the fstat tuple. The three
+`instant' fields are the struct's own atime, mtime and ctime slots
+(SBCL reports whole seconds; the nanoseconds slot is 0)."
   (declare (ignore dev ino))
-  (list (cons "%type" (%mode->type mode))
-        (cons "link-count" nlink)
-        (cons "size" size)
-        (cons "data-access-timestamp" (cons :some (%instant mtime 0)))
-        (cons "data-modification-timestamp" (cons :some (%instant mtime 0)))
-        (cons "status-change-timestamp" (cons :some (%instant mtime 0)))))
+  (flet ((instant (seconds) (cons :some (%instant seconds 0))))
+    (list (cons "%type" (%mode->type mode))
+          (cons "link-count" nlink)
+          (cons "size" size)
+          (cons "data-access-timestamp" (instant atime))
+          (cons "data-modification-timestamp" (instant mtime))
+          (cons "status-change-timestamp" (instant ctime)))))
 
 (defun %stat-at (desc path flags)
   "fstatat emulated with O_PATH + fstat (SBCL's stat wrapper is
@@ -2266,33 +2283,73 @@ filesystem itself and wasi:clocks (descriptor-stat's `instant')."
 (defun fs-stat (context self)
   (%fs-result
    (let ((desc (%descriptor-of context self (descriptor-resource-ct))))
-     (multiple-value-bind (dev ino mode nlink size mtime)
+     (multiple-value-bind (dev ino mode nlink size mtime atime ctime)
          (%fstat (%descriptor-fd desc))
-       (%stat-record dev ino mode nlink size mtime)))))
+       (%stat-record dev ino mode nlink size mtime atime ctime)))))
 
 (defun fs-stat-at (context self path-flags path)
   (%fs-result
    (%descriptor-of context self (descriptor-resource-ct))
-   (multiple-value-bind (dev ino mode nlink size mtime)
+   (multiple-value-bind (dev ino mode nlink size mtime atime ctime)
        (%stat-at (%descriptor-of context self (descriptor-resource-ct))
                  path path-flags)
-     (%stat-record dev ino mode nlink size mtime))))
+     (%stat-record dev ino mode nlink size mtime atime ctime))))
 
 (defun fs-get-type (context self)
   (%fs-result
    (let ((desc (%descriptor-of context self (descriptor-resource-ct))))
      (%mode->type (nth-value 2 (%fstat (%descriptor-fd desc)))))))
 
+(defun %effective-access-flags (dflags implied-write-p)
+  "The descriptor flags an OPEN reports: the guest's requested flags
+normalized the way the host actually opened the descriptor. A missing
+explicit `write' request means read mode (an empty request opens
+read-only and reports `read'); an explicit `write' without `read' is
+write-only. IMPLIED-WRITE-P says `create'/`truncate' opened the file
+for writing: it adds `write' but, unlike an explicit `write' request,
+does not remove the read default (the upstream
+filesystem-flags-and-type test: CREATE with no flags reports
+READ|WRITE; CREATE with WRITE reports WRITE)."
+  (let ((requested-read (member "read" dflags :test #'string=))
+        (requested-write (member "write" dflags :test #'string=)))
+    (append (if (or requested-read (not requested-write)) '("read") '())
+            (if (or requested-write implied-write-p) '("write") '())
+            (remove-if (lambda (f) (member f '("read" "write") :test #'string=))
+                       dflags))))
+
 (defun fs-get-flags (context self)
+  "The descriptor's flags as the host reports them. A DIRECTORY reports
+`read' plus the directory rights it actually has (`mutate-directory'),
+never the file-only `write' mode: the upstream wasip3
+filesystem-flags-and-type test requires READ|MUTATE_DIRECTORY for a
+read/write preopen. A file reports its effective access mode."
   (%fs-result
-   (cons :flags (copy-list
-                 (wasi-descriptor-flags
-                  (%descriptor-of context self (descriptor-resource-ct)))))))
+   (let* ((desc (%descriptor-of context self (descriptor-resource-ct)))
+          (flags (wasi-descriptor-flags desc))
+          (dir-p (or (wasi-descriptor-dir-p desc)
+                     (let ((mode (nth-value 2 (%fstat (%descriptor-fd desc)))))
+                       (and mode (= (logand mode +s-ifmt+) +s-ifdir+))))))
+     (cons :flags
+           (if dir-p
+               (cons "read"
+                     (remove-if (lambda (f)
+                                  (member f '("read" "write") :test #'string=))
+                                (copy-list flags)))
+               (copy-list flags))))))
 
 (defun fs-set-size (context self size)
+  "Adjust the file size. The KERNEL is the authority on whether this
+descriptor may be resized: a read-only descriptor gets `invalid' from
+`ftruncate' (EINVAL), exactly as the reference runtime reports it — the
+upstream filesystem-set-size test accepts invalid/bad-descriptor/access
+and rejects a provider-invented `read-only'."
   (%fs-result
    (let ((desc (%descriptor-of context self (descriptor-resource-ct))))
-     (%require-mutable desc)
+     ;; the WIT's `filesize' is u64 but the host's off_t is signed: a
+     ;; size that cannot be represented is `file-too-large' (EFBIG),
+     ;; never a host type error escaping the provider
+     (when (> size (1- (ash 1 63)))
+       (%fs-error "file-too-large"))
      (%fs-check (%libc-ftruncate (%descriptor-fd desc) size) "ftruncate")
      nil)))
 
@@ -2420,17 +2477,28 @@ host error, not an error-code."
              (%fs-error (errno->error-code (sb-alien:get-errno))))
            (let* ((mode (nth-value 3 (sb-unix:unix-fstat fd)))
                   (is-dir (and mode (= (logand mode +s-ifmt+) +s-ifdir+)))
+                  ;; `create'/`truncate' can only have opened the file
+                  ;; for writing, so they are part of the effective
+                  ;; access mode the descriptor reports (upstream
+                  ;; filesystem-flags-and-type: CREATE implies WRITE)
+                  (effective (%effective-access-flags
+                              dflags (or create truncate)))
                   (opened (make-wasi-descriptor
                            :fd fd
                            :preopen (wasi-descriptor-preopen desc)
-                           :flags (copy-list dflags)
+                           :flags effective
                            :owned-p t
                            :dir-p is-dir)))
              (list :own-handle (descriptor-resource-ct) opened))))))))
 
 (defun fs-advise (context self offset length advice)
+  "File advisory information. `posix_fadvise' applies to files only; a
+DIRECTORY is `bad-descriptor', never a silent success (the upstream
+wasip3 filesystem-advise test asserts it, and an advisory on a
+directory has no meaning)."
   (%fs-result
    (let* ((desc (%descriptor-of context self (descriptor-resource-ct)))
+          (mode (nth-value 2 (%fstat (%descriptor-fd desc))))
           (a (if (and (consp advice) (eq (car advice) :enum))
                  (cdr advice)
                  advice))
@@ -2442,6 +2510,8 @@ host error, not an error-code."
                       ((string= a "no-reuse") 5)
                       (t 0)))
           (ret (%libc-fadvise (%descriptor-fd desc) offset length code)))
+     (when (and mode (= (logand mode +s-ifmt+) +s-ifdir+))
+       (%fs-error "bad-descriptor"))
      ;; posix_fadvise RETURNS the error number (it does not set errno)
      (unless (zerop ret)
        (%fs-error (errno->error-code ret)))
@@ -2629,8 +2699,16 @@ DROPPED)."
                          :fill-pointer 0)))
     (lambda (max)
       (let ((want (min max *fs-stream-chunk*)))
-        (if (<= want 0)
-            (values nil nil)
+        (cond
+          ;; off_t is signed: an offset at or above 2^63 cannot be
+          ;; represented, and POSIX makes such a pread EINVAL. The WIT
+          ;; case is `invalid' (the upstream filesystem-io test asks
+          ;; for a read at u64::MAX and expects exactly that).
+          ((>= pos (ash 1 63))
+           (funcall settle (cons :err "invalid"))
+           (values nil t))
+          ((<= want 0) (values nil nil))
+          (t
             (let ((n (sb-sys:with-pinned-objects (slice)
                        (%libc-pread fd (sb-sys:vector-sap slice) want pos))))
               (cond
@@ -2647,7 +2725,7 @@ DROPPED)."
                  (incf pos n)
                  (when (< n want)
                    (funcall settle (cons :ok nil)))
-                 (values out (< n want))))))))))
+                 (values out (< n want)))))))))))
 
 (defun %byte-list->alien (bytes)
   "A fresh unsigned-char alien holding BYTES (a u8 element list)."
@@ -2673,6 +2751,10 @@ file's size from POSITION-FN at every attempt (EOF-append semantics)."
         ((<= n 0) (values 0 nil))
         (t
          (let ((pos (funcall position-fn fd)))
+           (if (>= pos (ash 1 63))
+               ;; off_t cannot represent POS: EINVAL, the WIT's invalid
+               (values 0 "invalid")
+             (progn
            (sb-alien:set-errno 0)
            (let ((written
                    (sb-sys:with-pinned-objects (octets)
@@ -2689,7 +2771,7 @@ file's size from POSITION-FN at every attempt (EOF-append semantics)."
                 (let ((errno (sb-alien:get-errno)))
                   (if (= errno +eagain+)
                       (values 0 nil)
-                      (values 0 (errno->error-code errno)))))))))))))
+                      (values 0 (errno->error-code errno)))))))))))))))
 
 (defun %fs-dropped-stream-and-future (elem-ct future-ct code)
   "The REFUSED shape of a stream-returning method: the guest's stream
@@ -6084,6 +6166,13 @@ the feature. Stable and unknown names pass through untouched."
                                 name feature)))))
   nil)
 
+(defparameter +wasi-http-unsupported-message+
+  "wasi:http is not supported by this runtime by design (removed in M17); the pinned HTTP WIT is reference data only. See docs/usage/wasi.md and specs/wasi/MANIFEST.md."
+  "The one canonical refusal text for the `wasi:http' package, shared
+by world composition and by every declared-import path. `wasi:http' is
+refused at ANY release line: the pinned HTTP WIT is reference data
+only and no provider is ever built from it.")
+
 (defun compose-world-providers (world context)
   "Compose the provider graph for the RESOLVED WORLD: exactly the
 imports WORLD declares, in declaration order, each bound under the
@@ -6107,8 +6196,7 @@ import this runtime has no provider for."
                ;; branch and the generic no-provider error: an http
                ;; import must never pass as unbound
                (error 'wasmdown.wit:wit-error
-                      :message
-                      "wasi:http is not supported by this runtime by design (removed in M17); the pinned HTTP WIT is reference data only. See docs/usage/wasi.md and specs/wasi/MANIFEST.md."))
+                      :message +wasi-http-unsupported-message+))
               (builder
                (push (cons name (funcall builder)) providers))
               ((%types-only-world-import-p item)
@@ -6135,6 +6223,102 @@ PACKAGES supplying its cross-package imports."
           collect (wasmdown.component::importrec-name
                    (wasmdown.component:compdef-payload d))))
 
+(defun %types-only-declared-import-p (name)
+  "T when the 0.3-line declared import NAME resolves to an interface
+with no functions and no resources, so nothing needs a host binding.
+Only a RESOLVED 0.3 package interface qualifies: an unknown name is
+never assumed types-only (it fails the provider check instead)."
+  (multiple-value-bind (status interface)
+      (wasmdown.wit:wit-import-surface-status name (%wasi-wit-packages))
+    (declare (ignore status))
+    (and interface
+         (null (wasmdown.wit:wit-interface-func-list interface))
+         (null (wasmdown.wit:wit-interface-resource-list interface)))))
+
+(defun %declared-03-provider (name builders)
+  "The provider instance for the 0.3-line declared import NAME, or NIL
+when the interface is types-only (it needs no host binding). A name
+this runtime has no provider for is a construction-time `WIT-ERROR'
+naming the import — never a trapping stub. NAME has already passed the
+0.3 line's exclusions."
+  (let ((builder (cdr (assoc name builders :test #'string=))))
+    (cond
+      (builder (funcall builder))
+      ((%types-only-declared-import-p name) nil)
+      (t
+       (error 'wasmdown.wit:wit-error
+              :message
+              (format nil "component declares import `~a`, for which this runtime has no provider"
+                      name))))))
+
+(defun %compose-declared-03-providers (context names)
+  "The provider alist for the 0.3-line DECLARED imports NAMES, in
+declaration order. The 0.3 gates run FIRST, over exactly these names,
+so no provider is built for a refused import: an @unstable interface
+whose feature is not enabled is refused naming import and feature,
+then `wasi:http' (any line, canonical message) and a `wasi:sockets'
+declaration (canonical message). Each surviving name is bound to its
+builder's provider; a types-only interface composes no entry."
+  (%refuse-unstable-declared-imports names)
+  (dolist (name names)
+    (cond
+      ((%wasi-http-import-name-p name)
+       (error 'wasmdown.wit:wit-error
+              :message +wasi-http-unsupported-message+))
+      ((%wasi-sockets-import-name-p name)
+       (error 'wasmdown:link-error
+              :message +wasi-sockets-unsupported-message+))))
+  (let ((builders (%wasi-provider-builders context))
+        (providers '()))
+    (dolist (name names)
+      (let ((provider (%declared-03-provider name builders)))
+        (when provider
+          (push (cons name provider) providers))))
+    (nreverse providers)))
+
+(defun %p2-declared-provider-table (context v2)
+  "A hash table import-name -> provider for the exact-version 0.2
+declared imports V2: one P2 provider table per DISTINCT patch version,
+each built for exactly the names that version declares. The selection
+stays version-exact; no provider is invented for a name the table does
+not have (PREVIEW2-COMMAND-PROVIDER raises for it)."
+  (let ((by-version (make-hash-table :test #'equal))
+        (table (make-hash-table :test #'equal)))
+    (dolist (pair v2)
+      (push (car pair) (gethash (cdr pair) by-version)))
+    (maphash (lambda (ver imports)
+               (dolist (provider
+                        (preview2-command-provider
+                         context :version ver
+                         :imports (nreverse imports)))
+                 (setf (gethash (car provider) table) (cdr provider))))
+             by-version)
+    table))
+
+(defun %compose-mixed-release-providers (context wasi-names v2)
+  "Compose ONE provider graph for a component that declares both
+release lines. V2 is the component's exact-version 0.2 declared
+imports as (name . version); WASI-NAMES is every declared `wasi:'
+import in declaration order. The imports NOT in V2 are the 0.3 line
+and are composed from the 0.3 command builders (gated exactly like a
+0.3-only component); the V2 imports come from the P2 tables at their
+own exact versions. The result is a single with-args alist in
+declaration order. A declared import outside both line's providers is
+still an error: no provider is invented to make a mix compose."
+  (let* ((p2-names (mapcar #'car v2))
+         (03-names (remove-if (lambda (name)
+                                (member name p2-names :test #'string=))
+                              wasi-names))
+         (03-providers (%compose-declared-03-providers context 03-names))
+         (p2-table (%p2-declared-provider-table context v2))
+         (providers '()))
+    (dolist (name wasi-names)
+      (let ((provider (or (gethash name p2-table)
+                          (cdr (assoc name 03-providers :test #'string=)))))
+        (when provider
+          (push (cons name provider) providers))))
+    (nreverse providers)))
+
 (defun component-command-providers (context comp &key (version "0.2.12"))
   "The provider set for COMP's DECLARED command imports, chosen by the
 release line the component asks for: an exact `@0.2.x' import gets the
@@ -6153,12 +6337,16 @@ the selected (stable) surface does not enable — the message names the
 import and the feature. Stable imports are unaffected and unknown
 names are left alone (the 0.3 path composes the command world exactly
 as before). The 0.2 line is untouched (the
-P2 sockets facade is a separate legacy claim), and a component that
-ALSO declares a 0.2 import keeps the mixed-release-line refusal, which
-is checked by the same predicate it always was: the two refusals never
-race, because the mixed check needs a non-empty `v2' and both 0.3
-refusals require `v2' empty. No feature can be enabled from the CLI:
-the gate is refusal-only."
+P2 sockets facade is a separate legacy claim).
+
+A component that declares BOTH lines gets one COMPOSED graph
+(%COMPOSE-MIXED-RELEASE-PROVIDERS): the 0.3 command builders bind
+exactly its 0.3-line declared imports under the same gates a 0.3-only
+component meets (unstable feature, `wasi:http' at any line, 0.3
+sockets), and the P2 tables bind its 0.2-line imports at their exact
+versions, in declaration order. An import that neither line can serve
+is still an error. No feature can be enabled from the CLI: the gate is
+refusal-only."
   (let* ((names (declared-component-imports comp))
          (wasi-names (remove-if-not (lambda (n)
                                       (and (stringp n)
@@ -6198,10 +6386,9 @@ the gate is refusal-only."
                  by-version)
         (nreverse providers)))
      (t
-      (error 'wasmdown:link-error
-             :message
-             (format nil "component mixes WASI release lines (~{~a~^, ~}); no single provider graph applies"
-                     wasi-names))))))
+      ;; both release lines in one component: compose each line from
+      ;; its own provider graph under one alist
+      (%compose-mixed-release-providers context wasi-names v2)))))
 
 (defun command-provider (context &key (world (command-world)))
   "The provider set of the `command' world as a with-args alist,
@@ -6217,8 +6404,14 @@ never bound."
   "The `run' function a command-world component exports: the exported
 `wasi:cli/run@<version>' instance's `run' (a comp-instance or an
 inline bag) at ANY supported version — a 0.2.12 command and a 0.3.2
-command export the same shape under their own release name — else a
-direct top-level `run' export. NIL when absent."
+command export the same shape under their own release name. A
+component that exports SEVERAL run versions (the wasip3 test guests
+also export a `wasi:cli/run@0.2.0' compatibility shim) is driven
+through the NEWEST one: the command entry is the highest release line
+the component itself offers, never whichever entry the export table
+happens to visit first. Fallbacks, in order: the unversioned
+`wasi:cli/run' instance, then a direct top-level `run' export. NIL
+when absent."
   (flet ((%export (name)
            (let ((hit (gethash name
                                (wasmdown.component.runtime:comp-instance-exports
@@ -6231,25 +6424,42 @@ direct top-level `run' export. NIL when absent."
               (wasmdown.component.runtime:runtime-export-value value "run"))
              (hash-table (gethash "run" value))
              (t nil))))
-    (or (let ((run-value nil)
-              (found nil))
-          ;; pick the run instance by PREFIX: the version is the
-          ;; component's, never assumed
-          (maphash (lambda (name value)
-                     (when (and (not found)
-                                (stringp name)
-                                (let ((p (search "wasi:cli/run" name
-                                                 :test #'char=)))
-                                  (and p (zerop p)))
-                                (or (= (length name) 12)
-                                    (char= (char name 12) #\@)))
-                       ;; the export table entry is (sort . value)
-                       (setf run-value (cdr value)
-                             found t)))
-                   (wasmdown.component.runtime:comp-instance-exports instance))
-          (and found (run-of run-value)))
-        (let ((direct (%export "run")))
-          (and (wasmdown.component.runtime:lifted-func-p direct) direct)))))
+    (let ((versioned '())
+          (unversioned nil))
+      ;; pick the run instances by PREFIX: the versions are the
+      ;; component's own, never assumed
+      (maphash (lambda (name value)
+                 (when (and (stringp name)
+                            (let ((p (search "wasi:cli/run" name
+                                             :test #'char=)))
+                              (and p (zerop p))))
+                   ;; the export table entry is (sort . value)
+                   (cond
+                     ((or (= (length name) 12)
+                          (not (char= (char name 12) #\@)))
+                      (setf unversioned (cdr value)))
+                     (t
+                      (let ((version (subseq name 13)))
+                        ;; a malformed suffix names no comparable
+                        ;; release: it is not a candidate
+                        (when (handler-case
+                                  (progn
+                                    (wasmdown.wit:wit-version<
+                                     version version)
+                                    t)
+                                (error () nil))
+                          (push (cons version (cdr value))
+                                versioned)))))))
+               (wasmdown.component.runtime:comp-instance-exports instance))
+      (or (loop for (version . value) in
+                (stable-sort versioned
+                             (lambda (a b)
+                               (wasmdown.wit:wit-version< (car b) (car a))))
+                when (run-of value)
+                  return it)
+          (and unversioned (run-of unversioned))
+          (let ((direct (%export "run")))
+            (and (wasmdown.component.runtime:lifted-func-p direct) direct))))))
 
 (defun %run-result-status (result)
   "The `result' domain value of the command's run -> the process

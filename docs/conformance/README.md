@@ -18,12 +18,14 @@ together, and a number from one lane says nothing about another.
 | inventory | check | `make test-backend-inventory` (regenerate: `make report-backend-inventory`) | [`inventory.md`](inventory.md), `tests/backend-inventory.json` | The pinned WASI census (P1 functions, P2/P3 interfaces) reconciles with what the runtime actually registers; excluded and not-implemented surfaces are separate rows. |
 | release-matrix | gate | `make verify-release` | stdout | Every recorded lane artifact (core parity, component both backends, P2/P3 both backends, bench, inventory) is present, green, and names HEAD as its tested source. P1 is stdout-only and named as such. |
 | property | gate | `make test-property` | stdout | Generated core modules run under both backends; results, trap kind and observable memory must agree. A differential oracle, not a conformance claim. |
+| async-property | gate | `make test-async-property` (negative control: `make test-async-property-negative`) | stdout | The REAL task/subtask, stream/future/cancel, host-pending and one-shot-watch primitives run under fixed xorshift64* seeds with no wall-clock sleeps. Exactly-once terminal/event/delivery, no double resolve, monotone states, store-work accounting, copy-generation monotonicity, backpressure admission and the bounded executor's fixed budget/thread affinity are checked; the fake reactor is scripted. Any violation exits non-zero; the negative-control target requires a deliberately injected double delivery to be detected. |
 | p1-repeat | gate | `make test-p1-repeat` | stdout | The P1 acceptance lane repeated in fresh processes (the plan's "P1 guest tests pass twice"). |
 | wasi preview1 | gate | `make test-wasi-preview1` (interpret); `tools/wasi-preview1-acceptance.py --backend compiled` (report) | stdout | The real CLI runs pinned SQLite guests with exact stdout/status, plus preopen, read-only, and escape denials. The compiled form runs the same cases with every guest core compiled (~200 s per fresh process); its exact stdout/status must match. |
 | wasi preview2 | gate | `make test-wasi-preview2` | `tests/wasi-results/latest/` | WASI 0.2 behaviour with one fresh guest process per case. |
 | wasi preview3 | gate (explicit) | `make test-wasi-preview3` | `tests/wasi-results/latest/` | The pinned hand-authored @0.3.2 command (`tools/build-p3-fixtures.lisp`) runs through the real CLI in both backends. Not part of `--abi all`; a missing fixture is a failure, never a skip. |
 | wasi all | gate | `make test-wasi` | [`wasi.md`](wasi.md), `tests/wasi-results/latest/` | Both released ABIs (`preview1`, `preview2`) in one run. |
 | upstream | discovery | `make test-upstream` | [`upstream.md`](upstream.md), `tests/upstream-results.jsonl` | Where the engine stands against proposal corpora beyond its declared scope. Never gated. |
+| wasi-testsuite | evidence (blocked) | `make test-wasi-upstream` | [`tests/wasi-upstream-summary.md`](../../tests/wasi-upstream-summary.md), `tests/wasi-upstream-results.json`, `tests/wasi-upstream-expectations.toml` | The pinned upstream precompiled WASI guests (`prod/testsuite-base`, 127 guests) through the registered adapter. Never gated; skips are only the declared http/sockets and legacy `sock_*` exclusions. The lane is **blocked**, not green: see the summary and PLAN §9.3 F1. Requires a checkout (`WASI_TESTSuite_DIR`); exits 2 with the fetch recipe when absent. |
 
 Pins:
 
@@ -31,6 +33,7 @@ Pins:
 | --- | --- |
 | WebAssembly/spec (core) | `b0ec1f3f449525c217dbff3f1dfab435a756ea92` |
 | WebAssembly/component-model | `d095e2f60ddae1f9a1e9b1e2fb547ec1114da677` |
+| WebAssembly/wasi-testsuite (precompiled guests) | `9d84631e427729802085c3d172d0a63cd360a1fa` (`prod/testsuite-base`) |
 | WASI WIT | v0.3.2 |
 
 ## Honest counting
@@ -69,6 +72,7 @@ nothing fails.
 | [`performance.md`](performance.md) | `make report-backends-bench` |
 | [`wasi.md`](wasi.md) | `python3 tools/run-wasi-suite.py --abi all --repeat 30 --commit-summary` |
 | [`upstream.md`](upstream.md) | `make test-upstream` |
+| `tests/wasi-upstream-summary.md` | `WASI_TESTSuite_DIR=<checkout> make test-wasi-upstream` |
 
 These files are generated; edit the runner under `tools/`, never the
 report. `make report-backends-bench` also writes

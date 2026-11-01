@@ -63,7 +63,10 @@ declaration lives in `specs/wasi/MANIFEST.md` ("Network communication:
 wasi:sockets (excluded)").
 
 Positional tokens after the file become guest arguments **only** with
-`--wasi`; `argv[0]` is the file path as given. The parser refuses, as
+`--wasi`; `argv[0]` is the input file's **file name** (basename, the POSIX
+program name), not the path handed to the CLI — the reference runtime and the
+pinned upstream `wasi-testsuite` `cli-env` case both expect `cli-env.wasm` for
+a guest invoked as `/path/to/cli-env.wasm`. The parser refuses, as
 usage errors: any capability flag or guest argument without `--wasi`,
 `--invoke` on a component, `--invoke` together with a `--wasi` core
 run (which runs `_start` once), guest arguments for a plain core

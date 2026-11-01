@@ -44,7 +44,7 @@ Every host import receives an explicitly built authority object — a
 | Enable the WASI set | `--wasi` | `make-wasi-context` |
 | Preopen | `--dir HOST[::GUEST][:ro]` | `open-wasi-preopen` in `:preopens` |
 | Environment | `--env K=V` (repeatable) | `:environment` alist |
-| Guest arguments | tokens after `--` | `:arguments` (first is `argv[0]`) |
+| Guest arguments | tokens after `--` | `:arguments` (the CLI sets the first to the input file's basename, POSIX `argv[0]`) |
 | Standard streams | implied by `--wasi` | `:stdin` `:stdout` `:stderr` (NIL = withdrawn) |
 | Network (TCP/UDP/DNS) | **Refused:** `--net`, `--listen` and `--dns` are usage errors (exit 2) | **No guest surface.** `make-wasi-network` / `:listen` / `:dns` exist only for the internal 0.3.2 composition; a component-declared `wasi:sockets` import is a link error |
 | Reactor | built by `--wasi` (serves clock deadlines and stream readiness) | `:reactor` |
