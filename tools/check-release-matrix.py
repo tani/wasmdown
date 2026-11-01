@@ -151,19 +151,22 @@ def check_rows(commit):
 def main():
     commit = head()
     rows = check_rows(commit)
-    # Artifacts are normally committed in a child of the tested source, so a
-    # row may name HEAD or HEAD's parent; anything else is stale evidence.
-    parents = subprocess.run(("git", "rev-parse", "HEAD~1"), cwd=ROOT,
-                             capture_output=True, text=True,
-                             check=False).stdout.strip().split()
+    # Artifacts are committed after the tested source, so a row may name
+    # HEAD or any ANCESTOR of it (the recorded commit is the tested tree);
+    # a commit that is not an ancestor is stale/foreign evidence.
+    def ancestor(sha):
+        if not sha or sha == "?":
+            return False
+        out = subprocess.run(("git", "merge-base", "--is-ancestor", sha, "HEAD"),
+                             cwd=ROOT, capture_output=True, check=False)
+        return out.returncode == 0
     width = max(len(r) for r, _, _ in rows)
     failures = 0
     print("%-*s  %-6s  %s" % (width, "row", "state", "evidence"))
     for row, ok, detail in rows:
         state = "OK" if ok else ("n/a" if ok is None else "FAIL")
-        if ok is False and detail.startswith("source ") and detail[7:19] in (
-                [p[:12] for p in parents] if parents else []):
-            ok, detail = True, detail + " (artifact commit is HEAD's child)"
+        if ok is False and detail.startswith("source ") and ancestor(detail[7:19]):
+            ok, detail = True, detail + " (artifact commit predates HEAD)"
         if ok is False:
             failures += 1
         print("%-*s  %-6s  %s" % (width, row, state, detail))

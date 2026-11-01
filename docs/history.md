@@ -354,8 +354,12 @@ resume-safe async guest is pinned.
   it with 7, and the command runner maps the WASI exit to the process status
   (CLI exit 7). A third guest imports `wasi:clocks/monotonic-clock@0.3.2`,
   calls `now()` twice and traps unless the second call is not earlier — the
-  first P3 provider call that is not an exit. The lane now runs three guests,
-  3 repeats each, in both backends. The component binary grammar details that mattered: type indices
+  first P3 provider call that is not an exit. A fourth guest is the first
+  RESUME-SAFE binary async command: `run` is lifted async with a callback,
+  the core run returns `YIELD`, the callback runs on the resume, calls
+  `task.return(ok)` and returns `EXIT`; the runner reports status 0 and no
+  leaked threads. The lane runs four guests, 3 repeats each, in both
+  backends. The component binary grammar details that mattered: type indices
   inside an instance type are local to that type's declarations, the lower's
   core func must be defined before the bag that exports it, and imported
   instances occupy the instance index space before defined ones.

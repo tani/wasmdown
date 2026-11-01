@@ -1,10 +1,10 @@
 {"schema":"wasmdown.backend-parity-summary.v1",
- "generated_at":"2026-11-01T13:10:16Z",
+ "generated_at":"2026-11-01T13:15:00Z",
  "mode":"report",
  "files_arg":"tests/spec-core/*.wast",
  "sbcl_version":"2.6.4",
- "source_commit":"39935b086b11d546894ed5081efa8937666858da",
- "source_tree":"3c4d187c8b14b71c97feb41303215e6e5be9e29d",
+ "source_commit":"4bed8c7d63fcd45504b3986c21bc2ecbf16fb0cc",
+ "source_tree":"4d0f1ab1de9a21ecdb39a9316b84d99e9e077814",
  "clean_tree":false,
  "files":[
   {"file":"address.wast","interpret_commands":260,"compiled_commands":260,"match":260,"diverge":0,"refusals":0,"interpret_entries":255,"compiled_entries":255},
@@ -109,6 +109,6 @@
  "classes":{"match":21260,"compiled-compile-refusal":0,"compiled-only-failure":0,"interpret-only-failure":0,"phase-mismatch":0,"outcome-mismatch":0,"trap-mismatch":0,"detail-mismatch":0},
  "refused_opcodes":[],
  "backend_entry_counts":{"interpret":10882079,"compiled":10882079},
- "elapsed_seconds":88.52,
+ "elapsed_seconds":97.87,
  "files_run":97
 }

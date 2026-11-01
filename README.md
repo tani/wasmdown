@@ -129,7 +129,7 @@ Every lane is measured, not asserted. Latest numbers (2026-11-01):
 | `make report-component-compiled` | report | 1 702 pass / 0 fail under `:compiled` | `tests/component-compiled/component.md` |
 | `make test-backend-parity` | gate | 21 260 / 21 260 core commands agree across both backends | [`backends.md`](docs/conformance/backends.md) |
 | `make test-wasi` | gate | 450/450 cases over 30 fresh-process runs | [`wasi.md`](docs/conformance/wasi.md) |
-| `make test-wasi-preview3` | gate (explicit) | 3 hand-authored 0.3.2 guests × 3 repeats, both backends | — |
+| `make test-wasi-preview3` | gate (explicit) | 4 hand-authored 0.3.2 guests × 3 repeats, both backends | — |
 | `make test-property` | gate | 2 000 generated modules, both backends agree | — |
 | `make test-upstream` | discovery | aggregated proposal corpus, never a gate | [`upstream.md`](docs/conformance/upstream.md) |
 | `make report-backends-bench` | report | per-backend cost medians | [`performance.md`](docs/conformance/performance.md) |

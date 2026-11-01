@@ -6,7 +6,7 @@ harness-error, timeout, skip, or census mismatch (a planned file that
 contributed no commands, a duplicate command, an unknown outcome).
 The denominator printed below is the number of commands EXECUTED.
 
-- Tested source: commit `39935b086b11d546894ed5081efa8937666858da`, tree `3c4d187c8b14b71c97feb41303215e6e5be9e29d`, dirty tree — see the commit/tree for provenance
+- Tested source: commit `4bed8c7d63fcd45504b3986c21bc2ecbf16fb0cc`, tree `4d0f1ab1de9a21ecdb39a9316b84d99e9e077814`, dirty tree — see the commit/tree for provenance
 - Pinned suite: WebAssembly/component-model `d095e2f60ddae1f9a1e9b1e2fb547ec1114da677` (2026-10-24, specs/lock.toml)
 - Scope: the whole vendored component suite in {binary, validation,
   linking, values, async} minus the entries in tests/component/nyi.txt

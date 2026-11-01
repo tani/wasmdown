@@ -193,10 +193,66 @@
            (b-sec 11 (b-vec (b-cat (b-nameattrs "wasi:cli/run@0.3.2")
                                    (b-bytes #x05 1) (b-bytes 0)))))))
 
+;;; ---------------------------------------------------------------
+;;; Fixture 4: an ASYNC command (resume-safe). run is lifted async with
+;;; a callback: the core run returns YIELD, the callback is invoked on
+;;; the resume and calls task.return(ok) before returning EXIT.
+
+(defun p3-async-guest-bytes ()
+  (let* ((core
+           (b-wat "(module
+                      (import \"env\" \"task.return\"
+                              (func $task.return (param i32)))
+                      (type $cb (func (param i32 i32 i32) (result i32)))
+                      (func (export \"run\") (result i32)
+                        (i32.const 1))
+                      (func (export \"cb\") (type $cb)
+                        (call $task.return (i32.const 0))
+                        (i32.const 0)))"))
+         (result-type (b-bytes #x6a #x00 #x00))
+         (run-ft (b-cat (b-bytes #x43) (b-vec)            ; async () ->
+                        (b-bytes #x00) (b-bytes 0)))
+         (types (b-vec result-type run-ft))
+         ;; task.return: 0x09 resultlist opts (the flat result is the i32
+         ;; variant discriminant of result<_,_>)
+         (taskret-canon (b-sec 8 (b-vec (b-cat (b-bytes #x09 #x00 #x00)
+                                                (b-vec)))))
+         (bag (b-sec 2 (b-vec (b-cat (b-bytes #x01)
+                                     (b-vec (b-cat (b-name "task.return")
+                                                   (b-bytes #x00 0)))))))
+         (m-inst (b-sec 2 (b-vec (b-cat (b-bytes #x00 0)
+                                        (b-vec (b-cat (b-name "env")
+                                                      (b-bytes #x12 0)))))))
+         (aliases (b-sec 6 (b-vec (b-cat (b-bytes #x00 #x00 #x01 1)
+                                         (b-name "run"))
+                                  (b-cat (b-bytes #x00 #x00 #x01 1)
+                                         (b-name "cb")))))
+         (lift-canon (b-sec 8 (b-vec (b-cat (b-bytes #x00 #x00 1)
+                                            (b-vec (b-bytes #x06)   ; async
+                                                   (b-cat (b-bytes #x07)
+                                                          (b-u32 2))) ; callback
+                                            (b-bytes 1)))))
+         (compinst (b-sec 5 (b-vec (b-cat (b-bytes #x01)
+                                          (b-vec (b-cat (b-nameattrs "run")
+                                                        (b-bytes #x01 0)))))))
+         (export (b-sec 11 (b-vec (b-cat (b-nameattrs "wasi:cli/run@0.3.2")
+                                         (b-bytes #x05 0) (b-bytes 0))))))
+    (b-cat (b-bytes 0 #x61 #x73 #x6d #x0d 0 1 0)
+           (b-sec 7 types)
+           (b-sec 1 core)
+           taskret-canon
+           bag
+           m-inst
+           aliases
+           lift-canon
+           compinst
+           export)))
+
 (defparameter *fixtures*
   (list (list "p3-guest.wasm" #'p3-sync-guest-bytes 0 "")
         (list "p3-import-guest.wasm" #'p3-import-guest-bytes 7 "")
-        (list "p3-clock-guest.wasm" #'p3-clock-guest-bytes 0 "")))
+        (list "p3-clock-guest.wasm" #'p3-clock-guest-bytes 0 "")
+        (list "p3-async-guest.wasm" #'p3-async-guest-bytes 0 "")))
 
 ;;; ---------------------------------------------------------------
 ;;; Verify through this project's own decoder/validator/runner, then
