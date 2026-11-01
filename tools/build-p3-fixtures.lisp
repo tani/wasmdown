@@ -14,10 +14,12 @@
 ;;;; smoke cannot give: the runner composes the provider from the
 ;;;; component's DECLARED import and the guest calls through a canon lower.
 ;;;;
-;;;; A richer stdout-importing async command lives in tests/wasi.lisp
-;;;; (wasi/e2e-command-component-binary); its body is not resume-safe, so
-;;;; it is exercised at the run-component level and not pinned as a CLI
-;;;; guest (see docs/status.md, "Known gaps").
+;;;; The parser-visible async command in tests/wasi.lisp
+;;;; (wasi/e2e-command-component-binary) is not resume-safe; the CLI lane
+;;;; pins the resume-safe replacements built here instead: a callback
+;;;; command that keeps its state in memory, and the stdout stream command
+;;;; (canonical future order: park the read, stage the write, drop the
+;;;; writable end, waitable-set.wait on the future event).
 ;;;;
 ;;;; This is ABI coverage, not evidence of real-toolchain integration:
 ;;;; no @0.3.2 guest from an upstream toolchain exists here.

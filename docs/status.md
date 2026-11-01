@@ -36,7 +36,7 @@ deliberately incomplete, and what will not be built. Measurements live in
 | WASI | Preview 1 (`wasi_snapshot_preview1`) | Full | All 46 pinned imports are provided over an explicit capability context. The whole acceptance lane (in-memory and on-disk SQLite, rollback, bail, preopen denial, read-only, escape) passes with compiled guest cores too. |
 | WASI | 0.3.2 providers | Partial | The CLI now owns a reactor (clock deadlines and socket readiness are servable); what remains partial is the provider surface itself — blocking DNS/stdio executors and the `@unstable` gates. |
 | WASI | 0.2 facade | Partial | 27 of 31 stable interfaces are bound at exact release names. |
-| WASI | 0.3.2 guest lane | Partial | Five hand-authored @0.3.2 commands run through the real CLI in both backends (`make test-wasi-preview3`): a no-import success smoke, a provider-importing guest that lowers `wasi:cli/exit@0.3.2` and exits 7, a clock guest that imports `wasi:clocks/monotonic-clock@0.3.2` and traps unless `now()` is monotonic, a resume-safe async command whose `run` is lifted async with a callback (`YIELD` from the core run, `task.return(ok)` in the callback, `EXIT`), and a stdout stream command that writes through `wasi:cli/stdout@0.3.2`'s `write-via-stream` using the canonical future order (park the read, stage the write, drop the writable end, `waitable-set.wait` for the future event) and prints `hi`. No upstream toolchain input exists here; socket/stream guests and a provider-driven async wait remain open. The provider side of that slice is already present, not a blocker: the command provider set composes 20 imports including `wasi:cli/stdout@0.3.2` (whose `write-via-stream` is backed by `cli-output-instance`), `wasi:cli/stderr@0.3.2` and `wasi:sockets/types@0.3.2`; only the types-only `wasi:cli/types@0.3.2` is reported unbound (`wasi/command-provider-composed-from-command-world` pins the set). The next slice is therefore the guest encoding (stream.new + async stream.write + the async `write-via-stream` call + future.read + drops), not provider work. |
+| WASI | 0.3.2 guest lane | Partial | Five hand-authored @0.3.2 commands run through the real CLI in both backends (`make test-wasi-preview3`): a no-import success smoke, a provider-importing guest that lowers `wasi:cli/exit@0.3.2` and exits 7, a clock guest that imports `wasi:clocks/monotonic-clock@0.3.2` and traps unless `now()` is monotonic, a resume-safe async command whose `run` is lifted async with a callback (`YIELD` from the core run, `task.return(ok)` in the callback, `EXIT`), and a stdout stream command that writes through `wasi:cli/stdout@0.3.2`'s `write-via-stream` using the canonical future order (park the read, stage the write, drop the writable end, `waitable-set.wait` for the future event) and prints `hi`. No upstream toolchain input exists here; socket guests and a cancelled-command guest remain open. The provider side of that slice is already present, not a blocker: the command provider set composes 20 imports including `wasi:cli/stdout@0.3.2` (whose `write-via-stream` is backed by `cli-output-instance`), `wasi:cli/stderr@0.3.2` and `wasi:sockets/types@0.3.2`; only the types-only `wasi:cli/types@0.3.2` is reported unbound (`wasi/command-provider-composed-from-command-world` pins the set). The stream slice is closed end to end; the remaining guest work is the socket family (resource-heavy: own/borrow socket handles, DNS) and a cancelled-command guest over the existing async machinery, not the CLI stdout path. |
 | WASI | `wasi:http` | Out of scope | Removed from the runtime by decision and not planned, recoverable from git history. |
 
 ## Declared limits
@@ -63,14 +63,15 @@ and neither is a validation rule (ADR-005).
 - Descriptor destructors and lend lists accumulate in long-lived hosts.
 - `@unstable` is parsed and recorded but not enforced; the affected interfaces
   are simply not registered.
-- The async-lifted command fixture in `tests/wasi.lisp` is not resume-safe.
-  Under the canonical async ABI a resumed task re-enters its callback and a
-  stateful guest resumes from the state it kept in memory; this
-  four-instruction fixture keeps none and writes unconditionally, so each
-  re-entry emits `hi` again (stdout repeats, then the deadlock oracle).
-  That is a property of the fixture, not of the scheduler: it is green
-  through `run-component` without a reactor, and the P3 CLI lane uses the
-  sync command until a resume-safe async guest is pinned.
+- The four-instruction async fixture in `tests/wasi.lisp`
+  (`wasi/e2e-command-component-binary`) is not resume-safe: it writes
+  unconditionally, so under a reactor-driven resume each re-entry emits `hi`
+  again. That is a property of that fixture, not of the scheduler. It is
+  retained as the in-process `run-component` case; the CLI lane now pins
+  resume-safe commands instead (`p3/async-callback` keeps its state in
+  memory; `p3/stream-stdout` parks the future read, stages the write and
+  waits on real events), so the lane no longer depends on the
+  four-instruction body.
 - The P3 `write-via-stream` path is now exercised end to end by a pinned
   guest (`p3/stream-stdout`, 3 repeats, both backends): it prints exactly
   `hi\n` through the worker-backed CLI stdout. Two runtime defects found

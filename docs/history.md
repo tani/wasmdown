@@ -331,13 +331,14 @@ verifies it through this project's own decoder/validator/runner, and records
 backends (exit 0); `wasi/command-component-runs-the-selected-backend` proves
 the nested core ran through the selected backend via the entry counters.
 
-The richer stdout-importing async command already in `tests/wasi.lisp` writes
-"hi" through a `stream<u8>` and `task.return`s; it is green through
-`run-component` without a reactor. Its body is not resume-safe (it writes
-unconditionally), so a reactor-driven resume re-executes it and stdout repeats;
-that is a limitation of this four-instruction fixture, not of the scheduler,
-and it is recorded in `status.md`. The CLI lane uses the sync command until a
-resume-safe async guest is pinned.
+The four-instruction stdout command in `tests/wasi.lisp` writes "hi"
+through a `stream<u8>` and `task.return`s; it is green through
+`run-component` without a reactor but is not resume-safe (it writes
+unconditionally, so a reactor-driven resume re-emits `hi`). That is a
+property of that fixture, not of the scheduler. The CLI lane now pins the
+resume-safe replacements instead: `p3/async-callback` (state in memory) and
+`p3/stream-stdout` (park the read, stage the write, wait on real events,
+print exactly `hi\n`).
 
 ## P2 stream readiness and P3 importing guests (2026-11-01)
 
