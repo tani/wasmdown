@@ -25,6 +25,6 @@ risky case (CL fixnums cannot hold all 64-bit patterns).
    modular arithmetic via `logand` is exact.
 −: Inner loops box i64s above 2^63-1 on SBCL (bignum escape). docs/design/PLAN.md
    §13 performance work (machine-word unboxing) is future M6 work; the
-   baseline backend accepts this cost for correctness first.
+   compiled backend accepts this cost for correctness first.
 −: Host functions must normalize (`i32-wrap`) returned values; the
    API documents this contract.

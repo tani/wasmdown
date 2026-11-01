@@ -11,7 +11,7 @@ declaring up to `(memory 65536)` (4 GiB) and more as *unlinkable*
 tests; a naive eager byte-vector backend tries to honor the full
 allocation and exhausts the SBCL heap — an uncatchable, process-killing
 failure (observed: a 512 MiB single-allocation death during the first
-baseline run; the validator's local-count preflight fixed a second
+compiled run; the validator's local-count preflight fixed a second
 512 MiB case, this ADR fixes the memory-pages one).
 
 ## Decision

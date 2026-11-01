@@ -22,7 +22,7 @@ graph TD
   VALIDATE --> INSTANTIATE["wasmdown.runtime: make-module-instance"]
   INSTANTIATE --> INVOKE["wasmdown.runtime: wasm-call"]
   INVOKE --> INTERP["wasmdown.interp: reference interpreter"]
-  INVOKE --> CODEGEN["wasmdown.codegen: baseline SBCL emitter"]
+  INVOKE --> CODEGEN["wasmdown.codegen: compiled SBCL emitter"]
   API["wasmdown.api public entry points"] --> VALIDATE
   API --> INSTANTIATE
   API --> INVOKE
@@ -117,7 +117,7 @@ records why the shape matters.
 ## Execution backends
 
 The backend is selected explicitly at instantiation — `:interpret` (default)
-or `:baseline` — and applies to the functions the module defines. It is a
+or `:compiled` — and applies to the functions the module defines. It is a
 property of the func-instance (`backend`, `compiled-entry`), not a replacement
 object: compilation fills the entry, so exports, tables, element segments,
 `ref.func` and other modules' imports keep the same reference, and an imported

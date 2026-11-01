@@ -77,7 +77,7 @@ the object itself is shared."
   module
   host-fn
   type
-  (backend :interpret :type (member :interpret :baseline))
+  (backend :interpret :type (member :interpret :compiled))
   compiled-entry)
 
 (defstruct (memory-instance (:constructor %make-memory-instance))
@@ -245,7 +245,7 @@ memory/table')."
 
 ;;; ---------------------------------------------------------------
 ;;; Value-level GC semantics (loop 22) shared by BOTH backends. The
-;;; reference interpreter calls these directly; the baseline compiler
+;;; reference interpreter calls these directly; the compiled compiler
 ;;; emits one call per GC instruction, so the packed normalization,
 ;;; field defaults, bounds checks and cast rules have exactly ONE
 ;;; implementation.
@@ -628,7 +628,7 @@ per-frame shape changes. See docs/status.md for the declared limit.")
   "Run one body of FUNC with the backend its func-instance selects."
   (let ((entry (func-instance-compiled-entry func)))
     (if entry
-        (progn (%count-backend-entry :baseline)
+        (progn (%count-backend-entry :compiled)
                (funcall entry args))
         (progn (%count-backend-entry :interpret)
                (funcall *invoke-wasm-body* func args)))))
@@ -1068,13 +1068,13 @@ tag: its type's params only, results being empty by construction).
   (values))
 
 (defun backend-entry-count (backend)
-  "Entries executed by BACKEND (:INTERPRET or :BASELINE) since the last
+  "Entries executed by BACKEND (:INTERPRET or :COMPILED) since the last
 reset; NIL for any other value."
   (gethash backend *backend-entry-counts* 0))
 
 (defun backend-entry-counts ()
-  "An alist of (backend . count) in :interpret, :baseline order."
-  (loop for k in '(:interpret :baseline)
+  "An alist of (backend . count) in :interpret, :compiled order."
+  (loop for k in '(:interpret :compiled)
         collect (cons k (gethash k *backend-entry-counts* 0))))
 
 (defun %count-backend-entry (backend)
@@ -1086,7 +1086,7 @@ reset; NIL for any other value."
 (defun wasm-call (func &rest args)
   "Call a func-instance. :HOST functions receive the ARGS as one list
  and return a results list. :WASM functions run through COMPILED-ENTRY
- when one is installed (the :baseline backend), otherwise through the
+ when one is installed (the :compiled backend), otherwise through the
  *INVOKE-WASM-FUNC* hook (the interpreter). The func-instance OBJECT is
  the same in both cases: compilation only fills the entry."
   (ecase (func-instance-kind func)

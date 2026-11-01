@@ -48,8 +48,8 @@ lanes** and must not be edited by hand:
 | `conformance/inventory.md` | `make report-backend-inventory` |
 | `conformance/performance.md` | `make report-backends-bench` |
 
-`tests/component-baseline/component.md` is the same kind of artifact for the
-baseline component run (`make report-component-baseline`); it is not part of
+`tests/component-compiled/component.md` is the same kind of artifact for the
+compiled component run (`make report-component-compiled`); it is not part of
 the released gate. Everything else in `docs/` is hand-written.
 
 ## Conventions

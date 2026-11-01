@@ -538,8 +538,8 @@ calls.")
 
 (defvar *component-core-mode* :interpret
   "The execution mode for embedded CORE modules of the component
-graph currently being instantiated (:interpret or :baseline). Bound
-by INSTANTIATE-COMPONENT; :baseline installs the compiled backend on
+graph currently being instantiated (:interpret or :compiled). Bound
+by INSTANTIATE-COMPONENT; :compiled installs the compiled backend on
 every core instance it allocates.")
 
 (defun instantiate-component (comp &key (with-args nil) (outer nil) (store nil)
@@ -677,11 +677,11 @@ inline-export BAG."
                                               iidx))))
               (mi (wasmdown.runtime:make-module-instance
                    module (%core-imports-alist module args)))
-              (_ (when (eq *component-core-mode* :baseline)
-                   (let ((installer (find-symbol "%INSTALL-BASELINE!" :wasmdown)))
+              (_ (when (eq *component-core-mode* :compiled)
+                   (let ((installer (find-symbol "%INSTALL-COMPILED!" :wasmdown)))
                      (unless (and installer (fboundp installer))
                        (error 'wasmdown:host-error
-                              :message "baseline codegen backend not loaded"))
+                              :message "compiled codegen backend not loaded"))
                      (funcall installer module mi)))))
          (%push-core-instance inst mi))))
     (:inline-exports
@@ -10139,7 +10139,7 @@ never closed by a nested helper."
 
 (setf wasmdown.wast:*component-instantiator*
       ;; the runner selects a guest backend for the CORE MODULES a
-      ;; component instantiates; :baseline compiles their defined
+      ;; component instantiates; :compiled compiles their defined
       ;; functions with the same eager rule as a bare core module.
       (lambda (comp)
         (instantiate-component comp

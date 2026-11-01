@@ -5,7 +5,7 @@
 ;;;;
 ;;;; Loads the ASDF system from the repository containing this script.
 ;;;; WASMDOWN_API_MODE selects the execution backend for core code
-;;;; (`interpret', the default, or `baseline').
+;;;; (`interpret', the default, or `compiled').
 ;;;;
 ;;;; ONE loading path: the ASDF system is the only definition of the
 ;;;; API and CLI (the old direct `load' of src/api + src/cli re-ran

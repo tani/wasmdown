@@ -13,9 +13,9 @@
 ;;;;   WASMDOWN_WAST_JSONL     output path, default
 ;;;;                           "tests/upstream-results.jsonl"
 ;;;;   WASMDOWN_WAST_LABEL     suite label for messages
-;;;;   WASMDOWN_WAST_MODE      interpret (default) or baseline: the guest
+;;;;   WASMDOWN_WAST_MODE      interpret (default) or compiled: the guest
 ;;;;                           backend for every module the scripts
-;;;;                           instantiate; a baseline compile refusal
+;;;;                           instantiate; a compiled compile refusal
 ;;;;                           classifies :fail/:compile, never a skip.
 ;;;;
 ;;;; The exit code is ALWAYS 0: a measurement lane never converts an
@@ -39,11 +39,11 @@
 (defparameter *jsonl* (%env "WASMDOWN_WAST_JSONL" "tests/upstream-results.jsonl"))
 (defparameter *label* (%env "WASMDOWN_WAST_LABEL" "upstream"))
 (defparameter *mode* (%env "WASMDOWN_WAST_MODE" "interpret"))
-(unless (member *mode* '("interpret" "baseline") :test #'string=)
-  (format t "~&WASMDOWN_WAST_MODE must be interpret or baseline, got ~s~%" *mode*)
+(unless (member *mode* '("interpret" "compiled") :test #'string=)
+  (format t "~&WASMDOWN_WAST_MODE must be interpret or compiled, got ~s~%" *mode*)
   (sb-ext:exit :code 2))
 (setf wasmdown.wast:*instantiate-mode*
-      (if (string= *mode* "baseline") :baseline :interpret))
+      (if (string= *mode* "compiled") :compiled :interpret))
 
 (defparameter *results*
   (wasmdown.wast:run-directory *root*

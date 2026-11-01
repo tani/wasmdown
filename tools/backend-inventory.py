@@ -293,11 +293,11 @@ def opcode_section():
                 continue
             rec = json.loads(line)
             pairs += 1
-            baseline = rec.get("baseline") or {}
-            if (baseline.get("outcome") == "fail"
-                    and baseline.get("phase") == "compile"):
+            compiled = rec.get("compiled") or {}
+            if (compiled.get("outcome") == "fail"
+                    and compiled.get("phase") == "compile"):
                 refusals += 1
-                m = OPCODE_RE.search(baseline.get("detail") or "")
+                m = OPCODE_RE.search(compiled.get("detail") or "")
                 if m:
                     counts[m.group(1)] = counts.get(m.group(1), 0) + 1
     return {
@@ -571,7 +571,7 @@ def render_markdown(doc):
     add("Evidence comes from the backend-parity lane "
         "(`tests/backend-parity-results.jsonl`, `wasmdown.backend-parity.v1`, "
         "written by `make report-backend-parity`), not from source text. A "
-        "baseline `fail` at phase `compile` is a refusal to lower an "
+        "compiled `fail` at phase `compile` is a refusal to lower an "
         "instruction; the counts below are whatever that file's last run "
         "recorded.")
     add("")
@@ -579,7 +579,7 @@ def render_markdown(doc):
         add("**Lane not run** — `tests/backend-parity-results.jsonl` is "
             "absent, so no opcode refusal counts are claimed here.")
     else:
-        add("Pairs recorded: %d; baseline compile refusals: %d; distinct "
+        add("Pairs recorded: %d; compiled compile refusals: %d; distinct "
             "refused opcodes: %d."
             % (ops["pairs"], ops["refusals"], len(ops["refused_opcodes"])))
         add("")

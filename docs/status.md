@@ -23,7 +23,7 @@ deliberately incomplete, and what will not be built. Measurements live in
 | Backends | Interpreter | Full | Default backend: scalar, SIMD, GC, EH, tail calls, multi-memory and memory64 semantics. |
 | Backends | Baseline codegen | Full for opcode coverage | Compiles every defined function before the start section and lowers every instruction the interpreter implements (scalar, memory, table, control, references, EH, tail calls, SIMD incl. relaxed, GC). An instruction with no lowering is a `codegen-error`, never an interpreter fallback. |
 | Backends | Backend parity (pinned core) | Full | `tools/run-backend-parity.lisp`: 21,260 / 21,260 commands agree in outcome and phase across both explicitly selected backends. |
-| Backends | Optimized or AOT tier | Not implemented | The engine ships an interpreter and a baseline compiler only. |
+| Backends | Optimized or AOT tier | Not implemented | The engine ships an interpreter and a compiled backend only. |
 | Backends | FASL cache | Not implemented | Compiled functions are not persisted across processes. |
 | Backends | Threads and atomics | Not implemented | Shared memory and the atomic instruction family are absent. |
 | Backends | Annotations proposal | Out of scope | Excluded permanently by the deliberate-exclusion list in [`design/PLAN.md` §3.3](design/PLAN.md). |
@@ -32,7 +32,7 @@ deliberately incomplete, and what will not be built. Measurements live in
 | Component model | Canonical ABI | Full | Lift/lower, flattening, string transcoding, `map` despecialization and post-return run at runtime. |
 | Component model | Resources | Full | Per-instance handle tables, own/borrow transfer, destructors and method dispatch. |
 | Component model | Async execution | Partial | The task/subtask state machine, cancellations and resource lifetimes run the whole async suite in both backends. Live-borrow accounting traps `task.return`/`task.cancel` with outstanding borrows; residual ABI/lifetime gaps are listed under Known gaps. |
-| Component model | Backend parity | Full | The whole component lane (1,702 commands) is green with every defined core compiled before its start section (`make report-component-baseline`). |
+| Component model | Backend parity | Full | The whole component lane (1,702 commands) is green with every defined core compiled before its start section (`make report-component-compiled`). |
 | WASI | Preview 1 (`wasi_snapshot_preview1`) | Full | All 46 pinned imports are provided over an explicit capability context. The whole acceptance lane (in-memory and on-disk SQLite, rollback, bail, preopen denial, read-only, escape) passes with compiled guest cores too. |
 | WASI | 0.3.2 providers | Partial | The CLI now owns a reactor (clock deadlines and socket readiness are servable); what remains partial is the provider surface itself — blocking DNS/stdio executors and the `@unstable` gates. |
 | WASI | 0.2 facade | Partial | 27 of 31 stable interfaces are bound at exact release names. |
@@ -97,10 +97,10 @@ gone. Live-borrow accounting already traps `task.return`/`task.cancel`, and the
 compound `result` layouts are pinned; the open items are the nested
 `option<stream<u8>>` owner resolution and lend/destructor reclamation.
 
-**Backends.** The pinned core parity lane, the component baseline report and
+**Backends.** The pinned core parity lane, the component compiled report and
 the cost bench exist; what remains is differential fuzz/property lanes and the
 remaining CI wiring (see [`conformance/matrix.md`](conformance/matrix.md)).
-The baseline tier is correctness-first; unboxing i64 and removing the extra
+The compiled tier is correctness-first; unboxing i64 and removing the extra
 `funcall` on compiled-to-guest edges are performance work, not scope.
 
 **WASI.** Finish the 0.1 and 0.2 facades; the 0.2 registry already binds 27 of

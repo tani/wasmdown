@@ -64,11 +64,11 @@
    (op :initarg :op :initform nil
        :reader codegen-error-op))
   (:documentation
-   "The baseline backend refused to compile a function: an instruction
+   "The compiled backend refused to compile a function: an instruction
 has no lowering. This is a compile-time refusal at the module boundary,
 distinct from decode/validate (the module is valid Wasm) and from a
 trap (no guest code ran). There is no interpreter fallback: a function
-the compiler cannot lower makes :mode :baseline fail before start.")
+the compiler cannot lower makes :mode :compiled fail before start.")
   (:report (lambda (c s)
              (format s "wasmdown: codegen error~@[ in function ~a~]~@[ at byte ~a~]~@[: ~a~]: ~a"
                      (codegen-error-function-index c)

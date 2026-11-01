@@ -1,5 +1,5 @@
 ;;;; Backend parity lane: run the same .wast script through both guest
-;;;; backends (:interpret, :baseline) in one process and pair the
+;;;; backends (:interpret, :compiled) in one process and pair the
 ;;;; per-command results.
 ;;;;
 ;;;; Emits:
@@ -10,7 +10,7 @@
 ;;;;     tests/backend-parity/backends.md)
 ;;;;
 ;;;; --mode report always exits 0; --mode gate exits non-zero on a
-;;;; divergence, a baseline compile refusal, a timeout/harness error in
+;;;; divergence, a compiled compile refusal, a timeout/harness error in
 ;;;; either backend, or a command-count mismatch between the backends.
 ;;;;
 ;;;; Each file is run twice: a fresh wast-state per run-script call, and
@@ -160,12 +160,12 @@
               (subseq detail start end))))))))
 
 (defun %classify (i b)
-  "CLASS for a divergence between interpret case I and baseline case B."
+  "CLASS for a divergence between interpret case I and compiled case B."
   (let ((io (getf i :outcome)) (bo (getf b :outcome))
         (ip (getf i :phase)) (bp (getf b :phase)))
     (cond
-      ((and (eq bo :fail) (eq bp :compile)) :baseline-compile-refusal)
-      ((and (eq io :pass) (not (eq bo :pass))) :baseline-only-failure)
+      ((and (eq bo :fail) (eq bp :compile)) :compiled-compile-refusal)
+      ((and (eq io :pass) (not (eq bo :pass))) :compiled-only-failure)
       ((and (eq bo :pass) (not (eq io :pass))) :interpret-only-failure)
       ((and (/= 0 (length (or (getf b :detail) "")))
             (search "trap" (or (getf b :detail) "") :test #'char-equal)
@@ -177,7 +177,7 @@
       ((not (equal (getf i :detail) (getf b :detail))) :detail-mismatch)
       (t :outcome-mismatch))))
 
-(defun %pair-file (file interpret baseline)
+(defun %pair-file (file interpret compiled)
   "Pair the two result lists by command index (case_id). Returns
  (values cases counts) where CASES is a list of plists."
   (let ((by-index (make-hash-table :test #'eql))
@@ -187,7 +187,7 @@
       (let ((idx (wasmdown.wast:wast-result-command-index r)))
         (setf (gethash idx iby-index) (%result->case r))
         (pushnew idx indices)))
-    (dolist (r baseline)
+    (dolist (r compiled)
       (let ((idx (wasmdown.wast:wast-result-command-index r)))
         (setf (gethash idx by-index) (%result->case r))
         (pushnew idx indices)))
@@ -198,14 +198,14 @@
                                        "no interpret result")))
                (b (or (gethash idx by-index)
                       (%synthetic-case file idx :harness-error
-                                       "no baseline result")))
+                                       "no compiled result")))
                (match (and (eq (getf i :outcome) (getf b :outcome))
                            (eq (getf i :phase) (getf b :phase)))))
           (push (list :file file
                       :case_id (getf i :case_id)
                       :assertion (getf i :assertion)
                       :interpret i
-                      :baseline b
+                      :compiled b
                       :verdict (if match :match :diverge)
                       :class (if match nil (%classify i b)))
                 cases)))
@@ -237,33 +237,33 @@
   (let ((all-cases '()) (per-file '()) (class-counts (make-hash-table :test #'eq))
         (opcode-counts (make-hash-table :test #'equal))
         (opcode-examples (make-hash-table :test #'equal))
-        (total-interpret-entries 0) (total-baseline-entries 0)
-        (total-interpret-commands 0) (total-baseline-commands 0)
+        (total-interpret-entries 0) (total-compiled-entries 0)
+        (total-interpret-commands 0) (total-compiled-commands 0)
         (start (get-internal-real-time)))
     ;; A measurement lane never writes to docs/conformance/core.md; the
     ;; only reports it can touch are its own.
     (dolist (path files)
       (let* ((name (file-namestring path))
-             (interpret-results nil) (baseline-results nil)
-             (interpret-counts nil) (baseline-counts nil))
+             (interpret-results nil) (compiled-results nil)
+             (interpret-counts nil) (compiled-counts nil))
         (format t "~&parity: ~a~%" name)
         (finish-output)
         (multiple-value-setq (interpret-results interpret-counts)
           (%run-mode path :interpret))
-        (multiple-value-setq (baseline-results baseline-counts)
-          (%run-mode path :baseline))
+        (multiple-value-setq (compiled-results compiled-counts)
+          (%run-mode path :compiled))
         (multiple-value-bind (cases i-count)
-            (%pair-file name interpret-results baseline-results)
+            (%pair-file name interpret-results compiled-results)
           (let ((match 0) (diverge 0) (refusals 0))
             (dolist (case cases)
               (let ((verdict (getf case :verdict))
                     (class (getf case :class))
-                    (base (getf case :baseline)))
+                    (base (getf case :compiled)))
                 (if (eq verdict :match)
                     (incf match)
                     (incf diverge))
                 (incf (gethash (or class :match) class-counts 0))
-                (when (eq class :baseline-compile-refusal)
+                (when (eq class :compiled-compile-refusal)
                   (incf refusals)
                   (let ((opcode (%refused-opcode (getf base :detail))))
                     (when opcode
@@ -274,19 +274,19 @@
                                     :case_id (getf case :case_id))))))))
               (push case all-cases))
             (let ((i-entries (or (cdr (assoc :interpret interpret-counts)) 0))
-                  (b-entries (or (cdr (assoc :baseline baseline-counts)) 0)))
+                  (b-entries (or (cdr (assoc :compiled compiled-counts)) 0)))
               (incf total-interpret-entries i-entries)
-              (incf total-baseline-entries b-entries)
+              (incf total-compiled-entries b-entries)
               (incf total-interpret-commands i-count)
-              (incf total-baseline-commands (length baseline-results))
+              (incf total-compiled-commands (length compiled-results))
               (push (list :file name
                           :interpret_commands i-count
-                          :baseline_commands (length baseline-results)
+                          :compiled_commands (length compiled-results)
                           :match match
                           :diverge diverge
                           :refusals refusals
                           :interpret_entries i-entries
-                          :baseline_entries b-entries)
+                          :compiled_entries b-entries)
                     per-file))))))
     (setf all-cases (nreverse all-cases)
           per-file (nreverse per-file))
@@ -296,9 +296,9 @@
           :opcode-counts opcode-counts
           :opcode-examples opcode-examples
           :interpret-entries total-interpret-entries
-          :baseline-entries total-baseline-entries
+          :compiled-entries total-compiled-entries
           :interpret-commands total-interpret-commands
-          :baseline-commands total-baseline-commands
+          :compiled-commands total-compiled-commands
           :elapsed (/ (- (get-internal-real-time) start)
                       (float internal-time-units-per-second)))))
 
@@ -310,14 +310,14 @@
   (with-open-file (s path :direction :output :if-exists :supersede
                           :if-does-not-exist :create)
     (dolist (case cases)
-      (let ((i (getf case :interpret)) (b (getf case :baseline)))
+      (let ((i (getf case :interpret)) (b (getf case :compiled)))
         (format s
                 "{\"schema\":\"wasmdown.backend-parity.v1\",~
                  \"file\":~a,~
                  \"case_id\":~a,~
                  \"assertion\":~a,~
                  \"interpret\":{\"outcome\":~a,\"phase\":~a,\"detail\":~a},~
-                 \"baseline\":{\"outcome\":~a,\"phase\":~a,\"detail\":~a},~
+                 \"compiled\":{\"outcome\":~a,\"phase\":~a,\"detail\":~a},~
                  \"verdict\":~a,~
                  \"class\":~a}~%"
                 (%json-string (getf case :file))
@@ -362,33 +362,33 @@
           do (unless first (format s ",~%"))
              (format s
                      "  {\"file\":~a,\"interpret_commands\":~d,~
-                      \"baseline_commands\":~d,\"match\":~d,\"diverge\":~d,~
+                      \"compiled_commands\":~d,\"match\":~d,\"diverge\":~d,~
                       \"refusals\":~d,\"interpret_entries\":~d,~
-                      \"baseline_entries\":~d}"
+                      \"compiled_entries\":~d}"
                      (%json-string (getf cell :file))
                      (getf cell :interpret_commands)
-                     (getf cell :baseline_commands)
+                     (getf cell :compiled_commands)
                      (getf cell :match)
                      (getf cell :diverge)
                      (getf cell :refusals)
                      (getf cell :interpret_entries)
-                     (getf cell :baseline_entries)))
+                     (getf cell :compiled_entries)))
     (format s "~% ],~%")
     (let ((cases (getf run :cases)))
       (format s " \"totals\":{\"cases\":~d,\"match\":~d,\"diverge\":~d,~
-               \"interpret_commands\":~d,\"baseline_commands\":~d,~
+               \"interpret_commands\":~d,\"compiled_commands\":~d,~
                \"refusals\":~d},~%"
               (length cases)
               (count :match cases :key (lambda (c) (getf c :verdict)))
               (count :diverge cases :key (lambda (c) (getf c :verdict)))
               (getf run :interpret-commands)
-              (getf run :baseline-commands)
-              (count :baseline-compile-refusal cases
+              (getf run :compiled-commands)
+              (count :compiled-compile-refusal cases
                      :key (lambda (c) (getf c :class)))))
     (format s " \"classes\":{")
     (let ((first t))
-      (dolist (class '(:match :baseline-compile-refusal
-                       :baseline-only-failure :interpret-only-failure
+      (dolist (class '(:match :compiled-compile-refusal
+                       :compiled-only-failure :interpret-only-failure
                        :phase-mismatch :outcome-mismatch :trap-mismatch
                        :detail-mismatch))
         (let ((n (gethash class (getf run :class-counts) 0)))
@@ -410,9 +410,9 @@
                        (%json-string (or (getf example :file) ""))
                        (%json-string (or (getf example :case_id) "")))))
     (format s "],~%")
-    (format s " \"backend_entry_counts\":{\"interpret\":~d,\"baseline\":~d},~%"
+    (format s " \"backend_entry_counts\":{\"interpret\":~d,\"compiled\":~d},~%"
             (getf run :interpret-entries)
-            (getf run :baseline-entries))
+            (getf run :compiled-entries))
     (format s " \"elapsed_seconds\":~,2f,~%" (getf run :elapsed))
     (format s " \"files_run\":~d~%}" (length files))))
 
@@ -422,22 +422,22 @@
 (defun %gate-failures (run files)
   (let ((failures '())
         (cases (getf run :cases)))
-    (when (/= (getf run :interpret-commands) (getf run :baseline-commands))
-      (push (format nil "executed command count differs: interpret ~d vs baseline ~d"
+    (when (/= (getf run :interpret-commands) (getf run :compiled-commands))
+      (push (format nil "executed command count differs: interpret ~d vs compiled ~d"
                     (getf run :interpret-commands)
-                    (getf run :baseline-commands))
+                    (getf run :compiled-commands))
             failures))
     (when (plusp (count :diverge cases :key (lambda (c) (getf c :verdict))))
       (push (format nil "~d diverging case~:p"
                     (count :diverge cases :key (lambda (c) (getf c :verdict))))
             failures))
-    (let ((refusals (count :baseline-compile-refusal cases
+    (let ((refusals (count :compiled-compile-refusal cases
                            :key (lambda (c) (getf c :class)))))
       (when (plusp refusals)
-        (push (format nil "~d baseline compile refusal~:p" refusals)
+        (push (format nil "~d compiled compile refusal~:p" refusals)
               failures)))
     (dolist (case cases)
-      (dolist (side '(:interpret :baseline))
+      (dolist (side '(:interpret :compiled))
         (let ((outcome (getf (getf case side) :outcome)))
           (when (member outcome '(:timeout :harness-error))
             (push (format nil "~a has ~a outcome" (getf case :case_id) outcome)
@@ -479,14 +479,14 @@
   (let* ((cases (getf run :cases))
          (divergences (count-if (lambda (c) (eq (getf c :verdict) :diverge))
                                 cases))
-         (refusals (count :baseline-compile-refusal cases
+         (refusals (count :compiled-compile-refusal cases
                           :key (lambda (c) (getf c :class))))
          (interp-timeouts (count-if
                            (lambda (c) (eq (getf (getf c :interpret) :outcome)
                                            :timeout))
                            cases))
          (base-timeouts (count-if
-                         (lambda (c) (eq (getf (getf c :baseline) :outcome)
+                         (lambda (c) (eq (getf (getf c :compiled) :outcome)
                                          :timeout))
                          cases))
          (interp-harness (count-if
@@ -494,7 +494,7 @@
                                           :harness-error))
                           cases))
          (base-harness (count-if
-                        (lambda (c) (eq (getf (getf c :baseline) :outcome)
+                        (lambda (c) (eq (getf (getf c :compiled) :outcome)
                                         :harness-error))
                         cases)))
     (with-open-file (s path :direction :output :if-exists :supersede)
@@ -503,19 +503,19 @@
               (%report-command options files))
       (format s "The same pinned scripts run twice in one process, once with~%")
       (format s "`wasmdown.wast:*instantiate-mode*` bound to `:interpret` and once to~%")
-      (format s "`:baseline` (the baseline compiler lowers every defined function of~%")
+      (format s "`:compiled` (the compiled backend lowers every defined function of~%")
       (format s "the module). A **pair** is one command executed by both backends,~%")
       (format s "matched by case id; two backends never share a wast-state, and the~%")
       (format s "backend entry counters are zeroed before each run.~%~%")
       (format s "A **match** is the same outcome *and* failure phase in both modes.~%")
-      (format s "Anything else is a **diverge** and is classified below; a baseline~%")
+      (format s "Anything else is a **diverge** and is classified below; a compiled~%")
       (format s "`compile` phase is a refusal to lower an instruction, never a~%")
       (format s "silent fall back to the interpreter.~%~%")
       (format s "## Lane modes~%~%")
       (format s "| Mode | Command | Exit semantics |~%")
       (format s "| --- | --- | --- |~%")
       (format s "| report | `make report-backend-parity` | Always zero; writes this report. |~%")
-      (format s "| gate | `make test-backend-parity` | Non-zero on any divergence, baseline compile refusal, timeout or harness error in either backend, or a command-count mismatch. |~%~%")
+      (format s "| gate | `make test-backend-parity` | Non-zero on any divergence, compiled compile refusal, timeout or harness error in either backend, or a command-count mismatch. |~%~%")
       (format s "- Scripts: ~a~%"
               (if (string= (getf options :files) *default-file-spec*)
                   "pinned core scripts, `tests/spec-core/*.wast`"
@@ -531,33 +531,33 @@
               (count :match cases :key (lambda (c) (getf c :verdict))))
       (format s "| diverge | ~d |~%| **total** | **~d** |~%~%"
               divergences (length cases))
-      (format s "Interpret commands: ~d; baseline commands: ~d;~%"
+      (format s "Interpret commands: ~d; compiled commands: ~d;~%"
               (getf run :interpret-commands)
-              (getf run :baseline-commands))
+              (getf run :compiled-commands))
       (format s "command-count mismatch: ~:[no~;yes~].~%~%"
               (/= (getf run :interpret-commands)
-                  (getf run :baseline-commands)))
+                  (getf run :compiled-commands)))
       (format s "## Divergence classes~%~%")
       (format s "| Class | Count |~%| --- | --- |~%")
       (format s "| match | ~d |~%"
               (gethash :match (getf run :class-counts) 0))
-      (dolist (class '(:baseline-compile-refusal :baseline-only-failure
+      (dolist (class '(:compiled-compile-refusal :compiled-only-failure
                        :interpret-only-failure :phase-mismatch
                        :outcome-mismatch :trap-mismatch :detail-mismatch))
         (format s "| ~a | ~d |~%" (%keyword-name class)
                 (gethash class (getf run :class-counts) 0)))
-      (format s "~%Timeout outcomes: interpret ~d, baseline ~d.~%"
+      (format s "~%Timeout outcomes: interpret ~d, compiled ~d.~%"
               interp-timeouts base-timeouts)
-      (format s "Harness-error outcomes: interpret ~d, baseline ~d.~%~%"
+      (format s "Harness-error outcomes: interpret ~d, compiled ~d.~%~%"
               interp-harness base-harness)
       (format s "## Per-file counts~%~%")
-      (format s "| File | interpret commands | baseline commands | match | diverge | refusals |~%")
+      (format s "| File | interpret commands | compiled commands | match | diverge | refusals |~%")
       (format s "| --- | --- | --- | --- | --- | --- |~%")
       (dolist (cell (getf run :per-file))
         (format s "| ~a | ~d | ~d | ~d | ~d | ~d |~%"
                 (%md-cell (%file-stem (getf cell :file)))
                 (getf cell :interpret_commands)
-                (getf cell :baseline_commands)
+                (getf cell :compiled_commands)
                 (getf cell :match)
                 (getf cell :diverge)
                 (getf cell :refusals)))
@@ -579,7 +579,7 @@
       (format s "| Backend | Wasm function entries executed |~%")
       (format s "| --- | --- |~%")
       (format s "| interpret | ~d |~%" (getf run :interpret-entries))
-      (format s "| baseline | ~d |~%" (getf run :baseline-entries))
+      (format s "| compiled | ~d |~%" (getf run :compiled-entries))
       (format s "~%Counters are reset before each per-file run and summed here; they~%")
       (format s "count Wasm function entries, not host calls.~%~%")
       (format s "## Regenerating~%~%")
@@ -617,14 +617,14 @@
   (%write-jsonl (getf run :cases) jsonl)
   (%write-summary run options files summary)
   (%write-report run options files report)
-  (format t "~&backend parity: ~d case~:p, ~d diverge, ~d baseline compile refusal~:p~%"
+  (format t "~&backend parity: ~d case~:p, ~d diverge, ~d compiled compile refusal~:p~%"
           (length (getf run :cases))
           (count :diverge (getf run :cases)
                  :key (lambda (c) (getf c :verdict)))
-          (count :baseline-compile-refusal (getf run :cases)
+          (count :compiled-compile-refusal (getf run :cases)
                  :key (lambda (c) (getf c :class))))
-  (format t "  interpret commands ~d, baseline commands ~d~%"
-          (getf run :interpret-commands) (getf run :baseline-commands))
+  (format t "  interpret commands ~d, compiled commands ~d~%"
+          (getf run :interpret-commands) (getf run :compiled-commands))
   (format t "  wrote ~a~%  wrote ~a~%  wrote ~a~%"
           (namestring jsonl) (namestring summary) (namestring report))
   (when (and (getf options :commit) (eq (getf options :mode) :gate))

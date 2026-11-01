@@ -728,7 +728,7 @@ args, apply, and throw to the function frame exactly like :return."
 ;;; ---------------------------------------------------------------
 ;;; GC value helpers (loop 22): the packed normalization and the
 ;;; dynamic cast rule live in WASMDOWN.RUNTIME (the "Value-level GC
-;;; semantics" section) so the baseline compiler's emitted calls and
+;;; semantics" section) so the compiled compiler's emitted calls and
 ;;; this interpreter share them. The frame's module supplies the type
 ;;; vector the cast lattice needs.
 
@@ -949,7 +949,7 @@ args, apply, and throw to the function frame exactly like :return."
     ;; The VALUE-level semantics (packed normalization, field defaults,
     ;; segment bounds, element access) live in WASMDOWN.RUNTIME's
     ;; "Value-level GC semantics" section: these branches are the same
-    ;; helpers the baseline compiler emits calls to, so both backends
+    ;; helpers the compiled compiler emits calls to, so both backends
     ;; share one implementation.
     ((eq op :struct.new)
      ;; [ft*] -> [(ref $t)]: pop the fields (top of stack = LAST
@@ -1241,7 +1241,7 @@ args, apply, and throw to the function frame exactly like :return."
 ;;; ---------------------------------------------------------------
 ;;; SIMD (loop 24): the interpreter's executor is a thin adapter over
 ;;; the ONE value-level semantics, WASMDOWN.SIMD:EXECUTE-OP — the same
-;;; function the baseline compiler emits a call to per instruction. It
+;;; function the compiled compiler emits a call to per instruction. It
 ;;; pops the instruction's operands in push order, resolves the memarg
 ;;; family's memory instance against this frame's module, and pushes
 ;;; the results.

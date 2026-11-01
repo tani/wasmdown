@@ -1949,7 +1949,7 @@ import surface bound to CONTEXT's capabilities. Returns
 (values INSTANCE STATE). IMPORTS (an imports table or raw alist) may
 add non-WASI imports; a conflicting WASI name is a link-error rather
 than a silent override. SOCKETS is the explicit fd -> native socket
-alist. MODE is :INTERPRET (default) or :BASELINE."
+alist. MODE is :INTERPRET (default) or :COMPILED."
   (let* ((state (%make-preview1-state :context context :module module
                                       :sockets sockets))
          (table (make-preview1-imports state)))
@@ -1972,19 +1972,19 @@ alist. MODE is :INTERPRET (default) or :BASELINE."
     (%p1-install-sockets state sockets)
     ;; MODE is installed in the PREPARE hook, not after instantiation:
     ;; PREPARE runs with every object allocated and no guest code yet, so
-    ;; in :BASELINE the START SECTION itself runs compiled. Installing
+    ;; in :COMPILED the START SECTION itself runs compiled. Installing
     ;; afterwards would silently interpret the start section.
     (ecase mode
       (:interpret)
-      (:baseline))
+      (:compiled))
     (let ((inst (wasmdown.runtime:make-module-instance
                  module
                  (wasmdown::imports-table-entries table)
                  :before-start (lambda (instance)
                                  (%p1-attach-memory state instance))
-                 :prepare (when (eq mode :baseline)
+                 :prepare (when (eq mode :compiled)
                             (lambda (instance)
-                              (wasmdown::%install-baseline! module instance))))))
+                              (wasmdown::%install-compiled! module instance))))))
       (setf (preview1-state-instance state) inst)
       (values inst state))))
 

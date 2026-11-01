@@ -41,7 +41,7 @@ Condition classes are exported from the same package; see
 | `make-wasi-context` / `open-wasi-preopen` | `wasmdown.wasi` | Build explicit capabilities. |
 | `run-preview1` | `wasmdown.wasi` | Run a Preview 1 command module (`_start` once); returns the raw u32 status. |
 | `run-component` | `wasmdown.wasi` | Run a command component; returns `(values status store)`. |
-| `compile-module-functions` | `wasmdown.codegen` | The baseline backend behind `:mode :baseline`. |
+| `compile-module-functions` | `wasmdown.codegen` | The compiled backend behind `:mode :compiled`. |
 
 [`wasi.md`](wasi.md) covers the capability objects; the CLI is
 [`cli.md`](cli.md).
@@ -68,15 +68,15 @@ multiple values out, coerced to `()` when the import returns nothing.
 ## Backend selection
 
 `mode` is explicit and applies to the functions **this module defines**:
-`:interpret` (default) or `:baseline`.
+`:interpret` (default) or `:compiled`.
 
 | Mode | Behaviour | Caveats |
 | --- | --- | --- |
 | `:interpret` | Every guest call runs the reference interpreter. | Always available; the semantic oracle for the other backend. |
-| `:baseline` | Every defined function is compiled before the start section runs, and the compiled entries are installed for every later call (exports, table elements, `ref.func`, imported uses). | Signals `host-error` if the backend module is not loaded, and `codegen-error` when a function uses an instruction the compiler cannot lower. Nothing guest-visible has run at that point: compilation happens before active segments and before the start section, and there is **no interpreter fallback**. |
+| `:compiled` | Every defined function is compiled before the start section runs, and the compiled entries are installed for every later call (exports, table elements, `ref.func`, imported uses). | Signals `host-error` if the backend module is not loaded, and `codegen-error` when a function uses an instruction the compiler cannot lower. Nothing guest-visible has run at that point: compilation happens before active segments and before the start section, and there is **no interpreter fallback**. |
 
 The order inside `instantiate` is fixed: validation -> import resolution
--> allocation -> backend installation (`:baseline` compiles here) ->
+-> allocation -> backend installation (`:compiled` compiles here) ->
 active segments -> exports -> `before-start` -> start section. A compile
 refusal therefore precedes any table/memory mutation and the start
 section itself runs through the selected backend.
@@ -109,7 +109,7 @@ is the hook the Preview 1 facade uses to bind the guest memory.
   (wasmdown:invoke instance "add" 42 13))   ; => (55)
 ```
 
-Imports and a baseline run:
+Imports and a compiled run:
 
 ```commonlisp
 (let* ((imports (wasmdown:make-imports))
@@ -119,6 +119,6 @@ Imports and a baseline run:
                                  '(:i32) '(:i32))
   (let ((instance (wasmdown:instantiate module
                                         :imports imports
-                                        :mode :baseline)))
+                                        :mode :compiled)))
     (wasmdown:invoke instance "compute" 21)))   ; => (42)
 ```

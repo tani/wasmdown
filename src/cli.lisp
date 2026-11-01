@@ -212,7 +212,7 @@ functions first)."
             (let ((sym (find-symbol "COMPILE-MODULE-FUNCTIONS" :wasmdown.codegen)))
               (unless (and sym (fboundp sym))
                 (format *error-output*
-                        "wasmdown: compile: baseline codegen backend not loaded (src/codegen.lisp)~%")
+                        "wasmdown: compile: compiled codegen backend not loaded (src/codegen.lisp)~%")
                 (return-from %cmd-compile 1))
               (let* ((inst (wasmdown:instantiate module))
                      (n (length (funcall (symbol-function sym)
@@ -288,15 +288,15 @@ unchanged, including dash-prefixed ones."
 
 (defun %api-mode ()
   "The documented WASMDOWN_API_MODE selection: absent or `interpret'
-selects the reference interpreter, `baseline' the wasmdown codegen
+selects the reference interpreter, `compiled' the wasmdown codegen
 backend, anything else is a host usage error. This mode is threaded
 into the CORE instantiation that actually executes guest code."
   (let ((value (sb-ext:posix-getenv "WASMDOWN_API_MODE")))
     (cond
       ((or (null value) (string= value "") (string= value "interpret"))
        :interpret)
-      ((string= value "baseline") :baseline)
-      (t (%usage-error "WASMDOWN_API_MODE must be `interpret' or `baseline', got ~s"
+      ((string= value "compiled") :compiled)
+      (t (%usage-error "WASMDOWN_API_MODE must be `interpret' or `compiled', got ~s"
                        value)))))
 
 (defun %run-collect (options flag)

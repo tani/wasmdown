@@ -71,13 +71,13 @@
 func-instances (absolute funcidx = imported funcs + defined index).
 Only BACKEND/COMPILED-ENTRY change: exports, table elements, element
 segments and other modules' imports keep the same reference objects
-(the M1 contract api.lisp's :baseline mode uses)."
+(the M1 contract api.lisp's :compiled mode uses)."
   (declare (ignorable mod))
   (let ((nimp (count :func (wasm-module-imports (module-instance-module inst))
                      :key #'wasm-import-kind)))
     (loop for j below (length compiled)
           for f = (svref (module-instance-funcs inst) (+ nimp j))
-          do (setf (func-instance-backend f) :baseline
+          do (setf (func-instance-backend f) :compiled
                    (func-instance-compiled-entry f) (svref compiled j)))
     inst))
 
@@ -639,7 +639,7 @@ functions, and require the same result (EQUALP)."
   ;; and the VALUE operand reassigns local 0 before the store emits:
   ;; the old emitter kept the local symbol, so the store went to
   ;; address 42 instead of the address the read produced (the defect
-  ;; that made baseline SQLite write its page-count byte to address 5).
+  ;; that made compiled SQLite write its page-count byte to address 5).
   (let* ((m (wasmdown.text:parse-wat
              "(module (memory 1)
                 (func (export \"f\") (param i32) (result i32)
@@ -683,7 +683,7 @@ functions, and require the same result (EQUALP)."
              (return_call $count (local.get 0))))")
 
 (wasmdown.test:test codegen/return-call-constant-stack
-  (dolist (mode '(:interpret :baseline))
+  (dolist (mode '(:interpret :compiled))
     (let ((inst (%instantiate-wat *tail-count-module* :mode mode)))
       (wasmdown.test:is (equal '(0) (wasmdown:invoke inst "count" 200000)))
       (wasmdown.test:is (zerop wasmdown.runtime:*guest-depth*)))))
@@ -702,7 +702,7 @@ functions, and require the same result (EQUALP)."
              (return_call_indirect (type $t) (local.get 0) (i32.const 0))))")
 
 (wasmdown.test:test codegen/return-call-indirect-constant-stack
-  (dolist (mode '(:interpret :baseline))
+  (dolist (mode '(:interpret :compiled))
     (let ((inst (%instantiate-wat *tail-indirect-module* :mode mode)))
       (wasmdown.test:is (equal '(0) (wasmdown:invoke inst "count" 200000)))
       (wasmdown.test:is (zerop wasmdown.runtime:*guest-depth*)))))
@@ -720,7 +720,7 @@ functions, and require the same result (EQUALP)."
              (return_call_ref (type $t) (local.get 0) (ref.func $count))))")
 
 (wasmdown.test:test codegen/return-call-ref-constant-stack
-  (dolist (mode '(:interpret :baseline))
+  (dolist (mode '(:interpret :compiled))
     (let ((inst (%instantiate-wat *tail-ref-module* :mode mode)))
       (wasmdown.test:is (equal '(0) (wasmdown:invoke inst "count" 200000)))
       (wasmdown.test:is (zerop wasmdown.runtime:*guest-depth*)))))
@@ -731,7 +731,7 @@ functions, and require the same result (EQUALP)."
            (func (export \"spin\") (call $spin (i32.const 0))))")
 
 (wasmdown.test:test codegen/non-tail-recursion-traps-in-both-backends
-  (dolist (mode '(:interpret :baseline))
+  (dolist (mode '(:interpret :compiled))
     (let ((inst (%instantiate-wat *non-tail-module* :mode mode)))
       (wasmdown.test:assert-trap :call-stack-exhausted
         (wasmdown:invoke inst "spin"))
@@ -745,7 +745,7 @@ functions, and require the same result (EQUALP)."
   (let* ((compiled (%instantiate-wat
                     "(module (func $f (result i32) (i32.const 11))
                               (func (export \"f\") (result i32) (call $f)))"
-                    :mode :baseline))
+                    :mode :compiled))
          (interped (%instantiate-wat
                     "(module (func $g (result i32) (i32.const 31))
                               (func (export \"g\") (result i32) (call $g)))"
@@ -757,10 +757,10 @@ functions, and require the same result (EQUALP)."
                           (import \"i\" \"g\" (func $g (result i32)))
                           (func (export \"sum\") (result i32)
                             (i32.add (call $f) (call $g))))"
-                 :mode :baseline
+                 :mode :compiled
                  :imports (list (cons '("a" "f") fv) (cons '("i" "g") gv)))))
     (wasmdown.test:is (equal '(42) (wasmdown:invoke mixed "sum")))
-    (wasmdown.test:is (eq :baseline (wasmdown.runtime:func-instance-backend fv)))
+    (wasmdown.test:is (eq :compiled (wasmdown.runtime:func-instance-backend fv)))
     (wasmdown.test:is (eq :interpret (wasmdown.runtime:func-instance-backend gv)))))
 
 (wasmdown.test:test codegen/uncaught-exception-boundary
@@ -781,7 +781,7 @@ functions, and require the same result (EQUALP)."
       (progn (wasmdown:invoke
               (%instantiate-wat "(module (tag $e)
                                         (func (export \"boom\") (throw $e)))"
-                                :mode :baseline)
+                                :mode :compiled)
               "boom")
              (wasmdown.test:is nil))
     (wasmdown:wasm-trap (c)
@@ -798,7 +798,7 @@ results (and equal trap kinds). Uses the public instantiate path."
                                    name args))
         (b-in (handler-case
                   (list :ok (apply #'wasmdown:invoke
-                                   (%instantiate-wat text :mode :baseline)
+                                   (%instantiate-wat text :mode :compiled)
                                    name args))
                 (wasmdown:wasm-trap (c) (list :trap (wasmdown:wasm-trap-kind c))))))
     (wasmdown.test:is (equal (list :ok i) b-in))
@@ -868,7 +868,7 @@ results (and equal trap kinds). Uses the public instantiate path."
 ;;; interpreter (WASMDOWN.SIMD:EXECUTE-OP and the WASMDOWN.RUNTIME GC
 ;;; helpers), so these fixtures are differential: every case runs the
 ;;; SAME module through wasmdown:instantiate in :interpret and
-;;; :baseline and requires equal results and equal trap kinds.
+;;; :compiled and requires equal results and equal trap kinds.
 
 (defun %parity-modes-equalp (text name &rest args)
   "Like %PARITY-MODES, but a trap is an OBSERVABLE of both backends
@@ -881,7 +881,7 @@ byte vectors, which EQUAL would distinguish by identity."
              (wasmdown:wasm-trap (c)
                (list :trap (wasmdown:wasm-trap-kind c))))))
     (let ((i (run :interpret))
-          (b (run :baseline)))
+          (b (run :compiled)))
       (wasmdown.test:is (equalp i b))
       b)))
 

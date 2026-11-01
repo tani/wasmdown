@@ -6135,8 +6135,8 @@ status: ok -> 0, err (or an absent/false result) -> 1."
 capabilities of CONTEXT. Instantiates with PROVIDERS (default: the
 whole COMMAND-PROVIDER set for CONTEXT), calls the exported
 `wasi:cli/run@<version>' `run' (async or sync) under execution MODE
-(:interpret or :baseline — the embedded cores compile through the
-wasmdown codegen backend when :baseline), and returns the process
+(:interpret or :compiled — the embedded cores compile through the
+wasmdown codegen backend when :compiled), and returns the process
 status. A `wasi:cli/exit' terminates the run with its status; the
 store is torn down in every case (no leaked guest threads). Traps
 propagate to the caller. Returns (VALUES STATUS STORE): the store is

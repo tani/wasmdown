@@ -160,7 +160,7 @@ Measured at that point: units 481 / 0. Core and component lanes were unchanged b
 ## Engine loops 18–24
 
 - **Loop 18** — tail calls (`return_call`, `return_call_indirect`, +45 rows and 893 unsupported at that point), exception handling (tags, `try_table`, `throw`, cross-call propagation, uncaught boundary at the outermost guest frame) and the named module definition/instance script forms.
-- **Loop 19** — typed function references in both backends, including `call_ref`, `return_call_ref`, `br_on_null`, `br_on_non_null` and `ref.as_non_null`; `br_on_null.wast` 10/10 and `br_on_non_null.wast` 12/12 under `--backend baseline`.
+- **Loop 19** — typed function references in both backends, including `call_ref`, `return_call_ref`, `br_on_null`, `br_on_non_null` and `ref.as_non_null`; `br_on_null.wast` 10/10 and `br_on_non_null.wast` 12/12 under `--backend compiled`.
 - **Loop 20** — `rec` type groups with canonicalization and iso-recursive equivalence: the wasm-comptype/rectype-group engine and the cross-module `func-type-match-p`. **Loop 21** — `struct`/`array` type declarations.
 - **Loop 22** — GC values end to end: `struct.new/get/set` with packed-field normalization, `array.new/get/set/len/fill/copy/init`, `i31` with 31-bit payload semantics, `ref.cast`/`ref.test`/`br_on_cast(_fail)` with the heap lattice, `ref.eq`, and `any`↔`extern` conversions — self-authored tests, since no vendored fixture exists.
 - **Loop 23** — multi-memory runtime and memory64 end to end: memidx immediates on every memory op, cross-memory copy with bounds on both backings, i64 addressing with addrtype-typed size/grow/fill/init rules, the `(memory i64 …)` text marker and limits flag `0x04`.
@@ -176,7 +176,7 @@ Measured at that point: units 481 / 0. Core and component lanes were unchanged b
 ## Compiled-backend divergence
 
 The compiled backend's core-suite status was measured separately, one process per
-file (`--backend baseline` through the WAST runner), and was never the green
+file (`--backend compiled` through the WAST runner), and was never the green
 interpret baseline: 86 of the 97 pinned files were fully green and 11 diverged.
 
 | Files | Symptom |
@@ -188,7 +188,7 @@ interpret baseline: 86 of the 97 pinned files were fully green and 11 diverged.
 All eleven were pre-existing compiled-backend gaps; the same files pass on the
 interpret lane. The backend did reach a component's embedded cores — the CLI
 threads `WASMDOWN_API_MODE` through `run-component :mode`, so
-`WASMDOWN_API_MODE=baseline make test-wasi` really compiled the guest cores —
+`WASMDOWN_API_MODE=compiled make test-wasi` really compiled the guest cores —
 but slowly: the 6 MB SQLite core needed a large compile-time heap and ~200 s per
 component case, which is why the runner defaults to an 8 GB heap and why the
 quick gate stayed the interpret lane. Disk writes under compiled code became
@@ -223,7 +223,7 @@ a 16-byte value instead of 4/2), plus 2 rows in the last file, `sync-streams`.
 ## Backend parity program (2026-11-01)
 
 Two explicitly selected guest backends — `:interpret` (the reference) and
-`:baseline` (every defined function compiled before the start section) — were
+`:compiled` (every defined function compiled before the start section) — were
 brought to observable agreement, and the mechanism record lives here because
 the ADRs are amended, not rewritten.
 
@@ -235,7 +235,7 @@ the ADRs are amended, not rewritten.
   its defining instance. ADR-004 carries the dated amendment note.
 - **Instantiation order.** `make-module-instance` gained a `:prepare` hook
   (allocation and segment states done, active segments unapplied, no guest
-  code run). `:baseline` compiles there, so a `codegen-error` precedes every
+  code run). `:compiled` compiles there, so a `codegen-error` precedes every
   guest-visible effect and the start section itself runs compiled.
 - **One call protocol.** `runtime:invoke-wasm` owns guest depth
   (`*guest-depth*` / `*guest-depth-limit*` 1000), the tail-transfer trampoline
@@ -267,9 +267,9 @@ the ADRs are amended, not rewritten.
 - **Measured outcome.** Pinned core suite: 21,260 / 21,260 commands agree in
   outcome and phase (0 divergences, 0 compile refusals), `make report-backend-parity`.
   Component lane: 1,631 / 1,631 under `:interpret` (gate) and again under
-  `:baseline` (report). WASI P1: the start section and `_start` both run through
+  `:compiled` (report). WASI P1: the start section and `_start` both run through
   the selected backend (`backend-entry-count` proves it). The FULL P1
-  acceptance lane passes under `:baseline` (14 checks across smoke,
+  acceptance lane passes under `:compiled` (14 checks across smoke,
   persistence, reopen, rollback, bail, no-preopen, read-only and escape;
   821 s of compile-heavy wall time), and two P2 cases are byte-identical
   across backends at ~200 s per compiled case.
@@ -282,7 +282,7 @@ the ADRs are amended, not rewritten.
   so the sync lift now hands the per-call task/thread to the post-return call
   (the same storage the body wrote). With the file green it left
   `tests/component/nyi.txt`, growing the component lane from 1,631 to 1,702
-  commands (gate, baseline report and census pin all moved together).
+  commands (gate, compiled report and census pin all moved together).
 - **The extension work also moved the interpreter lane.** Re-running the
   aggregated mirror (pin `63908677d005`) after the SIMD/GC/float-lane fixes
   reads 62,156 pass / 2,821 fail / 85 harness-error / 73 unsupported of 65,135
@@ -294,11 +294,25 @@ the ADRs are amended, not rewritten.
   two backends satisfy identical expectations rather than merely agreeing with
   each other.
 - **Cost picture** (`make report-backends-bench`, medians): on the synthetic
-  kernels `:baseline` runs 7–17x faster than `:interpret` (fib 9.4 ms vs 91 ms,
+  kernels `:compiled` runs 7–17x faster than `:interpret` (fib 9.4 ms vs 91 ms,
   memory fill 159 ms vs 671 ms), and eager compilation costs 0.4–1.5 ms and
   0.3–1.3 MiB per small module. A 6 MB guest (SQLite) needs ~8 GiB of SBCL
-  heap and ~200 s to compile, which is why the WASI lane's baseline runs are
+  heap and ~200 s to compile, which is why the WASI lane's compiled runs are
   report-mode evidence rather than a gate.
+
+## The compiled backend's name (2026-11-01)
+
+The conservative compile tier was called `:baseline`, following PLAN §6.3's
+vocabulary where it is the baseline an optimizing tier would be compared
+against. In the implementation that name collided with two other meanings —
+the *conformance baseline* lane kind (a measurement that is read rather than
+gated) and the reference interpreter as "the baseline" — so the backend is now
+`:compiled` (`WASMDOWN_API_MODE=compiled`, `func-instance-backend` =
+`:compiled`, lane artifacts `component-compiled*`). Nothing about the code
+path changed: still eager, whole-module, conservative SBCL `COMPILE` with
+`compiled-entry` on the defined func-instances and no interpreter fallback.
+PLAN §6.3 carries a matching note; the plan's `:baseline` row names the same
+slot.
 
 ## WASI 0.3.2 guest fixture (2026-11-01)
 

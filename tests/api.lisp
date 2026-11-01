@@ -255,11 +255,11 @@
        (fboundp (find-symbol "COMPILE-MODULE-FUNCTIONS" :wasmdown.codegen))))
 
 (when *codegen-present-p*
-  (wasmdown.test:test api/baseline-mode
-    (let ((inst (wasmdown:instantiate *add-mod* :mode :baseline)))
+  (wasmdown.test:test api/compiled-mode
+    (let ((inst (wasmdown:instantiate *add-mod* :mode :compiled)))
       (wasmdown.test:is (equal '(55) (wasmdown:invoke inst "add" 42 13))))
     (wasmdown.test:assert-trap :unreachable
-      (wasmdown:invoke (wasmdown:instantiate *trap-mod* :mode :baseline)
+      (wasmdown:invoke (wasmdown:instantiate *trap-mod* :mode :compiled)
                        "boom"))
     (let* ((mod (mmod
                  :types (vector (ft '(:i32) '(:i32)) (ft '() '(:i32)))
@@ -273,7 +273,7 @@
         (lambda (x) (* 2 x)) '(:i32) '(:i32))
       (wasmdown.test:is (equal '(10) (wasmdown:invoke
                                       (wasmdown:instantiate
-                                       mod :imports tab :mode :baseline)
+                                       mod :imports tab :mode :compiled)
                                       "run"))))
     (let* ((mod (mmod
                  :types (vector (ft '() '(:i32)))
@@ -297,13 +297,13 @@
                  :exports (vector (make-wasm-export "go" :func 1)))))
       (wasmdown.test:is (equal '(42) (wasmdown:invoke
                                       (wasmdown:instantiate
-                                       mod :mode :baseline)
+                                       mod :mode :compiled)
                                       "go"))))))
 
 (when (not *codegen-present-p*)
-  (wasmdown.test:test api/baseline-absent-honest-error
+  (wasmdown.test:test api/compiled-absent-honest-error
     (wasmdown.test:assert-raises wasmdown:host-error
-      (wasmdown:instantiate *add-mod* :mode :baseline))))
+      (wasmdown:instantiate *add-mod* :mode :compiled))))
 
 ;;; -----------------------------------------------------------------
 ;;; CLI (in-process via wasmdown.cli:main).
@@ -432,7 +432,7 @@
                         :before-start before-start))
 
 (when *codegen-present-p*
-  (wasmdown.test:test api/baseline-start-section-runs-compiled
+  (wasmdown.test:test api/compiled-start-section-runs-compiled
     ;; the start function sets a global; backend entry counters prove it
     ;; executed through the compiled entry, not the interpreter.
     (wasmdown.runtime:reset-backend-entry-counts)
@@ -442,15 +442,15 @@
                           (start $init)
                           (func (export \"get\") (result i32)
                             (global.get $g)))"
-                 :mode :baseline)))
+                 :mode :compiled)))
       (wasmdown.test:is (equal '(7) (wasmdown:invoke inst "get")))
       (wasmdown.test:is (= 0 (wasmdown.runtime:backend-entry-count :interpret)))
-      (wasmdown.test:is (>= (wasmdown.runtime:backend-entry-count :baseline) 2))
-      (wasmdown.test:is (eq :baseline
+      (wasmdown.test:is (>= (wasmdown.runtime:backend-entry-count :compiled) 2))
+      (wasmdown.test:is (eq :compiled
                             (wasmdown.runtime:func-instance-backend
                              (wasmdown:instance-export inst "get"))))))
 
-  (wasmdown.test:test api/baseline-compilation-precedes-start-and-segments
+  (wasmdown.test:test api/compiled-compilation-precedes-start-and-segments
     ;; every defined function is compiled BEFORE the start section
     ;; runs: the start function's memory write is the observable, and
     ;; the v128 function (formerly the canonical compiler refusal) is
@@ -463,18 +463,18 @@
            (module (wasmdown:validate-module (wasmdown.text:parse-wat text)))
            (mem (wasmdown.runtime:make-memory-instance
                  (wasmdown.types:make-wasm-limits 1)))
-           (inst (wasmdown:instantiate module :mode :baseline
+           (inst (wasmdown:instantiate module :mode :compiled
                                        :imports (list (cons '("env" "mem") mem)))))
       (wasmdown.test:is (= 1 (aref (wasmdown.runtime:memory-instance-bytes mem) 4)))
-      (wasmdown.test:is (eq :baseline
+      (wasmdown.test:is (eq :compiled
                             (wasmdown.runtime:func-instance-backend
                              (wasmdown:instance-export inst "f"))))
       (wasmdown.test:is (equalp '(#(1 0 0 0 2 0 0 0 3 0 0 0 4 0 0 0))
                                 (wasmdown:invoke inst "f")))))
 
-  (wasmdown.test:test api/baseline-lowers-formerly-refused-simd-and-gc
+  (wasmdown.test:test api/compiled-lowers-formerly-refused-simd-and-gc
     ;; the M4 coverage closure: v128.const and struct.new used to make
-    ;; :mode :baseline refuse the whole module at instantiation. Both
+    ;; :mode :compiled refuse the whole module at instantiation. Both
     ;; backends now agree on the values. (The codegen-error path itself
     ;; is pinned in tests/codegen.lisp; every opcode the decoder and
     ;; validator can produce is lowered, so no valid module reaches it.)
@@ -483,10 +483,10 @@
                            (struct.get $s 0 (struct.new $s (i32.const 7)))
                            (v128.const i32x4 1 2 3 4)))")
            (i (wasmdown:invoke (%wat-instance text :mode :interpret) "f"))
-           (b (wasmdown:invoke (%wat-instance text :mode :baseline) "f")))
+           (b (wasmdown:invoke (%wat-instance text :mode :compiled) "f")))
       (wasmdown.test:is (equalp i b))))
 
-  (wasmdown.test:test api/baseline-keeps-function-identity
+  (wasmdown.test:test api/compiled-keeps-function-identity
     ;; one func-instance object serves the export, the table element and
     ;; ref.func; compilation fills its entry instead of replacing it.
     (let* ((inst (%wat-instance
@@ -494,11 +494,11 @@
                            (elem (i32.const 0) $f)
                            (func $f (result i32) (i32.const 9))
                            (export \"f\" (func $f)))"
-                  :mode :baseline))
+                  :mode :compiled))
            (exported (wasmdown:instance-export inst "f"))
            (tab (svref (wasmdown.runtime:module-instance-tables inst) 0)))
       (wasmdown.test:is (eq exported (wasmdown.runtime:table-get tab 0)))
-      (wasmdown.test:is (eq :baseline
+      (wasmdown.test:is (eq :compiled
                             (wasmdown.runtime:func-instance-backend exported)))
       (wasmdown.test:is (functionp
                          (wasmdown.runtime:func-instance-compiled-entry exported)))))
@@ -506,9 +506,9 @@
   (wasmdown.test:test api/imported-wasm-function-keeps-its-backend
     (let* ((a (%wat-instance "(module (func (export \"f\") (result i32)
                                           (i32.const 5)))"
-                             :mode :baseline))
+                             :mode :compiled))
            (fv (wasmdown:instance-export a "f")))
-      (wasmdown.test:is (eq :baseline (wasmdown.runtime:func-instance-backend fv)))
+      (wasmdown.test:is (eq :compiled (wasmdown.runtime:func-instance-backend fv)))
       (wasmdown.runtime:reset-backend-entry-counts)
       (let ((b (%wat-instance
                 "(module (import \"a\" \"f\" (func $f (result i32)))
@@ -521,12 +521,12 @@
         (wasmdown.test:is (eq :interpret
                               (wasmdown.runtime:func-instance-backend
                                (wasmdown:instance-export b "g"))))
-        (wasmdown.test:is (eq :baseline
+        (wasmdown.test:is (eq :compiled
                               (wasmdown.runtime:func-instance-backend fv)))
-        (wasmdown.test:is (>= (wasmdown.runtime:backend-entry-count :baseline) 1)))))
+        (wasmdown.test:is (>= (wasmdown.runtime:backend-entry-count :compiled) 1)))))
 
   (wasmdown.test:test api/before-start-runs-once-before-start
-    (dolist (mode '(:interpret :baseline))
+    (dolist (mode '(:interpret :compiled))
       (let ((calls 0))
         (let ((inst (%wat-instance
                      "(module (global $g (mut i32) (i32.const 0))

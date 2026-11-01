@@ -1,7 +1,7 @@
 # WASMDOWN
 
 A WebAssembly runtime written in Common Lisp. Binary and text front ends,
-validation, a reference interpreter, a baseline SBCL code generator, the
+validation, a reference interpreter, an SBCL-compiling backend, the
 Component Model (canonical ABI, resources, async), and WASI hosts — with
 **no third-party Lisp dependencies**.
 
@@ -18,7 +18,7 @@ Component Model (canonical ABI, resources, async), and WASI hosts — with
 | Text format (`.wat`) and `.wast` scripts | Full: parser, stateful script runner, failure-phase classification |
 | Validation | Full for the declared engine scope, including unreachable polymorphism |
 | Interpreter (default backend) | Full: exact i32/i64/f32/f64 semantics, v128, GC, EH, tail calls, multi-memory, memory64 |
-| Codegen backend (`baseline`) | Full for opcode coverage: SBCL `COMPILE` of emitted Lisp, including SIMD, GC, EH and `return_call*`; every pinned core command and component command agrees with the interpreter |
+| Compiled backend | Full for opcode coverage: SBCL `COMPILE` of emitted Lisp, including SIMD, GC, EH and `return_call*`; every pinned core command and component command agrees with the interpreter |
 | Component Model | Full lane green: binary + text, validation, instantiation/linking, canonical ABI, resources, async scheduling |
 | WASI Preview 1 | Full `wasi_snapshot_preview1` surface (46 imports) |
 | WASI 0.3.2 providers | `clocks`, `random`, `cli`, `filesystem`, `sockets` under an explicit capability model |
@@ -49,7 +49,7 @@ graph TD
   FI --> WC["wasm-call"]
   WC --> PROTOCOL["invoke-wasm<br/>guest depth · tail transfer<br/>outermost exception boundary"]
   PROTOCOL --> BODY_I["interpreter body"]
-  PROTOCOL --> BODY_C["compiled closure<br/>baseline backend"]
+  PROTOCOL --> BODY_C["compiled closure<br/>compiled backend"]
 
   subgraph COMPONENT["Component path"]
     CBIN["component bytes / text"] --> CDEC["decode / parse component"]
@@ -126,7 +126,7 @@ Every lane is measured, not asserted. Latest numbers (2026-11-01):
 | `make test-unit` | gate | 667 pass / 0 fail | — |
 | `make test-spec-core` | baseline | 21 187 pass / 0 fail / 73 unsupported of 21 260 | [`core.md`](docs/conformance/core.md) |
 | `make test-component` | gate | 1 702 pass / 0 fail / 0 unsupported | [`component.md`](docs/conformance/component.md) |
-| `make report-component-baseline` | report | 1 702 pass / 0 fail under `:baseline` | `tests/component-baseline/component.md` |
+| `make report-component-compiled` | report | 1 702 pass / 0 fail under `:compiled` | `tests/component-compiled/component.md` |
 | `make test-backend-parity` | gate | 21 260 / 21 260 core commands agree across both backends | [`backends.md`](docs/conformance/backends.md) |
 | `make test-wasi` | gate | 450/450 cases over 30 fresh-process runs | [`wasi.md`](docs/conformance/wasi.md) |
 | `make test-upstream` | discovery | aggregated proposal corpus, never a gate | [`upstream.md`](docs/conformance/upstream.md) |

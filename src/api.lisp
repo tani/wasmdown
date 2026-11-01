@@ -18,11 +18,11 @@
 ;;;; - run-string takes a HEX-ENCODED module binary; the text format is a
 ;;;;   separate front end (wasmdown.text:parse-wat), not a run-string
 ;;;;   input form.
-;;;; - :mode :baseline requires wasmdown.codegen:compile-module-functions
+;;;; - :mode :compiled requires wasmdown.codegen:compile-module-functions
 ;;;;   to be loaded (src/codegen.lisp); the check is a runtime
 ;;;;   capability probe, never a stub. The start function and active
 ;;;;   segment initialization always run through the reference
-;;;;   interpreter (make-module-instance); baseline compilation is
+;;;;   interpreter (make-module-instance); compiled backend compilation is
 ;;;;   installed afterwards for every later call.
 
 (in-package #:wasmdown)
@@ -161,17 +161,17 @@ form instead."
                                   "instantiate: :imports must be an import table or an alist, got ~s"
                                   (type-of imports))))))
 
-(defun %baseline-compile (module instance)
+(defun %compiled-compile (module instance)
   "Compile MODULE's defined functions against INSTANCE using the
-baseline backend, or signal host-error when it is not loaded. Runtime
+compiled backend, or signal host-error when it is not loaded. Runtime
 capability probe — no stub."
   (let ((sym (find-symbol "COMPILE-MODULE-FUNCTIONS" :wasmdown.codegen)))
     (if (and sym (fboundp sym))
         (funcall (symbol-function sym) module instance)
         (error 'host-error
-               :message "baseline codegen backend not loaded (src/codegen.lisp)"))))
+               :message "compiled codegen backend not loaded (src/codegen.lisp)"))))
 
-(defun %install-baseline! (module inst)
+(defun %install-compiled! (module inst)
   "Install compiled entries into MODULE's DEFINED func-instances.
 
 Absolute funcidx = imported-func count + defined index, matching the
@@ -186,22 +186,22 @@ own backend.
 Called from the instantiation PREPARE hook, before active segments and
 before the start section; a codegen-error unwinds instantiation, so no
 guest code and no segment mutation happened."
-  (let* ((compiled (%baseline-compile module inst))
+  (let* ((compiled (%compiled-compile module inst))
          (nimp (loop for im across (wasmdown.types:wasm-module-imports module)
                      count (eq (wasmdown.types:wasm-import-kind im) :func)))
          (funcs (wasmdown.runtime:module-instance-funcs inst)))
     (unless (= (length compiled)
                (- (length funcs) nimp))
       (error 'host-error
-             :message "baseline: compiled entry count does not match defined functions"))
+             :message "compiled: entry count does not match defined functions"))
     (loop for i below (length compiled)
           for fi = (wasmdown.runtime:func-instance-kind (svref funcs (+ nimp i)))
           ;; a defined slot always holds a :wasm instance of THIS module
           do (unless (eq fi :wasm)
                (error 'host-error
-                      :message "baseline: defined function slot is not a :wasm func-instance"))
+                      :message "compiled: defined function slot is not a :wasm func-instance"))
              (let ((f (svref funcs (+ nimp i))))
-               (setf (wasmdown.runtime:func-instance-backend f) :baseline
+               (setf (wasmdown.runtime:func-instance-backend f) :compiled
                      (wasmdown.runtime:func-instance-compiled-entry f)
                      (svref compiled i))))
     inst))
@@ -218,7 +218,7 @@ propagates).
 MODE is explicit and applies to the functions THIS module defines:
 
   :INTERPRET (default) - the reference interpreter executes them.
-  :BASELINE           - every defined function is compiled before the
+  :COMPILED           - every defined function is compiled before the
                         start section runs; a function the compiler
                         cannot lower signals codegen-error, so guest
                         code never runs and there is no interpreter
@@ -235,14 +235,14 @@ after active segments/exports exist and before the Wasm start section
 memory and with both modes."
   (wasmdown.validate:validate-module module)
   (flet ((prepare (inst)
-           (when (eq mode :baseline) (%install-baseline! module inst))))
+           (when (eq mode :compiled) (%install-compiled! module inst))))
     (let ((inst (wasmdown.runtime:make-module-instance
                  module (%imports-alist imports)
                  :before-start before-start
-                 :prepare (and (eq mode :baseline) #'prepare))))
+                 :prepare (and (eq mode :compiled) #'prepare))))
       (ecase mode
         (:interpret inst)
-        (:baseline inst)))))
+        (:compiled inst)))))
 
 ;;; ---------------------------------------------------------------
 ;;; Invocation and inspection.

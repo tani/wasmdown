@@ -2380,9 +2380,9 @@ it); the core path is unchanged."
 
 (defvar *instantiate-mode* :interpret
   "Execution mode for the modules the script runner instantiates:
-  :INTERPRET (the reference interpreter) or :BASELINE (compile each
-  module with wasmdown.codegen and install it). A baseline conformance
-  pass binds this to :baseline; the default keeps every existing lane
+  :INTERPRET (the reference interpreter) or :COMPILED (compile each
+  module with wasmdown.codegen and install it). A compiled conformance
+  pass binds this to :compiled; the default keeps every existing lane
   on the interpreter.")
 
 (defvar *script-source* ""

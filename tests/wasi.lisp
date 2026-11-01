@@ -5048,7 +5048,7 @@ world w {
 ;;; zero entry count here.
 
 (test wasi/command-component-runs-the-selected-backend
-  (dolist (mode '(:interpret :baseline))
+  (dolist (mode '(:interpret :compiled))
     (let* ((sink (make-string-output-stream))
            (ctx (wasmdown.wasi:make-wasi-context :stdout sink)))
       (wasmdown.runtime:reset-backend-entry-counts)
@@ -5057,13 +5057,13 @@ world w {
                    (command-component-binary))
                   ctx :mode mode)))
       (is (string= "hi" (get-output-stream-string sink)))
-      (if (eq mode :baseline)
+      (if (eq mode :compiled)
           (progn
-            (is (plusp (wasmdown.runtime:backend-entry-count :baseline)))
+            (is (plusp (wasmdown.runtime:backend-entry-count :compiled)))
             (is (zerop (wasmdown.runtime:backend-entry-count :interpret))))
           (progn
             (is (plusp (wasmdown.runtime:backend-entry-count :interpret)))
-            (is (zerop (wasmdown.runtime:backend-entry-count :baseline))))))))
+            (is (zerop (wasmdown.runtime:backend-entry-count :compiled))))))))
 
 (test wasi/pinned-p3-guest-runs-both-backends
   ;; the tracked builder writes this file; when it is present (a fixture
@@ -5078,7 +5078,7 @@ world w {
                      (let ((v (make-array (file-length s)
                                           :element-type '(unsigned-byte 8))))
                        (read-sequence v s) v))))
-        (dolist (mode '(:interpret :baseline))
+        (dolist (mode '(:interpret :compiled))
           (is (eql 0 (wasmdown.wasi:run-component
                       (wasmdown.component:decode-component bytes)
                       (wasmdown.wasi:make-wasi-context) :mode mode))))))))

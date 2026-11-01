@@ -28,7 +28,7 @@ exit codes: 0 ok, 1 guest/compile error, 2 usage error
 | --- | --- | --- |
 | `validate` | exactly one file | Decodes, then statically validates. `--profile` is accepted and ignored (one profile only). |
 | `inspect` | exactly one file | Validates, then prints counts, import/export signatures, memory and table limits, start index, and the `module-features` keyword list. |
-| `compile` | one file and `--emit-lisp <out.lisp>` | Validates, instantiates, and runs the baseline code generator, writing Lisp source. A module with no defined functions is refused. |
+| `compile` | one file and `--emit-lisp <out.lisp>` | Validates, instantiates, and runs the code generator, writing Lisp source. A module with no defined functions is refused. |
 | `run` | one file | Executes a core module or a component; grammar below. |
 | `help` | nothing | Usage on stdout, exit 0. No arguments at all also prints usage, but exits 2. |
 
@@ -75,7 +75,7 @@ component:
 | Value | Backend |
 | --- | --- |
 | unset or `interpret` | Reference interpreter (default) |
-| `baseline` | SBCL code generation of the module's functions |
+| `compiled` | SBCL compilation of the module's functions |
 | anything else | Usage error (exit 2) |
 
 See [`lisp-api.md`](lisp-api.md) for its caveats.
@@ -85,10 +85,10 @@ See [`lisp-api.md`](lisp-api.md) for its caveats.
 `sbcl --script tools/wasmdown.lisp` starts with SBCL's default dynamic
 space, which is not enough to compile a multi-megabyte guest (the pinned
 SQLite fixture needs roughly 8 GiB at compile time). Run a `--wasi`
-component under `:baseline` with an explicit heap:
+component under `:compiled` with an explicit heap:
 
 ```sh
-WASMDOWN_API_MODE=baseline sbcl --dynamic-space-size 8192 \
+WASMDOWN_API_MODE=compiled sbcl --dynamic-space-size 8192 \
   --script tools/wasmdown.lisp run app.wasm --wasi -- /work/db
 ```
 

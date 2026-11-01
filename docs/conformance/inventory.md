@@ -6,7 +6,7 @@ Pinned: WASI Preview1 at `fae981bae14809d91f9bc2d63852d461f331d161`; WASI 0.2 re
 
 ## Method
 
-Two sources only, and neither is prose. **Pinned:** the generated Preview1 census (`specs/wasi/preview1/INVENTORY.md`, from the pinned WITX) and the vendored WIT trees (`specs/wasi/wasi-wit-<release>/`, parsed by `wasmdown.wit`). **Runtime:** `tools/backend-inventory.lisp` loads the system in SBCL and prints the registration tables that actually bind — `*p1-signatures*` / `*p1-implementations*`, `p2-builder-table` per release, `%wasi-provider-builders` — plus the interfaces the parser reads and the worlds' exports. A vendored file is never evidence of implementation, and a name is `bound` only when it appears in the runtime registry for that exact release. Opcode coverage is not scraped from source: it is read from the backend-parity lane's result records. Generated 2026-11-01T10:31:02Z from commit `4ceb27c0dd1daf95ccd5d32b5ffa1cd01914a0bb`, SBCL 2.6.4.
+Two sources only, and neither is prose. **Pinned:** the generated Preview1 census (`specs/wasi/preview1/INVENTORY.md`, from the pinned WITX) and the vendored WIT trees (`specs/wasi/wasi-wit-<release>/`, parsed by `wasmdown.wit`). **Runtime:** `tools/backend-inventory.lisp` loads the system in SBCL and prints the registration tables that actually bind — `*p1-signatures*` / `*p1-implementations*`, `p2-builder-table` per release, `%wasi-provider-builders` — plus the interfaces the parser reads and the worlds' exports. A vendored file is never evidence of implementation, and a name is `bound` only when it appears in the runtime registry for that exact release. Opcode coverage is not scraped from source: it is read from the backend-parity lane's result records. Generated 2026-11-01T10:45:26Z from commit `5e6ea43ba2ce3d342d0d552585683281040d5ac5`, SBCL 2.6.4.
 
 ## P1 — WASI Preview1 (46 pinned exports)
 
@@ -671,9 +671,9 @@ None.
 
 ## Baseline opcode coverage
 
-Evidence comes from the backend-parity lane (`tests/backend-parity-results.jsonl`, `wasmdown.backend-parity.v1`, written by `make report-backend-parity`), not from source text. A baseline `fail` at phase `compile` is a refusal to lower an instruction; the counts below are whatever that file's last run recorded.
+Evidence comes from the backend-parity lane (`tests/backend-parity-results.jsonl`, `wasmdown.backend-parity.v1`, written by `make report-backend-parity`), not from source text. A compiled `fail` at phase `compile` is a refusal to lower an instruction; the counts below are whatever that file's last run recorded.
 
-Pairs recorded: 21260; baseline compile refusals: 0; distinct refused opcodes: 0.
+Pairs recorded: 21260; compiled compile refusals: 0; distinct refused opcodes: 0.
 
 No refused opcodes recorded.
 

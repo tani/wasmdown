@@ -17,8 +17,8 @@ Usage:
     python3 tools/run-wasi-suite.py --abi all --repeat 3 \
         --output-dir tests/wasi-results/final
 
-Backend selection mirrors the runtime: `--backend baseline` sets
-WASMDOWN_API_MODE=baseline for the guest processes (interpret is the
+Backend selection mirrors the runtime: `--backend compiled` sets
+WASMDOWN_API_MODE=compiled for the guest processes (interpret is the
 default when the variable is absent).
 
 The manifest lives in this file (CASES) because it is small, explicit
@@ -309,7 +309,7 @@ def check(expect, out, err, rc, workdir):
             problems.append(f"{name} must not exist")
     if problems:
         # stderr is diagnostics only; include a bounded sample on failure
-        # (and name the baseline codegen's heap exhaustion explicitly —
+        # (and name the compiled backend's heap exhaustion explicitly —
         # it is the one failure whose message otherwise hides in a
         # 60-line SBCL crash report)
         sample = err.strip().splitlines()[:3]
@@ -347,8 +347,8 @@ def run_case(case, backend, groupdir, heap_mb):
                           if a == "HOSTPATH" else a)
     argv += ["--"] + guest_argv
     env = dict(os.environ)
-    if backend == "baseline":
-        env["WASMDOWN_API_MODE"] = "baseline"
+    if backend == "compiled":
+        env["WASMDOWN_API_MODE"] = "compiled"
     else:
         env.pop("WASMDOWN_API_MODE", None)
     env.setdefault("HOME", str(workdir))
@@ -377,14 +377,14 @@ def run_case(case, backend, groupdir, heap_mb):
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--abi", choices=sorted(ABI_FILTERS), default="all")
-    ap.add_argument("--backend", choices=["interpret", "baseline"],
+    ap.add_argument("--backend", choices=["interpret", "compiled"],
                     default="interpret")
     ap.add_argument("--repeat", type=int, default=1)
     ap.add_argument("--output-dir", default=str(ROOT / "tests" /
                                                 "wasi-results" / "latest"))
     ap.add_argument("--heap-mb", type=int, default=8192,
                     help="SBCL dynamic space for each guest process; the "
-                         "baseline backend compiles a 6 MB SQLite core and "
+                         "compiled backend compiles a 6 MB SQLite core and "
                          "needs far more than the 1 GB default")
     ap.add_argument("--commit-summary", action="store_true",
                     help="also write docs/conformance/wasi.md. "

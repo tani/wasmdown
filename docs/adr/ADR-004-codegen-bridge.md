@@ -43,4 +43,4 @@ this note records the mechanism it now takes.
    (docs/design/PLAN.md §12.3 invariant).
 +: No global-mode switching; an embedder can hold both.
 −: Compiled→guest-wasm calls pay one extra `funcall` vs a hypothetical
-   direct-compiled edge; acceptable at baseline tier, revisit at M6.
+   direct-compiled edge; acceptable at the compiled tier, revisit with an optimizing tier.

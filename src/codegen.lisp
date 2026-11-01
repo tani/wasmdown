@@ -1,4 +1,4 @@
-;;;; SBCL baseline compiler backend (docs/design/PLAN.md 6): validated IR to
+;;;; SBCL compiled backend (docs/design/PLAN.md 6): validated IR to
 ;;;; whitelisted Common Lisp forms, one Lisp function per Wasm
 ;;;; function, compiled by SBCL COMPILE. Package WASMDOWN.CODEGEN.
 ;;;;
@@ -21,7 +21,7 @@
 ;;;; generated code resolves memories/tables/globals/segments/funcs
 ;;;; through that instance at RUN time (via its inst parameter), so
 ;;;; post-compilation substitution of func-instances (api.lisp's
-;;;; baseline mode) is picked up by every direct call, ref.func and
+;;;; compiled mode) is picked up by every direct call, ref.func and
 ;;;; export automatically.
 ;;;;
 ;;;; Honesty: input must be VALIDATED (%VALIDATE; a validation error
@@ -471,7 +471,7 @@ its :end)."
            ;; NB: no placeholder emit here. A `(setf out (f32-bits 0))'
            ;; used to sit above as a type hint, but it is a real CALL
            ;; at runtime: every float LOAD (f64.load included) then
-           ;; signalled "0 is not a SINGLE-FLOAT" in baseline mode.
+           ;; signalled "0 is not a SINGLE-FLOAT" in compiled mode.
            (case float-type
              (:f32 (%emit cctx `(setf ,out
                                       (wasmdown.numops:f32-from-bits ,raw))))
@@ -1087,7 +1087,7 @@ the memory access and the full-span bounds check."
     :ref.test :ref.cast :br-on-cast :br-on-cast-fail
     :ref.eq :any.convert-extern :extern.convert-any
     :ref.i31 :i31.get-s :i31.get-u)
-  "GC / typed-reference opcodes with a baseline lowering.")
+  "GC / typed-reference opcodes with a compiled lowering.")
 
 (defun %comptype (cctx typeidx)
   (wasm-rec-type-comptype
@@ -1502,7 +1502,7 @@ WASMDOWN.RUNTIME value-level helper the interpreter uses."
                 :offset (wasm-instr-offset instr)
                 :function-index *current-function-index*
                 :message (format nil
-                                 "no lowering for opcode ~a (baseline does not fall back to the interpreter)"
+                                 "no lowering for opcode ~a (the compiled backend does not fall back to the interpreter)"
                                  op))))))
 
 ;;; ---------------------------------------------------------------

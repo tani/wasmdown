@@ -18,9 +18,9 @@ Cases
   escape           a path escaping the preopen root is refused
 
 Usage: tools/wasi-preview1-acceptance.py [--verbose]
-       [--backend interpret|baseline] [--heap-mb N]
+       [--backend interpret|compiled] [--heap-mb N]
 
---backend baseline runs the same cases with WASMDOWN_API_MODE=baseline:
+--backend compiled runs the same cases with WASMDOWN_API_MODE=compiled:
 every guest core is compiled before its start section, which needs a much
 larger SBCL heap (~8 GiB for the 6 MB SQLite fixture) and roughly 200 s
 of compile time per fresh process. The lane stays exact about stdout,
@@ -47,9 +47,9 @@ def _arg(flag, default):
 
 
 BACKEND = _arg("--backend", os.environ.get("WASMDOWN_BACKEND", "interpret"))
-HEAP_MB = int(_arg("--heap-mb", "8192" if BACKEND == "baseline" else "0"))
-CASE_TIMEOUT = 900 if BACKEND == "baseline" else 240
-if BACKEND not in ("interpret", "baseline"):
+HEAP_MB = int(_arg("--heap-mb", "8192" if BACKEND == "compiled" else "0"))
+CASE_TIMEOUT = 900 if BACKEND == "compiled" else 240
+if BACKEND not in ("interpret", "compiled"):
     print(f"unknown --backend {BACKEND!r}")
     sys.exit(2)
 
@@ -61,8 +61,8 @@ def run_cli(args, stdin_text, env=None, timeout=None):
     command = (["sbcl"] + heap
                + ["--script", LAUNCHER, "run", FIXTURE, "--wasi"] + args)
     environment = dict(os.environ)
-    if BACKEND == "baseline":
-        environment["WASMDOWN_API_MODE"] = "baseline"
+    if BACKEND == "compiled":
+        environment["WASMDOWN_API_MODE"] = "compiled"
     if env:
         environment.update(env)
     timeout = CASE_TIMEOUT if timeout is None else timeout

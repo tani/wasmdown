@@ -657,7 +657,7 @@ contents then showed up in the readdir listing."
   ;; fd_write, memory.grow, then fd_write again from the NEW page: the
   ;; second call must see the grown memory (a cached byte vector would
   ;; answer FAULT for a span the guest legitimately owns).
-  (dolist (mode '(:interpret :baseline))
+  (dolist (mode '(:interpret :compiled))
     (let* ((out (make-string-output-stream))
            (ctx (p1-context :arguments '("x") :stdout out)))
       (multiple-value-bind (instance state)
@@ -728,7 +728,7 @@ BACKEND-ENTRY-COUNTS), with the counters reset before the run."
   (multiple-value-bind (i-out i-errnos i-counts)
       (p1-parity-probe :interpret)
     (multiple-value-bind (b-out b-errnos b-counts)
-        (p1-parity-probe :baseline)
+        (p1-parity-probe :compiled)
       ;; identical guest-visible results from the same host providers
       (is (string= (format nil "start~%main~%") i-out))
       (is (string= i-out b-out))
@@ -738,10 +738,10 @@ BACKEND-ENTRY-COUNTS), with the counters reset before the run."
       ;; never enters a compiled entry, and the compiled lane runs the
       ;; START SECTION and `_start' as compiled code with zero
       ;; interpreted entries (no silent fallback).
-      (is= 0 (cdr (assoc :baseline i-counts)))
+      (is= 0 (cdr (assoc :compiled i-counts)))
       (is (plusp (cdr (assoc :interpret i-counts))))
       (is= 0 (cdr (assoc :interpret b-counts)))
-      (is (>= (cdr (assoc :baseline b-counts)) 2)))))
+      (is (>= (cdr (assoc :compiled b-counts)) 2)))))
 
 ;;; ---------------------------------------------------------------
 ;;; host-resource accounting: handles are released on success, trap,
@@ -873,7 +873,7 @@ BACKEND-ENTRY-COUNTS), with the counters reset before the run."
                             :arguments '("x")
                             :stdout (make-string-output-stream))))
       (unwind-protect
-           (dolist (mode '(:interpret :baseline))
+           (dolist (mode '(:interpret :compiled))
              (flet ((run (wat)
                       (wasmdown.wasi:run-preview1
                        (funcall (find-symbol "PARSE-WAT" '#:wasmdown.text) wat)

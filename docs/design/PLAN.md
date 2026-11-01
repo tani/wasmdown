@@ -226,6 +226,15 @@ Lower intra-function CFG to `LET`/`TAGBODY`/`GO` and typed temporaries. Implemen
 | `:optimized` | SSA optimization, specializations, bounds-check hoisting and optional SIMD intrinsics. | Same observables and error categories as baseline. |
 | `:aot` | Validated IR to `.lisp`/`.fasl`, cacheable locally. | ABI/version/CPU/OS/cache key matches exactly. |
 
+**Implementation note (2026-11-01).** This repository implements the
+conservative tier of the table above under the name `:compiled`
+(`wasmdown:instantiate module :mode :compiled`, `WASMDOWN_API_MODE=compiled`).
+It compiles every defined function with SBCL `COMPILE` before the start
+section, with no optimizer, tiering or interpreter fallback. The `:baseline`
+label in the table names the same slot in the plan's vocabulary; `:optimized`
+and `:aot` remain unimplemented. Renaming it in the implementation avoids
+confusing the tier with the *conformance-baseline* kind of lane.
+
 ### 6.4 FASL cache
 
 Key = SHA-256 of input bytes, spec profile, compiler/runtime versions, optimizer configuration, target CPU features, SBCL version and architecture, and relevant host ABI. Treat cached native artifacts as trusted executables: load only from a private user-owned directory with integrity verification. Atomic writes; deterministic cache eviction; no acceptance of arbitrary external FASLs.
