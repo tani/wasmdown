@@ -5303,10 +5303,17 @@ instance is torn down."
                       :initial-element 0)
    :pages 1 :max-pages 1 :has-max-p t :i64-p nil))
 
-(defun %pin-async-end ()
-  "A fresh READABLE stream end in its IDLE state (§1598-1621)."
+(defun %pin-async-end (&optional (elem :u8))
+  "A fresh READABLE stream end in its IDLE state (§1598-1621). The
+element ct is RECORDED the way {stream,future}.new records it: the
+lift's `end.t == t' guard (lift_async_value §2444) compares it with
+the valtype's element, so a hand-built end without one is a type
+mismatch, not a stream<u8>."
   (wasmdown.component.runtime::make-async-end
    :event-code wasmdown.component.runtime::+event-stream-read+
+   :t-ct (if elem
+             (wasmdown.component.runtime::make-ct* :prim elem)
+             nil)
    :state :idle))
 
 (test component/generic-path-five-cases-pin
@@ -5356,22 +5363,38 @@ instance is torn down."
         (is (null (aref (funcall h* caller) (1- idx))))
         (is (null (wasmdown.component.runtime::async-end-owner end)))))
     ;; CASE 2 — the SAME stream INDIRECTLY (a spilled tuple in the
-    ;; caller's memory): %ABI-LOAD's catch-all reads the i32 and the
-    ;; end STAYS in the caller's table. This is the frozen-%abi-load
-    ;; measured negative: the deletion of the flat arm does not change
-    ;; this path, and its handle arms must not come back.
+    ;; caller's memory). This pin was MIGRATED to the ABI contract:
+    ;; load (§2133-2169) reads the i32 and DELEGATES to lift_stream
+    ;; (§2161) -> lift_async_value (§2438), so the value is the END
+    ;; RECORD, the readable end is REMOVED from the loading
+    ;; instance's table (its owner/index cleared) and the slot is
+    ;; freed. The previous expectation — the raw index with the end
+    ;; left in the table — was the frozen catch-all's measured
+    ;; negative, i.e. exactly the ownership leak this pin now
+    ;; forbids: a memory-loaded payload never crossed a boundary.
     (let* ((guest (wasmdown.component.runtime:make-comp-instance))
            (mem (%pin-memory))
            (cx (funcall cx-of guest mem))
            (end (%pin-async-end))
            (idx (wasmdown.component.runtime::%handle-add-any guest end))
            (bytes (wasmdown.runtime:memory-instance-bytes mem)))
+      (setf (wasmdown.component.runtime::async-end-owner end) guest
+            (wasmdown.component.runtime::async-end-index end) idx)
       (loop for k below 4
             do (setf (aref bytes k)
                      (ldb (byte 8 (* 8 k)) idx)))
-      (is (eql idx
-               (wasmdown.component.runtime::%abi-load cx sct 0)))
-      (is (eq end (aref (funcall h* guest) (1- idx)))))
+      (is (eq end (wasmdown.component.runtime::%abi-load cx sct 0)))
+      ;; the SOURCE SLOT IS CONSUMED: not resident, freed for reuse,
+      ;; and the end is host-owned (owner + index cleared, §2446)
+      (is (null (aref (funcall h* guest) (1- idx))))
+      (is (eql idx (wasmdown.component.runtime::%handle-add-any
+                    guest :reused)))
+      (is (null (wasmdown.component.runtime::async-end-owner end)))
+      (is (null (wasmdown.component.runtime::async-end-index end)))
+      ;; a second load of the SAME index is a STALE index — the slot
+      ;; now holds :reused, which is not an end
+      (assert-trap :generic
+        (wasmdown.component.runtime::%abi-load cx sct 0)))
     ;; CASE 3a — a RECORD carrying a stream, an own and a borrow in a
     ;; FLAT position: the recursion transfers the STREAM field and
     ;; leaves the own/borrow i32 slots as raw indexes (the wrapper's
@@ -5507,6 +5530,224 @@ instance is torn down."
                       (wasmdown.component.runtime::%handle-resource-at
                        caller src rt)))))
           (remhash (cons callee 0) store))))))
+
+(test component/indirect-async-payload-ownership-pin
+  ;; CanonicalABI.md load (§2133-2169) + lift_async_value (§2438):
+  ;; a stream/future payload read out of MEMORY is LIFTED — the
+  ;; readable end leaves the loading instance's handles table, its
+  ;; owner/index clear, and the value is the END record. Three things
+  ;; the frozen catch-all could not give are pinned here: (a) no raw
+  ;; index escapes a memory-loaded payload through a REAL host lower
+  ;; (sync, with the tuple FORCED into memory past MAX_FLAT_PARAMS),
+  ;; (b) the async RESULT lowering resolves a NESTED (:idx . n) in the
+  ;; CALLEE's type space (the result context's :type-inst), and (c)
+  ;; lift_async_value's guard set (stale / wrong class / wrong
+  ;; element type / writable / non-idle / in a waitable set).
+  (let ((u64 (wasmdown.component.runtime::make-ct* :prim :u64))
+        (u8 (wasmdown.component.runtime::make-ct* :prim :u8))
+        (u32 (wasmdown.component.runtime::make-ct* :prim :u32))
+        (stream-read wasmdown.component.runtime::+event-stream-read+)
+        (stream-write wasmdown.component.runtime::+event-stream-write+))
+    ;; LABELS: RESIDENT-P calls H*, and flet bindings cannot see each
+    ;; other (the flet shape compiled H* as an undefined function)
+    (labels ((h* (inst) (wasmdown.component.runtime::%inst-handles inst))
+             (mem32 (mem ptr)
+               (loop for k below 4
+                     sum (ash (aref (wasmdown.runtime:memory-instance-bytes
+                                     mem)
+                                    (+ ptr k))
+                              (* 8 k))))
+             (new-end (&key (event stream-read) (state :idle) (t-ct u8))
+               (wasmdown.component.runtime::make-async-end
+                :event-code event :state state :t-ct t-ct))
+             (resident-p (end inst)
+               (notany (lambda (x) (eq x end))
+                       (coerce (h* inst) 'list))))
+      ;; ---- (a) SYNC HOST LOWER, FORCED INDIRECT ----
+      ;; 16 u64 params + option<stream<u8>> flatten to 18 slots, past
+      ;; MAX_FLAT_PARAMS: the real canon-lower wrapper takes one [ptr]
+      ;; and reads the whole tuple out of the caller's memory.
+      (let* ((caller (wasmdown.component.runtime:make-comp-instance))
+             (callee (wasmdown.component.runtime:make-comp-instance))
+             (mem (%pin-memory))
+             (sct (wasmdown.component.runtime::make-ct* :stream :u8))
+             (sidx (wasmdown.component.runtime::%push-type callee sct))
+             ;; the nested payload is a RAW ref: resolving it needs the
+             ;; CALLEE's type space (the result/argument type lives
+             ;; there, not in the caller's)
+             (opt (wasmdown.component.runtime::make-ct*
+                   :variant (vector (cons "none" nil)
+                                    (cons "some" (cons :idx sidx)))))
+             (oidx (wasmdown.component.runtime::%push-type callee opt))
+             (params (append
+                      (loop for i below 16
+                            collect (cons (format nil "a~d" i) u64))
+                      (list (cons "s" (cons :idx oidx)))))
+             (ft (wasmdown.component.runtime::make-ct*
+                  :func (list params (wasmdown.component.runtime::make-ct*
+                                      :prim :u32)
+                              nil)))
+             (ts (loop for p in params collect (cdr p)))
+             (tuple-width (wasmdown.component.runtime::make-ct*
+                           :tuple (coerce ts 'vector)))
+             (end (new-end))
+             (seen nil))
+        ;; a DIFFERENT type at the caller's index 0: if a nested ref
+        ;; resolved in the CALLER's space it would read this u32
+        (wasmdown.component.runtime::%push-type caller u32)
+        (wasmdown.component.runtime::%push-core-memory caller mem)
+        (wasmdown.component.runtime::%push-func
+         caller
+         (wasmdown.component.runtime:make-lifted-func
+          :type ft :inst callee
+          :host (lambda (args) (setf seen (copy-list args)) 7)))
+        (let* ((scx (wasmdown.component.runtime::make-abi-cx
+                     :inst caller :type-inst callee :memory mem))
+               (n-callee (length (h* callee))))
+          ;; the caller's compiled lower spills the tuple; the option's
+          ;; stream end is LOWERED into the CALLER's table first
+          (wasmdown.component.runtime::%abi-store
+           scx (append (loop for i below 16 collect i)
+                       (list (cons :some end)))
+           tuple-width 0)
+          (let ((idx (mem32 mem 132)))  ; 16*u64, then disc 1 + pad 3
+            (is (eql idx (length (h* caller))))
+            (is (eq end (aref (h* caller) (1- idx))))
+            (let* ((canon (wasmdown.component:make-canonrec
+                           :kind :lower :func 0
+                           :opts (list (list :memory 0))))
+                   (wrap (wasmdown.component.runtime::%lower-host-func
+                          caller 0 canon)))
+              (is (equal '(7) (wasmdown.runtime:wasm-call wrap 0)))
+              ;; the host provider saw the END RECORD nested in the
+              ;; option — never the raw table index
+              (is (eq end (cdr (nth 16 seen))))
+              (is (not (integerp (cdr (nth 16 seen)))))
+              ;; ownership: the SOURCE slot is consumed and the end is
+              ;; host-owned (not left resident anywhere)
+              (is (null (aref (h* caller) (1- idx))))
+              (is (null (wasmdown.component.runtime::async-end-owner end)))
+              (is (null (wasmdown.component.runtime::async-end-index end)))
+              ;; the PROVIDER's table never saw it
+              (is (= n-callee (length (h* callee))))
+              (is (resident-p end callee))))))
+      ;; ---- (b) ASYNC RESULT: a NESTED option<stream<u8>> ----
+      ;; The async lower's result is always spilled (MAX_FLAT_RESULTS
+      ;; 0), so the result context stores the nested option in the
+      ;; CALLER's memory. Its (:idx . n) payload must resolve in the
+      ;; CALLEE's space (FT-INST = the result context's :type-inst).
+      (let* ((caller (wasmdown.component.runtime:make-comp-instance))
+             (callee (wasmdown.component.runtime:make-comp-instance))
+             (mem (%pin-memory))
+             (sct (wasmdown.component.runtime::make-ct* :stream :u8))
+             (sidx (wasmdown.component.runtime::%push-type callee sct))
+             (opt (wasmdown.component.runtime::make-ct*
+                   :variant (vector (cons "none" nil)
+                                    (cons "some" (cons :idx sidx)))))
+             (oidx (wasmdown.component.runtime::%push-type callee opt))
+             (ft (wasmdown.component.runtime::make-ct*
+                  :func (list (list (cons "n" u64))
+                              (cons :idx oidx)
+                              t)))
+             (end (new-end))
+             (seen nil)
+             ;; the provider's answer — mutated for the NONE case
+             (reply (cons :some end)))
+        ;; the caller's type index 0 is a DIFFERENT type: a ref that
+        ;; resolved in the caller's space would store an integer here
+        (wasmdown.component.runtime::%push-type caller u32)
+        (wasmdown.component.runtime::%push-core-memory caller mem)
+        (wasmdown.component.runtime::%push-func
+         caller
+         (wasmdown.component.runtime:make-lifted-func
+          :type ft :inst callee
+          :host (lambda (args)
+                  (setf seen (copy-list args))
+                  reply)))
+        (let* ((canon (wasmdown.component:make-canonrec
+                       :kind :lower :func 0
+                       :opts (list (list :memory 0))))
+               (wrap (wasmdown.component.runtime::%canon-lower-async-host-func
+                      caller 0 canon))
+               (n-callee (length (h* callee)))
+               (bytes (wasmdown.runtime:memory-instance-bytes mem)))
+          (is (equal '(2) (wasmdown.runtime:wasm-call wrap 5 16)))
+          (is (equal '(5) seen))
+          ;; discriminant 1 = "some" at 16, the payload at 20 (join-
+          ;; aligned), and that index is the CALLER's new handle
+          (is (= 1 (aref bytes 16)))
+          (let ((idx (mem32 mem 20)))
+            (is (plusp idx))
+            (is (eq end (aref (h* caller) (1- idx))))
+            (is (eql caller (wasmdown.component.runtime::async-end-owner end)))
+            (is (eql idx (wasmdown.component.runtime::async-end-index end))))
+          ;; the provider's table is untouched by the transfer
+          (is (= n-callee (length (h* callee))))
+          (is (resident-p end callee))
+          ;; NONE ALLOCATES NOTHING: no handle on either side, the
+          ;; discriminant is 0 and the payload slot stays untouched
+          (let ((n-caller (length (h* caller))))
+            (setf reply :none)
+            (is (equal '(2) (wasmdown.runtime:wasm-call wrap 6 32)))
+            (is (= 0 (aref bytes 32)))
+            (is (zerop (mem32 mem 36)))
+            (is (= n-caller (length (h* caller))))
+            (is (= n-callee (length (h* callee)))))))
+      ;; ---- (c) lift_async_value's GUARD SET, THROUGH load ----
+      (let* ((guest (wasmdown.component.runtime:make-comp-instance))
+             (mem (%pin-memory))
+             (cx (wasmdown.component.runtime::make-abi-cx
+                  :inst guest :type-inst guest :memory mem))
+             (sct (wasmdown.component.runtime::make-ct* :stream :u8))
+             (fct (wasmdown.component.runtime::make-ct* :future :u8))
+             (bytes (wasmdown.runtime:memory-instance-bytes mem)))
+        (flet ((seat (end)
+                 (let ((idx (wasmdown.component.runtime::%handle-add-any
+                             guest end)))
+                   (loop for k below 4
+                         do (setf (aref bytes k)
+                                  (ldb (byte 8 (* 8 k)) idx)))
+                   idx)))
+          ;; stale: an index past every addable slot
+          (assert-trap :generic
+            (wasmdown.component.runtime::%abi-load cx sct 256))
+          ;; wrong CLASS: a resource handle is not an end
+          (let ((rt (wasmdown.component.runtime::make-ct* :resource nil)))
+            (seat nil)
+            (setf (aref (h* guest) (1- (length (h* guest))))
+                  (wasmdown.component.runtime::make-resource-handle
+                   rt 1 t))
+            (assert-trap :generic
+              (wasmdown.component.runtime::%abi-load cx sct 0)))
+          ;; wrong async class: a STREAM end through a future<u8>
+          (seat (new-end))
+          (assert-trap :generic
+            (wasmdown.component.runtime::%abi-load cx fct 0))
+          ;; wrong element type: stream<u8> valtype, stream<u32> end
+          (seat (new-end :t-ct u32))
+          (assert-trap :generic
+            (wasmdown.component.runtime::%abi-load cx sct 0))
+          ;; WRITABLE end: not a readable end
+          (seat (new-end :event stream-write))
+          (assert-trap :generic
+            (wasmdown.component.runtime::%abi-load cx sct 0))
+          ;; NON-IDLE
+          (seat (new-end :state :copying))
+          (assert-trap :generic
+            (wasmdown.component.runtime::%abi-load cx sct 0))
+          ;; IN A WAITABLE SET
+          (let* ((end (new-end))
+                 (wset (wasmdown.component.runtime::make-async-waitable-set)))
+            (seat end)
+            (wasmdown.component.runtime::%waitable-join end wset)
+            (assert-trap :generic
+              (wasmdown.component.runtime::%abi-load cx sct 0))
+            (wasmdown.component.runtime::%waitable-join end nil))
+          ;; the guards never consumed the slot: the last (now
+          ;; readable, idle, out-of-set) end still lifts
+          (let ((end (new-end)))
+            (seat end)
+            (is (eq end (wasmdown.component.runtime::%abi-load cx sct 0)))))))))
 
 (pin-test component/switched-target-exit-releases-pin
   ;; §474-484: the switch_to chain runs the target until it BLOCKS OR

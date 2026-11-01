@@ -1185,6 +1185,54 @@ list-of-tuples shape."
   "A fresh ct (the component package's keyword constructor, one arm)."
   (wasmdown.component:make-ct :kind kind :payload payload :offset offset))
 
+(defun %abi-type-key (vt inst)
+  "A structural KEY for the value type VT in the type space INST.
+Two valtypes naming the same type in the SAME space produce EQUAL
+keys, which is what lift_async_value's `trap_if(end.t != t)' guard
+(CanonicalABI.md 2444) needs: the end's recorded element ct and the
+valtype's element are resolved to the same space before comparing
+(struct cts compare by identity, and a prim element is stored as a
+keyword on the end but as a fresh prim ct on the valtype side). NIL
+is the EMPTY element type of the `(stream)'/`(future)' forms
+(CanonicalABI.md 4251). Raw (:idx . n) refs resolve through INST's
+type space (the one space the comparison is defined in)."
+  (if (null vt)
+      :empty
+      (let ((c (%abi-ct vt inst)))
+        (labels ((k (v) (%abi-type-key v inst))
+                 (field (v) (and v (k v))))
+          (let ((p (wasmdown.component:ct-payload c)))
+            (case (wasmdown.component:ct-kind c)
+              (:prim (list :prim p))
+              ;; a MAP ct never reaches here (%abi-ct despecializes)
+              (:list (list :list (k (car p)) (cdr p)))
+              (:record (list :record
+                             (loop for (label . fvt) in (coerce p 'list)
+                                   collect (cons label (k fvt)))))
+              (:tuple (list :tuple
+                            (loop for fvt across p collect (k fvt))))
+              (:variant (list :variant
+                              (loop for (label . cvt) in (coerce p 'list)
+                                    collect (cons label (field cvt)))))
+              (:option (list :option (field p)))
+              (:result (list :result (field (car p)) (field (cdr p))))
+              (:flags (list :flags (coerce p 'list)))
+              (:enum (list :enum (coerce p 'list)))
+              ;; the handle CLASS only: a resource's index is aliased
+              ;; and projected per type space (the same $R is 0 in one
+              ;; space and 3 in the next — passing-resources ::1), so
+              ;; comparing the index would trap on a legitimate
+              ;; cross-component transfer. `end.t == t' still catches
+              ;; every structural difference around the handle.
+              (:own :own)
+              (:borrow :borrow)
+              (:resource :resource)
+              (:stream (list :stream (field p)))
+              (:future (list :future (field p)))
+              ;; the opaque kinds (func/instance/component): compare
+              ;; their payloads structurally as-is
+              (t (list (wasmdown.component:ct-kind c) p))))))))
+
 (defun %abi-discriminant-size (cases)
   "discriminant_type (CanonicalABI.md 2038): the smallest unsigned
 width covering the case count — 1 byte up to 256 cases, 2 to 65536,
@@ -1897,6 +1945,18 @@ shape the native providers hand back for error codes such as
          (if (string= (car r) "ok")
              (cons :ok (cdr r))
              (cons :err (cdr r)))))
+      ((:stream :future)
+       ;; load()'s async rows (CanonicalABI.md 2159-2160) delegate to
+       ;; lift_stream/lift_future (2161-2162) -> lift_async_value
+       ;; (2438): the i32 at PTR indexes THIS context's handles table,
+       ;; the READABLE end is REMOVED from it, its owner/index are
+       ;; cleared, and the END record is the loaded value. The old
+       ;; catch-all returned the raw index, so a memory-loaded
+       ;; (indirect) stream/future payload never became an end object
+       ;; and the end stayed resident in the source table.
+       (%lift-async-end cx (%abi-load-int cx ptr 4)
+                        :kind (wasmdown.component:ct-kind c)
+                        :elem (wasmdown.component:ct-payload c)))
       (t (%abi-load-int cx ptr 4)))))
 
 (defun %abi-load-list (cx ptr length elem-type)
@@ -2242,7 +2302,9 @@ pairs consumed in order)."
               ;; lift_async_value (§2438): the i32 indexes THIS
               ;; instance's handles table; the READABLE end moves
               ;; out to the caller (the cx's instance is the owner)
-              (%lift-async-end cx (next :i32)))
+              (%lift-async-end cx (next :i32)
+                               :kind (wasmdown.component:ct-kind c)
+                               :elem (wasmdown.component:ct-payload c)))
              (t (next :i32))))))
     (lift vt)))
 
@@ -5483,16 +5545,36 @@ so its provider's late readiness notification resumes nothing."
   (unless (async-waitable-pending-event end)
     (%end-notify end 0)))
 
-(defun %lift-async-end (cx i)
+(defun %lift-async-end (cx i &key kind elem)
   "lift_stream / lift_future (§2432-2460): the i32 index I in CX's
 instance resolves the READABLE end; the guards; the end transfers
-OUT of this table (the caller re-adds it at its boundary)."
+OUT of this table (the caller re-adds it at its boundary).
+
+KIND is the valtype's ct-kind (:stream / :future) and ELEM its
+element valtype — both supplied by every conversion-site caller so
+lift_async_value's ReadableEndT and `end.t == t' assertions (§2444)
+run here: a stream end lifted through a future<...> type (or the
+reverse) traps instead of passing on the wrong class, and an end
+whose recorded element type differs from the valtype's traps."
   (let* ((inst (abi-cx-inst cx))
          (end (%handle-at inst i #'async-end-p "stream end")))
     (unless (member (async-end-event-code end)
                     (list +event-stream-read+ +event-future-read+))
       (error 'wasmdown:wasm-trap :kind :generic
              :message "handle index used with the wrong type"))
+    (when (and kind
+               (not (eql (async-end-event-code end)
+                         (if (eq kind :future)
+                             +event-future-read+
+                             +event-stream-read+))))
+      (error 'wasmdown:wasm-trap :kind :generic
+             :message "handle index used with the wrong type"))
+    (when elem
+      (unless (equal (%abi-type-key (async-end-t-ct end)
+                                    (%abi-type-inst cx))
+                     (%abi-type-key elem (%abi-type-inst cx)))
+        (error 'wasmdown:wasm-trap :kind :generic
+               :message "stream or future element type mismatch")))
     (unless (eq (async-end-state end) :idle)
       (error 'wasmdown:wasm-trap :kind :generic
              :message "cannot lift a stream or future in a non-idle state"))
@@ -5503,6 +5585,7 @@ OUT of this table (the caller re-adds it at its boundary)."
     (%handle-free-slot inst i)
     ;; §2446: lift_async_value clears the owner (lower re-sets it)
     (setf (async-end-owner end) nil)
+    (setf (async-end-index end) nil)
     end))
 
 (defun %lower-async-end (end cx)
@@ -9822,12 +9905,31 @@ is the valtype."
                                    (when rflat
                                      (let ((rc (%abi-ct result ft-inst))
                                            (ptr (first (last args)))
+                                           ;; THE RESULT'S TWO SPACES,
+                                           ;; both halves: INST (the
+                                           ;; caller) owns the handle
+                                           ;; table a stream/future end
+                                           ;; enters, and TYPE-INST
+                                           ;; (FT-INST, the CALLEE)
+                                           ;; resolves the result's
+                                           ;; (:idx . n) refs. Without
+                                           ;; TYPE-INST the top-level
+                                           ;; ct resolved in the
+                                           ;; callee's space but every
+                                           ;; NESTED ref (option<
+                                           ;; stream<u8>>'s "some"
+                                           ;; payload,
+                                           ;; record/list fields) fell
+                                           ;; back to INST's space and
+                                           ;; resolved the CALLER's
+                                           ;; type at that index.
                                            (scx (make-abi-cx
                                                  :memory memory
                                                  :realloc realloc
                                                  :encoding
                                                  (%abi-encoding-of enc-opt)
-                                                 :inst inst)))
+                                                 :inst inst
+                                                 :type-inst ft-inst)))
                                        (if (and rc
                                                 (member
                                                  (wasmdown.component:ct-kind
