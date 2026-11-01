@@ -377,8 +377,12 @@ print exactly `hi\n`).
   finishing in ~0.2 s proves the cancel ran. That surfaced one more defect:
   the async-lower pack took the callee task's mutex even when the callee is
   HOST-PENDING and has no task record (NIL `ASYNC-TASK`); the host-pending
-  arm now packs without the mutex. The lane runs six guests, 3 repeats each
-  (18/18 per backend). The component binary grammar details
+  arm now packs without the mutex. A seventh guest is a TCP SOCKET command: create/connect/send "ping"
+  over loopback, receive and wait for the echo, then drop. It is authored in
+  TEXT and encoded by the new tools/component-encode.lisp (no binary
+  serializer existed; six fixtures had been hand-assembled). The lane runs
+  seven guests, 3 repeats each (21/21 per backend), with a suite-side echo
+  server and --net for the socket case. The component binary grammar details
   that mattered: type indices
   inside an instance type are local to that type's declarations, the lower's
   core func must be defined before the bag that exports it, and imported
