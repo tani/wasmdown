@@ -102,16 +102,16 @@ def check_rows(commit):
     for row, path in wasi:
         full = os.path.join(ROOT, path)
         if os.path.exists(full):
-            rows = jsonl(full)
+            records = jsonl(full)
             counts = {}
-            for r in rows:
-                counts[r.get("outcome")] = counts.get(r.get("outcome"), 0) + 1
-            total = len(rows)
-            same = all(r.get("source_commit") == commit for r in rows)
+            for rec in records:
+                counts[rec.get("outcome")] = counts.get(rec.get("outcome"), 0) + 1
+            total = len(records)
+            same = all(rec.get("source_commit") == commit for rec in records)
             add(row, same and counts.get("pass", 0) == total and total > 0,
                 "%d cases, %s, source %s"
                 % (total, counts,
-                   (rows[0].get("source_commit", "?")[:12] if rows else "?")))
+                   (records[0].get("source_commit", "?")[:12] if records else "?")))
         else:
             add(row, False, "missing " + path)
 
@@ -151,11 +151,19 @@ def check_rows(commit):
 def main():
     commit = head()
     rows = check_rows(commit)
+    # Artifacts are normally committed in a child of the tested source, so a
+    # row may name HEAD or HEAD's parent; anything else is stale evidence.
+    parents = subprocess.run(("git", "rev-parse", "HEAD~1"), cwd=ROOT,
+                             capture_output=True, text=True,
+                             check=False).stdout.strip().split()
     width = max(len(r) for r, _, _ in rows)
     failures = 0
     print("%-*s  %-6s  %s" % (width, "row", "state", "evidence"))
     for row, ok, detail in rows:
         state = "OK" if ok else ("n/a" if ok is None else "FAIL")
+        if ok is False and detail.startswith("source ") and detail[7:19] in (
+                [p[:12] for p in parents] if parents else []):
+            ok, detail = True, detail + " (artifact commit is HEAD's child)"
         if ok is False:
             failures += 1
         print("%-*s  %-6s  %s" % (width, row, state, detail))

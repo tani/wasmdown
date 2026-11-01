@@ -25,6 +25,8 @@
            #:wast-result-detail #:wast-result-elapsed
            #:wast-result-message
            #:summarize-results #:write-jsonl #:result-outcome-counts
+           #:*jsonl-source-commit* #:*jsonl-source-tree*
+           #:*jsonl-clean-tree*
            ;; M7 slice 2: the token-tree contract the component TEXT
            ;; parser walks (stoken kinds/text + the (:list start end
            ;; . children) node shape). The CORE text parser keeps its
@@ -2762,12 +2764,21 @@ slicing its text from *script-source*."
 that measures a different corpus binds its own name, so the aggregated
 results of two suites stay distinguishable.")
 
+(defvar *jsonl-source-commit* nil
+  "When bound, JSONL lines carry this source identity (commit/tree/clean).")
+(defvar *jsonl-source-tree* nil)
+(defvar *jsonl-clean-tree* nil)
+
 (defun write-jsonl-line (stream result &optional (suite *jsonl-suite*))
   "One wasmdown.test-result.v1 JSON object line. SUITE names the corpus
 (\"core-spec\", \"component\", \"upstream\", ...) and every line also
-carries the source FILE, so a consumer need not parse CASE-ID."
+carries the source FILE, so a consumer need not parse CASE-ID. When
+*JSONL-SOURCE-COMMIT* is bound, the tested source identity is included."
   (format stream
           "{\"schema\":\"wasmdown.test-result.v1\",~
+           ~:[~;\"source_commit\":\"~a\",~
+              \"source_tree\":\"~a\",~
+              \"clean_tree\":~a,~]~
            \"suite\":\"~a\",~
            \"file\":\"~a\",~
            \"case_id\":\"~a::~a\",~
@@ -2776,6 +2787,10 @@ carries the source FILE, so a consumer need not parse CASE-ID."
            \"expected_failure_phase\":null,~
            \"actual_failure_phase\":\"~a\",~
            \"detail\":\"~a\"}~%"
+          *jsonl-source-commit*
+          (or *jsonl-source-commit* "")
+          (or *jsonl-source-tree* "")
+          (if *jsonl-clean-tree* "true" "false")
           (%json-escape suite)
           (%json-escape (wast-result-file result))
           (%json-escape (wast-result-file result))

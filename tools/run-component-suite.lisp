@@ -319,10 +319,6 @@ parent dir), not the first (the grandparent 'component' — the old
                  f :file (format nil "~a/~a"
                                  (car (last (pathname-directory f) 2))
                                  (file-namestring f))))))
-(when *jsonl* (wasmdown.wast:write-jsonl *results* *jsonl* "component"))
-
-;;; ---- tested source identity ----
-
 (defun %git-line (args)
   (handler-case
       (let ((out (uiop:run-program (cons "git" args)
@@ -331,6 +327,15 @@ parent dir), not the first (the grandparent 'component' — the old
         (let ((trimmed (string-trim '(#\Space #\Newline #\Return #\Tab) out)))
           (if (plusp (length trimmed)) trimmed "unknown")))
     (error () "unknown")))
+
+(when *jsonl*
+  (let ((status (%git-line '("status" "--porcelain"))))
+    (let ((wasmdown.wast:*jsonl-source-commit* (%git-line '("rev-parse" "HEAD")))
+          (wasmdown.wast:*jsonl-source-tree* (%git-line '("rev-parse" "HEAD^{tree}")))
+          (wasmdown.wast:*jsonl-clean-tree* (string= "" status)))
+      (wasmdown.wast:write-jsonl *results* *jsonl* "component"))))
+
+;;; ---- tested source identity ----
 
 (defun %source-line ()
   (format nil "- Tested source: commit `~a`, tree `~a`, ~a~%"
