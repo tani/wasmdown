@@ -393,9 +393,21 @@ CASES = [
         # ERR/no-entry. The guest removes every temporary object, so the
         # three repeats share the workdir; `absent` is the host-side
         # witness of that cleanup.
+        # The ADVANCED descriptor surface (same guest): get-flags/
+        # get-type, sync/sync-data on writable and read-only handles,
+        # advise, is-same-object across link-at's hard link,
+        # metadata-hash/metadata-hash-at agreement, set-size
+        # grow/shrink with zero-fill, set-times/set-times-at with the
+        # timestamps read back through stat, symlink-at + readlink-at
+        # (regular-file invalid, absolute target not-permitted), and
+        # stat-at's symlink-follow policy (symbolic-link/size 9
+        # without the flag, regular-file/size 17 with it). The guest
+        # unlinks every object it creates; `absent` names them too.
         "expect": {"stdout_equals": [], "exit": 0,
                    "files": ["out.txt"],
-                   "absent": ["subdir", "temp.txt", "moved.txt"],
+                   "absent": ["subdir", "temp.txt", "moved.txt",
+                              "out.link", "hello.sym", "size.txt",
+                              "abs.sym"],
                    "file_contents": {"out.txt": "wmd-write-probe\0\0!-app"}},
     },
     # ---------------- Preview 1 ----------------

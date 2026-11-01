@@ -10,7 +10,8 @@ LISP_FILES := $(wildcard src/*.lisp)
         report-backends-bench \
         test-upstream test-wasi-preview1 test-wasi-preview2 test-wasi \
         report-conformance p3-fixtures test-wasi-preview3 verify \
-        test-property test-p1-repeat \
+        test-property test-async-property test-async-property-negative \
+        test-p1-repeat \
         record-p2 record-p3 record-p3-compiled record-wasi-compiled \
         record-release verify-release \
         clean \
@@ -19,7 +20,7 @@ LISP_FILES := $(wildcard src/*.lisp)
 # Reproducible quick gate: the deterministic lanes that must be green on
 # any change. Compiled large-guest lanes stay report-only. ~2.5 min.
 verify: test-unit test-component test-backend-parity test-backend-inventory \
-	test-wasi test-wasi-preview3 test-property
+	test-wasi test-wasi-preview3 test-property test-async-property
 	$(SBCL) --script tools/build-p3-fixtures.lisp --check
 	@echo "verify: all quick gates green"
 
@@ -29,6 +30,23 @@ verify: test-unit test-component test-backend-parity test-backend-inventory \
 ITERATIONS ?= 2000
 test-property:
 	$(SBCL) --control-stack-size 32 --dynamic-space-size 4096 --script tools/fuzz-backends.lisp --iterations $(ITERATIONS)
+
+# Deterministic async property lane (docs/design/PLAN.md §9.3/F4): the REAL
+# task/subtask, stream/future/cancel and host-pending primitives driven by
+# fixed xorshift64* seeds (no wall-clock sleeps), plus the fake-reactor step
+# protocol, the backpressure admission gate and the bounded-executor audit.
+# A gate: any violated exactly-once / monotone-state / work-accounting
+# invariant exits non-zero. Override the corpus with ASYNC_SEEDS/ASYNC_REPEATS.
+ASYNC_SEEDS ?= 1,2,3,5,8,13,21,34
+ASYNC_REPEATS ?= 3
+test-async-property:
+	$(SBCL) --control-stack-size 32 --dynamic-space-size 2048 --script tools/run-async-property.lisp --seeds $(ASYNC_SEEDS) --repeats $(ASYNC_REPEATS)
+
+# Negative control for the async property gate: deliberately double-delivers
+# a host-pending continuation; the invariant checkers MUST report it. The
+# target is green only when the injected violation was detected.
+test-async-property-negative:
+	$(SBCL) --control-stack-size 32 --dynamic-space-size 2048 --script tools/run-async-property.lisp --negative-control
 
 # Canonical P2 interpret artifacts for the release matrix.
 record-p2:

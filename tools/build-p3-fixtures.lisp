@@ -1215,6 +1215,50 @@
 ;;;     [method]descriptor.remove-directory-at:
 ;;;       async func(self: borrow<descriptor>, path: string)
 ;;;         -> result<_, error-code>
+;;;     [method]descriptor.advise:
+;;;       async func(self: borrow<descriptor>, offset: filesize,
+;;;                  length: filesize, advice: advice)
+;;;         -> result<_, error-code>
+;;;     [method]descriptor.sync / [method]descriptor.sync-data:
+;;;       async func(self: borrow<descriptor>) -> result<_, error-code>
+;;;     [method]descriptor.get-flags:
+;;;       async func(self) -> result<descriptor-flags, error-code>
+;;;     [method]descriptor.get-type:
+;;;       async func(self) -> result<descriptor-type, error-code>
+;;;     [method]descriptor.set-size:
+;;;       async func(self, size: filesize) -> result<_, error-code>
+;;;     [method]descriptor.set-times:
+;;;       async func(self, data-access-timestamp: new-timestamp,
+;;;                  data-modification-timestamp: new-timestamp)
+;;;         -> result<_, error-code>
+;;;     [method]descriptor.set-times-at:
+;;;       async func(self, path-flags: path-flags, path: string,
+;;;                  data-access-timestamp: new-timestamp,
+;;;                  data-modification-timestamp: new-timestamp)
+;;;         -> result<_, error-code>
+;;;     [method]descriptor.link-at:
+;;;       async func(self, old-path-flags: path-flags, old-path: string,
+;;;                  new-descriptor: borrow<descriptor>, new-path: string)
+;;;         -> result<_, error-code>
+;;;     [method]descriptor.readlink-at:
+;;;       async func(self, path: string) -> result<string, error-code>
+;;;     [method]descriptor.symlink-at:
+;;;       async func(self, old-path: string, new-path: string)
+;;;         -> result<_, error-code>
+;;;     [method]descriptor.is-same-object:
+;;;       async func(self, other: borrow<descriptor>) -> bool
+;;;     [method]descriptor.metadata-hash:
+;;;       async func(self) -> result<metadata-hash-value, error-code>
+;;;     [method]descriptor.metadata-hash-at:
+;;;       async func(self, path-flags: path-flags, path: string)
+;;;         -> result<metadata-hash-value, error-code>
+;;;
+;;; The named types those signatures use are the WIT's own: advice is
+;;; an enum (6 cases, flat i32 = the case index), new-timestamp is a
+;;; variant { no-change, now, timestamp(instant) } (flat i64/i32
+;;; joined payload, 24 bytes in memory: disc u8 @0, instant at +8),
+;;; and metadata-hash-value is { lower: u64, upper: u64 } (16 bytes,
+;;; align 8).
 ;;;
 ;;; Canonical LOWER shapes (CanonicalABI flatten §2894-2930;
 ;;; MAX_FLAT_ASYNC_PARAMS = 4, ANY async result rides the appended
@@ -1258,6 +1302,40 @@
 ;;;       ; rides the appended [ptr]. Each element is a 24-byte
 ;;;       ; directory-entry (descriptor-type variant 16 bytes, then the
 ;;;       ; name's ptr@16/len@20); storing its string needs realloc.
+;;;   advise           (async) core (param i32 i64 i64 i32 i32) (result i32)
+;;;       ; (self, offset, length, advice enum = case index, retptr):
+;;;       ; exactly 4 flat params stay scalar.
+;;;   sync / sync-data / get-flags / get-type
+;;;                    (async) core (param i32 i32) (result i32)
+;;;       ; (self, retptr). get-flags' result payload is ONE byte at
+;;;       ; +4 (packed flags); get-type's is the nested variant disc.
+;;;   set-size         (async) core (param i32 i64 i32) (result i32)
+;;;       ; (self, size, retptr).
+;;;   set-times        (async) core (param i32 i32) (result i32)
+;;;       ; self + two 3-slot new-timestamp variants = 7 flat params, so
+;;;       ; the params tuple is (self@0, atime@8, mtime@32; each variant
+;;;       ; is disc u8@0 + instant u64/u32 at +8/+16, 24 bytes).
+;;;   set-times-at     (async) core (param i32 i32) (result i32)
+;;;       ; 10 flat params -> params tuple (self@0, pf u8@4, path
+;;;       ; ptr@8/len@12, atime@16, mtime@40; size 64).
+;;;   link-at          (async) core (param i32 i32) (result i32)
+;;;       ; 7 flat params -> params tuple (self@0, old-path-flags u8@4,
+;;;       ; old ptr@8/len@12, new-descriptor@16, new ptr@20/len@24).
+;;;   readlink-at      (async) core (param i32 i32 i32 i32) (result i32)
+;;;       ; (self, path ptr, path len, retptr); result<string,
+;;;       ; error-code> puts the string at payload +4: ptr@+4/len@+8.
+;;;   symlink-at       (async) core (param i32 i32) (result i32)
+;;;       ; 5 flat params -> params tuple (self@0, old ptr@4/len@8,
+;;;       ; new ptr@12/len@16).
+;;;   is-same-object   (async) core (param i32 i32 i32) (result i32)
+;;;       ; (self, other, retptr); the plain bool is ONE byte there.
+;;;   metadata-hash    (async) core (param i32 i32) (result i32)
+;;;       ; result<metadata-hash-value, error-code> payload at +8:
+;;;       ; lower u64@+8, upper u64@+16 (the record out-aligns
+;;;       ; error-code).
+;;;   metadata-hash-at (async) core (param i32 i32 i32 i32 i32) (result i32)
+;;;       ; self + path-flags + path ptr/len = 4 flat params stay scalar:
+;;;       ; (self, pf, ptr, len, retptr).
 ;;;
 ;;; The params-tuple layout (flags have an ELEMENT SIZE OF 1/2/4 per
 ;;; alignment_flags: 1 label and 4 labels are 1-byte fields, so the
@@ -1284,7 +1362,10 @@
 ;;; link-count u64@16, size u64@24, then three option<instant>@32/56/80
 ;;; (24 each: disc u8, instant {seconds u64, nanoseconds u32} at +8).
 ;;; The guest checks the type case (regular-file = 5), link-count and
-;;; size; the timestamps are not asserted.
+;;; size; the three option<instant> fields are checked too after
+;;; set-times/set-times-at set a fixed instant (the access and
+;;; modification readings must be exactly that second, the status
+;;; change only present and not older).
 ;;;
 ;;; The guest (run lifted async with a callback) asserts, and TRAPS
 ;;; on any failure:
@@ -1322,7 +1403,32 @@
 ;;;      remove-directory-at("subdir") both ok, then
 ;;;      stat-at("subdir") is ERR/no-entry (case 19). The temporary
 ;;;      objects are removed so repeated runs share the workdir;
-;;;   7. every handle is dropped (all descriptors, all stream and
+;;;   7. THE ADVANCED DESCRIPTOR SURFACE on a fresh read|write open of
+;;;      out.txt: get-flags = read|write (3) and get-flags on a
+;;;      read-only open = read (1); get-type = regular-file (5) and,
+;;;      on the preopen, directory (2); sync and sync-data are ok on
+;;;      both the writable and the read-only descriptor (the WIT's
+;;;      read-only no-effect case); advise(0, 22, sequential) ok;
+;;;      is-same-object is false against the preopen and true against
+;;;      a descriptor of the hard link link-at("out.txt" ->
+;;;      "out.link"); link-at of a missing path is ERR/no-entry;
+;;;      metadata-hash agrees across the two descriptors of one object
+;;;      and with metadata-hash-at on the alias path; the hard link
+;;;      raises stat-at's link-count to 2 and unlinking it returns
+;;;      no-entry; set-size grows a fresh file to 10 (ten ZERO bytes
+;;;      read back) and shrinks it to 4; set-times sets both
+;;;      timestamps of out.txt to a fixed instant and stat reads them
+;;;      back (access and modification exact, status change not
+;;;      older); set-times-at does the same through hello.txt's path;
+;;;      symlink-at("hello.txt" -> "hello.sym") ok, readlink-at
+;;;      returns exactly the 9-byte target, readlink-at of a regular
+;;;      file is ERR/invalid, symlink-at of an ABSOLUTE target is
+;;;      ERR/not-permitted; stat-at of hello.sym reports
+;;;      symbolic-link with size 9 (the target's length) WITHOUT
+;;;      symlink-follow and regular-file with size 17 WITH it. Every
+;;;      object this block creates is unlinked before the task
+;;;      returns;
+;;;   8. every handle is dropped (all descriptors, all stream and
 ;;;      future ends, the preopen's own handle).
 ;;;
 ;;; The async open-at is waited the CanonicalABI way: a packed
@@ -1441,6 +1547,19 @@
            "      (type $dent (record (field \"type\" $dtp2)"
            "                          (field \"name\" string)))"
            "      (export \"directory-entry\" (type $dentx (eq $dent)))"
+           ;; the remaining WIT named types the later methods use. The
+           ;; new-timestamp variant's timestamp case carries the clocks
+           ;; `instant` the WIT's `use` aliases in from the OUTER type
+           ;; space (the same implicit outer alias descriptor-stat uses).
+           "      (type $nts (variant (case \"no-change\") (case \"now\")"
+           "                        (case \"timestamp\" $instant)))"
+           "      (export \"new-timestamp\" (type $ntsx (eq $nts)))"
+           "      (type $adv (enum \"normal\" \"sequential\" \"random\""
+           "                      \"will-need\" \"dont-need\" \"no-reuse\"))"
+           "      (export \"advice\" (type $advx (eq $adv)))"
+           "      (type $mhv (record (field \"lower\" u64)"
+           "                         (field \"upper\" u64)))"
+           "      (export \"metadata-hash-value\" (type $mhvx (eq $mhv)))"
            "      (export \"descriptor\" (type $dt (sub resource)))"
            "      (export \"[method]descriptor.open-at\""
            "        (func async (param \"self\" (borrow $dt))"
@@ -1492,7 +1611,70 @@
            "      (export \"[method]descriptor.remove-directory-at\""
            "        (func async (param \"self\" (borrow $dt))"
            "                    (param \"path\" string)"
-           "                    (result (result (error $ec3)))))))"
+           "                    (result (result (error $ec3)))))"
+           ;; the remaining WIT methods (exact signatures, filesystem.wit)
+           "      (export \"[method]descriptor.advise\""
+           "        (func async (param \"self\" (borrow $dt))"
+           "                    (param \"offset\" u64)"
+           "                    (param \"length\" u64)"
+           "                    (param \"advice\" $advx)"
+           "                    (result (result (error $ec3)))))"
+           "      (export \"[method]descriptor.sync\""
+           "        (func async (param \"self\" (borrow $dt))"
+           "                    (result (result (error $ec3)))))"
+           "      (export \"[method]descriptor.sync-data\""
+           "        (func async (param \"self\" (borrow $dt))"
+           "                    (result (result (error $ec3)))))"
+           "      (export \"[method]descriptor.get-flags\""
+           "        (func async (param \"self\" (borrow $dt))"
+           "                    (result (result $df3 (error $ec3)))))"
+           "      (export \"[method]descriptor.get-type\""
+           "        (func async (param \"self\" (borrow $dt))"
+           "                    (result (result $dtp2 (error $ec3)))))"
+           "      (export \"[method]descriptor.set-size\""
+           "        (func async (param \"self\" (borrow $dt))"
+           "                    (param \"size\" u64)"
+           "                    (result (result (error $ec3)))))"
+           "      (export \"[method]descriptor.set-times\""
+           "        (func async (param \"self\" (borrow $dt))"
+           "                    (param \"data-access-timestamp\" $ntsx)"
+           "                    (param \"data-modification-timestamp\" $ntsx)"
+           "                    (result (result (error $ec3)))))"
+           "      (export \"[method]descriptor.set-times-at\""
+           "        (func async (param \"self\" (borrow $dt))"
+           "                    (param \"path-flags\" $pf3)"
+           "                    (param \"path\" string)"
+           "                    (param \"data-access-timestamp\" $ntsx)"
+           "                    (param \"data-modification-timestamp\" $ntsx)"
+           "                    (result (result (error $ec3)))))"
+           "      (export \"[method]descriptor.link-at\""
+           "        (func async (param \"self\" (borrow $dt))"
+           "                    (param \"old-path-flags\" $pf3)"
+           "                    (param \"old-path\" string)"
+           "                    (param \"new-descriptor\" (borrow $dt))"
+           "                    (param \"new-path\" string)"
+           "                    (result (result (error $ec3)))))"
+           "      (export \"[method]descriptor.readlink-at\""
+           "        (func async (param \"self\" (borrow $dt))"
+           "                    (param \"path\" string)"
+           "                    (result (result string (error $ec3)))))"
+           "      (export \"[method]descriptor.symlink-at\""
+           "        (func async (param \"self\" (borrow $dt))"
+           "                    (param \"old-path\" string)"
+           "                    (param \"new-path\" string)"
+           "                    (result (result (error $ec3)))))"
+           "      (export \"[method]descriptor.is-same-object\""
+           "        (func async (param \"self\" (borrow $dt))"
+           "                    (param \"other\" (borrow $dt))"
+           "                    (result bool)))"
+           "      (export \"[method]descriptor.metadata-hash\""
+           "        (func async (param \"self\" (borrow $dt))"
+           "                    (result (result $mhvx (error $ec3)))))"
+           "      (export \"[method]descriptor.metadata-hash-at\""
+           "        (func async (param \"self\" (borrow $dt))"
+           "                    (param \"path-flags\" $pf3)"
+           "                    (param \"path\" string)"
+           "                    (result (result $mhvx (error $ec3)))))))"
            "  (alias export $types \"descriptor\" (type $desc))"
            "  (import \"wasi:filesystem/preopens@0.3.2\""
            "    (instance $pre"
@@ -1509,6 +1691,20 @@
            "  (alias export $types \"[method]descriptor.rename-at\" (func $rename-f))"
            "  (alias export $types \"[method]descriptor.unlink-file-at\" (func $unlink-f))"
            "  (alias export $types \"[method]descriptor.remove-directory-at\" (func $rmdir-f))"
+           "  (alias export $types \"[method]descriptor.advise\" (func $advise-f))"
+           "  (alias export $types \"[method]descriptor.sync\" (func $sync-f))"
+           "  (alias export $types \"[method]descriptor.sync-data\" (func $syncdata-f))"
+           "  (alias export $types \"[method]descriptor.get-flags\" (func $getflags-f))"
+           "  (alias export $types \"[method]descriptor.get-type\" (func $gettype-f))"
+           "  (alias export $types \"[method]descriptor.set-size\" (func $setsize-f))"
+           "  (alias export $types \"[method]descriptor.set-times\" (func $settimes-f))"
+           "  (alias export $types \"[method]descriptor.set-times-at\" (func $settimesat-f))"
+           "  (alias export $types \"[method]descriptor.link-at\" (func $linkat-f))"
+           "  (alias export $types \"[method]descriptor.readlink-at\" (func $readlink-f))"
+           "  (alias export $types \"[method]descriptor.symlink-at\" (func $symlink-f))"
+           "  (alias export $types \"[method]descriptor.is-same-object\" (func $issame-f))"
+           "  (alias export $types \"[method]descriptor.metadata-hash\" (func $metahash-f))"
+           "  (alias export $types \"[method]descriptor.metadata-hash-at\" (func $metahashat-f))"
            "  (alias export $pre \"get-directories\" (func $getdirs-f))"
            "  (core module $Mem"
            "    (memory (export \"mem\") 1)"
@@ -1570,6 +1766,62 @@
            "    (canon lower (func $rmdir-f) async"
            "      (memory (core memory $mem \"mem\"))"
            "      (realloc (core func $mem \"realloc\"))))"
+           "  (core func $advise-lowered"
+           "    (canon lower (func $advise-f) async"
+           "      (memory (core memory $mem \"mem\"))"
+           "      (realloc (core func $mem \"realloc\"))))"
+           "  (core func $sync-lowered"
+           "    (canon lower (func $sync-f) async"
+           "      (memory (core memory $mem \"mem\"))"
+           "      (realloc (core func $mem \"realloc\"))))"
+           "  (core func $syncdata-lowered"
+           "    (canon lower (func $syncdata-f) async"
+           "      (memory (core memory $mem \"mem\"))"
+           "      (realloc (core func $mem \"realloc\"))))"
+           "  (core func $getflags-lowered"
+           "    (canon lower (func $getflags-f) async"
+           "      (memory (core memory $mem \"mem\"))"
+           "      (realloc (core func $mem \"realloc\"))))"
+           "  (core func $gettype-lowered"
+           "    (canon lower (func $gettype-f) async"
+           "      (memory (core memory $mem \"mem\"))"
+           "      (realloc (core func $mem \"realloc\"))))"
+           "  (core func $setsize-lowered"
+           "    (canon lower (func $setsize-f) async"
+           "      (memory (core memory $mem \"mem\"))"
+           "      (realloc (core func $mem \"realloc\"))))"
+           "  (core func $settimes-lowered"
+           "    (canon lower (func $settimes-f) async"
+           "      (memory (core memory $mem \"mem\"))"
+           "      (realloc (core func $mem \"realloc\"))))"
+           "  (core func $settimesat-lowered"
+           "    (canon lower (func $settimesat-f) async"
+           "      (memory (core memory $mem \"mem\"))"
+           "      (realloc (core func $mem \"realloc\"))))"
+           "  (core func $linkat-lowered"
+           "    (canon lower (func $linkat-f) async"
+           "      (memory (core memory $mem \"mem\"))"
+           "      (realloc (core func $mem \"realloc\"))))"
+           "  (core func $readlink-lowered"
+           "    (canon lower (func $readlink-f) async"
+           "      (memory (core memory $mem \"mem\"))"
+           "      (realloc (core func $mem \"realloc\"))))"
+           "  (core func $symlink-lowered"
+           "    (canon lower (func $symlink-f) async"
+           "      (memory (core memory $mem \"mem\"))"
+           "      (realloc (core func $mem \"realloc\"))))"
+           "  (core func $issame-lowered"
+           "    (canon lower (func $issame-f) async"
+           "      (memory (core memory $mem \"mem\"))"
+           "      (realloc (core func $mem \"realloc\"))))"
+           "  (core func $metahash-lowered"
+           "    (canon lower (func $metahash-f) async"
+           "      (memory (core memory $mem \"mem\"))"
+           "      (realloc (core func $mem \"realloc\"))))"
+           "  (core func $metahashat-lowered"
+           "    (canon lower (func $metahashat-f) async"
+           "      (memory (core memory $mem \"mem\"))"
+           "      (realloc (core func $mem \"realloc\"))))"
            "  (canon task.return (result $res) (core func $tr))"
            "  (canon waitable-set.new (core func $wsnew))"
            "  (canon waitable.join (core func $wjoin))"
@@ -1604,6 +1856,20 @@
            "    (import \"env\" \"rename-at\" (func $rename (param i32 i32) (result i32)))"
            "    (import \"env\" \"unlink-file-at\" (func $unlink (param i32 i32 i32 i32) (result i32)))"
            "    (import \"env\" \"remove-directory-at\" (func $rmdir (param i32 i32 i32 i32) (result i32)))"
+           "    (import \"env\" \"advise\" (func $advise (param i32 i64 i64 i32 i32) (result i32)))"
+           "    (import \"env\" \"sync\" (func $sync (param i32 i32) (result i32)))"
+           "    (import \"env\" \"sync-data\" (func $syncdata (param i32 i32) (result i32)))"
+           "    (import \"env\" \"get-flags\" (func $getflags (param i32 i32) (result i32)))"
+           "    (import \"env\" \"get-type\" (func $gettype (param i32 i32) (result i32)))"
+           "    (import \"env\" \"set-size\" (func $setsize (param i32 i64 i32) (result i32)))"
+           "    (import \"env\" \"set-times\" (func $settimes (param i32 i32) (result i32)))"
+           "    (import \"env\" \"set-times-at\" (func $settimesat (param i32 i32) (result i32)))"
+           "    (import \"env\" \"link-at\" (func $linkat (param i32 i32) (result i32)))"
+           "    (import \"env\" \"readlink-at\" (func $readlink (param i32 i32 i32 i32) (result i32)))"
+           "    (import \"env\" \"symlink-at\" (func $symlink (param i32 i32) (result i32)))"
+           "    (import \"env\" \"is-same-object\" (func $issame (param i32 i32 i32) (result i32)))"
+           "    (import \"env\" \"metadata-hash\" (func $metahash (param i32 i32) (result i32)))"
+           "    (import \"env\" \"metadata-hash-at\" (func $metahashat (param i32 i32 i32 i32 i32) (result i32)))"
            "    (import \"env\" \"stream.new\" (func $snew (result i64)))"
            "    (import \"env\" \"stream.write\" (func $swrite (param i32 i32 i32) (result i32)))"
            "    (import \"env\" \"stream.drop-writable\" (func $sdropw (param i32)))"
@@ -1640,6 +1906,15 @@
            "    (data (i32.const 600) \"subdir\")"
            "    (data (i32.const 608) \"temp.txt\")"
            "    (data (i32.const 624) \"moved.txt\")"
+           ;; the advanced-surface probes: the hard-link name, the
+           ;; symlink's name (its target is the existing "hello.txt"
+           ;; bytes at 64), the set-size file, and the ABSOLUTE target
+           ;; symlink-at must refuse with not-permitted
+           "    (data (i32.const 640) \"out.link\")"
+           "    (data (i32.const 648) \"hello.sym\")"
+           "    (data (i32.const 660) \"size.txt\")"
+           "    (data (i32.const 672) \"/abs\")"
+           "    (data (i32.const 680) \"abs.sym\")"
            "    (global $ws (mut i32) (i32.const 0))"
            "    (func $streq (param $a i32) (param $b i32) (param $n i32) (result i32)"
            "      (local $i i32)"
@@ -1819,6 +2094,7 @@
            "      (local $stream i32) (local $fut i32) (local $fd i32)"
            "      (local $wr i32) (local $dir i32) (local $found i32)"
            "      (local $pk i64)"
+           "      (local $fd2 i32) (local $fd3 i32)"
            "      (if (i32.ne (local.get $code) (i32.const 0)) (then unreachable))"
            ;; 1. the preopen named "/work"
            "      (call $getdirs (i32.const 0))"
@@ -2125,6 +2401,353 @@
            "      (call $settle (local.get $ret))"
            "      (if (i32.ne (i32.load8_u (i32.const 400)) (i32.const 1)) (then unreachable))"
            "      (if (i32.ne (i32.load8_u (i32.const 408)) (i32.const 19)) (then unreachable))"
+           ;; 7. THE ADVANCED DESCRIPTOR SURFACE. Reopen out.txt with
+           ;; read|write through the preopen (the earlier descriptor was
+           ;; dropped after the read-back) and exercise get-flags,
+           ;; get-type, sync, sync-data, advise, the timestamp methods,
+           ;; is-same-object, metadata-hash(-at), set-size, and the
+           ;; symlink/link surface.
+           "      (i32.store (i32.const 32) (local.get $pre))"
+           "      (i32.store8 (i32.const 36) (i32.const 0))"
+           "      (i32.store (i32.const 40) (i32.const 512))"
+           "      (i32.store (i32.const 44) (i32.const 7))"
+           "      (i32.store8 (i32.const 48) (i32.const 0))"
+           "      (i32.store8 (i32.const 49) (i32.const 3))"
+           "      (local.set $ret (call $openat (i32.const 32) (i32.const 8)))"
+           "      (call $settle (local.get $ret))"
+           "      (if (i32.ne (i32.load8_u (i32.const 8)) (i32.const 0)) (then unreachable))"
+           "      (local.set $fd (i32.load (i32.const 12)))"
+           ;; 7a. get-flags: result<descriptor-flags, error-code>; the
+           ;; flags' packed bit-vector is ONE byte at the payload
+           ;; (offset 4), so read|write is 3.
+           "      (local.set $ret (call $getflags (local.get $fd) (i32.const 8)))"
+           "      (call $settle (local.get $ret))"
+           "      (if (i32.ne (i32.load8_u (i32.const 8)) (i32.const 0)) (then unreachable))"
+           "      (if (i32.ne (i32.load8_u (i32.const 12)) (i32.const 3)) (then unreachable))"
+           ;; 7b. get-type: the descriptor-type VARIANT rides the +4
+           ;; payload, so its own discriminant is at 12. A regular file
+           ;; is case 5 and the preopen is a directory (case 2).
+           "      (local.set $ret (call $gettype (local.get $fd) (i32.const 8)))"
+           "      (call $settle (local.get $ret))"
+           "      (if (i32.ne (i32.load8_u (i32.const 8)) (i32.const 0)) (then unreachable))"
+           "      (if (i32.ne (i32.load8_u (i32.const 12)) (i32.const 5)) (then unreachable))"
+           "      (local.set $ret (call $gettype (local.get $pre) (i32.const 8)))"
+           "      (call $settle (local.get $ret))"
+           "      (if (i32.ne (i32.load8_u (i32.const 8)) (i32.const 0)) (then unreachable))"
+           "      (if (i32.ne (i32.load8_u (i32.const 12)) (i32.const 2)) (then unreachable))"
+           ;; 7c. sync and sync-data on the writable file: ok. The WIT's
+           ;; read-only case ("succeeds with no effect if the file
+           ;; descriptor is not opened for writing") is exercised on a
+           ;; separate READ-ONLY open: both must still be ok, and
+           ;; get-flags there is the read bit alone (1).
+           "      (local.set $ret (call $sync (local.get $fd) (i32.const 8)))"
+           "      (call $settle (local.get $ret))"
+           "      (if (i32.ne (i32.load8_u (i32.const 8)) (i32.const 0)) (then unreachable))"
+           "      (local.set $ret (call $syncdata (local.get $fd) (i32.const 8)))"
+           "      (call $settle (local.get $ret))"
+           "      (if (i32.ne (i32.load8_u (i32.const 8)) (i32.const 0)) (then unreachable))"
+           "      (i32.store (i32.const 32) (local.get $pre))"
+           "      (i32.store8 (i32.const 36) (i32.const 0))"
+           "      (i32.store (i32.const 40) (i32.const 512))"
+           "      (i32.store (i32.const 44) (i32.const 7))"
+           "      (i32.store8 (i32.const 48) (i32.const 0))"
+           "      (i32.store8 (i32.const 49) (i32.const 1))"
+           "      (local.set $ret (call $openat (i32.const 32) (i32.const 8)))"
+           "      (call $settle (local.get $ret))"
+           "      (if (i32.ne (i32.load8_u (i32.const 8)) (i32.const 0)) (then unreachable))"
+           "      (local.set $fd2 (i32.load (i32.const 12)))"
+           "      (local.set $ret (call $sync (local.get $fd2) (i32.const 8)))"
+           "      (call $settle (local.get $ret))"
+           "      (if (i32.ne (i32.load8_u (i32.const 8)) (i32.const 0)) (then unreachable))"
+           "      (local.set $ret (call $syncdata (local.get $fd2) (i32.const 8)))"
+           "      (call $settle (local.get $ret))"
+           "      (if (i32.ne (i32.load8_u (i32.const 8)) (i32.const 0)) (then unreachable))"
+           "      (local.set $ret (call $getflags (local.get $fd2) (i32.const 8)))"
+           "      (call $settle (local.get $ret))"
+           "      (if (i32.ne (i32.load8_u (i32.const 8)) (i32.const 0)) (then unreachable))"
+           "      (if (i32.ne (i32.load8_u (i32.const 12)) (i32.const 1)) (then unreachable))"
+           "      (call $fdrop (local.get $fd2))"
+           ;; 7d. advise(0, 22, sequential): 4 flat params fit the
+           ;; async scalar bound, so the core call is (self, offset,
+           ;; length, advice, retptr). The enum value is its case index
+           ;; (sequential = 1).
+           "      (local.set $ret (call $advise (local.get $fd) (i64.const 0)"
+           "                                    (i64.const 22) (i32.const 1)"
+           "                                    (i32.const 8)))"
+           "      (call $settle (local.get $ret))"
+           "      (if (i32.ne (i32.load8_u (i32.const 8)) (i32.const 0)) (then unreachable))"
+           ;; 7e. is-same-object: the WIT returns a plain bool (no
+           ;; result wrapper), and the async lower still passes it
+           ;; through the appended [ptr], where a bool is ONE byte.
+           "      (local.set $ret (call $issame (local.get $fd) (local.get $pre)"
+           "                                    (i32.const 8)))"
+           "      (call $settle (local.get $ret))"
+           "      ;; out.txt and the preopen's directory are DIFFERENT objects"
+           "      (if (i32.ne (i32.load8_u (i32.const 8)) (i32.const 0)) (then unreachable))"
+           ;; 7f. link-at(preopen, 0, "out.txt", preopen, "out.link"):
+           ;; 7 flat params exceed MAX_FLAT_ASYNC_PARAMS, so the params
+           ;; tuple is addressed (self@0, old-path-flags u8@4, old
+           ;; string ptr@8/len@12, new-descriptor@16, new string
+           ;; ptr@20/len@24).
+           "      (i32.store (i32.const 1400) (local.get $pre))"
+           "      (i32.store8 (i32.const 1404) (i32.const 0))"
+           "      (i32.store (i32.const 1408) (i32.const 512))"
+           "      (i32.store (i32.const 1412) (i32.const 7))"
+           "      (i32.store (i32.const 1416) (local.get $pre))"
+           "      (i32.store (i32.const 1420) (i32.const 640))"
+           "      (i32.store (i32.const 1424) (i32.const 8))"
+           "      (local.set $ret (call $linkat (i32.const 1400) (i32.const 8)))"
+           "      (call $settle (local.get $ret))"
+           "      (if (i32.ne (i32.load8_u (i32.const 8)) (i32.const 0)) (then unreachable))"
+           ;; a missing old path: link-at's WIT no-entry (case 19),
+           ;; never a trap (the result payload sits at align 4)
+           "      (i32.store (i32.const 1400) (local.get $pre))"
+           "      (i32.store8 (i32.const 1404) (i32.const 0))"
+           "      (i32.store (i32.const 1408) (i32.const 80))"
+           "      (i32.store (i32.const 1412) (i32.const 11))"
+           "      (i32.store (i32.const 1416) (local.get $pre))"
+           "      (i32.store (i32.const 1420) (i32.const 640))"
+           "      (i32.store (i32.const 1424) (i32.const 8))"
+           "      (local.set $ret (call $linkat (i32.const 1400) (i32.const 8)))"
+           "      (call $settle (local.get $ret))"
+           "      (if (i32.ne (i32.load8_u (i32.const 8)) (i32.const 1)) (then unreachable))"
+           "      (if (i32.ne (i32.load8_u (i32.const 12)) (i32.const 19)) (then unreachable))"
+           ;; the hard link's OWN descriptor, read-only
+           "      (i32.store (i32.const 32) (local.get $pre))"
+           "      (i32.store8 (i32.const 36) (i32.const 0))"
+           "      (i32.store (i32.const 40) (i32.const 640))"
+           "      (i32.store (i32.const 44) (i32.const 8))"
+           "      (i32.store8 (i32.const 48) (i32.const 0))"
+           "      (i32.store8 (i32.const 49) (i32.const 1))"
+           "      (local.set $ret (call $openat (i32.const 32) (i32.const 8)))"
+           "      (call $settle (local.get $ret))"
+           "      (if (i32.ne (i32.load8_u (i32.const 8)) (i32.const 0)) (then unreachable))"
+           "      (local.set $fd3 (i32.load (i32.const 12)))"
+           ;; both descriptors name the SAME object
+           "      (local.set $ret (call $issame (local.get $fd) (local.get $fd3)"
+           "                                    (i32.const 8)))"
+           "      (call $settle (local.get $ret))"
+           "      (if (i32.ne (i32.load8_u (i32.const 8)) (i32.const 1)) (then unreachable))"
+           ;; 7g. metadata-hash: result<metadata-hash-value, error-code>
+           ;; (payload aligned 8: lower@+8, upper@+16). The two
+           ;; descriptors of the same object and metadata-hash-at of the
+           ;; alias path must all agree.
+           "      (local.set $ret (call $metahash (local.get $fd) (i32.const 8)))"
+           "      (call $settle (local.get $ret))"
+           "      (if (i32.ne (i32.load8_u (i32.const 8)) (i32.const 0)) (then unreachable))"
+           "      (local.set $ret (call $metahash (local.get $fd3) (i32.const 1600)))"
+           "      (call $settle (local.get $ret))"
+           "      (if (i32.ne (i32.load8_u (i32.const 1600)) (i32.const 0)) (then unreachable))"
+           "      (if (i64.ne (i64.load (i32.const 16))"
+           "                  (i64.load (i32.const 1608)))"
+           "          (then unreachable))"
+           "      (if (i64.ne (i64.load (i32.const 24))"
+           "                  (i64.load (i32.const 1616)))"
+           "          (then unreachable))"
+           "      (local.set $ret (call $metahashat (local.get $pre) (i32.const 0)"
+           "                                        (i32.const 640) (i32.const 8)"
+           "                                        (i32.const 1632)))"
+           "      (call $settle (local.get $ret))"
+           "      (if (i32.ne (i32.load8_u (i32.const 1632)) (i32.const 0)) (then unreachable))"
+           "      (if (i64.ne (i64.load (i32.const 16))"
+           "                  (i64.load (i32.const 1640)))"
+           "          (then unreachable))"
+           "      (if (i64.ne (i64.load (i32.const 24))"
+           "                  (i64.load (i32.const 1648)))"
+           "          (then unreachable))"
+           ;; the hard link raises out.txt's link count to 2
+           "      (local.set $ret (call $statat (local.get $pre) (i32.const 0)"
+           "                                    (i32.const 640) (i32.const 8)"
+           "                                    (i32.const 400)))"
+           "      (call $settle (local.get $ret))"
+           "      (if (i32.ne (i32.load8_u (i32.const 400)) (i32.const 0)) (then unreachable))"
+           "      (if (i32.ne (i32.load8_u (i32.const 408)) (i32.const 5)) (then unreachable))"
+           "      (if (i32.ne (i32.load (i32.const 424)) (i32.const 2)) (then unreachable))"
+           ;; unlink the hard link: gone, with no-entry afterwards
+           "      (local.set $ret (call $unlink (local.get $pre) (i32.const 640)"
+           "                                    (i32.const 8) (i32.const 8)))"
+           "      (call $settle (local.get $ret))"
+           "      (if (i32.ne (i32.load8_u (i32.const 8)) (i32.const 0)) (then unreachable))"
+           "      (local.set $ret (call $statat (local.get $pre) (i32.const 0)"
+           "                                    (i32.const 640) (i32.const 8)"
+           "                                    (i32.const 400)))"
+           "      (call $settle (local.get $ret))"
+           "      (if (i32.ne (i32.load8_u (i32.const 400)) (i32.const 1)) (then unreachable))"
+           "      (if (i32.ne (i32.load8_u (i32.const 408)) (i32.const 19)) (then unreachable))"
+           "      (call $fdrop (local.get $fd3))"
+           ;; 7h. set-size on a fresh "size.txt": scalar shape (self,
+           ;; size, retptr). Growing an empty file to 10 fills zeros;
+           ;; shrinking to 4 keeps the first four bytes.
+           "      (i32.store (i32.const 32) (local.get $pre))"
+           "      (i32.store8 (i32.const 36) (i32.const 0))"
+           "      (i32.store (i32.const 40) (i32.const 660))"
+           "      (i32.store (i32.const 44) (i32.const 8))"
+           "      (i32.store8 (i32.const 48) (i32.const 9))"
+           "      (i32.store8 (i32.const 49) (i32.const 3))"
+           "      (local.set $ret (call $openat (i32.const 32) (i32.const 8)))"
+           "      (call $settle (local.get $ret))"
+           "      (if (i32.ne (i32.load8_u (i32.const 8)) (i32.const 0)) (then unreachable))"
+           "      (local.set $fd3 (i32.load (i32.const 12)))"
+           "      (local.set $ret (call $setsize (local.get $fd3) (i64.const 10)"
+           "                                    (i32.const 8)))"
+           "      (call $settle (local.get $ret))"
+           "      (if (i32.ne (i32.load8_u (i32.const 8)) (i32.const 0)) (then unreachable))"
+           "      (local.set $ret (call $stat (local.get $fd3) (i32.const 400)))"
+           "      (call $settle (local.get $ret))"
+           "      (if (i32.ne (i32.load8_u (i32.const 400)) (i32.const 0)) (then unreachable))"
+           "      (if (i32.ne (i32.load8_u (i32.const 408)) (i32.const 5)) (then unreachable))"
+           "      (if (i32.ne (i32.load (i32.const 432)) (i32.const 10)) (then unreachable))"
+           "      (if (i32.ne (i32.load (i32.const 436)) (i32.const 0)) (then unreachable))"
+           ;; the ten bytes read back are ZEROS (the untouched
+           ;; zero-initialized span at 1800 is the expected copy)
+           "      (call $read-span (local.get $fd3) (i32.const 1820)"
+           "                       (i32.const 16) (i64.const 0) (i32.const 10)"
+           "                       (i32.const 1800))"
+           "      (local.set $ret (call $setsize (local.get $fd3) (i64.const 4)"
+           "                                    (i32.const 8)))"
+           "      (call $settle (local.get $ret))"
+           "      (if (i32.ne (i32.load8_u (i32.const 8)) (i32.const 0)) (then unreachable))"
+           "      (local.set $ret (call $stat (local.get $fd3) (i32.const 400)))"
+           "      (call $settle (local.get $ret))"
+           "      (if (i32.ne (i32.load8_u (i32.const 400)) (i32.const 0)) (then unreachable))"
+           "      (if (i32.ne (i32.load (i32.const 432)) (i32.const 4)) (then unreachable))"
+           "      (call $read-span (local.get $fd3) (i32.const 1820)"
+           "                       (i32.const 16) (i64.const 0) (i32.const 4)"
+           "                       (i32.const 1800))"
+           "      (call $fdrop (local.get $fd3))"
+           "      (local.set $ret (call $unlink (local.get $pre) (i32.const 660)"
+           "                                    (i32.const 8) (i32.const 8)))"
+           "      (call $settle (local.get $ret))"
+           "      (if (i32.ne (i32.load8_u (i32.const 8)) (i32.const 0)) (then unreachable))"
+           ;; 7i. set-times: 7 flat params (self + two 3-slot variants)
+           ;; exceed 4, so the params tuple is addressed at 1400:
+           ;; self@0; each new-timestamp is a 24-byte variant (disc u8
+           ;; @+0, the instant payload at +8: seconds u64 @+8,
+           ;; nanoseconds u32 @+16), the second at tuple+32. The
+           ;; timestamp case is discriminant 2; both timestamps are set
+           ;; to the same fixed instant so the access and modification
+           ;; readings agree regardless of which the provider reports.
+           "      (i32.store (i32.const 1400) (local.get $fd))"
+           "      (i32.store8 (i32.const 1408) (i32.const 2))"
+           "      (i64.store (i32.const 1416) (i64.const 1500000000))"
+           "      (i32.store (i32.const 1424) (i32.const 0))"
+           "      (i32.store8 (i32.const 1432) (i32.const 2))"
+           "      (i64.store (i32.const 1440) (i64.const 1500000000))"
+           "      (i32.store (i32.const 1448) (i32.const 0))"
+           "      (local.set $ret (call $settimes (i32.const 1400) (i32.const 8)))"
+           "      (call $settle (local.get $ret))"
+           "      (if (i32.ne (i32.load8_u (i32.const 8)) (i32.const 0)) (then unreachable))"
+           ;; 7j. stat: descriptor-stat's three option<instant> fields
+           ;; are at 440/464/488 (disc u8, instant payload at +8:
+           ;; seconds u64, nanoseconds u32). Access and modification
+           ;; must be the exact instant set above; the status change is
+           ;; only required to be present and not older (POSIX gives it
+           ;; the now the futimens itself caused).
+           "      (local.set $ret (call $stat (local.get $fd) (i32.const 400)))"
+           "      (call $settle (local.get $ret))"
+           "      (if (i32.ne (i32.load8_u (i32.const 400)) (i32.const 0)) (then unreachable))"
+           "      (if (i32.ne (i32.load8_u (i32.const 408)) (i32.const 5)) (then unreachable))"
+           "      (if (i32.ne (i32.load (i32.const 424)) (i32.const 1)) (then unreachable))"
+           "      (if (i32.ne (i32.load (i32.const 432)) (i32.const 22)) (then unreachable))"
+           "      (if (i32.ne (i32.load8_u (i32.const 440)) (i32.const 1)) (then unreachable))"
+           "      (if (i32.ne (i32.load (i32.const 448)) (i32.const 1500000000)) (then unreachable))"
+           "      (if (i32.ne (i32.load (i32.const 452)) (i32.const 0)) (then unreachable))"
+           "      (if (i32.ne (i32.load (i32.const 456)) (i32.const 0)) (then unreachable))"
+           "      (if (i32.ne (i32.load8_u (i32.const 464)) (i32.const 1)) (then unreachable))"
+           "      (if (i32.ne (i32.load (i32.const 472)) (i32.const 1500000000)) (then unreachable))"
+           "      (if (i32.ne (i32.load (i32.const 476)) (i32.const 0)) (then unreachable))"
+           "      (if (i32.ne (i32.load (i32.const 480)) (i32.const 0)) (then unreachable))"
+           "      (if (i32.ne (i32.load8_u (i32.const 488)) (i32.const 1)) (then unreachable))"
+           "      (if (i32.lt_u (i32.load (i32.const 496)) (i32.const 1500000000)) (then unreachable))"
+           ;; 7k. set-times-at on hello.txt: 10 flat params collapse to
+           ;; the params tuple at 1400 (self@0, path-flags u8@4, path
+           ;; ptr@8/len@12, atime variant @16, mtime variant @40).
+           "      (i32.store (i32.const 1400) (local.get $pre))"
+           "      (i32.store8 (i32.const 1404) (i32.const 0))"
+           "      (i32.store (i32.const 1408) (i32.const 64))"
+           "      (i32.store (i32.const 1412) (i32.const 9))"
+           "      (i32.store8 (i32.const 1416) (i32.const 2))"
+           "      (i64.store (i32.const 1424) (i64.const 1500000000))"
+           "      (i32.store (i32.const 1432) (i32.const 0))"
+           "      (i32.store8 (i32.const 1440) (i32.const 2))"
+           "      (i64.store (i32.const 1448) (i64.const 1500000000))"
+           "      (i32.store (i32.const 1456) (i32.const 0))"
+           "      (local.set $ret (call $settimesat (i32.const 1400) (i32.const 8)))"
+           "      (call $settle (local.get $ret))"
+           "      (if (i32.ne (i32.load8_u (i32.const 8)) (i32.const 0)) (then unreachable))"
+           "      (local.set $ret (call $statat (local.get $pre) (i32.const 0)"
+           "                                    (i32.const 64) (i32.const 9)"
+           "                                    (i32.const 400)))"
+           "      (call $settle (local.get $ret))"
+           "      (if (i32.ne (i32.load8_u (i32.const 400)) (i32.const 0)) (then unreachable))"
+           "      (if (i32.ne (i32.load8_u (i32.const 408)) (i32.const 5)) (then unreachable))"
+           "      (if (i32.ne (i32.load8_u (i32.const 440)) (i32.const 1)) (then unreachable))"
+           "      (if (i32.ne (i32.load (i32.const 448)) (i32.const 1500000000)) (then unreachable))"
+           "      (if (i32.ne (i32.load (i32.const 464)) (i32.const 1)) (then unreachable))"
+           "      (if (i32.ne (i32.load (i32.const 472)) (i32.const 1500000000)) (then unreachable))"
+           ;; 7l. symlink-at(preopen, "hello.txt", "hello.sym"): 5 flat
+           ;; params exceed 4, so the params tuple is (self@0, old
+           ;; ptr@4/len@8, new ptr@12/len@16). readlink-at then returns
+           ;; the target string through the +4 payload (ptr@+4,
+           ;; len@+8). An ABSOLUTE target is not-permitted (case 30) —
+           ;; an err result, checked before creation.
+           "      (i32.store (i32.const 1400) (local.get $pre))"
+           "      (i32.store (i32.const 1404) (i32.const 64))"
+           "      (i32.store (i32.const 1408) (i32.const 9))"
+           "      (i32.store (i32.const 1412) (i32.const 648))"
+           "      (i32.store (i32.const 1416) (i32.const 9))"
+           "      (local.set $ret (call $symlink (i32.const 1400) (i32.const 8)))"
+           "      (call $settle (local.get $ret))"
+           "      (if (i32.ne (i32.load8_u (i32.const 8)) (i32.const 0)) (then unreachable))"
+           "      (local.set $ret (call $readlink (local.get $pre) (i32.const 648)"
+           "                                     (i32.const 9) (i32.const 8)))"
+           "      (call $settle (local.get $ret))"
+           "      (if (i32.ne (i32.load8_u (i32.const 8)) (i32.const 0)) (then unreachable))"
+           "      (if (i32.ne (i32.load (i32.const 16)) (i32.const 9)) (then unreachable))"
+           "      (if (i32.eqz (call $streq (i32.load (i32.const 12))"
+           "                                (i32.const 64) (i32.const 9)))"
+           "          (then unreachable))"
+           ;; readlink of a REGULAR file is ERR/invalid (case 11)
+           "      (local.set $ret (call $readlink (local.get $pre) (i32.const 512)"
+           "                                     (i32.const 7) (i32.const 8)))"
+           "      (call $settle (local.get $ret))"
+           "      (if (i32.ne (i32.load8_u (i32.const 8)) (i32.const 1)) (then unreachable))"
+           "      (if (i32.ne (i32.load8_u (i32.const 12)) (i32.const 11)) (then unreachable))"
+           "      (i32.store (i32.const 1400) (local.get $pre))"
+           "      (i32.store (i32.const 1404) (i32.const 672))"
+           "      (i32.store (i32.const 1408) (i32.const 4))"
+           "      (i32.store (i32.const 1412) (i32.const 680))"
+           "      (i32.store (i32.const 1416) (i32.const 7))"
+           "      (local.set $ret (call $symlink (i32.const 1400) (i32.const 8)))"
+           "      (call $settle (local.get $ret))"
+           "      (if (i32.ne (i32.load8_u (i32.const 8)) (i32.const 1)) (then unreachable))"
+           "      (if (i32.ne (i32.load8_u (i32.const 12)) (i32.const 30)) (then unreachable))"
+           ;; 7m. stat-at's symlink-follow policy on hello.sym: no
+           "      ;;      follow reports symbolic-link (4) and the TARGET's"
+           "      ;;      length (9) as size; symlink-follow (flag 1) reports"
+           "      ;;      the target regular-file (5) and ITS size (17)."
+           "      (local.set $ret (call $statat (local.get $pre) (i32.const 0)"
+           "                                    (i32.const 648) (i32.const 9)"
+           "                                    (i32.const 400)))"
+           "      (call $settle (local.get $ret))"
+           "      (if (i32.ne (i32.load8_u (i32.const 400)) (i32.const 0)) (then unreachable))"
+           "      (if (i32.ne (i32.load8_u (i32.const 408)) (i32.const 4)) (then unreachable))"
+           "      (if (i32.ne (i32.load (i32.const 432)) (i32.const 9)) (then unreachable))"
+           "      (local.set $ret (call $statat (local.get $pre) (i32.const 1)"
+           "                                    (i32.const 648) (i32.const 9)"
+           "                                    (i32.const 400)))"
+           "      (call $settle (local.get $ret))"
+           "      (if (i32.ne (i32.load8_u (i32.const 400)) (i32.const 0)) (then unreachable))"
+           "      (if (i32.ne (i32.load8_u (i32.const 408)) (i32.const 5)) (then unreachable))"
+           "      (if (i32.ne (i32.load (i32.const 432)) (i32.const 17)) (then unreachable))"
+           ;; the symlink and the reopened out.txt descriptor are both
+           ;; temporary; every object this block created is removed so
+           ;; the repeats share the workdir
+           "      (local.set $ret (call $unlink (local.get $pre) (i32.const 648)"
+           "                                    (i32.const 9) (i32.const 8)))"
+           "      (call $settle (local.get $ret))"
+           "      (if (i32.ne (i32.load8_u (i32.const 8)) (i32.const 0)) (then unreachable))"
+           "      (call $fdrop (local.get $fd))"
            "      (call $fdrop (local.get $dir))"
            ;; 7. the preopen's own handle goes too
            "      (call $fdrop (local.get $pre))"
@@ -2147,6 +2770,20 @@
            "          (export \"rename-at\" (func $rename-lowered))"
            "          (export \"unlink-file-at\" (func $unlink-lowered))"
            "          (export \"remove-directory-at\" (func $rmdir-lowered))"
+           "          (export \"advise\" (func $advise-lowered))"
+           "          (export \"sync\" (func $sync-lowered))"
+           "          (export \"sync-data\" (func $syncdata-lowered))"
+           "          (export \"get-flags\" (func $getflags-lowered))"
+           "          (export \"get-type\" (func $gettype-lowered))"
+           "          (export \"set-size\" (func $setsize-lowered))"
+           "          (export \"set-times\" (func $settimes-lowered))"
+           "          (export \"set-times-at\" (func $settimesat-lowered))"
+           "          (export \"link-at\" (func $linkat-lowered))"
+           "          (export \"readlink-at\" (func $readlink-lowered))"
+           "          (export \"symlink-at\" (func $symlink-lowered))"
+           "          (export \"is-same-object\" (func $issame-lowered))"
+           "          (export \"metadata-hash\" (func $metahash-lowered))"
+           "          (export \"metadata-hash-at\" (func $metahashat-lowered))"
            "          (export \"task.return\" (func $tr))"
            "          (export \"waitable-set.new\" (func $wsnew))"
            "          (export \"waitable.join\" (func $wjoin))"
