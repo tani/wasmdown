@@ -217,15 +217,29 @@
 (defun %sbcl-version ()
   (lisp-implementation-version))
 
-(defun %source-commit ()
+(defun %git-line (args)
   (handler-case
-      (let* ((out (uiop:run-program '("git" "rev-parse" "HEAD")
+      (let* ((out (uiop:run-program (cons "git" args)
                                     :output :string
                                     :error-output nil
                                     :directory (namestring *root*)))
              (trimmed (string-trim '(#\Space #\Newline #\Return #\Tab) out)))
         (if (plusp (length trimmed)) trimmed "unknown"))
     (error () "unknown")))
+
+(defun %source-commit () (%git-line '("rev-parse" "HEAD")))
+(defun %source-tree () (%git-line '("rev-parse" "HEAD^{tree}")))
+(defun %clean-tree-p ()
+  "True when the tested working tree was clean BEFORE this run wrote its
+artifacts; computed at summary time, so the report's own writes do not
+count against it."
+  (handler-case
+      (zerop (length (string-trim '(#\Space #\Newline #\Return #\Tab)
+                                  (uiop:run-program '("git" "status" "--porcelain")
+                                                    :output :string
+                                                    :error-output nil
+                                                    :directory (namestring *root*)))))
+    (error () nil)))
 
 (defun %now-utc ()
   (multiple-value-bind (s m h day month year)
@@ -356,6 +370,8 @@
     (format s " \"files_arg\":~a,~%" (%json-string (getf options :files)))
     (format s " \"sbcl_version\":~a,~%" (%json-string (%sbcl-version)))
     (format s " \"source_commit\":~a,~%" (%json-string (%source-commit)))
+    (format s " \"source_tree\":~a,~%" (%json-string (%source-tree)))
+    (format s " \"clean_tree\":~a,~%" (if (%clean-tree-p) "true" "false"))
     (format s " \"files\":[~%")
     (loop for cell in (getf run :per-file)
           for first = t then nil

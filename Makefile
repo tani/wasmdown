@@ -9,9 +9,16 @@ LISP_FILES := $(wildcard src/*.lisp)
         report-backend-inventory test-backend-inventory \
         report-backends-bench \
         test-upstream test-wasi-preview1 test-wasi-preview2 test-wasi \
-        report-conformance p3-fixtures test-wasi-preview3 \
+        report-conformance p3-fixtures test-wasi-preview3 verify \
         clean \
         load-system repl wasi-fixtures
+
+# Reproducible quick gate: the deterministic lanes that must be green on
+# any change. Compiled large-guest lanes stay report-only. ~2.5 min.
+verify: test-unit test-component test-backend-parity test-backend-inventory \
+	test-wasi test-wasi-preview3
+	$(SBCL) --script tools/build-p3-fixtures.lisp --check
+	@echo "verify: all quick gates green"
 
 all: test
 

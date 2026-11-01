@@ -61,6 +61,6 @@ compiled runs are report evidence rather than a gate.
   `tools/run-wasi-suite.py --abi preview3` selects that ABI explicitly and
   FAILS on the missing fixture (never skips); `--abi all` covers the two
   released ABIs only.
-- **`values/post-return.wast`.** Still excluded from the component lane:
-  62 pass / 9 fail, the failures being post-return trap semantics the runtime
-  does not model (see [`status.md`](../status.md) “Known gaps”).
+- **`values/post-return.wast`** is no longer excluded: post-return isolation
+  is implemented, the file passes 71/71, and the component lane denominator
+  moved from 1,631 to 1,702 commands.

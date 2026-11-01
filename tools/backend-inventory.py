@@ -78,7 +78,7 @@ def run_helper():
 
 def parse_records(records):
     data = {
-        "sbcl": None, "commit": None,
+        "sbcl": None, "commit": None, "tree": None, "clean": None,
         "p1_sig": [], "p1_impl": [],
         "p2_vend": {}, "p2_bound": {}, "p2_export": {},
         "p3_vend": [], "p3_bound": [], "p3_export": [],
@@ -108,6 +108,9 @@ def parse_records(records):
             data["p3_bound"].append(row[2])
         elif kind == "P3-EXPORT":
             data["p3_export"].append(row[2])
+    _commit, tree, clean = read_source()
+    data["tree"] = tree
+    data["clean"] = clean
     return data
 
 
@@ -310,6 +313,24 @@ def opcode_section():
     }
 
 
+def git_field(*args):
+    try:
+        out = subprocess.run(("git",) + args, capture_output=True, text=True,
+                             cwd=ROOT, check=False)
+        return out.stdout.strip() or "unknown"
+    except OSError:
+        return "unknown"
+
+
+def read_source():
+    """Commit, tree hash and whether the tested tree was clean when the
+    measurement started (this script writes artifacts afterwards)."""
+    commit = git_field("rev-parse", "HEAD")
+    tree = git_field("rev-parse", "HEAD^{tree}")
+    clean = git_field("status", "--porcelain") in ("", "unknown")
+    return commit, tree, clean
+
+
 def build_document(data):
     p1 = p1_section(data)
     p2 = p2_section(data)
@@ -320,6 +341,8 @@ def build_document(data):
                         .strftime("%Y-%m-%dT%H:%M:%SZ"),
         "sbcl_version": data["sbcl"],
         "source_commit": data["commit"],
+        "source_tree": data["tree"],
+        "clean_tree": data["clean"],
         "pins": read_pins(),
         "definitions": {
             "pinned_interfaces": "every interface parsed out of the vendored "

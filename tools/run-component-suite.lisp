@@ -321,6 +321,26 @@ parent dir), not the first (the grandparent 'component' — the old
                                  (file-namestring f))))))
 (when *jsonl* (wasmdown.wast:write-jsonl *results* *jsonl* "component"))
 
+;;; ---- tested source identity ----
+
+(defun %git-line (args)
+  (handler-case
+      (let ((out (uiop:run-program (cons "git" args)
+                                   :output :string :error-output nil
+                                   :directory (namestring *root*))))
+        (let ((trimmed (string-trim '(#\Space #\Newline #\Return #\Tab) out)))
+          (if (plusp (length trimmed)) trimmed "unknown")))
+    (error () "unknown")))
+
+(defun %source-line ()
+  (format nil "- Tested source: commit `~a`, tree `~a`, ~a~%"
+          (%git-line '("rev-parse" "HEAD"))
+          (%git-line '("rev-parse" "HEAD^{tree}"))
+          (if (string= "unknown" (%git-line '("status" "--porcelain")))
+              "clean tree"
+              (if (zerop (length (%git-line '("status" "--porcelain"))))
+                  "clean tree" "dirty tree — see the commit/tree for provenance"))))
+
 ;;; ---- report ----
 
 (defun outcome-counts (results)
@@ -361,6 +381,7 @@ parent dir), not the first (the grandparent 'component' — the old
           (format s "harness-error, timeout, skip, or census mismatch (a planned file that~%")
           (format s "contributed no commands, a duplicate command, an unknown outcome).~%")
           (format s "The denominator printed below is the number of commands EXECUTED.~%~%")))
+    (write-string (%source-line) s)
     (format s "- Pinned suite: WebAssembly/component-model `d095e2f60ddae1f9a1e9b1e2fb547ec1114da677` (2026-10-24, specs/lock.toml)~%")
     (format s "- Scope: the whole vendored component suite in {binary, validation,~%")
     (format s "  linking, values, async} minus the entries in tests/component/nyi.txt~%")

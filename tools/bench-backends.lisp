@@ -237,27 +237,63 @@ values (decode/validate of a tiny module is not 0 ms)."
                   (getf b :result)))))
     (format s "~%Regenerate: `sbcl --script tools/bench-backends.lisp --commit`~%")))
 
-(defun %json (rows)
+(defun %git-field (args)
+  (string-trim '(#\space #\tab #\newline)
+               (with-output-to-string (out)
+                 (ignore-errors
+                   (sb-ext:run-program "git" args :output out :error nil
+                                       :search t)))))
+
+(defun %source-record ()
+  "The tested source identity: commit, tree hash, and whether the tested
+working tree was clean. A report generated from uncommitted changes says
+so instead of naming a commit that does not contain the code."
+  (let* ((commit (%git-field '("rev-parse" "HEAD")))
+         (tree (%git-field '("rev-parse" "HEAD^{tree}")))
+         (status (%git-field '("status" "--porcelain"))))
+    (values (if (plusp (length commit)) commit "unknown")
+            (if (plusp (length tree)) tree "unknown")
+            (zerop (length status)))))
+
+(defun %json-str (string)
+  "STRING as a JSON string literal."
   (with-output-to-string (s)
-    (format s "{\"schema\":\"wasmdown.backend-bench.v1\",\"sbcl\":~s,\"repeat\":~d,\"fixtures\":["
-            (lisp-implementation-version) *repeat*)
-    (loop for row in rows
-          for first = t then nil
-          do (unless first (format s ","))
-             (format s "{\"fixture\":~s,\"decode_s\":~,6f,\"validate_s\":~,6f,\"backends\":["
-                     (getf row :fixture) (getf row :decode_seconds)
-                     (getf row :validate_seconds))
-             (loop for b in (getf row :backends)
-                   for bfirst = t then nil
-                   do (unless bfirst (format s ","))
-                      (format s "{\"mode\":~s,\"instantiate_s\":~,6f,\"instantiate_consed\":~d,\"run_s\":~,6f,\"result\":~s}"
-                              (getf b :mode)
-                              (getf b :instantiate_seconds)
-                              (or (getf b :instantiate_consed) 0)
-                              (getf b :run_seconds)
-                              (getf b :result)))
-             (format s "]}"))
-    (format s "]}")))
+    (write-char #\" s)
+    (loop for ch across (princ-to-string string)
+          do (case ch
+               (#\" (write-string "\\\"" s))
+               (#\\ (write-string "\\\\" s))
+               (#\Newline (write-string "\\n" s))
+               (t (write-char ch s))))
+    (write-char #\" s)))
+
+(defun %mode-name (mode) (string-downcase (symbol-name mode)))
+
+(defun %json (rows)
+  (multiple-value-bind (commit tree clean) (%source-record)
+    (with-output-to-string (s)
+      (format s "{\"schema\":\"wasmdown.backend-bench.v1\",\"sbcl\":~a,\"repeat\":~d,\"source_commit\":~a,\"source_tree\":~a,\"clean_tree\":~a,\"fixtures\":["
+              (%json-str (lisp-implementation-version)) *repeat*
+              (%json-str commit) (%json-str tree)
+              (if clean "true" "false"))
+      (loop for row in rows
+            for first = t then nil
+            do (unless first (format s ","))
+               (format s "{\"fixture\":~a,\"decode_s\":~,6f,\"validate_s\":~,6f,\"backends\":["
+                       (%json-str (getf row :fixture))
+                       (getf row :decode_seconds)
+                       (getf row :validate_seconds))
+               (loop for b in (getf row :backends)
+                     for bfirst = t then nil
+                     do (unless bfirst (format s ","))
+                        (format s "{\"mode\":\~a,\"instantiate_s\":~,6f,\"instantiate_consed\":~d,\"run_s\":~,6f,\"result\":~a}"
+                                (%json-str (%mode-name (getf b :mode)))
+                                (getf b :instantiate_seconds)
+                                (or (getf b :instantiate_consed) 0)
+                                (getf b :run_seconds)
+                                (%json-str (getf b :result))))
+               (format s "]}"))
+      (format s "]}"))))
 
 ;;; ---------------------------------------------------------------
 ;;; Main.

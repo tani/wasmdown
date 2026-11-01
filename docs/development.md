@@ -24,6 +24,7 @@ upstream lanes drive the WAST runner under SBCL.
 | Target | Runs | Kind | Notes |
 | --- | --- | --- | --- |
 | `all` | `test` | utility | Default target; alias of `test`. |
+| `verify` | unit, component, parity gate, inventory check, `test-wasi`, P3 lane, P3 fixture hash | gate | Reproducible quick gate: the deterministic lanes that must be green on any change (~2.5 min). Compiled large-guest lanes stay report-only. |
 | `test` | `test-unit` | utility | Alias. |
 | `test-unit` | `sbcl --script tools/run-tests.lisp` | gate | Units and integration tests in one process: ~663 tests, ~8 s. Non-zero exit on any failure. |
 | `test-spec-core` | `sbcl … --script tools/run-spec-core.lisp` | baseline | Pinned core `.wast` suite through the stateful WAST runner. Regenerates [`conformance/core.md`](conformance/core.md) and `tests/spec-core-results.jsonl`. Runs in ~3 s; a slow or hanging run is a bug. |
