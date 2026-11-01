@@ -15,7 +15,7 @@ deliberately incomplete, and what will not be built. Measurements live in
 | Frontend | Core text format (`.wat`) | Full | Produces the binary decoder's IR for the whole implemented opcode set. |
 | Frontend | Spec scripts (`.wast`) | Full | Commands, assertions and failure-phase classification run against shared script state. |
 | Frontend | Component text | Full | Parses the pinned validation suite's grammar into the component IR. |
-| Frontend | WIT reader | Partial | World `include`, `implements`/`external-id` and nominal resource typing are not read. |
+| Frontend | WIT reader | Full (pinned grammar) | World `include`/renaming, named `implements` and positional `@external-id` bindings, and nominal resource identity are parsed, resolved and pinned by tests (`tests/wit.lisp`: include-of-includes, rename equivalence, resource nominal identity across interfaces). Residual validator limits are tracked per case, not as a blanket WIT gap. |
 | Validation | Core validation | Full | Operand/control-stack algorithm with unreachable polymorphism over the declared scope. |
 | Validation | Component validation | Full | Label, index, canon, type-identity and instantiation-matching rules pass the pinned suite. |
 | Validation | Component type-use limits | Partial | Compound outer refs in imported-instance functypes are rejected by the text/validator front end. |
