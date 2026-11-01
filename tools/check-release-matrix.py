@@ -25,6 +25,7 @@ its source commit; 1 otherwise (each failing row is printed).
 """
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -164,9 +165,10 @@ def main():
     failures = 0
     print("%-*s  %-6s  %s" % (width, "row", "state", "evidence"))
     for row, ok, detail in rows:
-        state = "OK" if ok else ("n/a" if ok is None else "FAIL")
-        if ok is False and detail.startswith("source ") and ancestor(detail[7:19]):
+        m = re.search(r"source ([0-9a-f]{12})", detail)
+        if ok is False and m and ancestor(m.group(1)):
             ok, detail = True, detail + " (artifact commit predates HEAD)"
+        state = "OK" if ok else ("n/a" if ok is None else "FAIL")
         if ok is False:
             failures += 1
         print("%-*s  %-6s  %s" % (width, row, state, detail))
