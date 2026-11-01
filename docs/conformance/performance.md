@@ -23,3 +23,22 @@ one-shot cost per instantiation, not part of the run.
 | indirect-call | 2 | COMPILED | 5.0 us | 4.0 us | 1.43 ms | 1.3 MiB | 99.04 ms | `(500000)` |
 
 Regenerate: `sbcl --script tools/bench-backends.lisp --commit`
+
+## Compile-cost microbench and the policy experiment
+
+`tools/compile-cost.lisp` compiles N generated functions (loop + locals +
+branch + memory ops) and reports wall time and bytes consed, isolating the
+cost of SBCL compiling one emitted lambda:
+
+```
+300 functions, 24099 bytes
+  compile 0.20s  consed 212.0 MiB  (0.7 ms/func)
+```
+
+The recorded **negative** experiment: adding `(debug 0) (space 3)` to the
+emitted lambda's `optimize` declaration moved this to 0.19 s / 209.6 MiB
+(-1.2 % consing). The policy lever was measured and reverted; a reduction
+must come from the emitted form itself (temp-slot count / tagbody size),
+not from SBCL policy settings. The SQLite fixture's ~98 ms/function is the
+same phenomenon at real sizes (2039 functions, 8 GiB), so this microbench
+is the cheap proxy for that work.
