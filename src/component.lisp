@@ -7074,6 +7074,98 @@ indices are the child's own). NIL when unresolvable."
                                (third pl))
                  :offset (ct-offset ft)))))))
 
+(defun %materialize-component-ct (c view)
+  "Shape recovery for an OUTER-alias target: CT was read from VIEW's
+type space, so its nested (:idx . k) references index VIEW — NOT the
+declarator space of the imported instance the remap started in. Walk
+VIEW's entries owner-qualified (a nested outer alias switches to its
+declared owner; an eq-bound type follows its same-space target), and
+substitute every reachable reference with its ct. This also covers
+owner views that are themselves INSTANCE-CLASS DECLARATOR spaces,
+whose entries are alias descriptors rather than cts. Unresolvable
+references stay raw. Used only by %remap-decl-functype's
+owner-qualified alias arm."
+  (labels
+      ((walk-ref (k v)
+         (let ((entry (%type-view-entry-at v k)))
+           (cond
+            ((ct-p entry) (walk-ct entry v))
+            ((consp entry)
+             (case (car entry)
+               (:outer-alias
+                (let* ((alias (cdr entry))
+                       (owner (%declarator-owner
+                               v (aliasrec-count alias))))
+                  (if owner
+                      (walk-ref (aliasrec-target alias) owner)
+                      (cons :idx k))))
+               (:type-bound
+                (let ((bound (cdr entry)))
+                  (cond
+                   ((eq bound :sub-resource)
+                    (make-ct :kind :resource :payload '(0 . nil)
+                             :offset 0))
+                   ((and (listp bound) (eq (car bound) :eq))
+                    (walk-ref (second bound) v))
+                   (t (cons :idx k)))))
+               (t (cons :idx k))))
+            (t (cons :idx k)))))
+       (walk (vt v)
+         (cond
+          ((and (consp vt) (eq (car vt) :idx)
+                (integerp (cdr vt)))
+           (walk-ref (cdr vt) v))
+          ((ct-p vt) (walk-ct vt v))
+          (t vt)))
+       (walk-ct (c v)
+         (case (ct-kind c)
+           (:prim c)
+           (:list
+            (make-ct :kind :list
+                     :payload (cons (walk (car (ct-payload c)) v)
+                                    (cdr (ct-payload c)))
+                     :offset (ct-offset c)))
+           (:record
+            (make-ct :kind :record
+                     :payload (coerce
+                               (loop for (l . fvt) across (ct-payload c)
+                                     collect (cons l (walk fvt v)))
+                               'vector)
+                     :offset (ct-offset c)))
+           (:tuple
+            (make-ct :kind :tuple
+                     :payload (coerce
+                               (loop for t_ across (ct-payload c)
+                                     collect (walk t_ v))
+                               'vector)
+                     :offset (ct-offset c)))
+           (:variant
+            (make-ct :kind :variant
+                     :payload (coerce
+                               (loop for (l . cvt) across (ct-payload c)
+                                     collect (cons l
+                                                   (and cvt (walk cvt v))))
+                               'vector)
+                     :offset (ct-offset c)))
+           (:option
+            (make-ct :kind :option
+                     :payload (walk (ct-payload c) v)
+                     :offset (ct-offset c)))
+           (:result
+            (make-ct :kind :result
+                     :payload (cons (and (car (ct-payload c))
+                                         (walk (car (ct-payload c)) v))
+                                    (and (cdr (ct-payload c))
+                                         (walk (cdr (ct-payload c)) v)))
+                     :offset (ct-offset c)))
+           (:map
+            (make-ct :kind :map
+                     :payload (cons (walk (car (ct-payload c)) v)
+                                    (walk (cdr (ct-payload c)) v))
+                     :offset (ct-offset c)))
+           (t c))))
+    (if (ct-p c) (walk-ct c view) c)))
+
 (defun %remap-decl-functype (ft inst-idx ict &optional view)
   "M9 (linking ::90): a functype read out of an IMPORTED instance's
 declarator space — its (:idx . k) valtype payloads reference the
@@ -7114,7 +7206,10 @@ bounds')."
                     (:type
                      (incf n)
                      (when (= n k)
-                       (return-from entry-at (typedecl-payload td))))
+                       ;; the ct was defined IN the declarator space:
+                       ;; its own nested refs index THIS space
+                       (return-from entry-at
+                         (values (typedecl-payload td) (decl-view)))))
                     ((:alias :import)
                      (incf n)
                      (when (= n k)
@@ -7159,7 +7254,18 @@ bounds')."
                                        dv (aliasrec-count a)))
                                      (make-hash-table)))
                            (%verr "transitively refers to resources"))
-                         (return-from entry-at raw))))
+                         ;; the alias SWITCHES the owner: RAW's nested
+                         ;; refs index the owner's space, never ICT's
+                         ;; declarator space. Return that owner with the
+                         ;; ct so the recursive materialization uses it
+                         ;; (the old single-value read deindexed the
+                         ;; outer tuple's refs in ICT's space and could
+                         ;; resolve an unrelated same-numbered type).
+                         (return-from entry-at
+                           (values raw
+                                   (or (%declarator-owner
+                                        dv (aliasrec-count a))
+                                       dv))))))
                     (:export
                      ;; every EXPORT introduces an index too (the
                      ;; ORIGINAL counted all four kinds — the
@@ -7176,15 +7282,18 @@ bounds')."
                      (when (= n k)
                        (let* ((et (third (typedecl-payload td))))
                          (return-from entry-at
-                           (and (consp et) (eq (car et) :type)
-                                (let* ((bound (cdr et))
-                                       (m (and (listp bound)
-                                               (eq (car bound) :eq)
-                                               (second bound))))
-                                  (and m
-                                       (deindex-ct (entry-at m)))))))))
+                           (if (and (consp et) (eq (car et) :type))
+                               (let* ((bound (cdr et))
+                                      (m (and (listp bound)
+                                              (eq (car bound) :eq)
+                                              (second bound))))
+                                 (if m
+                                     (entry-at m)
+                                     (values nil (decl-view))))
+                               (values nil (decl-view)))))))
                     (t nil)))
-               finally (return-from entry-at nil)))
+               finally (return-from entry-at
+                         (values nil (decl-view)))))
        (deindex-ct (c)
          "Values lane (variants.wast): a declarator entry's ct may
 itself carry (:idx . m) refs — inline expressions interned into the
@@ -7269,8 +7378,14 @@ exportdecls."
          (if (not (and (consp vt) (eq (car vt) :idx)
                        (integerp (cdr vt))))
              vt
-             (let* ((k (cdr vt))
-                    (e (deindex-ct (entry-at k)))
+             (multiple-value-bind (raw owner) (entry-at (cdr vt))
+              (let* ((k (cdr vt))
+                    ;; a ct from an OUTER owner is materialized against
+                    ;; THAT owner's component space; a declarator-local
+                    ;; entry is deindexed through the declarator remap
+                    (e (if (and owner (not (eq owner (decl-view))))
+                           (%materialize-component-ct raw owner)
+                           (deindex-ct raw)))
                     ;; the interned own/borrow entry's payload is the
                     ;; OWNED type's declarator-space index
                     (m (and (ct-p e)
@@ -7301,7 +7416,7 @@ exportdecls."
                  e)
                 (target
                  (if (integerp target) (cons :idx target) target))
-                (t vt))))))
+                (t vt)))))))
     (if (not (and ft (ct-p ft) (eq (ct-kind ft) :func)))
         ft
         (let* ((pl (ct-payload ft))

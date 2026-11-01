@@ -2852,6 +2852,121 @@ repo root, as a string — the pin runs a fixture row VERBATIM."
                   (eq (wasmdown.wast:wast-result-outcome r) :pass))
                 results))))
 
+(test component/remap-outer-compound-functype-owner
+  ;; §9.3 validator row: an imported-instance functype whose parameter
+  ;; is a COMPOUND type brought in by an outer alias must materialize
+  ;; the compound's nested refs in the OWNER's space, not the
+  ;; declarator space (the old single-value entry-at deindexed a
+  ;; tuple's (:idx . 0) against the instance declarator, resolving an
+  ;; unrelated same-numbered type — a spurious memory requirement or a
+  ;; missed one).
+  (labels ((mk-ct (kind payload)
+             (wasmdown.component::make-ct :kind kind :payload payload
+                                          :offset 0))
+           (mk-decl (kind payload)
+             (wasmdown.component::make-typedecl :kind kind :payload payload))
+           (mk-alias (count target)
+             (wasmdown.component::make-aliasrec
+              :kind :outer :sort :type :count count :target target
+              :name "" :offset 0))
+           (mk-view (ct types &optional (outers nil))
+             (wasmdown.component::make-type-view
+              :ct ct :types types :identities #() :outers outers))
+           (mk-state (types)
+             (wasmdown.component::make-cval :types types))
+           (check (leaf)
+             ;; owner component space: 0 = LEAF, 1 = tuple<LEAF>
+             (let* ((owner (mk-state (vector leaf
+                                             (mk-ct :tuple
+                                                    (vector '(:idx . 0))))))
+                    (owner-view (mk-view owner
+                                         (wasmdown.component::cval-types owner)))
+                    ;; declarator space: 0 = a DIFFERENT decoy type,
+                    ;; 1 = outer alias to owner index 1
+                    (ict (mk-ct :instance
+                                (vector (mk-decl :type
+                                                 (mk-ct :prim :string))
+                                        (mk-decl :alias (mk-alias 1 1)))))
+                    (view (wasmdown.component::%declarator-view
+                           ict owner-view))
+                    (ft (mk-ct :func (list (vector (cons "x" '(:idx . 1)))
+                                           nil nil)))
+                    (out (wasmdown.component::%remap-decl-functype
+                          ft 0 ict view))
+                    (param (cdr (aref (first
+                                       (wasmdown.component::ct-payload out))
+                                      0))))
+               param)))
+    ;; the positive: the owner's tuple<u32>, NOT the declarator's decoy
+    (let ((param (check (mk-ct :prim :u32))))
+      (is (eq :tuple (wasmdown.component::ct-kind param)))
+      (is (eq :u32 (wasmdown.component::ct-payload
+                    (aref (wasmdown.component::ct-payload param) 0)))))
+    ;; the negative direction: a string leaf stays a string (memory is
+    ;; then genuinely required downstream)
+    (let ((param (check (mk-ct :prim :string))))
+      (is (eq :string (wasmdown.component::ct-payload
+                       (aref (wasmdown.component::ct-payload param) 0)))))
+    (flet ((validate-text (text)
+             (wasmdown.component:validate-component
+              (wasmdown.component.text::parse-component-text text))))
+      ;; end-to-end: the decoy-first text must now validate (no memory
+      ;; needed for tuple<u32>), and the real-string text must still
+      ;; reject with the memory requirement.
+      (is (progn
+            (validate-text
+             "(component
+                (type $x u32)
+                (type $t (tuple $x))
+                (import \"i\" (instance $i
+                  (type $shadow string)
+                  (export \"f\" (func (param \"x\" $t)))))
+                (alias export $i \"f\" (func $f))
+                (core func $lower (canon lower (func $f))))")
+            t))
+      (is (handler-case
+              (progn
+                (validate-text
+                 "(component
+                    (type $x string)
+                    (type $t (tuple $x))
+                    (import \"i\" (instance $i
+                      (type $shadow u32)
+                      (export \"f\" (func (param \"x\" $t)))))
+                    (alias export $i \"f\" (func $f))
+                    (core func $lower (canon lower (func $f))))")
+                nil)
+            (wasmdown:validation-error (e)
+              (search "memory" (wasmdown:wasmdown-error-message e)))))
+      ;; the result-position companion: the same outer compound in a
+      ;; RESULT slot resolves in the owner's space (positive), and a
+      ;; string leaf still forces memory (negative)
+      (is (progn
+            (validate-text
+             "(component
+                (type $x u32)
+                (type $t (tuple $x))
+                (import \"i\" (instance $i
+                  (type $shadow string)
+                  (export \"f\" (func (result $t)))))
+                (alias export $i \"f\" (func $f))
+                (core func $lower (canon lower (func $f))))")
+            t))
+      (is (handler-case
+              (progn
+                (validate-text
+                 "(component
+                    (type $x string)
+                    (type $t (tuple $x))
+                    (import \"i\" (instance $i
+                      (type $shadow u32)
+                      (export \"f\" (func (result $t)))))
+                    (alias export $i \"f\" (func $f))
+                    (core func $lower (canon lower (func $f))))")
+                nil)
+            (wasmdown:validation-error (e)
+              (search "memory" (wasmdown:wasmdown-error-message e))))))))
+
 (test component/type-view-owner-pins
   ;; WASI 0.3.2 residuals, plan step 1: a type space is resolved through
   ;; an OWNER-QUALIFIED VIEW (ct, types, identities, outers). A
