@@ -9850,8 +9850,19 @@ is the valtype."
              ;; %task-return holds when it flips resolved-p) and pack
              ;; from the captured values — no second read.
             (let ((ctask (async-subtask-task subtask)))
-              (sb-thread:with-recursive-lock ((async-task-mutex ctask))
-                (setf packed-state
+              (if (null ctask)
+                  ;; A HOST-PENDING callee has no AsyncTask record: the
+                  ;; provider closure ran under ON-START (state STARTED)
+                  ;; and its resolution is delivered by the pump LATER;
+                  ;; there is no task mutex to snapshot under and no
+                  ;; second reader to race. Packing through the mutex
+                  ;; unconditionally dereferenced NIL (the P3 async-lower
+                  ;; probe's TYPE-ERROR).
+                  (setf packed-state (if started-at-flip 1
+                                         (async-subtask-state subtask))
+                        eager-p (%subtask-resolved-p subtask))
+                (sb-thread:with-recursive-lock ((async-task-mutex ctask))
+                  (setf packed-state
                       ;; M14 THE FLIP-TIME PACK: report STARTED when
                       ;; the callee's on_start RAN — the reference's
                       ;; pack (§3715) reads the state before the
@@ -9861,8 +9872,8 @@ is the valtype."
                       ;; change what the CALLER observes at the pack
                       ;; (the resolution delivers at the caller's
                       ;; wait — the SUBTASK event, state RETURNED).
-                      (if started-at-flip 1 (async-subtask-state subtask))
-                      eager-p (%subtask-resolved-p subtask)))))
+                        (if started-at-flip 1 (async-subtask-state subtask))
+                        eager-p (%subtask-resolved-p subtask))))))
          ;; M14: clear the pack window's suppression (the caller's
          ;; observation is complete; the ready spawns run at the
          ;; caller's next blocking op — the fixtures' interleave)

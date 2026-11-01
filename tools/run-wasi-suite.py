@@ -73,6 +73,7 @@ P3_IMPORT = "p3-import-guest.wasm"
 P3_CLOCK = "p3-clock-guest.wasm"
 P3_ASYNC = "p3-async-guest.wasm"
 P3_STREAM = "p3-stream-guest.wasm"
+P3_CANCEL = "p3-cancel-guest.wasm"
 
 # ---- the cases -----------------------------------------------------
 # expect.stdout_equals  : exact stdout (list of lines, joined by \n, one
@@ -241,6 +242,17 @@ CASES = [
         # imports wasi:cli/exit@0.3.2, lowers exit-with-code, calls it with
         # 7: the command runner maps the WASI exit to the process status.
         "expect": {"stdout_equals": [], "exit": 7},
+    },
+    {
+        "id": "p3/cancel-subtask",
+        "abi": "preview3",
+        "fixture": P3_CANCEL,
+        "argv": [],
+        "stdin": "",
+        # lowers the clock's async wait-for, cancels the pending subtask
+        # synchronously (state must be cancelled) and drops it; a 1 s wait
+        # finishing quickly proves the cancelling path ran.
+        "expect": {"stdout_equals": [], "exit": 0},
     },
     {
         "id": "p3/stream-stdout",

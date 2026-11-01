@@ -411,13 +411,82 @@
            (b-sec 6 (b-vec (b-cat (b-bytes #x00 #x02 #x01 0) (b-name "mem"))))
            builtins alias-export lower bag m-inst aliases lift compinst export)))
 
+;;; ---------------------------------------------------------------
+;;; Fixture 6: async CANCELLATION. The callback lowers
+;;; wasi:clocks/monotonic-clock@0.3.2's async `wait-for` with the
+;;; `async` canon option, gets a pending subtask, cancels it
+;;; synchronously (the state must be one of the cancelled states)
+;;; and drops it before task.return. A 1 s wait that finishes in
+;;; ~0.2 s proves the cancelling path ran.
+(defun p3-cancel-guest-bytes ()
+  (let* ((core (b-wat "(module
+      (import \"env\" \"task.return\" (func $tr (param i32)))
+      (import \"env\" \"wait-for\" (func $waitfor (param i64) (result i32)))
+      (import \"env\" \"subtask.cancel\" (func $cancel (param i32) (result i32)))
+      (import \"env\" \"subtask.drop\" (func $drop (param i32)))
+      (type $cbty (func (param i32 i32 i32) (result i32)))
+      (func (export \"run\") (result i32) (i32.const 1))
+      (func (export \"cb\") (type $cbty)
+        (local $p i32) (local $s i32) (local $r i32)
+        (local.set $p (call $waitfor (i64.const 1000000000)))
+        (if (i32.ne (i32.and (local.get $p) (i32.const 15)) (i32.const 0))
+            (then (local.set $s (i32.shr_u (local.get $p) (i32.const 4)))
+                  (local.set $r (call $cancel (local.get $s)))
+                  (if (i32.or (i32.eq (local.get $r) (i32.const 3))
+                              (i32.eq (local.get $r) (i32.const 4)))
+                      (then (call $drop (local.get $s)))
+                      (else unreachable))))
+        (call $tr (i32.const 0))
+        (i32.const 0)))"))
+         (result-type (b-bytes #x6a #x00 #x00))
+         (run-ft (b-cat (b-bytes #x43) (b-vec) (b-bytes #x00) (b-bytes 0)))
+         ;; wait-for(how-long: duration) async
+         (wait-ft (b-cat (b-bytes #x43)
+                         (b-vec (b-cat (b-name "how-long") (b-bytes #x77)))
+                         (b-bytes #x01 #x00)))
+         (clock-itype (b-cat (b-bytes #x42)
+                             (b-vec (b-cat (b-bytes #x01) wait-ft)
+                                    (b-cat (b-bytes #x04)
+                                           (b-nameattrs "wait-for")
+                                           (b-bytes #x01 0)))))
+         (types (b-vec result-type run-ft clock-itype))
+         (import (b-vec (b-cat (b-nameattrs "wasi:clocks/monotonic-clock@0.3.2")
+                               (b-bytes #x05 2))))
+         (builtins (b-sec 8 (b-vec (b-cat (b-bytes #x09 #x00 #x00) (b-vec))
+                                   (b-bytes #x06 #x00)
+                                   (b-bytes #x0d))))
+         (alias-export (b-sec 6 (b-vec (b-cat (b-bytes #x01 #x00 0) (b-name "wait-for")))))
+         (lower (b-sec 8 (b-vec (b-cat (b-bytes #x01 #x00 0) (b-vec (b-bytes #x06))))))
+         (bag (b-sec 2 (b-vec (b-cat (b-bytes #x01)
+                                     (b-vec (b-cat (b-name "task.return") (b-bytes #x00 0))
+                                            (b-cat (b-name "subtask.cancel") (b-bytes #x00 1))
+                                            (b-cat (b-name "subtask.drop") (b-bytes #x00 2))
+                                            (b-cat (b-name "wait-for") (b-bytes #x00 3)))))))
+         (m-inst (b-sec 2 (b-vec (b-cat (b-bytes #x00 0)
+                                        (b-vec (b-cat (b-name "env") (b-bytes #x12 0)))))))
+         (aliases (b-sec 6 (b-vec (b-cat (b-bytes #x00 #x00 #x01 1) (b-name "run"))
+                                  (b-cat (b-bytes #x00 #x00 #x01 1) (b-name "cb")))))
+         (lift (b-sec 8 (b-vec (b-cat (b-bytes #x00 #x00 4)
+                                      (b-vec (b-bytes #x06) (b-cat (b-bytes #x07) (b-u32 5)))
+                                      (b-bytes 1)))))
+         (compinst (b-sec 5 (b-vec (b-cat (b-bytes #x01)
+                                          (b-vec (b-cat (b-nameattrs "run") (b-bytes #x01 1)))))))
+         (export (b-sec 11 (b-vec (b-cat (b-nameattrs "wasi:cli/run@0.3.2")
+                                         (b-bytes #x05 1) (b-bytes 0))))))
+    (b-cat (b-bytes 0 #x61 #x73 #x6d #x0d 0 1 0)
+           (b-sec 7 types)
+           (b-sec 10 import)
+           (b-sec 1 core)
+           builtins alias-export lower bag m-inst aliases lift compinst export)))
+
 (defparameter *fixtures*
   (list (list "p3-guest.wasm" #'p3-sync-guest-bytes 0 "")
         (list "p3-import-guest.wasm" #'p3-import-guest-bytes 7 "")
         (list "p3-clock-guest.wasm" #'p3-clock-guest-bytes 0 "")
         (list "p3-async-guest.wasm" #'p3-async-guest-bytes 0 "")
         (list "p3-stream-guest.wasm" #'p3-stream-guest-bytes 0 "hi
-")))
+")
+        (list "p3-cancel-guest.wasm" #'p3-cancel-guest-bytes 0 "")))
 
 ;;; ---------------------------------------------------------------
 ;;; Verify through this project's own decoder/validator/runner, then
@@ -442,9 +511,14 @@
   (let* ((comp (wasmdown.component:decode-component bytes))
          (_ (wasmdown.component:validate-component comp))
          (sink (make-string-output-stream))
-         (context (wasmdown.wasi:make-wasi-context :stdout sink))
-         (status (wasmdown.wasi:run-component comp context)))
+         ;; the reactor services clock deadlines; the cancellation
+         ;; fixture lowers the provider's async wait-for
+         (reactor (wasmdown.wasi:make-wasi-reactor))
+         (context (wasmdown.wasi:make-wasi-context :stdout sink
+                                                   :reactor reactor))
+         (status (progn (wasmdown.wasi:run-component comp context))))
     (declare (ignore _))
+    (ignore-errors (wasmdown.wasi:reactor-close reactor))
     (unless (eql expected-status status)
       (error "~a: command returned status ~a, expected ~a"
              label status expected-status))

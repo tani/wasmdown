@@ -369,8 +369,16 @@ print exactly `hi\n`).
   could not match it, advanced the generation and resubmitted the span, so
   stdout duplicated — the copy is now reused), and `%end-notify` woke only a
   sync waiter, never a `waitable-set` waiter (a task parked on the set never
-  learned a copy completed — both are now woken). The lane runs five guests,
-  3 repeats each (15/15 per backend). The component binary grammar details
+  learned a copy completed — both are now woken). A sixth guest exercises
+  CANCELLATION: it lowers the clock's async `wait-for` (the `async` canon
+  option is required; the non-async lower flattens to `(i64)->()` and the
+  module-import signature check rejects it), cancels the pending subtask
+  synchronously (asserting a cancelled state) and drops it; a 1 s wait
+  finishing in ~0.2 s proves the cancel ran. That surfaced one more defect:
+  the async-lower pack took the callee task's mutex even when the callee is
+  HOST-PENDING and has no task record (NIL `ASYNC-TASK`); the host-pending
+  arm now packs without the mutex. The lane runs six guests, 3 repeats each
+  (18/18 per backend). The component binary grammar details
   that mattered: type indices
   inside an instance type are local to that type's declarations, the lower's
   core func must be defined before the bag that exports it, and imported
