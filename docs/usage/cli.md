@@ -16,9 +16,8 @@ commands:
     compile <file.wasm> --emit-lisp <out.lisp>
     run <file> [--invoke <name> <int> ...]
     run <component> --wasi [--dir HOST[::GUEST]]
-          [--env K=V] [arg ...]
-    (the network options --net/--listen/--dns are refused: network
-     communication is out of scope by design)
+          [--env K=V] [--net HOST:PORT] [--listen ADDR:PORT]
+          [--dns NAME] [arg ...]
     help
 exit codes: 0 ok, 1 guest/compile error, 2 usage error
 ```
@@ -48,19 +47,19 @@ driven through the WASI command runner, a core module through
 | `--wasi` | Grant the WASI capability set: process streams, guest arguments, and the flags below. |
 | `--dir HOST[::GUEST][:ro]` | Preopen a host directory; `GUEST` defaults to `HOST`. `:ro` grants a read-only root (creation, writing, mutation denied). |
 | `--env K=V` | One environment variable. |
-| `--net` / `--listen` / `--dns` | **Refused (usage error).** Network communication (TCP, UDP and DNS) is out of scope by design; there is no `wasi:sockets` provider for guests and no network authority is ever built. The canonical message is printed by `help` and on refusal. |
+| `--net HOST:PORT` | Declare one outbound endpoint the guest may reach. `HOST` is `*` (any) or a dotted-quad IPv4 address; `PORT` is `*` (any) or 0–65535. Repeatable; undeclared destinations are denied. |
+| `--listen ADDR:PORT` | Declare one address the guest may bind/listen on, same grammar as `--net`. Repeatable. |
+| `--dns NAME` | Allow one DNS name (case-insensitive; `*.suffix`/`**.suffix` wildcards match a suffix). `--dns '*'` allows every name. Repeatable. |
 | `--` | Ends option parsing; every later token reaches the guest unchanged, including dash-prefixed ones. |
 
-The network options are recognised only to refuse them with this exact
-message:
-
-```
-Network communication (TCP, UDP and DNS) is not supported by this design; there is no wasi:sockets provider for guests. See docs/usage/wasi.md and specs/wasi/MANIFEST.md.
-```
-
-It is a permanent, deliberate exclusion, not a pending interface; the
-declaration lives in `specs/wasi/MANIFEST.md` ("Network communication:
-wasi:sockets (excluded)").
+Network authority is declared, never ambient: with no `--net`/`--listen`/
+`--dns` the context carries no network at all and every socket operation is
+refused. A guest that declares `wasi:sockets/types` or
+`wasi:sockets/ip-name-lookup` is bound to the runtime's sockets providers,
+but each bind, connect, send and resolve still consults the declared
+endpoints and DNS policy. A malformed endpoint is a usage/host error before
+any authority object is built; with `--wasi` absent the network options are
+usage errors.
 
 Positional tokens after the file become guest arguments **only** with
 `--wasi`; `argv[0]` is the input file's **file name** (basename, the POSIX

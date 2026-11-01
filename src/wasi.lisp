@@ -4421,10 +4421,34 @@ disarmed exactly once."
           (t (%socket-error (%socket-code "not-supported"))))))
 
 (defun %family-value (family)
-  (cons :enum (ecase family (:ipv4 "ipv4") (:ipv6 "ipv6"))))
+  (list :enum (ecase family (:ipv4 "ipv4") (:ipv6 "ipv6"))))
 
 (defun %wildcard-host (family)
   (ecase family (:ipv4 '(0 0 0 0)) (:ipv6 '(0 0 0 0 0 0 0 0))))
+
+(defun %unspecified-host-p (host)
+  "T when HOST is INADDR_ANY / in6addr_any (all zero)."
+  (and (listp host) (every #'zerop host)))
+
+(defun %ipv4-mapped-host-p (family host)
+  "T for an IPv6 address in the ::ffff:0:0/96 mapped range, which the
+WIT rejects (dual-stack sockets do not exist in this authority)."
+  (and (eq family :ipv6)
+       (listp host)
+       (= 8 (length host))
+       (every #'zerop (subseq host 0 5))
+       (= #xffff (nth 5 host))))
+
+(defun %multicast-or-broadcast-host-p (family host)
+  "T for an address that is not unicast: IPv4 multicast (224/4) and
+the limited broadcast, IPv6 multicast (ff00::/8)."
+  (case family
+    (:ipv4 (and (listp host) (= 4 (length host))
+                (or (<= 224 (first host) 239)
+                    (equal host '(255 255 255 255)))))
+    (:ipv6 (and (listp host) (= 8 (length host))
+                (<= #xff00 (first host) #xffff)))
+    (t nil)))
 
 ;;; ---------------------------------------------------------------
 ;;; The socket resources.
@@ -4441,6 +4465,14 @@ every derived send/receive/listen stream); the fd closes at zero."
   (sent-p nil)
   (received-p nil)
   (backlog 128)
+  ;; The keep-alive durations/count are WIT values, not raw kernel
+  ;; integers: the kernel takes seconds (and rejects values beyond its
+  ;; own limits), while the WIT is nanoseconds and accepts any u64.
+  ;; The setters store the requested value and push a best-effort
+  ;; clamped value to the kernel; the getters answer the stored one.
+  (keep-alive-idle-time 0)
+  (keep-alive-interval 0)
+  (keep-alive-count 0)
   ;; M17 step 6: the LIVE readiness watches this socket's streams hold
   ;; (released by CLOSE and by each stream's drop).
   (waits nil)
@@ -4709,6 +4741,9 @@ TIME_WAIT binding does not block the guest."
               (multiple-value-bind (fam host port)
                   (%sockaddr-sap->key (sb-alien:alien-sap alien))
                 (declare (ignore fam))
+                (when (or (%ipv4-mapped-host-p family host)
+                          (%multicast-or-broadcast-host-p family host))
+                  (%socket-error (%socket-code "invalid-argument")))
                 (unless (wasi-network-allows-listen-p network family host port)
                   (%socket-error (%socket-code "access-denied")))
                 (%socket-check (%libc-bind (%tcp-fd sock)
@@ -4738,6 +4773,11 @@ TIME_WAIT binding does not block the guest."
                    (multiple-value-bind (fam host port)
                        (%sockaddr-sap->key (sb-alien:alien-sap alien))
                      (declare (ignore fam))
+                     (when (or (zerop port)
+                               (%unspecified-host-p host)
+                               (%ipv4-mapped-host-p family host)
+                               (%multicast-or-broadcast-host-p family host))
+                       (%socket-error (%socket-code "invalid-argument")))
                      (unless (wasi-network-allows-outbound-p
                               network family host port)
                        (%socket-error (%socket-code "access-denied")))
@@ -4832,7 +4872,13 @@ through the store queue."
                                     :fd new
                                     :network (wasi-tcp-socket-network sock)
                                     :family family
-                                    :state :connected))
+                                    :state :connected
+                                    :keep-alive-idle-time
+                                    (wasi-tcp-socket-keep-alive-idle-time sock)
+                                    :keep-alive-interval
+                                    (wasi-tcp-socket-keep-alive-interval sock)
+                                    :keep-alive-count
+                                    (wasi-tcp-socket-keep-alive-count sock)))
                              out))
                            (t
                             (let ((errno (sb-alien:get-errno)))
@@ -5097,12 +5143,8 @@ data/EOF/error release the watch once."
      nil)))
 
 ;;; The keep-alive / hop-limit / buffer knobs. Duration values are
-;;; nanoseconds (wasi:clocks/types.duration); the kernel takes ms.
-
-(defun %ns->ms (ns)
-  "A positive duration in ms (the WIT rejects 0; a sub-ms value
-rounds up rather than becoming 0)."
-  (max 1 (floor ns 1000000)))
+;;; nanoseconds (wasi:clocks/types.duration); the kernel takes seconds,
+;;; so the setters store the WIT value and only push a clamped hint.
 
 (defun tcp-get-keep-alive-enabled (context network self
                                    &key (package (wasi-package "sockets")))
@@ -5124,72 +5166,73 @@ rounds up rather than becoming 0)."
                     +sol-socket+ +so-keepalive+ (if value 1 0))
    nil))
 
-(defun %tcp-knob-get (network self ct getter)
-  (%socket-result (%getsockopt-int (%tcp-fd (%tcp-of network self ct))
-                                   +sol-tcp+ getter)))
-
-(defun %tcp-knob-set (network self ct level opt value check)
-  (%socket-result
-   (when (and check (zerop value))
-     (%socket-error (%socket-code "invalid-argument")))
-   (%setsockopt-int (%tcp-fd (%tcp-of network self ct)) level opt value)
-   nil))
-
 (defun tcp-get-keep-alive-idle-time (context network self
                                      &key (package (wasi-package "sockets")))
   (declare (ignore context))
   (%socket-result
-   (* 1000000 (%getsockopt-int (%tcp-fd (%tcp-of
-                                         network self
-                                         (tcp-socket-resource-ct
-                                          :package package)))
-                                +sol-tcp+ +tcp-keepidle+))))
+   (wasi-tcp-socket-keep-alive-idle-time
+    (%tcp-of network self (tcp-socket-resource-ct :package package)))))
 
 (defun tcp-set-keep-alive-idle-time (context network self value
                                      &key (package (wasi-package "sockets")))
   (declare (ignore context))
   ;; the WIT rejects a ZERO duration before it reaches the kernel
-  (%socket-result
-   (when (zerop value)
-     (%socket-error (%socket-code "invalid-argument")))
-   (%tcp-knob-set network self (tcp-socket-resource-ct :package package)
-                  +sol-tcp+ +tcp-keepidle+ (%ns->ms value) nil)
-   nil))
+  (let ((sock (%tcp-of network self (tcp-socket-resource-ct
+                                     :package package))))
+    (%socket-result
+     (when (zerop value)
+       (%socket-error (%socket-code "invalid-argument")))
+     (setf (wasi-tcp-socket-keep-alive-idle-time sock) value)
+     ;; best effort: TCP_KEEPIDLE is in SECONDS, clamped to the
+     ;; kernel's accepted range; the WIT answer is the stored value
+     (ignore-errors
+       (%setsockopt-int (%tcp-fd sock) +sol-tcp+ +tcp-keepidle+
+                        (max 1 (min 32767 (floor value 1000000000)))))
+     nil)))
 
 (defun tcp-get-keep-alive-interval (context network self
                                     &key (package (wasi-package "sockets")))
   (declare (ignore context))
   (%socket-result
-   (* 1000000 (%getsockopt-int (%tcp-fd (%tcp-of
-                                         network self
-                                         (tcp-socket-resource-ct
-                                          :package package)))
-                                +sol-tcp+ +tcp-keepintvl+))))
+   (wasi-tcp-socket-keep-alive-interval
+    (%tcp-of network self (tcp-socket-resource-ct :package package)))))
 
 (defun tcp-set-keep-alive-interval (context network self value
                                     &key (package (wasi-package "sockets")))
   (declare (ignore context))
-  (%socket-result
-   (when (zerop value)
-     (%socket-error (%socket-code "invalid-argument")))
-   (%tcp-knob-set network self (tcp-socket-resource-ct :package package)
-                  +sol-tcp+ +tcp-keepintvl+ (%ns->ms value) nil)
-   nil))
+  (let ((sock (%tcp-of network self (tcp-socket-resource-ct
+                                     :package package))))
+    (%socket-result
+     (when (zerop value)
+       (%socket-error (%socket-code "invalid-argument")))
+     (setf (wasi-tcp-socket-keep-alive-interval sock) value)
+     (ignore-errors
+       (%setsockopt-int (%tcp-fd sock) +sol-tcp+ +tcp-keepintvl+
+                        (max 1 (min 32767 (floor value 1000000000)))))
+     nil)))
 
 (defun tcp-get-keep-alive-count (context network self
                                  &key (package (wasi-package "sockets")))
   (declare (ignore context))
   (%socket-result
-   (%getsockopt-int (%tcp-fd (%tcp-of network self
-                                      (tcp-socket-resource-ct
-                                       :package package)))
-                    +sol-tcp+ +tcp-keepcnt+)))
+   (wasi-tcp-socket-keep-alive-count
+    (%tcp-of network self (tcp-socket-resource-ct :package package)))))
 
 (defun tcp-set-keep-alive-count (context network self value
                                  &key (package (wasi-package "sockets")))
   (declare (ignore context))
-  (%tcp-knob-set network self (tcp-socket-resource-ct :package package)
-                 +sol-tcp+ +tcp-keepcnt+ value t))
+  (let ((sock (%tcp-of network self (tcp-socket-resource-ct
+                                     :package package))))
+    (%socket-result
+     (when (zerop value)
+       (%socket-error (%socket-code "invalid-argument")))
+     (setf (wasi-tcp-socket-keep-alive-count sock) value)
+     ;; the kernel accepts 1..127 probes; the WIT answer is the
+     ;; requested value
+     (ignore-errors
+       (%setsockopt-int (%tcp-fd sock) +sol-tcp+ +tcp-keepcnt+
+                        (min value 127)))
+     nil)))
 
 (defun tcp-get-hop-limit (context network self
                           &key (package (wasi-package "sockets")))
@@ -5271,7 +5314,6 @@ rounds up rather than becoming 0)."
                (logior +sock-dgram+ +sock-nonblock+ +sock-cloexec+)
                +ipproto-udp+)))
      (%socket-check fd "socket")
-     (%setsockopt-int fd +sol-socket+ +so-reuseaddr+ 1)
      (when (eq family :ipv6)
        (%setsockopt-int fd +ipproto-ipv6+ +ipv6-v6only+ 1))
      (list :own-handle
@@ -5295,6 +5337,9 @@ rounds up rather than becoming 0)."
               (multiple-value-bind (fam host port)
                   (%sockaddr-sap->key (sb-alien:alien-sap alien))
                 (declare (ignore fam))
+                (when (or (%ipv4-mapped-host-p family host)
+                          (%multicast-or-broadcast-host-p family host))
+                  (%socket-error (%socket-code "invalid-argument")))
                 (unless (wasi-network-allows-listen-p network family host port)
                   (%socket-error (%socket-code "access-denied")))
                 (%socket-check (%libc-bind (%udp-fd sock)
@@ -5319,6 +5364,11 @@ rounds up rather than becoming 0)."
               (multiple-value-bind (fam host port)
                   (%sockaddr-sap->key (sb-alien:alien-sap alien))
                 (declare (ignore fam))
+                (when (or (zerop port)
+                          (%unspecified-host-p host)
+                          (%ipv4-mapped-host-p family host)
+                          (%multicast-or-broadcast-host-p family host))
+                  (%socket-error (%socket-code "invalid-argument")))
                 (unless (wasi-network-allows-outbound-p network family host port)
                   (%socket-error (%socket-code "access-denied")))
                 (%socket-check (%libc-connect (%udp-fd sock)
@@ -5377,16 +5427,26 @@ rounds up rather than becoming 0)."
                 (multiple-value-bind (fam host port)
                     (%sockaddr-sap->key (sb-alien:alien-sap alien))
                   (declare (ignore fam))
+                  (unless (eq family (wasi-udp-socket-family sock))
+                    (%socket-error (%socket-code "invalid-argument")))
+                  (when (or (zerop port)
+                            (%unspecified-host-p host)
+                            (%ipv4-mapped-host-p family host)
+                            (%multicast-or-broadcast-host-p family host))
+                    (%socket-error (%socket-code "invalid-argument")))
                   (unless (wasi-network-allows-outbound-p
                            network family host port)
                     (%socket-error (%socket-code "access-denied")))
                   (%udp-send-bytes fd data alien len))
              (sb-alien:free-alien alien)))
          (%udp-send-bytes fd data nil nil))
+     ;; a successful datagram send implicitly binds the socket (POSIX)
+     (setf (wasi-udp-socket-bound-p sock) t)
      nil)))
 
 (defun %udp-send-bytes (fd bytes alien len)
-  "sendto/send BYTES; error-code DOMAIN or NIL."
+  "sendto/send BYTES; a socket error is signalled as WASI-SOCKET-ERROR
+(the caller's %SOCKET-RESULT turns it into the WIT variant)."
   (let ((n (length bytes)))
     (if (zerop n)
         nil
@@ -5415,11 +5475,11 @@ rounds up rather than becoming 0)."
                                      ((= errno +eintr+) nil)
                                      ((= errno +eagain+)
                                       (unless (%poll-fd fd +pollout+ 5000)
-                                        (return-from write
-                                          (%socket-code "timeout"))))
+                                        (%socket-error
+                                         (%socket-code "timeout"))))
                                      (t
-                                      (return-from write
-                                        (%socket-errno-code errno))))))))))
+                                      (%socket-error
+                                       (%socket-errno-code errno))))))))))
                  nil)
             (sb-alien:free-alien buf))))))
 
@@ -5436,6 +5496,51 @@ rounds up rather than becoming 0)."
        (unless bytes
          (%socket-error (%socket-code "timeout")))
        (list bytes addr)))))
+
+(defun %resolved-host-pending (value)
+  "A host-pending already resolved with VALUE (used when the async
+entry's synchronous preconditions fail)."
+  (wasmdown.component.runtime:make-host-pending
+   :start (lambda (resolve reject acknowledge-cancel)
+            (declare (ignore reject acknowledge-cancel))
+            (funcall resolve value)
+            (lambda () nil))))
+
+(defun %udp-receive-pending (context network self
+                             &key (package (wasi-package "sockets")))
+  "The ASYNC `udp-socket.receive` answer. The accept/read itself runs
+on a worker thread, so the guest's other tasks keep making progress
+(the WIT declares this method `async`); the result comes back through
+the store's pending pump. Every failure is the WIT domain error."
+  (handler-case
+      (let* ((sock (%udp-of network self (udp-socket-resource-ct
+                                          :package package)))
+             (fd (%udp-fd sock)))
+        (if (not (wasi-udp-socket-bound-p sock))
+            (%resolved-host-pending
+             (cons :err (%socket-code "invalid-state")))
+            (wasmdown.component.runtime:make-host-pending
+             :start
+             (lambda (resolve reject acknowledge-cancel)
+               (declare (ignore acknowledge-cancel))
+               (sb-thread:make-thread
+                (lambda ()
+                  (handler-case
+                      (multiple-value-bind (bytes addr) (%udp-recv fd)
+                        (if bytes
+                            (funcall resolve (cons :ok (list bytes addr)))
+                            (funcall resolve
+                                     (cons :err (%socket-code "timeout")))))
+                    (wasi-socket-error (c)
+                      (funcall resolve
+                               (cons :err (wasi-socket-error-code c))))
+                    (error (c) (funcall reject c))))
+                :name "wasi-udp-receive")
+               ;; the read is not interruptible mid-poll: a cancel
+               ;; request leaves the worker's normal result to deliver
+               (lambda () nil)))))
+    (wasi-socket-error (c)
+      (%resolved-host-pending (cons :err (wasi-socket-error-code c))))))
 
 (defun %udp-recv (fd)
   "One datagram: (values byte-list address-domain) or (values nil NIL)
@@ -5856,7 +5961,8 @@ first one). No network authority => every bind/connect is refused."
                   (lambda (self data remote) (udp-send context net self data remote
                                                        :package package)))
             (cons "[method]udp-socket.receive"
-                  (lambda (self) (udp-receive context net self :package package)))
+                  (lambda (self) (%udp-receive-pending context net self
+                                                       :package package)))
             (cons "[method]udp-socket.get-local-address"
                   (lambda (self) (udp-get-local-address context net self
                                                         :package package)))
@@ -6014,15 +6120,6 @@ interface's versioned import name (`ns:pkg/iface@version')."
                         (wasmdown.wit:wit-world-item-version item))
                 (wasmdown.wit:wit-world-item-interface item))))))
 
-(defparameter +wasi-sockets-unsupported-message+
-  "Network communication (TCP, UDP and DNS) is not supported by this design; there is no wasi:sockets provider for guests. See docs/usage/wasi.md and specs/wasi/MANIFEST.md."
-  "The one canonical refusal text for the `wasi:sockets' guest surface,
-shared by the component-declared-import check and the CLI option check.
-The SOCKETS PROVIDER stays in the runtime because the pinned 0.3.2
-`command' world imports `wasi:sockets/types' and
-`wasi:sockets/ip-name-lookup' itself; it is the GUEST-DECLARED import
-that is refused.")
-
 (defun %wasi-http-import-name-p (name)
   "T when the import NAME belongs to the `wasi:http' package, at any
 version and for any interface (`wasi:http/types@0.3.2', ...). The
@@ -6036,20 +6133,6 @@ know still counts — and a lookalike such as `wasi:http-client/x' or
          (and colon slash (< colon slash)
               (string= "wasi" name :end2 colon)
               (string= "http" (subseq name (1+ colon) slash))))))
-
-(defun %wasi-sockets-import-name-p (name)
-  "T when the import NAME belongs to the `wasi:sockets' package, at any
-version and for any interface (`wasi:sockets/types@0.3.2',
-`wasi:sockets/ip-name-lookup@0.3.2', ...). The namespace and package
-segments are matched structurally and terminated by the `/`, so a
-version suffix or an unknown interface still counts — and a lookalike
-such as `wasi:socketsx/types' or `my:wasi:sockets/types' does not."
-  (and (stringp name)
-       (let ((colon (position #\: name))
-             (slash (position #\/ name)))
-         (and colon slash (< colon slash)
-              (string= "wasi" name :end2 colon)
-              (string= "sockets" (subseq name (1+ colon) slash))))))
 
 (defun %types-only-world-import-p (item)
   "T when ITEM's resolved target is an interface with no functions
@@ -6256,18 +6339,15 @@ naming the import — never a trapping stub. NAME has already passed the
 declaration order. The 0.3 gates run FIRST, over exactly these names,
 so no provider is built for a refused import: an @unstable interface
 whose feature is not enabled is refused naming import and feature,
-then `wasi:http' (any line, canonical message) and a `wasi:sockets'
-declaration (canonical message). Each surviving name is bound to its
-builder's provider; a types-only interface composes no entry."
+then `wasi:http' (any line, canonical message). Each surviving name is
+bound to its builder's provider; a types-only interface composes no
+entry. `wasi:sockets' names bind through the network authority's
+providers exactly like the pinned command world's own sockets imports."
   (%refuse-unstable-declared-imports names)
   (dolist (name names)
-    (cond
-      ((%wasi-http-import-name-p name)
-       (error 'wasmdown.wit:wit-error
-              :message +wasi-http-unsupported-message+))
-      ((%wasi-sockets-import-name-p name)
-       (error 'wasmdown:link-error
-              :message +wasi-sockets-unsupported-message+))))
+    (when (%wasi-http-import-name-p name)
+      (error 'wasmdown.wit:wit-error
+             :message +wasi-http-unsupported-message+)))
   (let ((builders (%wasi-provider-builders context))
         (providers '()))
     (dolist (name names)
@@ -6327,26 +6407,25 @@ composed per version), anything else gets the vendored 0.3 command
 world. Choosing from the declared contract — never from the file name
 — is what keeps a 0.2 component from being handed 0.3 providers.
 
-A component that asks for the 0.3 line may not itself IMPORT
-`wasi:sockets' at any interface or version: guests get no sockets
-provider by design, and the refusal is raised from the DECLARED import
-list BEFORE anything composes, as a `LINK-ERROR' carrying the canonical
-message. The same 0.3 path refuses, before the sockets check, any
-declared import whose target interface is `@unstable' with a feature
-the selected (stable) surface does not enable — the message names the
-import and the feature. Stable imports are unaffected and unknown
-names are left alone (the 0.3 path composes the command world exactly
-as before). The 0.2 line is untouched (the
-P2 sockets facade is a separate legacy claim).
+A component that asks for the 0.3 line may also IMPORT
+`wasi:sockets/types' and `wasi:sockets/ip-name-lookup': the same
+builders the pinned command world uses bind them under the component's
+own declared names, so the network authority is reachable. The 0.3
+path refuses any declared import whose target interface is `@unstable'
+with a feature the selected (stable) surface does not enable — the
+message names the import and the feature — and `wasi:http' at any
+line. Stable imports are unaffected and unknown names are left alone.
+The 0.2 line is untouched (the P2 sockets facade is a separate legacy
+claim).
 
 A component that declares BOTH lines gets one COMPOSED graph
 (%COMPOSE-MIXED-RELEASE-PROVIDERS): the 0.3 command builders bind
 exactly its 0.3-line declared imports under the same gates a 0.3-only
-component meets (unstable feature, `wasi:http' at any line, 0.3
-sockets), and the P2 tables bind its 0.2-line imports at their exact
-versions, in declaration order. An import that neither line can serve
-is still an error. No feature can be enabled from the CLI: the gate is
-refusal-only."
+component meets (unstable feature, `wasi:http' at any line, including
+the sockets providers), and the P2 tables bind its 0.2-line imports at
+their exact versions, in declaration order. An import that neither
+line can serve is still an error. No feature can be enabled from the
+CLI: the gate is refusal-only."
   (let* ((names (declared-component-imports comp))
          (wasi-names (remove-if-not (lambda (n)
                                       (and (stringp n)
@@ -6365,12 +6444,6 @@ refusal-only."
       ;; selection does not enable is refused here, naming import and
       ;; feature, before anything composes.
       (%refuse-unstable-declared-imports wasi-names)
-      ;; likewise a guest may not declare a sockets import, even though
-      ;; the pinned command WORLD does (the world is composed, not
-      ;; declared, and its sockets providers stay available)
-      (when (find-if #'%wasi-sockets-import-name-p wasi-names)
-        (error 'wasmdown:link-error
-               :message +wasi-sockets-unsupported-message+))
       (command-provider context))
      ((= (length v2) (length wasi-names))
       ;; every WASI import is a 0.2 release: compose per exact version

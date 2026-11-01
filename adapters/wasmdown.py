@@ -12,10 +12,14 @@ Contract (wasi-testsuite `test-runner/wasi_test_runner/runtime_adapter.py`):
   compute_argv(test_path, (args, env, root), proposals, wasi_world, wasi_version)
 
 Declared profile: `wasi:cli/command` only, `wasm32-wasip1` + `wasm32-wasip3`.
-Proposal-tagged tests (`http`, `sockets`) are excluded by design and are
-skipped by tools/run-wasi-testsuite.py's generated expectations file; the
-assertion below keeps an accidental execution an explicit error instead of a
-silent unsupported run.
+Proposal-tagged tests are excluded by the main lane's generated expectations
+file; `tools/run-wasi-network-tests.py` selects the inverse subset.
+`wasi:sockets` tests are executed on this branch with an explicit, test-only
+network grant (`--net *:* --listen *:* --dns *`): the upstream sockets cases
+bind and connect to their own loopback ports and resolve no names, so the
+grant is wider than their need but is confined to this harness, never the
+runtime's default (the CLI still builds no ambient network authority). The
+`http` proposal remains refused here until its provider is restored.
 
 Environment:
   WASMDOWN_ROOT                    repository root (default: parent of adapters/)
@@ -64,16 +68,20 @@ def get_timeout_seconds() -> float:
     return TIMEOUT_SECONDS
 
 
+_GRANTED_PROPOSALS = {"sockets"}
+
+
 def compute_argv(test_path: str,
                  args_env_root: Tuple[List[str], Dict[str, str], Optional[str]],
                  proposals: List[str],
                  wasi_world: str,
                  wasi_version: str) -> List[str]:
-    if proposals:
+    unsupported = sorted(set(proposals) - _GRANTED_PROPOSALS)
+    if unsupported:
         raise RuntimeError(
-            "wasmdown declares no WASI proposals, but test "
-            f"{test_path} requested {proposals}; the driver must exclude it "
-            "by a declared rule (wasi:http / wasi:sockets exclusions)")
+            "wasmdown does not serve the WASI proposal(s) "
+            f"{unsupported}, but test {test_path} requested {proposals}; "
+            "the driver must exclude it by a declared rule")
     args, env, root = args_env_root
     argv = SBCL + [
         "--script", str(ROOT / "tools" / "wasmdown.lisp"),
@@ -83,5 +91,9 @@ def compute_argv(test_path: str,
         argv += ["--env", f"{key}={env[key]}"]
     if root:
         argv += ["--dir", f"{Path(root).resolve()}::/"]
+    if "sockets" in proposals:
+        # Test-harness grant only (see the module docstring): the upstream
+        # sockets cases use their own loopback endpoints.
+        argv += ["--net", "*:*", "--listen", "*:*", "--dns", "*"]
     argv += ["--"] + list(args)
     return argv

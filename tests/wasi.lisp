@@ -2771,8 +2771,8 @@ progress is possible, or the end is DROPPED."
                                    nil net server)))
                   (port (sock-value-port local)))
              (is (plusp port))
-             (is (equal "ipv4" (cdr (wasmdown.wasi:tcp-get-address-family
-                                     nil net server))))
+             (is (equal "ipv4" (second (wasmdown.wasi:tcp-get-address-family
+                                        nil net server))))
              (is (null (wasmdown.wasi:tcp-get-is-listening nil net server)))
              ;; listen -> a stream of accepted sockets
              (let ((listening (wasmdown.wasi:tcp-listen nil net server)))
@@ -2977,7 +2977,8 @@ progress is possible, or the end is DROPPED."
              (is (string= "invalid-state"
                           (sock-code (wasmdown.wasi:udp-disconnect nil net b))))
              (is (equal "ipv4"
-                        (cdr (wasmdown.wasi:udp-get-address-family nil net a))))
+                        (second (wasmdown.wasi:udp-get-address-family
+                                 nil net a))))
              ;; unicast hop limit
              (is (equal '(:ok) (wasmdown.wasi::udp-set-unicast-hop-limit
                                 nil net a 5)))
@@ -3712,13 +3713,20 @@ ok, and exports `run' (the runner's direct-export fallback)."
            ;; standard output; the guest arguments were plumbed
            (is (string= "hi" out)))
       (when (probe-file path) (delete-file path))))
-  ;; `--net` is a refused option (network is out of scope), so it is a
-  ;; usage error (2), not a malformed endpoint; a component run without
-  ;; `--wasi` but with guest args is likewise a usage error
+  ;; network options are accepted on the component path; a malformed
+  ;; endpoint is a host error (2), and a guest argument without --wasi
+  ;; is likewise a usage error
   (let ((path (%write-temp-bytes "tmp-cli-command2.wasm"
                                  (command-component-binary))))
     (unwind-protect
          (progn
+           (let ((out (with-output-to-string (s)
+                        (let ((*standard-output* s))
+                          (is (eql 0 (wasmdown.cli:main
+                                      (list "run" (namestring path) "--wasi"
+                                            "--net" "127.0.0.1:1"
+                                            "--listen" "*:*" "--dns" "*"))))))))
+             (is (string= "hi" out)))
            (is (eql 2 (wasmdown.cli:main
                        (list "run" (namestring path) "--wasi"
                              "--net" "nonsense"))))
@@ -5232,11 +5240,11 @@ world h {
                 (mapcar #'car (wasmdown.wasi:command-provider ctx))))))
 
 ;;; -----------------------------------------------------------------
-;;; wasi:sockets is not a guest capability (user decision, 2026-11-02):
-;;; network communication (TCP, UDP, DNS) is out of scope, so a guest
-;;; may not DECLARE a `wasi:sockets' import. The sockets PROVIDER stays
-;;; in the runtime because the pinned 0.3.2 `command' world imports
-;;; sockets itself (composed, never declared by the guest).
+;;; wasi:sockets is a declared guest capability on the 0.3 line: a
+;;; component that declares `wasi:sockets/types' or
+;;; `wasi:sockets/ip-name-lookup' is bound to the same provider the
+;;; pinned command world uses, and every operation is still gated by
+;;; the explicit network authority in its context (no ambient access).
 
 (defun %synthetic-import-comp (&rest names)
   "A decoded-component stand-in declaring exactly NAMES as imports.
@@ -5254,46 +5262,26 @@ the payloads need no resolvable extern types."
                          :offset 0))
           'vector)))
 
-(test wasi/sockets-import-name-is-structural
-  ;; the namespace and package segments are matched structurally: any
-  ;; interface and any version counts, a lookalike does not.
-  (dolist (name '("wasi:sockets/types@0.3.2"
-                  "wasi:sockets/ip-name-lookup@0.3.2"
-                  "wasi:sockets/network@0.2.12"
-                  "wasi:sockets/types"))
-    (is (wasmdown.wasi::%wasi-sockets-import-name-p name)))
-  (dolist (name '("wasi:socketsx/types@0.3.2"
-                  "my:wasi:sockets/types@0.3.2"
-                  "wasi:socket/types@0.3.2"
-                  "wasi:clocks/system-clock@0.3.2"
-                  "wasi:sockets"
-                  "sockets:types"))
-    (is (not (wasmdown.wasi::%wasi-sockets-import-name-p name)))))
-
-(test wasi/component-sockets-declared-import-is-link-error
-  ;; a component asking for the 0.3 line that DECLARES a sockets import
-  ;; is refused from the declared import list, before composition, with
-  ;; the canonical message byte for byte — never the generic
-  ;; unsupported-import ("no provider") text.
-  (let ((ctx (wasmdown.wasi:make-wasi-context)))
+(test wasi/component-sockets-declared-imports-bind-providers
+  ;; a 0.3 component declaring a sockets interface composes without a
+  ;; refusal and gets that name bound to a real provider instance. The
+  ;; whole 0.3 command world is still the graph the path composes, so
+  ;; the check is that the declared names the guest can see are present
+  ;; and usable, not merely that an error is absent.
+  (let ((ctx (wasmdown.wasi:make-wasi-context
+              :networks (list (sock-network)))))
     (dolist (name '("wasi:sockets/types@0.3.2"
                     "wasi:sockets/ip-name-lookup@0.3.2"))
-      (let ((condition nil))
-        (handler-case
-            (progn (wasmdown.wasi:component-command-providers
-                    ctx (%synthetic-import-comp name))
-                   nil)
-          (wasmdown:link-error (c) (setf condition c)))
-        (is condition)
-        (is (string= (wasmdown:wasmdown-error-message condition)
-                     wasmdown.wasi::+wasi-sockets-unsupported-message+))
-        (is (not (search "no provider"
-                         (wasmdown:wasmdown-error-message condition))))))))
+      (let* ((providers (wasmdown.wasi:component-command-providers
+                         ctx (%synthetic-import-comp name)))
+             (provider (cdr (assoc name providers :test #'string=))))
+        (is provider)
+        (is (wasmdown.component.runtime:comp-instance-p provider))))))
 
 (test wasi/component-declared-sockets-check-does-not-overreach
   ;; positive control: a component declaring only `wasi:cli/exit@0.3.2'
   ;; still composes the command world; lookalike package names are not
-  ;; mistaken for `wasi:sockets'.
+  ;; mistaken for `wasi:sockets' declarations.
   (let* ((ctx (wasmdown.wasi:make-wasi-context))
          (expected (length (wasmdown.wasi:command-provider ctx))))
     (dolist (names '(("wasi:cli/exit@0.3.2")
@@ -5366,24 +5354,23 @@ the payloads need no resolvable extern types."
                  "wasi:random/random@0.3.2")
                (mapcar #'car providers)))))
 
-(test wasi/component-mixed-sockets-declared-import-still-refused
-  ;; Admission of the mixed graph does NOT admit a 0.3 sockets
-  ;; declaration: the canonical sockets refusal (never the mixed-line
-  ;; text, never a generic no-provider error) is raised from the 0.3
-  ;; subset, before any provider is built.
-  (let ((ctx (wasmdown.wasi:make-wasi-context)))
+(test wasi/component-mixed-sockets-declared-imports-bind-providers
+  ;; Admission of the mixed graph also admits a 0.3 sockets
+  ;; declaration: the 0.3 subset binds it through the sockets builder
+  ;; while the 0.2 import still comes from the P2 table, in declaration
+  ;; order, under one graph.
+  (let ((ctx (wasmdown.wasi:make-wasi-context
+              :networks (list (sock-network)))))
     (dolist (name '("wasi:sockets/types@0.3.2"
                     "wasi:sockets/ip-name-lookup@0.3.2"))
-      (let ((condition nil))
-        (handler-case
-            (progn (wasmdown.wasi:component-command-providers
-                    ctx (%synthetic-import-comp
-                         name "wasi:io/streams@0.2.9"))
-                   nil)
-          (wasmdown:link-error (c) (setf condition c)))
-        (is condition)
-        (is (string= (wasmdown:wasmdown-error-message condition)
-                     wasmdown.wasi::+wasi-sockets-unsupported-message+))))))
+      (let* ((providers (wasmdown.wasi:component-command-providers
+                         ctx (%synthetic-import-comp
+                              name "wasi:io/streams@0.2.9")))
+             (provider (cdr (assoc name providers :test #'string=))))
+        (is provider)
+        (is (wasmdown.component.runtime:comp-instance-p provider))
+        (is (equal (list name "wasi:io/streams@0.2.9")
+                   (mapcar #'car providers)))))))
 
 (test wasi/component-mixed-http-declared-import-still-refused
   ;; wasi:http is refused at ANY line in a mixed component: the 0.3
@@ -5514,55 +5501,101 @@ the payloads need no resolvable extern types."
                         ctx (%synthetic-import-comp name))))
         (is (equal expected (mapcar #'car providers)))))))
 
-(test wasi/cli-network-options-are-refused
-  ;; `--net'/`--listen'/`--dns' are refused as a USAGE error carrying
-  ;; the canonical message WHILE PARSING: the input file is never
-  ;; opened and no network authority can be built.
-  (let ((missing "tmp-cli-network-absent.wasm"))
-    (is (not (probe-file missing)))
-    (dolist (tokens '(("--net" "127.0.0.1:1")
-                      ("--listen" "0.0.0.0:0")
-                      ("--dns" "*")))
-      (let ((stderr (with-output-to-string (s)
-                      (let ((*error-output* s))
-                        (is (eql 2 (wasmdown.cli:main
-                                    (append (list "run" missing "--wasi")
-                                            tokens))))))))
-        (is (search wasmdown.wasi::+wasi-sockets-unsupported-message+
-                    stderr))
-        (is (not (search "no provider" stderr)))))
-    ;; the usage-error's own message is the canonical text, exactly
+(test wasi/cli-network-options-parse-into-authority
+  ;; `--net'/`--listen'/`--dns' parse in command-line order and become
+  ;; the context's ONE explicit network authority. A destination the
+  ;; command line did not declare is denied — the policy is not widened
+  ;; by parsing a sibling endpoint.
+  (multiple-value-bind (file invokes options guest-args)
+      (wasmdown.cli::%parse-run-args
+       (list "app.wasm" "--wasi" "--net" "127.0.0.1:8080"
+             "--listen" "*:*" "--dns" "*" "guest-arg"))
+    (declare (ignore invokes))
+    (is (string= "app.wasm" file))
+    (is (equal '("guest-arg") guest-args))
+    (is (equal '(("--wasi" . t)
+                 ("--net" . "127.0.0.1:8080")
+                 ("--listen" . "*:*")
+                 ("--dns" . "*"))
+               options))
+    (multiple-value-bind (context reactor)
+        (wasmdown.cli::%component-context options guest-args file)
+      (unwind-protect
+           (let ((networks (wasmdown.wasi:wasi-context-networks context))
+                 (net (first (wasmdown.wasi:wasi-context-networks context))))
+             (is (= 1 (length networks)))
+             (is net)
+             ;; the declared outbound endpoint is allowed ...
+             (is (wasmdown.wasi:wasi-network-allows-outbound-p
+                  net :ipv4 '(127 0 0 1) 8080))
+             ;; ... while an undeclared port or host is denied
+             (is (not (wasmdown.wasi:wasi-network-allows-outbound-p
+                       net :ipv4 '(127 0 0 1) 8081)))
+             (is (not (wasmdown.wasi:wasi-network-allows-outbound-p
+                       net :ipv4 '(127 0 0 2) 8080)))
+             ;; `*:*' listen and `*' DNS are the explicit grants given
+             (is (wasmdown.wasi:wasi-network-allows-listen-p
+                  net :ipv4 '(0 0 0 0) 0))
+             (is (wasmdown.wasi:wasi-network-allows-dns-p
+                  net "anything.test")))
+        (when reactor (ignore-errors (wasmdown.wasi:reactor-close reactor)))))))
+
+(test wasi/cli-network-options-default-and-errors
+  ;; with no network option the context carries NO authority (deny-all),
+  ;; and --dir/--env keep their behavior
+  (multiple-value-bind (file invokes options guest-args)
+      (wasmdown.cli::%parse-run-args
+       (list "app.wasm" "--wasi" "--env" "HOME=/tmp" "--dir" "/tmp"
+             "guest-arg"))
+    (declare (ignore invokes))
+    (multiple-value-bind (context reactor)
+        (wasmdown.cli::%component-context options guest-args file)
+      (unwind-protect
+           (progn
+             (is (null (wasmdown.wasi:wasi-context-networks context)))
+             (is (equal '("HOME=/tmp")
+                        (mapcar (lambda (pair)
+                                  (format nil "~a=~a"
+                                          (car pair) (cdr pair)))
+                                (wasmdown.wasi:wasi-context-environment
+                                 context))))
+             (is (plusp (length (wasmdown.wasi:wasi-context-preopens
+                                 context)))))
+        (dolist (preopen (wasmdown.wasi:wasi-context-preopens context))
+          (ignore-errors (wasmdown.wasi:close-wasi-preopen preopen)))
+        (when reactor (ignore-errors (wasmdown.wasi:reactor-close reactor))))))
+  ;; a missing option value is a usage error at parse time
+  (handler-case
+      (progn (wasmdown.cli::%parse-run-args
+              (list "run" "app.wasm" "--wasi" "--net"))
+             (is nil "missing --net value was accepted"))
+    (wasmdown.cli::usage-error () t))
+  ;; network options without --wasi are a usage error
+  (multiple-value-bind (file invokes options guest-args)
+      (wasmdown.cli::%parse-run-args
+       (list "app.wasm" "--net" "127.0.0.1:1"))
+    (declare (ignore invokes))
     (handler-case
-        (wasmdown.cli::%parse-run-args
-         (list "run" missing "--wasi" "--net" "127.0.0.1:1"))
-      (wasmdown.cli::usage-error (c)
-        (is (string= wasmdown.wasi::+wasi-sockets-unsupported-message+
-                     (wasmdown.cli::usage-error-message c)))))
-    ;; --dir/--env/--wasi keep their behavior: they parse, and the
-    ;; capability context carries no network authority
-    (multiple-value-bind (file invokes options guest-args)
-        (wasmdown.cli::%parse-run-args
-         (list "app.wasm" "--wasi" "--env" "HOME=/tmp" "--dir" "/tmp"
-               "guest-arg"))
-      (declare (ignore invokes))
-      (is (string= "app.wasm" file))
-      (is (equal '("guest-arg") guest-args))
-      (multiple-value-bind (context reactor)
-          (wasmdown.cli::%component-context options guest-args file)
-        (unwind-protect
-             (progn
-               (is (null (wasmdown.wasi:wasi-context-networks context)))
-               (is (equal '("HOME=/tmp")
-                          (mapcar (lambda (pair)
-                                    (format nil "~a=~a"
-                                            (car pair) (cdr pair)))
-                                  (wasmdown.wasi:wasi-context-environment
-                                   context))))
-               (is (plusp (length (wasmdown.wasi:wasi-context-preopens
-                                   context)))))
-          (dolist (preopen (wasmdown.wasi:wasi-context-preopens context))
-            (ignore-errors (wasmdown.wasi:close-wasi-preopen preopen)))
-          (when reactor (ignore-errors (wasmdown.wasi:reactor-close reactor))))))))
+        (progn (wasmdown.cli::%component-context options guest-args file)
+               (is nil "network options without --wasi were accepted"))
+      (wasmdown.cli::usage-error () t)))
+  ;; a malformed endpoint is rejected while the authority is built
+  (multiple-value-bind (file invokes options guest-args)
+      (wasmdown.cli::%parse-run-args
+       (list "app.wasm" "--wasi" "--net" "nonsense"))
+    (declare (ignore invokes))
+    (handler-case
+        (progn (wasmdown.cli::%component-context options guest-args file)
+               (is nil "malformed endpoint was accepted"))
+      (wasmdown:host-error () t))))
+
+(test wasi/cli-help-documents-network-options
+  (let ((help (with-output-to-string (s)
+                (wasmdown.cli::%usage s))))
+    (is (search "--net HOST:PORT" help))
+    (is (search "--listen ADDR:PORT" help))
+    (is (search "--dns NAME" help))
+    (is (not (search "refused" help)))))
 
 ;;; -----------------------------------------------------------------
 ;;; Backend evidence for a command component (M9): the nested core the
