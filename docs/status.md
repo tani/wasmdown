@@ -90,7 +90,14 @@ and neither is a validation rule (ADR-005).
   worker-path guest is not resumed (deadlock oracle) with the event-gated
   async variant, while the in-process string-sink path completes. The next
   slice is that delivery path, not the guest encoding: the guests validate,
-  the provider is composed, and the duplication is gone.
+  the provider is composed, and the duplication is gone. Probes since:
+  the accepted span now reaches the file exactly once (`2` bytes), but the
+  callback is resumed with a plain yield tick (event 0) before the copy is
+  over (`stream.drop-writable` then traps `cannot remove busy stream`), and
+  gating on a real event (3/4) or waiting on `waitable-set.wait` over the
+  writable/future end both deadlock. The next step is the store's event
+  delivery for a parked stream copy to a callback-lifted task, not another
+  guest shape.
 - WASI 0.2 (shared by both backends, after the readiness/permit audit):
   end-of-input is still reported as `stream-error::closed` rather than
   `ok([])` (the open-but-empty vs closed distinction itself is now exact:
