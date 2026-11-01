@@ -464,6 +464,8 @@ def main() -> int:
                           capture_output=True, text=True).stdout.strip()
 
     results = []
+    identity = source_identity()   # captured once: the tested tree, not the
+                                   # tree at write time
     failures = 0
     for rep in range(1, args.repeat + 1):
         # one work directory per group per repetition, created fresh
@@ -487,7 +489,7 @@ def main() -> int:
             if not ok:
                 failures += 1
             results.append({
-                **source_identity(),
+                **identity,
                 "schema": "wasmdown.test-result.v1",
                 "suite": "wasi-" + case["abi"],
                 "case_id": case["id"],
