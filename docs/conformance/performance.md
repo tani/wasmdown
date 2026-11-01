@@ -84,3 +84,13 @@ SQLite Preview1 fixture: one `validate-module` costs **0.07 s and 33.5 MiB**
 2,039 functions that is 0.035 % of time and 0.4 % of consing, so the duplicate
 is left in place: the standalone guard is part of the public contract and the
 saving is immaterial.
+
+## The embedded instance constant is not a compile-cost driver (measured)
+
+Every emitted lambda binds `(inst ',instance)` — a quoted, circular module
+instance — even when the body never touches memory/table/global/func
+accessors. Measured directly by compiling 300 memory-free functions with and
+without that binding/constant (temporary build, reverted): **0.09 s / 100.1 MiB**
+with the binding vs **0.08 s / 99.8 MiB** without. The difference is noise, so
+omitting the constant for instance-free functions is not worth the special
+case; the cost remains in compiling the control graph of large bodies.
