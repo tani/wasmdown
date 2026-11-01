@@ -4005,6 +4005,22 @@ of a stream or future pair."
 ;;; closure; the STREAM/FUTURE result precedence and DONE
 ;;; transitions differ (§1848-1882: streams DONE only on DROPPED;
 ;;; futures DONE on COMPLETED and DROPPED; COMPLETED wins).
+(defun %wset-wake-waiters (wset)
+  "Wake every thread parked in %WSET-WAIT on WSET: a REAL wake-count
+(the durable target) plus the set's own broadcast. Used by both the
+subtask resolve and the stream/future pending-event arming."
+  (let ((waiters
+          (sb-thread:with-recursive-lock ((async-waitable-set-mutex wset))
+            (sb-thread:condition-broadcast
+             (async-waitable-set-waitqueue wset))
+            (copy-list (async-waitable-set-waiters wset)))))
+    (dolist (w waiters)
+      (sb-thread:with-recursive-lock ((async-thread-mutex w))
+        (incf (async-thread-wake-count w))
+        (sb-thread:condition-broadcast (async-thread-waitqueue w))
+        (sb-thread:condition-broadcast
+         (async-thread-suspend-waitqueue w))))))
+
 (defun %end-notify (end progress)
   (setf (async-waitable-pending-event end)
         (lambda ()
@@ -4043,7 +4059,15 @@ of a stream or future pair."
   ;; M15 MECHANISM 7 — THE SYNC RENDEZVOUS WAKE: a thread parked in
   ;; this end's SYNC read/write re-tests on a REAL wake.
   (let ((wt (async-waitable-sync-waiter-thread end)))
-    (when wt (%async-thread-wake wt))))
+    (when wt (%async-thread-wake wt)))
+  ;; A WAITABLE-SET WAITER parked on this end must also re-test: the
+  ;; pending event armed above is what %WSET-WAIT delivers, but nothing
+  ;; woke the set. (A subtask resolve does this in %SUBTASK-RESOLVE;
+  ;; a stream/future copy completion — e.g. the stdio worker finishing
+  ;; a parked host copy — takes this path instead.) Without it a task
+  ;; waiting on the end's set never learns the copy completed.
+  (when (async-waitable-wset end)
+    (%wset-wake-waiters (async-waitable-wset end))))
 
 ;;; ---- The GuestBuffer (CanonicalABI.md 1545-1586) ----
 ;;; A buffer is (list memory ptr length progress realloc encoding) — the
@@ -7668,19 +7692,7 @@ computes the tuple at delivery time)."
     ;; resume-all nudge; a count posted inside the park's
     ;; registration window is consumed at the park itself. The
     ;; set's own broadcast stays (harmless when no count rides it).
-    (let ((waiters
-            (sb-thread:with-recursive-lock
-                ((async-waitable-set-mutex (async-waitable-wset s)))
-              (sb-thread:condition-broadcast
-               (async-waitable-set-waitqueue (async-waitable-wset s)))
-              (copy-list (async-waitable-set-waiters
-                          (async-waitable-wset s))))))
-      (dolist (w waiters)
-        (sb-thread:with-recursive-lock ((async-thread-mutex w))
-          (incf (async-thread-wake-count w))
-          (sb-thread:condition-broadcast (async-thread-waitqueue w))
-          (sb-thread:condition-broadcast
-           (async-thread-suspend-waitqueue w)))))
+    (%wset-wake-waiters (async-waitable-wset s))
     ;; M14: DEFER inside the cancel-wait window (the third M11a
     ;; site running on the callee's thread inside the synchronous-
     ;; resume wait — the resolve's nudge would grant the callee's

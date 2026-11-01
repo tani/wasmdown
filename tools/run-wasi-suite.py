@@ -72,6 +72,7 @@ P3 = "p3-guest.wasm"
 P3_IMPORT = "p3-import-guest.wasm"
 P3_CLOCK = "p3-clock-guest.wasm"
 P3_ASYNC = "p3-async-guest.wasm"
+P3_STREAM = "p3-stream-guest.wasm"
 
 # ---- the cases -----------------------------------------------------
 # expect.stdout_equals  : exact stdout (list of lines, joined by \n, one
@@ -240,6 +241,17 @@ CASES = [
         # imports wasi:cli/exit@0.3.2, lowers exit-with-code, calls it with
         # 7: the command runner maps the WASI exit to the process status.
         "expect": {"stdout_equals": [], "exit": 7},
+    },
+    {
+        "id": "p3/stream-stdout",
+        "abi": "preview3",
+        "fixture": P3_STREAM,
+        "argv": [],
+        "stdin": "",
+        # write-via-stream: canonical future order (park read, stage write,
+        # drop writable, waitable-set.wait on the future event); stdout is
+        # the guest's bytes.
+        "expect": {"stdout_equals": ["hi"], "exit": 0},
     },
     {
         "id": "p3/async-callback",

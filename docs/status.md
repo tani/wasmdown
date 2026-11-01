@@ -36,7 +36,7 @@ deliberately incomplete, and what will not be built. Measurements live in
 | WASI | Preview 1 (`wasi_snapshot_preview1`) | Full | All 46 pinned imports are provided over an explicit capability context. The whole acceptance lane (in-memory and on-disk SQLite, rollback, bail, preopen denial, read-only, escape) passes with compiled guest cores too. |
 | WASI | 0.3.2 providers | Partial | The CLI now owns a reactor (clock deadlines and socket readiness are servable); what remains partial is the provider surface itself — blocking DNS/stdio executors and the `@unstable` gates. |
 | WASI | 0.2 facade | Partial | 27 of 31 stable interfaces are bound at exact release names. |
-| WASI | 0.3.2 guest lane | Partial | Four hand-authored @0.3.2 commands run through the real CLI in both backends (`make test-wasi-preview3`): a no-import success smoke, a provider-importing guest that lowers `wasi:cli/exit@0.3.2` and exits 7, a clock guest that imports `wasi:clocks/monotonic-clock@0.3.2` and traps unless `now()` is monotonic, and a resume-safe async command whose `run` is lifted async with a callback (`YIELD` from the core run, `task.return(ok)` in the callback, `EXIT`). No upstream toolchain input exists here; socket/stream guests and a provider-driven async wait remain open. The provider side of that slice is already present, not a blocker: the command provider set composes 20 imports including `wasi:cli/stdout@0.3.2` (whose `write-via-stream` is backed by `cli-output-instance`), `wasi:cli/stderr@0.3.2` and `wasi:sockets/types@0.3.2`; only the types-only `wasi:cli/types@0.3.2` is reported unbound (`wasi/command-provider-composed-from-command-world` pins the set). The next slice is therefore the guest encoding (stream.new + async stream.write + the async `write-via-stream` call + future.read + drops), not provider work. |
+| WASI | 0.3.2 guest lane | Partial | Five hand-authored @0.3.2 commands run through the real CLI in both backends (`make test-wasi-preview3`): a no-import success smoke, a provider-importing guest that lowers `wasi:cli/exit@0.3.2` and exits 7, a clock guest that imports `wasi:clocks/monotonic-clock@0.3.2` and traps unless `now()` is monotonic, a resume-safe async command whose `run` is lifted async with a callback (`YIELD` from the core run, `task.return(ok)` in the callback, `EXIT`), and a stdout stream command that writes through `wasi:cli/stdout@0.3.2`'s `write-via-stream` using the canonical future order (park the read, stage the write, drop the writable end, `waitable-set.wait` for the future event) and prints `hi`. No upstream toolchain input exists here; socket/stream guests and a provider-driven async wait remain open. The provider side of that slice is already present, not a blocker: the command provider set composes 20 imports including `wasi:cli/stdout@0.3.2` (whose `write-via-stream` is backed by `cli-output-instance`), `wasi:cli/stderr@0.3.2` and `wasi:sockets/types@0.3.2`; only the types-only `wasi:cli/types@0.3.2` is reported unbound (`wasi/command-provider-composed-from-command-world` pins the set). The next slice is therefore the guest encoding (stream.new + async stream.write + the async `write-via-stream` call + future.read + drops), not provider work. |
 | WASI | `wasi:http` | Out of scope | Removed from the runtime by decision and not planned, recoverable from git history. |
 
 ## Declared limits
@@ -71,33 +71,18 @@ and neither is a validation rule (ADR-005).
   That is a property of the fixture, not of the scheduler: it is green
   through `run-component` without a reactor, and the P3 CLI lane uses the
   sync command until a resume-safe async guest is pinned.
-- **P3 `write-via-stream` against the real CLI stdout is not yet correct.**
-  The stream path is proven in-process: `wasi/e2e-command-component-binary`
-  runs the hand-authored stdout command through `run-component` with a
-  string-output sink, and a resume-safe variant (state kept in memory,
-  `task.return` after the async `future.read`) reaches status 0 with output
-  exactly `hi` (character codes 104 105). Against a worker-backed stdout —
-  the CLI's file/tty sink, where `cl-stream-sink` copies the span onto the
-  context's stdio executor — the same guest does not settle: the sync
-  fixture emitted `hi` on every retry tick (148 bytes over ~74 ticks)
-  before the deadlock oracle. Root cause found and fixed: `%host-end-retry`
-  cleared the parked host copy before calling `%host-sink-drain :retry t`,
-  so the drain could not match the attempt, advanced the generation and
-  RESUBMITTED the same span to the stdio worker — every retry wrote the
-  bytes again. The copy now stays on the end and the retry reuses it; one
-  retry accepts the span exactly once (measured: `n=0` then `n=2`, one
-  generation). What remains is the wake-up after that acceptance: the
-  worker-path guest is not resumed (deadlock oracle) with the event-gated
-  async variant, while the in-process string-sink path completes. The next
-  slice is that delivery path, not the guest encoding: the guests validate,
-  the provider is composed, and the duplication is gone. Probes since:
-  the accepted span now reaches the file exactly once (`2` bytes), but the
-  callback is resumed with a plain yield tick (event 0) before the copy is
-  over (`stream.drop-writable` then traps `cannot remove busy stream`), and
-  gating on a real event (3/4) or waiting on `waitable-set.wait` over the
-  writable/future end both deadlock. The next step is the store's event
-  delivery for a parked stream copy to a callback-lifted task, not another
-  guest shape.
+- The P3 `write-via-stream` path is now exercised end to end by a pinned
+  guest (`p3/stream-stdout`, 3 repeats, both backends): it prints exactly
+  `hi\n` through the worker-backed CLI stdout. Two runtime defects found
+  while building it are fixed and pinned: `%host-end-retry` cleared the
+  parked host copy before its retry (so every readiness resubmitted the
+  span and stdout duplicated — now the copy is reused), and `%end-notify`
+  woke only a sync waiter, never a `waitable-set` waiter (so a task parked
+  on the set never learned a stream/future copy completed — now both are
+  woken). The guest itself must use the canonical order: park the future
+  read first, stage the write, wait for a WOULD-BLOCK write's own event
+  (3) before `drop-writable`, then wait for the future event (4).
+
 - WASI 0.2 (shared by both backends, after the readiness/permit audit):
   end-of-input is still reported as `stream-error::closed` rather than
   `ok([])` (the open-but-empty vs closed distinction itself is now exact:

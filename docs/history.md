@@ -358,8 +358,19 @@ resume-safe async guest is pinned.
   RESUME-SAFE binary async command: `run` is lifted async with a callback,
   the core run returns `YIELD`, the callback runs on the resume, calls
   `task.return(ok)` and returns `EXIT`; the runner reports status 0 and no
-  leaked threads. The lane runs four guests, 3 repeats each, in both
-  backends. The component binary grammar details that mattered: type indices
+  leaked threads. A fifth guest is the stdout STREAM shape: it imports
+  `wasi:cli/stdout@0.3.2`, parks an async `future.read` first, stages a
+  `stream.write`, waits for the write's own event when the worker-backed
+  stdout returns WOULD-BLOCK, drops the writable end (the provider resolves
+  the future on that drop) and waits for the future event; the CLI prints
+  exactly `hi\n`. Building it surfaced two runtime defects, both fixed:
+  `%host-end-retry` cleared the parked host copy before the retry (the retry
+  could not match it, advanced the generation and resubmitted the span, so
+  stdout duplicated — the copy is now reused), and `%end-notify` woke only a
+  sync waiter, never a `waitable-set` waiter (a task parked on the set never
+  learned a copy completed — both are now woken). The lane runs five guests,
+  3 repeats each (15/15 per backend). The component binary grammar details
+  that mattered: type indices
   inside an instance type are local to that type's declarations, the lower's
   core func must be defined before the bag that exports it, and imported
   instances occupy the instance index space before defined ones.
