@@ -340,6 +340,13 @@ host binding."
     (dolist (name declared)
       (let ((hit (assoc name builders :test #'string=)))
         (cond
+          ;; HTTP is excluded globally, not just on the 0.3 path: an
+          ;; exact-version 0.2 import must get the same canonical
+          ;; message instead of a generic "no provider".
+          ((%wasi-http-import-name-p name)
+           (error 'wasmdown.wit:wit-error
+                  :message
+                  "wasi:http is not supported by this runtime by design (removed in M17); the pinned HTTP WIT is reference data only. See docs/usage/wasi.md and specs/wasi/MANIFEST.md."))
           (hit (push (cons name (funcall (cdr hit))) providers))
           ;; a types-only import carries no host binding
           ((let ((iface (p2-interface-by-name name)))

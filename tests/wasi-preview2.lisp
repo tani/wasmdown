@@ -39,6 +39,23 @@
         (wasmdown:link-error (c)
           (search "0.2.99" (wasmdown:wasmdown-error-message c))))))
 
+(test wasi-preview2/http-import-rejected-by-design
+  ;; HTTP is excluded globally; the 0.2 facade must give the canonical
+  ;; by-design message, not the generic "no provider" wording.
+  (let ((ctx (wasmdown.wasi:make-wasi-context)))
+    (unwind-protect
+         (dolist (name '("wasi:http/types@0.2.12"
+                         "wasi:http/client@0.2.12"))
+           (is (handler-case
+                   (progn
+                     (wasmdown.wasi:preview2-command-provider
+                      ctx :imports (list name))
+                     nil)
+                 (wasmdown.wit:wit-error (c)
+                   (search "wasi:http is not supported by this runtime by design"
+                           (wasmdown:wasmdown-error-message c))))))
+      (wasmdown.wasi:close-wasi-context ctx))))
+
 (test wasi-preview2/clocks-and-random
   (let ((clock (wasmdown.wasi:p2-monotonic-clock-instance "0.2.12")))
     (let ((a (p2-call clock "now")))
