@@ -5073,6 +5073,38 @@ world w {
       (is message)
       (is (search "bogus" message)))))
 
+(test wasi/world-provider-http-import-rejected-by-design
+  ;; `wasi:http' is not supported by this runtime (removed in M17). An
+  ;; http import is refused by its own rule at COMPOSITION time, with
+  ;; the canonical message — before the provider lookup, so it can
+  ;; never fall through as an unbound types-only import or as the
+  ;; generic "no provider" error.
+  (let* ((ctx (wasmdown.wasi:make-wasi-context))
+         (pkgs (wasmdown.wasi::%wasi-wit-packages))
+         (pkg (wasmdown.wit:parse-wit-string
+               "package test:httpworld@0.1.0;
+
+world h {
+  import wasi:http/types@0.3.2;
+}
+"))
+         (world (wasmdown.wit:resolve-wit-world pkg "h" :packages pkgs))
+         (message nil))
+    (is (equal '("wasi:http/types@0.3.2")
+               (mapcar #'wasmdown.wasi::%world-import-name
+                       (wasmdown.wit:wit-world-imports world))))
+    (handler-case (wasmdown.wasi:compose-world-providers world ctx)
+      (wasmdown.wit:wit-error (c)
+        (setf message (wasmdown:wasmdown-error-message c))))
+    (is message)
+    (is (search "wasi:http is not supported by this runtime by design"
+                message))
+    ;; the dedicated refusal, not the generic unsupported-import path
+    (is (not (search "no provider" message)))
+    ;; and no wasi:http entry is ever bound by the command provider
+    (is (notany (lambda (name) (eql 0 (search "wasi:http" name)))
+                (mapcar #'car (wasmdown.wasi:command-provider ctx))))))
+
 ;;; -----------------------------------------------------------------
 ;;; Backend evidence for a command component (M9): the nested core the
 ;;; component instantiates runs through the SELECTED backend, and the

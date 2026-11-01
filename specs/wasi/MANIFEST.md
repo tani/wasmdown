@@ -34,6 +34,41 @@ interfaces (the release ships each package standalone with its deps
 inlined as separate files); they are retained verbatim so the vendored
 tree is byte-identical to the release asset.
 
+## Unsupported by design (not pending)
+
+`wasi:http` is **excluded permanently by user decision (2026-11-02)**. It was
+removed in M17 (M16 slice 5) and is recoverable from git history; it is not an
+implementation gap, is not planned, and will not be restored. The vendored
+`wasi-wit-0.3.2/http/http.wit` remains **reference data only** — it is kept so
+the vendored tree stays byte-identical to the release asset, and no provider,
+world, adapter or test may be derived from it as a deliverable.
+
+Excluded vendored declarations, verified against
+`specs/wasi/wasi-wit-0.3.2/http/http.wit`:
+
+| Declaration | Kind | Status |
+| --- | --- | --- |
+| `wasi:http/types@0.3.2` | interface | unsupported by design (vendored reference data only) |
+| `wasi:http/handler@0.3.2` | interface | unsupported by design (vendored reference data only) |
+| `wasi:http/client@0.3.2` | interface | unsupported by design (vendored reference data only) |
+| `wasi:http/service` | world | unsupported by design |
+| `wasi:http/middleware` | world | unsupported by design |
+
+There is no `outgoing-handler` / `incoming-handler` in the pinned 0.3.2
+release; the outgoing client is `client.send` and the incoming service is
+`handler.handle` inside the `service`/`middleware` worlds.
+
+A guest or embedder that imports `wasi:http` is refused at link time with this
+exact message:
+
+```
+wasi:http is not supported by this runtime by design (removed in M17); the pinned HTTP WIT is reference data only. See docs/usage/wasi.md and specs/wasi/MANIFEST.md.
+```
+
+The declared support profile is therefore `conformant for the declared WASI
+0.3.2 profile (wasi:http excluded)` at most; an unqualified "full WASI 0.3.2"
+label is not claimed (see `docs/design/PLAN.md` §2.1).
+
 ## Verification
 
 ```sh

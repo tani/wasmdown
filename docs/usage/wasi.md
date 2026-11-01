@@ -66,7 +66,19 @@ dispatch is by the `@0.3.2` suffix of the import name.
 | `wasi:cli` | `environment` (`get-environment`, `get-arguments`, `get-initial-cwd`), `exit` (`exit`, `exit-with-code` via the `wasi-exit` condition), `stdin`/`stdout`/`stderr` as real streams, the `terminal-*` interfaces (`isatty` answers `some` or `none`, never a fabricated handle), and the command world's `run`. |
 | `wasi:filesystem` | The `descriptor` resource (own/borrow, destructors, non-owning preopens), all non-stream descriptor methods with the errno → `error-code` table, `preopens.get-directories`, `read-via-stream` / `write-via-stream` / `append-via-stream` / `read-directory`, and flag gating that reports `not-permitted` / `read-only` through the interface's `result` rather than throwing. |
 | `wasi:sockets` | The network authority, `tcp-socket` and `udp-socket` (create, bind, connect, listen, accept, send, receive, addresses, knobs), `ip-name-lookup` via `getaddrinfo`, and the errno → `sockets-error-code` table. A socket's handle plus its send/receive/listen streams share one reference count; the fd closes at zero. |
-| `wasi:http` | **Removed — out of scope.** There is no provider and no transport option. The implementation is recoverable from git history; the vendored `specs/wasi/wasi-wit-0.3.2/http/*.wit` files remain as reference data only. |
+| `wasi:http` | **Unsupported by design — not an implementation gap, not planned.** Excluded permanently by user decision (2026-11-02); removed in M17 and recoverable from git history. There is no provider and no transport option. The vendored `specs/wasi/wasi-wit-0.3.2/http/*.wit` files remain reference data only. Imports are rejected at link time with the exact message below. See [`../../specs/wasi/MANIFEST.md`](../../specs/wasi/MANIFEST.md) § “Unsupported by design (not pending)”. |
+
+An import of `wasi:http` is refused with this exact message:
+
+```
+wasi:http is not supported by this runtime by design (removed in M17); the pinned HTTP WIT is reference data only. See docs/usage/wasi.md and specs/wasi/MANIFEST.md.
+```
+
+This is a deliberate, permanent exclusion — not a pending interface and not a
+missing piece of the declared profile. The declared profile is the pinned
+WASI 0.3.2 surface **minus** `wasi:http`; the unsupported declarations
+(`types`, `handler`, `client`, and the `service`/`middleware` worlds) are
+enumerated in `specs/wasi/MANIFEST.md`.
 
 Coverage is enforced at construction: an unimplemented function of a
 bound interface is a `host-error`, never a trapping stub.

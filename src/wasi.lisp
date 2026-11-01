@@ -5906,6 +5906,20 @@ interface's versioned import name (`ns:pkg/iface@version')."
                         (wasmdown.wit:wit-world-item-version item))
                 (wasmdown.wit:wit-world-item-interface item))))))
 
+(defun %wasi-http-import-name-p (name)
+  "T when the import NAME belongs to the `wasi:http' package, at any
+version and for any interface (`wasi:http/types@0.3.2', ...). The
+namespace and package segments are matched structurally, so a version
+suffix, an unversioned spelling, or an interface this file does not
+know still counts — and a lookalike such as `wasi:http-client/x' or
+`my:wasi:http/types' does not."
+  (and (stringp name)
+       (let ((colon (position #\: name))
+             (slash (position #\/ name)))
+         (and colon slash (< colon slash)
+              (string= "wasi" name :end2 colon)
+              (string= "http" (subseq name (1+ colon) slash))))))
+
 (defun %types-only-world-import-p (item)
   "T when ITEM's resolved target is an interface with no functions
 and no resources: nothing for a provider instance to bind. Only a
@@ -6011,6 +6025,13 @@ import this runtime has no provider for."
           (setf (gethash name seen) t)
           (let ((builder (cdr (assoc name builders :test #'string=))))
             (cond
+              ((%wasi-http-import-name-p name)
+               ;; refused BEFORE the provider lookup, the types-only
+               ;; branch and the generic no-provider error: an http
+               ;; import must never pass as unbound
+               (error 'wasmdown.wit:wit-error
+                      :message
+                      "wasi:http is not supported by this runtime by design (removed in M17); the pinned HTTP WIT is reference data only. See docs/usage/wasi.md and specs/wasi/MANIFEST.md."))
               (builder
                (push (cons name (funcall builder)) providers))
               ((%types-only-world-import-p item)

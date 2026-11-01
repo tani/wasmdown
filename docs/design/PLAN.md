@@ -107,18 +107,22 @@ Support declarations have three distinct values: `conformant` (every applicable 
 ### 2.1 Definition of full support for the declared WASI 0.3.2 profile (2026-11-02)
 
 "Full support" here means **conformant for the DECLARED WASI 0.3.2 profile**:
-the pinned 0.3.2 stable surface with `wasi:http` excluded by decision. It is a
-claim about a pinned release, not about any 0.3.x draft. This is deliberately
-narrower than the unqualified phrase "full WASI 0.3.2" in §12.9, which is
-reserved for a claim covering every mandatory adopted stable interface including
-HTTP; because HTTP is an explicit exclusion here, this project's maximum honest
-label is `conformant for the declared 0.3.2 profile (wasi:http excluded)`, never
-an unqualified "full WASI 0.3.2". Until every condition below holds,
+the pinned 0.3.2 stable surface with `wasi:http` excluded by user decision
+(2026-11-02). It is a claim about a pinned release, not about any 0.3.x draft.
+The target is permanently this declared profile: the project does **not** aim to
+restore or implement `wasi:http`, and no milestone, gate, release row or
+definition-of-done item makes it pending. The unqualified phrase "full WASI
+0.3.2" in §12.9 is only a definitional boundary — it describes what a claim
+covering every interface would mean — and is **not a project goal**. Because
+HTTP is a permanent exclusion, this project's maximum honest label is
+`conformant for the declared 0.3.2 profile (wasi:http excluded)`, never an
+unqualified "full WASI 0.3.2". Until every condition below holds,
 `docs/status.md` says `partial`.
 
 1. **Scope is enumerated.** Every stable interface in the pinned 0.3.2 WIT
    packages is either implemented or listed as an explicit exclusion. Current
-   exclusions: `wasi:http` (removed at user direction), guest threads/atomics,
+   exclusions: `wasi:http` (removed at user direction in M17, 2026-11-02,
+   permanent and not pending), guest threads/atomics,
    annotations, and unratified proposals. The claim names the profile
    ("declared 0.3.2 profile") and the exclusions; it never means "including
    excluded interfaces".
@@ -141,7 +145,8 @@ an unqualified "full WASI 0.3.2". Until every condition below holds,
 A conformant-profile claim also states which **version** is covered (0.3.2
 here), which worlds are in scope, and the exclusions above. Claims for any other
 0.3.x release require their own pinned WIT and gates. §12.9's unqualified
-level remains unreachable by design while HTTP is excluded.
+level is a definitional boundary only: it is not a project goal, and no
+milestone, gate or release condition requires it.
 
 ## 3. Conformance contract and feature inventory
 
@@ -860,7 +865,7 @@ M0 -> M1 -> M2 -> M3 -> M4 -> M5 -> M6
 | 0.3 | After M5 | Core Wasm 3.0 conformant under published limits, if G2 fully achieved. |
 | 0.5 | After M6–M8 | Optimized Core 3.0 plus partial/complete explicitly versioned legacy WASI. |
 | 0.9 | After M9–M10 | WASI 0.3.2 release candidate; feature coverage documented per world. |
-| 1.0 | After M11 | Core 3.0 + the declared WASI 0.3.2 profile (all pinned stable interfaces except the explicit `wasi:http` exclusion), backed by published conformance evidence; an unqualified "full WASI 0.3.2" label still requires HTTP. |
+| 1.0 | After M11 | Core 3.0 + the declared WASI 0.3.2 profile (all pinned stable interfaces except the permanent `wasi:http` exclusion, user decision 2026-11-02), backed by published conformance evidence; no release claims an unqualified "full WASI 0.3.2", and HTTP is never pending or restored. |
 
 ---
 
@@ -926,7 +931,7 @@ completed milestones. Evidence lives in `docs/status.md`,
 - [ ] Official Core 3.0 tests pass with no semantic skips or hidden missing feature gates, subject to documented permitted limits.
 - [ ] Compiled Lisp source is inspectable; optimized and interpreter paths are differential-equivalent.
 - [ ] Component Model encoding, validation, Canonical ABI, nested composition, resources and required adopted feature gates pass tests.
-- [ ] The declared WASI 0.3.2 profile is implemented and passes applicable conformance tests: every pinned stable interface except the explicit `wasi:http` exclusion, with the claim naming that exclusion; an unqualified "full WASI 0.3.2" claim additionally requires HTTP and is therefore not made.
+- [ ] The declared WASI 0.3.2 profile is implemented and passes applicable conformance tests: every pinned stable interface except the permanent `wasi:http` exclusion (user decision 2026-11-02), with the claim naming that exclusion. `wasi:http` is not pending and not planned; no unqualified "full WASI 0.3.2" claim is made.
 - [ ] WASI 0.1 and 0.2 compatibility assertions are separately documented and tested.
 - [ ] Host capability/security review passes; hostile programs can be run with meaningful worker-process isolation.
 - [ ] Benchmarks, architecture/platform support, explicit resource limits, build instructions, pinned dependencies and release artifacts are published.
