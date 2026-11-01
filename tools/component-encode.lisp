@@ -40,6 +40,19 @@
                                          (setf n (ash n -7))
                                       finally (push n out)
                                               (return (coerce (nreverse out) '(vector (unsigned-byte 8)))))))
+(defun s33 (n)
+  "signed LEB128 for a component valtype type index (Binary.md 252:
+  signed s33, not the unsigned u32 form — 64 must encode as C0 00, not
+  40 which is the FUNC constructor byte)."
+  (let ((out '()))
+    (loop
+      (let ((byte (logand n #x7f)))
+        (setf n (ash n -7))
+        (if (or (and (zerop n) (zerop (logand byte #x40)))
+                (and (= n -1) (logand byte #x40)))
+            (progn (push byte out) (return))
+            (push (logior #x80 byte) out))))
+    (coerce (nreverse out) '(vector (unsigned-byte 8)))))
 (defun by (&rest xs) (coerce xs '(vector (unsigned-byte 8))))
 (defun cat (&rest vs) (apply #'concatenate '(vector (unsigned-byte 8)) vs))
 (defun nm (s) (cat (u32 (length s)) (map 'vector #'char-code s)))
@@ -71,7 +84,7 @@
   "component valtype: prim keyword, (:idx . n), or an inline ct."
   (typecase v
     (keyword (by (cdr (assoc v *prim-bytes*))))
-    (cons (if (eq (car v) :idx) (u32 (cdr v))
+    (cons (if (eq (car v) :idx) (s33 (cdr v))
               (vt (c::make-ct :kind :prim :payload v))))
     (c::ct (enc-deftype v))
     (t (error "unknown valtype ~s" v))))

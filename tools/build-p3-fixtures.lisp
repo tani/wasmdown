@@ -1194,6 +1194,27 @@
 ;;;     [method]descriptor.stat:
 ;;;       async func(self: borrow<descriptor>)
 ;;;         -> result<descriptor-stat, error-code>
+;;;     [method]descriptor.create-directory-at:
+;;;       async func(self: borrow<descriptor>, path: string)
+;;;         -> result<_, error-code>
+;;;     [method]descriptor.stat-at:
+;;;       async func(self: borrow<descriptor>, path-flags: path-flags,
+;;;                  path: string)
+;;;         -> result<descriptor-stat, error-code>
+;;;     [method]descriptor.read-directory:
+;;;       func(self: borrow<descriptor>)
+;;;         -> tuple<stream<directory-entry>,
+;;;                  future<result<_, error-code>>>
+;;;     [method]descriptor.rename-at:
+;;;       async func(self: borrow<descriptor>, old-path: string,
+;;;                  new-descriptor: borrow<descriptor>, new-path: string)
+;;;         -> result<_, error-code>
+;;;     [method]descriptor.unlink-file-at:
+;;;       async func(self: borrow<descriptor>, path: string)
+;;;         -> result<_, error-code>
+;;;     [method]descriptor.remove-directory-at:
+;;;       async func(self: borrow<descriptor>, path: string)
+;;;         -> result<_, error-code>
 ;;;
 ;;; Canonical LOWER shapes (CanonicalABI flatten §2894-2930;
 ;;; MAX_FLAT_ASYNC_PARAMS = 4, ANY async result rides the appended
@@ -1221,6 +1242,22 @@
 ;;;       ; state. The async rule always passes ANY result through the
 ;;;       ; appended [ptr], hence memory (the store writes the whole
 ;;;       ; result<descriptor-stat, error-code> there).
+;;;   create-directory-at / unlink-file-at / remove-directory-at
+;;;                    (async) core (param i32 i32 i32 i32) (result i32)
+;;;       ; (self, path ptr, path len, result out-param): 3 flat params,
+;;;       ; so they stay scalar and only the result goes through [ptr].
+;;;   stat-at          (async) core (param i32 i32 i32 i32 i32) (result i32)
+;;;       ; (self, path-flags, path ptr, path len, result out-param).
+;;;   rename-at        (async) core (param i32 i32) (result i32)
+;;;       ; 6 flat params exceed 4, so the FIRST param is the params
+;;;       ; tuple address (self@0, old ptr@4/len@8, new-descriptor@12,
+;;;       ; new ptr@16/len@20, size 24) and the SECOND the out-param.
+;;;   read-directory   (sync)  core (param i32 i32)
+;;;       ; (self handle, retptr) -> (stream handle @0, future @4); the
+;;;       ; tuple result's 2 flat handles exceed MAX_FLAT_RESULTS, so it
+;;;       ; rides the appended [ptr]. Each element is a 24-byte
+;;;       ; directory-entry (descriptor-type variant 16 bytes, then the
+;;;       ; name's ptr@16/len@20); storing its string needs realloc.
 ;;;
 ;;; The params-tuple layout (flags have an ELEMENT SIZE OF 1/2/4 per
 ;;; alignment_flags: 1 label and 4 labels are 1-byte fields, so the
@@ -1255,7 +1292,10 @@
 ;;;   2. open-at("hello.txt", read) returns ok and a live descriptor;
 ;;;   3. read-via-stream(0) + stream.read yields exactly 17 bytes
 ;;;      equal to the seeded "filesystem-probe\n" and the paired
-;;;      future resolves ok;
+;;;      future resolves ok; a WRITE through that read-only descriptor
+;;;      (write-via-stream) must REFUSE with error-code::read-only
+;;;      (case 32) through the paired future — an err result, never a
+;;;      trap;
 ;;;   4. THE WRITE PATH on the same preopen: open-at("out.txt",
 ;;;      create|truncate, read|write) returns ok; write-via-stream at
 ;;;      offset 0 moves 15 bytes through stream.new + stream.write (a
@@ -1271,7 +1311,18 @@
 ;;;      wakes it — an err result or a partial copy traps;
 ;;;   5. open-at("missing.txt") returns ERR with error-code::no-entry
 ;;;      (case 19) — an err result, never a trap;
-;;;   6. every handle is dropped (both descriptors, all stream and
+;;;   6. THE DIRECTORY SURFACE: create-directory-at("subdir") ok;
+;;;      open-at("subdir", directory, read) ok; stat($dir) reports
+;;;      descriptor-type::directory (case 2); read-directory on the
+;;;      preopen enumerates every entry and its names include
+;;;      hello.txt, out.txt, subdir and temp.txt, with the paired
+;;;      future ok; rename-at("temp.txt" -> "moved.txt") ok and
+;;;      stat-at("moved.txt") reports regular-file, size 0;
+;;;      unlink-file-at("moved.txt") and
+;;;      remove-directory-at("subdir") both ok, then
+;;;      stat-at("subdir") is ERR/no-entry (case 19). The temporary
+;;;      objects are removed so repeated runs share the workdir;
+;;;   7. every handle is dropped (all descriptors, all stream and
 ;;;      future ends, the preopen's own handle).
 ;;;
 ;;; The async open-at is waited the CanonicalABI way: a packed
@@ -1317,18 +1368,35 @@
            "  (type $ST (stream u8))"
            "  (type $FT (future (result (error $ec))))"
            "  (type $res (result))"
-           ;; The imported instance type declares its five type
-           ;; exports LOCALLY (`type` declarators named by an
-           ;; `(export ... (type $id))`) and then the methods. That
-           ;; mirrors the provider: FILESYSTEM-TYPES-INSTANCE exports
-           ;; the interface's defined types under their WIT names
-           ;; (path-flags/open-flags/descriptor-flags/error-code) and
-           ;; the descriptor resource. Locality matters twice: the
-           ;; variant's `other(option string)` prerequisite ref must
-           ;; live in THIS declarator space, and an `(alias outer ...)`
-           ;; of a compound top-level type is re-walked by the
-           ;; validator's remap in the instance space, where its inner
-           ;; index aliased back to the alias slot (infinite remap).
+           ;; the clocks record descriptor-stat uses via the WIT's
+           ;; `use wasi:clocks/system-clock@0.3.2.{instant}': a TOP-level
+           ;; type so the instance type can reference it (the parser
+           ;; emits the implicit outer alias a `use` produces).
+           "  (type $instant (record (field \"seconds\" u64)"
+           "                        (field \"nanoseconds\" u32)))"
+           ;; the directory iteration's element type at the TOP level,
+           ;; so the stream.read canon can name it (the instance space
+           ;; has the WIT-shaped copy).
+           "  (type $dtv (variant (case \"block-device\")"
+           "                      (case \"character-device\")"
+           "                      (case \"directory\") (case \"fifo\")"
+           "                      (case \"symbolic-link\")"
+           "                      (case \"regular-file\") (case \"socket\")"
+           "                      (case \"other\" (option string))))"
+           "  (type $ent (record (field \"type\" $dtv)"
+           "                     (field \"name\" string)))"
+           "  (type $DENT (stream $ent))"
+           ;; The imported instance type follows the WIT shape: every
+           ;; defined type is declared LOCALLY and then EXPORTED under
+           ;; its WIT name (`(export "name" (type $slot (eq $local)))`);
+           ;; later types and every method signature reference the
+           ;; EXPORT SLOT, not the local definition (external-visibility
+           ;; ::0/::2: only the export's NEW index is externally
+           ;; visible, and a func export may not reference a local
+           ;; record/variant). The provider exports the same WIT names.
+           ;; descriptor-stat's timestamps reference the top-level
+           ;; clocks `instant`; the text parser emits the implicit outer
+           ;; alias a WIT `use` produces.
            "  (import \"wasi:filesystem/types@0.3.2\""
            "    (instance $types"
            "      (type $pf2 (flags \"symlink-follow\"))"
@@ -1346,10 +1414,12 @@
                    *p3-fs-error-code-cases*)
            "      (export \"error-code\" (type $ec3 (eq $ec2)))"
            ;; the STAT surface (the guest asserts the write's placement by
-           ;; the descriptor's own metadata): descriptor-type's eight cases
-           ;; in WIT order (regular-file = 5), instant as the clocks record,
-           ;; and descriptor-stat's field sequence, which the provider's
-           ;; domain value fstat record fills positionally.
+           ;; the descriptor's own metadata). The WIT shape is honoured:
+           ;; each defined type is EXPORTED (a type-bound export's NEW
+           ;; index is the externally visible name — external-visibility
+           ;; ::0/::2), and later types reference that NAME, never the
+           ;; local definition. descriptor-stat's timestamps use the
+           ;; outer-aliased clocks `instant` (the WIT's `use`).
            "      (type $dtp (variant (case \"block-device\")"
            "                          (case \"character-device\")"
            "                          (case \"directory\") (case \"fifo\")"
@@ -1357,17 +1427,20 @@
            "                          (case \"regular-file\")"
            "                          (case \"socket\")"
            "                          (case \"other\" (option string))))"
-           "      (type $ins2 (record (field \"seconds\" u64)"
-           "                          (field \"nanoseconds\" u32)))"
-           "      (type $dst (record (field \"type\" $dtp)"
+           "      (export \"descriptor-type\" (type $dtp2 (eq $dtp)))"
+           "      (type $dst (record (field \"type\" $dtp2)"
            "                         (field \"link-count\" u64)"
            "                         (field \"size\" u64)"
            "                         (field \"data-access-timestamp\""
-           "                                (option $ins2))"
+           "                                (option $instant))"
            "                         (field \"data-modification-timestamp\""
-           "                                (option $ins2))"
+           "                                (option $instant))"
            "                         (field \"status-change-timestamp\""
-           "                                (option $ins2))))"
+           "                                (option $instant))))"
+           "      (export \"descriptor-stat\" (type $dst2 (eq $dst)))"
+           "      (type $dent (record (field \"type\" $dtp2)"
+           "                          (field \"name\" string)))"
+           "      (export \"directory-entry\" (type $dentx (eq $dent)))"
            "      (export \"descriptor\" (type $dt (sub resource)))"
            "      (export \"[method]descriptor.open-at\""
            "        (func async (param \"self\" (borrow $dt))"
@@ -1392,7 +1465,34 @@
            "              (result (future (result (error $ec3))))))"
            "      (export \"[method]descriptor.stat\""
            "        (func async (param \"self\" (borrow $dt))"
-           "                    (result (result $dst (error $ec3)))))))"
+           "                    (result (result $dst2 (error $ec3)))))"
+           "      (export \"[method]descriptor.create-directory-at\""
+           "        (func async (param \"self\" (borrow $dt))"
+           "                    (param \"path\" string)"
+           "                    (result (result (error $ec3)))))"
+           "      (export \"[method]descriptor.stat-at\""
+           "        (func async (param \"self\" (borrow $dt))"
+           "                    (param \"path-flags\" $pf3)"
+           "                    (param \"path\" string)"
+           "                    (result (result $dst2 (error $ec3)))))"
+           "      (export \"[method]descriptor.read-directory\""
+           "        (func (param \"self\" (borrow $dt))"
+           "                    (result (tuple (stream $dentx)"
+           "                                   (future (result (error $ec3)))))))"
+           "      (export \"[method]descriptor.rename-at\""
+           "        (func async (param \"self\" (borrow $dt))"
+           "                    (param \"old-path\" string)"
+           "                    (param \"new-descriptor\" (borrow $dt))"
+           "                    (param \"new-path\" string)"
+           "                    (result (result (error $ec3)))))"
+           "      (export \"[method]descriptor.unlink-file-at\""
+           "        (func async (param \"self\" (borrow $dt))"
+           "                    (param \"path\" string)"
+           "                    (result (result (error $ec3)))))"
+           "      (export \"[method]descriptor.remove-directory-at\""
+           "        (func async (param \"self\" (borrow $dt))"
+           "                    (param \"path\" string)"
+           "                    (result (result (error $ec3)))))))"
            "  (alias export $types \"descriptor\" (type $desc))"
            "  (import \"wasi:filesystem/preopens@0.3.2\""
            "    (instance $pre"
@@ -1403,6 +1503,12 @@
            "  (alias export $types \"[method]descriptor.write-via-stream\" (func $wvs-f))"
            "  (alias export $types \"[method]descriptor.append-via-stream\" (func $avs-f))"
            "  (alias export $types \"[method]descriptor.stat\" (func $stat-f))"
+           "  (alias export $types \"[method]descriptor.create-directory-at\" (func $mkdir-f))"
+           "  (alias export $types \"[method]descriptor.stat-at\" (func $statat-f))"
+           "  (alias export $types \"[method]descriptor.read-directory\" (func $readdir-f))"
+           "  (alias export $types \"[method]descriptor.rename-at\" (func $rename-f))"
+           "  (alias export $types \"[method]descriptor.unlink-file-at\" (func $unlink-f))"
+           "  (alias export $types \"[method]descriptor.remove-directory-at\" (func $rmdir-f))"
            "  (alias export $pre \"get-directories\" (func $getdirs-f))"
            "  (core module $Mem"
            "    (memory (export \"mem\") 1)"
@@ -1440,6 +1546,30 @@
            "    (canon lower (func $stat-f) async"
            "      (memory (core memory $mem \"mem\"))"
            "      (realloc (core func $mem \"realloc\"))))"
+           "  (core func $mkdir-lowered"
+           "    (canon lower (func $mkdir-f) async"
+           "      (memory (core memory $mem \"mem\"))"
+           "      (realloc (core func $mem \"realloc\"))))"
+           "  (core func $statat-lowered"
+           "    (canon lower (func $statat-f) async"
+           "      (memory (core memory $mem \"mem\"))"
+           "      (realloc (core func $mem \"realloc\"))))"
+           "  (core func $readdir-lowered"
+           "    (canon lower (func $readdir-f)"
+           "      (memory (core memory $mem \"mem\"))"
+           "      (realloc (core func $mem \"realloc\"))))"
+           "  (core func $rename-lowered"
+           "    (canon lower (func $rename-f) async"
+           "      (memory (core memory $mem \"mem\"))"
+           "      (realloc (core func $mem \"realloc\"))))"
+           "  (core func $unlink-lowered"
+           "    (canon lower (func $unlink-f) async"
+           "      (memory (core memory $mem \"mem\"))"
+           "      (realloc (core func $mem \"realloc\"))))"
+           "  (core func $rmdir-lowered"
+           "    (canon lower (func $rmdir-f) async"
+           "      (memory (core memory $mem \"mem\"))"
+           "      (realloc (core func $mem \"realloc\"))))"
            "  (canon task.return (result $res) (core func $tr))"
            "  (canon waitable-set.new (core func $wsnew))"
            "  (canon waitable.join (core func $wjoin))"
@@ -1447,6 +1577,10 @@
            "  (canon subtask.drop (core func $subdrop))"
            "  (canon stream.new $ST (core func $snew))"
            "  (canon stream.read $ST async (memory (core memory $mem \"mem\")) (core func $sread))"
+           "  (canon stream.read $DENT async"
+           "         (memory (core memory $mem \"mem\"))"
+           "         (realloc (core func $mem \"realloc\"))"
+           "         (core func $sreadd))"
            "  (canon stream.write $ST async (memory (core memory $mem \"mem\")) (core func $swrite))"
            "  (canon future.read $FT async"
            "         (memory (core memory $mem \"mem\"))"
@@ -1464,6 +1598,12 @@
            "    (import \"env\" \"write-via-stream\" (func $wvs (param i32 i32 i64) (result i32)))"
            "    (import \"env\" \"append-via-stream\" (func $avs (param i32 i32) (result i32)))"
            "    (import \"env\" \"stat\" (func $stat (param i32 i32) (result i32)))"
+           "    (import \"env\" \"create-directory-at\" (func $mkdir (param i32 i32 i32 i32) (result i32)))"
+           "    (import \"env\" \"stat-at\" (func $statat (param i32 i32 i32 i32 i32) (result i32)))"
+           "    (import \"env\" \"read-directory\" (func $readdir (param i32 i32)))"
+           "    (import \"env\" \"rename-at\" (func $rename (param i32 i32) (result i32)))"
+           "    (import \"env\" \"unlink-file-at\" (func $unlink (param i32 i32 i32 i32) (result i32)))"
+           "    (import \"env\" \"remove-directory-at\" (func $rmdir (param i32 i32 i32 i32) (result i32)))"
            "    (import \"env\" \"stream.new\" (func $snew (result i64)))"
            "    (import \"env\" \"stream.write\" (func $swrite (param i32 i32 i32) (result i32)))"
            "    (import \"env\" \"stream.drop-writable\" (func $sdropw (param i32)))"
@@ -1473,6 +1613,7 @@
            "    (import \"env\" \"waitable-set.wait\" (func $wswait (param i32 i32) (result i32)))"
            "    (import \"env\" \"subtask.drop\" (func $subdrop (param i32)))"
            "    (import \"env\" \"stream.read\" (func $sread (param i32 i32 i32) (result i32)))"
+           "    (import \"env\" \"stream.read-dir\" (func $sreadd (param i32 i32 i32) (result i32)))"
            "    (import \"env\" \"future.read\" (func $fread (param i32 i32) (result i32)))"
            "    (import \"env\" \"stream.drop-readable\" (func $sdropr (param i32)))"
            "    (import \"env\" \"future.drop-readable\" (func $fdropr (param i32)))"
@@ -1493,6 +1634,12 @@
            "    (data (i32.const 536) \"!\")"
            "    (data (i32.const 544) \"-app\")"
            "    (data (i32.const 552) \"wmd-write-probe\\00\\00!-app\")"
+           ;; the directory probe's paths; the read-directory element
+           ;; buffer at 1024 (24 bytes per directory-entry: type variant
+           ;; 16 + string ptr/len 8); the realloc'd names live above 4096
+           "    (data (i32.const 600) \"subdir\")"
+           "    (data (i32.const 608) \"temp.txt\")"
+           "    (data (i32.const 624) \"moved.txt\")"
            "    (global $ws (mut i32) (i32.const 0))"
            "    (func $streq (param $a i32) (param $b i32) (param $n i32) (result i32)"
            "      (local $i i32)"
@@ -1505,6 +1652,15 @@
            "          (local.set $i (i32.add (local.get $i) (i32.const 1)))"
            "          (br $l)))"
            "      (i32.const 1))"
+           ;; a directory-entry's NAME equals the given span: the record
+           ;; stores the type variant at +0 and the string at +16 (ptr)
+           ;; and +20 (len)
+           "    (func $nameeq (param $e i32) (param $p i32) (param $n i32) (result i32)"
+           "      (if (i32.ne (i32.load (i32.add (local.get $e) (i32.const 20)))"
+           "                  (local.get $n))"
+           "          (then (return (i32.const 0))))"
+           "      (call $streq (i32.load (i32.add (local.get $e) (i32.const 16)))"
+           "                   (local.get $p) (local.get $n)))"
            ;; the async open-at: read the out-param only after the
            ;; subtask has RETURNED; the event tuple lands at 336
            "    (func $settle (param $packed i32)"
@@ -1661,6 +1817,8 @@
            "      (local $base i32) (local $n i32) (local $i i32) (local $e i32)"
            "      (local $pre i32) (local $ret i32) (local $cnt i32)"
            "      (local $stream i32) (local $fut i32) (local $fd i32)"
+           "      (local $wr i32) (local $dir i32) (local $found i32)"
+           "      (local $pk i64)"
            "      (if (i32.ne (local.get $code) (i32.const 0)) (then unreachable))"
            ;; 1. the preopen named "/work"
            "      (call $getdirs (i32.const 0))"
@@ -1680,6 +1838,7 @@
            "          (br $l)))"
            "      (if (i32.eqz (local.get $pre)) (then unreachable))"
            "      (global.set $ws (call $wsnew))"
+
            ;; 2. open "hello.txt" read-only through the preopen.
            ;; The async lower has 5 flat params (self borrow, one
            ;; path-flags field, the path's ptr+len, open-flags,
@@ -1735,6 +1894,30 @@
            "            (call $wjoin (local.get $fut) (i32.const 0))))"
            "      (if (i32.ne (i32.load8_u (i32.const 24)) (i32.const 0)) (then unreachable))"
            "      (call $sdropr (local.get $stream))"
+           "      (call $fdropr (local.get $fut))"
+           ;; 3a. THE WRITE REFUSAL: this descriptor was opened with the
+           ;; read flag only, so write-via-stream must REFUSE with
+           ;; error-code::read-only (case 32) through the paired future —
+           ;; never a trap, and never a byte written. The provider drops
+           ;; the guest's data end; the guest drops its writable peer and
+           ;; reads the already-resolved future (eager CopyResult 0 with
+           ;; result<_, error-code> = err/read-only at 24).
+           "      (local.set $pk (call $snew))"
+           "      (local.set $ret (i32.wrap_i64 (local.get $pk)))"
+           "      (local.set $wr"
+           "        (i32.wrap_i64 (i64.shr_u (local.get $pk) (i64.const 32))))"
+           "      (local.set $fut"
+           "        (call $wvs (local.get $fd) (local.get $ret) (i64.const 0)))"
+           "      (call $sdropw (local.get $wr))"
+           "      (local.set $ret (call $fread (local.get $fut) (i32.const 24)))"
+           "      (if (i32.eq (local.get $ret) (i32.const -1))"
+           "          (then"
+           "            (call $wjoin (local.get $fut) (global.get $ws))"
+           "            (local.set $ret (call $wswait (global.get $ws) (i32.const 336)))"
+           "            (if (i32.ne (local.get $ret) (i32.const 4)) (then unreachable))"
+           "            (call $wjoin (local.get $fut) (i32.const 0))))"
+           "      (if (i32.ne (i32.load8_u (i32.const 24)) (i32.const 1)) (then unreachable))"
+           "      (if (i32.ne (i32.load8_u (i32.const 28)) (i32.const 32)) (then unreachable))"
            "      (call $fdropr (local.get $fut))"
            "      (call $fdrop (local.get $fd))"
            ;; 4. THE WRITE PATH: create+truncate "out.txt" through the
@@ -1798,7 +1981,152 @@
            "      (call $settle (local.get $ret))"
            "      (if (i32.ne (i32.load8_u (i32.const 8)) (i32.const 1)) (then unreachable))"
            "      (if (i32.ne (i32.load8_u (i32.const 12)) (i32.const 19)) (then unreachable))"
-           ;; 6. the preopen's own handle goes too
+           ;; 6. THE DIRECTORY SURFACE. create-directory-at("subdir")
+           ;; must succeed; open-at("subdir", directory, read) yields a
+           ;; directory descriptor; stat reports directory (case 2);
+           ;; read-directory on the PREOPEN enumerates the entries and
+           ;; must list hello.txt, out.txt, subdir and temp.txt; rename-at
+           ;; (temp.txt -> moved.txt) + stat-at prove the rename,
+           ;; unlink-file-at removes it and remove-directory-at removes
+           ;; subdir — every temporary object is gone before the task
+           ;; returns, so the case's repeats share the workdir safely.
+           "      (local.set $ret (call $mkdir (local.get $pre)"
+           "                                   (i32.const 600) (i32.const 6)"
+           "                                   (i32.const 8)))"
+           "      (call $settle (local.get $ret))"
+           "      (if (i32.ne (i32.load8_u (i32.const 8)) (i32.const 0)) (then unreachable))"
+           ;; 6a. open the new directory: open-flags directory(2),
+           ;; descriptor-flags read(1) — a read-only open of a directory
+           ;; needs no mutate-directory authority
+           "      (i32.store (i32.const 32) (local.get $pre))"
+           "      (i32.store8 (i32.const 36) (i32.const 0))"
+           "      (i32.store (i32.const 40) (i32.const 600))"
+           "      (i32.store (i32.const 44) (i32.const 6))"
+           "      (i32.store8 (i32.const 48) (i32.const 2))"
+           "      (i32.store8 (i32.const 49) (i32.const 1))"
+           "      (local.set $ret (call $openat (i32.const 32) (i32.const 8)))"
+           "      (call $settle (local.get $ret))"
+           "      (if (i32.ne (i32.load8_u (i32.const 8)) (i32.const 0)) (then unreachable))"
+           "      (local.set $dir (i32.load (i32.const 12)))"
+           ;; 6b. stat($dir): ok, descriptor-type directory (case 2) at
+           ;; the payload's +0, link-count at +16 — at least one link
+           "      (local.set $ret (call $stat (local.get $dir) (i32.const 400)))"
+           "      (call $settle (local.get $ret))"
+           "      (if (i32.ne (i32.load8_u (i32.const 400)) (i32.const 0)) (then unreachable))"
+           "      (if (i32.ne (i32.load8_u (i32.const 408)) (i32.const 2)) (then unreachable))"
+           "      (if (i32.lt_u (i32.load (i32.const 424)) (i32.const 1)) (then unreachable))"
+           ;; 6c. create a second file for the rename probe
+           "      (i32.store (i32.const 32) (local.get $pre))"
+           "      (i32.store8 (i32.const 36) (i32.const 0))"
+           "      (i32.store (i32.const 40) (i32.const 608))"
+           "      (i32.store (i32.const 44) (i32.const 8))"
+           "      (i32.store8 (i32.const 48) (i32.const 9))"
+           "      (i32.store8 (i32.const 49) (i32.const 2))"
+           "      (local.set $ret (call $openat (i32.const 32) (i32.const 8)))"
+           "      (call $settle (local.get $ret))"
+           "      (if (i32.ne (i32.load8_u (i32.const 8)) (i32.const 0)) (then unreachable))"
+           "      (call $fdrop (i32.load (i32.const 12)))"
+           ;; 6d. read-directory(preopen): tuple<stream, future>. Every
+           ;; delivered entry is 24 bytes and its NAME is compared
+           ;; against the four expected names; the loop ends on the
+           ;; stream's DROPPED (EOF) and the paired future must be ok.
+           "      (call $readdir (local.get $pre) (i32.const 16))"
+           "      (local.set $stream (i32.load (i32.const 16)))"
+           "      (local.set $fut (i32.load (i32.const 20)))"
+           "      (local.set $found (i32.const 0))"
+           "      (block $deof"
+           "        (loop $dmore"
+           "          (local.set $ret (call $sreadd (local.get $stream)"
+           "                                       (i32.const 1024) (i32.const 8)))"
+           "          (if (i32.eq (local.get $ret) (i32.const -1))"
+           "              (then"
+           "                (call $wjoin (local.get $stream) (global.get $ws))"
+           "                (local.set $ret (call $wswait (global.get $ws) (i32.const 336)))"
+           "                (if (i32.ne (local.get $ret) (i32.const 2)) (then unreachable))"
+           "                (call $wjoin (local.get $stream) (i32.const 0))"
+           "                (local.set $ret (i32.load (i32.const 344)))))"
+           "          (if (i32.eq (i32.and (local.get $ret) (i32.const 15)) (i32.const 1))"
+           "              (then (br $deof)))"
+           "          (if (i32.ne (i32.and (local.get $ret) (i32.const 15)) (i32.const 0))"
+           "              (then unreachable))"
+           "          (local.set $n (i32.shr_u (local.get $ret) (i32.const 4)))"
+           "          (if (i32.eqz (local.get $n)) (then unreachable))"
+           "          (local.set $i (i32.const 0))"
+           "          (block $ents"
+           "            (loop $ent"
+           "              (br_if $ents (i32.ge_u (local.get $i) (local.get $n)))"
+           "              (local.set $e (i32.add (i32.const 1024)"
+           "                                     (i32.mul (local.get $i) (i32.const 24))))"
+           "              (if (call $nameeq (local.get $e) (i32.const 64) (i32.const 9))"
+           "                  (then (local.set $found"
+           "                         (i32.or (local.get $found) (i32.const 1)))))"
+           "              (if (call $nameeq (local.get $e) (i32.const 512) (i32.const 7))"
+           "                  (then (local.set $found"
+           "                         (i32.or (local.get $found) (i32.const 2)))))"
+           "              (if (call $nameeq (local.get $e) (i32.const 600) (i32.const 6))"
+           "                  (then (local.set $found"
+           "                         (i32.or (local.get $found) (i32.const 4)))))"
+           "              (if (call $nameeq (local.get $e) (i32.const 608) (i32.const 8))"
+           "                  (then (local.set $found"
+           "                         (i32.or (local.get $found) (i32.const 8)))))"
+           "              (local.set $i (i32.add (local.get $i) (i32.const 1)))"
+           "              (br $ent)))"
+           "          (br $dmore)))"
+           "      (if (i32.ne (local.get $found) (i32.const 15)) (then unreachable))"
+           "      (local.set $ret (call $fread (local.get $fut) (i32.const 24)))"
+           "      (if (i32.eq (local.get $ret) (i32.const -1))"
+           "          (then"
+           "            (call $wjoin (local.get $fut) (global.get $ws))"
+           "            (local.set $ret (call $wswait (global.get $ws) (i32.const 336)))"
+           "            (if (i32.ne (local.get $ret) (i32.const 4)) (then unreachable))"
+           "            (call $wjoin (local.get $fut) (i32.const 0))))"
+           "      (if (i32.ne (i32.load8_u (i32.const 24)) (i32.const 0)) (then unreachable))"
+           "      (call $sdropr (local.get $stream))"
+           "      (call $fdropr (local.get $fut))"
+           ;; 6e. rename-at: the 6 flat params exceed
+           ;; MAX_FLAT_ASYNC_PARAMS, so the params tuple is at 32
+           ;; (self@0, old ptr@4/len@8, new-descriptor@12, new ptr@16/
+           ;; len@20) and the core call takes (params-ptr, retptr).
+           "      (i32.store (i32.const 32) (local.get $pre))"
+           "      (i32.store (i32.const 36) (i32.const 608))"
+           "      (i32.store (i32.const 40) (i32.const 8))"
+           "      (i32.store (i32.const 44) (local.get $pre))"
+           "      (i32.store (i32.const 48) (i32.const 624))"
+           "      (i32.store (i32.const 52) (i32.const 9))"
+           "      (local.set $ret (call $rename (i32.const 32) (i32.const 8)))"
+           "      (call $settle (local.get $ret))"
+           "      (if (i32.ne (i32.load8_u (i32.const 8)) (i32.const 0)) (then unreachable))"
+           ;; 6f. stat-at("moved.txt"): 4 flat params stay scalar, so
+           ;; the core call is (self, flags, ptr, len, retptr); ok,
+           ;; regular-file (5), size 0 (created empty)
+           "      (local.set $ret (call $statat (local.get $pre) (i32.const 0)"
+           "                                    (i32.const 624) (i32.const 9)"
+           "                                    (i32.const 400)))"
+           "      (call $settle (local.get $ret))"
+           "      (if (i32.ne (i32.load8_u (i32.const 400)) (i32.const 0)) (then unreachable))"
+           "      (if (i32.ne (i32.load8_u (i32.const 408)) (i32.const 5)) (then unreachable))"
+           "      (if (i32.ne (i32.load (i32.const 432)) (i32.const 0)) (then unreachable))"
+           ;; 6g. unlink-file-at(moved.txt) then remove-directory-at
+           ;; (subdir): both must report ok
+           "      (local.set $ret (call $unlink (local.get $pre) (i32.const 624)"
+           "                                    (i32.const 9) (i32.const 8)))"
+           "      (call $settle (local.get $ret))"
+           "      (if (i32.ne (i32.load8_u (i32.const 8)) (i32.const 0)) (then unreachable))"
+           "      (local.set $ret (call $rmdir (local.get $pre) (i32.const 600)"
+           "                                   (i32.const 6) (i32.const 8)))"
+           "      (call $settle (local.get $ret))"
+           "      (if (i32.ne (i32.load8_u (i32.const 8)) (i32.const 0)) (then unreachable))"
+           ;; 6h. stat-at("subdir") after the removal: err/no-entry. The
+           ;; result's join alignment is descriptor-stat's 8, so the
+           ;; error-code discriminant sits at 408.
+           "      (local.set $ret (call $statat (local.get $pre) (i32.const 0)"
+           "                                    (i32.const 600) (i32.const 6)"
+           "                                    (i32.const 400)))"
+           "      (call $settle (local.get $ret))"
+           "      (if (i32.ne (i32.load8_u (i32.const 400)) (i32.const 1)) (then unreachable))"
+           "      (if (i32.ne (i32.load8_u (i32.const 408)) (i32.const 19)) (then unreachable))"
+           "      (call $fdrop (local.get $dir))"
+           ;; 7. the preopen's own handle goes too
            "      (call $fdrop (local.get $pre))"
            "      (call $tr (i32.const 0))"
            "      (i32.const 0)))"
@@ -1813,6 +2141,12 @@
            "          (export \"write-via-stream\" (func $wvs-lowered))"
            "          (export \"append-via-stream\" (func $avs-lowered))"
            "          (export \"stat\" (func $stat-lowered))"
+           "          (export \"create-directory-at\" (func $mkdir-lowered))"
+           "          (export \"stat-at\" (func $statat-lowered))"
+           "          (export \"read-directory\" (func $readdir-lowered))"
+           "          (export \"rename-at\" (func $rename-lowered))"
+           "          (export \"unlink-file-at\" (func $unlink-lowered))"
+           "          (export \"remove-directory-at\" (func $rmdir-lowered))"
            "          (export \"task.return\" (func $tr))"
            "          (export \"waitable-set.new\" (func $wsnew))"
            "          (export \"waitable.join\" (func $wjoin))"
@@ -1820,6 +2154,7 @@
            "          (export \"subtask.drop\" (func $subdrop))"
            "          (export \"stream.new\" (func $snew))"
            "          (export \"stream.read\" (func $sread))"
+           "          (export \"stream.read-dir\" (func $sreadd))"
            "          (export \"stream.write\" (func $swrite))"
            "          (export \"stream.drop-readable\" (func $sdropr))"
            "          (export \"stream.drop-writable\" (func $sdropw))"
@@ -1885,6 +2220,8 @@ Normalize the IR the encoder consumes."
      (wasmdown.component.text::parse-component-text *p3-fs-text*)
      :resource-drop))))
 
+(defvar *fs-context-counter* 0)
+
 (defun p3-fs-context (path)
   "The filesystem capability context the fixture asserts against: one
 preopen named /work over a fresh temporary directory seeded with
@@ -1892,8 +2229,14 @@ hello.txt. :AFTER closes the preopen and removes the directory (the
 builder runs in-process, so it owns the host handle)."
   (declare (ignore path))
   (let* ((dir (merge-pathnames
-               (format nil "wasmdown-fs-~36r/"
-                       (random (expt 2 32)))
+               ;; the pid + a counter make the name unique ACROSS
+               ;; processes: SBCL's default random-state is seeded
+               ;; deterministically, so a bare (random ...) reused the
+               ;; same directory after a failed run left residue (a
+               ;; leftover "subdir" then made the guest's
+               ;; create-directory-at return exist and trap)
+               (format nil "wasmdown-fs-~d-~36r/"
+                       (sb-unix:unix-getpid) (incf *fs-context-counter*))
                (uiop:temporary-directory)))
          (seed (merge-pathnames "hello.txt" dir)))
     (ensure-directories-exist dir)

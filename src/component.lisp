@@ -6618,7 +6618,14 @@ freely)."
                                         ((:type :core-module) "type")
                                         (t "type")))))
                ;; the NEW index the declarator introduces is named
-               ;; on its own side (the index = the pre-push length)
+               ;; on its own side (the index = the pre-push length).
+               ;; Binary.md 274: in an INSTANCE type only type-bound
+               ;; declarators introduce a TYPE index; a func export
+               ;; must not shift every later reference (the old walk
+               ;; pushed every declarator, so a same-numbered wrong
+               ;; declarator could pass/fail the visibility check).
+               (when (or (not (eq (ct-kind ct) :instance))
+                         (%type-indexing-declarator-p d))
                (let ((idx (length (cval-types inner))))
                  (setf (gethash idx
                                 (if (eq (typedecl-kind d) :import)
@@ -6637,7 +6644,7 @@ freely)."
                              :offset 0)
                     (make-ct :kind :prim
                              :payload :imported-or-exported-type))
-                (cval-types inner))))
+                (cval-types inner)))))
             (t nil)))))))
 
 

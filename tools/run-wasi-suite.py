@@ -378,8 +378,24 @@ CASES = [
         # of the 22 bytes is compared, so placement, zero-fill and append
         # are all asserted inside the guest. `file_contents` is the
         # independent host-side witness of the same bytes.
+        #
+        # A write through the READ-ONLY hello.txt descriptor must be
+        # refused with error-code::read-only (case 32) through the paired
+        # future, never a trap.
+        #
+        # The DIRECTORY surface: create-directory-at(subdir) ok;
+        # open-at(subdir, directory) ok; stat reports directory (case 2);
+        # read-directory on the preopen enumerates and must name
+        # hello.txt, out.txt, subdir and temp.txt with the future ok;
+        # rename-at(temp.txt -> moved.txt) ok and stat-at reports
+        # regular-file/size 0; unlink-file-at(moved.txt) and
+        # remove-directory-at(subdir) ok, then stat-at(subdir) is
+        # ERR/no-entry. The guest removes every temporary object, so the
+        # three repeats share the workdir; `absent` is the host-side
+        # witness of that cleanup.
         "expect": {"stdout_equals": [], "exit": 0,
                    "files": ["out.txt"],
+                   "absent": ["subdir", "temp.txt", "moved.txt"],
                    "file_contents": {"out.txt": "wmd-write-probe\0\0!-app"}},
     },
     # ---------------- Preview 1 ----------------
