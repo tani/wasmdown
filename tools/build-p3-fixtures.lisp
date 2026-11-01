@@ -705,11 +705,11 @@
   "The socket command connects to a loopback echo on *SOCKET-PORT*."
   (declare (ignore expected-stdout))
   (let* ((fd (%echo-listener *socket-port*))
-         (th (%echo-thread fd)))
+         (th (%echo-thread fd))
+         (reactor (wasmdown.wasi:make-wasi-reactor)))
     (unwind-protect
          (let* ((comp (wasmdown.component:decode-component bytes))
                 (sink (make-string-output-stream))
-                (reactor (wasmdown.wasi:make-wasi-reactor))
                 (net (wasmdown.wasi:make-wasi-network
                       :outbound (list (wasmdown.wasi:make-wasi-endpoint
                                        :address '(127 0 0 1)
@@ -722,13 +722,13 @@
                 (status (wasmdown.wasi:run-component comp context)))
            (wasmdown.component:validate-component comp)
            (ignore-errors (sb-thread:join-thread th :timeout 2))
-           (ignore-errors (wasmdown.wasi:reactor-close reactor))
            (unless (eql expected-status status)
              (error "~a: command returned status ~a, expected ~a"
                     label status expected-status))
            (format t "~&~a: decoded, validated, ran through a socket echo (status ~a)~%"
                    label status))
       (ignore-errors (sb-thread:join-thread th :timeout 2))
+      (ignore-errors (wasmdown.wasi:reactor-close reactor))
       (ignore-errors (wasmdown.wasi::%close-fd fd)))))
 
 (defun verify (label bytes expected-status expected-stdout)
