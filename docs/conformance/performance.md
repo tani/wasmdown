@@ -62,5 +62,7 @@ so the SBCL compile cost is superlinear in the emitted form. This is the
 quantified form of the SQLite observation (~98 ms/function, 8 GiB for 2,039
 functions): the lever is the emitted form's size (temp bindings and tagbody
 length), not SBCL policy (the `(debug 0)(space 3)` experiment is recorded
-above as a −1.2 % negative result). Any reduction should be measured
-against this table.
+above as a −1.2 % negative result; `(speed 1)` was also measured at the
+16-op scale and is strictly worse — same time, 391 MiB vs 309 MiB consed —
+so lower optimization is not a compile-cost lever either). Any reduction
+should be measured against this table.
