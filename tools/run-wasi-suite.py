@@ -63,11 +63,12 @@ def source_identity():
     }
 P1 = "sqlite3-p1.wasm"
 P2 = "sqlite3-p2.wasm"
-# A WASI 0.3.2 (@0.3.2 imports, Component Model async) command guest.
-# No such guest is pinned in this repository yet: no toolchain in the
-# development environment produces the 0.3.2 component ABI. The lane
-# selects preview3 ONLY when asked, and a missing fixture is a FAILURE
-# (never a skip), so nothing can pass silently.
+# WASI 0.3.2 (@0.3.2 imports, Component Model async) command guests.
+# Six hand-authored guests are pinned (tools/build-p3-fixtures.lisp and
+# P3-CHECKSUMS); no toolchain in the development environment produces the
+# 0.3.2 component ABI, so upstream-toolchain integration is still absent.
+# The lane selects preview3 ONLY when asked, and a missing fixture is a
+# FAILURE (never a skip), so nothing can pass silently.
 P3 = "p3-guest.wasm"
 P3_IMPORT = "p3-import-guest.wasm"
 P3_CLOCK = "p3-clock-guest.wasm"

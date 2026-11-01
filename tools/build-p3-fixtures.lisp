@@ -9,6 +9,14 @@
 ;;;;   p3-import-guest.wasm   imports wasi:cli/exit@0.3.2, lowers
 ;;;;                          exit-with-code into its core, calls it with 7,
 ;;;;                          so the command's process status is 7
+;;;;   p3-clock-guest.wasm    imports wasi:clocks/monotonic-clock@0.3.2 and
+;;;;                          traps unless now() is monotonic
+;;;;   p3-async-guest.wasm    resume-safe async run (callback, state kept in
+;;;;                          memory, task.return in the callback)
+;;;;   p3-stream-guest.wasm   stdout write-via-stream in canonical future
+;;;;                          order; prints "hi\n"
+;;;;   p3-cancel-guest.wasm   lowers the clock's async wait-for, cancels the
+;;;;                          pending subtask and drops it (asserts cancelled)
 ;;;;
 ;;;; The importing guest is the provider-importing evidence the no-import
 ;;;; smoke cannot give: the runner composes the provider from the
@@ -484,8 +492,7 @@
         (list "p3-import-guest.wasm" #'p3-import-guest-bytes 7 "")
         (list "p3-clock-guest.wasm" #'p3-clock-guest-bytes 0 "")
         (list "p3-async-guest.wasm" #'p3-async-guest-bytes 0 "")
-        (list "p3-stream-guest.wasm" #'p3-stream-guest-bytes 0 "hi
-")
+        (list "p3-stream-guest.wasm" #'p3-stream-guest-bytes 0 (format nil "hi~%"))
         (list "p3-cancel-guest.wasm" #'p3-cancel-guest-bytes 0 "")))
 
 ;;; ---------------------------------------------------------------
