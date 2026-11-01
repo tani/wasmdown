@@ -37,6 +37,7 @@
   :serial t
   :components
   ((:file "tests/harness")
+(:file "tools/component-encode")
    (:file "tests/numops")
    (:file "tests/binary")
    (:file "tests/validate")
@@ -51,6 +52,7 @@
    (:file "tests/component-pins")
    (:file "tests/component-store")
    (:file "tests/wasi")
+(:file "tests/component-encode")
    (:file "tests/wasi-preview1")
    (:file "tests/wasi-p2-fixtures")
    (:file "tests/wasi-preview2")))

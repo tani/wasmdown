@@ -36,6 +36,7 @@ upstream lanes drive the WAST runner under SBCL.
 | `report-backend-inventory` | `python3 tools/backend-inventory.py` | report | Regenerates [`conformance/inventory.md`](conformance/inventory.md) and `tests/backend-inventory.json` from the runtime's registration tables vs the pinned census. |
 | `test-backend-inventory` | `python3 tools/backend-inventory.py --check` | check | Fails when the committed inventory is stale. |
 | `report-backends-bench` | `sbcl … --script tools/bench-backends.lisp --repeat 3 --commit --json tests/bench-backends.json` | report | Per-backend decode / validate / instantiate(+compile) / run medians into [`conformance/performance.md`](conformance/performance.md). |
+| `component-encode` | `sbcl --script tools/component-encode.lisp IN.wat OUT.wasm` | tool | Minimal component text→binary encoder over the parser IR (types, imports/exports, aliases, canon lift/lower + async builtins, core modules/instances, component instances). Guarded by `wasi/component-text-encoder-roundtrip`. |
 | `record-release` | parity + component (both backends) + WASI lanes + P3 + bench + inventory | report | Regenerates every artifact the release matrix reads. The compiled P2 row is separate (`make record-wasi-compiled`, ~37 min). |
 | `record-p2` / `record-p3` / `record-p3-compiled` | `tools/run-wasi-suite.py --abi … --output-dir tests/wasi-results/…` | report | Canonical output directories the release matrix checks. |
 | `record-wasi-compiled` | P2 lane, `--backend compiled --heap-mb 8192` | report | The expensive (~37 min) compiled WASI row. |
