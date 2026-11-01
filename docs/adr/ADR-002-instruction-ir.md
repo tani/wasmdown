@@ -4,7 +4,7 @@ Date: 2026-10-23 · Status: accepted
 
 ## Context
 
-PLAN.md §5.3 requires a typed IR shared by validate/runtime/interp/
+docs/design/PLAN.md §5.3 requires a typed IR shared by validate/runtime/interp/
 codegen ("DecodedModule"), with source-map links.
 
 ## Decision
@@ -27,7 +27,7 @@ codegen ("DecodedModule"), with source-map links.
 
 +: Single source of truth; encode/decode/validate/interp/codegen all
    dispatch on the same keywords.
-+: `offset` gives the source map PLAN.md §5.3 requires (diagnostics
++: `offset` gives the source map docs/design/PLAN.md §5.3 requires (diagnostics
    print module/function/offset).
 −: Two block-terminator conventions (with/without `:end`) is subtle;
    early agents repeatedly got it wrong in tests. Mitigated by CONTRACTS

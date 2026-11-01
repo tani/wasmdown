@@ -2187,7 +2187,7 @@
 # two-space result store, cancel-window fire gate, the gate's
 # pending-cancel wake, and the sync-IO park's arm-time clear.
 #
-# THE NEXT MILESTONE: WASI per PLAN.md §9 (the M16 hand-off).
+# THE NEXT MILESTONE: WASI per docs/design/PLAN.md §9 (the M16 hand-off).
 # M15 session 2 (2026-10-28): THE ASYNC SUITE IS COMPLETE — 45/45
 # files, lane 1631/0/0/0. sync-streams (the last file) IN THE LANE.
 #

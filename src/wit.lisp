@@ -1,4 +1,4 @@
-;;;; WASMDOWN — the WIT text frontend (PLAN.md §8.1, M16 slice 1).
+;;;; WASMDOWN — the WIT text frontend (docs/design/PLAN.md §8.1, M16 slice 1).
 ;;;;
 ;;;; A real tokenizer + recursive-descent reader for the WIT surface
 ;;;; the vendored WASI 0.3.2 snapshot uses:

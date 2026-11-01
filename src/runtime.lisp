@@ -1,4 +1,4 @@
-;;;; Runtime objects and module instantiation (PLAN.md §7, CONTRACTS.md
+;;;; Runtime objects and module instantiation (docs/design/PLAN.md §7, CONTRACTS.md
 ;;;; "Runtime objects"). Package WASMDOWN.RUNTIME.
 ;;;;
 ;;;; - module-instance / func-instance / memory-instance / table-instance /
@@ -27,7 +27,7 @@
          :message (apply #'format nil format-control args)))
 
 (defparameter *page-size* 65536)
-(defparameter *max-pages* 1024)          ; impl limit (PLAN.md 3.4): 64 MiB
+(defparameter *max-pages* 1024)          ; impl limit (docs/design/PLAN.md 3.4): 64 MiB
                                          ; default; raise for real workloads.
                                          ; 65536 (4 GiB) would exhaust the
                                          ; SBCL heap on eager allocation.
@@ -121,7 +121,7 @@ instance (instance.wast's import/export generativity tests pin this)."
   (type (make-wasm-func-type '() '()) :type wasm-func-type))
 
 ;;; ---------------------------------------------------------------
-;;; GC value objects (PLAN.md §7.5: "Represent Wasm-GC structs and
+;;; GC value objects (docs/design/PLAN.md §7.5: "Represent Wasm-GC structs and
 ;;; arrays as Lisp-managed objects... Use Lisp GC for backing
 ;;; storage, but explicitly implement Wasm subtype, field mutability
 ;;; and cast rules"). No registry is needed — the Lisp GC owns
@@ -225,7 +225,7 @@ already-normalized element values."
 (defun %check-array-span (array start end)
   "END exclusive; traps when [START, END) leaves the array. Arrays
 are tables-of-values per the loop-22 trap taxonomy: the TABLE OOB
-kind covers array bounds (PLAN.md §7.5 lists 'out-of-bounds
+kind covers array bounds (docs/design/PLAN.md §7.5 lists 'out-of-bounds
 memory/table')."
   (unless (and (<= start end)
                (<= end (length (wasm-array-instance-contents array))))
@@ -346,7 +346,7 @@ the memory's ADDRESS TYPE on failure (4294967295 for i32 memories;
 failure is the index-type -1). On success the byte vector is
 replaced by a larger one that preserves contents and zero-fills.
 The *max-pages* ceiling is the runtime's own allocation bound
-(PLAN.md §3.4) — the validator's spec-side bound is separate."
+(docs/design/PLAN.md §3.4) — the validator's spec-side bound is separate."
   (let* ((old (memory-instance-pages mem))
          (new (+ old delta))
          (fail (if (memory-instance-i64-p mem)

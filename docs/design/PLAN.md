@@ -1,11 +1,19 @@
 # WASMDOWN: A Common Lisp–Native WebAssembly Runtime
 
+> **This file is the binding design contract.** Section numbers cited
+> elsewhere (§2, §12.7, §11.3, …) refer to this document. Implementation
+> files under `src/`, the ADRs and `docs/CONTRACTS.md` refer back to it by
+> section. It states the target, not the measured state: for what is
+> actually implemented and what is deliberately out of scope see
+> [`../status.md`](../status.md), and for measured lane results see
+> [`../conformance/`](../conformance/README.md).
+
 **Technical specification and implementation plan — revision 1.1 (22 October 2026)**
 
 > **Status:** Proposed architecture, **partially implemented and
 > conformance-measured** — the core subset, the Component Model (M7–M15)
 > and the WASI 0.3.2 host providers (M16) are in the tree; see
-> `README.md` and `specs/lock.toml`. `declared_support` = `partial`
+> [`../status.md`](../status.md) and `specs/lock.toml`. `declared_support` = `partial`
 > (§2). Baseline: Core WebAssembly 3.0, the Component Model adopted by WASI 0.3.2, and optional backward-compatibility facades for WASI 0.1/0.2. Primary platform: SBCL on Linux x86-64, then Linux AArch64/macOS. Production goal: zero mandatory third-party Common Lisp libraries.
 
 **Changes in revision 1.1:** Converted the complete HTML specification to Markdown; expanded §12 with executable test-harness contracts, official test suite pinning, failure-phase classification, Component Model and WASI test adapters, fuzz/differential testing, CI commands, machine-readable reports, and exact conformance/release gates.
@@ -340,7 +348,7 @@ WASI 0.2 keeps its own canonical interfaces and `wasi:io` resource semantics, ma
 > WASI 0.1/0.2 facades (§8.4). The former HTTP residuals (outgoing
 > streaming uploads, incoming service/middleware worlds,
 > keep-alive/pipelining/trailers) are **out of scope, not pending**.
-> See `README.md`'s *WASI 0.3.2 host providers (M16)* and ADR-003.
+> See `docs/usage/wasi.md` and ADR-003.
 > `declared_support` stays `partial`.
 
 ### 9.1 Capabilities

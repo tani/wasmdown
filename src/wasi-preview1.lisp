@@ -6,7 +6,7 @@
 ;;;; with the component-model resource ABI used by WASI 0.2/0.3, so it
 ;;;; lives in its OWN facade over the same native authorities:
 ;;;;
-;;;;   * capabilities come from an explicit wasi-context (PLAN.md §9.1);
+;;;;   * capabilities come from an explicit wasi-context (docs/design/PLAN.md §9.1);
 ;;;;     a P1 embedder never reads an ambient global;
 ;;;;   * preopens are host DIRECTORY HANDLES resolved per component
 ;;;;     (handle-relative, `..`-confined) — never path prefixes;

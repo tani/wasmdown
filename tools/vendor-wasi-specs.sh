@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Vendor the pinned WASI specification trees (PLAN.md §12.1, step 1).
+# Vendor the pinned WASI specification trees (docs/design/PLAN.md §12.1, step 1).
 #
 # Every artifact below is pinned by URL + SHA-256. This script never
 # floats a branch: the WASI repository revision is the immutable tag

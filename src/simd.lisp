@@ -1,7 +1,7 @@
 ;;;; SIMD (v128 + relaxed SIMD), loop 24 — shared metadata + semantics.
 ;;;; Package WASMDOWN.SIMD.
 ;;;;
-;;;; REPRESENTATION (PLAN.md 7.3, binding): a v128 value is ONE
+;;;; REPRESENTATION (docs/design/PLAN.md 7.3, binding): a v128 value is ONE
 ;;;; object — a (simple-array (unsigned-byte 8) (16)) byte vector —
 ;;;; on the value stack, never per-lane boxed objects. Every lane op
 ;;;; scalarizes over the 16 backing bytes (loop per lane count).
@@ -517,7 +517,7 @@ violation. IMM is the entry's imm shape."
                (funcall verr "invalid lane index ~a (max 31)" l)))))
 
 ;;; ---------------------------------------------------------------
-;;; Scalarized execution (PLAN.md 7.3: lane-by-lane over the byte
+;;; Scalarized execution (docs/design/PLAN.md 7.3: lane-by-lane over the byte
 ;;; backing; the v128 stays ONE object through every op).
 ;;;
 ;;; Argument order: values arrive in push order (last pushed = LAST

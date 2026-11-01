@@ -4,7 +4,7 @@ Date: 2026-10-23 · Status: accepted
 
 ## Context
 
-PLAN.md §6.1/§12.3: interpreter and compiled paths must coexist, be
+docs/design/PLAN.md §6.1/§12.3: interpreter and compiled paths must coexist, be
 differential-equivalent observables, and share semantics — including
 host functions — without one clobbering the other.
 
@@ -24,7 +24,7 @@ host functions — without one clobbering the other.
 ## Consequences
 
 +: Interp and codegen can be parity-tested on identical instances
-   (PLAN.md §12.3 invariant).
+   (docs/design/PLAN.md §12.3 invariant).
 +: No global-mode switching; an embedder can hold both.
 −: Compiled→guest-wasm calls pay one extra `funcall` vs a hypothetical
    direct-compiled edge; acceptable at baseline tier, revisit at M6.

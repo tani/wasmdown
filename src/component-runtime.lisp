@@ -353,7 +353,7 @@ capability, exactly the old drain-only behaviour)."
 (defstruct (component-store (:include host-store)
                             (:constructor %make-component-store))
   "One store: the host-work state above PLUS the execution ownership
-of one instantiation graph (PLAN.md step 2). Every top-level
+of one instantiation graph (docs/design/PLAN.md step 2). Every top-level
 component graph gets exactly one store; nested instances inherit the
 root's. STORE-TEARDOWN / CALL-WITH-COMPONENT-STORE are the lifecycle
 boundary: an instance never outlives its store."
@@ -373,7 +373,7 @@ boundary: an instance never outlives its store."
   (ct-defining-inst (make-hash-table :test #'equal))
   ;; the scheduler registry and the execution RIGHT, per store: a
   ;; store's guest threads and the thread allowed to run next belong
-  ;; to that instantiation graph, never to the process (PLAN.md
+  ;; to that instantiation graph, never to the process (docs/design/PLAN.md
   ;; step 2). The LOCK serializing right handoffs stays process-wide
   ;; (*STORE-RIGHT*) — it guards the protocol, not any state.
   (threads nil)
@@ -3868,7 +3868,7 @@ of a stream or future pair."
   (event-code nil)  ; 2=STREAM_READ 3=STREAM_WRITE 4=FUTURE_READ 5=FUTURE_WRITE
   (future-p nil)   ; T = FutureEnd (the notify/DONE transitions differ)
   ;; M16 SLICE 2 — THE HOST BACKING. A provider-owned end carries the
-  ;; CL closure that feeds/drains its PAIRED end (PLAN.md §8.3/§9.1:
+  ;; CL closure that feeds/drains its PAIRED end (docs/design/PLAN.md §8.3/§9.1:
   ;; the host side of stream<u8>/future<T>, no ambient globals):
   ;;   HOST-SINK (on a host READABLE end): (octets start end) ->
   ;;     (values consumed-count error-or-nil) — a u8 SPAN, at most
@@ -4162,7 +4162,7 @@ replace (the source contract's vector shape, no per-element call)."
                (dotimes (i n) (put-one (aref vals i))))))))
     (incf (fourth buf) n)))
 
-;;; ---- The HOST-BACKED ends (M16 slice 2, PLAN.md §8.3/§9.1) ----
+;;; ---- The HOST-BACKED ends (M16 slice 2, docs/design/PLAN.md §8.3/§9.1) ----
 ;;; A provider turns one end of a stream/future pair into the HOST
 ;;; side: a readable end with a SINK (the guest's writes drain into a
 ;;; CL stream) or a writable end with a SOURCE (the guest's reads pull

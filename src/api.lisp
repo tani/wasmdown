@@ -1,4 +1,4 @@
-;;;; Public API (PLAN.md §11.1). Package WASMDOWN — the user-facing
+;;;; Public API (docs/design/PLAN.md §11.1). Package WASMDOWN — the user-facing
 ;;;; surface over binary/validate/runtime/interp.
 ;;;;
 ;;;; Phase taxonomy (docs/CONTRACTS.md): read-module signals
@@ -15,9 +15,9 @@
 ;;;;   the decoded IR does not retain the source binary. Padded LEB
 ;;;;   encodings and section padding are lost; decode(module-bytes m)
 ;;;;   is semantically identical to m.
-;;;; - run-string takes a HEX-ENCODED module binary. This slice has no
-;;;;   text (WAT) parser; the name refers to the string→module
-;;;;   constructor, not to a WAT source form.
+;;;; - run-string takes a HEX-ENCODED module binary; the text format is a
+;;;;   separate front end (wasmdown.text:parse-wat), not a run-string
+;;;;   input form.
 ;;;; - :mode :baseline requires wasmdown.codegen:compile-module-functions
 ;;;;   to be loaded (src/codegen.lisp); the check is a runtime
 ;;;;   capability probe, never a stub. The start function and active
@@ -70,7 +70,7 @@ identical to MODULE."
   (wasmdown.binary:encode-module module))
 
 (defun validate-module (module)
-  "Statically validate MODULE (PLAN.md §11.1: no compilation, no host
+  "Statically validate MODULE (docs/design/PLAN.md §11.1: no compilation, no host
 allocation, no execution). Returns the module on success; signals
 validation-error otherwise."
   (wasmdown.validate:validate-module module)
@@ -78,9 +78,9 @@ validation-error otherwise."
 
 (defun run-string (hex)
   "Build a module from HEX, a hex-encoded WebAssembly binary
-(whitespace is ignored). This slice has no text/WAT format: the string
-is binary hex, not WebAssembly text. Signals host-error on malformed
-hex, decode-error on a malformed binary."
+(whitespace is ignored). The string is binary hex, not WebAssembly text;
+use wasmdown.text:parse-wat for the text format. Signals host-error on
+malformed hex, decode-error on a malformed binary."
   (let ((clean
           (remove-if (lambda (c) (member c '(#\space #\tab #\newline #\return)))
                      hex)))
@@ -271,7 +271,7 @@ when the module has no such export."
   (wasmdown.runtime:export-value instance name))
 
 ;;; ---------------------------------------------------------------
-;;; Feature derivation for `inspect` (PLAN.md §11.2): which keywords of
+;;; Feature derivation for `inspect` (docs/design/PLAN.md §11.2): which keywords of
 ;;; the implemented extension surface the module actually uses.
 
 (defun %scan-ops (module)

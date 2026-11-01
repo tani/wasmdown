@@ -1,4 +1,4 @@
-;;;; WASMDOWN — .wat text format parser (PLAN.md §3.3: the core spec
+;;;; WASMDOWN — .wat text format parser (docs/design/PLAN.md §3.3: the core spec
 ;;;; defines a text format; this is the M0 development/conformance
 ;;;; frontend). Package WASMDOWN.TEXT.
 ;;;;
@@ -18,7 +18,7 @@
 ;;;; reported the same way — the text format is the same phase.
 ;;;;
 ;;;; APPROACH (overall): tokenize the whole input into parenthesized
-;;;; s-expressions of tokens (never CL READ — PLAN.md §5.1), then fold
+;;;; s-expressions of tokens (never CL READ — docs/design/PLAN.md §5.1), then fold
 ;;;; each module field with a name/index environment. Instruction
 ;;;; immediates resolve identifiers to numeric indices at parse time so
 ;;;; encode-module can consume the module unchanged.

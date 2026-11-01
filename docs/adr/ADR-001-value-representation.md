@@ -4,7 +4,7 @@ Date: 2026-10-23 · Status: accepted
 
 ## Context
 
-PLAN.md §7 requires exact i32/i64/f32/f64 semantics and flags i64 as the
+docs/design/PLAN.md §7 requires exact i32/i64/f32/f64 semantics and flags i64 as the
 risky case (CL fixnums cannot hold all 64-bit patterns).
 
 ## Decision
@@ -23,7 +23,7 @@ risky case (CL fixnums cannot hold all 64-bit patterns).
    subsystem boundaries; comparisons and equality are ordinary `=`.
 +: i64 fits Lisp integers natively (bignum-backed on 64-bit SBCL);
    modular arithmetic via `logand` is exact.
-−: Inner loops box i64s above 2^63-1 on SBCL (bignum escape). PLAN.md
+−: Inner loops box i64s above 2^63-1 on SBCL (bignum escape). docs/design/PLAN.md
    §13 performance work (machine-word unboxing) is future M6 work; the
    baseline backend accepts this cost for correctness first.
 −: Host functions must normalize (`i32-wrap`) returned values; the

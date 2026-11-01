@@ -15,7 +15,7 @@
 ;;;; VALIDATION of this artifact is deliberately NOT asserted yet:
 ;;;; the envelope's `wasi:io/streams.input-stream.subscribe' resolves
 ;;;; to [] -> [] instead of [i32] -> [i32] until the component
-;;;; type-space normalization (PLAN.md step 4) lands, so asserting it
+;;;; type-space normalization (docs/design/PLAN.md step 4) lands, so asserting it
 ;;;; today would pin a bug.
 
 (defpackage #:wasmdown.test.wasi-p2-fixtures

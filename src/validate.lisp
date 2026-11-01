@@ -1,4 +1,4 @@
-;;;; Static validation engine (PLAN.md §5.2): module-level invariants and
+;;;; Static validation engine (docs/design/PLAN.md §5.2): module-level invariants and
 ;;;; the spec's operand/control-stack algorithm with stack polymorphism.
 ;;;; Signals wasmdown:validation-error; never decode-error.
 
@@ -848,7 +848,7 @@ storages exchange i32 VALUES (the normalization happens at interp)."
     h))
 
 (defun validate-gc-instr (fv op imms module)
-  "The GC value family's operand rules (loop 22, PLAN.md §3.1).
+  "The GC value family's operand rules (loop 22, docs/design/PLAN.md §3.1).
   - struct.new: [ft*] -> [(ref $t)]; struct.get/set per field
     (+packed _s/_u on i8/i16 only, i32 at the operand level)
   - array.*: new/default/fixed/new_data/new_elem produce (ref $t);

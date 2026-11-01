@@ -1,5 +1,5 @@
 #!/usr/bin/env -S sbcl --script
-;;;; WASMDOWN CLI launcher (PLAN.md §11.2). Runs the wasmdown.cli
+;;;; WASMDOWN CLI launcher (docs/design/PLAN.md §11.2). Runs the wasmdown.cli
 ;;;; entry in-process and exits with its stable status:
 ;;;;   0 ok, 1 guest/compile error, 2 usage error.
 ;;;;

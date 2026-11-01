@@ -1,5 +1,5 @@
 ;;;; Test runner entry: loads the WASMDOWN system plus the test harness,
-;;;; then runs every test file. Exits nonzero on any failure (PLAN.md §12.7).
+;;;; then runs every test file. Exits nonzero on any failure (docs/design/PLAN.md §12.7).
 
 (require :asdf)
 

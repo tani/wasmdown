@@ -1,4 +1,4 @@
-;;;; Reference interpreter (PLAN.md §7, CONTRACTS.md). Package
+;;;; Reference interpreter (docs/design/PLAN.md §7, CONTRACTS.md). Package
 ;;;; WASMDOWN.INTERP.
 ;;;;
 ;;;; interp-invoke executes a wasm function body with an explicit
@@ -766,7 +766,7 @@ args, apply, and throw to the function frame exactly like :return."
 ;;; cast check, and a data-segment memory proxy for array.new_data.
 
 (defun %normalize-packed (v storage-type)
-  "The STORE side of packed normalization (PLAN.md §7.5): an i8/i16
+  "The STORE side of packed normalization (docs/design/PLAN.md §7.5): an i8/i16
 storage wraps the value to its width; every other storage keeps the
 value (the validator proved the type)."
   (case storage-type

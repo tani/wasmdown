@@ -1,4 +1,4 @@
-;;;; Parity suite for wasmdown.codegen (PLAN.md 12.3): every fixture is
+;;;; Parity suite for wasmdown.codegen (docs/design/PLAN.md 12.3): every fixture is
 ;;;; instantiated once, invoked through the reference interpreter (the
 ;;;; default *INVOKE-WASM-FUNC*), then compiled with COMPILE-MODULE-
 ;;;; FUNCTIONS, installed into the same instance, and invoked again;
@@ -127,7 +127,7 @@ instances per engine keep stateful fixtures (memory.grow, globals,
 host side effects) honest: each engine sees the module in its initial
 state. With EMIT non-nil the generated source is pretty-printed to
 *EMIT-DIR*/NAME.lisp and must contain a TAGBODY (inspectable source,
-PLAN.md 6.1/12.3). Returns the compiled-phase instance."
+docs/design/PLAN.md 6.1/12.3). Returns the compiled-phase instance."
   (flet ((phase-inst ()
            (make-module-instance mod (or imports '()))))
     (let* ((before (%invoke-safe (phase-inst) name args))

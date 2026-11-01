@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Component-lane CENSUS: run the lane N times and require every run to
-# be green (PLAN.md §12.7's repeat-run stability requirement).
+# be green (docs/design/PLAN.md §12.7's repeat-run stability requirement).
 #
 # The component lane carries the async/concurrency scenarios, whose
 # failure MECHANISMS are scheduling lotteries: a single green run does
@@ -25,7 +25,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 LOGDIR="${ROOT}/tmp-census"
 mkdir -p "${LOGDIR}"
 
-EXPECTED=1631        # pinned executed count (PLAN.md §12.9 baseline)
+EXPECTED=1631        # pinned executed count (docs/design/PLAN.md §12.9 baseline)
 failures=0
 printf '%-6s %-10s %-8s %-6s %-6s %-8s\n' run executed fail herr tout wall
 printf '%-6s %-10s %-8s %-6s %-6s %-8s\n' ---- -------- ---- ---- ---- ----

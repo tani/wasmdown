@@ -1,5 +1,5 @@
 ;;;; Decoded-module IR: the cross-slice data contract between binary,
-;;;; validate, runtime, interp and codegen (PLAN.md §5.3 DecodedModule).
+;;;; validate, runtime, interp and codegen (docs/design/PLAN.md §5.3 DecodedModule).
 ;;;;
 ;;;; Representation policy:
 ;;;; - Value types are the keywords :i32 :i64 :f32 :f64 :v128 and
@@ -185,7 +185,7 @@ exprs may only use IMPORTED globals (global.wast ::120 expects
   bytes)
 
 (defstruct wasm-custom
-  "Custom section kept as inert bytes (PLAN.md §5.1)."
+  "Custom section kept as inert bytes (docs/design/PLAN.md §5.1)."
   (name "" :type string)
   (bytes #() :type (vector (unsigned-byte 8)))
   (offset 0 :type (integer 0)))
@@ -252,7 +252,7 @@ exprs may only use IMPORTED globals (global.wast ::120 expects
 (defun %heap-top (heap types)
   "The TOP BUCKET of HEAP in the type vector TYPES: :FUNC, :EXTERN,
 :EXN or :ANY (the GC hierarchy — eq/i31/struct/array and their
-typeuses — lives under :ANY; PLAN.md §3.1 References and GC). Null
+typeuses — lives under :ANY; docs/design/PLAN.md §3.1 References and GC). Null
 bottoms map to their own bucket's top. An out-of-range typeuse
 signals the catchable 'unknown type' validation-error (never a raw
 Lisp error through the wast harness)."
@@ -322,7 +322,7 @@ bucket-topped spellings. Used only by %HEAP-SUB-P's equal-rank arm."
 
 (defun %heap-rank (heap types)
   "The lattice RANK of HEAP within its top bucket (loop 22, the GC
-heap lattice; PLAN.md §3.1):
+heap lattice; docs/design/PLAN.md §3.1):
   0 — the null bottoms (:none/:nofunc/:noextern/:noexn)
   1 — CONCRETE heaps: every typeuse (nominal concrete types) and
       the GC's kind keywords :i31/:struct/:array (the immediate

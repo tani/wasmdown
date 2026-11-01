@@ -47,7 +47,7 @@ RUNS=30
 ALLOW_DIRTY=0
 LABEL=""
 TIMEOUT=200
-GENERATED="tests/component-results.jsonl CONFORMANCE-COMPONENT.md"
+GENERATED="tests/component-results.jsonl docs/conformance/component.md"
 
 while [ $# -gt 0 ]; do
   case "$1" in

@@ -1,4 +1,4 @@
-;;;; SBCL baseline compiler backend (PLAN.md 6): validated IR to
+;;;; SBCL baseline compiler backend (docs/design/PLAN.md 6): validated IR to
 ;;;; whitelisted Common Lisp forms, one Lisp function per Wasm
 ;;;; function, compiled by SBCL COMPILE. Package WASMDOWN.CODEGEN.
 ;;;;
@@ -68,7 +68,7 @@ instantiated INSTANCE) to native code via SBCL COMPILE. Returns a
 simple-vector of (lambda (args) results) closures in defined-func
 order. Signals wasmdown:validation-error when the module is invalid.
 EMIT, when a pathname or stream, receives the pretty-printed lambda
-form of each function (inspectable generated source, PLAN.md 6.1)."
+form of each function (inspectable generated source, docs/design/PLAN.md 6.1)."
   (%validate module)
   (let* ((n (length (wasm-module-funcs module)))
          (vectors (make-array n))
@@ -86,14 +86,14 @@ form of each function (inspectable generated source, PLAN.md 6.1)."
       (when (and stream (pathnamep emit)) (close stream)))))
 
 ;;; ---------------------------------------------------------------
-;;; Validation gate: the shared static validator (PLAN.md: never
+;;; Validation gate: the shared static validator (docs/design/PLAN.md: never
 ;;; compile an unvalidated module).
 
 (defun %validate (module)
   (wasmdown.validate:validate-module module))
 
 ;;; ---------------------------------------------------------------
-;;; Audited opcode-to-primitive maps (PLAN.md 6.1: "may generate a
+;;; Audited opcode-to-primitive maps (docs/design/PLAN.md 6.1: "may generate a
 ;;; call to a runtime primitive only from a finite, audited mapping").
 ;;; Numeric ops: opcode -> (numops-function nargs).
 

@@ -2,7 +2,7 @@
 #
 # Not part of the production runtime: wasmdown itself has zero mandatory
 # third-party dependencies; this flake pins the compilers that BUILD the
-# test fixtures (PLAN.md §10.3, §12.2). The pinned revisions are the ones
+# test fixtures (docs/design/PLAN.md §10.3, §12.2). The pinned revisions are the ones
 # recorded for the fixture experiment:
 #
 #   zig          0.17.0

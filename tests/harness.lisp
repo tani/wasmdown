@@ -1,4 +1,4 @@
-;;;; Minimal test harness: deterministic, zero dependencies (PLAN.md §12).
+;;;; Minimal test harness: deterministic, zero dependencies (docs/design/PLAN.md §12).
 
 (defpackage #:wasmdown.test
   (:use #:cl)

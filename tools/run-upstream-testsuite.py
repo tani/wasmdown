@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Upstream WebAssembly/testsuite adapter (PLAN.md §12.7).
+"""Upstream WebAssembly/testsuite adapter (docs/design/PLAN.md §12.7).
 
 Fetches the aggregated testsuite mirror at an EXACT commit, runs it
 through the WAST runner (tools/run-upstream-wast.lisp) and writes:

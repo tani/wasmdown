@@ -134,7 +134,7 @@
 
 (wasmdown.test:test wast/parse-script-truncated-signals-decode-error
   ;; A prefix cutting a multi-line form mid-string must signal a
-  ;; CATCHABLE decode-error (PLAN.md 10.1), never a crash.
+  ;; CATCHABLE decode-error (docs/design/PLAN.md 10.1), never a crash.
   (let ((src (with-output-to-string (out)
                (write-line "(module binary" out)
                (write-line "  \"\\00asm\\01\\00\\00\\00\"" out)
@@ -572,7 +572,7 @@
     (wasmdown.test:is (equal '(:pass :pass :pass :pass) os))))
 
 (wasmdown.test:test wast/return-call-deep-self-recursion
-  ;; Tail calls (loop 18, PLAN.md §3.1/§6.2): return_call replaces the
+  ;; Tail calls (loop 18, docs/design/PLAN.md §3.1/§6.2): return_call replaces the
   ;; current guest frame via the interp-invoke trampoline (THROW
   ;; *TAIL-CALL-TAG* unwinds to the loop; re-entry keeps the SAME
   ;; *CALL-DEPTH*), so counting to 1_000_000 runs in constant stack

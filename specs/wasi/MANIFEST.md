@@ -44,7 +44,7 @@ sha256sum /tmp/wasi-wit-0.3.2.tar.gz
 tar xzf /tmp/wasi-wit-0.3.2.tar.gz -C specs/wasi/
 ```
 
-## Policy (PLAN.md §2)
+## Policy (docs/design/PLAN.md §2)
 
 Vendor exact stable WIT snapshots; never float a main-branch WIT. Version
 dispatch is by the package's `@0.3.2` suffix in the import name (e.g.

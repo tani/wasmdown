@@ -3264,7 +3264,7 @@ Returns (values stream fd); the caller closes FD."
 
 (test wasi/terminals-none-for-non-tty
   ;; a string stream has no host fd: no terminal capability exists,
-  ;; never a fabricated handle (PLAN.md §9.1)
+  ;; never a fabricated handle (docs/design/PLAN.md §9.1)
   (let* ((ctx (wasmdown.wasi:make-wasi-context
                :stdin (make-string-input-stream "")
                :stdout (make-string-output-stream)

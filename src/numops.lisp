@@ -1,5 +1,5 @@
 ;;;; Exact numeric primitive semantics for every scalar Wasm opcode
-;;;; (PLAN.md §4 numops). i32/i64 are unsigned Lisp integers, f32/f64 are
+;;;; (docs/design/PLAN.md §4 numops). i32/i64 are unsigned Lisp integers, f32/f64 are
 ;;;; single/double floats per docs/CONTRACTS.md. All traps use
 ;;;; wasmdown:wasm-trap with the kinds fixed there.
 

@@ -1,4 +1,4 @@
-;;;; WASMDOWN — the Component Model TEXT parser (PLAN.md §12.7, M7
+;;;; WASMDOWN — the Component Model TEXT parser (docs/design/PLAN.md §12.7, M7
 ;;;; slice 2). Produces the SAME component IR the binary reader builds
 ;;;; (src/component.lisp's comp/compdef records): the text parser walks
 ;;;; the .wast runner's s-expression token trees (wasmdown.wast's

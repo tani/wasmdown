@@ -1,4 +1,4 @@
-;;;; Public condition taxonomy (PLAN.md §11.1).
+;;;; Public condition taxonomy (docs/design/PLAN.md §11.1).
 ;;;; Errors carry structured data, never raw strings only.
 
 (in-package #:wasmdown)

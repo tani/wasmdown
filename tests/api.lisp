@@ -1,5 +1,5 @@
 ;;;; Integration tests for the public API (src/api.lisp) and CLI
-;;;; (src/cli.lisp) per PLAN.md §11. Modules are built programmatically
+;;;; (src/cli.lisp) per docs/design/PLAN.md §11. Modules are built programmatically
 ;;;; per src/types.lisp, encoded to real .wasm binaries, and run through
 ;;;; the public entry points; CLI paths are exercised in-process via
 ;;;; wasmdown.cli:main (no subprocess).

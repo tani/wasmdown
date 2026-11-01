@@ -1,4 +1,4 @@
-;;;; CLI entry (PLAN.md §11.2 subset). Package WASMDOWN.CLI.
+;;;; CLI entry (docs/design/PLAN.md §11.2 subset). Package WASMDOWN.CLI.
 ;;;;
 ;;;; wasmdown.cli:main (argv) runs one subcommand in-process and
 ;;;; returns the stable host exit status:
@@ -8,7 +8,7 @@
 ;;;;   2  usage/host-invocation error: bad arguments, unknown command,
 ;;;;      missing file, malformed integer, host-error
 ;;;; Structured diagnostics go to *error-output*; results and summaries
-;;;; to *standard-output*. Traps print their kind (PLAN.md §11.2:
+;;;; to *standard-output*. Traps print their kind (docs/design/PLAN.md §11.2:
 ;;;; "stable host exit status independent of Wasm trap representation").
 ;;;;
 ;;;; Implemented subset: validate / inspect / compile / run / help.
@@ -354,7 +354,7 @@ mutation through the root are denied by the derived ABI rights."
 
 (defun %component-context (options guest-args file)
   "The capability context a component run is configured with. Without
---wasi every capability is withdrawn (PLAN.md §9.1: the default is
+--wasi every capability is withdrawn (docs/design/PLAN.md §9.1: the default is
 empty); with it, the process streams and the guest arguments (the
 component path as argv[0]) are the explicitly configured ones."
   (let ((wasi (assoc "--wasi" options)))

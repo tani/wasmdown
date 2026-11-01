@@ -1,5 +1,5 @@
 ;;;; Package definitions. Internal packages are flat files for now; the
-;;;; subsystem boundaries of PLAN.md §4 are enforced by dependency order
+;;;; subsystem boundaries of docs/design/PLAN.md §4 are enforced by dependency order
 ;;;; in wasmdown.asd and the contracts in docs/CONTRACTS.md.
 
 (defpackage #:wasmdown
@@ -164,7 +164,7 @@
            ;; reads, the hostile-count-checked vector reader and the
            ;; peek used by the head-byte dispatches. OFF-LIMIT /
            ;; PEEK-BYTE-AT / READ-VEC / READ-BYTE-VEC are part of the
-           ;; wasmdown.binary contract per PLAN.md §4 (the component
+           ;; wasmdown.binary contract per docs/design/PLAN.md §4 (the component
            ;; reader shares the core's decoder discipline; these were
            ;; unexported internal helpers before the component slice).
            #:reader-bytes #:reader-limit #:peek-byte-at #:read-vec #:read-byte-vec
@@ -380,7 +380,7 @@
 (defpackage #:wasmdown.wasi
   (:use #:cl)
   (:export
-   ;; the capability context (PLAN.md §9.1: an explicit authority
+   ;; the capability context (docs/design/PLAN.md §9.1: an explicit authority
    ;; object, never ambient Lisp globals)
    #:wasi-context
    #:wasi-context-p

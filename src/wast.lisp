@@ -1,4 +1,4 @@
-;;;; Stateful .wast spec-script runner (PLAN.md 12.2, M3 deliverable).
+;;;; Stateful .wast spec-script runner (docs/design/PLAN.md 12.2, M3 deliverable).
 ;;;; Package WASMDOWN.WAST.
 ;;;;
 ;;;; A .wast script is a sequence of commands executed against shared
@@ -6,14 +6,14 @@
 ;;;; last-defined current module, and the synthetic spectest host
 ;;;; module. For every command the runner records an outcome from the
 ;;;; enum pass | fail | skip | unsupported | timeout | harness-error
-;;;; (PLAN.md 12.8) plus, for failures, the actual phase from
+;;;; (docs/design/PLAN.md 12.8) plus, for failures, the actual phase from
 ;;;; decode | validate | link | instantiate | execute.
 ;;;;
 ;;;; Script parsing keeps the RAW source span of every module form so
 ;;;; (module ...) text is handed to wasmdown.text:parse-wat verbatim;
 ;;;; quote forms are re-assembled from their (decoded) string literals
 ;;;; and binary forms from their raw byte chunks. No CL:READ ever
-;;;; touches fixture content (PLAN.md 5.1).
+;;;; touches fixture content (docs/design/PLAN.md 5.1).
 
 (defpackage #:wasmdown.wast
   (:use #:cl)
@@ -758,7 +758,7 @@ definition's $id), or signals decode-error on bad shape."
            (t
             ;; The quote payload is module FIELDS per the script
             ;; grammar; parse-wat expects a whole (module ...) form,
-            ;; so wrap the concatenation (PLAN.md 12: quote payloads
+            ;; so wrap the concatenation (docs/design/PLAN.md 12: quote payloads
             ;; were previously handed verbatim to parse-wat, which
             ;; rejected them with "expected exactly one (module
             ;; ...)" — recording assert_malformed cases as
@@ -1340,7 +1340,7 @@ keeps every allocation bounded and reports the honest phase.")
     would make the validator's local-index expansion allocate
     proportionally and exhaust the SBCL heap (an uncatchable fatal
     error). Signals a catchable wasmdown:validation-error with an
-    honest message (PLAN.md 10.1)."
+    honest message (docs/design/PLAN.md 10.1)."
   (loop for f across (wasmdown.types:wasm-module-funcs module)
         for tyidx = (wasmdown.types:wasm-func-typeidx f)
         ;; func.wast ::91-112: an out-of-range (type N) reaches the
@@ -1669,7 +1669,7 @@ loaded. M7 slice 2.")
   *component-text-parser*)
 
 (defvar *store-run-hook* nil
-  "The script-level STORE boundary (PLAN.md step 2). When set, the
+  "The script-level STORE boundary (docs/design/PLAN.md step 2). When set, the
 hook receives a thunk running the whole script and is responsible for
 binding a fresh store around it and tearing it down afterwards —
 component-runtime installs exactly that. Several component commands in
@@ -1859,7 +1859,7 @@ runner state."
       (error "no active wast state")))
 
 ;;; ---------------------------------------------------------------
-;;; Result records (PLAN.md 12.8).
+;;; Result records (docs/design/PLAN.md 12.8).
 
 (defstruct wast-result
   file                                    ; file name (string)
@@ -2254,7 +2254,7 @@ an opaque type tag; numbers/floats print verbatim."
 
 (defun %trap-kind-for (message)
   "The wasm-trap kind keyword the assertion MESSAGE category requires
-(PLAN.md 12.2 message-category mapping)."
+(docs/design/PLAN.md 12.2 message-category mapping)."
   (let ((m (string-downcase message)))
     (cond
      ((search "unreachable" m) :unreachable)
@@ -2386,7 +2386,7 @@ module text out of assertion forms).")
 (defun run-script (source &key (file "<script>") (stream nil))
   "Execute a .wast script (string or pathname) against fresh state.
 Returns the list of wast-result records, one per command. STREAM, when
-given, receives a JSONL line per result (PLAN.md 12.8)."
+given, receives a JSONL line per result (docs/design/PLAN.md 12.8)."
   (let ((*print-circle* t)
         (*print-level* 4)
         (*print-length* 8))
@@ -2588,7 +2588,7 @@ source via %exec-assert-failure's re-parse."
 
 (defun %exec-assert-return (state cmd record)
   "assert_return: run the action, compare result tuples with NaN
-classes (PLAN.md 12.2)."
+classes (docs/design/PLAN.md 12.2)."
   (let ((action-node (wast-cmd-module-arg cmd)))
     (multiple-value-bind (kind action-cmd)
         (%action-of action-node)
@@ -2620,7 +2620,7 @@ classes (PLAN.md 12.2)."
 
 (defun %exec-assert-failure (state cmd record)
   "The expected-failure assertions. Each requires a SPECIFIC phase
-(PLAN.md 12.2): assert_malformed -> :decode, assert_invalid ->
+(docs/design/PLAN.md 12.2): assert_malformed -> :decode, assert_invalid ->
 :validate, assert_unlinkable -> :link, assert_trap -> wasm-trap with
 kind from the message category, assert_exhaustion -> :call-stack-
 exhausted."
@@ -2737,7 +2737,7 @@ slicing its text from *script-source*."
      :bytes (if (eq kind :binary) payload nil))))
 
 ;;; ---------------------------------------------------------------
-;;; JSONL + summaries (PLAN.md 12.8).
+;;; JSONL + summaries (docs/design/PLAN.md 12.8).
 
 (defun %json-escape (s)
   (with-output-to-string (out)
@@ -2752,7 +2752,7 @@ slicing its text from *script-source*."
               (t (write-char c out))))))
 
 (defvar *jsonl-suite* "core-spec"
-  "The suite label written into JSONL lines (PLAN.md §12.8): a lane
+  "The suite label written into JSONL lines (docs/design/PLAN.md §12.8): a lane
 that measures a different corpus binds its own name, so the aggregated
 results of two suites stay distinguishable.")
 

@@ -48,7 +48,7 @@ Signed views: `wasmdown.numops:i32-s`, `i64-s` (and `_u` identity helpers).
   declarative `(:declarative)`. Data active: `(:active memidx expr)`.
 - func locals: list of `(valtype . count)` pairs (declared order).
 
-## Phase separation (PLAN.md §12.2)
+## Phase separation (docs/design/PLAN.md §12.2)
 
 `decode-error` (malformed binary) / `validation-error` (bad typing) /
 `link-error` (import mismatch) / `instantiation-error` (segment bounds etc.)
@@ -88,4 +88,4 @@ runs everything, nonzero exit on failure.
 - `wasmdown.codegen`: compile each function via SBCL `COMPILE` of emitted
   LET/TAGBODY forms; same `wasm-call` entry; parity tested vs interp.
 - `wasmdown` API: `read-module validate-module instantiate invoke …`.
-- CLI: `validate`/`run`/`compile`/`inspect` subcommands per PLAN.md §11.2.
+- CLI: `validate`/`run`/`compile`/`inspect` subcommands per docs/design/PLAN.md §11.2.

@@ -488,7 +488,7 @@
     "(module (func (drop (f32x4.convert_s/i32x4 (v128.const i64x2 0 0)))))")))
 
 ;;; ================================================================
-;;; Regressions found by the upstream-testsuite lane (PLAN.md §12.7).
+;;; Regressions found by the upstream-testsuite lane (docs/design/PLAN.md §12.7).
 
 (wasmdown.test:test simd/float-lane-comparisons-yield-masks
   ;; f32x4.eq used to run its compare through the FLOAT map: the

@@ -1,4 +1,4 @@
-;;;; WASMDOWN — the Component Model binary layer (PLAN.md §4: the
+;;;; WASMDOWN — the Component Model binary layer (docs/design/PLAN.md §4: the
 ;;;; wasmdown.component subsystem; M7 slice 1).
 ;;;;
 ;;;; This file owns the COMPONENT side of layer discrimination and the
@@ -19,7 +19,7 @@
 ;;;;     outer), canon definitions, start, import/export with
 ;;;;     externnames + attributes.
 ;;;;
-;;;; Decoder discipline mirrors src/binary.lisp (PLAN.md §5.1): every
+;;;; Decoder discipline mirrors src/binary.lisp (docs/design/PLAN.md §5.1): every
 ;;;; read is bounds-checked through the shared wasmdown.binary reader,
 ;;;; counts are checked against the remaining input before any
 ;;;; allocation, offsets in decode-error conditions are absolute, and
@@ -393,7 +393,7 @@ type')."
 (defvar *component-defs-so-far* nil)
 
 ;;; ---------------------------------------------------------------
-;;; Layer discrimination (PLAN.md §4: wasmdown.binary owns it; this is
+;;; Layer discrimination (docs/design/PLAN.md §4: wasmdown.binary owns it; this is
 ;;; the component half — the CORE reader (src/binary.lisp decode-module)
 ;;; already demands version byte0 = 1 = layer 0x00, so a component
 ;;; binary handed to decode-module fails 'unknown binary version',

@@ -1,4 +1,4 @@
-;;;; WASMDOWN — the WASI host-provider framework (PLAN.md §9, M16):
+;;;; WASMDOWN — the WASI host-provider framework (docs/design/PLAN.md §9, M16):
 ;;;; the WIT interface + an implementation alist -> a component
 ;;;; instance value the runtime can bind through with-args, plus the
 ;;;; wasi:clocks, wasi:random and wasi:cli providers (environment,
@@ -12,7 +12,7 @@
 ;;;;     runtime's canon-lower wrapper lifts/lowers the canonical ABI
 ;;;;     in the CALLER's memory, calls the closure with/returns the
 ;;;;     component VALUE domain (CL integers, strings, lists, records);
-;;;;   * capabilities are an EXPLICIT wasi-context (PLAN.md §9.1);
+;;;;   * capabilities are an EXPLICIT wasi-context (docs/design/PLAN.md §9.1);
 ;;;;     no provider reads ambient Lisp globals;
 ;;;;   * secure randomness is OS entropy (/dev/urandom), never
 ;;;;     CL:RANDOM;
@@ -45,7 +45,7 @@
 
 (defstruct wasi-context
   "The explicit authority object a CLI provider is built from
-(PLAN.md §9.1). ARGUMENTS is a list of strings, ENVIRONMENT an alist
+(docs/design/PLAN.md §9.1). ARGUMENTS is a list of strings, ENVIRONMENT an alist
 of (name . value) strings, CWD a string or NIL, and STDIN/STDOUT/
 STDERR the CL streams the stdio providers may use (or NIL: no such
 capability — never an ambient global). PREOPENS is the filesystem
@@ -911,7 +911,7 @@ fewer bytes than requested; a bounded read also bounds the host).")
 ;;; host side of the WIT's
 ;;;   read-via-stream:  func() -> tuple<stream<u8>, future<result<_, error-code>>>
 ;;;   write-via-stream: func(stream<u8>) -> future<result<_, error-code>>
-;;; over the CONTEXT's CL streams (PLAN.md §9.1: an explicit authority
+;;; over the CONTEXT's CL streams (docs/design/PLAN.md §9.1: an explicit authority
 ;;; object, never *STANDARD-OUTPUT*). The host ends are constructed by
 ;;; the runtime's host-backed stream/future machinery: the guest's
 ;;; writes drain into the sink, the guest's reads pull from the source,
@@ -1388,7 +1388,7 @@ slice 6 — the terminal authorities."
 ;;; `isatty(3)' is the only honest test (a redirected file/string
 ;;; stream is not a terminal), so the rep is the host fd + the probe
 ;;; result, and a non-TTY stream yields `none' — never a fabricated
-;;; handle (PLAN.md §9.1: the capability is explicit).
+;;; handle (docs/design/PLAN.md §9.1: the capability is explicit).
 
 (defstruct wasi-terminal
   "The REP of a terminal-input / terminal-output handle: the host file
@@ -1502,7 +1502,7 @@ three link-time authorities) as a with-args alist."
 ;;; ===============================================================
 ;;; wasi:filesystem (M16 slice 3a) — THE CAPABILITY MODEL.
 ;;;
-;;; PLAN.md §9.1: a file root is an OPEN HOST DIRECTORY HANDLE, never
+;;; docs/design/PLAN.md §9.1: a file root is an OPEN HOST DIRECTORY HANDLE, never
 ;;; a string prefix. Every operation is handle-relative (`*at' calls
 ;;; against the descriptor's fd); there is no path-prefix filtering
 ;;; anywhere. The authority object is WASI-PREOPEN — the fd, the
@@ -1562,7 +1562,7 @@ three link-time authorities) as a with-args alist."
       (export (intern name package) package))))
 
 ;;; ---------------------------------------------------------------
-;;; The libc `*at' bindings (PLAN.md §9.2: thin, audited SB-ALIEN).
+;;; The libc `*at' bindings (docs/design/PLAN.md §9.2: thin, audited SB-ALIEN).
 
 (sb-alien:define-alien-routine ("open" %libc-open) sb-alien:int
   (path sb-alien:c-string) (flags sb-alien:int) (mode sb-alien:int))
@@ -1771,7 +1771,7 @@ read only on failure: a successful call leaves it stale)."
 ;;; The authority objects.
 
 (defstruct wasi-preopen
-  "A WASI file root: an OPEN HOST DIRECTORY HANDLE (PLAN.md §9.1) and
+  "A WASI file root: an OPEN HOST DIRECTORY HANDLE (docs/design/PLAN.md §9.1) and
 the guest-visible path string the guest knows it by. Every operation
 on it is handle-relative; there is no path-prefix check to bypass.
 PERMISSIONS is the EXPLICIT authority the embedder granted (\"read\",
@@ -3057,7 +3057,7 @@ preopens)."
 ;;; wasi:sockets (M16 slice 4) — THE NETWORK CAPABILITY + the
 ;;; tcp-socket/udp-socket RESOURCES + ip-name-lookup.
 ;;;
-;;; PLAN.md §9.1: "A host import must receive an explicitly allocated
+;;; docs/design/PLAN.md §9.1: "A host import must receive an explicitly allocated
 ;;; authority object, not ambient Lisp globals." WASI-NETWORK is that
 ;;; object: the declared OUTBOUND endpoints, the allowed LISTEN
 ;;; addresses and the DNS policy. Every socket is created through one
@@ -3071,7 +3071,7 @@ preopens)."
 ;;; network), which is the only capability-parameter channel the
 ;;; vendored interface offers.
 ;;;
-;;; The OS surface is SB-ALIEN only (PLAN.md §9.2): the sockaddr
+;;; The OS surface is SB-ALIEN only (docs/design/PLAN.md §9.2): the sockaddr
 ;;; structs are spelled out for the Linux LP64 layout (x86_64 and
 ;;; arm64 identical) and the offsets are verified empirically by the
 ;;; tests, the same discipline slice 3b used for `struct dirent'.
@@ -3321,7 +3321,7 @@ IPv6 8-tuple; PORT is :any or an integer."
   (port :any))
 
 (defstruct wasi-network
-  "A wasi:sockets network authority (PLAN.md §9.1): the declared
+  "A wasi:sockets network authority (docs/design/PLAN.md §9.1): the declared
 OUTBOUND destinations, the allowed LISTEN addresses and the DNS
 policy. NIL in OUTBOUND/LISTEN means `nothing is declared' (deny);
 :any means `every address/port'. DNS is :none (deny), :all, or a
@@ -5848,7 +5848,7 @@ alist, all bound to one network authority."
 ;;;      an exit — or a trap — leaves no parked guest thread behind.
 ;;;
 ;;; The provider set is capability-driven: every provider consults the
-;;; explicit WASI-CONTEXT (PLAN.md §9.1), never an ambient global — and
+;;; explicit WASI-CONTEXT (docs/design/PLAN.md §9.1), never an ambient global — and
 ;;; (M17, plan step 3) the SET is the resolved world's import set, not
 ;;; a hand-written whole-surface list.
 

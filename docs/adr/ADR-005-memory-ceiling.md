@@ -4,7 +4,7 @@ Date: 2026-10-23 · Status: accepted
 
 ## Context
 
-PLAN.md §3.4 permits documented implementation ceilings; §7.4 requires
+docs/design/PLAN.md §3.4 permits documented implementation ceilings; §7.4 requires
 eager, explicitly checked linear memory. The official suite
 (`memory.wast`, `memory_grow.wast`) deliberately instantiates modules
 declaring up to `(memory 65536)` (4 GiB) and more as *unlinkable*
@@ -27,12 +27,12 @@ ordinary dynamic variable embedders can raise for real workloads.
 
 +: Unlinkable/oversized-allocation tests in the suite fail *honestly*
    (classified `fail`/`unsupported`) instead of killing the process.
-+: PLAN.md §3.4 satisfied: the ceiling is documented here, in
++: docs/design/PLAN.md §3.4 satisfied: the ceiling is documented here, in
    `specs/lock.toml`, and in the README; exhaustion is reported as a
    resource condition, never as a validation error or a crash.
 −: Modules legitimately requiring >64 MiB min pages are rejected by
    default — a documented limit, not a silent omission; raise
    `*max-pages*` (and SBCL's `--dynamic-space-size`) for such
-   workloads. The PLAN.md §7.4 OS-virtual-memory backend (reserve/
+   workloads. The docs/design/PLAN.md §7.4 OS-virtual-memory backend (reserve/
    commit) is the future path that removes this ceiling without
    risking heap exhaustion.
