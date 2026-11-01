@@ -66,21 +66,19 @@ dispatch is by the `@0.3.2` suffix of the import name.
 | `wasi:cli` | `environment` (`get-environment`, `get-arguments`, `get-initial-cwd`, lowered as `list<string>`/`list<tuple<string,string>>` through guest memory + `realloc`), `exit` (`exit`, `exit-with-code` via the `wasi-exit` condition), `stdin`/`stdout`/`stderr` as real streams, the `terminal-*` interfaces (`isatty` answers `some` or `none`, never a fabricated handle), and the command world's `run`. Guest evidence: `p3/cli-stdin-env-stderr-terminal` asserts argv[0] and an extra argument, a `--env` pair and the option-typed initial cwd, sees `terminal-stdout` as `none` on a captured (non-tty) stdout, reads real stdin (`stdin-probe\n`) through `read-via-stream` requiring the explicit DROPPED EOF result and an ok paired future, and writes to stderr through `write-via-stream`; `p3/import-exit` covers `exit`, `p3/stream-stdout` covers stdout. |
 | `wasi:filesystem` | The `descriptor` resource (own/borrow, destructors, non-owning preopens), all non-stream descriptor methods with the errno → `error-code` table, `preopens.get-directories`, `read-via-stream` / `write-via-stream` / `append-via-stream` / `read-directory`, and flag gating that reports `not-permitted` / `read-only` through the interface's `result` rather than throwing. Guest evidence: `p3/filesystem-preopens-read` lists a `/work` preopen, opens a seeded `hello.txt` through it with an async `open-at` (waited as a subtask), reads exactly 17 bytes with `read-via-stream` + `stream.read`, gets `error-code::no-entry` as an err result (not a trap) for a missing path, creates `out.txt`, writes at explicit offsets and appends at EOF (`stat` regular-file/link-count 1/size 22, byte-exact read-back), gets `error-code::read-only` (case 32) as an err result for a write through the read-only descriptor, and exercises `create-directory-at` / `stat-at` / `read-directory` (enumerating `hello.txt`, `out.txt`, `subdir`, `temp.txt`) / `rename-at` / `unlink-file-at` / `remove-directory-at`, with a host-side witness that the removed objects are absent. Link/symlink operations and the stat symlink-follow policy, the advanced metadata/time calls (`advise`, `sync`, `sync-data`, `set-size`, `set-times`, `get-flags`, `get-type`, `metadata-hash`, `is-same-object`) and stat timestamps are provider/unit-tested but not guest-evidenced; there is no seek API in 0.3.2. |
 | `wasi:sockets` | **Unsupported by design — not an implementation gap, not planned.** TCP, UDP and DNS are excluded permanently by user decision (2026-11-02); there is no guest-visible socket or DNS provider. The vendored `specs/wasi/wasi-wit-0.3.2/sockets/sockets.wit` is reference data only. The pinned `wasi:cli/command` world imports `wasi:sockets/types@0.3.2` and `wasi:sockets/ip-name-lookup@0.3.2` itself, so a 0.3.2 sockets provider is retained internally for that composition only; guests cannot reach it. Imports are rejected at link time with the exact message below. See [`../../specs/wasi/MANIFEST.md`](../../specs/wasi/MANIFEST.md) § “Network communication: `wasi:sockets` (excluded)”. |
-| `wasi:http` | **Unsupported by design — not an implementation gap, not planned.** Excluded permanently by user decision (2026-11-02); removed in M17 and recoverable from git history. There is no provider and no transport option. The vendored `specs/wasi/wasi-wit-0.3.2/http/*.wit` files remain reference data only. Imports are rejected at link time with the exact message below. See [`../../specs/wasi/MANIFEST.md`](../../specs/wasi/MANIFEST.md) § “Unsupported by design (not pending)”. |
+| `wasi:http` | **Outgoing only (M16 slice 5, restored):** `types` (the `fields`, `request`, `request-options` and `response` resources with their header/body/trailer semantics) and `client.send` over HTTP/1.1 on the built-in plain TCP transport. A `https` request needs an EMBEDDER-registered `wasi-http-transport` on the capability context; without one `send` returns `configuration-error` (never a plaintext fallback, and the runtime implements no TLS itself). The INCOMING `handler` interface and the `service` / `middleware` worlds are not provided yet. On the WASI 0.2 (Preview2) line there is still no `wasi:http` provider, so a 0.2 declaration is refused with the message below.
 
-An import of `wasi:http` is refused with this exact message:
+A WASI 0.2 (Preview2) declaration of `wasi:http` is refused with this exact
+message:
 
 ```
-wasi:http is not supported by this runtime by design (removed in M17); the pinned HTTP WIT is reference data only. See docs/usage/wasi.md and specs/wasi/MANIFEST.md.
+wasi:http is not supported by this runtime by design on the WASI 0.2 (Preview2) line; the 0.3.2 `types` + `client` providers are the served HTTP surface. See docs/usage/wasi.md and specs/wasi/MANIFEST.md.
 ```
 
-This is a deliberate, permanent exclusion — not a pending interface and not a
-missing piece of the declared profile. The declared profile is the pinned
-WASI 0.3.2 surface **minus** `wasi:http` and `wasi:sockets`; the unsupported
-HTTP declarations (`types`, `handler`, `client`, and the
-`service`/`middleware` worlds) and the unsupported sockets declarations
-(`types`, `ip-name-lookup`, and the `imports` world) are enumerated in
-`specs/wasi/MANIFEST.md`.
+The pinned 0.3.2 outgoing HTTP surface (`types`, `client`) is served; `handler`
+and the `service`/`middleware` worlds remain unprovided, and the sockets
+declarations (`types`, `ip-name-lookup`, and the `imports` world) remain
+unsupported, as enumerated in `specs/wasi/MANIFEST.md`.
 
 An import of `wasi:sockets` is refused with this exact message:
 

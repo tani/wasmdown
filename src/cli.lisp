@@ -16,7 +16,9 @@
 ;;;; driven through the WASI command runner (`--wasi', `--dir',
 ;;;; `--env' and guest arguments), a core module keeps the `--invoke'
 ;;;; path. No --mapdir / --profile-conditional / artifact ABI checks
-;;;; yet.
+;;;; yet; --http-transport is embedder-only (documented at the run
+;;;; command): the outgoing `wasi:http/types' + `client' providers are
+;;;; served and plain `http' rides the built-in TCP transport.
 ;;;;
 ;;;; Network communication (TCP, UDP and DNS) is out of scope by
 ;;;; design: the network options `--net', `--listen' and `--dns' are
@@ -246,11 +248,16 @@ functions first)."
 ;;;   --dir HOST[::GUEST] a preopen (guest-visible name after `::')
 ;;;   --env K=V          one environment variable
 ;;;
-;;; HTTP is not supported in this runtime: there is no `wasi:http'
-;;; provider and no transport option (the `wasi:http' surface was
-;;; removed at user direction in M17).
+;;; HTTP (outgoing `wasi:http/types' + `wasi:http/client') is served:
+;;; a component that DECLARES those imports gets their providers, and
+;;; an `http' request rides the built-in plain TCP transport. TLS
+;;; transports are EMBEDDER-only (PLAN.md §9.2 — pluggable transport
+;;; services are CL objects on the wasi-context, not a CLI capability):
+;;; `--http-transport' is refused with that explanation, and https
+;;; without an embedder transport is the WIT's `configuration-error',
+;;; never a silent plaintext fallback.
 ;;;
-;;; Network communication is not supported either: `--net', `--listen'
+;;; Network communication is not supported: `--net', `--listen'
 ;;; and `--dns' are refused with the canonical message while the
 ;;; options are parsed, i.e. before any capability context or network
 ;;; authority exists.
@@ -288,6 +295,12 @@ later stage."
                     (push (cons name (nreverse ints)) invokes))))
                ((string= tok "--wasi")
                 (push (cons "--wasi" t) options))
+               ((string= tok "--http-transport")
+                ;; HTTP transports are embedder-only: the built-in
+                ;; plain TCP transport serves `http', and a TLS
+                ;; transport is a CL object on the wasi-context
+                (%usage-error
+                 "run: --http-transport is embedder-only; configure :http-transports on the wasi-context in the embedder"))
                ((member tok '("--net" "--listen" "--dns") :test #'string=)
                 ;; refused as an OPTION, never as a missing endpoint:
                 ;; the canonical message, not a generic provider error
