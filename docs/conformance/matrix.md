@@ -48,6 +48,14 @@ compile — about 98 ms per function — which is why WASI compiled runs are
 report evidence rather than a gate. The bench table carries each fixture's
 function count so compile cost is readable per function.
 
+## Release check
+
+`make verify-release` (`tools/check-release-matrix.py`) reads the recorded
+artifacts and requires every row above to be present, green, and to carry
+HEAD as its tested source commit: core parity summary, component records for
+both backends, the P2/P3 WASI records, the bench JSON and the inventory.
+P1 is stdout-only and is listed as `n/a` with `make verify` named as its gate.
+
 ## Blocked
 
 - **A real-toolchain WASI 0.3.2 guest.** The lane runs a hand-authored

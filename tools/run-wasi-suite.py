@@ -42,6 +42,25 @@ import time
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 FAILURE_DIR = None  # set by main() to <output-dir>/failures
 FIXTURES = ROOT / "tests" / "fixtures" / "wasi"
+
+
+def _git(*args):
+    try:
+        out = subprocess.run(("git",) + args, cwd=ROOT, capture_output=True,
+                             text=True, check=False)
+        return out.stdout.strip() or "unknown"
+    except OSError:
+        return "unknown"
+
+
+def source_identity():
+    """Commit, tree and cleanliness of the tested tree, recorded with every
+    result so a report cannot be attributed to the wrong commit."""
+    return {
+        "source_commit": _git("rev-parse", "HEAD"),
+        "source_tree": _git("rev-parse", "HEAD^{tree}"),
+        "clean_tree": _git("status", "--porcelain") in ("", "unknown"),
+    }
 P1 = "sqlite3-p1.wasm"
 P2 = "sqlite3-p2.wasm"
 # A WASI 0.3.2 (@0.3.2 imports, Component Model async) command guest.
@@ -468,6 +487,7 @@ def main() -> int:
             if not ok:
                 failures += 1
             results.append({
+                **source_identity(),
                 "schema": "wasmdown.test-result.v1",
                 "suite": "wasi-" + case["abi"],
                 "case_id": case["id"],

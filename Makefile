@@ -11,6 +11,8 @@ LISP_FILES := $(wildcard src/*.lisp)
         test-upstream test-wasi-preview1 test-wasi-preview2 test-wasi \
         report-conformance p3-fixtures test-wasi-preview3 verify \
         test-property test-p1-repeat \
+        record-p2 record-p3 record-p3-compiled record-wasi-compiled \
+        record-release verify-release \
         clean \
         load-system repl wasi-fixtures
 
@@ -27,6 +29,33 @@ verify: test-unit test-component test-backend-parity test-backend-inventory \
 ITERATIONS ?= 2000
 test-property:
 	$(SBCL) --control-stack-size 32 --dynamic-space-size 4096 --script tools/fuzz-backends.lisp --iterations $(ITERATIONS)
+
+# Canonical P2 interpret artifacts for the release matrix.
+record-p2:
+	python3 tools/run-wasi-suite.py --abi preview2 --output-dir tests/wasi-results/p2-interpret
+
+# Record the P3 lane artifacts the release matrix checks (fast).
+record-p3:
+	python3 tools/run-wasi-suite.py --abi preview3 --output-dir tests/wasi-results/p3-interpret
+
+record-p3-compiled:
+	python3 tools/run-wasi-suite.py --abi preview3 --backend compiled --output-dir tests/wasi-results/p3-compiled
+
+# P2 behaviour lane under the compiled backend (~37 min at ~200 s/case).
+# This is the expensive row of the release matrix; it is a report run.
+record-wasi-compiled:
+	python3 tools/run-wasi-suite.py --abi preview2 --backend compiled --heap-mb 8192 --output-dir tests/wasi-results/compiled-preview2
+
+# Rebuild every recorded artifact the release matrix reads (the compiled P2
+# row is the long one; comment it out for a quick refresh).
+record-release: report-backend-parity test-component report-component-compiled \
+	test-wasi record-p2 record-p3 record-p3-compiled report-backends-bench \
+	report-backend-inventory
+	@echo "record-release: artifacts regenerated (compiled P2 row: make record-wasi-compiled)"
+
+# Check the recorded release matrix: every row present, green and from HEAD.
+verify-release:
+	python3 tools/check-release-matrix.py
 
 # P1 acceptance repeated in fresh processes (the plan's "P1 guest tests pass
 # twice"). Interpret mode; the compiled form is report evidence, not a repeat
