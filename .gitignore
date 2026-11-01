@@ -6,6 +6,9 @@ tmp-cli-*.wasm
 .\#*
 .cache/
 tmp-census/
+.envrc
+.env
+.env.*
 tests/upstream-testsuite/
 tests/upstream-results.jsonl
 tests/wasi-results/
