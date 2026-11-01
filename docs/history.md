@@ -314,6 +314,11 @@ path changed: still eager, whole-module, conservative SBCL `COMPILE` with
 PLAN §6.3 carries a matching note; the plan's `:baseline` row names the same
 slot.
 
+Re-measured under the new name: P1 acceptance all cases pass with
+`WASMDOWN_API_MODE=compiled`, P2 behaviour lane 11/11 (fresh output directory
+`tests/wasi-results/compiled-preview2/`), P3 command 1/1, component lane
+1,702/0 — so the renamed value drives the same code path end to end.
+
 ## WASI 0.3.2 guest fixture (2026-11-01)
 
 No toolchain in this environment emits the `@0.3.2` component ABI, so the P3
