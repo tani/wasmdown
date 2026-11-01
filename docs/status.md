@@ -79,14 +79,18 @@ and neither is a validation rule (ADR-005).
   exactly `hi` (character codes 104 105). Against a worker-backed stdout —
   the CLI's file/tty sink, where `cl-stream-sink` copies the span onto the
   context's stdio executor — the same guest does not settle: the sync
-  fixture emits `hi` on every retry tick (148 bytes over ~74 ticks) before
-  the deadlock oracle, and the event-gated async variant deadlocks. The
-  open question is the copy/`host-end-ready` retry interaction with
-  `stream.drop-writable` (which correctly traps while a copy is in flight,
-  §4488), not the guest encoding: `tools/`-built guests validate and the
-  provider is composed. This is why the P3 CLI lane still has no stream
-  case; the fixture shape is recorded here so the next slice starts from
-  the worker path rather than re-deriving the ABI.
+  fixture emitted `hi` on every retry tick (148 bytes over ~74 ticks)
+  before the deadlock oracle. Root cause found and fixed: `%host-end-retry`
+  cleared the parked host copy before calling `%host-sink-drain :retry t`,
+  so the drain could not match the attempt, advanced the generation and
+  RESUBMITTED the same span to the stdio worker — every retry wrote the
+  bytes again. The copy now stays on the end and the retry reuses it; one
+  retry accepts the span exactly once (measured: `n=0` then `n=2`, one
+  generation). What remains is the wake-up after that acceptance: the
+  worker-path guest is not resumed (deadlock oracle) with the event-gated
+  async variant, while the in-process string-sink path completes. The next
+  slice is that delivery path, not the guest encoding: the guests validate,
+  the provider is composed, and the duplication is gone.
 - WASI 0.2 (shared by both backends, after the readiness/permit audit):
   end-of-input is still reported as `stream-error::closed` rather than
   `ok([])` (the open-but-empty vs closed distinction itself is now exact:

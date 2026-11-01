@@ -4864,7 +4864,11 @@ T when a parked copy was resumed."
     (when (and copy
                (eql generation (async-end-generation end))
                (eql generation (host-copy-generation copy)))
-      (setf (async-end-host-copy end) nil)   ; claim it: one retry
+      ;; The copy STAYS on the end: %HOST-SINK-DRAIN / %HOST-SOURCE-FILL
+      ;; with :RETRY match it by (kind, end, generation) and reuse it.
+      ;; Clearing it here made the retry see no copy, advance the
+      ;; generation and RESUBMIT the same span to the stdio worker —
+      ;; every retry wrote the bytes again (the P3 stdout duplication).
       (ecase (host-copy-kind copy)
         (:sink
          (%host-sink-drain (host-copy-end copy) :retry t)
