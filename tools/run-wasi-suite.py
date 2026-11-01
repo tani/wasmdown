@@ -367,8 +367,20 @@ CASES = [
         # seeded 17 bytes (asserted equal), the paired future resolves ok,
         # and a second open-at of a missing path must return ERR with
         # error-code::no-entry (case 19) — an err result, never a trap.
-        # Any mismatch traps, so the exit status is the assertion.
-        "expect": {"stdout_equals": [], "exit": 0},
+        #
+        # The WRITE path on the same preopen: open-at creates+truncates
+        # out.txt with read|write flags, writes 15 bytes at offset 0
+        # through stream.new + write-via-stream + stream.write, writes
+        # "!" at offset 17 (the WIT's zero-fill between the old end and
+        # the write), appends "-app" through append-via-stream, and stat
+        # must report regular-file / link-count 1 / size 22. The same
+        # descriptor then reads the file back at offset 0 and every one
+        # of the 22 bytes is compared, so placement, zero-fill and append
+        # are all asserted inside the guest. `file_contents` is the
+        # independent host-side witness of the same bytes.
+        "expect": {"stdout_equals": [], "exit": 0,
+                   "files": ["out.txt"],
+                   "file_contents": {"out.txt": "wmd-write-probe\0\0!-app"}},
     },
     # ---------------- Preview 1 ----------------
     {
@@ -467,6 +479,15 @@ def check(expect, out, err, rc, workdir):
         p = workdir / name
         if not p.exists() or p.stat().st_size == 0:
             problems.append(f"expected file {name} missing or empty")
+    # exact bytes where a case needs more than existence: the filesystem
+    # write path's guest asserts its own read-back, and this is the
+    # independent host-side witness of the same bytes
+    for name, want in expect.get("file_contents", {}).items():
+        p = workdir / name
+        if not p.exists():
+            problems.append(f"expected file {name} missing")
+        elif p.read_bytes() != want.encode():
+            problems.append(f"{name} bytes {p.read_bytes()!r} != {want.encode()!r}")
     for name in expect.get("absent", []):
         if (workdir / name).exists():
             problems.append(f"{name} must not exist")

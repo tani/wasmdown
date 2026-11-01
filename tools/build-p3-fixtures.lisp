@@ -1184,6 +1184,16 @@
 ;;;     [method]descriptor.read-via-stream:
 ;;;       func(self: borrow<descriptor>, offset: filesize)
 ;;;         -> tuple<stream<u8>, future<result<_, error-code>>>
+;;;     [method]descriptor.write-via-stream:
+;;;       func(self: borrow<descriptor>, data: stream<u8>,
+;;;            offset: filesize)
+;;;         -> future<result<_, error-code>>
+;;;     [method]descriptor.append-via-stream:
+;;;       func(self: borrow<descriptor>, data: stream<u8>)
+;;;         -> future<result<_, error-code>>
+;;;     [method]descriptor.stat:
+;;;       async func(self: borrow<descriptor>)
+;;;         -> result<descriptor-stat, error-code>
 ;;;
 ;;; Canonical LOWER shapes (CanonicalABI flatten §2894-2930;
 ;;; MAX_FLAT_ASYNC_PARAMS = 4, ANY async result rides the appended
@@ -1201,6 +1211,16 @@
 ;;;   read-via-stream  (sync)  core (param i32 i64 i32)
 ;;;       ; (self handle, offset, retptr) -> (stream handle @0,
 ;;;       ; future handle @4)
+;;;   write-via-stream (sync)  core (param i32 i32 i64) (result i32)
+;;;       ; (self, readable data end, offset) -> the RESULT FUTURE's
+;;;       ; handle; 1 flat result, so no retptr and no memory needed
+;;;   append-via-stream (sync) core (param i32 i32) (result i32)
+;;;       ; (self, readable data end) -> the result future's handle
+;;;   stat             (async) core (param i32 i32) (result i32)
+;;;       ; (self, result out-param); the i32 is the packed subtask
+;;;       ; state. The async rule always passes ANY result through the
+;;;       ; appended [ptr], hence memory (the store writes the whole
+;;;       ; result<descriptor-stat, error-code> there).
 ;;;
 ;;; The params-tuple layout (flags have an ELEMENT SIZE OF 1/2/4 per
 ;;; alignment_flags: 1 label and 4 labels are 1-byte fields, so the
@@ -1219,6 +1239,16 @@
 ;;; with 12-byte elements (handle@0, name ptr@4, name len@8); a
 ;;; tuple<stream<u8>, future<...>> result is two i32 handles.
 ;;;
+;;; stat's out-param (result<descriptor-stat, error-code>): disc@0
+;;; (ok = 0), payload at align 8 — the variant's join alignment is the
+;;; max over its cases, and descriptor-stat's u64 fields out-align the
+;;; error-code's 4. descriptor-stat there is 104 bytes:
+;;; descriptor-type@0 (16: disc u8, other(option<string>) at +4),
+;;; link-count u64@16, size u64@24, then three option<instant>@32/56/80
+;;; (24 each: disc u8, instant {seconds u64, nanoseconds u32} at +8).
+;;; The guest checks the type case (regular-file = 5), link-count and
+;;; size; the timestamps are not asserted.
+;;;
 ;;; The guest (run lifted async with a callback) asserts, and TRAPS
 ;;; on any failure:
 ;;;   1. get-directories has an entry named "/work"; take its handle;
@@ -1226,10 +1256,23 @@
 ;;;   3. read-via-stream(0) + stream.read yields exactly 17 bytes
 ;;;      equal to the seeded "filesystem-probe\n" and the paired
 ;;;      future resolves ok;
-;;;   4. open-at("missing.txt") returns ERR with error-code::no-entry
+;;;   4. THE WRITE PATH on the same preopen: open-at("out.txt",
+;;;      create|truncate, read|write) returns ok; write-via-stream at
+;;;      offset 0 moves 15 bytes through stream.new + stream.write (a
+;;;      BLOCKED copy is waited in the set and its event records the
+;;;      progress); a second write-via-stream puts "!" at offset 17,
+;;;      so bytes 15..16 must be the WIT's ZERO FILL; append-via-stream
+;;;      then adds "-app" at EOF. stat must report regular-file,
+;;;      link-count 1, size 22; read-via-stream(0) on the SAME
+;;;      descriptor then compares all 22 bytes against the expected
+;;;      span, and the paired future must resolve ok. After every
+;;;      write the guest has parked a future.read, so the provider's
+;;;      resolve has already written result::ok where the future event
+;;;      wakes it — an err result or a partial copy traps;
+;;;   5. open-at("missing.txt") returns ERR with error-code::no-entry
 ;;;      (case 19) — an err result, never a trap;
-;;;   5. every handle is dropped (opened descriptor, both stream
-;;;      ends, the preopen's own handle).
+;;;   6. every handle is dropped (both descriptors, all stream and
+;;;      future ends, the preopen's own handle).
 ;;;
 ;;; The async open-at is waited the CanonicalABI way: a packed
 ;;; STARTING/STARTED state is joined into a waitable set and
@@ -1302,6 +1345,29 @@
                    "      (type $ec2 (variant ~{(case ~s)~^ ~} (case \"other\" (option string))))"
                    *p3-fs-error-code-cases*)
            "      (export \"error-code\" (type $ec3 (eq $ec2)))"
+           ;; the STAT surface (the guest asserts the write's placement by
+           ;; the descriptor's own metadata): descriptor-type's eight cases
+           ;; in WIT order (regular-file = 5), instant as the clocks record,
+           ;; and descriptor-stat's field sequence, which the provider's
+           ;; domain value fstat record fills positionally.
+           "      (type $dtp (variant (case \"block-device\")"
+           "                          (case \"character-device\")"
+           "                          (case \"directory\") (case \"fifo\")"
+           "                          (case \"symbolic-link\")"
+           "                          (case \"regular-file\")"
+           "                          (case \"socket\")"
+           "                          (case \"other\" (option string))))"
+           "      (type $ins2 (record (field \"seconds\" u64)"
+           "                          (field \"nanoseconds\" u32)))"
+           "      (type $dst (record (field \"type\" $dtp)"
+           "                         (field \"link-count\" u64)"
+           "                         (field \"size\" u64)"
+           "                         (field \"data-access-timestamp\""
+           "                                (option $ins2))"
+           "                         (field \"data-modification-timestamp\""
+           "                                (option $ins2))"
+           "                         (field \"status-change-timestamp\""
+           "                                (option $ins2))))"
            "      (export \"descriptor\" (type $dt (sub resource)))"
            "      (export \"[method]descriptor.open-at\""
            "        (func async (param \"self\" (borrow $dt))"
@@ -1314,7 +1380,19 @@
            "        (func (param \"self\" (borrow $dt))"
            "              (param \"offset\" u64)"
            "              (result (tuple (stream u8)"
-           "                             (future (result (error $ec3)))))))))"
+           "                             (future (result (error $ec3)))))))"
+           "      (export \"[method]descriptor.write-via-stream\""
+           "        (func (param \"self\" (borrow $dt))"
+           "              (param \"data\" (stream u8))"
+           "              (param \"offset\" u64)"
+           "              (result (future (result (error $ec3))))))"
+           "      (export \"[method]descriptor.append-via-stream\""
+           "        (func (param \"self\" (borrow $dt))"
+           "              (param \"data\" (stream u8))"
+           "              (result (future (result (error $ec3))))))"
+           "      (export \"[method]descriptor.stat\""
+           "        (func async (param \"self\" (borrow $dt))"
+           "                    (result (result $dst (error $ec3)))))))"
            "  (alias export $types \"descriptor\" (type $desc))"
            "  (import \"wasi:filesystem/preopens@0.3.2\""
            "    (instance $pre"
@@ -1322,6 +1400,9 @@
            "        (func (result (list (tuple (own $desc) string)))))))"
            "  (alias export $types \"[method]descriptor.open-at\" (func $openat-f))"
            "  (alias export $types \"[method]descriptor.read-via-stream\" (func $rvs-f))"
+           "  (alias export $types \"[method]descriptor.write-via-stream\" (func $wvs-f))"
+           "  (alias export $types \"[method]descriptor.append-via-stream\" (func $avs-f))"
+           "  (alias export $types \"[method]descriptor.stat\" (func $stat-f))"
            "  (alias export $pre \"get-directories\" (func $getdirs-f))"
            "  (core module $Mem"
            "    (memory (export \"mem\") 1)"
@@ -1347,17 +1428,32 @@
            "    (canon lower (func $rvs-f)"
            "      (memory (core memory $mem \"mem\"))"
            "      (realloc (core func $mem \"realloc\"))))"
+           "  (core func $wvs-lowered"
+           "    (canon lower (func $wvs-f)"
+           "      (memory (core memory $mem \"mem\"))"
+           "      (realloc (core func $mem \"realloc\"))))"
+           "  (core func $avs-lowered"
+           "    (canon lower (func $avs-f)"
+           "      (memory (core memory $mem \"mem\"))"
+           "      (realloc (core func $mem \"realloc\"))))"
+           "  (core func $stat-lowered"
+           "    (canon lower (func $stat-f) async"
+           "      (memory (core memory $mem \"mem\"))"
+           "      (realloc (core func $mem \"realloc\"))))"
            "  (canon task.return (result $res) (core func $tr))"
            "  (canon waitable-set.new (core func $wsnew))"
            "  (canon waitable.join (core func $wjoin))"
            "  (canon waitable-set.wait (memory (core memory $mem \"mem\")) (core func $wswait))"
            "  (canon subtask.drop (core func $subdrop))"
+           "  (canon stream.new $ST (core func $snew))"
            "  (canon stream.read $ST async (memory (core memory $mem \"mem\")) (core func $sread))"
+           "  (canon stream.write $ST async (memory (core memory $mem \"mem\")) (core func $swrite))"
            "  (canon future.read $FT async"
            "         (memory (core memory $mem \"mem\"))"
            "         (realloc (core func $mem \"realloc\"))"
            "         (core func $fread))"
            "  (canon stream.drop-readable $ST (core func $sdropr))"
+           "  (canon stream.drop-writable $ST (core func $sdropw))"
            "  (canon future.drop-readable $FT (core func $fdropr))"
            "  (canon resource.drop $desc (core func $fdrop))"
            "  (core module $M"
@@ -1365,6 +1461,12 @@
            "    (import \"env\" \"get-directories\" (func $getdirs (param i32)))"
            "    (import \"env\" \"open-at\" (func $openat (param i32 i32) (result i32)))"
            "    (import \"env\" \"read-via-stream\" (func $rvs (param i32 i64 i32)))"
+           "    (import \"env\" \"write-via-stream\" (func $wvs (param i32 i32 i64) (result i32)))"
+           "    (import \"env\" \"append-via-stream\" (func $avs (param i32 i32) (result i32)))"
+           "    (import \"env\" \"stat\" (func $stat (param i32 i32) (result i32)))"
+           "    (import \"env\" \"stream.new\" (func $snew (result i64)))"
+           "    (import \"env\" \"stream.write\" (func $swrite (param i32 i32 i32) (result i32)))"
+           "    (import \"env\" \"stream.drop-writable\" (func $sdropw (param i32)))"
            "    (import \"env\" \"task.return\" (func $tr (param i32)))"
            "    (import \"env\" \"waitable-set.new\" (func $wsnew (result i32)))"
            "    (import \"env\" \"waitable.join\" (func $wjoin (param i32 i32)))"
@@ -1379,6 +1481,18 @@
            "    (data (i32.const 80) \"missing.txt\")"
            "    (data (i32.const 96) \"/work\")"
            "    (data (i32.const 112) \"filesystem-probe\\n\")"
+           ;; the write path's probe: the path, the three spans handed to
+           ;; the write streams, and the exact 22 bytes a correct
+           ;; out.txt holds afterwards (write at 0, "!" at offset 17 with
+           ;; the 15..16 hole the WIT's extension rule requires, append
+           ;; at EOF). Kept above 512: the hello.txt assertion reads the
+           ;; newline at 128, and 192/224/256/336/400 are result, event,
+           ;; buffer and stat areas.
+           "    (data (i32.const 512) \"out.txt\")"
+           "    (data (i32.const 520) \"wmd-write-probe\")"
+           "    (data (i32.const 536) \"!\")"
+           "    (data (i32.const 544) \"-app\")"
+           "    (data (i32.const 552) \"wmd-write-probe\\00\\00!-app\")"
            "    (global $ws (mut i32) (i32.const 0))"
            "    (func $streq (param $a i32) (param $b i32) (param $n i32) (result i32)"
            "      (local $i i32)"
@@ -1409,6 +1523,137 @@
            "      (if (i32.ne (i32.load (i32.const 344)) (i32.const 2)) (then unreachable))"
            "      (call $wjoin (local.get $sub) (i32.const 0))"
            "      (call $subdrop (local.get $sub)))"
+           ;; THE WRITE SPAN: move LEN bytes from SRC into FD through a
+           ;; fresh stream pair. stream.new packs readable|writable<<32;
+           ;; the readable end is handed to write-via-stream (OFFSET) or
+           ;; append-via-stream, and the guest keeps the writable end.
+           ;; A BLOCKED stream.write is joined into the set and waited
+           ;; (the event's payload is the CopyResult: state 0, progress
+           ;; <<4); the writable end is then dropped, which is what
+           ;; lets the provider resolve the future, and the guest had
+           ;; parked a future.read at 192 so the resolved result
+           ;; (result<_, error-code>) is already in memory when the
+           ;; future event arrives.
+           "    (func $write-span"
+           "          (param $fd i32) (param $src i32) (param $len i32)"
+           "          (param $off i64) (param $append i32)"
+           "      (local $pk i64) (local $rd i32) (local $wr i32)"
+           "      (local $fut i32) (local $ret i32) (local $done i32)"
+           "      (local.set $pk (call $snew))"
+           "      (local.set $rd (i32.wrap_i64 (local.get $pk)))"
+           "      (local.set $wr"
+           "        (i32.wrap_i64 (i64.shr_u (local.get $pk) (i64.const 32))))"
+           "      (if (local.get $append)"
+           "          (then (local.set $fut"
+           "                            (call $avs (local.get $fd) (local.get $rd))))"
+           "          (else (local.set $fut"
+           "                            (call $wvs (local.get $fd) (local.get $rd)"
+           "                                       (local.get $off)))))"
+           "      (call $wjoin (local.get $fut) (global.get $ws))"
+           "      (local.set $ret (call $fread (local.get $fut) (i32.const 192)))"
+           "      (if (i32.ne (local.get $ret) (i32.const -1)) (then unreachable))"
+           "      (block $wdone"
+           "        (loop $wloop"
+           "          (br_if $wdone (i32.ge_u (local.get $done) (local.get $len)))"
+           "          (local.set $ret"
+           "            (call $swrite (local.get $wr)"
+           "                          (i32.add (local.get $src) (local.get $done))"
+           "                          (i32.sub (local.get $len) (local.get $done))))"
+           "          (if (i32.eq (i32.and (local.get $ret) (i32.const 15))"
+           "                      (i32.const 0))"
+           "              (then"
+           "                (local.set $done"
+           "                  (i32.add (local.get $done)"
+           "                           (i32.shr_u (local.get $ret) (i32.const 4))))"
+           "                (br $wloop)))"
+           ;; BLOCKED: the copy is staged; wait for its stream-write event
+           ;; (code 3) and take the progress the event carries
+           "          (call $wjoin (local.get $wr) (global.get $ws))"
+           "          (local.set $ret (call $wswait (global.get $ws) (i32.const 224)))"
+           "          (if (i32.ne (local.get $ret) (i32.const 3)) (then unreachable))"
+           "          (local.set $ret (i32.load (i32.const 228)))"
+           "          (if (i32.ne (i32.and (local.get $ret) (i32.const 15))"
+           "                      (i32.const 0))"
+           "              (then unreachable))"
+           "          (if (i32.eqz (i32.shr_u (local.get $ret) (i32.const 4)))"
+           "              (then unreachable))"
+           "          (local.set $done"
+           "            (i32.add (local.get $done)"
+           "                     (i32.shr_u (local.get $ret) (i32.const 4))))"
+           "          (br $wloop)))"
+           "      (call $sdropw (local.get $wr))"
+           "      (local.set $ret (call $wswait (global.get $ws) (i32.const 224)))"
+           "      (if (i32.ne (local.get $ret) (i32.const 4)) (then unreachable))"
+           ;; result<_, error-code> at 192: case 0 is ok
+           "      (if (i32.ne (i32.load8_u (i32.const 192)) (i32.const 0))"
+           "          (then unreachable))"
+           "      (call $wjoin (local.get $fut) (i32.const 0))"
+           "      (call $fdropr (local.get $fut)))"
+           ;; THE READ SPAN: read FD at OFFSET into DST until the stream
+           ;; reports DROPPED (EOF), compare every byte against EXPECT
+           ;; (contiguous across chunks), require exactly WANT bytes, and
+           ;; require the paired future to resolve ok.
+           "    (func $read-span"
+           "          (param $fd i32) (param $dst i32) (param $max i32)"
+           "          (param $off i64) (param $want i32) (param $expect i32)"
+           "      (local $rd i32) (local $fut i32) (local $ret i32)"
+           "      (local $n i32) (local $done i32) (local $i i32)"
+           "      (call $rvs (local.get $fd) (local.get $off) (i32.const 16))"
+           "      (local.set $rd (i32.load (i32.const 16)))"
+           "      (local.set $fut (i32.load (i32.const 20)))"
+           "      (block $eof"
+           "        (loop $more"
+           "          (local.set $ret"
+           "            (call $sread (local.get $rd) (local.get $dst)"
+           "                         (local.get $max)))"
+           "          (if (i32.eq (local.get $ret) (i32.const -1))"
+           "              (then"
+           "                (call $wjoin (local.get $rd) (global.get $ws))"
+           "                (local.set $ret"
+           "                  (call $wswait (global.get $ws) (i32.const 336)))"
+           "                (if (i32.ne (local.get $ret) (i32.const 2))"
+           "                    (then unreachable))"
+           "                (call $wjoin (local.get $rd) (i32.const 0))"
+           "                (local.set $ret (i32.load (i32.const 344)))))"
+           ;; CopyResult: DROPPED=1 (EOF); COMPLETED=0 with the count<<4
+           "          (if (i32.eq (i32.and (local.get $ret) (i32.const 15))"
+           "                      (i32.const 1))"
+           "              (then (br $eof)))"
+           "          (if (i32.ne (i32.and (local.get $ret) (i32.const 15))"
+           "                      (i32.const 0))"
+           "              (then unreachable))"
+           "          (local.set $n (i32.shr_u (local.get $ret) (i32.const 4)))"
+           "          (if (i32.or (i32.eqz (local.get $n))"
+           "                      (i32.gt_u (i32.add (local.get $done) (local.get $n))"
+           "                                (local.get $want)))"
+           "              (then unreachable))"
+           "          (local.set $i (i32.const 0))"
+           "          (block $bytes"
+           "            (loop $byte"
+           "              (br_if $bytes (i32.ge_u (local.get $i) (local.get $n)))"
+           "              (if (i32.ne"
+           "                    (i32.load8_u (i32.add (local.get $dst)"
+           "                                          (local.get $i)))"
+           "                    (i32.load8_u (i32.add (local.get $expect)"
+           "                                         (i32.add (local.get $done)"
+           "                                                  (local.get $i)))))"
+           "                  (then unreachable))"
+           "              (local.set $i (i32.add (local.get $i) (i32.const 1)))"
+           "              (br $byte)))"
+           "          (local.set $done (i32.add (local.get $done) (local.get $n)))"
+           "          (br $more)))"
+           "      (if (i32.ne (local.get $done) (local.get $want)) (then unreachable))"
+           "      (local.set $ret (call $fread (local.get $fut) (i32.const 24)))"
+           "      (if (i32.eq (local.get $ret) (i32.const -1))"
+           "          (then"
+           "            (call $wjoin (local.get $fut) (global.get $ws))"
+           "            (local.set $ret (call $wswait (global.get $ws) (i32.const 336)))"
+           "            (if (i32.ne (local.get $ret) (i32.const 4)) (then unreachable))"
+           "            (call $wjoin (local.get $fut) (i32.const 0))))"
+           "      (if (i32.ne (i32.load8_u (i32.const 24)) (i32.const 0))"
+           "          (then unreachable))"
+           "      (call $sdropr (local.get $rd))"
+           "      (call $fdropr (local.get $fut)))"
            "    (func (export \"run\") (result i32) (i32.const 1))"
            "    (func (export \"run-cb\")"
            "          (param $code i32) (param $si i32) (param $payload i32)"
@@ -1492,15 +1737,68 @@
            "      (call $sdropr (local.get $stream))"
            "      (call $fdropr (local.get $fut))"
            "      (call $fdrop (local.get $fd))"
-           ;; 4. the negative probe: a missing path is an ERR result
-           ;; (error-code::no-entry = case 19), never a trap
+           ;; 4. THE WRITE PATH: create+truncate "out.txt" through the
+           ;; preopen with read+write descriptor flags (open-flags
+           ;; create|truncate = 9, flags read|write = 3). The created
+           ;; file's own descriptor carries both, so the same handle
+           ;; writes and reads back.
+           "      (i32.store (i32.const 32) (local.get $pre))"
+           "      (i32.store8 (i32.const 36) (i32.const 0))"
+           "      (i32.store (i32.const 40) (i32.const 512))"
+           "      (i32.store (i32.const 44) (i32.const 7))"
+           "      (i32.store8 (i32.const 48) (i32.const 9))"
+           "      (i32.store8 (i32.const 49) (i32.const 3))"
+           "      (local.set $ret (call $openat (i32.const 32) (i32.const 8)))"
+           "      (call $settle (local.get $ret))"
+           "      (if (i32.ne (i32.load8_u (i32.const 8)) (i32.const 0)) (then unreachable))"
+           "      (local.set $fd (i32.load (i32.const 12)))"
+           ;; 4a. write-via-stream at offset 0
+           "      (call $write-span (local.get $fd) (i32.const 520)"
+           "                        (i32.const 15) (i64.const 0) (i32.const 0))"
+           ;; 4b. a NONZERO offset: "!" at 17 leaves 15..16 zero, the
+           ;; WIT's "bytes between the previous end and the start of the
+           ;; write set to zero"
+           "      (call $write-span (local.get $fd) (i32.const 536)"
+           "                        (i32.const 1) (i64.const 17) (i32.const 0))"
+           ;; 4c. append-via-stream: "-app" at the current EOF
+           "      (call $write-span (local.get $fd) (i32.const 544)"
+           "                        (i32.const 4) (i64.const 0) (i32.const 1))"
+           ;; 4d. stat: ok, descriptor-type regular-file (case 5),
+           ;; link-count 1, size 22 (u64). The result variant's payload
+           ;; begins at retptr+8: the variant's join alignment is the
+           ;; MAXIMUM over its cases, and the ok case (descriptor-stat,
+           ;; u64 fields) is 8-aligned, not the error-code's 4. The
+           ;; descriptor-stat record there is 104 bytes: descriptor-type
+           ;; (16, disc at +0), link-count at +16, size at +24.
+           "      (local.set $ret (call $stat (local.get $fd) (i32.const 400)))"
+           "      (call $settle (local.get $ret))"
+           ;; result<descriptor-stat, error-code>: case 0 is ok
+           "      (if (i32.ne (i32.load8_u (i32.const 400)) (i32.const 0)) (then unreachable))"
+           "      (if (i32.ne (i32.load8_u (i32.const 408)) (i32.const 5)) (then unreachable))"
+           "      (if (i32.ne (i32.load (i32.const 424)) (i32.const 1)) (then unreachable))"
+           "      (if (i32.ne (i32.load (i32.const 432)) (i32.const 22)) (then unreachable))"
+           "      (if (i32.ne (i32.load (i32.const 436)) (i32.const 0)) (then unreachable))"
+           ;; 4e. read the same file back at offset 0 through
+           ;; read-via-stream: all 22 bytes must equal the expected span
+           "      (call $read-span (local.get $fd) (i32.const 256)"
+           "                       (i32.const 64) (i64.const 0) (i32.const 22)"
+           "                       (i32.const 552))"
+           "      (call $fdrop (local.get $fd))"
+           ;; 5. the negative probe: a missing path is an ERR result
+           ;; (error-code::no-entry = case 19), never a trap. The whole
+           ;; tuple is rewritten: the write open left create|truncate and
+           ;; read|write in it, and a create would make the probe pass.
+           "      (i32.store (i32.const 32) (local.get $pre))"
+           "      (i32.store8 (i32.const 36) (i32.const 0))"
            "      (i32.store (i32.const 40) (i32.const 80))"
            "      (i32.store (i32.const 44) (i32.const 11))"
+           "      (i32.store8 (i32.const 48) (i32.const 0))"
+           "      (i32.store8 (i32.const 49) (i32.const 1))"
            "      (local.set $ret (call $openat (i32.const 32) (i32.const 8)))"
            "      (call $settle (local.get $ret))"
            "      (if (i32.ne (i32.load8_u (i32.const 8)) (i32.const 1)) (then unreachable))"
            "      (if (i32.ne (i32.load8_u (i32.const 12)) (i32.const 19)) (then unreachable))"
-           ;; 5. the preopen's own handle goes too
+           ;; 6. the preopen's own handle goes too
            "      (call $fdrop (local.get $pre))"
            "      (call $tr (i32.const 0))"
            "      (i32.const 0)))"
@@ -1512,14 +1810,20 @@
            "          (export \"get-directories\" (func $getdirs-lowered))"
            "          (export \"open-at\" (func $openat-lowered))"
            "          (export \"read-via-stream\" (func $rvs-lowered))"
+           "          (export \"write-via-stream\" (func $wvs-lowered))"
+           "          (export \"append-via-stream\" (func $avs-lowered))"
+           "          (export \"stat\" (func $stat-lowered))"
            "          (export \"task.return\" (func $tr))"
            "          (export \"waitable-set.new\" (func $wsnew))"
            "          (export \"waitable.join\" (func $wjoin))"
            "          (export \"waitable-set.wait\" (func $wswait))"
            "          (export \"subtask.drop\" (func $subdrop))"
+           "          (export \"stream.new\" (func $snew))"
            "          (export \"stream.read\" (func $sread))"
-           "          (export \"future.read\" (func $fread))"
+           "          (export \"stream.write\" (func $swrite))"
            "          (export \"stream.drop-readable\" (func $sdropr))"
+           "          (export \"stream.drop-writable\" (func $sdropw))"
+           "          (export \"future.read\" (func $fread))"
            "          (export \"future.drop-readable\" (func $fdropr))"
            "          (export \"resource.drop\" (func $fdrop))))))"
            "  (func $run (export \"run\") async (result $res)"

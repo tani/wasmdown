@@ -1932,6 +1932,91 @@ accumulated u8 values."
              (is (eql -1 (wasmdown.wasi:wasi-descriptor-fd desc))))
         (wasmdown.wasi:close-wasi-preopen pre)))))
 
+(test wasi/fs-descriptor-drop-fd-plateau-pin
+  ;; §9.3's capability check, counted on NATIVE FDs: a warm-up then
+  ;; repeated open->stream->drop->stream-end cycles return the open-fd
+  ;; count to baseline every time, with the descriptor's refs passing
+  ;; through 2 -> 1 -> 0 and closing the fd exactly once (a stream
+  ;; outliving its handle keeps the fd, and the last release closes
+  ;; it). The OWNED handle's drop runs the provider finalizer once:
+  ;; a second drop of the same index traps (the slot is gone) and
+  ;; cannot decrement/close a second time.
+  (flet ((open-fd-count ()
+           (loop for fd from 0 below 256
+                 count (sb-unix:unix-fstat fd))))
+    (with-fs-root (root "fs-plateau" '("data.txt"))
+      (fs-write! (fs-p root "data.txt") "abcdef")
+      (let* ((pre (wasmdown.wasi:open-wasi-preopen root :name "/r"))
+             (ctx (wasmdown.wasi:make-wasi-context :preopens (list pre)))
+             (d (wasmdown.wasi:wasi-preopen-descriptor pre))
+             (baseline (open-fd-count)))
+        (unwind-protect
+             (progn
+               ;; WARM-UP + repeated cycles: every count returns to
+               ;; baseline and every capacity (refs/fd slot) is the
+               ;; same as the warm-up's
+               (dotimes (i 6)
+                 (let* ((desc (fs-open-file ctx d "data.txt" nil
+                                            (cons :flags '("read"))))
+                        (fd (wasmdown.wasi:wasi-descriptor-fd desc))
+                        (pair (wasmdown.wasi:fs-read-via-stream ctx desc 0))
+                        (stream (first pair))
+                        (future (second pair)))
+                   (is (= 2 (wasmdown.wasi:wasi-descriptor-refs desc)))
+                   (is (= (1+ baseline) (open-fd-count)))
+                   ;; the guest handle goes first: the stream holds the
+                   ;; fd open
+                   (wasmdown.wasi:close-wasi-descriptor desc)
+                   (is (= 1 (wasmdown.wasi:wasi-descriptor-refs desc)))
+                   (is (wasmdown.wasi:wasi-descriptor-closed-p desc))
+                   (is (plusp fd))
+                   (is (not (null (sb-unix:unix-fstat fd))))
+                   ;; drain the stream: the last holder releases once
+                   (is (equal '(97 98 99) (fs-drain-3 stream)))
+                   (is (equal '(100 101 102) (fs-drain-3 stream)))
+                   (is (null (fs-drain-3 stream)))
+                   (is (equal '(:ok) (fs-future-value future)))
+                   (is (zerop (wasmdown.wasi:wasi-descriptor-refs desc)))
+                   (is (eql -1 (wasmdown.wasi:wasi-descriptor-fd desc)))
+                   (is (null (sb-unix:unix-fstat fd)))
+                   (is (= baseline (open-fd-count)))))
+               ;; OWNED DESCRIPTOR via the ABI's handle: the drop
+               ;; closes once, and the second drop of the same index
+               ;; traps without a second release
+               (let* ((ct (wasmdown.wasi:descriptor-resource-ct))
+                      (provider (wasmdown.wasi:filesystem-types-instance ctx))
+                      (guest (wasmdown.component.runtime:make-comp-instance))
+                      (desc (wasmdown.wasi::make-wasi-descriptor
+                             :fd (sb-unix:unix-open "/dev/null"
+                                                    sb-unix:o_rdonly 0)
+                             :owned-p t))
+                      (fd (wasmdown.wasi:wasi-descriptor-fd desc)))
+                 (unwind-protect
+                      (progn
+                        (wasmdown.component.runtime::%push-instance
+                         guest provider)
+                        (let* ((idx (wasmdown.component.runtime::%handle-add
+                                     guest ct desc t))
+                               (drop (wasmdown.component.runtime::%resource-builtin-host-func
+                                      guest :resource-drop ct nil)))
+                          (is (= (1+ baseline) (open-fd-count)))
+                          (wasmdown.runtime:wasm-call drop idx)
+                          (is (wasmdown.wasi:wasi-descriptor-closed-p desc))
+                          (is (zerop (wasmdown.wasi:wasi-descriptor-refs desc)))
+                          (is (eql -1 (wasmdown.wasi:wasi-descriptor-fd desc)))
+                          (is (null (sb-unix:unix-fstat fd)))
+                          (is (= baseline (open-fd-count)))
+                          ;; the index was freed: a stale drop cannot
+                          ;; release anything a second time
+                          (wasmdown.runtime:wasm-call drop idx)
+                          (is (zerop (wasmdown.wasi:wasi-descriptor-refs desc)))
+                          (is (eql -1 (wasmdown.wasi:wasi-descriptor-fd desc)))
+                          (is (= baseline (open-fd-count)))))
+                   (let ((left (wasmdown.wasi:wasi-descriptor-fd desc)))
+                     (when (and (integerp left) (not (minusp left)))
+                       (sb-unix:unix-close left))))))
+          (wasmdown.wasi:close-wasi-preopen pre))))))
+
 (test wasi/fs-stream-reference-released-once
   ;; the stream's reference is released on its terminal event: the
   ;; read-error path and the guest's own drop

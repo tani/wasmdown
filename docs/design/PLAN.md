@@ -407,15 +407,19 @@ WASI 0.2 keeps its own canonical interfaces and `wasi:io` resource semantics, ma
 > close (2026-11-02):** the CLI now OWNS a reactor that serves clock
 > deadlines and stream readiness, so "no timer reactor / wait-until
 > unsupported" no longer describes the tree; the current evidence is the
-> seven-guest P3 CLI lane (21/21 x3, both backends). The retained internal
+> ten-guest P3 CLI lane (30/30 x3, both backends), including a guest that
+> observes a 200 ms `wait-for` completion, one covering
+> cli stdin/env/stderr/terminal and one covering filesystem
+> preopens/open-at/read-via-stream/errors. The retained internal
 > sockets provider still has its unit pins (`wasi/reactor-tcp-loopback`,
 > `wasi/sockets-{accept,recv,send}-reactor-readiness`), but they are
 > composition evidence, not network support. Remaining residuals are
 > maintained, per row and with exit evidence, in **§9.3**: upstream
-> toolchain/suite evidence, per-interface CLI guest coverage, nested
-> `option<stream<u8>>` ownership, descriptor dtor/lend reclamation,
-> compound error-result lowering and per-case
-> validator limits. The WASI 0.1/0.2 facades stay separate (§8.4).
+> toolchain/suite evidence, per-interface CLI guest coverage (the filesystem
+> directory/advanced-metadata and write-error paths remain open), the blocked-stdio executor audit and per-case
+> validator limits. The former descriptor dtor/lend and compound
+> error-result rows are resolved (2026-11-02; see §9.3). The WASI 0.1/0.2
+> facades stay separate (§8.4).
 > HTTP and network communication remain **out of scope, not pending**.
 > See `docs/usage/wasi.md` and ADR-003.
 > `declared_support` stays `partial`.
@@ -444,37 +448,76 @@ Important feasibility condition: zero external Lisp packages is realistic; zero 
 ### 9.3 Declared-profile full-support gap register (2026-11-02)
 
 Current evidence: `docs/status.md`, `docs/conformance/matrix.md`, the P3 lane
-(`make test-wasi-preview3`; seven guests incl. random, 21/21 x3 in both
-backends) and `tools/build-p3-fixtures.lisp` + P3-CHECKSUMS. Rows are classified as
+(`make test-wasi-preview3`; ten guests incl. random, deadline-wait,
+cli stdin/env/stderr/terminal and filesystem preopens/read, 30/30 x3 in both
+backends) and
+`tools/build-p3-fixtures.lisp` + P3-CHECKSUMS. Rows are classified as
 **defect** (implementation must change), **evidence** (implementation exists,
 guest/gate evidence missing), **resolved** (closed with evidence and kept for
 provenance) and **exclusion** (out of scope by decision).
 Only defect rows block a *correctness* claim; evidence rows block the *conformance*
-claim until supplied. Two rows below were closed on 2026-11-02 and are kept for
-provenance: the random CLI guest (`p3/random-bytes`) and `@unstable` enforcement
-(refusal-only link gate, no feature flag). Network communication (`wasi:sockets` TCP/UDP/DNS) is an
+claim until supplied. Five rows below were closed on 2026-11-02 and are kept for
+provenance: the random CLI guest (`p3/random-bytes`), the deadline-completion
+guest (`p3/deadline-wait`), the cli/stdio/env/terminal guest
+(`p3/cli-stdin-env-stderr-terminal`, now including real stdin bytes and the explicit
+DROPPED EOF), the filesystem guest (`p3/filesystem-preopens-read`, read path) and
+`@unstable` enforcement
+(refusal-only link gate, no feature flag). Two further rows closed in the
+borrow/metadata slice: descriptor destructor / lend bookkeeping (reclaim +
+store retirement, with residual limits recorded in the row) and compound
+error-result lowering (audited, no discrepancy; the pin was extended). Network communication (`wasi:sockets` TCP/UDP/DNS) is an
 exclusion, not an evidence row: there is no guest-visible provider, and a
 component-declared import is refused with the message under §9.
 
 | Area | Current measured state | Exit evidence required for "full" | Class |
 | --- | --- | --- | --- |
-| Upstream toolchain guest | None; all seven lane guests are hand-authored TEXT encoded by `tools/component-encode.lisp`. No toolchain in this environment emits @0.3.2. | A pinned toolchain commit + one generated @0.3.2 command guest, hashed and regenerated reproducibly, green in both backends. | evidence (blocked) |
+| Upstream toolchain guest | None; all ten lane guests are hand-authored TEXT encoded by `tools/component-encode.lisp`. No toolchain in this environment emits @0.3.2. | A pinned toolchain commit + one generated @0.3.2 command guest, hashed and regenerated reproducibly, green in both backends. | evidence (blocked) |
 | Upstream WASI 0.3 suite / adapter | Not run; plan §12.5 defines the adapter, none registered yet. | Adapter + pinned suite branch; all applicable cases green, or the claim remains partial with the blocker recorded. | evidence |
-| CLI guest coverage: filesystem | In-process provider/unit tests only; no CLI guest for preopens/open/read-via-stream/write-via-stream/offset/errors. | Command guests for the filesystem surface, both backends. | evidence |
+| CLI guest coverage: filesystem | **Partially resolved (2026-11-02) — read+write path:** `p3/filesystem-preopens-read` (`p3-fs-guest.wasm`) imports `wasi:filesystem/{types,preopens}@0.3.2` and traps unless: `get-directories` lists a `/work` preopen and its handle is taken; an async `open-at` of the seeded `hello.txt` through that preopen returns ok and a live descriptor; `read-via-stream` + `stream.read` copies exactly 17 bytes equal to `filesystem-probe\n` and the paired future resolves ok; a second `open-at` of a missing path returns an err result with `error-code::no-entry` (case 19) rather than trapping; and every handle (opened descriptor, both stream ends, the preopen's own handle) is dropped. The async `open-at` is waited as a SUBTASK event in a waitable set. The write path is now guest-evidenced too: `open-at` create|truncate, `write-via-stream` at offset 0, a second write at offset 17 (the gap must be zero-filled), `append-via-stream` at EOF, parked write futures resolving ok, `stat` (regular-file, link-count 1, size 22), same-descriptor read-back byte-exact, plus a host-side file-contents assertion. Remaining evidence for this row: directory operations, write-side error paths (read-only), stat timestamps and the advanced metadata/time calls; seek does not exist in 0.3.2. Green in both backends, 3 repeats. | Supplied; retained as a regression pin. Directory ops, write-error paths and advanced metadata/time remain provider/unit-tested, not guest-evidenced. | evidence |
 | CLI guest coverage: random | **Resolved (2026-11-02):** `p3/random-bytes` imports `wasi:random/random@0.3.2` plus `insecure`/`insecure-seed`; two 16-byte secure reads must have exact lengths and differ, and the `u64`/seed calls must complete (any failure traps -> nonzero exit); list results are lowered through memory+realloc. Green in both backends, 3 repeats. | Supplied; retained as a regression pin. | resolved |
-| CLI guest coverage: clock deadlines | `now()` guest plus a cancel-during-`wait-for` guest; no guest that observes a `wait-until`/`wait-for` **completion** through the CLI reactor. | Deadline completion guest (deterministic bound), both backends. | evidence |
+| CLI guest coverage: clock deadlines | **Resolved (2026-11-02):** `p3/deadline-wait` lowers the clock's async `wait-for` with a 200 ms request, joins the subtask into a waitable set and returns `WAIT`; the CLI's owned reactor parks until the deadline fires, and the resumed callback traps unless the subtask returned after at least 200 ms of clock time, so an early completion fails. The 200 ms bound is the regression proof for the liveness-oracle fix (see the note below the table). Green in both backends, 3 repeats. | Supplied; retained as a regression pin. | resolved |
 | CLI guest coverage: sockets (excluded) | Not applicable: network communication is excluded, so the former TCP loopback guest was removed with the lane (2026-11-02). The retained internal provider keeps unit pins only. | None — excluded interfaces are never evidence rows. Import refusal is pinned by the link-time check. | exclusion |
-| CLI guest coverage: cli/stdio/env/terminal | exit/stdout only. | stdin/stderr, environment(args/env), terminal-* where the host grants them. | evidence |
+| CLI guest coverage: cli/stdio/env/terminal | **Resolved (2026-11-02):** `p3/cli-stdin-env-stderr-terminal` (`p3-cli-guest.wasm`) imports `wasi:cli/{stdin,environment,stderr,terminal-stdout}` @0.3.2 and traps unless argv[0] is the fixture path the CLI supplied, argv[1] is the literal `wmd-cli-marker`, the environment carries `WMD_ENV_PROBE=env-probe-value`, `get-initial-cwd` is an option (none or non-empty), and `get-terminal-stdout` is `none` on the captured (non-tty) stdout. It reads real stdin through stdin's `read-via-stream` in the canonical async copy order (an eager event is the packed `CopyResult|progress<<4`; a BLOCKED copy is joined into a waitable set and waited), requires exactly `stdin-probe\n` and the explicit DROPPED EOF result, and requires the paired future to read back `result::ok`; any other byte traps. It then writes `p3-cli-guest: stderr probe` through stderr's `write-via-stream` in the canonical future order (park the read, stage the write, drop the writable end, wait for the future event), leaving stdout empty and exiting 0. The two string lists and the option returns are read through `realloc`-lowered ABI layouts. Green in both backends, 3 repeats. | Supplied; retained as a regression pin. | resolved |
 | Socket readiness (internal composition) | The retained internal provider registers readiness; `wasi/reactor-tcp-loopback` and `wasi/sockets-{accept,recv,send}-reactor-readiness` pass in-process. This is composition evidence only — guest sockets are excluded, and no readiness claim is made for the declared profile. | None for the declared profile; the internal provider is not a deliverable. | exclusion |
 | Blocked-stdio executor | `wasi-context-stdio-executor` exists and is used; §status providers row still labels the surface partial. | Audit boundedness/thread-affinity, then correct the status row; guest stdio evidence. | audit |
-| Nested `option<stream<u8>>` host lower | Resolves in the provider's table instead of the caller's (Known gaps). | Fixed owner resolution + regression pin (positive and trap paths). | defect |
-| Descriptor destructor / lend bookkeeping | Destructors and lend lists can accumulate in long-lived hosts (Known gaps). | Reclaim policy + counters/plateau test over repeated instantiations. | defect |
-| Compound error-result lowering | History records `%abi-lower`'s top-level error-result discriminant for compound outer shapes as residual; per-case validator limits remain. | Fixed lowering + ABI matrix cases (nested result/error shapes). | defect (audit) |
+| Nested `option<stream<u8>>` host lower | **Resolved (2026-11-02).** `%abi-load` implements the loading spec's `stream`/`future` rows through `%lift-async-end` (load §2133–2169 → lift_async_value §2438): the memory slot indexes the **loading (caller) instance's** table, the readable end is removed from that table with owner and index cleared (§2446), and the source slot is freed for reuse — a second load of the same index traps as stale. `%lift-async-end` enforces `lift_async_value`'s guards (readable class must match the valtype; element type must match through `%abi-type-key`, which resolves both type spaces; own/borrow compare class only because resource indices are alias-projected) and clears owner+index. The async result-store context carries `:type-inst`, the **provider's** type space, so a nested `(:idx . n)` no longer resolves against the caller's types (measured with a colliding `u32` at caller index 0). Pins: `component/indirect-async-payload-ownership-pin` (forced-indirect sync host lower at 18 flat slots; async `option<stream<u8>>` results with colliding type indices; `none` allocates nothing; stale/class/element/writable/non-idle/waitable-set traps) and the migrated `component/generic-path-five-cases-pin` CASE 2 (end-object contract; the second load traps). Negative controls proved both the load arm and the guard set load-bearing; unit 693/0, component 1,702/0, P3 10/10 ×3 per backend. | Supplied; retained as regression pins. | resolved |
+| Descriptor destructor / lend bookkeeping | **Resolved (2026-11-02) — host borrow reclamation plus store retirement.** A lowering stages borrow handles in `*pending-borrow-handles*`; a host callee has no Task to adopt them. Each staged handle is now a `pending-borrow` record (owner table, 1-based slot, handle) reclaimed **exactly once** — `unwind-protect` on the immediate return and on a trap, and across a HOST-PENDING only at its **terminal** outcome (resolve, reject, or an **acknowledged** cancel; an un-acknowledged cancel keeps the borrow live). Removal clears a slot only while it still holds the same record, so a reused slot is never disturbed; the source `num_lends` ledger stays the Subtask's and is cleared by `%subtask-deliver-resolve`. `%handle-add` follows the shared Table free list (§1131) instead of appending. `%store-teardown` clears `resource-dtor-table`, `ct-defining-inst` and `comp-closure` for the store it is given and for the bound store, because every store-lifecycle caller discards the store afterwards (wast per-script store, `call-with-component-store` close path, `run-component`, pin stores). Pins: `component/host-borrow-reclaim-pin`, `component/host-borrow-retained-across-pending-pin`, `component/store-metadata-retires-with-store-pin`, `component/resource-metadata-live-graph-isolation-pin` and `wasi/fs-descriptor-drop-fd-plateau-pin` (six open/drop cycles at baseline); `component/generic-path-five-cases-pin` CASE 3c/B migrated off the leak. Unit 693/0, component 1,702/0, P3 10/10. **Residual limits:** a caller-owned store reused for many top-level instantiations **without** teardown still accumulates dtor/provenance rows (no per-instantiation pruning, and a live graph keeps its dtors resolvable); scheduler-state teardown still targets the **bound** store; outstanding non-terminal host pendings are not force-reclaimed at teardown; freed slots are class-polymorphic (class guards trap on a stale cross-class index). | Supplied by the pins above; retained as regressions. | resolved |
+| Compound error-result lowering | **Resolved (2026-11-02) — audited, no discrepancy; no code change.** No reproducer exists: `%abi-lower`'s `:result` arm lowers to `variant(ok, error)` and the join always leads with the top-level discriminant. `component/abi-compound-result-lowering` was extended with four shapes — both arms empty records, mixed-arity tuples, a variant carrying a record, and `option`/`option` — and passes unchanged. Per-case validator limits around imported-instance functypes with outer compound refs remain a separate row (`WIT/validator residual limits`), not an ABI-lowering defect. | Audit pin (supplied); retained as a regression. | resolved (audit) |
 | `@unstable` gating | **Resolved (2026-11-02):** enforced on the 0.3 composition path before anything is composed. The gate reuses the WIT selection/import-surface check (`wit-import-surface-status`) rather than a second annotation reader; a declared gated import whose feature the selected stable surface does not enable is a `link-error` naming the import and the feature, shaped as `wasi:clocks/timezone@0.3.2 is @unstable(feature = clocks-timezone) and that feature is not enabled; unstable interfaces are outside the selected stable WASI 0.3.2 surface (see docs/usage/wasi.md and specs/wasi/MANIFEST.md).` Stable imports are unaffected. No feature flag is exposed: the CLI cannot enable a feature, so the gate is refusal-only. Pinned by `wasi/component-unstable-declared-import-is-link-error`, `wit/selection-import-surface-query` and `wit/selection-command-world-timezone-import`. | Supplied. | resolved |
 | WIT/validator residual limits | Reader covers include/renaming, implements/@external-id and nominal resource identity with pins; individual validator edge cases remain tracked per fixture. | Per-case closure or documented limit; no blanket "WIT unimplemented" claim. | audit |
 | Deterministic async property suites | Component async suite + P3 fixtures; no dedicated fake-reactor/fake-executor property lane for P3. | Property lane over task/stream/future/cancel state transitions with repeated seeds. | evidence |
-| Compiled backend cost | P3 lane runs compiled; large compiled lanes are reports. Owner accepted compile time/heap (2026-11-02). | A bounded cheap compiled gate for P3 (already the 7-case lane); no reduction required for conformance. | accepted limit |
+| Compiled backend cost | P3 lane runs compiled; large compiled lanes are reports. Owner accepted compile time/heap (2026-11-02). | A bounded cheap compiled gate for P3 (already the 10-case lane); no reduction required for conformance. | accepted limit |
 | WASI HTTP, network communication (`wasi:sockets` TCP/UDP/DNS and the CLI network options), threads/atomics, annotations, unratified proposals | Not implemented by decision. | Listed as exclusions in the support declaration; never reported as passes. | exclusion |
+
+**Liveness-oracle fix (2026-11-02), the evidence behind the deadline row.**
+The async lift's drain/replay loop used to treat a store with no *ready* task as
+quiescent after a fixed budget of roughly 100 ms, so a guest parked in
+`wait-for` longer than that budget was declared deadlocked even though the
+reactor's timer was about to fire. The oracle now asks whether the store has
+**pending host work** and an **armed one-shot reactor deadline**; that
+combination is possible progress, so the loop keeps pumping until the deadline
+fires. A bare fd-readiness watch is deliberately *excluded* from the predicate:
+a socket may never become ready, so a readiness watch alone is not a liveness
+guarantee. Genuine deadlocks still trap: the component suite's
+`component/deadlock.wast` and `component/dont-block-start.wast` fixtures
+assert the oracle's deadlock trap, and both stay 2/2 green — the negative
+control that the new predicate did not disable deadlock detection. The predicate is
+generic (`%host-store-future-progress-p`) with the WASI specialization
+`reactor-pending-deadline-p`, pinned by
+`wasi/reactor-pending-deadline-p` (armed vs. spent/cancelled registration,
+fd-watch exclusion, store work-count gate), and proved end to end by
+`p3/deadline-wait`'s 200 ms bound, which sits past the old budget.
+
+**Provider variant guard (2026-11-02), not a gap row.** `%abi-store-variant`
+treats a bare label as shorthand only for a **payload-less** case. For a
+payload-bearing case it now raises `wasmdown:host-error` (`a bare variant
+label (...) names a case with a payload; pass (label . payload)`) instead of
+storing the discriminant and leaving the payload slot stale; the tagged
+`(label . payload)` form stores discriminant plus payload as before. Pinned by
+`component/abi-bare-variant-label`. This is provider-domain hygiene; the
+former descriptor destructor / lend row is now **resolved** (see that row:
+host temporary borrows are reclaimed exactly once and graph metadata retires
+with the store, with the residual limits recorded there).
 
 ## 10. Security, isolation and resource management
 
@@ -903,12 +946,12 @@ completed milestones. Evidence lives in `docs/status.md`,
 | M1–M2 | Implemented: stable func-instance identity, prepare/start ordering, shared call/tail/EH protocol | Preserve regressions; deeper EH/reentry properties are tracked, not blocking P3 |
 | M3 | Recorded green core parity (21,260 matches, 0 refusals) + property/fuzz lane | Independent semantic oracle beyond differential agreement (plan-level) |
 | M4 | P1 46 imports bound; non-network acceptance lane green incl. compiled. The four legacy `sock_*` imports are excluded from the declared support profile (network exclusion, 2026-11-02) | Behavioural audit items stay in their own rows; the claim is explicitly the NON-NETWORK P1 surface |
-| M5 | Component lane 1,702/1,702; canonical ABI/resources/async exercised | §9.3 defects: nested stream owner, dtor/lend reclaim, compound error-result |
+| M5 | Component lane 1,702/1,702; canonical ABI/resources/async exercised; nested async payload ownership, descriptor dtor/lend reclaim and the compound error-result row are resolved (2026-11-02) | Per-case validator limits (§9.3) remain in their own row; no §9.3 defect row is open |
 | M6 | P2 behaviour lane green after readiness/permit fixes | Version matrix beyond 0.2.12 is an explicit non-claim today |
 | M7 | Compiled lowering covers interpreter families | Generated/upstream tests remain plan-level; not a P3 blocker |
-| M8 | Reactor/scheduler/borrow checks; resume-safe and cancelled guests pinned | Fake-reactor property lane; executor thread-affinity audit |
-| M9 | Seven hand-authored @0.3.2 CLI guests (incl. random), 21/21 x3 both backends; text→binary encoder + round-trip guard | Upstream toolchain guest; per-interface guest breadth (fs/deadlines/stdio/env/terminal); network communication is excluded |
-| M10 | Cost data, profiles, release matrix; compile cost accepted by owner | Bounded cheap compiled P3 gate already exists (7-case lane); stress matrix per §12.7 |
+| M8 | Reactor/scheduler/borrow checks; resume-safe, cancelled and deadline-waiting guests pinned. The drain oracle now counts pending host work plus an armed one-shot reactor deadline as possible progress (fd readiness excluded), so a 200 ms `wait-for` completes; genuine deadlock fixtures still trap | Fake-reactor property lane; executor thread-affinity audit |
+| M9 | Ten hand-authored @0.3.2 CLI guests (incl. random, deadline-wait, cli stdin/env/stderr/terminal and filesystem preopens/read), 30/30 x3 both backends; text→binary encoder + round-trip guard | Upstream toolchain guest; network communication is excluded |
+| M10 | Cost data, profiles, release matrix; compile cost accepted by owner | Bounded cheap compiled P3 gate already exists (10-case lane); stress matrix per §12.7 |
 | M11 | Quick gates + repeated lanes + release matrix checker | Security/portability fuzzing programme remains plan-level |
 | M12 | Not started (threads/atomics option) | Out of scope unless explicitly enabled |
 
@@ -917,8 +960,8 @@ completed milestones. Evidence lives in `docs/status.md`,
 | Step | Work package | Depends on | Exit evidence |
 | --- | --- | --- | --- |
 | F1 | Evidence plumbing: register the `wasi-testsuite` 0.3 adapter (§12.5) and pin a toolchain that emits @0.3.2; add both as explicit `make` targets with source-identity records | §12.5, §12.8 | Adapter/guest runs green, or a recorded blocker that forces `partial` |
-| F2 | Interface completion in the CLI lane: filesystem (preopens, streams, offsets, errors), clock deadline completion, cli stdin/stderr/env/terminal. Network communication (`wasi:sockets` TCP/UDP/DNS) is excluded and is not a work item. | F1 for toolchain evidence; can start in parallel for hand-authored guests | Command guests per family, both backends, 3 repeats, hashes pinned |
-| F3 | Defect closure from §9.3: nested `option<stream<u8>>` ownership, descriptor dtor/lend reclamation, compound error-result lowering, per-case validator limits | M5/M8 internals | Each with a regression pin that fails before/passes after; register rows closed |
+| F2 | Interface completion in the CLI lane: every family has a guest, and the filesystem read/write/append/offset/stat path is now guest-evidenced (2026-11-02): smoke, exit, clocks, resume-safe callback, stdout stream, cancel, random, deadline-wait, cli stdin/env/stderr/terminal and filesystem preopens/open/read/write/append/offset/stat/error. Remaining interface coverage: filesystem directory operations, write-side error paths and advanced metadata/time calls. Not interface coverage: upstream toolchain/suite evidence (F1), the deterministic async property lane, the blocked-stdio executor audit and the per-case validator limits. (The liveness oracle counts an armed one-shot reactor deadline as possible progress, so a deadline longer than the old budget no longer reads as a deadlock; the provider variant guard rejects payload-bearing bare labels as `host-error`s.) Network communication (`wasi:sockets` TCP/UDP/DNS) is excluded and is not a work item. | F1 for toolchain evidence; can start in parallel for hand-authored guests | Met for coverage: command guests per family, both backends, 3 repeats, hashes pinned; the remaining rows carry their own exit evidence |
+| F3 | Defect closure from §9.3: per-case validator limits (the descriptor dtor/lend reclaim and compound error-result rows closed 2026-11-02) | M5/M8 internals | Each with a regression pin that fails before/passes after; register rows closed |
 | F4 | Async assurance: deterministic fake-reactor/fake-executor property lane, cancel/close races, exactly-once and backpressure invariants; executor thread-affinity audit | F3 for lifetime semantics | Repeated property lane green with seeds; audits documented |
 | F5 | Claim flip to `conformant for the declared 0.3.2 profile`: run G5 + §12.11 checklist, regenerate matrix, update `docs/status.md` only if no row is unmet; release notes enumerate worlds/exclusions (HTTP and network communication never claimed) | F1–F4 | P3 x both backends green at one commit; support table complete |
 

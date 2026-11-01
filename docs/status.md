@@ -31,20 +31,115 @@ deliberately incomplete, and what will not be built. Measurements live in
 | Component model | Instantiation and linking | Full | Two-level core-instance linking, component `with`-args and alias projection execute. |
 | Component model | Canonical ABI | Full | Lift/lower, flattening, string transcoding, `map` despecialization and post-return run at runtime. |
 | Component model | Resources | Full | Per-instance handle tables, own/borrow transfer, destructors and method dispatch. |
-| Component model | Async execution | Partial | The task/subtask state machine, cancellations and resource lifetimes run the whole async suite in both backends. Live-borrow accounting traps `task.return`/`task.cancel` with outstanding borrows; residual ABI/lifetime gaps are listed under Known gaps. |
+| Component model | Async execution | Partial | The task/subtask state machine, cancellations and resource lifetimes run the whole async suite in both backends. Live-borrow accounting traps `task.return`/`task.cancel` with outstanding borrows; the store-retirement limits under Known gaps bound long-lived reuse. |
 | Component model | Backend parity | Full | The whole component lane (1,702 commands) is green with every defined core compiled before its start section (`make report-component-compiled`). |
 | WASI | Preview 1 (`wasi_snapshot_preview1`) | Partial (network imports excluded) | All 46 pinned imports are provided over an explicit capability context; the whole acceptance lane (in-memory and on-disk SQLite, rollback, bail, preopen denial, read-only, escape) passes with compiled guest cores too. The four legacy `sock_*` imports remain implemented and legacy-tested, but network communication is excluded from the declared support profile (2026-11-02; see the `wasi:sockets@0.3.2` row), so the P1 claim is explicitly the NON-NETWORK P1 surface; no network behaviour is claimed. |
-| WASI | 0.3.2 providers | Partial | The CLI owns a reactor (clock deadlines and stream readiness are servable); what remains partial is the provider surface itself — the blocked-stdio executor audit and the canonical-ABI/lifetime residuals listed under Known gaps. Declared `@unstable` imports are refused at link time (see Known gaps), so stability gating is no longer a missing piece. `wasi:sockets` is excluded, not partial; see the `wasi:sockets@0.3.2` row. |
+| WASI | 0.3.2 providers | Partial | The CLI owns a reactor (clock deadlines and stream readiness are servable; a 200 ms `wait-for` completion is guest-evidenced by `p3/deadline-wait`); what remains partial is the provider surface itself — the blocked-stdio executor audit and the store-retirement limits listed under Known gaps. Declared `@unstable` imports are refused at link time (see Known gaps), so stability gating is no longer a missing piece. `wasi:sockets` is excluded, not partial; see the `wasi:sockets@0.3.2` row. |
 | WASI | 0.2 facade | Partial | 27 of 31 stable interfaces are bound at exact release names. The bound `wasi:sockets/*` interfaces are legacy-tested through the embedding API only; the CLI refuses `--net/--listen/--dns` for every run, so no P2 sockets path exists through the CLI. Network communication is excluded from the declared support profile (see the `wasi:sockets@0.3.2` row) and no P2 network behaviour is claimed. |
 | WASI | `wasi:http` | Unsupported by design (not a gap, not planned) | Deliberate, permanent exclusion by user decision (2026-11-02); removed in M17 and recoverable from git history. The vendored `specs/wasi/wasi-wit-0.3.2/http/*.wit` is reference data only. An import is refused with `wasi:http is not supported by this runtime by design (removed in M17); the pinned HTTP WIT is reference data only. See docs/usage/wasi.md and specs/wasi/MANIFEST.md.` See [`specs/wasi/MANIFEST.md`](../specs/wasi/MANIFEST.md) § “Unsupported by design (not pending)”. Not counted as an incomplete interface. |
 | WASI | `wasi:sockets@0.3.2` | Unsupported by design (not a gap, not planned) | TCP, UDP and DNS are excluded permanently by user decision (2026-11-02); there is no `wasi:sockets` provider for guests. The vendored `specs/wasi/wasi-wit-0.3.2/sockets/sockets.wit` is reference data only. A **0.3-line** component-declared import (`types`, `ip-name-lookup`, any 0.3.x version) is refused at link time with `Network communication (TCP, UDP and DNS) is not supported by this design; there is no wasi:sockets provider for guests. See docs/usage/wasi.md and specs/wasi/MANIFEST.md.` The pinned `wasi:cli/command` world imports sockets itself, so a 0.3.2 sockets provider is retained internally for that composition only. See [`specs/wasi/MANIFEST.md`](../specs/wasi/MANIFEST.md) § “Network communication: `wasi:sockets` (excluded)”. Not counted as an incomplete interface. |
-| WASI | 0.3.2 guest lane | Partial | Seven hand-authored @0.3.2 commands run through the real CLI in both backends (`make test-wasi-preview3`, 3 repeats, 21/21 per backend): a no-import smoke; a `wasi:cli/exit@0.3.2` importer (exit 7); a `wasi:clocks/monotonic-clock@0.3.2` importer; a resume-safe async callback command; a `write-via-stream` stdout command printing `hi`; a cancelled-subtask command; and a `wasi:random/random@0.3.2` guest with `insecure`/`insecure-seed` (two 16-byte reads must have exact lengths and differ; `get-random-u64`/seed must complete), lowering the list returns through memory+realloc. The stream and random guests are authored in TEXT and encoded by `tools/component-encode.lisp`, guarded by `wasi/component-text-encoder-roundtrip`. The lane stays Partial because no upstream @0.3.2 toolchain guest exists here; provider behaviour is measured by this lane and the component tests. The former TCP loopback socket command was removed with the network exclusion (2026-11-02); network is not part of this lane. |
+| WASI | 0.3.2 guest lane | Partial | Ten hand-authored @0.3.2 commands run through the real CLI in both backends (`make test-wasi-preview3`, 3 repeats, 30/30 per backend): a no-import smoke; a `wasi:cli/exit@0.3.2` importer (exit 7); a `wasi:clocks/monotonic-clock@0.3.2` importer; a resume-safe async callback command; a `write-via-stream` stdout command printing `hi`; a cancelled-subtask command; a `wasi:random/random@0.3.2` guest with `insecure`/`insecure-seed` (two 16-byte reads must have exact lengths and differ; `get-random-u64`/seed must complete), lowering the list returns through memory+realloc; a clock-deadline guest (`p3/deadline-wait`) whose async `wait-for` asks for 200 ms and must return only after at least that much clock time, parked in a waitable set until the CLI's owned reactor fires; a `wasi:cli/{stdin,environment,stderr,terminal-stdout}@0.3.2` guest (`p3/cli-stdin-env-stderr-terminal`) asserting argv[0]/marker, an `--env` pair and the option-typed initial cwd, `terminal-stdout` = `none` on a non-tty, reading exactly `stdin-probe\n` from real stdin through `read-via-stream` with the explicit DROPPED EOF result and a paired future that reads back ok, and writing `p3-cli-guest: stderr probe` through stderr's `write-via-stream` in canonical future order; and a `wasi:filesystem/{types,preopens}@0.3.2` guest (`p3/filesystem-preopens-read`) that lists the `/work` preopen, opens the seeded `hello.txt` through it (async `open-at`, waited as a subtask), reads exactly 17 bytes via `read-via-stream`+`stream.read`, requires an err result with `error-code::no-entry` (never a trap) for a missing path, and drops every handle. The 200 ms bound sits past the async lift's former ~100 ms quiescence budget and is the regression proof for the liveness-oracle fix: pending host work plus an armed one-shot reactor deadline is possible progress, a bare fd-readiness watch is not, and the component suite's genuine deadlock fixtures (`component/deadlock.wast`, `dont-block-start`) still trap. Unit pin: `wasi/reactor-pending-deadline-p`. The stream, random, deadline, cli and filesystem guests are authored in TEXT and encoded by `tools/component-encode.lisp`, guarded by `wasi/component-text-encoder-roundtrip`. The lane stays Partial because no upstream @0.3.2 toolchain guest exists here; provider behaviour is measured by this lane and the component tests. The former TCP loopback socket command was removed with the network exclusion (2026-11-02); network is not part of this lane. |
 
 ## Known gaps and accepted limits
 
-- Nested `option<stream<u8>>` passed through a host lower resolves in the
-  provider's table instead of the caller's.
-- Descriptor destructors and lend lists accumulate in long-lived hosts.
+- **Resolved (2026-11-02): nested `option<stream<u8>>` payload ownership.**
+  `%abi-load` implements the loading spec's `stream`/`future` rows through
+  `%lift-async-end` instead of the old catch-all: the memory slot indexes the
+  **loading (caller) instance's** handle table, the readable end is removed
+  from that table with its owner and index cleared, and the source slot is
+  freed for reuse — a second load of the same index is a stale-index trap.
+  `%lift-async-end` carries `lift_async_value`'s guards (the readable class
+  must match the valtype; the element type must match through `%abi-type-key`,
+  which resolves both type spaces; own/borrow compare class only, because
+  resource indices are alias-projected) and clears owner+index on the lifted
+  end. The async result-store context carries `:type-inst`, the **provider's**
+  type space, so a nested `(:idx . n)` resolves there instead of against the
+  caller's types. Pinned by
+  `component/indirect-async-payload-ownership-pin` (a forced-indirect sync
+  host lower at 18 flat slots; async `option<stream<u8>>` results with
+  colliding type indices; `none` allocating nothing; stale/class/element/
+  writable/non-idle/waitable-set traps) and the migrated
+  `component/generic-path-five-cases-pin` CASE 2 (end-object contract; the
+  second load traps). Negative controls confirmed both the load arm and the
+  guard set are load-bearing. Unit 693/0, component 1,702/0, P3 10/10 (30/30)
+  in both backends.
+- **Resolved (2026-11-02): host borrow reclamation and store-retirement
+  metadata.** A host callee has no async task to adopt the borrow handles a
+  lowering staged, so the staged records were dropped and their slots leaked.
+  Each staged handle is now a `pending-borrow` record carrying its owner
+  table, 1-based slot and the handle itself, reclaimed **exactly once**: on
+  the immediate return and on a trap (an `unwind-protect`), and across a
+  HOST-PENDING only at the pending's **terminal** outcome — resolve, reject,
+  or an **acknowledged** cancel. An un-acknowledged cancel is not terminal,
+  so the borrow stays live until the provider's real result. Reclamation
+  clears the slot and returns it to the free list only while it still holds
+  the same record, so a slot already reused is never disturbed; the source
+  handle's `num_lends` ledger stays the subtask's and is cleared by
+  `%subtask-deliver-resolve`. `%handle-add` now follows the shared Table
+  free-list policy (§1131): a resource handle reuses a freed slot instead of
+  appending forever, so repeated new/drop cycles plateau. `%store-teardown`
+  clears `resource-dtor-table`, `ct-defining-inst` and `comp-closure` — for
+  the store it is given and for the bound store — because every
+  store-lifecycle caller discards the store afterwards: the wast per-script
+  store, `call-with-component-store`'s close path, `run-component`'s own
+  store and the pins' fresh stores. Pinned by
+  `component/host-borrow-reclaim-pin` (immediate return, trap, a nested guest
+  call does not inherit the account, free-slot reuse, source handle
+  untouched), `component/host-borrow-retained-across-pending-pin` (retained
+  through resolve and acknowledged cancel; a cancel request alone is not
+  terminal; a late resolve still reclaims),
+  `component/store-metadata-retires-with-store-pin` (warm-up plus four
+  instantiate→new/drop→teardown cycles give identical metadata counts; six
+  destructor runs in one graph leave the handle vector at capacity 2 and the
+  free list at 2; a second live handle of the same type keeps the dtor
+  registered) and
+  `component/resource-metadata-live-graph-isolation-pin` (two live stores;
+  one store's teardown never strips the other's provenance). The
+  `component/generic-path-five-cases-pin` CASE 3c/B was migrated from
+  expecting the leaked slot to asserting it is empty and back on the free
+  list. WASI evidence: `wasi/fs-descriptor-drop-fd-plateau-pin` runs six
+  open→stream→drop→stream-end cycles and keeps the process open-fd count at
+  baseline, with a stream that outlives its handle holding the fd until the
+  last release closes it exactly once. Unit 693/0, component 1,702/0, P3
+  10/10 (30/30) in both backends.
+- **Limits of store-retirement-based reclamation.** A caller-owned store
+  reused for many top-level instantiations **without** `store-teardown` still
+  accumulates dtor/provenance rows: there is no per-instantiation pruning,
+  and a live graph must keep its types' dtors registered because a dropping
+  handle still resolves them. `store-teardown`'s scheduler-state teardown
+  still targets the **bound** store, so an explicit argument retires that
+  store's metadata while the bound store's scheduler state is torn down.
+  Outstanding non-terminal host pendings are not force-reclaimed at teardown,
+  and a freed resource slot can be reused by any record class (the class
+  guards reject a stale index that names a different class, as a trap).
+- `%abi-lower`'s top-level error-result discriminant for **compound outer
+  shapes** was **audited and withdrawn as a residual (2026-11-02)**: no
+  reproducer exists. The `:result` arm lowers to `variant(ok, error)` and the
+  join always leads with the discriminant, including both-empty records,
+  mixed-arity tuples, a variant carrying a record, and an `option`/`option`
+  pair. `component/abi-compound-result-lowering` was extended with those four
+  shapes and passes unchanged; **no lowering code was changed**. Per-case
+  validator limits around imported-instance functypes with outer compound
+  refs remain separate open items tracked against individual fixtures — not
+  an ABI-lowering defect. The row history is in §9.3 of
+  [`design/PLAN.md`](design/PLAN.md).
+- The P3 filesystem guest now covers the **read and write paths**: `preopens`,
+  `open-at` (incl. an err `no-entry`), `read-via-stream` + `stream.read`
+  (byte-exact, DROPPED EOF), `write-via-stream` and `append-via-stream` with
+  explicit offsets (including zero-fill extension), parked write futures
+  resolving ok, `stat` (type regular-file, link-count 1, size 22), and a
+  same-descriptor read-back compared byte-exactly; the suite also asserts the
+  host-side file bytes. Still open: directory operations (`read-directory`,
+  `create/remove-directory-at`, `rename/unlink/link/symlink/readlink-at`),
+  write-side error paths (read-only descriptor/preopen), stat timestamps,
+  `set-times/set-size/sync/advise/metadata-hash/get-flags/get-type/stat-at/
+  is-same-object`. There is no seek API in 0.3.2 (offsets are stream args).
+- Provider variant lowering accepts a bare label only for a **payload-less**
+  case. Giving a bare label to a case that carries a payload is now a
+  `host-error` (`a bare variant label (...) names a case with a payload; pass
+  (label . payload)`) instead of storing the discriminant and leaving the
+  payload slot stale; the tagged `(label . payload)` form is unchanged. Pinned
+  by `component/abi-bare-variant-label`.
 - `@unstable` imports are **enforced at link time**. The 0.3 composition path
   checks every declared `wasi:` import through the WIT selection gate
   (`wit-import-surface-status`) before anything is composed: if the target
@@ -118,6 +213,16 @@ deliberately incomplete, and what will not be built. Measurements live in
   `--abi preview3` is explicit-only and `--abi all` covers the two released
   ABIs. Provider-level 0.3.2 coverage is measured by the component lane and
   unit pins, not by that lane.
+- **Reactor liveness is deadline-based, by design.** The drain oracle treats
+  an armed one-shot clock deadline (plus pending host work) as possible
+  progress, so a `wait-for`/`wait-until` longer than any fixed budget
+  completes; a bare fd-readiness watch is excluded, because a peer may never
+  become ready, and is therefore not a liveness guarantee. Genuine deadlocks
+  still trap: the component lane's `component/deadlock.wast` and
+  `component/dont-block-start.wast` assert the deadlock trap and stay 2/2
+  green — the negative control for the predicate.
+  Pinned by `wasi/reactor-pending-deadline-p`; end-to-end proof is
+  `p3/deadline-wait` (200 ms).
 
 ## Roadmap
 
@@ -126,11 +231,16 @@ readiness work without an embedder); what remains is keeping every blocking
 host path (blocked stdio) on the bounded executors rather than a caller's
 thread. Network paths are excluded and not part of this roadmap.
 
-**Canonical ABI.** Revisit the `borrow` lend arms that survive in the two
-canon-lower wrappers; the position-dependent `stream`/`future` arms are already
-gone. Live-borrow accounting already traps `task.return`/`task.cancel`, and the
-compound `result` layouts are pinned; the open items are the nested
-`option<stream<u8>>` owner resolution and lend/destructor reclamation.
+**Canonical ABI.** The position-dependent `stream`/`future` arms are gone; the
+`borrow` lend arms that remain in the two canon-lower wrappers are
+load-bearing, not vestigial: an async-typed callee resolves a borrow index in
+its own table, so the raw caller index is not substitutable (the regressing
+rows are `passing-resources::1` and `drop-cross-task-borrow::2/::4/::6`).
+Live-borrow accounting traps `task.return`/`task.cancel` with outstanding
+borrows, compound `result` layouts are pinned, and the former
+lend/destructor reclamation defect is resolved: host temporary borrows are
+reclaimed exactly once and store metadata retires with the store (see Known
+gaps). Nested `option<stream<u8>>` ownership is likewise resolved.
 
 **Backends.** The pinned core parity lane, the component compiled report and
 the cost bench exist; what remains is differential fuzz/property lanes and the

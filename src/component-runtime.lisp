@@ -524,15 +524,19 @@ dynamic caller's table does not hold it.")
 (defvar *pending-borrow-handles* nil
   "M17 step 2: the borrow handles a lowering JUST added to the
 callee's Table (CanonicalABI.md 2832's lower_borrow), awaiting the
-callee Task that must own them. The spec's lookup happens with
-`cx.borrow_scope' = the CALLEE Task already alive; this runtime
-lowers the args before the Task exists, so the lower records the
-records here and %ADOPT-BORROW-HANDLES moves them onto the Task at
-its creation: num_borrows rises (§2838) once per handle and each
-handle's borrow_scope becomes the Task, which is exactly what
-§3798's resource.drop decrements and §802/§820's return/cancel
-trap on. Bound (and drained) per lowering; never inherited across
-calls.")
+callee Task that must own them. Each entry is a PENDING-BORROW
+record — the OWNER table, the 1-based SLOT and the handle — so a
+handle no Task adopts (a HOST callee, which has no Task to receive
+§2838's num_borrows increment) is removed exactly once (on immediate
+completion or trap, or at a host-pending's terminal outcome). The
+spec's lookup happens with `cx.borrow_scope' = the CALLEE Task
+already alive; this runtime lowers the args before the Task exists,
+so the lower records them here and %ADOPT-BORROW-HANDLES moves them
+onto the Task at its creation: num_borrows rises (§2838) once per
+handle and each handle's borrow_scope becomes the Task, which is
+exactly what §3798's resource.drop decrements and §802/§820's
+return/cancel trap on. Bound (and drained) per lowering; never
+inherited across calls.")
 
 
 (declaim (notinline instantiate-component %exec-core-instance
@@ -2742,21 +2746,33 @@ reaching the built-in."
                    (%inst-host-store (lifted-func-inst lf))))
              ;; a host callee has no Task to adopt this call's borrow
              ;; handles (§2838) — drain them so a NESTED guest call
-             ;; made by the provider cannot inherit the account
-             (ignored-borrows *pending-borrow-handles*)
-             (val (progn
-                    (setf *pending-borrow-handles* nil)
-                    (funcall (lifted-func-host lf) args))))
-        (declare (ignore ignored-borrows))
-        (return-from lifted-func-call
-          (cond
-            ((not (host-pending-p val)) val)
-            ((and ft (third (wasmdown.component:ct-payload ft)))
-             (%host-pending-join val))
-            (t
-             (error 'wasmdown:host-error
-                    :message
-                    "a sync-typed host closure returned a host-pending"))))))
+             ;; made by the provider cannot inherit the account, and
+             ;; RECLAIM them on this call's exit (below): the provider
+             ;; may read them through *HOST-PROVIDER-INST* for the
+             ;; whole call, then the temporary records are removed.
+             (borrows *pending-borrow-handles*)
+             ;; set once the borrows are RETAINED past this stack
+             ;; frame — a direct call that has to JOIN a host-pending
+             ;; keeps them until that pending is terminal; the unwind
+             ;; cleanup then skips its reclaim
+             (keep nil))
+        (setf *pending-borrow-handles* nil)
+        (unwind-protect
+             (let ((val (funcall (lifted-func-host lf) args)))
+               (return-from lifted-func-call
+                 (cond
+                   ((not (host-pending-p val)) val)
+                   ((and ft (third (wasmdown.component:ct-payload ft)))
+                    ;; §2832's borrow is live for the pending's whole
+                    ;; life: join to its TERMINAL outcome, then remove
+                    (prog1 (%host-pending-join val)
+                      (%reclaim-pending-borrows borrows)
+                      (setf keep t)))
+                   (t
+                    (error 'wasmdown:host-error
+                           :message
+                           "a sync-typed host closure returned a host-pending")))))
+          (unless keep (%reclaim-pending-borrows borrows)))))
     (unless (and core (wasmdown.runtime:func-instance-p core))
       (error 'wasmdown:host-error
              :message "lifted func wraps no core func"))
@@ -3094,15 +3110,51 @@ per-instance handle-index allocation)."
         (setf (gethash :handles (comp-instance-imports inst)) v)
         v)))
 
+(defstruct (pending-borrow (:constructor make-pending-borrow
+                                           (inst slot handle)))
+  "One BORROW handle a lowering just added to a callee's Table
+(CanonicalABI.md §2832's lower_borrow), staged for the Task that must
+own it. INST and SLOT are the table and 1-based index the handle
+occupies, kept so the temporary record can be removed EXACTLY ONCE
+when no Task adopts it (a host callee has no Task to receive
+§2838's num_borrows increment) — the handle itself is the identity
+check, so a slot already reused is never disturbed."
+  (inst nil)
+  (slot 0)
+  (handle nil))
+
 (defun %handle-add (inst rt rep own-p)
-  "Table.add (CanonicalABI.md 3762): append an owning handle; the
-index handed to wasm is the 1-based slot. APPEND-ONLY: the fixtures
-pin absolute handle indices, so a freed slot is never reused for a
-resource (the free list belongs to the shared waitable/subtask
-namespace — %HANDLE-ADD-ANY)."
-  (let ((v (%inst-handles inst)))
-    (vector-push-extend (make-resource-handle rt rep own-p) v)
-    (length v)))
+  "Table.add (CanonicalABI.md §1131-1160/§3762): add a RESOURCE
+handle record; the index handed to wasm is the 1-based slot. The
+shared table policy applies: a freed slot on the instance's free
+list is REUSED before the vector extends (§1131's free list is the
+one Table's, whatever the record class), so repeated
+new/drop cycles plateau instead of growing the back end. The slot's
+former occupant is gone; a stale index that names another class is
+rejected by the callers' class guards."
+  (%handle-add-any inst (make-resource-handle rt rep own-p)))
+
+(defun %reclaim-pending-borrows (borrows)
+  "Remove the staged BORROW handles BORROWS from their tables,
+EXACTLY ONCE each: the slot is cleared and returned to the free list
+only while it still holds THE SAME record (a slot already removed and
+reused by another class is never disturbed). Used for the two
+no-Task paths — a host callee's call, which has no Task to adopt
+lower_borrow's account — on immediate completion or trap; a
+host-PENDING keeps the records until its terminal outcome (the
+continuation %CALL-ASYNC-FUNCINST registers). The SOURCE handle's
+num_lends ledger belongs to the Subtask's deliver_resolve
+(§1446-1475), never to this cleanup."
+  (dolist (b borrows)
+    (let* ((inst (pending-borrow-inst b))
+           (slot (pending-borrow-slot b))
+           (h (pending-borrow-handle b))
+           (v (%inst-handles inst)))
+      (when (and (integerp slot) (> slot 0) (<= slot (length v))
+                 (eq (aref v (1- slot)) h))
+        (setf (aref v (1- slot)) nil)
+        (%handle-free-slot inst slot))))
+  nil)
 
 (defun %handle-resource (inst rt i)
   "The RESOURCE handle record at slot I when it names RT, else NIL
@@ -3540,12 +3592,14 @@ TARGET's space."
                                             ;; table, so the lend goes THERE
                                             ;; (the guest-callee local shape
                                             ;; keeps the callee-defining table)
+                                            (bi-inst
+                                              (if (lifted-func-host f)
+                                                  inst ft-inst))
                                             (bi (and rep
                                                      (or (lifted-func-host f)
                                                          (not impl-p))
                                                      (%handle-add
-                                                      (if (lifted-func-host f)
-                                                          inst ft-inst)
+                                                      bi-inst
                                                       rt rep nil))))
                                        ;; §2832's lower_borrow: the
                                        ;; borrow handle belongs to the
@@ -3557,11 +3611,16 @@ TARGET's space."
                                        ;; was NEVER the caller's
                                        ;; num_borrows (that is §1447's
                                        ;; num_lends, on the source).
+                                       ;; The record keeps its OWNER
+                                       ;; TABLE and SLOT: a HOST callee
+                                       ;; has no Task, so its borrow
+                                       ;; is reclaimed by the host
+                                       ;; call's exit instead.
                                        (when bi
-                                         (push (%handle-resource-at
-                                                (if (lifted-func-host f)
-                                                    inst ft-inst)
-                                                bi rt)
+                                         (push (make-pending-borrow
+                                                bi-inst bi
+                                                (%handle-resource-at
+                                                 bi-inst bi rt))
                                                *pending-borrow-handles*))
                                        ;; the callee's core gets the
                                        ;; handle INDEX (lower_borrow),
@@ -7561,11 +7620,14 @@ rises once per handle and the handle's borrow_scope is the Task, so
 §802/§820's task.return/task.cancel trap while any of them is
 undropped and §3798's resource.drop is the one decrement. The
 SOURCE handles' num_lends stays the separate §1447 ledger on the
-Subtask."
-  (dolist (h handles)
-    (when h
-      (incf (async-task-num-borrows task))
-      (setf (resource-handle-borrow-scope h) task)))
+Subtask. HANDLES is the staged PENDING-BORROW records; their owner
+table and slot stay recorded so the no-Task (host-callee) paths can
+reclaim them, while an adopted handle's lifetime is the Task's."
+  (dolist (b handles)
+    (let ((h (pending-borrow-handle b)))
+      (when h
+        (incf (async-task-num-borrows task))
+        (setf (resource-handle-borrow-scope h) task))))
   task)
 
 (defun %task-return (task result)
@@ -9782,24 +9844,30 @@ is the valtype."
                                           ;; sync lower — the provider
                                           ;; reads the index off the
                                           ;; dynamic caller's table
+                                          (bi-inst
+                                            (if (lifted-func-host f)
+                                                inst ft-inst))
                                           (bi (and rep
                                                    (or (lifted-func-host f)
                                                        (not impl-p))
                                                    (%handle-add
-                                                    (if (lifted-func-host f)
-                                                        inst ft-inst)
+                                                    bi-inst
                                                     rt rep nil))))
                                      ;; §2838: the borrow handle's
                                      ;; num_borrows home is the CALLEE
                                      ;; Task (created just below) —
                                      ;; never the lending task's
                                      ;; count (that is the source's
-                                     ;; num_lends above)
+                                     ;; num_lends above). A HOST
+                                     ;; callee has no Task: its
+                                     ;; borrow is reclaimed at the
+                                     ;; completion (or terminal
+                                     ;; cancellation) it announces.
                                      (when bi
-                                       (push (%handle-resource-at
-                                              (if (lifted-func-host f)
-                                                  inst ft-inst)
-                                              bi rt)
+                                       (push (make-pending-borrow
+                                              bi-inst bi
+                                              (%handle-resource-at
+                                               bi-inst bi rt))
                                              *pending-borrow-handles*))
                                      (push (or bi rep) vals)
                                      (incf ai)))
@@ -10104,36 +10172,52 @@ is the valtype."
              (*current-component-store*
                (or *current-component-store*
                    (%inst-host-store (lifted-func-inst f))))
-             (async-p (and ft (third (wasmdown.component:ct-payload ft)))))
-        (when on-start (funcall on-start))
-        (let ((val (funcall host component-args)))
-          (cond
-            ((host-pending-p val)
-             (unless async-p
-               (error 'wasmdown:host-error
-                      :message
-                      "a sync-typed host closure returned a host-pending"))
-             (let ((pending val))
-               (%host-pending-set-continuation
-                pending
-                (lambda (outcome)
-                  (ecase (car outcome)
-                    (:resolve (funcall on-resolve (cdr outcome)))
-                    (:cancel (funcall on-resolve :cancelled))
-                    (:reject (let ((x (cdr outcome)))
-                               (if (typep x 'condition)
-                                   (funcall on-resolve (cons :trap x))
-                                   (funcall on-resolve x)))))))
-               ;; an already-settled pending delivers NOW (still
-               ;; through the pump, on the pending's store context)
-               (%host-pump (host-pending-store pending))
-               (return-from %call-async-funcinst
-                 (values (lambda () (%host-pending-request-cancel pending))
-                         nil))))
-            (t
-             (funcall on-resolve val)
-             (return-from %call-async-funcinst
-               (values (lambda () nil) nil)))))))
+             (async-p (and ft (third (wasmdown.component:ct-payload ft))))
+             ;; the staged BORROW records live on the caller's table
+             ;; for the provider's whole call; a HOST callee has no
+             ;; Task to adopt them, so this exit removes them — except
+             ;; across a host-PENDING, where they are retained until
+             ;; the pending's TERMINAL outcome (a cancel REQUEST is
+             ;; not terminal, §host-pending's state doc)
+             (retained nil))
+        (unwind-protect
+             (progn
+               (when on-start (funcall on-start))
+               (let ((val (funcall host component-args)))
+                 (cond
+                   ((host-pending-p val)
+                    (unless async-p
+                      (error 'wasmdown:host-error
+                             :message
+                             "a sync-typed host closure returned a host-pending"))
+                    (let ((pending val))
+                      (%host-pending-set-continuation
+                       pending
+                       (lambda (outcome)
+                         (unwind-protect
+                              (ecase (car outcome)
+                                (:resolve (funcall on-resolve (cdr outcome)))
+                                (:cancel (funcall on-resolve :cancelled))
+                                (:reject (let ((x (cdr outcome)))
+                                           (if (typep x 'condition)
+                                               (funcall on-resolve (cons :trap x))
+                                               (funcall on-resolve x)))))
+                           ;; the call is terminal: remove the temporary
+                           ;; borrow handles (exactly once)
+                           (%reclaim-pending-borrows borrow-handles))))
+                      ;; an already-settled pending delivers NOW (still
+                      ;; through the pump, on the pending's store
+                      ;; context) — the continuation then reclaims
+                      (%host-pump (host-pending-store pending))
+                      (setf retained t)
+                      (return-from %call-async-funcinst
+                        (values (lambda () (%host-pending-request-cancel pending))
+                                nil))))
+                   (t
+                    (funcall on-resolve val)
+                    (return-from %call-async-funcinst
+                      (values (lambda () nil) nil))))))
+          (unless retained (%reclaim-pending-borrows borrow-handles)))))
     (if (and ft (third (wasmdown.component:ct-payload ft)))
         ;; the callee is ASYNC-TYPED: run the lift on its own thread
         ;; (the task resolves via task.return whenever it's ready)
@@ -10268,7 +10352,25 @@ runs AFTER that mutex is released."
       (setf (component-store-right-handoffs (%cs)) nil)
       ;; STEP 4: no ticket survives a teardown (a recycled thread
       ;; object must not alias a dead entry)
-      (clrhash (component-store-driver-records (%cs))))
+      (clrhash (component-store-driver-records (%cs)))
+      ;; STORE RETIREMENT (§9.3's dtor/provenance reclamation): the
+      ;; resource-destructor, type-provenance and component-closure
+      ;; tables key entries by, and retain, the graph's comp-instances
+      ;; — one store owns exactly one instantiation graph (an instance
+      ;; never outlives its store; docs/design/PLAN.md step 2), and
+      ;; every store-lifecycle caller discards the store after this
+      ;; call (the wast run hook's per-script store, CALL-WITH-
+      ;; COMPONENT-STORE's close-p path, RUN-COMPONENT's own store,
+      ;; the pins' fresh stores). Nothing can look a dtor or a
+      ;; provenance record up afterwards, so the tables are cleared
+      ;; with the scheduler state instead of retaining the graph for
+      ;; the life of the object. A LIVE graph's store is untouched:
+      ;; teardown is per store, and a type's dtor is consulted when a
+      ;; handle drops, never removed by one — so the second live
+      ;; store's entries keep resolving.
+      (clrhash (component-store-comp-closure (%cs)))
+      (clrhash (component-store-resource-dtor-table (%cs)))
+      (clrhash (component-store-ct-defining-inst (%cs))))
     ;; ---- PHASE 2: NO SCHEDULER MUTEX. The exit call takes the
     ;; leaving task's peer mutexes AND re-acquires the store right
     ;; (through the M11a resume-all); the broadcasts are peer
@@ -10296,10 +10398,12 @@ runs AFTER that mutex is released."
 the native threads. A caller-owned store is closed by whoever owns
 it; an argumentless call without a bound store is an error — never a
 process-wide sweep.
-The execution state it clears (the scheduler thread registry, the
-execution right and its ticket, the handoff frames, driver records and
-the tick/aging/progress/cancel gates) is the STORE's own — no process
-global is touched, so two graphs never tear each other down."
+The GRAPH METADATA it clears (the resource destructor, alias
+provenance and component-closure tables) is the NAMED store's — those
+records are dead the moment the caller discards the returned store,
+and they retain its comp-instances — while the scheduler state
+(thread registry, right/ticket, handoff frames, driver records, tick
+gates) is torn down on the store bound by the caller."
   (let ((store (or store *current-component-store*)))
     (unless store
       (error 'wasmdown:host-error
@@ -10307,6 +10411,15 @@ global is touched, so two graphs never tear each other down."
     (unless (host-store-p store)
       (error 'wasmdown:host-error
              :message (format nil "store-teardown: ~s is not a store" store)))
+    ;; STORE RETIREMENT, named store: every store-lifecycle caller
+    ;; discards the store after this call, so the graph metadata that
+    ;; keys on (and retains) its comp-instances can go with it. Clear
+    ;; it explicitly for the NAMED store: the scheduler state below is
+    ;; the bound store's, and an explicit argument must still retire
+    ;; the metadata of the store it names.
+    (clrhash (component-store-comp-closure store))
+    (clrhash (component-store-resource-dtor-table store))
+    (clrhash (component-store-ct-defining-inst store))
     (%store-teardown)
     store))
 

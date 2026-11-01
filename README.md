@@ -88,7 +88,7 @@ Requires **SBCL** (developed against 2.6.4); Python 3 only for the WASI
 behaviour lane, Nix only to rebuild the pinned WASI fixtures.
 
 ```sh
-make test-unit                  # unit + integration suite (672 tests, ~8 s)
+make test-unit                  # unit + integration suite (693 tests, ~8 s)
 sbcl --script tools/wasmdown.lisp help
 ```
 
@@ -124,13 +124,13 @@ Every lane is measured, not asserted. Latest numbers (2026-11-02):
 
 | Lane | Kind | Measured | Docs |
 | --- | --- | --- | --- |
-| `make test-unit` | gate | 672 pass / 0 fail | — |
+| `make test-unit` | gate | 693 pass / 0 fail | — |
 | `make test-spec-core` | baseline | 21 187 pass / 0 fail / 73 unsupported of 21 260 | [`core.md`](docs/conformance/core.md) |
 | `make test-component` | gate | 1 702 pass / 0 fail / 0 unsupported | [`component.md`](docs/conformance/component.md) |
 | `make report-component-compiled` | report | 1 702 pass / 0 fail under `:compiled` | `tests/component-compiled/component.md` |
 | `make test-backend-parity` | gate | 21 260 / 21 260 core commands agree across both backends | [`backends.md`](docs/conformance/backends.md) |
 | `make test-wasi` | gate | 450/450 cases over 30 fresh-process runs | [`wasi.md`](docs/conformance/wasi.md) |
-| `make test-wasi-preview3` | gate (explicit) | 7 hand-authored 0.3.2 guests × 3 repeats (21/21), both backends | — |
+| `make test-wasi-preview3` | gate (explicit) | 10 hand-authored 0.3.2 guests (incl. random, clock deadline, cli stdin/env/stderr/terminal, filesystem preopens/read) × 3 repeats (30/30), both backends | — |
 | Network communication (TCP/UDP/DNS) | excluded | not verified, not claimed: component imports are refused at link time; the canonical message is in [`specs/wasi/MANIFEST.md`](specs/wasi/MANIFEST.md) | — |
 | `make test-property` | gate | 2 000 generated modules, both backends agree | — |
 | `make test-upstream` | discovery | aggregated proposal corpus, never a gate | [`upstream.md`](docs/conformance/upstream.md) |

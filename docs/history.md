@@ -397,7 +397,7 @@ print exactly `hi\n`).
 
 - Numbering convention: engine-slice loops 18–24 and Component Model milestones M7–M17 ran in parallel; neither series renumbers the other.
 - Remaining work named at the M17 close, none of it inside the lane: provider step 5/6 (DNS and blocking-stdio bounded executors, and socket accept/recv/send registering a reactor watch instead of reporting would-block to a caller that then waits); step 1's last item (the two canon-lower wrappers' positional stream/future/borrow arms, where deletion needs the verification-set fixtures in the probe set first — `%abi-load`'s memory-path transfer arms stay out as a measured negative); borrow-side lifetime pins (a live borrow held across `task.return` must trap; borrow-in-awaitable-set), reusing the guest-drop pin's shape; and one parked delta with a measured verdict, `wip/type-view` (at parity in a clean window, not landed because a green lane's bar is "no measured cost"). `wip/reactor-wiring` was closed as superseded: its driver pump and context reactor landed as the store driver, its socket plumbing as the executor slice with a strictly stronger keying scheme, so it was never rebased or re-measured.
-- Residual security/ABI honesty items recorded with M16: no socket or timer reactor, so a guest cannot be woken later and `clocks.wait-until`/`wait-for` stay declared-unsupported; the nested `option<stream<u8>>` through a host lower resolves the async end in the provider's table instead of the caller's; descriptor-destructor and lend-list accumulation for long-lived hosts; `%abi-lower`'s top-level error-result discriminant for compound outer shapes; pre-existing text/validator limits around imported-instance functypes with outer compound refs (the runtime lifts with the real WIT functype, so fixtures work around the validator, not the ABI); `@unstable` gating parsed but not enforced (the timezone interface is simply not registered; enforced 2026-11-02 — see “Stability gate and the seven-guest P3 lane”); `wasi:sockets` has no `shutdown` in this WIT revision; and world `include`, `implements`/`external-id` and nominal resource typing are not read by the WIT frontend.
+- Residual security/ABI honesty items recorded with M16: no socket or timer reactor, so a guest cannot be woken later and `clocks.wait-until`/`wait-for` stay declared-unsupported; the nested `option<stream<u8>>` through a host lower (resolved 2026-11-02 — see “Nested async payload ownership” at the end of this file); descriptor-destructor and lend-list accumulation for long-lived hosts (resolved 2026-11-02 — see “Host borrow reclamation and store retirement” at the end of this file); `%abi-lower`'s top-level error-result discriminant for compound outer shapes (audited and withdrawn 2026-11-02 — see “Compound error-result audit” at the end of this file); pre-existing text/validator limits around imported-instance functypes with outer compound refs (the runtime lifts with the real WIT functype, so fixtures work around the validator, not the ABI); `@unstable` gating parsed but not enforced (the timezone interface is simply not registered; enforced 2026-11-02 — see “Stability gate and the seven-guest P3 lane”); `wasi:sockets` has no `shutdown` in this WIT revision; and world `include`, `implements`/`external-id` and nominal resource typing are not read by the WIT frontend.
 - Items open since the M7-era measurement: the compiler-backend parity matrix (§12.3's `:optimized`/`:aot` plus the differential oracle), the property/fuzz lanes (§12.6), and the remaining CI lanes (M11). Threads/atomics and the FASL cache were never started.
 
 ## Network communication excluded (2026-11-02)
@@ -489,3 +489,290 @@ previously unexercised instance-`run` shape.
 
 Evidence at the change: unit tests 685/0, `make verify` green, canonical
 `tests/wasi-results/p3-*` re-recorded.
+
+## Deadline liveness and the cli/stderr/terminal guest — nine-guest P3 lane (2026-11-02)
+
+Two §9.3 evidence rows closed and the lane grew to **nine** hand-authored
+@0.3.2 commands (27/27 ×3 in both backends), superseding the seven-guest
+count above.
+
+**Liveness oracle.** The async lift's drain/replay loop declared a store
+quiescent after a fixed budget of roughly 100 ms with no *ready* task. That is
+wrong when a guest is parked in `wait-for`: the reactor's timer is about to
+fire, yet the store looks idle, so the oracle reported a deadlock and the
+guest never observed its deadline. The fix makes the liveness query name the
+one thing that guarantees future progress: **pending host work plus an armed
+one-shot reactor deadline**. The generic predicate is
+`%host-store-future-progress-p` on the store; the WASI specialization is the
+`%reactor-pending-deadline-p` generic, implemented by the reactor as the
+exported `reactor-pending-deadline-p`, which is true only while a live
+one-shot deadline registration is armed (a spent or cancelled registration and
+an empty reactor are false). A bare fd-readiness watch is deliberately
+**excluded**: a peer may never become ready, so a readiness watch alone is not
+a liveness guarantee. Genuine deadlocks still trap — `component/deadlock.wast`
+and `dont-block-start` remain oracle-tripping fixtures in the component async
+gate (1,702/0). Unit pin: `wasi/reactor-pending-deadline-p` (unarmed reactor;
+fd watch only; armed deadline; store work-count gate through
+`%HOST-STORE-WORK-ADD`; cancellation removes it; a fired one-shot leaves
+nothing behind).
+
+**Deadline guest as the regression proof.** `p3-deadline-guest.wasm` lowers
+the clock's async `wait-for` with a **200 ms** request — deliberately past the
+old ~100 ms budget — joins the subtask into a waitable set and returns
+`WAIT`; the reactor's callback loop parks until the deadline fires, and the
+resumed callback traps unless the subtask returned after at least 200 ms of
+clock time (`t1 - t0 >= 200 ms`), so an early completion fails. It passes in
+both backends, three repeats.
+
+**cli/env/stderr/terminal guest.** `p3-cli-env-stderr-terminal`
+(`p3-cli-guest.wasm`) imports `wasi:cli/environment`, `wasi:cli/stderr` and
+`wasi:cli/terminal-stdout` @0.3.2. It reads `get-arguments` and
+`get-environment` as `list<string>` / `list<tuple<string,string>>` and
+`get-initial-cwd` / `get-terminal-stdout` as options through
+`realloc`-lowered ABI layouts, and traps unless argv[0] is the fixture path
+the CLI supplied, argv[1] is `wmd-cli-marker`, the environment carries
+`WMD_ENV_PROBE=env-probe-value`, the initial cwd is an option and
+`terminal-stdout` is `none` on the captured (non-tty) stdout. It then writes
+`p3-cli-guest: stderr probe` through stderr's `write-via-stream` in the
+canonical future order (park the future read, stage the write, drop the
+writable end, wait for the future event); stdout stays empty and the exit is 0.
+The suite runner gained per-case `--env` plumbing, with a `{fixture}`
+placeholder expanding to the path handed to the guest as argv[0].
+
+**Lane and evidence.** Nine guests — smoke, exit importer, monotonic-clock
+`now`, resume-safe async callback, stdout `write-via-stream`, cancelled
+subtask, random, deadline-wait, cli-env-stderr-terminal — at 27/27 ×3 in both
+backends (`P3-CHECKSUMS` and `tests/wasi-results/p3-*` re-recorded). Unit tests
+686/0, `make verify` green, component async gate 1,702/0 with the deadlock
+fixtures still trapping.
+
+## Filesystem and stdin guests — ten-guest P3 lane (2026-11-02)
+
+The §9.3 filesystem evidence row closed and the lane grew to **ten**
+hand-authored @0.3.2 commands (30/30 ×3 in both backends), superseding the
+nine-guest count above.
+
+**Filesystem guest.** `p3/filesystem-preopens-read` (`p3-fs-guest.wasm`, TEXT
+encoded) imports `wasi:filesystem/{types,preopens}@0.3.2`. With a `/work`
+preopen seeded with `hello.txt` (`filesystem-probe\n`), the guest takes the
+preopen handle from `get-directories`, issues an async `open-at` and waits for
+its SUBTASK/RETURNED event in a waitable set, reads exactly 17 bytes through
+`read-via-stream` + `stream.read` (a blocked copy is waited with the packed
+`CopyResult|progress<<4` payload), and confirms the paired future is ok. A
+second `open-at` of `missing.txt` must return an error result with
+`error-code::no-entry` (case 19) — an err value, not a trap. Every handle
+(opened descriptor, both stream ends, the preopen handle) is dropped; any
+mismatch traps, so exit 0 is the assertion.
+
+**Stdin probe.** The cli guest now also imports `wasi:cli/stdin@0.3.2`: it
+reads the suite's real stdin bytes (`stdin-probe\n`) through
+`read-via-stream`, requires the explicit DROPPED EOF result and an ok paired
+future, and traps on any other byte. The runner supplies the marker from the
+case manifest. The cli/stdio/env/terminal row therefore covers stdin,
+environment, stderr and terminal and stays resolved.
+
+**Bare-label variant guard.** `%abi-store-variant` accepted a bare label for
+any variant case, so a payload-bearing case would store only the discriminant
+and leave the payload slot stale. It now raises `wasmdown:host-error`
+(`a bare variant label (...) names a case with a payload; pass (label .
+payload)`) for that shape; payload-less bare labels remain the
+native-provider shorthand and the tagged form is unchanged. Pinned by
+`component/abi-bare-variant-label`. This guard does not touch descriptor
+dtor/lend reclamation; that defect was resolved later the same day — see
+“Host borrow reclamation and store retirement” at the end of this file.
+
+**Lane and evidence.** Ten guests — smoke, exit importer, monotonic-clock
+`now`, resume-safe async callback, stdout `write-via-stream`, cancelled
+subtask, random, deadline-wait, cli stdin/env/stderr/terminal, filesystem
+preopens/read — at 30/30 ×3 in both backends (`P3-CHECKSUMS` and
+`tests/wasi-results/p3-*` re-recorded). Unit tests 687/0 (688 after the
+nested-async fix below), `make verify` green,
+component async gate 1,702/0 with the deadlock fixtures still trapping.
+
+## Nested async payload ownership — load arm, guards and type space (2026-11-02)
+
+**Measured defect (now closed).** A `stream`/`future` payload read out of guest memory by the
+generic `%abi-load` catch-all returned the raw handle index and left the
+readable end resident in the loading instance's table — so a nested payload
+never crossed a boundary and ownership stayed with the loader by accident. On
+the async result side, a nested `(:idx . n)` resolved against the **caller's**
+type space, so an `option<stream<u8>>` result could name the provider's type
+but be read as whatever shared that index in the caller.
+
+**Load arm.** `%abi-load` now implements load's `StreamType`/`FutureType` rows
+(§2133–2169) by delegating to `%lift-async-end` (§2161 → `lift_async_value`,
+§2438): the memory slot indexes the **loading (caller) instance's** handle
+table, the readable end is removed from that table, its owner and index are
+cleared (§2446), and the source slot is freed for reuse. A second load of the
+same index is therefore a stale index — the slot no longer holds an end — and
+traps.
+
+**Guard set.** `%lift-async-end` gained `lift_async_value`'s checks. The end's
+recorded element `ct` must match the valtype's element through
+`%abi-type-key`, which resolves both sides into one type space (struct `ct`s
+compare by identity; a prim element is a keyword on the end but a fresh prim
+`ct` on the valtype side; a raw `(:idx . n)` resolves through the given
+space). The readable class must match the valtype, and own/borrow compare
+class only because resource indices are alias-projected. The lift clears
+owner+index on the value it returns.
+
+**Type space.** The async result-store context now carries `:type-inst`, the
+provider (callee) type space, so a nested `(:idx . n)` in an
+`option<stream<u8>>` result resolves there rather than against the caller's
+types. The pin measures this with a colliding `u32` at caller index 0: a
+caller-space resolution would store an integer instead of the end record.
+
+**Pins and negative controls.**
+`component/generic-path-five-cases-pin` CASE 2 was migrated from the frozen
+catch-all's expectation (raw index, end still resident) to the ABI contract:
+the loaded value is the end record, the source slot is null, freed for reuse,
+and the second load of the same index traps. A stale expectation was exactly
+the leak the old measurement recorded. The new
+`component/indirect-async-payload-ownership-pin` covers (a) a real sync host
+lower with the tuple forced into memory past `MAX_FLAT_PARAMS` — 16 `u64`
+params plus the option flatten to 18 slots — where the host provider sees the
+end record nested in the option, never an integer, the caller's source slot is
+consumed, and the provider's table never sees the end; (b) async
+`option<stream<u8>>` results with colliding type indices, including the
+`none` case allocating nothing and leaving both handle tables unchanged; and
+(c) `lift_async_value`'s trap set through load — stale index, a resource
+handle in an end slot, a stream end through `future<u8>`, a wrong element type
+(`stream<u32>` end for a `stream<u8>` valtype), a writable end, a non-idle
+end, and an end in a waitable set — with the final readable, idle,
+out-of-set end still lifting, so the guards do not consume the slot. Negative
+controls confirmed both the load arm and the guard set are load-bearing.
+
+**Lane.** Unit 688/0 (687 before), component 1,702/0, P3 10/10 ×3 in both
+backends (30/30) unchanged; `make verify` green.
+
+## Host borrow reclamation and store retirement (2026-11-02)
+
+**Measured defect.** A canonical lower stages the borrow handles it added to
+the callee's Table in `*pending-borrow-handles*`, for the callee Task that
+must adopt them (§2832 → §2838). A **host** callee has no Task: the call
+bound and cleared the dynamic list and simply dropped the records, so the
+borrow handle stayed in the table with no owner and nothing ever removed it.
+`%handle-add` was append-only by design (fixtures pinned absolute indices), so
+every host call with a borrow parameter grew the table by one slot — the
+"lend lists accumulate" half of the old Known-gaps bullet. The destructor
+half was the same shape: `resource-dtor-table`, `ct-defining-inst` and
+`comp-closure` key on, and retain, the graph's comp-instances, and nothing
+retired them when the store was discarded.
+
+**Reclaim policy.** Each staged entry is now a struct `PENDING-BORROW`
+carrying the **owner table**, the 1-based **slot** and the **handle**. A
+host-callee call reclaims its staged records exactly once:
+
+- on the immediate return and on a trap, via `unwind-protect`;
+- across a HOST-PENDING, they are **retained** for the pending's whole life
+  and removed in the continuation's own `unwind-protect` at the **terminal**
+  outcome — resolve, reject, or an **acknowledged** cancel;
+- a cancel **request** is not terminal (the provider may not be able to
+  stop), so the borrow stays live and a later resolve still reclaims it;
+- removal clears the slot and returns it to the free list only while the slot
+  still holds **the same record**, so a slot already reused by another class
+  is never disturbed.
+
+The source handle's `num_lends` ledger is untouched by this cleanup: it
+belongs to the Subtask and is cleared by `%subtask-deliver-resolve`, so the
+loan stays counted until delivery.
+
+**Shared free-slot policy.** `%handle-add` now delegates to the one Table
+allocator (`%handle-add-any`) and therefore reuses the instance's free list
+(§1131) instead of appending. The slot's former occupant is gone; a stale
+index that names another record class is rejected by the callers' class
+guards, so the reuse is not type-safe by construction.
+
+**Store retirement.** `%store-teardown` now clears `comp-closure`,
+`resource-dtor-table` and `ct-defining-inst`. The safety argument is a
+lifecycle proof, not a heuristic: every store-lifecycle caller discards the
+store after the call — the wast run hook's per-script store,
+`call-with-component-store`'s close path, `run-component`'s own store and the
+pins' fresh stores — so nothing can look a destructor or provenance record up
+afterwards. Teardown retires the metadata of the store it is **given** as well
+as the bound store (the named-store retarget: an explicit argument must still
+retire the store it names), while the scheduler-state teardown (thread
+registry, execution right/ticket, handoff frames, driver records, tick gates)
+still runs on the **bound** store. A **live** graph's store is never touched:
+teardown is per store, and dropping one handle does not remove the type's
+destructor while another handle of the same type is live.
+
+**Plateau evidence.**
+`component/store-metadata-retires-with-store-pin` runs a warm-up cycle and
+then four repeated `instantiate → new/drop → teardown` cycles: the live
+metadata counts are identical every time — `(1 2 0)` for dtor/provenance/
+closure, never iteration-shaped — and `(0 0 0)` after each teardown. Inside
+one graph, two owning handles of the same type occupy slots 1 and 2; six
+destructor runs (two drops plus four new/drop cycles) leave the handle vector
+at **capacity 2** and the free list at **2**, so the table and free list
+plateau; the first drop keeps the type's dtor registered because the second
+handle is live.
+`component/resource-metadata-live-graph-isolation-pin` holds two live graphs
+in two stores: dropping in A runs A's destructor and leaves both metadata
+sets intact, tearing down B cannot strip A's provenance, and each store
+retires only its own records. `wasi/fs-descriptor-drop-fd-plateau-pin`
+covers the descriptor side: six `open → stream → drop → stream-end` cycles
+keep the process open-fd count at baseline, a stream that outlives its handle
+keeps the fd until the last release, and the last release closes it exactly
+once. No heap-size assertion; the fd count and the structural counts are the
+observables.
+
+**Pins and migration.** `component/host-borrow-reclaim-pin` (immediate
+return, trap, a nested guest call does not inherit the account, free-slot
+reuse, source handle untouched, source `num_lends` still the subtask's),
+`component/host-borrow-retained-across-pending-pin` (retained through
+resolve and acknowledged cancel; a cancel request alone is not terminal; a
+late resolve still reclaims), plus the two metadata pins above.
+`component/generic-path-five-cases-pin` CASE 3c/B was migrated: it used to
+assert the leaked slot was still resident, and now asserts the slot is empty
+and the index is back on the free list while the source index still owns its
+resource. The pins carry both positive and cleanup assertions (free-list
+membership, post-teardown `(0 0 0)`).
+
+**Residual risks.** Reclaim is store-retirement-based, so a caller-owned
+store reused for many top-level instantiations **without** teardown still
+accumulates dtor/provenance rows — there is no per-instantiation pruning, and
+a live graph must keep its dtors resolvable. Scheduler-state teardown still
+targets the bound store. Outstanding non-terminal host pendings are not
+force-reclaimed at teardown. A freed slot can be reused by any record class,
+with the class guards (traps) as the only type check.
+
+**Lane.** Unit 693/0, component 1,702/0, P3 10/10 ×3 in both backends;
+`make verify` green.
+
+## Compound error-result audit — residual withdrawn (2026-11-02)
+
+The known-gaps bullet that said `%abi-lower` could lose the top-level
+error-result discriminant for **compound outer shapes** was audited and
+withdrawn: there is **no reproducer** against this tree. The `:result` arm
+lowers to `variant("ok", "error")`, whose join always leads with the
+discriminant, and the existing pin already covered nested `result`, record,
+list and primitive arms. `component/abi-compound-result-lowering` was
+extended with four more shapes — both arms empty records (`(0)`/`(1)`),
+mixed-arity tuples, a variant carrying a record, and an `option`/`option`
+pair — all passing unchanged. **No lowering code changed.** The per-case
+validator limits around imported-instance functypes with outer compound refs
+were never an ABI-lowering issue and remain open in their own row. Recorded
+as an audit outcome, not a fix.
+
+## Filesystem write path — offsets, append, stat (2026-11-02)
+
+The P3 filesystem guest (`p3-fs-guest.wasm`, same suite case) grew the write
+half of the row: open-at with create|truncate, `write-via-stream` at offset 0,
+a second write at offset 17 (the 2-byte gap must be zero-filled),
+`append-via-stream` at EOF, the BLOCKED event path through a waitable set,
+parked write futures that must resolve `result::ok`, and `descriptor.stat`
+(`ok`, regular-file case 5, link-count 1, size 22; the payload sits at
+retptr+8 because the variant join alignment is 8 from the u64 fields). A
+same-descriptor `read-via-stream` reads all 22 bytes and compares them
+byte-exactly; the suite adds a host-side `expect.file_contents` witness
+(`wmd-write-probe\0\0!-app`). The missing-path probe was also fixed to rewrite
+the full open-at tuple (its leftover create|truncate flags could have made it
+pass vacuously).
+
+The row stays partial: directory operations, write-side error paths
+(read-only descriptor/preopen), stat timestamps and the advanced calls
+(`set-times`, `set-size`, `sync`, `advise`, `metadata-hash`, `get-flags`,
+`get-type`, `stat-at`, `is-same-object`) are provider/unit-tested only; 0.3.2
+has no seek API, offsets are explicit stream arguments. P3 30/30 ×3 both
+backends, `make verify` green, only the filesystem fixture hash changed.

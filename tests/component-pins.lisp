@@ -5464,8 +5464,9 @@ mismatch, not a stream<u8>."
         (is (= 7 (wasmdown.component.runtime::%abi-load-int scx 20 4)))))
     ;; CASE 5 — an own handle in a COMPOUND result: lowering the
     ;; abstract (:own-handle rt rep) adds EXACTLY ONE handle to the
-    ;; lowering caller's table (the free list is not consulted for a
-    ;; resource, so the slot is the fresh append).
+    ;; lowering caller's table. A FRESH table has an empty free list,
+    ;; so the slot is the fresh append; reuse of freed slots (the
+    ;; shared Table policy §1131) is pinned by the plateau pin below.
     (let* ((guest (wasmdown.component.runtime:make-comp-instance))
            (cx (funcall cx-of guest))
            (ct (wasmdown.component.runtime::make-ct*
@@ -5503,12 +5504,18 @@ mismatch, not a stream<u8>."
                ;; the resource ct was ALIAS-PROJECTED into the callee
                ;; (§2834's same-implementor shortcut must NOT apply)
                (setf (gethash (cons callee 0) store) :pin-source)
-               (wasmdown.component.runtime::%push-func
+               (let ((live nil))
+                 (wasmdown.component.runtime::%push-func
                 caller
                 (wasmdown.component.runtime:make-lifted-func
                  :type ft :inst callee
                  :host (lambda (args)
-                         (setf seen (copy-list args))
+                         (setf seen (copy-list args)
+                               ;; the borrow is LIVE for the provider's
+                               ;; whole call; read it while it exists
+                               live (wasmdown.component.runtime::%handle-resource-at
+                                     wasmdown.component.runtime::*handle-caller-inst*
+                                     (first args) rt))
                          7)))
                (let* ((src (wasmdown.component.runtime::%handle-add
                             caller rt 42 t))
@@ -5516,20 +5523,33 @@ mismatch, not a stream<u8>."
                              caller 0 nil))
                       (out (wasmdown.runtime:wasm-call wrap src))
                       (bi (first seen))
-                      (h (wasmdown.component.runtime::%handle-resource-at
-                          caller bi rt)))
+                      (free (gethash :handle-free
+                                     (wasmdown.component.runtime:comp-instance-imports
+                                      caller))))
                  (is (equal '(7) out))
-                 ;; the callee got a NEW index; the source index is
-                 ;; untouched and still OWNS the resource
+                 ;; the callee got a NEW index, a NON-OWNING borrow
+                 ;; record naming the source's rep (§2832)
                  (is (= 2 bi))
-                 (is (not (wasmdown.component.runtime::resource-handle-own-p
-                           h)))
+                 (is (and live
+                          (not (wasmdown.component.runtime::resource-handle-own-p
+                                live))))
                  (is (eql 42
-                          (wasmdown.component.runtime::resource-handle-rep h)))
+                          (wasmdown.component.runtime::resource-handle-rep
+                           live)))
+                 ;; a HOST callee has no Task to own the borrow, so the
+                 ;; call's exit RECLAIMED the temporary record: its slot
+                 ;; is empty and the index is back on the shared free
+                 ;; list (a later add re-uses it)
+                 (is (null (aref (wasmdown.component.runtime::%inst-handles
+                                  caller)
+                                 (1- bi))))
+                 (is (member bi free))
+                 ;; the source index is untouched and still OWNS the
+                 ;; resource
                  (is (wasmdown.component.runtime::resource-handle-own-p
                       (wasmdown.component.runtime::%handle-resource-at
                        caller src rt)))))
-          (remhash (cons callee 0) store))))))
+          (remhash (cons callee 0) store)))))))
 
 (test component/indirect-async-payload-ownership-pin
   ;; CanonicalABI.md load (§2133-2169) + lift_async_value (§2438):
@@ -6331,6 +6351,489 @@ THE LOCK ORDER rule (b): those are RIGHT acquisitions, and a held
          (%pin-slice "tests/component/async/sync-streams.wast" 1 208)
          "sync-streams-pin.wast"))))
 
+;;; ---------------------------------------------------------------
+;;; §9.3 — RESOURCE METADATA AND TEMPORARY-BORROW RECLAMATION.
+;;;
+;;; Two lifetime rules, measured by COUNTS only (no heap timing):
+;;;
+;;;  (1) METADATA IS THE STORE'S. The resource destructor table, the
+;;;      alias-provenance records and the component closures key on
+;;;      (and retain) the graph's instances; one store owns exactly
+;;;      one instantiation graph, so %STORE-TEARDOWN retires them
+;;;      with the graph. A LIVE store's records are untouched by a
+;;;      single handle drop — two handles of one type both release
+;;;      through the same registered dtor, and tearing down another
+;;;      store cannot remove them.
+;;;
+;;;  (2) A HOST-TEMPORARY BORROW IS REMOVED ONCE. A lowering stages
+;;;      the borrow handle it adds for an async-typed callee; a guest
+;;;      callee's Task adopts it (%ADOPT-BORROW-HANDLES), but a HOST
+;;;      callee has no Task, so the call's exit removes it — on the
+;;;      immediate return and on a trap, and for a HOST-PENDING only
+;;;      at its TERMINAL outcome (a cancel REQUEST is not terminal —
+;;;      §host-pending's state doc). The SOURCE handle's num_lends
+;;;      ledger stays the subtask's, cleared by
+;;;      %SUBTASK-DELIVER-RESOLVE, never by this cleanup.
+;;;
+;;; The resource path also uses the shared Table free list (§1131), so
+;;; the handle vector and free list plateau across new/drop cycles.
+
+;; $C defines a resource type with a real core destructor and exports
+;; new/drop; the root aliases the exported type, so the store records
+;; both the destructor and an alias-provenance row.
+(defparameter *pin-dtor-component-src*
+  "(component
+     (component $C
+       (core module $M
+         (memory (export \"mem\") 1)
+         (func (export \"dtor\") (param i32)
+           (i32.store (i32.const 0)
+             (i32.add (i32.load (i32.const 0)) (i32.const 1)))))
+       (core instance $m (instantiate $M))
+       (type $R' (resource (rep i32) (dtor (core func $m \"dtor\"))))
+       (export $R \"R\" (type $R'))
+       (canon resource.new $R' (core func $new))
+       (canon resource.drop $R' (core func $drop))
+       (func (export \"new\") (param \"rep\" u32) (result (own $R))
+         (canon lift (core func $new)))
+       (func (export \"drop\") (param \"self\" (own $R))
+         (canon lift (core func $drop))))
+     (instance $c (instantiate $C))
+     (alias export $c \"R\" (type $R)))")
+
+(defun %pin-dtor-component ()
+  (let ((comp (wasmdown.component.text::parse-component-text
+               *pin-dtor-component-src*)))
+    (is (wasmdown.component:validate-component comp))
+    comp))
+
+(defun %pin-dtor-graph (comp store)
+  "Instantiate COMP into STORE; return (values ROOT CALLEE NEW DROP)
+where CALLEE is the nested $C instance and NEW/DROP its lifted
+exports."
+  (let* ((root (wasmdown.component.runtime:instantiate-component
+                comp :store store))
+         (callee (aref (wasmdown.component.runtime::comp-instance-instances
+                        root) 0)))
+    (values root callee
+            (cdr (gethash "new"
+                          (wasmdown.component.runtime::comp-instance-exports
+                           callee)))
+            (cdr (gethash "drop"
+                          (wasmdown.component.runtime::comp-instance-exports
+                           callee))))))
+
+(defun %pin-dtor-count (callee)
+  "The value $C's dtor core func wrote into its own memory (a count of
+dtor runs, read without any heap instrumentation)."
+  (let* ((core (aref (wasmdown.component.runtime::comp-instance-core-instances
+                      callee)
+                     0))
+         (mem (wasmdown.runtime:export-value core "mem"))
+         (bytes (wasmdown.runtime:memory-instance-bytes mem)))
+    (loop for k below 4 sum (ash (aref bytes k) (* 8 k)))))
+
+(defun %pin-store-metadata (store)
+  "The store's graph-metadata entry counts (dtors provenance closures)."
+  (list (hash-table-count
+         (wasmdown.component.runtime::component-store-resource-dtor-table
+          store))
+        (hash-table-count
+         (wasmdown.component.runtime::component-store-ct-defining-inst store))
+        (hash-table-count
+         (wasmdown.component.runtime::component-store-comp-closure store))))
+
+(defun %pin-live-resource-counts (inst)
+  "The number of LIVE owning and borrowed RESOURCE records in INST's
+table (the table also holds waitables/subtasks)."
+  (let ((own 0) (borrow 0))
+    (loop for h across (wasmdown.component.runtime::%inst-handles inst)
+          when (wasmdown.component.runtime::resource-handle-p h)
+            do (if (wasmdown.component.runtime::resource-handle-own-p h)
+                   (incf own)
+                   (incf borrow)))
+    (values own borrow)))
+
+(defun %pin-free-slot-count (inst)
+  (length (gethash :handle-free
+                   (wasmdown.component.runtime:comp-instance-imports inst))))
+
+(pin-test component/store-metadata-retires-with-store-pin
+  ;; (1) A WARM-UP GRAPH, then repeated instantiate->new->drop->
+  ;; release-graph cycles: the live counts are CONSTANT (the graph
+  ;; shape, never the iteration), the handle vector and free list
+  ;; plateau (the resource path reuses §1131's free list), and the
+  ;; store-retirement clears every metadata entry. The SECOND live
+  ;; graph inside the cycle proves a drop does not remove the type's
+  ;; dtor while another handle of the same type is live.
+  (let ((comp (%pin-dtor-component)))
+    (flet ((cycle ()
+             (let* ((store (%current-store))
+                    (base (list 1 2 0)))
+               (multiple-value-bind (root callee new drop)
+                   (%pin-dtor-graph comp store)
+                 (declare (ignore root))
+                 (is (equal base (%pin-store-metadata store)))
+                 ;; TWO owning handles of the SAME type, allocated
+                 ;; through new (which consumes and frees its own
+                 ;; core-side handle) — the free list is reused, so
+                 ;; the vector is two slots wide, never wider
+                 (let* ((v1 (wasmdown.component.runtime:lifted-func-call
+                             new 5))
+                        (rt (second v1))
+                        (h1 (wasmdown.component.runtime::%handle-add
+                             callee rt (third v1) t))
+                        (v2 (wasmdown.component.runtime:lifted-func-call
+                             new 6))
+                        (h2 (wasmdown.component.runtime::%handle-add
+                             callee rt (third v2) t))
+                        (capacity (length
+                                   (wasmdown.component.runtime::%inst-handles
+                                    callee))))
+                   (is (eql 1 h1))
+                   (is (eql 2 h2))
+                   (is (= 2 capacity))
+                   (is (equal '(2 0)
+                              (multiple-value-list
+                               (%pin-live-resource-counts callee))))
+                   ;; ONE drop: the dtor ran, the type's record is
+                   ;; STILL registered (the second handle is live),
+                   ;; and the provenance is untouched
+                   (wasmdown.component.runtime:lifted-func-call drop h1)
+                   (is (= 1 (%pin-dtor-count callee)))
+                   (is (equal base (%pin-store-metadata store)))
+                   (is (equal '(1 0)
+                              (multiple-value-list
+                               (%pin-live-resource-counts callee))))
+                   (is (= 1 (%pin-free-slot-count callee)))
+                   ;; the second drop: the SAME registered dtor runs
+                   (wasmdown.component.runtime:lifted-func-call drop h2)
+                   (is (= 2 (%pin-dtor-count callee)))
+                   (is (equal '(0 0)
+                              (multiple-value-list
+                               (%pin-live-resource-counts callee))))
+                   (is (= 2 (%pin-free-slot-count callee)))
+                   ;; repeated new/drop cycles in the LIVE graph do
+                   ;; not grow capacity or the free list
+                   (dotimes (i 4)
+                     (let* ((v (wasmdown.component.runtime:lifted-func-call
+                                new (+ 10 i)))
+                            (h (wasmdown.component.runtime::%handle-add
+                                callee (second v) (third v) t)))
+                       (wasmdown.component.runtime:lifted-func-call drop h))
+                     (is (= capacity
+                            (length (wasmdown.component.runtime::%inst-handles
+                                     callee))))
+                     (is (= 2 (%pin-free-slot-count callee))))
+                   (is (= 6 (%pin-dtor-count callee)))
+                   ;; release-graph: every entry is retired
+                   (let ((live (%pin-store-metadata store)))
+                     (wasmdown.component.runtime:store-teardown store)
+                     (values live (%pin-store-metadata store))))))))
+      (multiple-value-bind (warmup after-warmup) (cycle)
+        (is (equal '(1 2 0) warmup))
+        (is (equal '(0 0 0) after-warmup))
+        (dotimes (i 4)
+          (multiple-value-bind (live after) (cycle)
+            (is (equal warmup live))
+            (is (equal '(0 0 0) after))))))))
+
+(pin-test component/resource-metadata-live-graph-isolation-pin
+  ;; TWO LIVE graphs in TWO stores: dropping a handle in A runs A's
+  ;; destructor and leaves both stores' metadata intact; tearing down
+  ;; B cannot strip A's provenance — A's SAME dtor still runs on its
+  ;; next drop. Each store retires only its own records.
+  (let* ((comp (%pin-dtor-component))
+         (store-a (wasmdown.component.runtime:make-component-store))
+         (store-b (wasmdown.component.runtime:make-component-store))
+         (md (list 1 2 0)))
+    (multiple-value-bind (ra ca na da) (%pin-dtor-graph comp store-a)
+      (declare (ignore ra))
+      (multiple-value-bind (rb cb nb db) (%pin-dtor-graph comp store-b)
+        (declare (ignore rb nb db))
+        (is (equal md (%pin-store-metadata store-a)))
+        (is (equal md (%pin-store-metadata store-b)))
+        (flet ((drop-one (callee new drop)
+                 (let* ((v (wasmdown.component.runtime:lifted-func-call new 7))
+                        (rt (second v))
+                        (h (wasmdown.component.runtime::%handle-add
+                            callee rt (third v) t)))
+                   (wasmdown.component.runtime:lifted-func-call drop h))))
+          ;; A's drop: A's dtor count rises, B's graph is untouched
+          (drop-one ca na da)
+          (is (= 1 (%pin-dtor-count ca)))
+          (is (zerop (%pin-dtor-count cb)))
+          (is (equal md (%pin-store-metadata store-a)))
+          (is (equal md (%pin-store-metadata store-b)))
+          ;; retiring B leaves A's records and its dtor resolution
+          (wasmdown.component.runtime:store-teardown store-b)
+          (is (equal '(0 0 0) (%pin-store-metadata store-b)))
+          (is (equal md (%pin-store-metadata store-a)))
+          (drop-one ca na da)
+          (is (= 2 (%pin-dtor-count ca)))
+          (is (zerop (%pin-dtor-count cb)))
+          (is (equal md (%pin-store-metadata store-a)))
+          (is (equal '(0 0 0) (%pin-store-metadata store-b))))
+        (wasmdown.component.runtime:store-teardown store-a)
+        (is (equal '(0 0 0) (%pin-store-metadata store-a)))))))
+
+;;; ---- host-temporary borrows ----
+
+(defun %pin-host-borrow-setup (store provider &optional result)
+  "CALLER holds a host lifted func of an ASYNC-typed functype taking
+(borrow $R); CALLEE declares $R as type 0 AND the alias-provenance
+record makes it ALIAS-PROJECTED, so §2834's same-implementor shortcut
+must not apply and lower_borrow really creates a borrow handle. The
+provider host closure is PROVIDER (args -> value | host-pending)."
+  (let* ((caller (wasmdown.component.runtime:make-comp-instance))
+         (callee (wasmdown.component.runtime:make-comp-instance))
+         (rt (wasmdown.component.runtime::make-ct* :resource nil))
+         (bct (wasmdown.component.runtime::make-ct* :borrow 0))
+         (ft (wasmdown.component.runtime::make-ct*
+              :func (list (list (cons "self" bct)) result t))))
+    (wasmdown.component.runtime::%push-type callee rt)
+    (wasmdown.component.runtime::%push-type caller rt)
+    (setf (gethash (cons callee 0)
+                   (wasmdown.component.runtime::component-store-ct-defining-inst
+                    store))
+          :pin-source)
+    (wasmdown.component.runtime::%push-func
+     caller
+     (wasmdown.component.runtime:make-lifted-func
+      :type ft :inst callee :host provider))
+    (values caller callee rt)))
+
+(defun %pin-borrows-of (inst rt)
+  (let ((n 0))
+    (loop for h across (wasmdown.component.runtime::%inst-handles inst)
+          when (and (wasmdown.component.runtime::resource-handle-p h)
+                    (eql rt (wasmdown.component.runtime::resource-handle-rt
+                             h))
+                    (not (wasmdown.component.runtime::resource-handle-own-p
+                          h)))
+            do (incf n))
+    n))
+
+(defun %pin-any-borrow-count (inst)
+  "Every live NON-OWNING resource record in INST's table — the shape a
+provider can check without closing over the resource identity."
+  (let ((n 0))
+    (loop for h across (wasmdown.component.runtime::%inst-handles inst)
+          when (and (wasmdown.component.runtime::resource-handle-p h)
+                    (not (wasmdown.component.runtime::resource-handle-own-p
+                          h)))
+            do (incf n))
+    n))
+
+(defun %pin-own-handle (inst rt rep)
+  (wasmdown.component.runtime::%handle-add inst rt rep t))
+
+(defun %pin-source-lends (inst rt)
+  (wasmdown.component.runtime::resource-handle-num-lends
+   (wasmdown.component.runtime::%handle-resource-at inst 1 rt)))
+
+(pin-test component/host-borrow-reclaim-pin
+  ;; (2) The temporary BORROW handle of a lowered call to a HOST
+  ;; callee: no Task adopts it, so the call's exit removes it exactly
+  ;; once. The provider still sees a live, non-owning handle during
+  ;; the call; the SOURCE handle is untouched.
+  (let ((comp-store (%current-store)))
+    ;; (a) SYNC lower, immediate value
+    (multiple-value-bind (caller callee rt)
+        (%pin-host-borrow-setup
+         comp-store
+         (lambda (args)
+           (declare (ignore args))
+           (is (= 1 (%pin-any-borrow-count
+                     wasmdown.component.runtime::*handle-caller-inst*)))
+           7)
+         (wasmdown.component.runtime::make-ct* :prim :u32))
+      (declare (ignore callee))
+      (let* ((src (%pin-own-handle caller rt 42))
+             (wrap (wasmdown.component.runtime::%lower-host-func
+                    caller 0 nil))
+             (out (wasmdown.runtime:wasm-call wrap src)))
+        (is (equal '(7) out))
+        (is (= 1 src))
+        (is (zerop (%pin-borrows-of caller rt)))
+        (is (null (aref (wasmdown.component.runtime::%inst-handles caller)
+                        (1- 2))))
+        (is (member 2 (gethash :handle-free
+                               (wasmdown.component.runtime:comp-instance-imports
+                                caller))))
+        (is (wasmdown.component.runtime::resource-handle-own-p
+             (wasmdown.component.runtime::%handle-resource-at
+              caller src rt)))))
+    ;; (b) SYNC lower, provider TRAP: the unwind removes the borrow
+    (multiple-value-bind (caller callee rt)
+        (%pin-host-borrow-setup
+         comp-store
+         (lambda (args)
+           (declare (ignore args))
+           (error 'wasmdown:host-error :message "provider trap")))
+      (declare (ignore callee))
+      (let* ((src (%pin-own-handle caller rt 43))
+             (wrap (wasmdown.component.runtime::%lower-host-func
+                    caller 0 nil)))
+        (is (handler-case
+                (progn (wasmdown.runtime:wasm-call wrap src) nil)
+              (wasmdown:host-error () t)))
+        (is (zerop (%pin-borrows-of caller rt)))
+        (is (= 1 (%pin-free-slot-count caller)))
+        (is (wasmdown.component.runtime::resource-handle-own-p
+             (wasmdown.component.runtime::%handle-resource-at
+              caller src rt)))))
+    ;; (c) ASYNC lower, immediate value: the callee resolves EAGERLY
+    ;; (packed RETURNED), the borrow is removed at the same exit and
+    ;; the eager deliver_resolve clears the lender ledger
+    (multiple-value-bind (caller callee rt)
+        (%pin-host-borrow-setup
+         comp-store
+         (lambda (args)
+           (declare (ignore args))
+           (is (= 1 (%pin-any-borrow-count
+                     wasmdown.component.runtime::*handle-caller-inst*)))
+           7))
+      (declare (ignore callee))
+      (let* ((src (%pin-own-handle caller rt 47))
+             (wrap (wasmdown.component.runtime::%canon-lower-async-host-func
+                    caller 0
+                    (wasmdown.component:make-canonrec :kind :lower :func 0
+                                                      :opts nil)))
+             (out (let ((wasmdown.component.runtime::*current-component-store*
+                          comp-store))
+                    (wasmdown.runtime:wasm-call wrap src))))
+        (is (equal '(2) out))           ; Subtask.State.RETURNED, eager
+        (is (zerop (%pin-borrows-of caller rt)))
+        (is (member 2 (gethash :handle-free
+                               (wasmdown.component.runtime:comp-instance-imports
+                                caller))))
+        (is (zerop (%pin-source-lends caller rt)))))))
+
+(pin-test component/host-borrow-retained-across-pending-pin
+  ;; (2 cont.) ASYNC lower + HOST-PENDING: the borrow is RETAINED
+  ;; while the pending is live (a cancel REQUEST is recorded but is
+  ;; NOT terminal), and removed exactly once at the terminal outcome
+  ;; (resolve or acknowledged cancel). The lender ledger is the
+  ;; subtask's: num_lends stays 1 until the subtask's delivery.
+  (flet ((async-lower (caller)
+           (wasmdown.component.runtime::%canon-lower-async-host-func
+            caller 0
+            (wasmdown.component:make-canonrec :kind :lower :func 0
+                                              :opts nil)))
+         (subtask-of (caller out)
+           (aref (wasmdown.component.runtime::%inst-handles caller)
+                 (1- (ash (first out) -4)))))
+    (let ((store (%current-store)))
+      ;; ---- pending -> RESOLVE ----
+      (let (resolve! pending)
+        (multiple-value-bind (caller callee rt)
+            (%pin-host-borrow-setup
+             store
+             (lambda (args)
+               (declare (ignore args))
+               (setf pending
+                     (wasmdown.component.runtime:make-host-pending
+                      :start (lambda (res rej ack)
+                               (declare (ignore rej ack))
+                               (setf resolve! res)
+                               (lambda () nil))))))
+          (declare (ignore callee))
+          (let* ((src (%pin-own-handle caller rt 44))
+                 (wrap (async-lower caller))
+                 (out (let ((wasmdown.component.runtime::*current-component-store*
+                              store))
+                        (wasmdown.runtime:wasm-call wrap src)))
+                 (subtask (subtask-of caller out)))
+            (is (= 1 (%pin-borrows-of caller rt)))
+            (is (= 1 (%pin-source-lends caller rt)))
+            (is (= 1 (length (wasmdown.component.runtime::async-subtask-lenders
+                              subtask))))
+            (funcall resolve! :value)
+            (wasmdown.component.runtime::%host-pump store)
+            (is (wasmdown.component.runtime::host-pending-delivered-p pending))
+            (is (zerop (%pin-borrows-of caller rt)))
+            (is (member 2 (gethash :handle-free
+                                   (wasmdown.component.runtime:comp-instance-imports
+                                    caller))))
+            ;; the loan is the subtask's until its DELIVERY clears it
+            (is (= 1 (%pin-source-lends caller rt)))
+            (is (= 1 (length (wasmdown.component.runtime::async-subtask-lenders
+                              subtask))))
+            (funcall (wasmdown.component.runtime::async-waitable-pending-event
+                      subtask))
+            (is (zerop (%pin-source-lends caller rt)))
+            (is (null (wasmdown.component.runtime::async-subtask-lenders
+                       subtask))))))
+      ;; ---- pending -> ACKNOWLEDGED CANCEL ----
+      (let (pending)
+        (multiple-value-bind (caller callee rt)
+            (%pin-host-borrow-setup
+             store
+             (lambda (args)
+               (declare (ignore args))
+               (setf pending
+                     (wasmdown.component.runtime:make-host-pending
+                      :start (lambda (res rej ack)
+                               (declare (ignore res rej))
+                               (lambda () (funcall ack) t))))))
+          (declare (ignore callee))
+          (let* ((src (%pin-own-handle caller rt 45))
+                 (wrap (async-lower caller))
+                 (out (let ((wasmdown.component.runtime::*current-component-store*
+                              store))
+                        (wasmdown.runtime:wasm-call wrap src)))
+                 (subtask (subtask-of caller out)))
+            ;; the REQUEST alone keeps the borrow and the operation
+            (funcall (wasmdown.component.runtime::async-subtask-on-cancel
+                      subtask))
+            (is (= 1 (%pin-borrows-of caller rt)))
+            (is (eq :waiting
+                    (wasmdown.component.runtime::host-pending-state pending)))
+            (wasmdown.component.runtime::%host-pump store)
+            (is (eq :cancelled
+                    (wasmdown.component.runtime::host-pending-state pending)))
+            (is (zerop (%pin-borrows-of caller rt)))
+            (is (= 1 (%pin-source-lends caller rt)))
+            (funcall (wasmdown.component.runtime::async-waitable-pending-event
+                      subtask))
+            (is (zerop (%pin-source-lends caller rt)))
+            (is (null (wasmdown.component.runtime::async-subtask-lenders
+                       subtask))))))
+      ;; ---- an UNABLE-TO-STOP provider: the cancel is requested but
+      ;; NOT acknowledged, so the borrow stays until the normal result
+      (let (resolve! pending)
+        (multiple-value-bind (caller callee rt)
+            (%pin-host-borrow-setup
+             store
+             (lambda (args)
+               (declare (ignore args))
+               (setf pending
+                     (wasmdown.component.runtime:make-host-pending
+                      :start (lambda (res rej ack)
+                               (declare (ignore rej ack))
+                               (setf resolve! res)
+                               (lambda () nil))))))
+          (declare (ignore callee))
+          (let* ((src (%pin-own-handle caller rt 46))
+                 (wrap (async-lower caller))
+                 (out (let ((wasmdown.component.runtime::*current-component-store*
+                              store))
+                        (wasmdown.runtime:wasm-call wrap src)))
+                 (subtask (subtask-of caller out)))
+            (funcall (wasmdown.component.runtime::async-subtask-on-cancel
+                      subtask))
+            (wasmdown.component.runtime::%host-pump store)
+            (is (wasmdown.component.runtime::host-pending-cancel-requested
+                 pending))
+            (is (not (wasmdown.component.runtime::host-pending-terminal-p
+                      pending)))
+            (is (= 1 (%pin-borrows-of caller rt)))
+            (funcall resolve! :late)
+            (wasmdown.component.runtime::%host-pump store)
+            (is (wasmdown.component.runtime::host-pending-delivered-p pending))
+            (is (zerop (%pin-borrows-of caller rt)))))))))
+
 (defun run-component-pins ()
   "Run the component pins (registered via TEST; returns T)."
   (let ((wasmdown.test::*tests*
@@ -6427,6 +6930,10 @@ THE LOCK ORDER rule (b): those are RIGHT acquisitions, and a held
                       component/borrowed-handle-not-joinable-pin
                       component/switched-target-exit-releases-pin
                       component/nested-sync-lower-keeps-guest-right-pin
+                      component/store-metadata-retires-with-store-pin
+                      component/resource-metadata-live-graph-isolation-pin
+                      component/host-borrow-reclaim-pin
+                      component/host-borrow-retained-across-pending-pin
                       component/lock-order-no-scheduler-held-across-store-right-pin
                       component/store-teardown-runs-with-right-held-pin)))          wasmdown.test::*tests*)))
     (multiple-value-bind (passed failed)
@@ -6522,7 +7029,38 @@ THE LOCK ORDER rule (b): those are RIGHT acquisitions, and a held
       ;; a list in the err arm keeps the pointer+length join
       (let* ((lst (c :list (cons (c :prim :u8) nil)))
              (r (c :result (cons (c :prim :u32) lst))))
-        (is (equal '(0 3 0) (lower (cons :ok 3) r)))))))
+        (is (equal '(0 3 0) (lower (cons :ok 3) r))))
+      ;; AUDIT (2026-11-02): the former residual note said a compound
+      ;; OUTER result could lose its top-level discriminant. No
+      ;; reproducer exists against this tree: the :result arm lowers to
+      ;; variant("ok","error") and the join always leads with the
+      ;; discriminant. These shapes pin that contract explicitly.
+      (let* ((empty (c :record (vector)))
+             (r (c :result (cons empty empty))))
+        (is (equal '(0) (lower (cons :ok nil) r)))
+        (is (equal '(1) (lower (cons :err nil) r))))
+      (let* ((t1 (c :tuple (vector (c :prim :u32))))
+             (t2 (c :tuple (vector (c :prim :u32) (c :prim :u32))))
+             (r (c :result (cons t1 t2))))
+        (is (equal '(0 5 0) (lower (cons :ok (list 5)) r)))
+        (is (equal '(1 6 7) (lower (cons :err (list 6 7)) r))))
+      (let* ((var (c :variant
+                     (vector (cons "a" (c :prim :u32))
+                             (cons "b" (c :record
+                                           (vector (cons "x" (c :prim :u32))
+                                                   (cons "y" (c :prim :u32))))))))
+             (r (c :result (cons var (c :prim :u32)))))
+        (is (equal '(0 0 5 0) (lower (cons :ok (cons "a" 5)) r)))
+        (is (equal '(0 1 6 7)
+                   (lower (cons :ok (cons "b" (list (cons "x" 6)
+                                                     (cons "y" 7))))
+                          r)))
+        (is (equal '(1 8 0 0) (lower (cons :err 8) r))))
+      (let* ((o (c :option (c :prim :u32)))
+             (r (c :result (cons o o))))
+        (is (equal '(0 1 3) (lower (cons :ok (cons :some 3)) r)))
+        (is (equal '(0 0 0) (lower (cons :ok :none) r)))
+        (is (equal '(1 1 4) (lower (cons :err (cons :some 4)) r)))))))
 
 (test component/abi-bare-variant-label
   ;; A bare label is the native providers' shorthand for a PAYLOAD-LESS

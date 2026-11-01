@@ -16,7 +16,7 @@ links are generated.
 | WASI 0.2 behaviour lane (11 cases) | 11/11 pass | 11/11 pass (11 x ~200 s compile wall time). Each case's manifest entry asserts exact stdout bytes and exact status, so both backends satisfy the SAME byte-level expectations — stronger than a post-hoc sha diff. Per-case records live under `tests/wasi-results/` (`latest/` for interpret, the compiled run's `--output-dir`), distinguished by the `backend` field | `tools/run-wasi-suite.py --abi preview2 [--backend compiled]` |
 | WASI 0.3.2 providers | unit/provider pins, component async suite | same providers; component suite green under `:compiled` | [`inventory.md`](inventory.md), `tests/wasi*.lisp` |
 | 0.3.2 sockets provider (internal composition only) | unit pins incl. `wasi/e2e-tcp-echo-component` PASS | same test binary, host listener + echo thread | `make test-unit`; `tests/wasi.lisp` |
-| Pinned 0.3.2 guests (hand-authored) | 7/7 pass ×3 repeats (21/21): no-import success smoke, a `wasi:cli/exit@0.3.2` importer (exit 7), a `wasi:clocks/monotonic-clock@0.3.2` importer (monotonic `now()`), a resume-safe async command (callback `task.return`), a `write-via-stream` stdout command (`hi`), a cancelled-subtask command, and a `wasi:random/random@0.3.2` guest (`insecure`/`insecure-seed`: exact 16-byte lengths, differing secure reads, `u64`/seed calls; `realloc`-lowered lists) | 7/7 pass, same cases and repeats (21/21); the nested core runs compiled (`backend-entry-count`) | `make test-wasi-preview3`, `tools/build-p3-fixtures.lisp`, `wasi/command-component-runs-the-selected-backend` |
+| Pinned 0.3.2 guests (hand-authored) | 10/10 pass ×3 repeats (30/30): no-import success smoke, a `wasi:cli/exit@0.3.2` importer (exit 7), a `wasi:clocks/monotonic-clock@0.3.2` importer (monotonic `now()`), a resume-safe async command (callback `task.return`), a `write-via-stream` stdout command (`hi`), a cancelled-subtask command, a `wasi:random/random@0.3.2` guest (`insecure`/`insecure-seed`: exact 16-byte lengths, differing secure reads, `u64`/seed calls; `realloc`-lowered lists), a clock-deadline guest (`wait-for` 200 ms completes through the CLI reactor; the 200 ms bound is the liveness-oracle regression proof), a `wasi:cli/{stdin,environment,stderr,terminal-stdout}@0.3.2` guest (argv[0]/marker, `--env` pair, option-typed initial cwd, `terminal-stdout` = `none` on a non-tty, real stdin `stdin-probe\n` with explicit DROPPED EOF and an ok paired future, stderr through `write-via-stream`), and a `wasi:filesystem/{types,preopens}@0.3.2` guest (`/work` preopen, async `open-at` of seeded `hello.txt`, exactly 17 bytes through `read-via-stream`+`stream.read`, missing path = err `no-entry`, every handle dropped) | 10/10 pass, same cases and repeats (30/30); the nested core runs compiled (`backend-entry-count`) | `make test-wasi-preview3`, `tools/build-p3-fixtures.lisp`, `wasi/command-component-runs-the-selected-backend`, `wasi/reactor-pending-deadline-p` |
 
 Network communication (TCP, UDP and DNS) is **excluded from the declared
 support profile**: the sockets row above is an internal-composition pin for
@@ -69,6 +69,107 @@ summary lists every distinct tested commit, so a lagging row (typically the
 ~37 min compiled P2 lane) is visible rather than averaged away. P1 is
 stdout-only and is listed as `n/a` with `make verify` named as its gate.
 
+## Resolved
+
+- **Resume-safe async P3 guest.** The lane pins resume-safe commands:
+  `p3/async-callback` keeps continuation state in memory, `p3/stream-stdout`
+  parks the future read and waits on real events, and `p3/deadline-wait`
+  parks on a reactor deadline. The four-instruction fixture in
+  `tests/wasi.lisp` remains non-resume-safe and is retained only as the
+  in-process `run-component` case (recorded in `docs/status.md`).
+  `tools/run-wasi-suite.py --abi preview3` selects the 0.3.2 ABI explicitly
+  and FAILS on a missing fixture (never skips); `--abi all` covers the two
+  released ABIs only.
+- **`values/post-return.wast`** is no longer excluded: post-return isolation
+  is implemented, the file passes 71/71, and the component lane denominator
+  moved from 1,631 to 1,702 commands.
+- **Deadline completion, cli stdio/env/stderr/terminal, and the filesystem read+write paths.**
+  `p3/deadline-wait` (200 ms `wait-for`, and the liveness-oracle fix that
+  lets an armed reactor deadline count as possible progress while a bare
+  fd-readiness watch does not), `p3/cli-stdin-env-stderr-terminal` (argv/env/
+  initial-cwd, `terminal-stdout`, real stdin `stdin-probe\n` with the
+  explicit DROPPED EOF and an ok paired future, stderr `write-via-stream`)
+  and `p3/filesystem-preopens-read` (the `/work` preopen, async `open-at` of
+  the seeded `hello.txt`, exactly 17 bytes through `read-via-stream` +
+  `stream.read`, a missing path as err `no-entry`, every handle dropped)
+  joined the P3 lane, now 10/10 ×3 per backend. The filesystem guest also
+  exercises `write-via-stream`/`append-via-stream` at explicit offsets
+  (including zero-fill extension), parked write futures, `stat`
+  (regular-file, link-count 1, size 22), a same-descriptor read-back and a
+  host-side file-contents witness. The deadline and cli rows are closed; the
+  filesystem row stays partial for directory operations, write-side error
+  paths and advanced metadata/time calls.
+- **Nested `option<stream<u8>>` payload ownership (2026-11-02).** `%abi-load`
+  implements the loading spec's `stream`/`future` rows through
+  `%lift-async-end`: a memory slot indexes the **loading (caller) instance's**
+  table, the readable end is removed from that table with owner and index
+  cleared, and the source slot is freed for reuse — a second load of the same
+  index traps as stale. `%lift-async-end` enforces `lift_async_value`'s
+  guards: readable class must match the valtype, element type must match
+  through `%abi-type-key` (both type spaces resolved; own/borrow compare class
+  only, because resource indices are alias-projected), and owner+index are
+  both cleared. The async result-store context carries `:type-inst`, the
+  **provider's** type space, so a nested `(:idx . n)` resolves there instead
+  of the caller's space (measured with a colliding `u32` at caller index 0).
+  Pinned by `component/indirect-async-payload-ownership-pin` — a
+  forced-indirect sync host lower at 18 flat slots, async
+  `option<stream<u8>>` results with colliding type indices, `none` allocating
+  nothing, and stale/class/element/writable/non-idle/waitable-set traps — and
+  by `component/generic-path-five-cases-pin` CASE 2, migrated to the
+  end-object contract (the second load traps). Negative controls showed both
+  the load arm and the guard set are load-bearing. Unit 693/0, component
+  1,702/0, P3 10/10 ×3 per backend.
+- **Host borrow reclamation and store-retirement metadata (2026-11-02).**
+  A host callee has no Task to adopt the borrow handles a lowering staged, so
+  the staged records were dropped and their slots leaked. Each staged handle
+  is now a `pending-borrow` record (owner table, 1-based slot, handle)
+  reclaimed exactly once: on the immediate return and on a trap, and across a
+  HOST-PENDING only at the pending's terminal outcome (resolve, reject, or an
+  acknowledged cancel — an un-acknowledged cancel keeps the borrow live).
+  Reclamation clears a slot only while it still holds the same record, so a
+  reused slot is never disturbed. `%handle-add` uses the shared Table free
+  list, so repeated new/drop cycles plateau, and `%store-teardown` clears
+  `resource-dtor-table`, `ct-defining-inst` and `comp-closure` for the store
+  it names and the bound store, because every store-lifecycle caller discards
+  the store afterwards. Pinned by `component/host-borrow-reclaim-pin`,
+  `component/host-borrow-retained-across-pending-pin`,
+  `component/store-metadata-retires-with-store-pin` and
+  `component/resource-metadata-live-graph-isolation-pin` (warm-up plus four
+  instantiate→new/drop→teardown cycles give identical metadata counts; six
+  destructor runs leave capacity 2 and free list 2; a second live handle of
+  the same type keeps the dtor registered; two live stores never strip each
+  other's provenance), plus `wasi/fs-descriptor-drop-fd-plateau-pin` (six
+  open→stream→drop→stream-end cycles at baseline open-fd count). The
+  `component/generic-path-five-cases-pin` CASE 3c/B now asserts the freed
+  slot is empty and back on the free list instead of encoding the leak.
+  Residual limits are recorded in `docs/status.md` and §9.3: teardown-based
+  reclaim means a caller-owned store reused for many top-level instantiations
+  without teardown still accumulates dtor/provenance rows; scheduler-state
+  teardown still targets the bound store; non-terminal host pendings are not
+  force-reclaimed; freed slots are class-polymorphic and the class guards
+  trap.
+- **Compound error-result lowering (2026-11-02) — audited, no discrepancy.**
+  No reproducer exists against this tree: `%abi-lower`'s `:result` arm lowers
+  to `variant(ok, error)` with the discriminant leading the join.
+  `component/abi-compound-result-lowering` was extended with four shapes —
+  both arms empty records, mixed-arity tuples, a variant carrying a record,
+  and `option`/`option` — and passes unchanged. **No lowering code was
+  changed**; this row was withdrawn as a defect. Per-case validator limits
+  remain a separate open item below.
+
+## Still open
+
+- **Filesystem directory and advanced paths.** The P3 filesystem guest now
+  covers preopens/open/read/write/append/offsets/stat/error (including a
+  host-side byte witness); directory operations, write-side error paths and
+  advanced metadata/time calls remain uncovered.
+- **Per-case validator limits.** Imported-instance functypes with outer
+  compound refs are rejected by the text/validator front end; individual
+  cases are tracked per fixture, not as a blanket WIT gap and not as an
+  ABI-lowering defect.
+- **Blocked-stdio executor audit** and upstream toolchain/suite evidence (see
+  Blocked below).
+
 ## Blocked
 
 - **A real-toolchain WASI 0.3.2 guest.** The lane runs a hand-authored
@@ -76,15 +177,3 @@ stdout-only and is listed as `n/a` with `make verify` named as its gate.
   (`tools/build-p3-fixtures.lisp`, bytes pinned by `P3-CHECKSUMS`); no
   toolchain emits the 0.3.2 component ABI here, so this is ABI coverage, not
   real-toolchain integration evidence.
-- **Resume-safe async P3 guest.** The importing guest above is synchronous;
-  a stateful async command (continuation state in memory, one-shot side
-  effects across reactor wakes) is not pinned yet. The tiny stdout fixture in
-  `tests/wasi.lisp` keeps no resume state, so a callback re-invocation
-  re-emits its output — a fixture limitation, recorded in `docs/status.md`. The fixture is exercised at the `run-component` level
-  and the P3 CLI lane uses the sync command.
-  `tools/run-wasi-suite.py --abi preview3` selects that ABI explicitly and
-  FAILS on the missing fixture (never skips); `--abi all` covers the two
-  released ABIs only.
-- **`values/post-return.wast`** is no longer excluded: post-return isolation
-  is implemented, the file passes 71/71, and the component lane denominator
-  moved from 1,631 to 1,702 commands.

@@ -47,7 +47,7 @@ Every host import receives an explicitly built authority object — a
 | Guest arguments | tokens after `--` | `:arguments` (first is `argv[0]`) |
 | Standard streams | implied by `--wasi` | `:stdin` `:stdout` `:stderr` (NIL = withdrawn) |
 | Network (TCP/UDP/DNS) | **Refused:** `--net`, `--listen` and `--dns` are usage errors (exit 2) | **No guest surface.** `make-wasi-network` / `:listen` / `:dns` exist only for the internal 0.3.2 composition; a component-declared `wasi:sockets` import is a link error |
-| Reactor | none | `:reactor` |
+| Reactor | built by `--wasi` (serves clock deadlines and stream readiness) | `:reactor` |
 
 A preopen's authority is the permission set the embedder granted —
 `"read"`, `"write"`, `"mutate-directory"` — from which the guest's
@@ -61,10 +61,10 @@ dispatch is by the `@0.3.2` suffix of the import name.
 
 | Package | Delivered |
 | --- | --- |
-| `wasi:clocks` | `monotonic-clock` `now` / `get-resolution`, `system-clock` `now` / `get-resolution`, `types.duration`. The async `wait-until` / `wait-for` park on the context's reactor. `clocks-timezone` is `@unstable` and is refused at link time (see “Stability gating”). |
+| `wasi:clocks` | `monotonic-clock` `now` / `get-resolution`, `system-clock` `now` / `get-resolution`, `types.duration`. The async `wait-until` / `wait-for` park on the context's reactor; the CLI builds that reactor itself (`--wasi`), so a parked deadline **completion** is servable through the CLI — `p3/deadline-wait` proves a 200 ms `wait-for` returns only after the requested time. An embedder that supplies `:reactor` gets the same behaviour. `clocks-timezone` is `@unstable` and is refused at link time (see “Stability gating”). |
 | `wasi:random` | `get-random-bytes`, `get-random-u64`, and the insecure `get-insecure-random-bytes` / `-u64` / `get-insecure-seed` — all from OS entropy, never the Lisp RNG. Zero-length requests return an empty list; a single request is capped at 1 MiB. |
-| `wasi:cli` | `environment` (`get-environment`, `get-arguments`, `get-initial-cwd`), `exit` (`exit`, `exit-with-code` via the `wasi-exit` condition), `stdin`/`stdout`/`stderr` as real streams, the `terminal-*` interfaces (`isatty` answers `some` or `none`, never a fabricated handle), and the command world's `run`. |
-| `wasi:filesystem` | The `descriptor` resource (own/borrow, destructors, non-owning preopens), all non-stream descriptor methods with the errno → `error-code` table, `preopens.get-directories`, `read-via-stream` / `write-via-stream` / `append-via-stream` / `read-directory`, and flag gating that reports `not-permitted` / `read-only` through the interface's `result` rather than throwing. |
+| `wasi:cli` | `environment` (`get-environment`, `get-arguments`, `get-initial-cwd`, lowered as `list<string>`/`list<tuple<string,string>>` through guest memory + `realloc`), `exit` (`exit`, `exit-with-code` via the `wasi-exit` condition), `stdin`/`stdout`/`stderr` as real streams, the `terminal-*` interfaces (`isatty` answers `some` or `none`, never a fabricated handle), and the command world's `run`. Guest evidence: `p3/cli-stdin-env-stderr-terminal` asserts argv[0] and an extra argument, a `--env` pair and the option-typed initial cwd, sees `terminal-stdout` as `none` on a captured (non-tty) stdout, reads real stdin (`stdin-probe\n`) through `read-via-stream` requiring the explicit DROPPED EOF result and an ok paired future, and writes to stderr through `write-via-stream`; `p3/import-exit` covers `exit`, `p3/stream-stdout` covers stdout. |
+| `wasi:filesystem` | The `descriptor` resource (own/borrow, destructors, non-owning preopens), all non-stream descriptor methods with the errno → `error-code` table, `preopens.get-directories`, `read-via-stream` / `write-via-stream` / `append-via-stream` / `read-directory`, and flag gating that reports `not-permitted` / `read-only` through the interface's `result` rather than throwing. Guest evidence: `p3/filesystem-preopens-read` lists a `/work` preopen, opens a seeded `hello.txt` through it with an async `open-at` (waited as a subtask), reads exactly 17 bytes with `read-via-stream` + `stream.read`, gets `error-code::no-entry` as an err result (not a trap) for a missing path, and drops every handle. Write-via-stream, offsets, metadata and directory operations are provider/unit-tested but not yet guest-evidenced. |
 | `wasi:sockets` | **Unsupported by design — not an implementation gap, not planned.** TCP, UDP and DNS are excluded permanently by user decision (2026-11-02); there is no guest-visible socket or DNS provider. The vendored `specs/wasi/wasi-wit-0.3.2/sockets/sockets.wit` is reference data only. The pinned `wasi:cli/command` world imports `wasi:sockets/types@0.3.2` and `wasi:sockets/ip-name-lookup@0.3.2` itself, so a 0.3.2 sockets provider is retained internally for that composition only; guests cannot reach it. Imports are rejected at link time with the exact message below. See [`../../specs/wasi/MANIFEST.md`](../../specs/wasi/MANIFEST.md) § “Network communication: `wasi:sockets` (excluded)”. |
 | `wasi:http` | **Unsupported by design — not an implementation gap, not planned.** Excluded permanently by user decision (2026-11-02); removed in M17 and recoverable from git history. There is no provider and no transport option. The vendored `specs/wasi/wasi-wit-0.3.2/http/*.wit` files remain reference data only. Imports are rejected at link time with the exact message below. See [`../../specs/wasi/MANIFEST.md`](../../specs/wasi/MANIFEST.md) § “Unsupported by design (not pending)”. |
 
@@ -92,7 +92,13 @@ Network communication is not a missing interface and not planned. TCP, UDP
 and DNS are permanently out of scope, as are the CLI network options.
 
 Coverage is enforced at construction: an unimplemented function of a
-bound interface is a `host-error`, never a trapping stub.
+bound interface is a `host-error`, never a trapping stub. Provider values are
+native Lisp shapes: a payload-less variant case is a bare label (for example
+`"no-entry"`), while a payload-bearing case must be tagged
+`(label . payload)`. A bare label for a payload-bearing case is a
+`host-error` (`a bare variant label (...) names a case with a payload; pass
+(label . payload)`), never a discriminant-only half-value; pinned by
+`component/abi-bare-variant-label`.
 
 ### Stability gating
 
@@ -115,9 +121,10 @@ not a declared guest import and is not gated by this check.
 
 | Limit | Effect |
 | --- | --- |
-| No reactor in the default context | The CLI builds no reactor, so `clocks.wait-until` / `wait-for` signal `host-error`. An embedder that supplies `:reactor` gets both. |
+| Reactor liveness | The CLI builds a reactor, so `clocks.wait-until` / `wait-for` complete there instead of signalling `host-error`; an embedder may supply `:reactor` directly. An armed one-shot deadline counts as possible progress for the drain oracle, but a bare fd-readiness watch does not — a peer may never become ready — so readiness alone is not a liveness guarantee. Genuine deadlocks still trap. |
 | `@unstable` gating | Enforced at link time on the 0.3 path: a declared import of a gated interface whose feature is not enabled is a link error naming the import and the feature (see “Stability gating”). No CLI flag enables a feature, so unstable interfaces stay outside the selected profile. |
 | `proc_raise` (Preview 1) | A valid signal returns `errno::notsup`; an invalid one `errno::inval`. The hosting SBCL process is never signalled. |
+| Resource lifetime | Descriptor fds are reference-counted (the handle plus every stream it handed out) and close exactly once at zero references; six open/drop cycles keep the process open-fd count at baseline. A host-called lower's temporary borrow handle is reclaimed when the call finishes (or at a host-pending's terminal outcome), and freed table slots are reused. Component graph metadata (destructor and provenance tables) retires when the owning store is torn down; a long-lived caller-owned store reused for many top-level instantiations **without** teardown still accumulates those rows. |
 
 ## WASI Preview 1
 
