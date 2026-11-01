@@ -101,7 +101,10 @@
            ;; the store's state accessors an embedder/test reads
            #:component-store-threads
            #:component-store-right-ticket
-           #:component-store-right-owner))
+           #:component-store-right-owner
+           ;; the drain oracle's LIVENESS query on the store's reactor
+           ;; (the WASI backend specializes it; see %reactor-step)
+           #:%reactor-pending-deadline-p))
 (in-package #:wasmdown.component.runtime)
 
 ;;; SB-INTROSPECT is an SBCL contrib (not third-party): the sink-arity
@@ -4426,6 +4429,22 @@ Returns (values PROGRESS-P PENDING-P)."))
              :message "no reactor backend is loaded for this store"))
     (funcall fn reactor max-wait-ns)))
 
+;;; THE REACTOR DEADLINE-READINESS PROTOCOL (the drain oracle's
+;;; liveness input). A store's reactor knows registrations the driver
+;;; cannot see; the ONE question the drain oracle may ask is whether
+;;; an armed ONE-SHOT TIMER guarantees a future event. The WASI
+;;; backend specializes this on its reactor record; every other
+;;; reactor (a scripted test double) answers NIL, i.e. the old
+;;; no-future-progress behaviour, exactly as for a drain-only store.
+(defgeneric %reactor-pending-deadline-p (reactor)
+  (:documentation "T when REACTOR holds at least one ARMED, not yet
+fired one-shot deadline registration: the clock alone will make it
+due, so a store parked only on it can make progress later. Readiness
+watches are deliberately NOT part of this question — a socket may
+never become ready, so counting one would turn a genuine hang into an
+infinite wait.")
+  (:method (reactor) (declare (ignore reactor)) nil))
+
 (defconstant +store-tick-max-wait-ns+ 1000000
   "The tick's reactor budget: 1 ms. Bounded work per boundary, and
 the reactor clamps it further to the earliest deadline.")
@@ -4442,6 +4461,26 @@ lock-free; only the mutation needs the lock)."
   "The tick's GATE: does STORE have queued events or a live host
 pending? ONE word-sized slot read, no lock."
   (and store (plusp (host-store-work store))))
+
+(defun %host-store-future-progress-p (store)
+  "Can STORE still make progress with NO host event arriving from
+outside — i.e. is the next bounded store tick guaranteed to run a
+reactor callback? True exactly when the store has host work pending
+(so %STORE-TICK will actually pump) AND its reactor holds an armed
+one-shot DEADLINE. Time alone makes such a registration due; the
+pending's own host-work unit keeps the store's tick gate open until it
+fires, so the two conditions hold together for a clock wait.
+
+THE DRAIN ORACLE USES THIS (see %CANON-LIFT-ASYNC): a quiescent slice
+while this is true is NOT quiescence — the timer's expiry is the
+pending event. FD-readiness watches are excluded by design: readiness
+may never arrive, and counting it would let a genuinely deadlocked
+task wait forever."
+  (let ((reactor (and store (host-store-reactor store))))
+    (and reactor
+         (%host-store-work-pending-p store)
+         (%reactor-pending-deadline-p reactor)
+         t)))
 
 (defun %host-enqueue (thunk &optional store)
   "Queue THUNK on STORE (default: the current store, else the global
@@ -8108,9 +8147,26 @@ drop-readable must return index 1 again)."
                     ;; no progress is a quiescent cycle (the deadlock
                     ;; fixtures' oracle); a cycle with NO tick spent
                     ;; cannot judge progress (the guest is mid-turn).
+                    ;;
+                    ;; THE ARMED-TIMER EXCEPTION (§the CLI reactor):
+                    ;; a slice with no progress is also NOT quiescent
+                    ;; while the store's reactor holds an armed
+                    ;; one-shot DEADLINE — time alone will make that
+                    ;; registration due, and the very next store tick
+                    ;; (the poll boundary just completed) fires it and
+                    ;; queues the pending's resolution. A guest parked
+                    ;; in `wasi:clocks` `wait-for' longer than the
+                    ;; idle budget is therefore live work, not a
+                    ;; deadlock: the CLI's reactor makes the wait
+                    ;; servable later. Readiness watches do NOT get
+                    ;; this reprieve (%HOST-STORE-FUTURE-PROGRESS-P):
+                    ;; a socket may never become ready, so a pure fd
+                    ;; watch still trips the trap exactly as before.
                     (if (> (component-store-async-progress (%cs)) before)
                         (setf idle-cycles 0)
-                        (if spent
+                        (if (and spent
+                                 (not (%host-store-future-progress-p
+                                       (%cs))))
                             (incf idle-cycles)
                             (setf idle-cycles 0))))
              ;; THE DEADLOCK TRAP (§3539-3542): enough consecutive

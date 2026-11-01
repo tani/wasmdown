@@ -604,5 +604,8 @@
    #:reactor-step
    #:reactor-watch-fd
    #:reactor-watch-deadline
+   ;; the drain oracle's liveness query: is at least one one-shot
+   ;; deadline armed (future progress) on this reactor?
+   #:reactor-pending-deadline-p
    #:reactor-close
    #:reactor-wake))

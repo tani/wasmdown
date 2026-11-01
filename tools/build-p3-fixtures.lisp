@@ -22,12 +22,20 @@
 ;;;;                          list-returning funcs with (memory ...) and
 ;;;;                          (realloc ...), and traps unless two 16-byte
 ;;;;                          reads have exact lengths and differ
-;;;;   p3-deadline-guest.wasm lowers the clock's async wait-for (50 ms),
+;;;;   p3-deadline-guest.wasm lowers the clock's async wait-for (200 ms),
 ;;;;                          joins the subtask into a waitable set and
 ;;;;                          returns WAIT; the reactor's callback loop
 ;;;;                          parks until the deadline fires, and the
 ;;;;                          resumed callback traps unless the subtask
-;;;;                          returned after at least 50 ms of clock time
+;;;;                          returned after at least 200 ms of clock time
+;;;;                          (the bound also proves the drain oracle no
+;;;;                          longer calls an armed timer a deadlock)
+;;;;   p3-cli-guest.wasm      imports wasi:cli/{environment,stderr,
+;;;;                          terminal-stdout}@0.3.2; asserts argv[0]/
+;;;;                          marker, a --env pair, option-typed
+;;;;                          get-initial-cwd and terminal-stdout none,
+;;;;                          then writes a fixed message to stderr
+;;;;                          through write-via-stream
 ;;;;
 ;;;; The importing guest is the provider-importing evidence the no-import
 ;;;; smoke cannot give: the runner composes the provider from the
@@ -649,19 +657,23 @@
 ;;; the task (wait_from_callback) until the deadline fires and the
 ;;; subtask resolves RETURNED; the resumed callback requires the
 ;;; event to be SUBTASK(1)/RETURNED(2) of ITS subtask, reads `now`
-;;; again and traps unless t1 - t0 >= the 50 ms it asked for. A
+;;; again and traps unless t1 - t0 >= the 200 ms it asked for. A
 ;;; wait that completes early is a trap, never a pass.
 ;;;
 ;;; No memory is needed: the WAIT protocol hands the event to the
 ;;; callback as core arguments (the event STORE belongs only to a
 ;;; guest-called waitable-set.wait, which this guest never makes).
 ;;;
-;;; 50 ms keeps the fixture quick AND deterministic: the async lift's
-;;; CLI caller drain declares a deadlock after 50 quiescent 2 ms poll
-;;; slices (~100 ms without progress), so a longer park would trip
-;;; that trap instead of observing the deadline (measured: 100 ms
-;;; passes, 150 ms deadlock-traps). The elapsed check only requires
-;;; >= 50 ms, so an overshoot (a loaded machine) still passes.
+;;; THE 200 ms BOUND IS THE LIVENESS PROOF: the async lift's CLI
+;;; caller drain once declared a deadlock after 50 quiescent ~2 ms
+;;; poll slices (~117 ms without progress), so a park longer than
+;;; that tripped the oracle instead of observing the deadline
+;;; (measured before the fix: 100 ms passed, 150 ms deadlock-trapped).
+;;; The oracle now treats an ARMED reactor deadline as future
+;;; progress, so the fixture asks for 200 ms deliberately: comfortably
+;;; past the old 50-cycle budget, yet short enough to keep the lane
+;;; fast. The elapsed check only requires >= 200 ms, so an overshoot
+;;; (a loaded machine) still passes.
 (defparameter *p3-deadline-text*
   (format nil "~{~a~%~}"
           (list
@@ -703,8 +715,8 @@
    "      (if (i32.eqz (local.get $code))"
    "          (then"
    "            (global.set $t0 (call $now))"
-   "            (local.set $p (call $waitfor (i64.const 50000000)))"
-   ;; a 50 ms wait must still be pending: STARTING(0) or STARTED(1);
+   "            (local.set $p (call $waitfor (i64.const 200000000)))"
+   ;; a 200 ms wait must still be pending: STARTING(0) or STARTED(1);
    ;; RETURNED(2) or a cancelled state is a premature completion
    "            (if (i32.gt_u (i32.and (local.get $p) (i32.const 15))"
    "                          (i32.const 1))"
@@ -723,7 +735,7 @@
    "      (if (i32.ne (local.get $si) (global.get $sub)) (then unreachable))"
    "      (local.set $t1 (call $now))"
    "      (if (i64.lt_u (i64.sub (local.get $t1) (global.get $t0))"
-   "                    (i64.const 50000000))"
+   "                    (i64.const 200000000))"
    "          (then unreachable))"
    "      (call $join (global.get $sub) (i32.const 0))"
    "      (call $subdrop (global.get $sub))"
@@ -752,15 +764,326 @@
   (component-encode:encode-component
    (wasmdown.component.text::parse-component-text *p3-deadline-text*)))
 
+;;; ---------------------------------------------------------------
+;;; Fixture 9: the CLI consumer surface — environment, stderr and the
+;;; terminal authority (docs/design/PLAN.md §9.3's CLI guest coverage
+;;; row, which only had exit/stdout).
+;;;
+;;; Imports (exact `cli.wit' @0.3.2 signatures, specs/wasi/
+;;; wasi-wit-0.3.2/cli/cli.wit):
+;;;
+;;;   wasi:cli/environment@0.3.2
+;;;     get-environment:  func() -> list<tuple<string, string>>
+;;;     get-arguments:    func() -> list<string>
+;;;     get-initial-cwd:  func() -> option<string>
+;;;   wasi:cli/stderr@0.3.2
+;;;     write-via-stream: func(data: stream<u8>)
+;;;                             -> future<result<_, error-code>>
+;;;   wasi:cli/terminal-stdout@0.3.2
+;;;     get-terminal-stdout: func() -> option<terminal-output>
+;;;
+;;; Canonical LOWER signatures (CanonicalABI flatten, MAX_FLAT_RESULTS
+;;; = 1 — the trailing i32 is the caller's retptr; the host stores the
+;;; result there and allocates through the (realloc ...) bump):
+;;;
+;;;   get-environment      core (param i32)     ; retptr -> (ptr,len)
+;;;   get-arguments        core (param i32)
+;;;   get-initial-cwd      core (param i32)     ; retptr -> option<string>
+;;;                                              ; (disc u8 @0, ptr @4, len @8)
+;;;   get-terminal-stdout  core (param i32)     ; retptr -> option<own<..>>
+;;;                                              ; (disc u8 @0, handle @4)
+;;;   write-via-stream     core (param i32) (result i32)   ; one flat result
+;;;
+;;; The guest (run lifted async with a callback) asserts, and TRAPS on
+;;; any failure, that: argv has >= 2 entries, argv[0] equals the value
+;;; of WMD_EXPECT_ARGV0 (the fixture path the CLI supplied), argv[1]
+;;; is the literal "wmd-cli-marker", the environment carries
+;;; WMD_ENV_PROBE=env-probe-value, get-initial-cwd is an option (none
+;;; or a non-empty string), get-terminal-stdout is an option and — in
+;;; the captured (non-tty) lane, signalled by WMD_EXPECT_TERMINAL=none
+;;; — is `none'. It then writes the fixed message
+;;; "p3-cli-guest: stderr probe" through stderr's write-via-stream in
+;;; the canonical future order (async future.read parks the read, the
+;;; write is staged, the writable end is dropped, waitable-set.wait
+;;; takes the future event). Success exits 0; every mismatch traps.
+;;;
+;;; The two string lists are read out of guest memory (list header
+;;; ptr@0,len@4 for <string>; ptr@0,len@4 then elements of 8 bytes;
+;;; list<tuple<string,string>> has 16-byte elements: name ptr/len then
+;;; value ptr/len) — the exact layouts the canonical ABI's store rules
+;;; give.
+
+(defparameter *p3-cli-text*
+  (format nil "~{~a~%~}"
+          (list
+           "(component"
+           "  (type $ec (enum \"io\" \"illegal-byte-sequence\" \"pipe\"))"
+           "  (type $ST (stream u8))"
+           "  (type $FT (future (result (error $ec))))"
+           "  (import \"wasi:cli/environment@0.3.2\""
+           "    (instance $env"
+           "      (export \"get-environment\" (func (result (list (tuple string string)))))"
+           "      (export \"get-arguments\" (func (result (list string))))"
+           "      (export \"get-initial-cwd\" (func (result (option string))))))"
+           "  (import \"wasi:cli/stderr@0.3.2\""
+           "    (instance $stderr"
+           "      (export \"write-via-stream\""
+           "        (func (param \"data\" (stream u8))"
+           "              (result (future (result (error $ec))))))))"
+           "  (import \"wasi:cli/terminal-stdout@0.3.2\""
+           "    (instance $ttyout"
+           "      (export \"terminal-output\" (type $termout (sub resource)))"
+           "      (export \"get-terminal-stdout\""
+           "        (func (result (option (own $termout)))))))"
+           "  (alias export $env \"get-environment\" (func $getenv))"
+           "  (alias export $env \"get-arguments\" (func $getargs))"
+           "  (alias export $env \"get-initial-cwd\" (func $getcwd))"
+           "  (alias export $stderr \"write-via-stream\" (func $wvs))"
+           "  (alias export $ttyout \"get-terminal-stdout\" (func $gettty))"
+           "  (core module $Mem"
+           "    (memory (export \"mem\") 1)"
+           "    (global $bump (mut i32) (i32.const 4096))"
+           "    (func (export \"realloc\") (param i32 i32 i32 i32) (result i32)"
+           "      (local $p i32)"
+           "      (local.set $p (global.get $bump))"
+           "      (global.set $bump"
+           "        (i32.and (i32.add (global.get $bump)"
+           "                          (i32.add (local.get 3) (i32.const 7)))"
+           "                 (i32.const -8)))"
+           "      (local.get $p)))"
+           "  (core instance $mem (instantiate $Mem))"
+           "  (core func $getenv-lowered"
+           "    (canon lower (func $getenv)"
+           "      (memory (core memory $mem \"mem\"))"
+           "      (realloc (core func $mem \"realloc\"))))"
+           "  (core func $getargs-lowered"
+           "    (canon lower (func $getargs)"
+           "      (memory (core memory $mem \"mem\"))"
+           "      (realloc (core func $mem \"realloc\"))))"
+           "  (core func $getcwd-lowered"
+           "    (canon lower (func $getcwd)"
+           "      (memory (core memory $mem \"mem\"))"
+           "      (realloc (core func $mem \"realloc\"))))"
+           "  (core func $wvs-lowered"
+           "    (canon lower (func $wvs)"
+           "      (memory (core memory $mem \"mem\"))"
+           "      (realloc (core func $mem \"realloc\"))))"
+           "  (core func $gettty-lowered"
+           "    (canon lower (func $gettty)"
+           "      (memory (core memory $mem \"mem\"))"
+           "      (realloc (core func $mem \"realloc\"))))"
+           "  (canon task.return (result (result)) (core func $tr))"
+           "  (canon stream.new $ST (core func $snew))"
+           "  (canon stream.write $ST async (memory (core memory $mem \"mem\")) (core func $swrite))"
+           "  (canon stream.drop-writable $ST (core func $sdropw))"
+           "  (canon future.read $FT async (memory (core memory $mem \"mem\")) (core func $fread))"
+           "  (canon waitable-set.new (core func $wsnew))"
+           "  (canon waitable.join (core func $wjoin))"
+           "  (canon waitable-set.wait (memory (core memory $mem \"mem\")) (core func $wswait))"
+           "  (core module $M"
+           "    (import \"env\" \"mem\" (memory 1))"
+           "    (import \"env\" \"get-environment\" (func $getenv (param i32)))"
+           "    (import \"env\" \"get-arguments\" (func $getargs (param i32)))"
+           "    (import \"env\" \"get-initial-cwd\" (func $getcwd (param i32)))"
+           "    (import \"env\" \"get-terminal-stdout\" (func $gettty (param i32)))"
+           "    (import \"env\" \"write-via-stream\" (func $wvs (param i32) (result i32)))"
+           "    (import \"env\" \"task.return\" (func $tr (param i32)))"
+           "    (import \"env\" \"stream.new\" (func $snew (result i64)))"
+           "    (import \"env\" \"stream.write\" (func $swrite (param i32 i32 i32) (result i32)))"
+           "    (import \"env\" \"stream.drop-writable\" (func $sdropw (param i32)))"
+           "    (import \"env\" \"future.read\" (func $fread (param i32 i32) (result i32)))"
+           "    (import \"env\" \"waitable-set.new\" (func $wsnew (result i32)))"
+           "    (import \"env\" \"waitable.join\" (func $wjoin (param i32 i32)))"
+           "    (import \"env\" \"waitable-set.wait\" (func $wswait (param i32 i32) (result i32)))"
+           "    (data (i32.const 64) \"wmd-cli-marker\")"
+           "    (data (i32.const 80) \"WMD_ENV_PROBE\")"
+           "    (data (i32.const 96) \"env-probe-value\")"
+           "    (data (i32.const 112) \"WMD_EXPECT_ARGV0\")"
+           "    (data (i32.const 128) \"WMD_EXPECT_TERMINAL\")"
+           "    (data (i32.const 148) \"none\")"
+           "    (data (i32.const 160) \"p3-cli-guest: stderr probe\\n\")"
+           "    (global $fut (mut i32) (i32.const 0))"
+           "    (global $readable (mut i32) (i32.const 0))"
+           "    (global $writable (mut i32) (i32.const 0))"
+           "    (global $set (mut i32) (i32.const 0))"
+           "    (global $state (mut i32) (i32.const 0))"
+           "    (type $cbty (func (param i32 i32 i32) (result i32)))"
+           "    (func $streq (param $a i32) (param $an i32) (param $b i32) (param $bn i32) (result i32)"
+           "      (local $i i32)"
+           "      (if (i32.ne (local.get $an) (local.get $bn)) (then (return (i32.const 0))))"
+           "      (block $done"
+           "        (loop $l"
+           "          (br_if $done (i32.ge_u (local.get $i) (local.get $an)))"
+           "          (if (i32.ne (i32.load8_u (i32.add (local.get $a) (local.get $i)))"
+           "                      (i32.load8_u (i32.add (local.get $b) (local.get $i))))"
+           "              (then (return (i32.const 0))))"
+           "          (local.set $i (i32.add (local.get $i) (i32.const 1)))"
+           "          (br $l)))"
+           "      (i32.const 1))"
+           "    (func $env-find (param $name i32) (param $nlen i32) (result i32)"
+           "      (local $base i32) (local $count i32) (local $i i32) (local $a i32)"
+           "      (call $getenv (i32.const 8))"
+           "      (local.set $base (i32.load (i32.const 8)))"
+           "      (local.set $count (i32.load (i32.const 12)))"
+           "      (block $done"
+           "        (loop $l"
+           "          (br_if $done (i32.ge_u (local.get $i) (local.get $count)))"
+           "          (local.set $a (i32.add (local.get $base)"
+           "                                 (i32.mul (local.get $i) (i32.const 16))))"
+           "          (if (call $streq (i32.load (local.get $a))"
+           "                           (i32.load (i32.add (local.get $a) (i32.const 4)))"
+           "                           (local.get $name) (local.get $nlen))"
+           "              (then"
+           "                (i32.store (i32.const 48) (i32.load (i32.add (local.get $a) (i32.const 8))))"
+           "                (i32.store (i32.const 52) (i32.load (i32.add (local.get $a) (i32.const 12))))"
+           "                (return (i32.const 1))))"
+           "          (local.set $i (i32.add (local.get $i) (i32.const 1)))"
+           "          (br $l)))"
+           "      (i32.const 0))"
+           "    (func (export \"run\") (result i32)"
+           "      (local $base i32) (local $count i32) (local $d i32)"
+           "      (call $getargs (i32.const 0))"
+           "      (local.set $base (i32.load (i32.const 0)))"
+           "      (local.set $count (i32.load (i32.const 4)))"
+           "      (if (i32.lt_u (local.get $count) (i32.const 2)) (then unreachable))"
+           "      (if (i32.eqz (call $env-find (i32.const 112) (i32.const 16)))"
+           "          (then unreachable))"
+           "      (if (i32.eqz (call $streq (i32.load (local.get $base))"
+           "                                (i32.load (i32.add (local.get $base) (i32.const 4)))"
+           "                                (i32.load (i32.const 48)) (i32.load (i32.const 52))))"
+           "          (then unreachable))"
+           "      (if (i32.eqz (call $streq (i32.load (i32.add (local.get $base) (i32.const 8)))"
+           "                                (i32.load (i32.add (local.get $base) (i32.const 12)))"
+           "                                (i32.const 64) (i32.const 14)))"
+           "          (then unreachable))"
+           "      (if (i32.eqz (call $env-find (i32.const 80) (i32.const 13)))"
+           "          (then unreachable))"
+           "      (if (i32.eqz (call $streq (i32.load (i32.const 48)) (i32.load (i32.const 52))"
+           "                                (i32.const 96) (i32.const 15)))"
+           "          (then unreachable))"
+           "      (call $getcwd (i32.const 16))"
+           "      (local.set $d (i32.load8_u (i32.const 16)))"
+           "      (if (i32.gt_u (local.get $d) (i32.const 1)) (then unreachable))"
+           "      (if (i32.eq (local.get $d) (i32.const 1))"
+           "          (then (if (i32.eqz (i32.load (i32.const 24))) (then unreachable))))"
+           "      (call $gettty (i32.const 32))"
+           "      (local.set $d (i32.load8_u (i32.const 32)))"
+           "      (if (i32.gt_u (local.get $d) (i32.const 1)) (then unreachable))"
+           "      (if (call $env-find (i32.const 128) (i32.const 19))"
+           "          (then"
+           "            (if (call $streq (i32.load (i32.const 48))"
+           "                             (i32.load (i32.const 52))"
+           "                             (i32.const 148) (i32.const 4))"
+           "                (then"
+           "                  (if (i32.ne (local.get $d) (i32.const 0))"
+           "                      (then unreachable))))))"
+           "      (i32.const 1))"
+           "    (func (export \"run-cb\") (type $cbty)"
+           "      (local $s i64) (local $ret i32)"
+           "      (block $done"
+           "        (block $st10"
+           "          (block $st20"
+           "            (br_table $done $st10 $st20"
+           "                      (i32.div_u (global.get $state) (i32.const 10))))"
+           "          (if (i32.ne (i32.const 0) (i32.load (i32.const 192)))"
+           "              (then unreachable))"
+           "          (call $tr (i32.const 0))"
+           "          (return (i32.const 0)))"
+           "        (call $sdropw (global.get $writable))"
+           "        (global.set $state (i32.const 20))"
+           "        (local.set $ret (call $wswait (global.get $set) (i32.const 224)))"
+           "        (if (i32.ne (local.get $ret) (i32.const 4)) (then unreachable))"
+           "        (if (i32.ne (i32.const 0) (i32.load (i32.const 192)))"
+           "            (then unreachable))"
+           "        (call $tr (i32.const 0))"
+           "        (return (i32.const 0)))"
+           "      (local.set $s (call $snew))"
+           "      (global.set $readable (i32.wrap_i64 (local.get $s)))"
+           "      (global.set $writable (i32.wrap_i64 (i64.shr_u (local.get $s) (i64.const 32))))"
+           "      (global.set $fut (call $wvs (global.get $readable)))"
+           "      (global.set $set (call $wsnew))"
+           "      (call $wjoin (global.get $fut) (global.get $set))"
+           "      (local.set $ret (call $fread (global.get $fut) (i32.const 192)))"
+           "      (if (i32.ne (local.get $ret) (i32.const -1)) (then unreachable))"
+           "      (local.set $ret (call $swrite (global.get $writable) (i32.const 160) (i32.const 27)))"
+           "      (if (i32.and (local.get $ret) (i32.const 15))"
+           "          (then"
+           "            (call $wjoin (global.get $writable) (global.get $set))"
+           "            (global.set $state (i32.const 10))"
+           "            (local.set $ret (call $wswait (global.get $set) (i32.const 224)))"
+           "            (if (i32.ne (local.get $ret) (i32.const 3)) (then unreachable))"
+           "            (call $sdropw (global.get $writable))"
+           "            (global.set $state (i32.const 20))"
+           "            (local.set $ret (call $wswait (global.get $set) (i32.const 224)))"
+           "            (if (i32.ne (local.get $ret) (i32.const 4)) (then unreachable))"
+           "            (if (i32.ne (i32.const 0) (i32.load (i32.const 192)))"
+           "                (then unreachable))"
+           "            (call $tr (i32.const 0))"
+           "            (return (i32.const 0))))"
+           "      (call $sdropw (global.get $writable))"
+           "      (global.set $state (i32.const 20))"
+           "      (local.set $ret (call $wswait (global.get $set) (i32.const 224)))"
+           "      (if (i32.ne (local.get $ret) (i32.const 4)) (then unreachable))"
+           "      (if (i32.ne (i32.const 0) (i32.load (i32.const 192)))"
+           "          (then unreachable))"
+           "      (call $tr (i32.const 0))"
+           "      (i32.const 0)))"
+           "  (core instance $m"
+           "    (instantiate $M"
+           "      (with \"env\""
+           "        (instance"
+           "          (export \"mem\" (memory $mem \"mem\"))"
+           "          (export \"get-environment\" (func $getenv-lowered))"
+           "          (export \"get-arguments\" (func $getargs-lowered))"
+           "          (export \"get-initial-cwd\" (func $getcwd-lowered))"
+           "          (export \"get-terminal-stdout\" (func $gettty-lowered))"
+           "          (export \"write-via-stream\" (func $wvs-lowered))"
+           "          (export \"task.return\" (func $tr))"
+           "          (export \"stream.new\" (func $snew))"
+           "          (export \"stream.write\" (func $swrite))"
+           "          (export \"stream.drop-writable\" (func $sdropw))"
+           "          (export \"future.read\" (func $fread))"
+           "          (export \"waitable-set.new\" (func $wsnew))"
+           "          (export \"waitable.join\" (func $wjoin))"
+           "          (export \"waitable-set.wait\" (func $wswait))))))"
+           "  (func $run (export \"run\") async (result (result))"
+           "    (canon lift (core func $m \"run\") async (callback (core func $m \"run-cb\"))))"
+           "  (instance $runiface (export \"run\" (func $run)))"
+           "  (export \"wasi:cli/run@0.3.2\" (instance $runiface)"
+           "    (instance (export \"run\" (func async (result (result)))))))"
+               )))
+
+(defun p3-cli-guest-bytes ()
+  (component-encode:encode-component
+   (wasmdown.component.text::parse-component-text *p3-cli-text*)))
+
+(defun p3-cli-context (path)
+  "The capability context the CLI-lane fixture asserts against: argv
+(the path the runner gave it as argv[0], plus the marker the suite
+passes) and the environment pairs the suite passes with --env."
+  (let ((argv0 (namestring path)))
+    (list :arguments (list argv0 "wmd-cli-marker")
+          :environment (list (cons "WMD_ENV_PROBE" "env-probe-value")
+                             (cons "WMD_EXPECT_ARGV0" argv0)
+                             (cons "WMD_EXPECT_TERMINAL" "none")))))
+
+;;; Each entry: NAME BUILDER EXPECTED-STATUS EXPECTED-STDOUT
+;;; EXPECTED-STDERR CONTEXT-FN (name -> a plist of WASI context
+;;; keyword arguments, or NIL for the plain fixtures).
+
 (defparameter *fixtures*
-  (list (list "p3-guest.wasm" #'p3-sync-guest-bytes 0 "")
-        (list "p3-import-guest.wasm" #'p3-import-guest-bytes 7 "")
-        (list "p3-clock-guest.wasm" #'p3-clock-guest-bytes 0 "")
-        (list "p3-async-guest.wasm" #'p3-async-guest-bytes 0 "")
-        (list "p3-stream-guest.wasm" #'p3-stream-guest-bytes 0 (format nil "hi~%"))
-        (list "p3-cancel-guest.wasm" #'p3-cancel-guest-bytes 0 "")
-        (list "p3-random-guest.wasm" #'p3-random-guest-bytes 0 "")
-        (list "p3-deadline-guest.wasm" #'p3-deadline-guest-bytes 0 "")))
+  (list (list "p3-guest.wasm" #'p3-sync-guest-bytes 0 "" "" nil)
+        (list "p3-import-guest.wasm" #'p3-import-guest-bytes 7 "" "" nil)
+        (list "p3-clock-guest.wasm" #'p3-clock-guest-bytes 0 "" "" nil)
+        (list "p3-async-guest.wasm" #'p3-async-guest-bytes 0 "" "" nil)
+        (list "p3-stream-guest.wasm" #'p3-stream-guest-bytes 0 (format nil "hi~%")
+              "" nil)
+        (list "p3-cancel-guest.wasm" #'p3-cancel-guest-bytes 0 "" "" nil)
+        (list "p3-random-guest.wasm" #'p3-random-guest-bytes 0 "" "" nil)
+        (list "p3-deadline-guest.wasm" #'p3-deadline-guest-bytes 0 "" "" nil)
+        (list "p3-cli-guest.wasm" #'p3-cli-guest-bytes 0 ""
+              (format nil "p3-cli-guest: stderr probe~%")
+              #'p3-cli-context)))
 
 ;;; ---------------------------------------------------------------
 ;;; Verify through this project's own decoder/validator/runner, then
@@ -781,26 +1104,34 @@
             when (search name line)
               do (return (subseq line 0 (min 64 (length line))))))))
 
-(defun verify (label bytes expected-status expected-stdout)
+(defun verify (label bytes expected-status expected-stdout
+               &key expected-stderr arguments environment)
   (let* ((comp (wasmdown.component:decode-component bytes))
          (_ (wasmdown.component:validate-component comp))
          (sink (make-string-output-stream))
+         (errsink (make-string-output-stream))
          ;; the reactor services clock deadlines; the cancellation
          ;; fixture lowers the provider's async wait-for
          (reactor (wasmdown.wasi:make-wasi-reactor))
-         (context (wasmdown.wasi:make-wasi-context :stdout sink
-                                                   :reactor reactor))
+         (context (apply #'wasmdown.wasi:make-wasi-context
+                         :stdout sink :stderr errsink :reactor reactor
+                         (append (and arguments (list :arguments arguments))
+                                 (and environment
+                                      (list :environment environment)))))
          (status (progn (wasmdown.wasi:run-component comp context))))
     (declare (ignore _))
     (ignore-errors (wasmdown.wasi:reactor-close reactor))
     (unless (eql expected-status status)
       (error "~a: command returned status ~a, expected ~a"
              label status expected-status))
-    (let ((out (get-output-stream-string sink)))
+    (let ((out (get-output-stream-string sink))
+          (err (get-output-stream-string errsink)))
       (unless (string= expected-stdout out)
-        (error "~a: stdout ~s, expected ~s" label out expected-stdout)))
-    (format t "~&~a: decoded, validated, ran (status ~a, stdout ~s)~%"
-            label status expected-stdout)))
+        (error "~a: stdout ~s, expected ~s" label out expected-stdout))
+      (unless (string= expected-stderr err)
+        (error "~a: stderr ~s, expected ~s" label err expected-stderr))
+      (format t "~&~a: decoded, validated, ran (status ~a, stdout ~s, stderr ~s)~%"
+              label status expected-stdout expected-stderr))))
 
 ;;; ---------------------------------------------------------------
 ;;; Main.
@@ -809,8 +1140,8 @@
   (if check
       (let ((bad 0))
         (dolist (entry *fixtures*)
-          (destructuring-bind (name _ status stdout) entry
-            (declare (ignore _ status stdout))
+          (destructuring-bind (name _ status stdout stderr context) entry
+            (declare (ignore _ status stdout stderr context))
             (let ((path (merge-pathnames name *dir*))
                   (recorded (recorded-sha name)))
               (if (not (probe-file path))
@@ -827,13 +1158,17 @@
         (ensure-directories-exist *dir*)
         (let ((lines '()))
           (dolist (entry *fixtures*)
-            (destructuring-bind (name builder status stdout) entry
+            (destructuring-bind (name builder status stdout stderr context) entry
               (let* ((bytes (funcall builder))
-                     (path (merge-pathnames name *dir*)))
+                     (path (merge-pathnames name *dir*))
+                     (extra (and context (funcall context path))))
                 (with-open-file (s path :direction :output :if-exists :supersede
                                         :element-type '(unsigned-byte 8))
                   (write-sequence bytes s))
-                (verify name bytes status stdout)
+                (verify name bytes status stdout
+                        :expected-stderr stderr
+                        :arguments (getf extra :arguments)
+                        :environment (getf extra :environment))
                 (push (format nil "~a  ~a" (sha256 path) name) lines)
                 (format t "~&wrote ~a~%" path))))
           (with-open-file (s *sums* :direction :output :if-exists :supersede)

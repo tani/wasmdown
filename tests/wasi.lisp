@@ -3719,6 +3719,43 @@ STEP never blocks, so a fake clock fully determines the outcome."
                (is (equal (list :c :a :b) (reverse order))))))
       (wasmdown.wasi:reactor-close reactor))))
 
+(test wasi/reactor-pending-deadline-p
+  ;; THE DRAIN ORACLE'S LIVENESS QUERY: an armed one-shot deadline is
+  ;; future progress; a spent/cancelled registration and a bare fd
+  ;; readiness watch are not.
+  (let* ((now 1000000000)
+         (reactor (reactor-fake (lambda () now) nil)))
+    (unwind-protect
+         (progn
+           (is (not (wasmdown.wasi:reactor-pending-deadline-p reactor)))
+           ;; a readiness watch alone is NOT guaranteed progress: a
+           ;; socket may never become ready
+           (let ((cancel (wasmdown.wasi:reactor-watch-fd
+                          reactor 0 :read 'oracle-test
+                          (lambda (status) (declare (ignore status))))))
+             (is (not (wasmdown.wasi:reactor-pending-deadline-p reactor)))
+             (funcall cancel))
+           ;; an armed deadline is
+           (let ((cancel (wasmdown.wasi:reactor-watch-deadline
+                          reactor (+ now 5000000000) (lambda () nil))))
+             (is (wasmdown.wasi:reactor-pending-deadline-p reactor))
+             ;; the STORE-level predicate combines it with the tick gate
+             (let ((store (wasmdown.component.runtime:make-component-store
+                           :reactor reactor)))
+               (is (not (rtcall "%HOST-STORE-FUTURE-PROGRESS-P" store)))
+               (rtcall "%HOST-STORE-WORK-ADD" store 1)
+               (is (rtcall "%HOST-STORE-FUTURE-PROGRESS-P" store))
+               (rtcall "%HOST-STORE-WORK-ADD" store -1))
+             ;; cancelling removes it
+             (funcall cancel)
+             (is (not (wasmdown.wasi:reactor-pending-deadline-p reactor))))
+           ;; a fired one-shot leaves nothing behind
+           (wasmdown.wasi:reactor-watch-deadline reactor 0 (lambda () nil))
+           (is (wasmdown.wasi:reactor-pending-deadline-p reactor))
+           (wasmdown.wasi:reactor-step reactor 0)
+           (is (not (wasmdown.wasi:reactor-pending-deadline-p reactor))))
+      (wasmdown.wasi:reactor-close reactor))))
+
 (test wasi/reactor-fd-order
   ;; one pump = one callback per ready registration; readiness is
   ;; delivered in registration order, and each step repeats it

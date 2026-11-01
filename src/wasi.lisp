@@ -3941,6 +3941,32 @@ DEADLINE fires on the next step. Returns an idempotent cancel-fn."
       (sb-thread:release-mutex mutex))
     (lambda () (%reactor-cancel reactor registration))))
 
+(defun reactor-pending-deadline-p (reactor)
+  "T when REACTOR holds at least one ARMED one-shot deadline: a
+registration still in the :LIVE state (dispatch and cancel both
+unlink it, so the deadline list never keeps a spent registration).
+This is the liveness question the store's drain oracle asks through
+%REACTOR-PENDING-DEADLINE-P: the clock alone makes such a registration
+due on the next step. FD watches are not consulted — readiness is not
+guaranteed."
+  (let ((mutex (wasi-reactor-mutex reactor))
+        (armed nil))
+    (sb-thread:grab-mutex mutex)
+    (unwind-protect
+         (unless (wasi-reactor-closed-p reactor)
+           (dolist (registration (wasi-reactor-deadlines reactor))
+             (when (eq (reactor-registration-state registration) :live)
+               (setf armed t)
+               (return))))
+      (sb-thread:release-mutex mutex))
+    (and armed t)))
+
+(defmethod wasmdown.component.runtime:%reactor-pending-deadline-p
+    ((reactor wasi-reactor))
+  "The store driver's view of the reactor's armed timers (the async
+lift's drain oracle consults this; see the generic's documentation)."
+  (reactor-pending-deadline-p reactor))
+
 ;;; --- the pump ----------------------------------------------------------
 
 (defun %reactor-snapshot (reactor)

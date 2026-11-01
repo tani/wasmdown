@@ -64,7 +64,7 @@ def source_identity():
 P1 = "sqlite3-p1.wasm"
 P2 = "sqlite3-p2.wasm"
 # WASI 0.3.2 (@0.3.2 imports, Component Model async) command guests.
-# Eight hand-authored guests are pinned (tools/build-p3-fixtures.lisp and
+# Nine hand-authored guests are pinned (tools/build-p3-fixtures.lisp and
 # P3-CHECKSUMS); no toolchain in the development environment produces the
 # 0.3.2 component ABI, so upstream-toolchain integration is still absent.
 # The lane selects preview3 ONLY when asked, and a missing fixture is a
@@ -77,8 +77,12 @@ P3_STREAM = "p3-stream-guest.wasm"
 P3_CANCEL = "p3-cancel-guest.wasm"
 P3_RANDOM = "p3-random-guest.wasm"
 P3_DEADLINE = "p3-deadline-guest.wasm"
+P3_CLI = "p3-cli-guest.wasm"
 
 # ---- the cases -----------------------------------------------------
+# env                   : `K=V' pairs passed with --env (a `{fixture}'
+#                         placeholder expands to the fixture path, i.e.
+#                         the argv[0] the runner supplies)
 # expect.stdout_equals  : exact stdout (list of lines, joined by \n, one
 #                         trailing newline tolerated)
 # expect.stdout_contains: every string must appear in stdout
@@ -224,7 +228,7 @@ CASES = [
         "expect": {"exit_nonzero": True, "absent": ["x.db"]},
     },
     # ---------------- WASI 0.3.2 ----------------
-    # Eight hand-authored @0.3.2 guests are pinned (tools/build-p3-fixtures.lisp,
+    # Nine hand-authored @0.3.2 guests are pinned (tools/build-p3-fixtures.lisp,
     # P3-CHECKSUMS): a missing fixture is a FAILURE, never a skip, so the P3
     # ABI cannot look covered by absence. This first case is only the
     # no-import smoke; the provider cases below are the coverage.
@@ -308,12 +312,36 @@ CASES = [
         "fixture": P3_DEADLINE,
         "argv": [],
         "stdin": "",
-        # lowers the clock's async wait-for (50 ms), joins the subtask into
+        # lowers the clock's async wait-for (200 ms), joins the subtask into
         # a waitable set and returns WAIT; the CLI reactor's callback loop
         # parks until the deadline fires and the subtask resolves RETURNED.
         # The resumed callback traps unless the elapsed monotonic clock
-        # time is >= the requested 50 ms, so an early completion fails.
+        # time is >= the requested 200 ms, so an early completion fails.
+        # The bound is deliberately past the async lift's old ~100 ms
+        # quiescence budget: the drain oracle must treat the ARMED reactor
+        # deadline as future progress, not as a deadlock.
         "expect": {"stdout_equals": [], "exit": 0},
+    },
+    {
+        "id": "p3/cli-env-stderr-terminal",
+        "abi": "preview3",
+        "fixture": P3_CLI,
+        # --env carries the environment probe pair, the expected argv[0]
+        # (the fixture path exactly as the runner passed it) and the
+        # lane's non-tty expectation for get-terminal-stdout.
+        "env": ["WMD_ENV_PROBE=env-probe-value",
+                "WMD_EXPECT_ARGV0={fixture}",
+                "WMD_EXPECT_TERMINAL=none"],
+        "argv": ["wmd-cli-marker"],
+        "stdin": "",
+        # imports wasi:cli/{environment,stderr,terminal-stdout}@0.3.2: the
+        # guest traps unless argv[0] is the fixture path, argv[1] is the
+        # marker, the environment holds WMD_ENV_PROBE=env-probe-value,
+        # get-initial-cwd is an option and get-terminal-stdout is `none'
+        # on the captured (non-tty) stdout; it then writes the fixed
+        # message through stderr's write-via-stream. stdout stays empty.
+        "expect": {"stdout_equals": [], "exit": 0,
+                   "stderr_contains": ["p3-cli-guest: stderr probe"]},
     },
     # ---------------- Preview 1 ----------------
     {
@@ -449,6 +477,11 @@ def run_case(case, backend, groupdir, heap_mb):
             argv += ["--dir", f"{workdir}::{spec[:-3]}:ro"]
         else:
             argv += ["--dir", f"{workdir}::{spec}"]
+    # --env takes K=V before `--': the pairs reach wasi:cli/environment,
+    # and `{fixture}' expands to the path the runner hands the guest as
+    # argv[0], so a case can assert on that exact string.
+    for spec in case.get("env", []):
+        argv += ["--env", spec.replace("{fixture}", str(fixture))]
     guest_argv = []
     for a in case.get("argv", []):
         guest_argv.append(str(workdir / "host-denied.db")
