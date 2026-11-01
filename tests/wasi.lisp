@@ -596,6 +596,38 @@ delivered OUTCOME in the returned cons's CDR (:UNSET until then)."
         ;; the stream write end returns to idle after delivery
         (is (eq :idle (rtcall "ASYNC-END-STATE" writer)))))))
 
+(test wasi/host-sink-would-block-retry-keeps-generation
+  ;; Regression: a WOULD-BLOCK sink parks the copy; the readiness retry
+  ;; must REUSE that parked attempt. Clearing it made the retry advance
+  ;; the generation and resubmit the same span to the worker, so every
+  ;; readiness wrote the bytes again (the P3 stdout duplication).
+  (multiple-value-bind (reader writer)
+      (wasmdown.component.runtime:make-host-stream-pair *u8-ct*)
+    (let ((calls 0) (sink-bytes '()))
+      (wasmdown.component.runtime:host-end-set-sink
+       reader (lambda (octets start end)
+                (incf calls)
+                (if (= calls 1)
+                    (values 0 nil)                       ; WOULD-BLOCK, parked
+                    (progn
+                      (setf sink-bytes
+                            (append sink-bytes
+                                    (coerce (subseq octets start end) 'list)))
+                      (values (- end start) nil)))))
+      (let ((staged (wasmdown.component.runtime:make-host-buffer
+                     2 :values '(104 105))))
+        (is (eql 0 (rtcall "%END-COPY" writer staged nil)))
+        (let ((generation
+                (wasmdown.component.runtime:host-end-generation reader)))
+          ;; the worker completes at the parked attempt's generation
+          (wasmdown.component.runtime:host-end-ready reader generation)
+          (is (= 2 calls))
+          (is (equal '(104 105) sink-bytes))
+          (is (eql generation
+                     (wasmdown.component.runtime:host-end-generation reader)))
+          (is (eql (%completed 2)
+                   (third (rtcall "%WAITABLE-GET-PENDING-EVENT" writer)))))))))
+
 (test wasi/host-source-end-eof-dropped
   ;; The guest's readable end pulls from a HOST writable end's SOURCE:
   ;; the bytes arrive COMPLETED|n<<4; the source's EOF drops the host
