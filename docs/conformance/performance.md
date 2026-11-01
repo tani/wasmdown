@@ -94,3 +94,15 @@ without that binding/constant (temporary build, reverted): **0.09 s / 100.1 MiB*
 with the binding vs **0.08 s / 99.8 MiB** without. The difference is noise, so
 omitting the constant for instance-free functions is not worth the special
 case; the cost remains in compiling the control graph of large bodies.
+
+## Decision: compile cost accepted (2026-11-02)
+
+The project owner has accepted the current compile time/heap cost for the
+compiled backend. No compile-reduction change ships. Rationale recorded with
+the measurements above: every implementable lever is a measured negative
+(optimization policy, array temp slots, duplicate validation, per-lambda
+instance constant), and the remaining lever — the emitted TAGBODY/GO control
+graph — would require changing the explicit M3 contract ("preserve
+TAGBODY/GO"). This closes the M10 "compile-heap reductions" exit item as an
+accepted, documented limit rather than an open defect; re-open only with a
+decision to revisit the M3 control-flow contract.

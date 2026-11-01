@@ -75,6 +75,11 @@ deliberately incomplete, and what will not be built. Measurements live in
   `@unstable` at 0.2.12 and not exported); a `last-operation-failed`
   stream does not yet transition to `closed`.
 - Preview 1 `proc_raise` returns `NOTSUP`; a guest cannot signal itself.
+- Compiled-backend compile time/heap is an ACCEPTED limit (owner decision,
+  2026-11-02): no reduction ships. Measurements and the rejected levers are in
+  `docs/conformance/performance.md`; the untested control-graph lever is fenced
+  by the M3 TAGBODY/GO contract.
+
 - P3 async **cancellation** is exercised end to end by `p3/cancel-subtask`
   (3 repeats, both backends). Getting there fixed a real defect:
   `%canon-lower-async-host-func` packed its STARTED/RETURNED state under the
