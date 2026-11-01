@@ -203,9 +203,11 @@ CASES = [
         "id": "p3/guest-smoke",
         "abi": "preview3",
         "fixture": P3,
-        "argv": ["--version"],
+        "argv": [],
         "stdin": "",
-        "expect": {"exit": 0},
+        # the pinned hand-authored command exports `run` returning ok and
+        # writes nothing; regenerate with tools/build-p3-fixtures.lisp
+        "expect": {"stdout_equals": [], "exit": 0},
     },
     # ---------------- Preview 1 ----------------
     {

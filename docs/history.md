@@ -300,6 +300,25 @@ the ADRs are amended, not rewritten.
   heap and ~200 s to compile, which is why the WASI lane's baseline runs are
   report-mode evidence rather than a gate.
 
+## WASI 0.3.2 guest fixture (2026-11-01)
+
+No toolchain in this environment emits the `@0.3.2` component ABI, so the P3
+guest lane pins a **hand-authored** command: `tools/build-p3-fixtures.lisp`
+assembles a component from the pinned binary grammar (header, type section with
+`result<_,_>` and its functype, a core module, core instance, alias, `canon
+lift`, an instance carrying `run`, and the `wasi:cli/run@0.3.2` export),
+verifies it through this project's own decoder/validator/runner, and records
+`P3-CHECKSUMS`. `make test-wasi-preview3` runs it through the real CLI in both
+backends (exit 0); `wasi/command-component-runs-the-selected-backend` proves
+the nested core ran through the selected backend via the entry counters.
+
+The richer stdout-importing async command already in `tests/wasi.lisp` writes
+"hi" through a `stream<u8>` and `task.return`s; it is green through
+`run-component` without a reactor, but driving it through the CLI (which owns a
+reactor) re-enters the core body every store tick, repeating stdout and ending
+in the deadlock oracle. That defect is recorded in `status.md`; the lane uses
+the sync command until it is fixed.
+
 ## Roadmap-era notes
 
 - Numbering convention: engine-slice loops 18–24 and Component Model milestones M7–M17 ran in parallel; neither series renumbers the other.

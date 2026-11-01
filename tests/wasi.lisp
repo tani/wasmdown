@@ -5040,3 +5040,45 @@ world w {
           (setf message (wasmdown:wasmdown-error-message c))))
       (is message)
       (is (search "bogus" message)))))
+
+;;; -----------------------------------------------------------------
+;;; Backend evidence for a command component (M9): the nested core the
+;;; component instantiates runs through the SELECTED backend, and the
+;;; counter proves it — a mode that silently interpreted would show a
+;;; zero entry count here.
+
+(test wasi/command-component-runs-the-selected-backend
+  (dolist (mode '(:interpret :baseline))
+    (let* ((sink (make-string-output-stream))
+           (ctx (wasmdown.wasi:make-wasi-context :stdout sink)))
+      (wasmdown.runtime:reset-backend-entry-counts)
+      (is (eql 0 (wasmdown.wasi:run-component
+                  (wasmdown.component:decode-component
+                   (command-component-binary))
+                  ctx :mode mode)))
+      (is (string= "hi" (get-output-stream-string sink)))
+      (if (eq mode :baseline)
+          (progn
+            (is (plusp (wasmdown.runtime:backend-entry-count :baseline)))
+            (is (zerop (wasmdown.runtime:backend-entry-count :interpret))))
+          (progn
+            (is (plusp (wasmdown.runtime:backend-entry-count :interpret)))
+            (is (zerop (wasmdown.runtime:backend-entry-count :baseline))))))))
+
+(test wasi/pinned-p3-guest-runs-both-backends
+  ;; the tracked builder writes this file; when it is present (a fixture
+  ;; build ran) the pinned bytes must be a working command in BOTH modes.
+  (let ((path (merge-pathnames "tests/fixtures/wasi/p3-guest.wasm"
+                               (make-pathname
+                                :directory
+                                (butlast (pathname-directory
+                                          *load-truename*))))))
+    (when (probe-file path)
+      (let ((bytes (with-open-file (s path :element-type '(unsigned-byte 8))
+                     (let ((v (make-array (file-length s)
+                                          :element-type '(unsigned-byte 8))))
+                       (read-sequence v s) v))))
+        (dolist (mode '(:interpret :baseline))
+          (is (eql 0 (wasmdown.wasi:run-component
+                      (wasmdown.component:decode-component bytes)
+                      (wasmdown.wasi:make-wasi-context) :mode mode))))))))

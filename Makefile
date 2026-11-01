@@ -9,7 +9,8 @@ LISP_FILES := $(wildcard src/*.lisp)
         report-backend-inventory test-backend-inventory \
         report-backends-bench \
         test-upstream test-wasi-preview1 test-wasi-preview2 test-wasi \
-        report-conformance clean \
+        report-conformance p3-fixtures test-wasi-preview3 \
+        clean \
         load-system repl wasi-fixtures
 
 all: test
@@ -104,6 +105,17 @@ test-component-census:
 # runner into tests/upstream-results.jsonl. Never a release gate.
 test-upstream:
 	python3 tools/run-upstream-testsuite.py
+
+# Hand-authored WASI 0.3.2 command fixture (no @0.3.2 toolchain here).
+# Writes tests/fixtures/wasi/p3-guest.wasm + P3-CHECKSUMS; --check verifies.
+p3-fixtures:
+	$(SBCL) --script tools/build-p3-fixtures.lisp
+
+# WASI 0.3.2 guest lane: the pinned hand-authored command, real CLI, one
+# case. It is NOT part of --abi all (released ABIs only) and requires the
+# fixture above; --check fails when the checked-in hash does not match.
+test-wasi-preview3: p3-fixtures
+	python3 tools/run-wasi-suite.py --abi preview3
 
 # Development-only fixture build (needs the pinned Nix toolchain).
 wasi-fixtures:

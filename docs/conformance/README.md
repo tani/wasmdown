@@ -18,6 +18,7 @@ together, and a number from one lane says nothing about another.
 | inventory | check | `make test-backend-inventory` (regenerate: `make report-backend-inventory`) | [`inventory.md`](inventory.md), `tests/backend-inventory.json` | The pinned WASI census (P1 functions, P2/P3 interfaces) reconciles with what the runtime actually registers; excluded and not-implemented surfaces are separate rows. |
 | wasi preview1 | gate | `make test-wasi-preview1` (interpret); `tools/wasi-preview1-acceptance.py --backend baseline` (report) | stdout | The real CLI runs pinned SQLite guests with exact stdout/status, plus preopen, read-only, and escape denials. The baseline form runs the same cases with every guest core compiled (~200 s per fresh process); its exact stdout/status must match. |
 | wasi preview2 | gate | `make test-wasi-preview2` | `tests/wasi-results/latest/` | WASI 0.2 behaviour with one fresh guest process per case. |
+| wasi preview3 | gate (explicit) | `make test-wasi-preview3` | `tests/wasi-results/latest/` | The pinned hand-authored @0.3.2 command (`tools/build-p3-fixtures.lisp`) runs through the real CLI in both backends. Not part of `--abi all`; a missing fixture is a failure, never a skip. |
 | wasi all | gate | `make test-wasi` | [`wasi.md`](wasi.md), `tests/wasi-results/latest/` | Both released ABIs (`preview1`, `preview2`) in one run. |
 | upstream | discovery | `make test-upstream` | [`upstream.md`](upstream.md), `tests/upstream-results.jsonl` | Where the engine stands against proposal corpora beyond its declared scope. Never gated. |
 

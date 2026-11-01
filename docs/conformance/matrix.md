@@ -15,7 +15,7 @@ links are generated.
 | WASI Preview 1 acceptance (in-memory and on-disk SQLite) | 14/14 checks pass | 14/14 checks pass: smoke, persistence (two processes), reopen, rollback, bail, no-preopen, read-only, escape — 821 s of compile-heavy wall time. The lane asserts exact stdout/status per case, so both backends meet identical expectations | `tools/wasi-preview1-acceptance.py [--backend baseline]` |
 | WASI 0.2 behaviour lane (11 cases) | 11/11 pass | 11/11 pass (11 x ~200 s compile wall time). Each case's manifest entry asserts exact stdout bytes and exact status, so both backends satisfy the SAME byte-level expectations — stronger than a post-hoc sha diff. Per-case records: `tests/wasi-results/latest/` (interpret) and `tests/wasi-results/baseline-preview2/` (baseline), distinguished by the `backend` field | `tools/run-wasi-suite.py --abi preview2 [--backend baseline]` |
 | WASI 0.3.2 providers | unit/provider pins, component async suite | same providers; component suite green under `:baseline` | [`inventory.md`](inventory.md), `tests/wasi*.lisp` |
-| Pinned 0.3.2 guest | no guest fixture exists in this repository | — | see “Blocked” below |
+| Pinned 0.3.2 guest (hand-authored) | 1/1 pass (command world, exit 0) | 1/1 pass; the nested core runs compiled (`backend-entry-count`) | `make test-wasi-preview3`, `tools/build-p3-fixtures.lisp`, `wasi/command-component-runs-the-selected-backend` |
 
 The backend property lives on the function, not on a replacement object: the
 selected mode compiles each defined function's existing `func-instance`
@@ -48,8 +48,15 @@ baseline runs are report evidence rather than a gate.
 
 ## Blocked
 
-- **WASI 0.3.2 guest end-to-end.** No toolchain in this environment emits the
-  `@0.3.2` component ABI, so no guest fixture is pinned.
+- **A real-toolchain WASI 0.3.2 guest.** The lane runs a hand-authored
+  `@0.3.2` command assembled from the pinned binary grammar
+  (`tools/build-p3-fixtures.lisp`, bytes pinned by `P3-CHECKSUMS`); no
+  toolchain emits the 0.3.2 component ABI here, so this is ABI coverage, not
+  real-toolchain integration evidence.
+- **Async-lifted command through the CLI.** The stdout-importing async
+  command in `tests/wasi.lisp` re-enters its core body while a reactor drives
+  the store, so the CLI loops instead of returning; it is exercised at the
+  `run-component` level (no reactor) and recorded in `docs/status.md`.
   `tools/run-wasi-suite.py --abi preview3` selects that ABI explicitly and
   FAILS on the missing fixture (never skips); `--abi all` covers the two
   released ABIs only.

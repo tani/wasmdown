@@ -36,6 +36,7 @@ deliberately incomplete, and what will not be built. Measurements live in
 | WASI | Preview 1 (`wasi_snapshot_preview1`) | Full | All 46 pinned imports are provided over an explicit capability context. The whole acceptance lane (in-memory and on-disk SQLite, rollback, bail, preopen denial, read-only, escape) passes with compiled guest cores too. |
 | WASI | 0.3.2 providers | Partial | The CLI now owns a reactor (clock deadlines and socket readiness are servable); what remains partial is the provider surface itself — blocking DNS/stdio executors and the `@unstable` gates. |
 | WASI | 0.2 facade | Partial | 27 of 31 stable interfaces are bound at exact release names. |
+| WASI | 0.3.2 guest lane | Partial | A hand-authored @0.3.2 command runs through the real CLI in both backends (`make test-wasi-preview3`); no upstream toolchain input exists here, and an async-lifted command under a reactor is a recorded defect. |
 | WASI | `wasi:http` | Out of scope | Removed from the runtime by decision and not planned, recoverable from git history. |
 
 ## Declared limits
@@ -62,6 +63,11 @@ and neither is a validation rule (ADR-005).
 - Descriptor destructors and lend lists accumulate in long-lived hosts.
 - `@unstable` is parsed and recorded but not enforced; the affected interfaces
   are simply not registered.
+- An async-lifted command component driven by the CLI (which owns a reactor)
+  re-enters its core body each store tick instead of resuming the canonical
+  continuation: stdout repeats and the run ends in the deadlock oracle. The
+  same component is green through `run-component` without a reactor
+  (`tests/wasi.lisp`); the P3 CLI lane therefore uses the sync command.
 - WASI 0.2 (shared by both backends, found by the behavioural audit):
   end-of-input is reported as `stream-error::closed` rather than `ok([])`;
   `write`/`write-zeroes` do not enforce the `check-write` permit; the UDP

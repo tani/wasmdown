@@ -1,8 +1,8 @@
 {
  "schema": "wasmdown.inventory.v1",
- "generated_at": "2026-11-01T05:57:03Z",
+ "generated_at": "2026-11-01T10:31:02Z",
  "sbcl_version": "2.6.4",
- "source_commit": "426064e53a5512708dd3cfd223954ce48ae1661e",
+ "source_commit": "4ceb27c0dd1daf95ccd5d32b5ffa1cd01914a0bb",
  "pins": {
   "core_spec_commit": "b0ec1f3f449525c217dbff3f1dfab435a756ea92",
   "wasi_release": "v0.3.2",
