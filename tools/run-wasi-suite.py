@@ -64,7 +64,7 @@ def source_identity():
 P1 = "sqlite3-p1.wasm"
 P2 = "sqlite3-p2.wasm"
 # WASI 0.3.2 (@0.3.2 imports, Component Model async) command guests.
-# Nine hand-authored guests are pinned (tools/build-p3-fixtures.lisp and
+# Ten hand-authored guests are pinned (tools/build-p3-fixtures.lisp and
 # P3-CHECKSUMS); no toolchain in the development environment produces the
 # 0.3.2 component ABI, so upstream-toolchain integration is still absent.
 # The lane selects preview3 ONLY when asked, and a missing fixture is a
@@ -78,6 +78,7 @@ P3_CANCEL = "p3-cancel-guest.wasm"
 P3_RANDOM = "p3-random-guest.wasm"
 P3_DEADLINE = "p3-deadline-guest.wasm"
 P3_CLI = "p3-cli-guest.wasm"
+P3_FS = "p3-fs-guest.wasm"
 
 # ---- the cases -----------------------------------------------------
 # env                   : `K=V' pairs passed with --env (a `{fixture}'
@@ -228,7 +229,7 @@ CASES = [
         "expect": {"exit_nonzero": True, "absent": ["x.db"]},
     },
     # ---------------- WASI 0.3.2 ----------------
-    # Nine hand-authored @0.3.2 guests are pinned (tools/build-p3-fixtures.lisp,
+    # Ten hand-authored @0.3.2 guests are pinned (tools/build-p3-fixtures.lisp,
     # P3-CHECKSUMS): a missing fixture is a FAILURE, never a skip, so the P3
     # ABI cannot look covered by absence. This first case is only the
     # no-import smoke; the provider cases below are the coverage.
@@ -323,7 +324,7 @@ CASES = [
         "expect": {"stdout_equals": [], "exit": 0},
     },
     {
-        "id": "p3/cli-env-stderr-terminal",
+        "id": "p3/cli-stdin-env-stderr-terminal",
         "abi": "preview3",
         "fixture": P3_CLI,
         # --env carries the environment probe pair, the expected argv[0]
@@ -333,15 +334,41 @@ CASES = [
                 "WMD_EXPECT_ARGV0={fixture}",
                 "WMD_EXPECT_TERMINAL=none"],
         "argv": ["wmd-cli-marker"],
-        "stdin": "",
-        # imports wasi:cli/{environment,stderr,terminal-stdout}@0.3.2: the
-        # guest traps unless argv[0] is the fixture path, argv[1] is the
+        # the marker the guest requires byte-for-byte through real stdin.
+        "stdin": "stdin-probe\n",
+        # imports wasi:cli/{stdin,environment,stderr,terminal-stdout}@0.3.2:
+        # the guest traps unless argv[0] is the fixture path, argv[1] is the
         # marker, the environment holds WMD_ENV_PROBE=env-probe-value,
         # get-initial-cwd is an option and get-terminal-stdout is `none'
-        # on the captured (non-tty) stdout; it then writes the fixed
-        # message through stderr's write-via-stream. stdout stays empty.
+        # on the captured (non-tty) stdout. It reads stdin through
+        # read-via-stream + stream.read (packed CopyResult|progress<<4,
+        # a BLOCKED copy joined into the waitable set and waited), requires
+        # exactly "stdin-probe\n" and the explicit DROPPED EOF result, and
+        # requires the paired future to read back result::ok. A different
+        # stdin byte traps (nonzero exit), so the exit status is the
+        # assertion. It then writes the fixed message through stderr's
+        # write-via-stream. stdout stays empty.
         "expect": {"stdout_equals": [], "exit": 0,
                    "stderr_contains": ["p3-cli-guest: stderr probe"]},
+    },
+    {
+        "id": "p3/filesystem-preopens-read",
+        "abi": "preview3",
+        "fixture": P3_FS,
+        # the preopen the guest looks up by its guest-visible name, and
+        # the seeded file it opens THROUGH that preopen (relative path).
+        "preopen": ["/work"],
+        "seed": {"hello.txt": "filesystem-probe\n"},
+        "argv": [],
+        "stdin": "",
+        # imports wasi:filesystem/{types,preopens}@0.3.2: get-directories
+        # lists a "/work" preopen, open-at (async, waited as a SUBTASK
+        # event) opens hello.txt, read-via-stream + stream.read copy the
+        # seeded 17 bytes (asserted equal), the paired future resolves ok,
+        # and a second open-at of a missing path must return ERR with
+        # error-code::no-entry (case 19) — an err result, never a trap.
+        # Any mismatch traps, so the exit status is the assertion.
+        "expect": {"stdout_equals": [], "exit": 0},
     },
     # ---------------- Preview 1 ----------------
     {

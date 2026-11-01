@@ -1745,9 +1745,13 @@ of the WRONG case's resource slot."
 
 (defun %abi-store-variant (cx v c ptr)
   "store_variant (CanonicalABI.md 2787): the discriminant + the
-payload at the join-aligned offset."
+payload at the join-aligned offset. V is the tagged domain value
+\((label . payload)'); a BARE label (a payload-less case's name, the
+shape the native providers hand back for error codes such as
+\(:err . "no-entry")) names the case and stores no payload."
   (let* ((cases (coerce (wasmdown.component:ct-payload c) 'list))
-         (idx (%abi-case-index (car v) cases))
+         (tagged (consp v))
+         (idx (%abi-case-index (if tagged (car v) v) cases))
          (case (nth idx cases))
          (payload (cdr case))
          (ds (%abi-discriminant-size cases))
@@ -1755,8 +1759,17 @@ payload at the join-aligned offset."
                               when cvt maximize
                               (%abi-alignment cvt (%abi-type-inst cx)))
                         1))))
+    (when (and payload (not tagged))
+      ;; A bare label is only a shortcut for a PAYLOAD-LESS case. For a
+      ;; case WITH a payload it would store the discriminant and leave
+      ;; the payload slot untouched (stale/zero bytes), so refuse it
+      ;; explicitly instead of producing a half-initialized value.
+      (error 'wasmdown:host-error
+             :message
+             (format nil "a bare variant label (~s) names a case with a ~
+                          payload; pass (label . payload)" v)))
     (%abi-store-int cx idx ptr ds)
-    (when payload
+    (when (and payload tagged)
       (let ((p (+ ptr (%abi-align-to ds ma))))
         (%abi-store cx (cdr v) payload p)))))
 

@@ -30,12 +30,14 @@
 ;;;;                          returned after at least 200 ms of clock time
 ;;;;                          (the bound also proves the drain oracle no
 ;;;;                          longer calls an armed timer a deadlock)
-;;;;   p3-cli-guest.wasm      imports wasi:cli/{environment,stderr,
+;;;;   p3-cli-guest.wasm      imports wasi:cli/{stdin,environment,stderr,
 ;;;;                          terminal-stdout}@0.3.2; asserts argv[0]/
 ;;;;                          marker, a --env pair, option-typed
 ;;;;                          get-initial-cwd and terminal-stdout none,
-;;;;                          then writes a fixed message to stderr
-;;;;                          through write-via-stream
+;;;;                          reads "stdin-probe\n" from real stdin
+;;;;                          (read-via-stream + stream.read to DROPPED +
+;;;;                          the paired future's ok), then writes a fixed
+;;;;                          message to stderr through write-via-stream
 ;;;;
 ;;;; The importing guest is the provider-importing evidence the no-import
 ;;;; smoke cannot give: the runner composes the provider from the
@@ -776,6 +778,9 @@
 ;;;     get-environment:  func() -> list<tuple<string, string>>
 ;;;     get-arguments:    func() -> list<string>
 ;;;     get-initial-cwd:  func() -> option<string>
+;;;   wasi:cli/stdin@0.3.2
+;;;     read-via-stream:  func() -> tuple<stream<u8>,
+;;;                                       future<result<_, error-code>>>
 ;;;   wasi:cli/stderr@0.3.2
 ;;;     write-via-stream: func(data: stream<u8>)
 ;;;                             -> future<result<_, error-code>>
@@ -792,6 +797,9 @@
 ;;;                                              ; (disc u8 @0, ptr @4, len @8)
 ;;;   get-terminal-stdout  core (param i32)     ; retptr -> option<own<..>>
 ;;;                                              ; (disc u8 @0, handle @4)
+;;;   read-via-stream      core (param i32)     ; retptr -> tuple
+;;;                                              ; (stream handle @0,
+;;;                                              ;  future handle @4)
 ;;;   write-via-stream     core (param i32) (result i32)   ; one flat result
 ;;;
 ;;; The guest (run lifted async with a callback) asserts, and TRAPS on
@@ -801,11 +809,17 @@
 ;;; WMD_ENV_PROBE=env-probe-value, get-initial-cwd is an option (none
 ;;; or a non-empty string), get-terminal-stdout is an option and — in
 ;;; the captured (non-tty) lane, signalled by WMD_EXPECT_TERMINAL=none
-;;; — is `none'. It then writes the fixed message
-;;; "p3-cli-guest: stderr probe" through stderr's write-via-stream in
-;;; the canonical future order (async future.read parks the read, the
-;;; write is staged, the writable end is dropped, waitable-set.wait
-;;; takes the future event). Success exits 0; every mismatch traps.
+;;; — is `none'. It then reads the suite-supplied stdin through
+;;; stdin's read-via-stream (stream.read in the canonical async copy
+;;; order: an eager event is the packed CopyResult|progress<<4 return,
+;;; a BLOCKED copy is joined into a waitable set and waited), requires
+;;; exactly "stdin-probe\n" and the explicit DROPPED (EOF) result, and
+;;; requires the paired future to read back result::ok. It then writes
+;;; the fixed message "p3-cli-guest: stderr probe" through stderr's
+;;; write-via-stream in the canonical future order (async future.read
+;;; parks the read, the write is staged, the writable end is dropped,
+;;; waitable-set.wait takes the future event). Success exits 0; every
+;;; mismatch traps.
 ;;;
 ;;; The two string lists are read out of guest memory (list header
 ;;; ptr@0,len@4 for <string>; ptr@0,len@4 then elements of 8 bytes;
@@ -825,6 +839,11 @@
            "      (export \"get-environment\" (func (result (list (tuple string string)))))"
            "      (export \"get-arguments\" (func (result (list string))))"
            "      (export \"get-initial-cwd\" (func (result (option string))))))"
+           "  (import \"wasi:cli/stdin@0.3.2\""
+           "    (instance $in"
+           "      (export \"read-via-stream\""
+           "        (func (result (tuple (stream u8)"
+           "                       (future (result (error $ec)))))))))"
            "  (import \"wasi:cli/stderr@0.3.2\""
            "    (instance $stderr"
            "      (export \"write-via-stream\""
@@ -838,6 +857,7 @@
            "  (alias export $env \"get-environment\" (func $getenv))"
            "  (alias export $env \"get-arguments\" (func $getargs))"
            "  (alias export $env \"get-initial-cwd\" (func $getcwd))"
+           "  (alias export $in \"read-via-stream\" (func $rvs))"
            "  (alias export $stderr \"write-via-stream\" (func $wvs))"
            "  (alias export $ttyout \"get-terminal-stdout\" (func $gettty))"
            "  (core module $Mem"
@@ -868,6 +888,10 @@
            "    (canon lower (func $wvs)"
            "      (memory (core memory $mem \"mem\"))"
            "      (realloc (core func $mem \"realloc\"))))"
+           "  (core func $rvs-lowered"
+           "    (canon lower (func $rvs)"
+           "      (memory (core memory $mem \"mem\"))"
+           "      (realloc (core func $mem \"realloc\"))))"
            "  (core func $gettty-lowered"
            "    (canon lower (func $gettty)"
            "      (memory (core memory $mem \"mem\"))"
@@ -876,6 +900,9 @@
            "  (canon stream.new $ST (core func $snew))"
            "  (canon stream.write $ST async (memory (core memory $mem \"mem\")) (core func $swrite))"
            "  (canon stream.drop-writable $ST (core func $sdropw))"
+           "  (canon stream.read $ST async (memory (core memory $mem \"mem\")) (core func $sread))"
+           "  (canon stream.drop-readable $ST (core func $sdropr))"
+           "  (canon future.drop-readable $FT (core func $fdropr))"
            "  (canon future.read $FT async (memory (core memory $mem \"mem\")) (core func $fread))"
            "  (canon waitable-set.new (core func $wsnew))"
            "  (canon waitable.join (core func $wjoin))"
@@ -887,10 +914,14 @@
            "    (import \"env\" \"get-initial-cwd\" (func $getcwd (param i32)))"
            "    (import \"env\" \"get-terminal-stdout\" (func $gettty (param i32)))"
            "    (import \"env\" \"write-via-stream\" (func $wvs (param i32) (result i32)))"
+           "    (import \"env\" \"read-via-stream\" (func $rvs (param i32)))"
            "    (import \"env\" \"task.return\" (func $tr (param i32)))"
            "    (import \"env\" \"stream.new\" (func $snew (result i64)))"
            "    (import \"env\" \"stream.write\" (func $swrite (param i32 i32 i32) (result i32)))"
            "    (import \"env\" \"stream.drop-writable\" (func $sdropw (param i32)))"
+           "    (import \"env\" \"stream.read\" (func $sread (param i32 i32 i32) (result i32)))"
+           "    (import \"env\" \"stream.drop-readable\" (func $sdropr (param i32)))"
+           "    (import \"env\" \"future.drop-readable\" (func $fdropr (param i32)))"
            "    (import \"env\" \"future.read\" (func $fread (param i32 i32) (result i32)))"
            "    (import \"env\" \"waitable-set.new\" (func $wsnew (result i32)))"
            "    (import \"env\" \"waitable.join\" (func $wjoin (param i32 i32)))"
@@ -902,11 +933,15 @@
            "    (data (i32.const 128) \"WMD_EXPECT_TERMINAL\")"
            "    (data (i32.const 148) \"none\")"
            "    (data (i32.const 160) \"p3-cli-guest: stderr probe\\n\")"
+           "    (data (i32.const 320) \"stdin-probe\\n\")"
            "    (global $fut (mut i32) (i32.const 0))"
            "    (global $readable (mut i32) (i32.const 0))"
            "    (global $writable (mut i32) (i32.const 0))"
            "    (global $set (mut i32) (i32.const 0))"
            "    (global $state (mut i32) (i32.const 0))"
+           "    (global $total (mut i32) (i32.const 0))"
+           "    (global $srcread (mut i32) (i32.const 0))"
+           "    (global $futread (mut i32) (i32.const 0))"
            "    (type $cbty (func (param i32 i32 i32) (result i32)))"
            "    (func $streq (param $a i32) (param $an i32) (param $b i32) (param $bn i32) (result i32)"
            "      (local $i i32)"
@@ -979,7 +1014,7 @@
            "                      (then unreachable))))))"
            "      (i32.const 1))"
            "    (func (export \"run-cb\") (type $cbty)"
-           "      (local $s i64) (local $ret i32)"
+           "      (local $s i64) (local $ret i32) (local $n i32) (local $i i32)"
            "      (block $done"
            "        (block $st10"
            "          (block $st20"
@@ -997,11 +1032,77 @@
            "            (then unreachable))"
            "        (call $tr (i32.const 0))"
            "        (return (i32.const 0)))"
+           "      (global.set $set (call $wsnew))"
+           ;; ---- the STDIN probe: read-via-stream, then stream.read
+           ;; until the explicit DROPPED (EOF) result, and the paired
+           ;; future's ok result. A BLOCKED copy is joined into the
+           ;; set and waited (the abi's async copy order).
+           "      (call $rvs (i32.const 336))"
+           "      (global.set $srcread (i32.load (i32.const 336)))"
+           "      (global.set $futread (i32.load (i32.const 340)))"
+           "      (global.set $total (i32.const 0))"
+           "      (block $eof"
+           "        (loop $more"
+           "          (local.set $ret (call $sread (global.get $srcread)"
+           "                                      (i32.const 256) (i32.const 64)))"
+           "          (if (i32.eq (local.get $ret) (i32.const -1))"
+           "              (then"
+           "                (call $wjoin (global.get $srcread) (global.get $set))"
+           "                (local.set $ret (call $wswait (global.get $set)"
+           "                                              (i32.const 224)))"
+           "                (if (i32.ne (local.get $ret) (i32.const 2))"
+           "                    (then unreachable))"
+           "                (call $wjoin (global.get $srcread) (i32.const 0))"
+           "                (local.set $ret (i32.load (i32.const 228)))))"
+           ;; CopyResult: COMPLETED=0 (bytes), DROPPED=1 (EOF, progress 0)
+           "          (if (i32.eq (i32.and (local.get $ret) (i32.const 15))"
+           "                      (i32.const 1))"
+           "              (then (br $eof)))"
+           "          (if (i32.ne (i32.and (local.get $ret) (i32.const 15))"
+           "                      (i32.const 0))"
+           "              (then unreachable))"
+           "          (local.set $n (i32.shr_u (local.get $ret) (i32.const 4)))"
+           "          (if (i32.or (i32.eqz (local.get $n))"
+           "                      (i32.gt_u (i32.add (global.get $total)"
+           "                                        (local.get $n))"
+           "                                (i32.const 12)))"
+           "              (then unreachable))"
+           "          (local.set $i (i32.const 0))"
+           "          (block $bytes"
+           "            (loop $byte"
+           "              (br_if $bytes (i32.ge_u (local.get $i) (local.get $n)))"
+           "              (if (i32.ne"
+           "                    (i32.load8_u (i32.add (i32.const 256)"
+           "                                          (local.get $i)))"
+           "                    (i32.load8_u (i32.add (i32.const 320)"
+           "                                         (i32.add (global.get $total)"
+           "                                                  (local.get $i)))))"
+           "                  (then unreachable))"
+           "              (local.set $i (i32.add (local.get $i) (i32.const 1)))"
+           "              (br $byte)))"
+           "          (global.set $total (i32.add (global.get $total)"
+           "                                      (local.get $n)))"
+           "          (br $more)))"
+           "      (if (i32.ne (global.get $total) (i32.const 12))"
+           "          (then unreachable))"
+           "      (local.set $ret (call $fread (global.get $futread)"
+           "                                    (i32.const 240)))"
+           "      (if (i32.eq (local.get $ret) (i32.const -1))"
+           "          (then"
+           "            (call $wjoin (global.get $futread) (global.get $set))"
+           "            (local.set $ret (call $wswait (global.get $set)"
+           "                                          (i32.const 224)))"
+           "            (if (i32.ne (local.get $ret) (i32.const 4))"
+           "                (then unreachable))"
+           "            (call $wjoin (global.get $futread) (i32.const 0))))"
+           "      (if (i32.ne (i32.load8_u (i32.const 240)) (i32.const 0))"
+           "          (then unreachable))"
+           "      (call $sdropr (global.get $srcread))"
+           "      (call $fdropr (global.get $futread))"
            "      (local.set $s (call $snew))"
            "      (global.set $readable (i32.wrap_i64 (local.get $s)))"
            "      (global.set $writable (i32.wrap_i64 (i64.shr_u (local.get $s) (i64.const 32))))"
            "      (global.set $fut (call $wvs (global.get $readable)))"
-           "      (global.set $set (call $wsnew))"
            "      (call $wjoin (global.get $fut) (global.get $set))"
            "      (local.set $ret (call $fread (global.get $fut) (i32.const 192)))"
            "      (if (i32.ne (local.get $ret) (i32.const -1)) (then unreachable))"
@@ -1038,10 +1139,14 @@
            "          (export \"get-initial-cwd\" (func $getcwd-lowered))"
            "          (export \"get-terminal-stdout\" (func $gettty-lowered))"
            "          (export \"write-via-stream\" (func $wvs-lowered))"
+           "          (export \"read-via-stream\" (func $rvs-lowered))"
            "          (export \"task.return\" (func $tr))"
            "          (export \"stream.new\" (func $snew))"
            "          (export \"stream.write\" (func $swrite))"
            "          (export \"stream.drop-writable\" (func $sdropw))"
+           "          (export \"stream.read\" (func $sread))"
+           "          (export \"stream.drop-readable\" (func $sdropr))"
+           "          (export \"future.drop-readable\" (func $fdropr))"
            "          (export \"future.read\" (func $fread))"
            "          (export \"waitable-set.new\" (func $wsnew))"
            "          (export \"waitable.join\" (func $wjoin))"
@@ -1057,12 +1162,455 @@
   (component-encode:encode-component
    (wasmdown.component.text::parse-component-text *p3-cli-text*)))
 
+;;; ---------------------------------------------------------------
+;;; Fixture 10: the FILESYSTEM consumer surface — wasi:filesystem/
+;;; {types,preopens}@0.3.2. This is the guest the CLI lane's PLAN
+;;; §9.3 row lacked: the P2 lane only ever exercised the filesystem
+;;; through an in-process provider/unit test, never through a real
+;;; command component.
+;;;
+;;; Import (exact signatures, specs/wasi/wasi-wit-0.3.2/filesystem/
+;;; filesystem.wit):
+;;;
+;;;   wasi:filesystem/preopens@0.3.2
+;;;     get-directories: func() -> list<tuple<descriptor, string>>
+;;;                      ; descriptor is own<descriptor>, FIRST
+;;;   wasi:filesystem/types@0.3.2
+;;;     [method]descriptor.open-at:
+;;;       async func(self: borrow<descriptor>, path-flags: path-flags,
+;;;                  path: string, open-flags: open-flags,
+;;;                  flags: descriptor-flags)
+;;;         -> result<descriptor, error-code>
+;;;     [method]descriptor.read-via-stream:
+;;;       func(self: borrow<descriptor>, offset: filesize)
+;;;         -> tuple<stream<u8>, future<result<_, error-code>>>
+;;;
+;;; Canonical LOWER shapes (CanonicalABI flatten §2894-2930;
+;;; MAX_FLAT_ASYNC_PARAMS = 4, ANY async result rides the appended
+;;; [ptr] out-param):
+;;;
+;;;   get-directories  (sync)  core (param i32)     ; retptr -> (ptr,len)
+;;;   open-at          (async) core (param i32 i32) (result i32)
+;;;       ; the 5 flat params (path-flags i32, string ptr+len,
+;;;       ; open-flags i32, descriptor-flags i32) exceed 4, so the
+;;;       ; FIRST param is the ADDRESS of the params tuple; the
+;;;       ; SECOND is the caller's result out-param; the i32 result
+;;;       ; is the packed subtask state (state | index<<4).
+;;;       ; memory + realloc are required: the result's error-code
+;;;       ; variant carries a `string' case (other(option<string>)).
+;;;   read-via-stream  (sync)  core (param i32 i64 i32)
+;;;       ; (self handle, offset, retptr) -> (stream handle @0,
+;;;       ; future handle @4)
+;;;
+;;; The params-tuple layout (flags have an ELEMENT SIZE OF 1/2/4 per
+;;; alignment_flags: 1 label and 4 labels are 1-byte fields, so the
+;;; tuple is pf@0 u8, string ptr@4/len@8, open-flags@12 u8,
+;;; descriptor-flags@13 u8, size 16):
+;;;
+;;;   0 path-flags u8 | 4 path ptr | 8 path len | 12 open-flags u8
+;;;   | 13 descriptor-flags u8
+;;;
+;;; The result out-param (result<own<descriptor>, error-code>) is
+;;; disc@0 u8 and the payload at align 4: handle@4, or the
+;;; error-code variant's disc@4 (no-entry = case 19).
+;;;
+;;; The memory layouts the guest reads are the canonical store rules:
+;;; a list<tuple<own<descriptor>, string>> header is (ptr@0, len@4)
+;;; with 12-byte elements (handle@0, name ptr@4, name len@8); a
+;;; tuple<stream<u8>, future<...>> result is two i32 handles.
+;;;
+;;; The guest (run lifted async with a callback) asserts, and TRAPS
+;;; on any failure:
+;;;   1. get-directories has an entry named "/work"; take its handle;
+;;;   2. open-at("hello.txt", read) returns ok and a live descriptor;
+;;;   3. read-via-stream(0) + stream.read yields exactly 17 bytes
+;;;      equal to the seeded "filesystem-probe\n" and the paired
+;;;      future resolves ok;
+;;;   4. open-at("missing.txt") returns ERR with error-code::no-entry
+;;;      (case 19) — an err result, never a trap;
+;;;   5. every handle is dropped (opened descriptor, both stream
+;;;      ends, the preopen's own handle).
+;;;
+;;; The async open-at is waited the CanonicalABI way: a packed
+;;; STARTING/STARTED state is joined into a waitable set and
+;;; waitable-set.wait takes the SUBTASK(1)/RETURNED(2) event of THAT
+;;; subtask; the eager RETURNED(2) pack needs no wait. The stream and
+;;; future reads use the async copy built-ins: an eager event is the
+;;; return value, a BLOCKED (-1) copy is waited on in the set and the
+;;; event payload (CopyResult + progress<<4) is the result.
+
+(defparameter *p3-fs-error-code-cases*
+  '("access" "already" "bad-descriptor" "busy" "deadlock" "quota"
+    "exist" "file-too-large" "illegal-byte-sequence" "in-progress"
+    "interrupted" "invalid" "io" "is-directory" "loop" "too-many-links"
+    "message-size" "name-too-long" "no-device" "no-entry" "no-lock"
+    "insufficient-memory" "insufficient-space" "not-directory"
+    "not-empty" "not-recoverable" "unsupported" "no-tty"
+    "no-such-device" "overflow" "not-permitted" "pipe" "read-only"
+    "invalid-seek" "text-file-busy" "cross-device"))
+
+(defparameter *p3-fs-text*
+  (format nil "~{~a~%~}"
+          (list
+           "(component"
+           ;; the ALIAS DECLARATORS INSIDE AN INSTANCE TYPE come FIRST
+           ;; and target indices at or beyond the instance's own
+           ;; partial type vector: the validator's declarator walk
+           ;; pushes a :outer-aliased marker for a non-resource
+           ;; target but a RESOURCE marker when the target index
+           ;; happens to name a resource slot of the partial space.
+           ;; Ordered this way every numeric target (0,1,2,4) is past
+           ;; the partial vector, so the walk only ever emits
+           ;; markers and the func result validates. (Top-level type
+           ;; order: $pf=0, $of=1, $df=2, option<string>=3, $ec=4.)
+           "  (type $pf (flags \"symlink-follow\"))"
+           "  (type $of (flags \"create\" \"directory\" \"exclusive\" \"truncate\"))"
+           "  (type $df (flags \"read\" \"write\" \"file-integrity-sync\""
+           "                   \"data-integrity-sync\" \"requested-write-sync\""
+           "                   \"mutate-directory\"))"
+           (format nil
+                   "  (type $ec (variant ~{(case ~s)~^ ~} (case \"other\" (option string))))"
+                   *p3-fs-error-code-cases*)
+           "  (type $ST (stream u8))"
+           "  (type $FT (future (result (error $ec))))"
+           "  (type $res (result))"
+           ;; The imported instance type declares its five type
+           ;; exports LOCALLY (`type` declarators named by an
+           ;; `(export ... (type $id))`) and then the methods. That
+           ;; mirrors the provider: FILESYSTEM-TYPES-INSTANCE exports
+           ;; the interface's defined types under their WIT names
+           ;; (path-flags/open-flags/descriptor-flags/error-code) and
+           ;; the descriptor resource. Locality matters twice: the
+           ;; variant's `other(option string)` prerequisite ref must
+           ;; live in THIS declarator space, and an `(alias outer ...)`
+           ;; of a compound top-level type is re-walked by the
+           ;; validator's remap in the instance space, where its inner
+           ;; index aliased back to the alias slot (infinite remap).
+           "  (import \"wasi:filesystem/types@0.3.2\""
+           "    (instance $types"
+           "      (type $pf2 (flags \"symlink-follow\"))"
+           "      (export \"path-flags\" (type $pf3 (eq $pf2)))"
+           "      (type $of2 (flags \"create\" \"directory\" \"exclusive\""
+           "                       \"truncate\"))"
+           "      (export \"open-flags\" (type $of3 (eq $of2)))"
+           "      (type $df2 (flags \"read\" \"write\" \"file-integrity-sync\""
+           "                        \"data-integrity-sync\""
+           "                        \"requested-write-sync\""
+           "                        \"mutate-directory\"))"
+           "      (export \"descriptor-flags\" (type $df3 (eq $df2)))"
+           (format nil
+                   "      (type $ec2 (variant ~{(case ~s)~^ ~} (case \"other\" (option string))))"
+                   *p3-fs-error-code-cases*)
+           "      (export \"error-code\" (type $ec3 (eq $ec2)))"
+           "      (export \"descriptor\" (type $dt (sub resource)))"
+           "      (export \"[method]descriptor.open-at\""
+           "        (func async (param \"self\" (borrow $dt))"
+           "                    (param \"path-flags\" $pf3)"
+           "                    (param \"path\" string)"
+           "                    (param \"open-flags\" $of3)"
+           "                    (param \"flags\" $df3)"
+           "                    (result (result (own $dt) (error $ec3)))))"
+           "      (export \"[method]descriptor.read-via-stream\""
+           "        (func (param \"self\" (borrow $dt))"
+           "              (param \"offset\" u64)"
+           "              (result (tuple (stream u8)"
+           "                             (future (result (error $ec3)))))))))"
+           "  (alias export $types \"descriptor\" (type $desc))"
+           "  (import \"wasi:filesystem/preopens@0.3.2\""
+           "    (instance $pre"
+           "      (export \"get-directories\""
+           "        (func (result (list (tuple (own $desc) string)))))))"
+           "  (alias export $types \"[method]descriptor.open-at\" (func $openat-f))"
+           "  (alias export $types \"[method]descriptor.read-via-stream\" (func $rvs-f))"
+           "  (alias export $pre \"get-directories\" (func $getdirs-f))"
+           "  (core module $Mem"
+           "    (memory (export \"mem\") 1)"
+           "    (global $bump (mut i32) (i32.const 4096))"
+           "    (func (export \"realloc\") (param i32 i32 i32 i32) (result i32)"
+           "      (local $p i32)"
+           "      (local.set $p (global.get $bump))"
+           "      (global.set $bump"
+           "        (i32.and (i32.add (global.get $bump)"
+           "                          (i32.add (local.get 3) (i32.const 7)))"
+           "                 (i32.const -8)))"
+           "      (local.get $p)))"
+           "  (core instance $mem (instantiate $Mem))"
+           "  (core func $getdirs-lowered"
+           "    (canon lower (func $getdirs-f)"
+           "      (memory (core memory $mem \"mem\"))"
+           "      (realloc (core func $mem \"realloc\"))))"
+           "  (core func $openat-lowered"
+           "    (canon lower (func $openat-f) async"
+           "      (memory (core memory $mem \"mem\"))"
+           "      (realloc (core func $mem \"realloc\"))))"
+           "  (core func $rvs-lowered"
+           "    (canon lower (func $rvs-f)"
+           "      (memory (core memory $mem \"mem\"))"
+           "      (realloc (core func $mem \"realloc\"))))"
+           "  (canon task.return (result $res) (core func $tr))"
+           "  (canon waitable-set.new (core func $wsnew))"
+           "  (canon waitable.join (core func $wjoin))"
+           "  (canon waitable-set.wait (memory (core memory $mem \"mem\")) (core func $wswait))"
+           "  (canon subtask.drop (core func $subdrop))"
+           "  (canon stream.read $ST async (memory (core memory $mem \"mem\")) (core func $sread))"
+           "  (canon future.read $FT async"
+           "         (memory (core memory $mem \"mem\"))"
+           "         (realloc (core func $mem \"realloc\"))"
+           "         (core func $fread))"
+           "  (canon stream.drop-readable $ST (core func $sdropr))"
+           "  (canon future.drop-readable $FT (core func $fdropr))"
+           "  (canon resource.drop $desc (core func $fdrop))"
+           "  (core module $M"
+           "    (import \"env\" \"mem\" (memory 1))"
+           "    (import \"env\" \"get-directories\" (func $getdirs (param i32)))"
+           "    (import \"env\" \"open-at\" (func $openat (param i32 i32) (result i32)))"
+           "    (import \"env\" \"read-via-stream\" (func $rvs (param i32 i64 i32)))"
+           "    (import \"env\" \"task.return\" (func $tr (param i32)))"
+           "    (import \"env\" \"waitable-set.new\" (func $wsnew (result i32)))"
+           "    (import \"env\" \"waitable.join\" (func $wjoin (param i32 i32)))"
+           "    (import \"env\" \"waitable-set.wait\" (func $wswait (param i32 i32) (result i32)))"
+           "    (import \"env\" \"subtask.drop\" (func $subdrop (param i32)))"
+           "    (import \"env\" \"stream.read\" (func $sread (param i32 i32 i32) (result i32)))"
+           "    (import \"env\" \"future.read\" (func $fread (param i32 i32) (result i32)))"
+           "    (import \"env\" \"stream.drop-readable\" (func $sdropr (param i32)))"
+           "    (import \"env\" \"future.drop-readable\" (func $fdropr (param i32)))"
+           "    (import \"env\" \"resource.drop\" (func $fdrop (param i32)))"
+           "    (data (i32.const 64) \"hello.txt\")"
+           "    (data (i32.const 80) \"missing.txt\")"
+           "    (data (i32.const 96) \"/work\")"
+           "    (data (i32.const 112) \"filesystem-probe\\n\")"
+           "    (global $ws (mut i32) (i32.const 0))"
+           "    (func $streq (param $a i32) (param $b i32) (param $n i32) (result i32)"
+           "      (local $i i32)"
+           "      (block $done"
+           "        (loop $l"
+           "          (br_if $done (i32.ge_u (local.get $i) (local.get $n)))"
+           "          (if (i32.ne (i32.load8_u (i32.add (local.get $a) (local.get $i)))"
+           "                      (i32.load8_u (i32.add (local.get $b) (local.get $i))))"
+           "              (then (return (i32.const 0))))"
+           "          (local.set $i (i32.add (local.get $i) (i32.const 1)))"
+           "          (br $l)))"
+           "      (i32.const 1))"
+           ;; the async open-at: read the out-param only after the
+           ;; subtask has RETURNED; the event tuple lands at 336
+           "    (func $settle (param $packed i32)"
+           "      (local $st i32) (local $sub i32) (local $ret i32)"
+           "      (local.set $st (i32.and (local.get $packed) (i32.const 15)))"
+           "      (local.set $sub (i32.shr_u (local.get $packed) (i32.const 4)))"
+           ;; the EAGER pack (§3714-3717) is the bare state 2: the
+           ;; runtime already delivered and dropped the subtask, so
+           ;; there is no index to drop here
+           "      (if (i32.eq (local.get $st) (i32.const 2)) (then (return)))"
+           "      (if (i32.gt_u (local.get $st) (i32.const 1)) (then unreachable))"
+           "      (call $wjoin (local.get $sub) (global.get $ws))"
+           "      (local.set $ret (call $wswait (global.get $ws) (i32.const 336)))"
+           "      (if (i32.ne (local.get $ret) (i32.const 1)) (then unreachable))"
+           "      (if (i32.ne (i32.load (i32.const 340)) (local.get $sub)) (then unreachable))"
+           "      (if (i32.ne (i32.load (i32.const 344)) (i32.const 2)) (then unreachable))"
+           "      (call $wjoin (local.get $sub) (i32.const 0))"
+           "      (call $subdrop (local.get $sub)))"
+           "    (func (export \"run\") (result i32) (i32.const 1))"
+           "    (func (export \"run-cb\")"
+           "          (param $code i32) (param $si i32) (param $payload i32)"
+           "          (result i32)"
+           "      (local $base i32) (local $n i32) (local $i i32) (local $e i32)"
+           "      (local $pre i32) (local $ret i32) (local $cnt i32)"
+           "      (local $stream i32) (local $fut i32) (local $fd i32)"
+           "      (if (i32.ne (local.get $code) (i32.const 0)) (then unreachable))"
+           ;; 1. the preopen named "/work"
+           "      (call $getdirs (i32.const 0))"
+           "      (local.set $base (i32.load (i32.const 0)))"
+           "      (local.set $n (i32.load (i32.const 4)))"
+           "      (block $found"
+           "        (loop $l"
+           "          (br_if $found (i32.ge_u (local.get $i) (local.get $n)))"
+           "          (local.set $e (i32.add (local.get $base)"
+           "                                 (i32.mul (local.get $i) (i32.const 12))))"
+           "          (if (i32.and (i32.eq (i32.load (i32.add (local.get $e) (i32.const 8)))"
+           "                               (i32.const 5))"
+           "                       (call $streq (i32.load (i32.add (local.get $e) (i32.const 4)))"
+           "                                    (i32.const 96) (i32.const 5)))"
+           "              (then (local.set $pre (i32.load (local.get $e)))))"
+           "          (local.set $i (i32.add (local.get $i) (i32.const 1)))"
+           "          (br $l)))"
+           "      (if (i32.eqz (local.get $pre)) (then unreachable))"
+           "      (global.set $ws (call $wsnew))"
+           ;; 2. open "hello.txt" read-only through the preopen.
+           ;; The async lower has 5 flat params (self borrow, one
+           ;; path-flags field, the path's ptr+len, open-flags,
+           ;; descriptor-flags), so MAX_FLAT_ASYNC_PARAMS = 4 collapses
+           ;; the WHOLE parameter tuple into the first core arg. The
+           ;; tuple layout is (self i32 @0, path-flags u8 @4, string
+           ;; ptr @8 / len @12, open-flags u8 @16, descriptor-flags
+           ;; u8 @17).
+           "      (i32.store (i32.const 32) (local.get $pre))"
+           "      (i32.store8 (i32.const 36) (i32.const 0))"
+           "      (i32.store (i32.const 40) (i32.const 64))"
+           "      (i32.store (i32.const 44) (i32.const 9))"
+           "      (i32.store8 (i32.const 48) (i32.const 0))"
+           "      (i32.store8 (i32.const 49) (i32.const 1))"
+           "      (local.set $ret (call $openat (i32.const 32) (i32.const 8)))"
+           "      (call $settle (local.get $ret))"
+           "      (if (i32.ne (i32.load8_u (i32.const 8)) (i32.const 0)) (then unreachable))"
+           "      (local.set $fd (i32.load (i32.const 12)))"
+           ;; 3. read it through read-via-stream + stream.read
+           "      (call $rvs (local.get $fd) (i64.const 0) (i32.const 16))"
+           "      (local.set $stream (i32.load (i32.const 16)))"
+           "      (local.set $fut (i32.load (i32.const 20)))"
+           "      (local.set $ret (call $sread (local.get $stream)"
+           "                                   (i32.const 256) (i32.const 64)))"
+           "      (if (i32.eq (local.get $ret) (i32.const -1))"
+           "          (then"
+           "            (call $wjoin (local.get $stream) (global.get $ws))"
+           "            (local.set $ret (call $wswait (global.get $ws) (i32.const 336)))"
+           "            (if (i32.ne (local.get $ret) (i32.const 2)) (then unreachable))"
+           "            (call $wjoin (local.get $stream) (i32.const 0))"
+           "            (local.set $ret (i32.load (i32.const 344)))))"
+           "      (if (i32.ne (i32.and (local.get $ret) (i32.const 15)) (i32.const 0))"
+           "          (then unreachable))"
+           "      (local.set $cnt (i32.shr_u (local.get $ret) (i32.const 4)))"
+           "      (if (i32.ne (local.get $cnt) (i32.const 17)) (then unreachable))"
+           "      (if (i32.ne (i32.load (i32.const 256)) (i32.load (i32.const 112)))"
+           "          (then unreachable))"
+           "      (if (i32.ne (i32.load (i32.const 260)) (i32.load (i32.const 116)))"
+           "          (then unreachable))"
+           "      (if (i32.ne (i32.load (i32.const 264)) (i32.load (i32.const 120)))"
+           "          (then unreachable))"
+           "      (if (i32.ne (i32.load (i32.const 268)) (i32.load (i32.const 124)))"
+           "          (then unreachable))"
+           "      (if (i32.ne (i32.load8_u (i32.const 272)) (i32.load8_u (i32.const 128)))"
+           "          (then unreachable))"
+           ;; the stream's paired future must resolve ok
+           "      (local.set $ret (call $fread (local.get $fut) (i32.const 24)))"
+           "      (if (i32.eq (local.get $ret) (i32.const -1))"
+           "          (then"
+           "            (call $wjoin (local.get $fut) (global.get $ws))"
+           "            (local.set $ret (call $wswait (global.get $ws) (i32.const 336)))"
+           "            (if (i32.ne (local.get $ret) (i32.const 4)) (then unreachable))"
+           "            (call $wjoin (local.get $fut) (i32.const 0))))"
+           "      (if (i32.ne (i32.load8_u (i32.const 24)) (i32.const 0)) (then unreachable))"
+           "      (call $sdropr (local.get $stream))"
+           "      (call $fdropr (local.get $fut))"
+           "      (call $fdrop (local.get $fd))"
+           ;; 4. the negative probe: a missing path is an ERR result
+           ;; (error-code::no-entry = case 19), never a trap
+           "      (i32.store (i32.const 40) (i32.const 80))"
+           "      (i32.store (i32.const 44) (i32.const 11))"
+           "      (local.set $ret (call $openat (i32.const 32) (i32.const 8)))"
+           "      (call $settle (local.get $ret))"
+           "      (if (i32.ne (i32.load8_u (i32.const 8)) (i32.const 1)) (then unreachable))"
+           "      (if (i32.ne (i32.load8_u (i32.const 12)) (i32.const 19)) (then unreachable))"
+           ;; 5. the preopen's own handle goes too
+           "      (call $fdrop (local.get $pre))"
+           "      (call $tr (i32.const 0))"
+           "      (i32.const 0)))"
+           "  (core instance $m"
+           "    (instantiate $M"
+           "      (with \"env\""
+           "        (instance"
+           "          (export \"mem\" (memory $mem \"mem\"))"
+           "          (export \"get-directories\" (func $getdirs-lowered))"
+           "          (export \"open-at\" (func $openat-lowered))"
+           "          (export \"read-via-stream\" (func $rvs-lowered))"
+           "          (export \"task.return\" (func $tr))"
+           "          (export \"waitable-set.new\" (func $wsnew))"
+           "          (export \"waitable.join\" (func $wjoin))"
+           "          (export \"waitable-set.wait\" (func $wswait))"
+           "          (export \"subtask.drop\" (func $subdrop))"
+           "          (export \"stream.read\" (func $sread))"
+           "          (export \"future.read\" (func $fread))"
+           "          (export \"stream.drop-readable\" (func $sdropr))"
+           "          (export \"future.drop-readable\" (func $fdropr))"
+           "          (export \"resource.drop\" (func $fdrop))))))"
+           "  (func $run (export \"run\") async (result $res)"
+           "    (canon lift (core func $m \"run\") async"
+           "                (callback (core func $m \"run-cb\"))))"
+           "  (instance $runiface (export \"run\" (func $run)))"
+           "  (export \"wasi:cli/run@0.3.2\" (instance $runiface)"
+           "    (instance (export \"run\" (func async (result $res))))))")))
+
+(defun %canon-definition (comp kind)
+  "Rewrite the text parser's :builtin classification of the dotted
+canon DEFINITION KIND (:resource-drop / :resource-new / :resource-rep)
+into the canon definition the encoder understands. The parser routes
+EVERY dotted name to :builtin (src/component-text.lisp), while these
+three are canon-style definitions carrying a typeidx immediate; the
+binary encoding is opcode 0x03/0x02/0x04 + typeidx."
+  (loop for d across (wasmdown.component::comp-defs comp)
+        do (let ((p (and (eq (wasmdown.component::compdef-kind d) :canon)
+                         (wasmdown.component::compdef-payload d))))
+             (when (and p
+                        (eq (wasmdown.component::canonrec-kind p) :builtin)
+                        (eq (first (wasmdown.component::canonrec-imms p))
+                            kind))
+               (let ((idx (second (wasmdown.component::canonrec-imms p))))
+                 (setf (wasmdown.component::canonrec-kind p) kind
+                       (wasmdown.component::canonrec-typeidx p) idx
+                       (wasmdown.component::canonrec-imms p) nil)))))
+  comp)
+
+(defun %normalize-eq-bounds (comp)
+  "The text parser emits a `(type (eq N))` externtype payload as the
+LIST (:type :eq N); tools/component-encode's enc-typebound reads the
+CONS shape (:eq . N) (no earlier fixture used an eq-bound export).
+Normalize the IR the encoder consumes."
+  (loop for d across (wasmdown.component::comp-defs comp)
+        do (let ((p (wasmdown.component::compdef-payload d)))
+             (when (and (eq (wasmdown.component::compdef-kind d) :type)
+                        (eq (wasmdown.component::ct-kind p) :instance))
+               (loop for td across (wasmdown.component::ct-payload p)
+                     when (member (wasmdown.component::typedecl-kind td)
+                                  '(:import :export))
+                       do (let* ((pl (wasmdown.component::typedecl-payload td))
+                                 (et (third pl)))
+                            (when (and (consp et)
+                                       (eq (car et) :type)
+                                       (consp (cdr et))
+                                       (eq (second et) :eq)
+                                       (= (length et) 3))
+                              (setf (third pl)
+                                    (cons :type
+                                          (cons :eq
+                                                (third et))))))))))
+  comp)
+
+(defun p3-fs-guest-bytes ()
+  (component-encode:encode-component
+   (%normalize-eq-bounds
+    (%canon-definition
+     (wasmdown.component.text::parse-component-text *p3-fs-text*)
+     :resource-drop))))
+
+(defun p3-fs-context (path)
+  "The filesystem capability context the fixture asserts against: one
+preopen named /work over a fresh temporary directory seeded with
+hello.txt. :AFTER closes the preopen and removes the directory (the
+builder runs in-process, so it owns the host handle)."
+  (declare (ignore path))
+  (let* ((dir (merge-pathnames
+               (format nil "wasmdown-fs-~36r/"
+                       (random (expt 2 32)))
+               (uiop:temporary-directory)))
+         (seed (merge-pathnames "hello.txt" dir)))
+    (ensure-directories-exist dir)
+    (with-open-file (s seed :direction :output :if-exists :supersede)
+      (format s "filesystem-probe~%"))
+    (let ((pre (wasmdown.wasi:open-wasi-preopen dir :name "/work")))
+      (list :preopens (list pre)
+            :after (lambda ()
+                     (ignore-errors (wasmdown.wasi:close-wasi-preopen pre))
+                     (ignore-errors
+                       (uiop:delete-directory-tree
+                        dir :validate t :if-does-not-exist :ignore)))))))
+
 (defun p3-cli-context (path)
   "The capability context the CLI-lane fixture asserts against: argv
 (the path the runner gave it as argv[0], plus the marker the suite
-passes) and the environment pairs the suite passes with --env."
+passes), the environment pairs the suite passes with --env, and the
+suite's stdin bytes (\"stdin-probe\\n\")."
   (let ((argv0 (namestring path)))
     (list :arguments (list argv0 "wmd-cli-marker")
+          :stdin (make-string-input-stream (format nil "stdin-probe~%"))
           :environment (list (cons "WMD_ENV_PROBE" "env-probe-value")
                              (cons "WMD_EXPECT_ARGV0" argv0)
                              (cons "WMD_EXPECT_TERMINAL" "none")))))
@@ -1083,7 +1631,9 @@ passes) and the environment pairs the suite passes with --env."
         (list "p3-deadline-guest.wasm" #'p3-deadline-guest-bytes 0 "" "" nil)
         (list "p3-cli-guest.wasm" #'p3-cli-guest-bytes 0 ""
               (format nil "p3-cli-guest: stderr probe~%")
-              #'p3-cli-context)))
+              #'p3-cli-context)
+        (list "p3-fs-guest.wasm" #'p3-fs-guest-bytes 0 "" ""
+              #'p3-fs-context)))
 
 ;;; ---------------------------------------------------------------
 ;;; Verify through this project's own decoder/validator/runner, then
@@ -1105,7 +1655,7 @@ passes) and the environment pairs the suite passes with --env."
               do (return (subseq line 0 (min 64 (length line))))))))
 
 (defun verify (label bytes expected-status expected-stdout
-               &key expected-stderr arguments environment)
+               &key expected-stderr arguments environment preopens stdin)
   (let* ((comp (wasmdown.component:decode-component bytes))
          (_ (wasmdown.component:validate-component comp))
          (sink (make-string-output-stream))
@@ -1117,7 +1667,10 @@ passes) and the environment pairs the suite passes with --env."
                          :stdout sink :stderr errsink :reactor reactor
                          (append (and arguments (list :arguments arguments))
                                  (and environment
-                                      (list :environment environment)))))
+                                      (list :environment environment))
+                                 (and stdin (list :stdin stdin))
+                                 (and preopens
+                                      (list :preopens preopens)))))
          (status (progn (wasmdown.wasi:run-component comp context))))
     (declare (ignore _))
     (ignore-errors (wasmdown.wasi:reactor-close reactor))
@@ -1168,7 +1721,11 @@ passes) and the environment pairs the suite passes with --env."
                 (verify name bytes status stdout
                         :expected-stderr stderr
                         :arguments (getf extra :arguments)
-                        :environment (getf extra :environment))
+                        :environment (getf extra :environment)
+                        :stdin (getf extra :stdin)
+                        :preopens (getf extra :preopens))
+                (let ((after (getf extra :after)))
+                  (when after (funcall after)))
                 (push (format nil "~a  ~a" (sha256 path) name) lines)
                 (format t "~&wrote ~a~%" path))))
           (with-open-file (s *sums* :direction :output :if-exists :supersede)

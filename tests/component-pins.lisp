@@ -6283,6 +6283,35 @@ THE LOCK ORDER rule (b): those are RIGHT acquisitions, and a held
              (r (c :result (cons (c :prim :u32) lst))))
         (is (equal '(0 3 0) (lower (cons :ok 3) r)))))))
 
+(test component/abi-bare-variant-label
+  ;; A bare label is the native providers' shorthand for a PAYLOAD-LESS
+  ;; case (e.g. (:err . "no-entry") -> "no-entry"). It must never be
+  ;; accepted for a case WITH a payload: that would store only the
+  ;; discriminant and leave the payload slot untouched.
+  (let* ((mk (symbol-function 'wasmdown.component.runtime::make-ct*))
+         (inst (wasmdown.component.runtime:make-comp-instance))
+         (mem (wasmdown.runtime:make-memory-instance
+               (wasmdown.types:make-wasm-limits 1)))
+         (cx (wasmdown.component.runtime::make-abi-cx
+              :inst inst :type-inst inst :memory mem)))
+    (flet ((c (&rest a) (apply mk a)))
+      (let* ((v (c :variant (vector (cons "none" nil)
+                                    (cons "some" (c :prim :u32))))))
+        ;; payload-less: bare label is the shorthand, discriminant only
+        (wasmdown.component.runtime::%abi-store cx "none" v 0)
+        (is (= 0 (wasmdown.component.runtime::%abi-load-int cx 0 1)))
+        ;; payload-bearing: bare label is refused, never half-stored
+        (handler-case
+            (progn
+              (wasmdown.component.runtime::%abi-store cx "some" v 8)
+              (is nil))
+          (wasmdown:host-error (e)
+            (is (search "bare variant label" (wasmdown:wasmdown-error-message e)))))
+        ;; the tagged form still stores discriminant + payload
+        (wasmdown.component.runtime::%abi-store cx (cons "some" 7) v 8)
+        (is (= 1 (wasmdown.component.runtime::%abi-load-int cx 8 1)))
+        (is (= 7 (wasmdown.component.runtime::%abi-load-int cx 12 4)))))))
+
 (test component/abi-compound-result-store-load
   ;; the canonical LAYOUT (not just the flat path): discriminant byte,
   ;; join-aligned payload, and the exact round trip for both arms.
