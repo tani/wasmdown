@@ -314,10 +314,11 @@ the nested core ran through the selected backend via the entry counters.
 
 The richer stdout-importing async command already in `tests/wasi.lisp` writes
 "hi" through a `stream<u8>` and `task.return`s; it is green through
-`run-component` without a reactor, but driving it through the CLI (which owns a
-reactor) re-enters the core body every store tick, repeating stdout and ending
-in the deadlock oracle. That defect is recorded in `status.md`; the lane uses
-the sync command until it is fixed.
+`run-component` without a reactor. Its body is not resume-safe (it writes
+unconditionally), so a reactor-driven resume re-executes it and stdout repeats;
+that is a limitation of this four-instruction fixture, not of the scheduler,
+and it is recorded in `status.md`. The CLI lane uses the sync command until a
+resume-safe async guest is pinned.
 
 ## Roadmap-era notes
 

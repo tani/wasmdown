@@ -63,11 +63,13 @@ and neither is a validation rule (ADR-005).
 - Descriptor destructors and lend lists accumulate in long-lived hosts.
 - `@unstable` is parsed and recorded but not enforced; the affected interfaces
   are simply not registered.
-- An async-lifted command component driven by the CLI (which owns a reactor)
-  re-enters its core body each store tick instead of resuming the canonical
-  continuation: stdout repeats and the run ends in the deadlock oracle. The
-  same component is green through `run-component` without a reactor
-  (`tests/wasi.lisp`); the P3 CLI lane therefore uses the sync command.
+- The async-lifted command fixture in `tests/wasi.lisp` is not
+  resume-safe: its core body writes unconditionally, so when the CLI's
+  reactor resumes the task the body re-executes (stdout repeats, then the
+  deadlock oracle). That is a property of the tiny fixture, not of the
+  scheduler: a real async command keeps its state in memory and resumes.
+  It is green through `run-component` without a reactor; the P3 CLI lane
+  uses the sync command until a resume-safe async guest is pinned.
 - WASI 0.2 (shared by both backends, found by the behavioural audit):
   end-of-input is reported as `stream-error::closed` rather than `ok([])`;
   `write`/`write-zeroes` do not enforce the `check-write` permit; the UDP
