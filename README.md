@@ -26,6 +26,33 @@ Component Model (canonical ABI, resources, async), and WASI hosts — with
 | Threads / atomics, FASL cache, optimized or AOT backend | Not implemented |
 | Annotations proposal | Out of scope |
 
+## Repository structure
+
+```mermaid
+graph TD
+  ROOT["wasmdown"] --> SRC["src/ — 22 files, one per subsystem"]
+  ROOT --> TESTS["tests/"]
+  ROOT --> TOOLS["tools/"]
+  ROOT --> DOCS["docs/"]
+  ROOT --> SPECS["specs/ — vendored specs and pins"]
+  ROOT --> BUILD["wasmdown.asd + Makefile"]
+  SRC --> FRONT["frontends<br/>binary · binary-encode · text · wast"]
+  SRC --> CORE["core engine<br/>types · validate · runtime · interp · codegen"]
+  SRC --> COMP["component model<br/>component · component-text · component-runtime · wit"]
+  SRC --> HOST["WASI hosts<br/>wasi · wasi-preview1 · wasi-preview2"]
+  SRC --> BASE["shared base<br/>packages · conditions · numops · simd · api · cli"]
+  TESTS --> T_U["unit and integration pins"]
+  TESTS --> T_L["spec-core/ · component/ · fixtures/ — lane corpora"]
+  TOOLS --> X_L["lane runners · inventory · cost bench · fixture builders"]
+  DOCS --> D_A["architecture · status · usage/ · development"]
+  DOCS --> D_C["conformance/ — generated reports"]
+  DOCS --> D_H["design/PLAN · adr/ · history"]
+```
+
+`tests/` and `tools/` feed the lanes whose generated results land in
+`docs/conformance/`; the module-by-module pipeline diagram is in
+[`docs/architecture.md`](docs/architecture.md).
+
 ## Quick start
 
 Requires **SBCL** (developed against 2.6.4); Python 3 only for the WASI
