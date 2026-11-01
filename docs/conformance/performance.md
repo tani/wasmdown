@@ -64,5 +64,9 @@ functions): the lever is the emitted form's size (temp bindings and tagbody
 length), not SBCL policy (the `(debug 0)(space 3)` experiment is recorded
 above as a −1.2 % negative result; `(speed 1)` was also measured at the
 16-op scale and is strictly worse — same time, 391 MiB vs 309 MiB consed —
-so lower optimization is not a compile-cost lever either). Any reduction
-should be measured against this table.
+so lower optimization is not a compile-cost lever either; and emitting the
+temp slots as ONE simple-vector accessed through SYMBOL-MACROLET instead of N
+lexical bindings was measured at the 16-op scale and is strictly WORSE — 42 ms
+and 745 MiB per function vs 13 ms and 305 MiB — so the binding count is not the
+driver either: the cost sits in SBCL compiling the large TAGBODY/GO graph
+itself). Any reduction should be measured against this table.
