@@ -18,7 +18,7 @@ Component Model (canonical ABI, resources, async), and WASI hosts — with
 | Text format (`.wat`) and `.wast` scripts | Full: parser, stateful script runner, failure-phase classification |
 | Validation | Full for the declared engine scope, including unreachable polymorphism |
 | Interpreter (default backend) | Full: exact i32/i64/f32/f64 semantics, v128, GC, EH, tail calls, multi-memory, memory64 |
-| Codegen backend (`baseline`) | Partial: SBCL `COMPILE` of emitted Lisp; no `return_call*`, compiled core-suite parity incomplete |
+| Codegen backend (`baseline`) | Full for opcode coverage: SBCL `COMPILE` of emitted Lisp, including SIMD, GC, EH and `return_call*`; every pinned core command and component command agrees with the interpreter |
 | Component Model | Full lane green: binary + text, validation, instantiation/linking, canonical ABI, resources, async scheduling |
 | WASI Preview 1 | Full `wasi_snapshot_preview1` surface (46 imports) |
 | WASI 0.3.2 providers | `clocks`, `random`, `cli`, `filesystem`, `sockets` under an explicit capability model |
@@ -26,32 +26,60 @@ Component Model (canonical ABI, resources, async), and WASI hosts — with
 | Threads / atomics, FASL cache, optimized or AOT backend | Not implemented |
 | Annotations proposal | Out of scope |
 
-## Repository structure
+## Execution architecture
+
+Semantic picture of how a guest runs: one IR, one validator, one call
+protocol, and two bodies behind it. The module-by-module pipeline (with
+every front end and encoder) is in [`docs/architecture.md`](docs/architecture.md).
 
 ```mermaid
 graph TD
-  ROOT["wasmdown"] --> SRC["src/ — 22 files, one per subsystem"]
-  ROOT --> TESTS["tests/"]
-  ROOT --> TOOLS["tools/"]
-  ROOT --> DOCS["docs/"]
-  ROOT --> SPECS["specs/ — vendored specs and pins"]
-  ROOT --> BUILD["wasmdown.asd + Makefile"]
-  SRC --> FRONT["frontends<br/>binary · binary-encode · text · wast"]
-  SRC --> CORE["core engine<br/>types · validate · runtime · interp · codegen"]
-  SRC --> COMP["component model<br/>component · component-text · component-runtime · wit"]
-  SRC --> HOST["WASI hosts<br/>wasi · wasi-preview1 · wasi-preview2"]
-  SRC --> BASE["shared base<br/>packages · conditions · numops · simd · api · cli"]
-  TESTS --> T_U["unit and integration pins"]
-  TESTS --> T_L["spec-core/ · component/ · fixtures/ — lane corpora"]
-  TOOLS --> X_L["lane runners · inventory · cost bench · fixture builders"]
-  DOCS --> D_A["architecture · status · usage/ · development"]
-  DOCS --> D_C["conformance/ — generated reports"]
-  DOCS --> D_H["design/PLAN · adr/ · history"]
+  subgraph FRONT["Front ends"]
+    BYTES["core bytes .wasm"] --> DECODE["wasmdown.binary: decode-module"]
+    TEXT[".wat / .wast text"] --> PARSE["wasmdown.text / wasmdown.wast"]
+    DECODE --> IR["wasm-module IR<br/>types · wasm-instr · segments"]
+    PARSE --> IR
+  end
+
+  IR --> VALIDATE["wasmdown.validate<br/>phase class: validation-error"]
+  VALIDATE --> INSTANTIATE["instantiate<br/>link · allocate · prepare"]
+  INSTANTIATE --> INSTANCE["module-instance<br/>funcs · tables · memories · globals · exports"]
+  INSTANCE --> FI["func-instance<br/>kind :wasm / :host<br/>backend · compiled-entry"]
+
+  FI --> WC["wasm-call"]
+  WC --> PROTOCOL["invoke-wasm<br/>guest depth · tail transfer<br/>outermost exception boundary"]
+  PROTOCOL --> BODY_I["interpreter body"]
+  PROTOCOL --> BODY_C["compiled closure<br/>baseline backend"]
+
+  subgraph COMPONENT["Component path"]
+    CBIN["component bytes / text"] --> CDEC["decode / parse component"]
+    CDEC --> CVALID["validate-component"]
+    CVALID --> STORE["component-store + instances"]
+    STORE --> CANON["canon lift / lower<br/>resources · streams · subtasks"]
+  end
+  CANON --> INSTANCE
+  STORE --> WC
+
+  subgraph HOST["Host edge — capabilities only, no ambient authority"]
+    CTX["wasi-context"] --> P1["wasi_snapshot_preview1<br/>46 imports"]
+    CTX --> P2["wasi 0.2 providers"]
+    CTX --> P3["wasi 0.3.2 providers<br/>reactor · streams · futures"]
+  end
+  P1 --> INSTANCE
+  P2 --> CANON
+  P3 --> CANON
+
+  SHARED["shared semantics<br/>numops · simd · runtime values"] -.-> BODY_I
+  SHARED -.-> BODY_C
+  SHARED -.-> CANON
 ```
 
-`tests/` and `tools/` feed the lanes whose generated results land in
-`docs/conformance/`; the module-by-module pipeline diagram is in
-[`docs/architecture.md`](docs/architecture.md).
+Two properties hold across the whole graph: the backend is chosen once at
+`instantiate` and fills `compiled-entry` on the defined func-instances
+(references are never replaced, so imports/exports/tables keep their object),
+and every guest call — interpreted, compiled, or across a component boundary —
+enters through `invoke-wasm`, which owns depth, tail transfers and the
+outermost trap boundary.
 
 ## Quick start
 
@@ -59,7 +87,7 @@ Requires **SBCL** (developed against 2.6.4); Python 3 only for the WASI
 behaviour lane, Nix only to rebuild the pinned WASI fixtures.
 
 ```sh
-make test-unit                  # unit + integration suite (663 tests, ~8 s)
+make test-unit                  # unit + integration suite (667 tests, ~8 s)
 sbcl --script tools/wasmdown.lisp help
 ```
 
@@ -95,7 +123,7 @@ Every lane is measured, not asserted. Latest numbers (2026-11-01):
 
 | Lane | Kind | Measured | Docs |
 | --- | --- | --- | --- |
-| `make test-unit` | gate | 663 pass / 0 fail | — |
+| `make test-unit` | gate | 667 pass / 0 fail | — |
 | `make test-spec-core` | baseline | 21 187 pass / 0 fail / 73 unsupported of 21 260 | [`core.md`](docs/conformance/core.md) |
 | `make test-component` | gate | 1 702 pass / 0 fail / 0 unsupported | [`component.md`](docs/conformance/component.md) |
 | `make report-component-baseline` | report | 1 702 pass / 0 fail under `:baseline` | `tests/component-baseline/component.md` |
