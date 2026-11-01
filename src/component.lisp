@@ -5392,10 +5392,24 @@ the recorded owner ring — the wasi:io/streams re-export chain is an
           (make-ct :kind :resource :payload '(0 . nil) :offset 0))
          ((and (listp bound) (eq (car bound) :eq))
           (handler-case
-              (let ((shape (resolve-declarator-type
-                            ct (second bound)
-                            (gethash ct *ct-owner-view*))))
-                (and (ct-p shape) shape))
+              (let* ((owner (gethash ct *ct-owner-view*))
+                     (shape (resolve-declarator-type ct (second bound)
+                                                     owner)))
+                ;; the resolved shape lives in the DECLARATOR space: its
+                ;; nested (:idx . k) refs index that space, not the
+                ;; component space the alias-exported copy is later read
+                ;; from (a component-level (result _ $e) resolving k
+                ;; there landed on an unrelated non-value type — the
+                ;; wasi:filesystem/types error-code `other(option<string>)`
+                ;; case of filesystem-read-directory @0.3.2, 'alignment
+                ;; of non-value type'). Materialize every reachable ref
+                ;; against the declarator view, exactly as the
+                ;; imported-instance FUNCTYPE remap does
+                ;; (%REMAP-DECL-FUNCTYPE); a shape needs no index once
+                ;; its refs are cts.
+                (and (ct-p shape)
+                     (%materialize-component-ct
+                      shape (%declarator-view ct owner))))
             (wasmdown:validation-error () nil)))
          (t nil))))))
 
@@ -7366,20 +7380,27 @@ the component-space checks never read a declarator index."
                          :offset (ct-offset c)))
                (t c))))
        (export-name-for (m)
-         "The name of the m-th TYPE-INTRODUCING exportdecl (in
-declarator order): a (sub resource) export's et carries the
-:SUB-RESOURCE marker — its declarator-space position is the export
-ARM's ordinal (the bind index the arm assigns), so count type-sorted
-exportdecls."
+         "The export NAME of the declarator at slot M. An own/borrow
+payload names the resource's TYPE INDEX in this DECLARATOR space
+(Binary.md: 0x69/0x68 <typeidx>), and every type-introducing
+declarator occupies one slot — so M counts TYPE-INTRODUCING
+declarators, not type-sorted exportdecls as the old ordinal count
+did: wasi:filesystem/types declares option<string>, error-code, its
+export, and only then the descriptor export, so slot 3 resolved to
+'directory-entry' instead of 'descriptor' and
+[method]descriptor.read-directory's `self` param remapped to the
+directory-entry record instead of the resource handle, breaking the
+shim's actual.3 core signature. NIL when the slot is
+not an exportdecl (an alias or a type declarator carries no export
+name; the caller's resource-marker fallback then applies)."
          (loop with n = -1
                for td across (ct-payload ict)
-               when (and (eq (typedecl-kind td) :export)
-                         (let ((et (third (typedecl-payload td))))
-                           (and (consp et) (eq (car et) :type))))
+               when (%type-indexing-declarator-p td)
                  do (incf n)
                     (when (= n m)
                       (return-from export-name-for
-                        (first (typedecl-payload td))))
+                        (and (eq (typedecl-kind td) :export)
+                             (first (typedecl-payload td)))))
                finally (return-from export-name-for nil)))
        (remap-valtype (vt)
          (if (not (and (consp vt) (eq (car vt) :idx)

@@ -7261,3 +7261,96 @@ provider can check without closing over the resource identity."
         (is (= 1 (wasmdown.component.runtime::%abi-load-int cx 32 1)))
         (is (equal val
                    (wasmdown.component.runtime::%abi-load cx r 32)))))))
+
+
+(test component/alias-export-declarator-refs
+  ;; wasi:filesystem/types@0.3.2 error-code is `other(option<string>)`
+  ;; (specs/wasi/wasi-wit-0.3.2/filesystem/filesystem.wit:68). The
+  ;; component does `(alias export 0 "error-code" (type))`, so the
+  ;; variant ct — whose case payload is a DECLARATOR-space
+  ;; (:idx . 0) naming option<string>, a type the instance never
+  ;; exports — is pushed into the COMPONENT type space verbatim. A
+  ;; later component-level `(result _ $e)` then read that ref in the
+  ;; component space, landed on index 0 (the imported instance
+  ;; type), and elem_size failed 'alignment of non-value type'
+  ;; (upstream filesystem-read-directory @0.3.2). The export shape
+  ;; resolver must materialize the declarator refs.
+  (labels ((mk (kind payload)
+             (wasmdown.component::make-ct :kind kind :payload payload
+                                          :offset 0))
+           (decl (kind payload)
+             (wasmdown.component::make-typedecl :kind kind :payload payload))
+           (export-decl (name bound)
+             (decl :export (list name nil (cons :type bound)))))
+    (let* ((ict (mk :instance
+                    (vector (decl :type (mk :option :string))
+                            (decl :type (mk :variant
+                                            (vector (cons "access" nil)
+                                                    (cons "other" '(:idx . 0)))))
+                            (export-decl "error-code" (list :eq 1)))))
+           (shape (wasmdown.component::%instance-ct-exported-type-shape
+                   "error-code" ict))
+           (cases (and shape (wasmdown.component::ct-payload shape)))
+           (other (and cases (cdr (aref cases 1))))
+           (empty (wasmdown.component::make-cval :types #())))
+      (is (eq :variant (wasmdown.component::ct-kind shape)))
+      ;; the ref is the declarator's option<string> ct, never raw
+      (is (wasmdown.component:ct-p other))
+      (is (eq :option (wasmdown.component::ct-kind other)))
+      (is (eq :string (wasmdown.component::ct-payload other)))
+      ;; and the canonical ABI layout of the materialized shape is
+      ;; computable: variant [d1] + option<string> (16 bytes, align 8)
+      (is (= 24 (wasmdown.component:elem-size shape empty)))
+      (is (= 8 (wasmdown.component::%valtype-align other empty))))))
+
+(test component/declarator-slot-resource-name
+  ;; (own i)/(borrow i) carry the resource's TYPE INDEX in the
+  ;; DECLARATOR space, so the projecting export's name is the
+  ;; declarator AT THAT SLOT. The old ordinal count (the m-th
+  ;; type-sorted exportdecl) broke whenever a type declarator
+  ;; preceded the resource: wasi:filesystem/types declares
+  ;; option<string> and error-code before exporting descriptor, so
+  ;; [method]descriptor.read-directory's `self` param (slot 8 =
+  ;; interned borrow 3) resolved to the "directory-entry" export
+  ;; instead of "descriptor". The lowered shim then had a record
+  ;; param instead of a handle and the guest's `actual.3` core
+  ;; import signature mismatched ('expected: (func)', upstream
+  ;; filesystem-read-directory @0.3.2).
+  (labels ((mk (kind payload)
+             (wasmdown.component::make-ct :kind kind :payload payload
+                                          :offset 0))
+           (decl (kind payload)
+             (wasmdown.component::make-typedecl :kind kind :payload payload))
+           (export-decl (name bound)
+             (decl :export (list name nil (cons :type bound)))))
+    (let* ((ict
+             (mk :instance
+                 (vector
+                  ;; 0: a non-exported type BEFORE the resource
+                  (decl :type (mk :option :string))
+                  ;; 1/2: error-code + its export
+                  (decl :type (mk :variant (vector (cons "access" nil))))
+                  (export-decl "error-code" (list :eq 1))
+                  ;; 3: descriptor (sub resource) — the slot the
+                  ;; borrow below names
+                  (export-decl "descriptor" :sub-resource)
+                  ;; 4/5: descriptor-type + its export
+                  (decl :type (mk :variant (vector (cons "directory" nil))))
+                  (export-decl "descriptor-type" (list :eq 4))
+                  ;; 6/7: directory-entry + its export (the DECOY
+                  ;; the old export-ordinal count picked)
+                  (decl :type (mk :record (vector (cons "name" :string))))
+                  (export-decl "directory-entry" (list :eq 6))
+                  ;; 8: the interned borrow<descriptor> param type
+                  (decl :type (mk :borrow 3)))))
+           (ft (mk :func (list (vector (cons "self" '(:idx . 8))) nil nil)))
+           (view (wasmdown.component::%declarator-view ict nil))
+           (out (let ((wasmdown.component::*inst-alias-typeidx*
+                        (let ((h (make-hash-table :test #'equal)))
+                          (setf (gethash (cons 0 "descriptor") h) 7)
+                          (setf (gethash (cons 0 "directory-entry") h) 9)
+                          h)))
+                  (wasmdown.component::%remap-decl-functype ft 0 ict view)))
+           (param (cdr (aref (first (wasmdown.component::ct-payload out)) 0))))
+      ;; the descriptor alias index — NOT the directory-entry decoy
+      (is (equal '(:idx . 7) param)))))
