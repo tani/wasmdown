@@ -33,11 +33,12 @@ deliberately incomplete, and what will not be built. Measurements live in
 | Component model | Resources | Full | Per-instance handle tables, own/borrow transfer, destructors and method dispatch. |
 | Component model | Async execution | Partial | The task/subtask state machine, cancellations and resource lifetimes run the whole async suite in both backends. Live-borrow accounting traps `task.return`/`task.cancel` with outstanding borrows; residual ABI/lifetime gaps are listed under Known gaps. |
 | Component model | Backend parity | Full | The whole component lane (1,702 commands) is green with every defined core compiled before its start section (`make report-component-compiled`). |
-| WASI | Preview 1 (`wasi_snapshot_preview1`) | Full | All 46 pinned imports are provided over an explicit capability context. The whole acceptance lane (in-memory and on-disk SQLite, rollback, bail, preopen denial, read-only, escape) passes with compiled guest cores too. |
-| WASI | 0.3.2 providers | Partial | The CLI now owns a reactor (clock deadlines and socket readiness are servable); what remains partial is the provider surface itself — blocking DNS/stdio executors and the `@unstable` gates. |
-| WASI | 0.2 facade | Partial | 27 of 31 stable interfaces are bound at exact release names. |
+| WASI | Preview 1 (`wasi_snapshot_preview1`) | Partial (network imports excluded) | All 46 pinned imports are provided over an explicit capability context; the whole acceptance lane (in-memory and on-disk SQLite, rollback, bail, preopen denial, read-only, escape) passes with compiled guest cores too. The four legacy `sock_*` imports remain implemented and legacy-tested, but network communication is excluded from the declared support profile (2026-11-02; see the `wasi:sockets@0.3.2` row), so the P1 claim is explicitly the NON-NETWORK P1 surface; no network behaviour is claimed. |
+| WASI | 0.3.2 providers | Partial | The CLI owns a reactor (clock deadlines and stream readiness are servable); what remains partial is the provider surface itself — the `@unstable` gates, the blocked-stdio executor audit, and the canonical-ABI/lifetime residuals listed under Known gaps. `wasi:sockets` is excluded, not partial; see the `wasi:sockets@0.3.2` row. |
+| WASI | 0.2 facade | Partial | 27 of 31 stable interfaces are bound at exact release names. The bound `wasi:sockets/*` interfaces are legacy-tested through the embedding API only; the CLI refuses `--net/--listen/--dns` for every run, so no P2 sockets path exists through the CLI. Network communication is excluded from the declared support profile (see the `wasi:sockets@0.3.2` row) and no P2 network behaviour is claimed. |
 | WASI | `wasi:http` | Unsupported by design (not a gap, not planned) | Deliberate, permanent exclusion by user decision (2026-11-02); removed in M17 and recoverable from git history. The vendored `specs/wasi/wasi-wit-0.3.2/http/*.wit` is reference data only. An import is refused with `wasi:http is not supported by this runtime by design (removed in M17); the pinned HTTP WIT is reference data only. See docs/usage/wasi.md and specs/wasi/MANIFEST.md.` See [`specs/wasi/MANIFEST.md`](../specs/wasi/MANIFEST.md) § “Unsupported by design (not pending)”. Not counted as an incomplete interface. |
-| WASI | 0.3.2 guest lane | Partial | Seven hand-authored @0.3.2 commands run through the real CLI in both backends (`make test-wasi-preview3`, 3 repeats): a no-import smoke; a `wasi:cli/exit@0.3.2` importer (exit 7); a `wasi:clocks/monotonic-clock@0.3.2` importer; a resume-safe async callback command; a `write-via-stream` stdout command printing `hi`; a cancelled-subtask command; and a TCP loopback socket command (create/connect/send/receive against a suite-side echo, `--net`). The socket and stream guests are authored in TEXT and encoded by `tools/component-encode.lisp`, guarded by `wasi/component-text-encoder-roundtrip`. The lane stays Partial because no upstream @0.3.2 toolchain guest exists here; provider behaviour is measured by this lane and the component tests. |
+| WASI | `wasi:sockets@0.3.2` | Unsupported by design (not a gap, not planned) | TCP, UDP and DNS are excluded permanently by user decision (2026-11-02); there is no `wasi:sockets` provider for guests. The vendored `specs/wasi/wasi-wit-0.3.2/sockets/sockets.wit` is reference data only. A **0.3-line** component-declared import (`types`, `ip-name-lookup`, any 0.3.x version) is refused at link time with `Network communication (TCP, UDP and DNS) is not supported by this design; there is no wasi:sockets provider for guests. See docs/usage/wasi.md and specs/wasi/MANIFEST.md.` The pinned `wasi:cli/command` world imports sockets itself, so a 0.3.2 sockets provider is retained internally for that composition only. See [`specs/wasi/MANIFEST.md`](../specs/wasi/MANIFEST.md) § “Network communication: `wasi:sockets` (excluded)”. Not counted as an incomplete interface. |
+| WASI | 0.3.2 guest lane | Partial | Six hand-authored @0.3.2 commands run through the real CLI in both backends (`make test-wasi-preview3`, 3 repeats): a no-import smoke; a `wasi:cli/exit@0.3.2` importer (exit 7); a `wasi:clocks/monotonic-clock@0.3.2` importer; a resume-safe async callback command; a `write-via-stream` stdout command printing `hi`; and a cancelled-subtask command. The stream guest is authored in TEXT and encoded by `tools/component-encode.lisp`, guarded by `wasi/component-text-encoder-roundtrip`. The lane stays Partial because no upstream @0.3.2 toolchain guest exists here; provider behaviour is measured by this lane and the component tests. The former TCP loopback socket command was removed with the network exclusion (2026-11-02); network is not part of this lane. |
 - Nested `option<stream<u8>>` passed through a host lower resolves in the
   provider's table instead of the caller's.
 - Descriptor destructors and lend lists accumulate in long-lived hosts.
@@ -74,7 +75,9 @@ deliberately incomplete, and what will not be built. Measurements live in
   host-chosen rather than queried from the socket buffer;
   `sockets/network-error-code` has helper-level coverage only (it is
   `@unstable` at 0.2.12 and not exported); a `last-operation-failed`
-  stream does not yet transition to `closed`.
+  stream does not yet transition to `closed`. The socket-specific items in
+  this bullet describe the excluded legacy network path only; they are not
+  part of the declared support profile.
 - Preview 1 `proc_raise` returns `NOTSUP`; a guest cannot signal itself.
 - Compiled-backend compile time/heap is an ACCEPTED limit (owner decision,
   2026-11-02): no reduction ships. Measurements and the rejected levers are in
@@ -101,10 +104,10 @@ deliberately incomplete, and what will not be built. Measurements live in
 
 ## Roadmap
 
-**Providers.** The CLI owns its reactor now (socket readiness watches and
-`clocks.wait-until`/`wait-for` work without an embedder); what remains is
-keeping every blocking host path (DNS, blocked stdio) on the bounded
-executors rather than a caller's thread.
+**Providers.** The CLI owns its reactor now (clock deadlines and stream
+readiness work without an embedder); what remains is keeping every blocking
+host path (blocked stdio) on the bounded executors rather than a caller's
+thread. Network paths are excluded and not part of this roadmap.
 
 **Canonical ABI.** Revisit the `borrow` lend arms that survive in the two
 canon-lower wrappers; the position-dependent `stream`/`future` arms are already

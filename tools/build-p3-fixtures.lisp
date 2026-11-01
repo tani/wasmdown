@@ -488,161 +488,13 @@
            (b-sec 1 core)
            builtins alias-export lower bag m-inst aliases lift compinst export)))
 
-;;; ---------------------------------------------------------------
-;;; Fixture 7: the stdout-free SOCKET command. A TCP echo on a
-;;; loopback port: create -> connect -> send "ping" -> drop write end,
-;;; then receive and wait for the echo (waitable-set event) and check
-;;; the first byte. run is async with a callback; the callback does
-;;; the work once and task.returns. The port is fixed so the binary
-;;; stays reproducible; the lane starts an echo server on it.
-
-(defparameter *socket-port* 45231)
-
-(defun p3-socket-guest-bytes ()
-  (let* ((port *socket-port*)
-         (text
-          (format nil "(component ~
- (type $SADDR (variant (case \"ipv4\" (tuple u32 u32 u32)) ~
-                       (case \"ipv6\" (tuple u32 u32 u32)))) ~
- (import \"wasi:sockets/types@0.3.2\" ~
-  (instance $sock ~
-   (export \"tcp-socket\" (type $T (sub resource))) ~
-   (export \"[static]tcp-socket.create\" ~
-     (func (param \"address-family\" u32) (result (result (own $T) u32)))) ~
-   (export \"[method]tcp-socket.connect\" ~
-     (func async (param \"self\" (borrow $T)) (param \"remote-address\" $SADDR) ~
-                 (result (result (error u32))))) ~
-   (export \"[method]tcp-socket.send\" ~
-     (func (param \"self\" (borrow $T)) (param \"data\" (stream u8)) ~
-                 (result (future (result (error u32)))))) ~
-   (export \"[method]tcp-socket.receive\" ~
-     (func (param \"self\" (borrow $T)) ~
-                 (result (tuple (stream u8) (future (result (error u32))))))))) ~
- (alias export $sock \"[static]tcp-socket.create\" (func $create)) ~
- (alias export $sock \"[method]tcp-socket.connect\" (func $connect)) ~
- (alias export $sock \"[method]tcp-socket.send\" (func $send)) ~
- (alias export $sock \"[method]tcp-socket.receive\" (func $receive)) ~
- (core module $Mem (memory (export \"mem\") 1)) ~
- (core instance $memory (instantiate $Mem)) ~
- (core func $create-l (canon lower (func $create) (memory (core memory $memory \"mem\")))) ~
- (core func $connect-l (canon lower (func $connect) async (memory (core memory $memory \"mem\")))) ~
- (core func $send-l (canon lower (func $send) (memory (core memory $memory \"mem\")))) ~
- (core func $receive-l (canon lower (func $receive) (memory (core memory $memory \"mem\")))) ~
- (type $ST (stream u8)) ~
- (type $FT (future (result (error u32)))) ~
- (canon task.return (result (result)) (core func $tr)) ~
- (canon stream.new $ST (core func $snew)) ~
- (canon stream.write $ST async (memory (core memory $memory \"mem\")) (core func $swrite)) ~
- (canon stream.read $ST async (memory (core memory $memory \"mem\")) (core func $sread)) ~
- (canon stream.drop-writable $ST (core func $sdropw)) ~
- (canon subtask.drop (core func $subdrop)) ~
- (canon waitable.join (core func $join)) ~
- (canon waitable-set.new (core func $wsnew)) ~
- (canon waitable-set.wait (memory (core memory $memory \"mem\")) (core func $wait)) ~
- (core module $M ~
-  (import \"env\" \"mem\" (memory 1)) ~
-  (import \"env\" \"tr\" (func $tr (param i32))) ~
-  (import \"env\" \"create\" (func $create (param i32 i32))) ~
-  (import \"env\" \"connect\" (func $connect (param i32 i32) (result i32))) ~
-  (import \"env\" \"send\" (func $send (param i32 i32) (result i32))) ~
-  (import \"env\" \"receive\" (func $receive (param i32 i32))) ~
-  (import \"env\" \"snew\" (func $snew (result i64))) ~
-  (import \"env\" \"swrite\" (func $swrite (param i32 i32 i32) (result i32))) ~
-  (import \"env\" \"sread\" (func $sread (param i32 i32 i32) (result i32))) ~
-  (import \"env\" \"sdropw\" (func $sdropw (param i32))) ~
-  (import \"env\" \"subdrop\" (func $subdrop (param i32))) ~
-  (import \"env\" \"join\" (func $join (param i32 i32))) ~
-  (import \"env\" \"wsnew\" (func $wsnew (result i32))) ~
-  (import \"env\" \"wait\" (func $wait (param i32 i32) (result i32))) ~
-  (global $sock (mut i32) (i32.const 0)) ~
-  (func $poll-subtask (param $packed i32) (param $ws i32) ~
-    (local $sub i32) ~
-    (if (i32.ne (i32.and (local.get $packed) (i32.const 15)) (i32.const 2)) ~
-      (then ~
-        (local.set $sub (i32.shr_u (local.get $packed) (i32.const 4))) ~
-        (call $join (local.get $sub) (local.get $ws)) ~
-        (block $done ~
-          (loop $poll ~
-            (drop (call $wait (local.get $ws) (i32.const 224))) ~
-            (br_if $done (i32.eq (i32.load (i32.const 224)) (i32.const 1))) ~
-            (br $poll))) ~
-        (call $subdrop (local.get $sub))))) ~
-  (func $phase1 (result i32) ~
-    (local $ws i32) (local $packed i32) ~
-    (local $rx i32) (local $tx i32) (local $pair i64) (local $r i32) ~
-    (call $create (i32.const 0) (i32.const 64)) ~
-    (if (i32.ne (i32.const 0) (i32.load8_u (i32.const 64))) (then unreachable)) ~
-    (global.set $sock (i32.load (i32.const 68))) ~
-    (i32.store (i32.const 0) (global.get $sock)) ~
-    (i32.store8 (i32.const 4) (i32.const 0)) ~
-    (i32.store16 (i32.const 8) (i32.const ~d)) ~
-    (i32.store8 (i32.const 10) (i32.const 127)) ~
-    (i32.store8 (i32.const 11) (i32.const 0)) ~
-    (i32.store8 (i32.const 12) (i32.const 0)) ~
-    (i32.store8 (i32.const 13) (i32.const 1)) ~
-    (local.set $ws (call $wsnew)) ~
-    (local.set $packed (call $connect (i32.const 0) (i32.const 16))) ~
-    (if (i32.ne (i32.const 2) (i32.and (local.get $packed) (i32.const 15))) (then unreachable)) ~
-    (call $poll-subtask (local.get $packed) (local.get $ws)) ~
-    (if (i32.ne (i32.const 0) (i32.load8_u (i32.const 16))) (then unreachable)) ~
-    (local.set $pair (call $snew)) ~
-    (local.set $rx (i32.wrap_i64 (local.get $pair))) ~
-    (local.set $tx (i32.wrap_i64 (i64.shr_u (local.get $pair) (i64.const 32)))) ~
-    (i32.store8 (i32.const 160) (i32.const 112)) ~
-    (i32.store8 (i32.const 161) (i32.const 105)) ~
-    (i32.store8 (i32.const 162) (i32.const 110)) ~
-    (i32.store8 (i32.const 163) (i32.const 103)) ~
-    (drop (call $send (global.get $sock) (local.get $rx))) ~
-    (local.set $r (call $swrite (local.get $tx) (i32.const 160) (i32.const 4))) ~
-    (if (i32.ne (i32.const 64) (local.get $r)) (then unreachable)) ~
-    (call $sdropw (local.get $tx)) ~
-    (i32.const 0)) ~
-  (func $phase2 (result i32) ~
-    (local $ws i32) (local $rs i32) (local $r i32) ~
-    (drop (call $phase1)) ~
-    (call $receive (global.get $sock) (i32.const 128)) ~
-    (local.set $rs (i32.load (i32.const 128))) ~
-    (local.set $ws (call $wsnew)) ~
-    (call $join (local.get $rs) (local.get $ws)) ~
-    (local.set $r (call $sread (local.get $rs) (i32.const 176) (i32.const 4))) ~
-    (if (i32.eq (local.get $r) (i32.const -1)) ~
-        (then (drop (call $wait (local.get $ws) (i32.const 224))))) ~
-    (if (i32.ne (i32.load8_u (i32.const 176)) (i32.const 112)) (then unreachable)) ~
-    (i32.const 1)) ~
-  (func (export \"run\") (result i32) (i32.const 1)) ~
-  (func (export \"cb\") (param i32 i32 i32) (result i32) ~
-    (drop (call $phase2)) ~
-    (call $tr (i32.const 0)) ~
-    (i32.const 0))) ~
- (core instance $m (instantiate $M (with \"env\" (instance ~
-   (export \"mem\" (memory $memory \"mem\")) ~
-   (export \"tr\" (func $tr)) ~
-   (export \"create\" (func $create-l)) ~
-   (export \"connect\" (func $connect-l)) ~
-   (export \"send\" (func $send-l)) ~
-   (export \"receive\" (func $receive-l)) ~
-   (export \"snew\" (func $snew)) ~
-   (export \"swrite\" (func $swrite)) ~
-   (export \"sread\" (func $sread)) ~
-   (export \"sdropw\" (func $sdropw)) ~
-   (export \"subdrop\" (func $subdrop)) ~
-   (export \"join\" (func $join)) ~
-   (export \"wsnew\" (func $wsnew)) ~
-   (export \"wait\" (func $wait)))))) ~
- (func $run async (result (result)) ~
-   (canon lift (core func $m \"run\") async (callback (core func $m \"cb\")))) ~
- (export \"run\" (func $run)))" port)))
-    (component-encode:encode-component
-     (wasmdown.component.text::parse-component-text text))))
-
 (defparameter *fixtures*
   (list (list "p3-guest.wasm" #'p3-sync-guest-bytes 0 "")
         (list "p3-import-guest.wasm" #'p3-import-guest-bytes 7 "")
         (list "p3-clock-guest.wasm" #'p3-clock-guest-bytes 0 "")
         (list "p3-async-guest.wasm" #'p3-async-guest-bytes 0 "")
         (list "p3-stream-guest.wasm" #'p3-stream-guest-bytes 0 (format nil "hi~%"))
-        (list "p3-cancel-guest.wasm" #'p3-cancel-guest-bytes 0 "")
-        (list "p3-socket-guest.wasm" #'p3-socket-guest-bytes 0 "")))
+        (list "p3-cancel-guest.wasm" #'p3-cancel-guest-bytes 0 "")))
 
 ;;; ---------------------------------------------------------------
 ;;; Verify through this project's own decoder/validator/runner, then
@@ -662,74 +514,6 @@
             while line
             when (search name line)
               do (return (subseq line 0 (min 64 (length line))))))))
-
-(defun %echo-listener (port)
-  "Bind a loopback listener on PORT (fixed) and return (values fd)."
-  (let ((fd (wasmdown.wasi::%libc-socket
-             wasmdown.wasi::+af-inet+ wasmdown.wasi::+sock-stream+
-             wasmdown.wasi::+ipproto-tcp+)))
-    (multiple-value-bind (alien len)
-        (wasmdown.wasi::%make-sockaddr
-         "ipv4" (list (cons "port" port) (cons "address" '(127 0 0 1))))
-      (unwind-protect
-           (progn
-             (when (minusp (wasmdown.wasi::%libc-bind
-                            fd (sb-alien:alien-sap alien) len))
-               (error "socket fixture: cannot bind echo port ~d" port))
-             (wasmdown.wasi::%libc-listen fd 4))
-        (sb-alien:free-alien alien)))
-    fd))
-
-(defun %echo-thread (listen-fd)
-  "Accept one connection, read its bytes, echo `pong`, close."
-  (sb-thread:make-thread
-   (lambda ()
-     (let ((cfd (wasmdown.wasi::%libc-accept4
-                 listen-fd (sb-sys:int-sap 0) (sb-sys:int-sap 0) 0)))
-       (unwind-protect
-            (let ((buf (sb-alien:make-alien sb-alien:unsigned-char 8)))
-              (unwind-protect
-                   (progn
-                     (wasmdown.wasi::%libc-recv
-                      cfd (sb-alien:alien-sap buf) 8 0)
-                     (let ((msg (make-array
-                                 4 :element-type '(unsigned-byte 8)
-                                   :initial-contents '(112 111 110 103))))
-                       (wasmdown.wasi::%libc-send
-                        cfd (sb-sys:vector-sap msg) 4 0)))
-                (sb-alien:free-alien buf)))
-         (wasmdown.wasi::%close-fd cfd))))
-   :name "fixture-sock-echo"))
-
-(defun verify-socket (label bytes expected-status expected-stdout)
-  "The socket command connects to a loopback echo on *SOCKET-PORT*."
-  (declare (ignore expected-stdout))
-  (let* ((fd (%echo-listener *socket-port*))
-         (th (%echo-thread fd))
-         (reactor (wasmdown.wasi:make-wasi-reactor)))
-    (unwind-protect
-         (let* ((comp (wasmdown.component:decode-component bytes))
-                (sink (make-string-output-stream))
-                (net (wasmdown.wasi:make-wasi-network
-                      :outbound (list (wasmdown.wasi:make-wasi-endpoint
-                                       :address '(127 0 0 1)
-                                       :port *socket-port*))
-                      :listen '()
-                      :dns '("localhost")))
-                (context (wasmdown.wasi:make-wasi-context
-                          :stdout sink :reactor reactor
-                          :networks (list net)))
-                (status (wasmdown.wasi:run-component comp context)))
-           (wasmdown.component:validate-component comp)
-           (ignore-errors (sb-thread:join-thread th :timeout 2))
-           (unless (eql expected-status status)
-             (error "~a: command returned status ~a, expected ~a"
-                    label status expected-status))
-           (format t "~&~a: decoded, validated, ran through a socket echo (status ~a)~%"
-                   label status))
-      (ignore-errors (sb-thread:join-thread th :timeout 2))
-      (ignore-errors (wasmdown.wasi:reactor-close reactor))
-      (ignore-errors (wasmdown.wasi::%close-fd fd)))))
 
 (defun verify (label bytes expected-status expected-stdout)
   (let* ((comp (wasmdown.component:decode-component bytes))
@@ -783,9 +567,7 @@
                 (with-open-file (s path :direction :output :if-exists :supersede
                                         :element-type '(unsigned-byte 8))
                   (write-sequence bytes s))
-                (if (string= name "p3-socket-guest.wasm")
-                    (verify-socket name bytes status stdout)
-                    (verify name bytes status stdout))
+                (verify name bytes status stdout)
                 (push (format nil "~a  ~a" (sha256 path) name) lines)
                 (format t "~&wrote ~a~%" path))))
           (with-open-file (s *sums* :direction :output :if-exists :supersede)

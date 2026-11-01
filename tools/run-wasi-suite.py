@@ -38,8 +38,6 @@ import subprocess
 import sys
 import tempfile
 import time
-import socket
-import threading
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 FAILURE_DIR = None  # set by main() to <output-dir>/failures
@@ -77,7 +75,6 @@ P3_CLOCK = "p3-clock-guest.wasm"
 P3_ASYNC = "p3-async-guest.wasm"
 P3_STREAM = "p3-stream-guest.wasm"
 P3_CANCEL = "p3-cancel-guest.wasm"
-P3_SOCKET = "p3-socket-guest.wasm"
 
 # ---- the cases -----------------------------------------------------
 # expect.stdout_equals  : exact stdout (list of lines, joined by \n, one
@@ -282,19 +279,6 @@ CASES = [
         "expect": {"stdout_equals": [], "exit": 0},
     },
     {
-        "id": "p3/socket-echo",
-        "abi": "preview3",
-        "fixture": P3_SOCKET,
-        "argv": [],
-        "stdin": "",
-        # text-authored via tools/component-encode.lisp: create/connect/send
-        # "ping" over loopback, receive and wait for the echo; the suite
-        # serves the echo on the fixture's fixed port.
-        "echo_port": 45231,
-        "net": ["127.0.0.1:45231"],
-        "expect": {"stdout_equals": [], "exit": 0},
-    },
-    {
         "id": "p3/clock-monotonic",
         "abi": "preview3",
         "fixture": P3_CLOCK,
@@ -419,27 +403,6 @@ def check(expect, out, err, rc, workdir):
     return True, "ok"
 
 
-def start_echo(port):
-    """A one-shot loopback echo server on PORT: accept, read, send 'pong'."""
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(("127.0.0.1", port))
-    srv.listen(1)
-
-    def serve():
-        try:
-            conn, _ = srv.accept()
-            with conn:
-                conn.recv(64)
-                conn.sendall(b"pong")
-        finally:
-            srv.close()
-
-    th = threading.Thread(target=serve, daemon=True)
-    th.start()
-    return th
-
-
 def run_case(case, backend, groupdir, heap_mb):
     fixture = FIXTURES / case["fixture"]
     if not fixture.exists():
@@ -463,8 +426,6 @@ def run_case(case, backend, groupdir, heap_mb):
     for a in case.get("argv", []):
         guest_argv.append(str(workdir / "host-denied.db")
                           if a == "HOSTPATH" else a)
-    for spec in case.get("net", []):
-        argv += ["--net", spec]
     argv += ["--"] + guest_argv
     env = dict(os.environ)
     if backend == "compiled":
@@ -472,8 +433,6 @@ def run_case(case, backend, groupdir, heap_mb):
     else:
         env.pop("WASMDOWN_API_MODE", None)
     env.setdefault("HOME", str(workdir))
-    echo_thread = (start_echo(case["echo_port"])
-                   if case.get("echo_port") else None)
     t0 = time.time()
     try:
         proc = subprocess.run(argv, input=case.get("stdin", ""),
@@ -482,8 +441,6 @@ def run_case(case, backend, groupdir, heap_mb):
         out, err, rc = proc.stdout, proc.stderr, proc.returncode
     except subprocess.TimeoutExpired:
         return False, f"timeout after {case.get('timeout', 300)}s"
-    if echo_thread is not None:
-        echo_thread.join(timeout=5)
     elapsed = time.time() - t0
     ok, detail = check(case["expect"], out, err, rc, workdir)
     if not ok:

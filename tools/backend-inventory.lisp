@@ -118,8 +118,15 @@
       (when pkg
         (dolist (row (interface-records pkg))
           (emit "P3-VEND" short (first row) (second row) (third row))))))
+  ;; Network sockets and HTTP are excluded from the declared profile even
+  ;; though their providers stay in the registry for internal composition
+  ;; (the pinned command world imports sockets itself). Report those as
+  ;; INTERNAL, never as provided support.
   (dolist (n (sort (remove-duplicates bound :test #'string=) #'string<))
-    (emit "P3-BOUND" "all" n))
+    (if (or (eql 0 (search "wasi:http/" n))
+            (eql 0 (search "wasi:sockets/" n)))
+        (emit "P3-INTERNAL" "all" n)
+        (emit "P3-BOUND" "all" n)))
   ;; the 0.3.2 command world's EXPORTS (run is an export, not an import)
   (handler-case
       (let ((world (wasmdown.wit:resolve-wit-world

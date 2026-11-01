@@ -20,9 +20,10 @@ Component Model (canonical ABI, resources, async), and WASI hosts — with
 | Interpreter (default backend) | Full: exact i32/i64/f32/f64 semantics, v128, GC, EH, tail calls, multi-memory, memory64 |
 | Compiled backend | Full for opcode coverage: SBCL `COMPILE` of emitted Lisp, including SIMD, GC, EH and `return_call*`; every pinned core command and component command agrees with the interpreter |
 | Component Model | Full lane green: binary + text, validation, instantiation/linking, canonical ABI, resources, async scheduling |
-| WASI Preview 1 | Full `wasi_snapshot_preview1` surface (46 imports) |
-| WASI 0.3.2 providers | `clocks`, `random`, `cli`, `filesystem`, `sockets` under an explicit capability model |
+| WASI Preview 1 | Full legacy `wasi_snapshot_preview1` surface (46 imports; the `sock_*` imports are legacy ABI only — networking is excluded) |
+| WASI 0.3.2 providers | `clocks`, `random`, `cli`, `filesystem` under an explicit capability model (`wasi:http` and `wasi:sockets` excluded by design) |
 | WASI 0.2 component facade | 27 of 31 stable interfaces bound at exact release names |
+| Network communication (TCP/UDP/DNS), `wasi:http` | Out of scope: no guest-visible provider; component imports are refused |
 | Threads / atomics, FASL cache, optimized or AOT backend | Not implemented |
 | Annotations proposal | Out of scope |
 
@@ -129,7 +130,8 @@ Every lane is measured, not asserted. Latest numbers (2026-11-01):
 | `make report-component-compiled` | report | 1 702 pass / 0 fail under `:compiled` | `tests/component-compiled/component.md` |
 | `make test-backend-parity` | gate | 21 260 / 21 260 core commands agree across both backends | [`backends.md`](docs/conformance/backends.md) |
 | `make test-wasi` | gate | 450/450 cases over 30 fresh-process runs | [`wasi.md`](docs/conformance/wasi.md) |
-| `make test-wasi-preview3` | gate (explicit) | 7 hand-authored 0.3.2 guests × 3 repeats, both backends | — |
+| `make test-wasi-preview3` | gate (explicit) | 6 hand-authored 0.3.2 guests × 3 repeats, both backends | — |
+| Network communication (TCP/UDP/DNS) | excluded | not verified, not claimed: component imports are refused at link time; the canonical message is in [`specs/wasi/MANIFEST.md`](specs/wasi/MANIFEST.md) | — |
 | `make test-property` | gate | 2 000 generated modules, both backends agree | — |
 | `make test-upstream` | discovery | aggregated proposal corpus, never a gate | [`upstream.md`](docs/conformance/upstream.md) |
 | `make report-backends-bench` | report | per-backend cost medians | [`performance.md`](docs/conformance/performance.md) |

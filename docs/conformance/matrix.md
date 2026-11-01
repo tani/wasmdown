@@ -15,8 +15,16 @@ links are generated.
 | WASI Preview 1 acceptance (in-memory and on-disk SQLite) | 14/14 checks pass | 14/14 checks pass: smoke, persistence (two processes), reopen, rollback, bail, no-preopen, read-only, escape — 821 s of compile-heavy wall time. The lane asserts exact stdout/status per case, so both backends meet identical expectations | `tools/wasi-preview1-acceptance.py [--backend compiled]` |
 | WASI 0.2 behaviour lane (11 cases) | 11/11 pass | 11/11 pass (11 x ~200 s compile wall time). Each case's manifest entry asserts exact stdout bytes and exact status, so both backends satisfy the SAME byte-level expectations — stronger than a post-hoc sha diff. Per-case records live under `tests/wasi-results/` (`latest/` for interpret, the compiled run's `--output-dir`), distinguished by the `backend` field | `tools/run-wasi-suite.py --abi preview2 [--backend compiled]` |
 | WASI 0.3.2 providers | unit/provider pins, component async suite | same providers; component suite green under `:compiled` | [`inventory.md`](inventory.md), `tests/wasi*.lisp` |
-| 0.3.2 TCP loopback (component text) | `wasi/e2e-tcp-echo-component` PASS | same test binary, host listener + echo thread | `make test-unit`; `tests/wasi.lisp` |
-| Pinned 0.3.2 guests (hand-authored) | 7/7 pass ×3 repeats: no-import success smoke, a `wasi:cli/exit@0.3.2` importer (exit 7), a `wasi:clocks/monotonic-clock@0.3.2` importer (monotonic `now()`), a resume-safe async command (callback `task.return`), a `write-via-stream` stdout command (`hi`), a cancelled-subtask command and a TCP loopback socket command | 7/7 pass, same cases and repeats; the nested core runs compiled (`backend-entry-count`) | `make test-wasi-preview3`, `tools/build-p3-fixtures.lisp`, `wasi/command-component-runs-the-selected-backend` |
+| 0.3.2 sockets provider (internal composition only) | unit pins incl. `wasi/e2e-tcp-echo-component` PASS | same test binary, host listener + echo thread | `make test-unit`; `tests/wasi.lisp` |
+| Pinned 0.3.2 guests (hand-authored) | 6/6 pass ×3 repeats: no-import success smoke, a `wasi:cli/exit@0.3.2` importer (exit 7), a `wasi:clocks/monotonic-clock@0.3.2` importer (monotonic `now()`), a resume-safe async command (callback `task.return`), a `write-via-stream` stdout command (`hi`) and a cancelled-subtask command | 6/6 pass, same cases and repeats; the nested core runs compiled (`backend-entry-count`) | `make test-wasi-preview3`, `tools/build-p3-fixtures.lisp`, `wasi/command-component-runs-the-selected-backend` |
+
+Network communication (TCP, UDP and DNS) is **excluded from the declared
+support profile**: the sockets row above is an internal-composition pin for
+the pinned `wasi:cli/command` world, not a support row and not a P3 guest
+case, and no row here counts a socket case as P3 support. A component-declared
+`wasi:sockets` import is refused at link time (see
+[`../../specs/wasi/MANIFEST.md`](../../specs/wasi/MANIFEST.md) § “Network
+communication: `wasi:sockets` (excluded)”).
 
 The backend property lives on the function, not on a replacement object: the
 selected mode compiles each defined function's existing `func-instance`

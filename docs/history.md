@@ -382,7 +382,10 @@ print exactly `hi\n`).
   TEXT and encoded by the new tools/component-encode.lisp (no binary
   serializer existed; six fixtures had been hand-assembled). The lane runs
   seven guests, 3 repeats each (21/21 per backend), with a suite-side echo
-  server and --net for the socket case. The component binary grammar details
+  server and --net for the socket case.
+  *(Superseded 2026-11-02: network communication became out of scope; the
+  socket guest and its fixture were removed and the lane is six guests. Kept as
+  history, not as a current support claim.)* The component binary grammar details
   that mattered: type indices
   inside an instance type are local to that type's declarations, the lower's
   core func must be defined before the bag that exports it, and imported
@@ -394,3 +397,41 @@ print exactly `hi\n`).
 - Remaining work named at the M17 close, none of it inside the lane: provider step 5/6 (DNS and blocking-stdio bounded executors, and socket accept/recv/send registering a reactor watch instead of reporting would-block to a caller that then waits); step 1's last item (the two canon-lower wrappers' positional stream/future/borrow arms, where deletion needs the verification-set fixtures in the probe set first — `%abi-load`'s memory-path transfer arms stay out as a measured negative); borrow-side lifetime pins (a live borrow held across `task.return` must trap; borrow-in-awaitable-set), reusing the guest-drop pin's shape; and one parked delta with a measured verdict, `wip/type-view` (at parity in a clean window, not landed because a green lane's bar is "no measured cost"). `wip/reactor-wiring` was closed as superseded: its driver pump and context reactor landed as the store driver, its socket plumbing as the executor slice with a strictly stronger keying scheme, so it was never rebased or re-measured.
 - Residual security/ABI honesty items recorded with M16: no socket or timer reactor, so a guest cannot be woken later and `clocks.wait-until`/`wait-for` stay declared-unsupported; the nested `option<stream<u8>>` through a host lower resolves the async end in the provider's table instead of the caller's; descriptor-destructor and lend-list accumulation for long-lived hosts; `%abi-lower`'s top-level error-result discriminant for compound outer shapes; pre-existing text/validator limits around imported-instance functypes with outer compound refs (the runtime lifts with the real WIT functype, so fixtures work around the validator, not the ABI); `@unstable` gating parsed but not enforced (the timezone interface is simply not registered); `wasi:sockets` has no `shutdown` in this WIT revision; and world `include`, `implements`/`external-id` and nominal resource typing are not read by the WIT frontend.
 - Items open since the M7-era measurement: the compiler-backend parity matrix (§12.3's `:optimized`/`:aot` plus the differential oracle), the property/fuzz lanes (§12.6), and the remaining CI lanes (M11). Threads/atomics and the FASL cache were never started.
+
+## Network communication excluded (2026-11-02)
+
+By user decision, **network communication — TCP, UDP and DNS — is permanently
+out of scope**, together with the CLI network options `--net`, `--listen` and
+`--dns`. This is not an implementation gap and not planned: networking is
+removed from the declared WASI profile, from the P3 guest lane, from the
+conformance matrix's support rows and from the milestone work lists (F2 no
+longer names sockets).
+
+What changed in the tree:
+
+- A component that **declares** a `wasi:sockets` import (any interface, any
+  version) is refused at link time, before any guest code runs, with this
+  exact message:
+
+  ```
+  Network communication (TCP, UDP and DNS) is not supported by this design; there is no wasi:sockets provider for guests. See docs/usage/wasi.md and specs/wasi/MANIFEST.md.
+  ```
+
+- The CLI refuses `--net`, `--listen` and `--dns` as usage errors (exit 2)
+  before building any authority; no network authority exists in the CLI.
+- The seventh P3 CLI guest — the TCP loopback socket command, previously run
+  against a suite-side echo server with `--net` — was removed. The P3
+  hand-authored lane is now **six** guests (18/18 ×3 per backend).
+- The 0.3.2 `wasi:sockets` provider remains in the runtime **only** because
+  the pinned `wasi:cli/command` world imports
+  `wasi:sockets/types@0.3.2` and `wasi:sockets/ip-name-lookup@0.3.2` itself;
+  that internal composition is an implementation detail, not a guest surface
+  or support evidence. The vendored
+  `specs/wasi/wasi-wit-0.3.2/sockets/sockets.wit` is reference data only.
+- `wasi:http` remains excluded (removed in M17) under the same policy; both
+  exclusions are enumerated in `specs/wasi/MANIFEST.md`.
+
+The declared profile is therefore `conformant for the declared WASI 0.3.2
+profile (wasi:http and wasi:sockets excluded)` at most, and `partial` until
+the §2.1 conditions hold. The canonical network message above is the only
+refusal text for this surface; the canonical HTTP message is unchanged.

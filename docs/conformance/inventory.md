@@ -6,7 +6,7 @@ Pinned: WASI Preview1 at `fae981bae14809d91f9bc2d63852d461f331d161`; WASI 0.2 re
 
 ## Method
 
-Two sources only, and neither is prose. **Pinned:** the generated Preview1 census (`specs/wasi/preview1/INVENTORY.md`, from the pinned WITX) and the vendored WIT trees (`specs/wasi/wasi-wit-<release>/`, parsed by `wasmdown.wit`). **Runtime:** `tools/backend-inventory.lisp` loads the system in SBCL and prints the registration tables that actually bind — `*p1-signatures*` / `*p1-implementations*`, `p2-builder-table` per release, `%wasi-provider-builders` — plus the interfaces the parser reads and the worlds' exports. A vendored file is never evidence of implementation, and a name is `bound` only when it appears in the runtime registry for that exact release. Opcode coverage is not scraped from source: it is read from the backend-parity lane's result records. Generated 2026-11-01T13:52:06Z from commit `a2b9da6cae1380de8f994d9512845b36314a9a99`, SBCL 2.6.4.
+Two sources only, and neither is prose. **Pinned:** the generated Preview1 census (`specs/wasi/preview1/INVENTORY.md`, from the pinned WITX) and the vendored WIT trees (`specs/wasi/wasi-wit-<release>/`, parsed by `wasmdown.wit`). **Runtime:** `tools/backend-inventory.lisp` loads the system in SBCL and prints the registration tables that actually bind — `*p1-signatures*` / `*p1-implementations*`, `p2-builder-table` per release, `%wasi-provider-builders` — plus the interfaces the parser reads and the worlds' exports. A vendored file is never evidence of implementation, and a name is `bound` only when it appears in the runtime registry for that exact release. Opcode coverage is not scraped from source: it is read from the backend-parity lane's result records. Generated 2026-11-01T15:54:38Z from commit `402fe73e803fbe931f7e65333df5a0a3c7aa799e`, SBCL 2.6.4.
 
 ## P1 — WASI Preview1 (46 pinned exports)
 
@@ -576,7 +576,7 @@ The 4 unbound STABLE interfaces at `0.2.12` are listed here by name; every one i
 
 ## P3 — WASI 0.3.2 packages
 
-Interfaces parsed from `specs/wasi/wasi-wit-0.3.2/`; `provided` is the `%wasi-provider-builders` registry. `wasi:http` is vendored as reference data only and is excluded by decision.
+Interfaces parsed from `specs/wasi/wasi-wit-0.3.2/`; `provided` is the `%wasi-provider-builders` registry. `wasi:http` and `wasi:sockets` (TCP/UDP/DNS) are excluded by decision; their WIT is reference data and any registry entry is internal composition only, never support.
 
 | package | interfaces | provided | excluded | export-only | types-only | missing |
 |---|---|---|---|---|---|---|
@@ -584,7 +584,7 @@ Interfaces parsed from `specs/wasi/wasi-wit-0.3.2/`; `provided` is the `%wasi-pr
 | `wasi:random@0.3.2` | 3 | 3 | 0 | 0 | 0 | 0 |
 | `wasi:cli@0.3.2` | 12 | 10 | 0 | 1 | 1 | 0 |
 | `wasi:filesystem@0.3.2` | 2 | 2 | 0 | 0 | 0 | 0 |
-| `wasi:sockets@0.3.2` | 2 | 2 | 0 | 0 | 0 | 0 |
+| `wasi:sockets@0.3.2` | 2 | 0 | 2 | 0 | 0 | 0 |
 | `wasi:http@0.3.2` | 3 | 0 | 3 | 0 | 0 | 0 |
 
 ### `wasi:clocks@0.3.2`
@@ -632,8 +632,8 @@ Interfaces parsed from `specs/wasi/wasi-wit-0.3.2/`; `provided` is the `%wasi-pr
 
 | interface | status | surface |
 |---|---|---|
-| `wasi:sockets/ip-name-lookup@0.3.2` | bound | has-surface |
-| `wasi:sockets/types@0.3.2` | bound | has-surface |
+| `wasi:sockets/ip-name-lookup@0.3.2` | excluded (internal composition only) | has-surface |
+| `wasi:sockets/types@0.3.2` | excluded (internal composition only) | has-surface |
 
 ### `wasi:http@0.3.2`
 

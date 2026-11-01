@@ -16,8 +16,9 @@ commands:
     compile <file.wasm> --emit-lisp <out.lisp>
     run <file> [--invoke <name> <int> ...]
     run <component> --wasi [--dir HOST[::GUEST]]
-          [--env K=V] [--net HOST:PORT] [--listen ADDR:PORT]
-          [--dns NAME] [arg ...]
+          [--env K=V] [arg ...]
+    (the network options --net/--listen/--dns are refused: network
+     communication is out of scope by design)
     help
 exit codes: 0 ok, 1 guest/compile error, 2 usage error
 ```
@@ -47,13 +48,19 @@ driven through the WASI command runner, a core module through
 | `--wasi` | Grant the WASI capability set: process streams, guest arguments, and the flags below. |
 | `--dir HOST[::GUEST][:ro]` | Preopen a host directory; `GUEST` defaults to `HOST`. `:ro` grants a read-only root (creation, writing, mutation denied). |
 | `--env K=V` | One environment variable. |
-| `--net HOST:PORT` | Declare an outbound endpoint. |
-| `--listen ADDR:PORT` | Declare a listen address. |
-| `--dns NAME` or `--dns *` | Allow one name, or any name. |
+| `--net` / `--listen` / `--dns` | **Refused (usage error).** Network communication (TCP, UDP and DNS) is out of scope by design; there is no `wasi:sockets` provider for guests and no network authority is ever built. The canonical message is printed by `help` and on refusal. |
 | `--` | Ends option parsing; every later token reaches the guest unchanged, including dash-prefixed ones. |
 
-Endpoints (`--net`, `--listen`) accept `*` or a dotted-quad IPv4 host
-and `*` or a port `0..65535`; host names belong to `--dns` instead.
+The network options are recognised only to refuse them with this exact
+message:
+
+```
+Network communication (TCP, UDP and DNS) is not supported by this design; there is no wasi:sockets provider for guests. See docs/usage/wasi.md and specs/wasi/MANIFEST.md.
+```
+
+It is a permanent, deliberate exclusion, not a pending interface; the
+declaration lives in `specs/wasi/MANIFEST.md` ("Network communication:
+wasi:sockets (excluded)").
 
 Positional tokens after the file become guest arguments **only** with
 `--wasi`; `argv[0]` is the file path as given. The parser refuses, as

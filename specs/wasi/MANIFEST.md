@@ -65,9 +65,45 @@ exact message:
 wasi:http is not supported by this runtime by design (removed in M17); the pinned HTTP WIT is reference data only. See docs/usage/wasi.md and specs/wasi/MANIFEST.md.
 ```
 
+### Network communication: `wasi:sockets` (excluded)
+
+Network communication — **TCP, UDP and DNS** — is **excluded permanently by
+user decision (2026-11-02)**, by the same decision that removed `wasi:http`.
+It is not an implementation gap, is not planned, and will not be restored.
+The vendored `wasi-wit-0.3.2/sockets/sockets.wit` remains **reference data
+only**: it is kept so the vendored tree stays byte-identical to the release
+asset, and no guest-visible provider, world or adapter may be derived from it
+as a deliverable.
+
+Excluded vendored declarations, verified against
+`specs/wasi/wasi-wit-0.3.2/sockets/sockets.wit`:
+
+| Declaration | Kind | Status |
+| --- | --- | --- |
+| `wasi:sockets/types@0.3.2` | interface (`error-code`, address types, the `tcp-socket` and `udp-socket` resources) | unsupported by design (vendored reference data only) |
+| `wasi:sockets/ip-name-lookup@0.3.2` | interface (`resolve-addresses`, i.e. DNS) | unsupported by design (vendored reference data only) |
+| `wasi:sockets/imports@0.3.2` | world | unsupported by design |
+
+A **0.3-line** component that *declares* an import from `wasi:sockets` — any
+0.3.x interface/version — is refused at link time with this exact message (the
+separate 0.2 facade is unaffected by this check):
+
+```
+Network communication (TCP, UDP and DNS) is not supported by this design; there is no wasi:sockets provider for guests. See docs/usage/wasi.md and specs/wasi/MANIFEST.md.
+```
+
+The pinned `wasi:cli/command` world imports `wasi:sockets/types@0.3.2` and
+`wasi:sockets/ip-name-lookup@0.3.2` itself (the `command` world in
+`specs/wasi/wasi-wit-0.3.2/cli/cli.wit`). A 0.3.2 sockets provider is therefore retained
+inside the runtime **only** to compose that pinned world's own imports; it is
+an implementation detail, not a guest surface, and it is not evidence of
+network support. There is no CLI network authority either: `--net`,
+`--listen` and `--dns` are refused as usage errors (exit 2) before any
+authority is built.
+
 The declared support profile is therefore `conformant for the declared WASI
-0.3.2 profile (wasi:http excluded)` at most; an unqualified "full WASI 0.3.2"
-label is not claimed (see `docs/design/PLAN.md` §2.1).
+0.3.2 profile (wasi:http and wasi:sockets excluded)` at most; an unqualified
+"full WASI 0.3.2" label is not claimed (see `docs/design/PLAN.md` §2.1).
 
 ## Verification
 

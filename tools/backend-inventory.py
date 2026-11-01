@@ -47,6 +47,10 @@ P3_PACKAGES = ("clocks", "random", "cli", "filesystem", "sockets", "http")
 
 # wasi:http is removed, not pending (specs/lock.toml [status] wasi-http).
 EXCLUDED_PACKAGES = {"http"}
+# P3-only exclusions: the providers stay in the registry for internal
+# composition (the pinned command world imports sockets itself), but the
+# interfaces are never a guest-visible support surface.
+P3_INTERNAL_PACKAGES = {"http", "sockets"}
 EXCLUDED_REASON = {
     "http": "excluded by decision: wasi:http removed from the runtime "
             "(specs/lock.toml [status] wasi-http = REMOVED)",
@@ -58,6 +62,7 @@ VERDICTS = {
     "unstable": "unstable (gated off)",
     "export_only": "export-only (world export, not an import)",
     "types_only": "types-only (no host binding needed)",
+    "excluded_internal": "excluded (internal composition only)",
     "missing": "not implemented",
 }
 
@@ -81,7 +86,7 @@ def parse_records(records):
         "sbcl": None, "commit": None, "tree": None, "clean": None,
         "p1_sig": [], "p1_impl": [],
         "p2_vend": {}, "p2_bound": {}, "p2_export": {},
-        "p3_vend": [], "p3_bound": [], "p3_export": [],
+        "p3_vend": [], "p3_bound": [], "p3_internal": [], "p3_export": [],
     }
     for row in records:
         kind = row[0]
@@ -106,6 +111,8 @@ def parse_records(records):
                  "stability": row[3], "surface": row[4]})
         elif kind == "P3-BOUND":
             data["p3_bound"].append(row[2])
+        elif kind == "P3-INTERNAL":
+            data["p3_internal"].append(row[2])
         elif kind == "P3-EXPORT":
             data["p3_export"].append(row[2])
     _commit, tree, clean = read_source()
@@ -233,6 +240,7 @@ def p2_section(data):
 
 def p3_section(data):
     bound = set(data["p3_bound"])
+    internal = set(data["p3_internal"])
     exported = set(data["p3_export"])
     packages = []
     for package in P3_PACKAGES:
@@ -241,7 +249,9 @@ def p3_section(data):
             if rec["package"] != package:
                 continue
             name = rec["interface"]
-            if name in bound:
+            if name in internal:
+                status = "excluded_internal"
+            elif name in bound:
                 status = "bound"
             elif package in EXCLUDED_PACKAGES:
                 status = "excluded"
@@ -264,7 +274,10 @@ def p3_section(data):
             "provided": [r["interface"] for r in rows if r["status"] == "bound"],
             "missing": [r["interface"] for r in rows if r["status"] == "missing"],
             "excluded": [r["interface"] for r in rows
-                         if r["status"] in ("excluded", "unstable")],
+                         if r["status"] in ("excluded", "unstable",
+                                             "excluded_internal")],
+            "internal_only": [r["interface"] for r in rows
+                              if r["status"] == "excluded_internal"],
             "export_only": [r["interface"] for r in rows
                             if r["status"] == "export_only"],
             "types_only": [r["interface"] for r in rows
@@ -352,7 +365,11 @@ def build_document(data):
             "bound": "present in the runtime registry for that exact release "
                      "(p2-builder-table / %wasi-provider-builders)",
             "excluded": "pinned but withheld by an explicit decision "
-                        "(wasi:http removed; @unstable feature-gated off)",
+                        "(wasi:http removed; wasi:sockets network scope; "
+                        "@unstable feature-gated off)",
+            "internal_only": "a provider exists ONLY to compose the pinned "
+                             "command world; guests may not import it "
+                             "(wasi:sockets, wasi:http)",
             "export_only": "the world EXPORTS the interface, so it is not an "
                            "import and never gets a provider entry",
             "missing": "pinned, stable, and neither bound nor excluded nor an "
@@ -480,8 +497,9 @@ def render_markdown(doc):
     add("## P3 — WASI 0.3.2 packages")
     add("")
     add("Interfaces parsed from `specs/wasi/wasi-wit-0.3.2/`; `provided` is the "
-        "`%wasi-provider-builders` registry. `wasi:http` is vendored as "
-        "reference data only and is excluded by decision.")
+        "`%wasi-provider-builders` registry. `wasi:http` and `wasi:sockets` "
+        "(TCP/UDP/DNS) are excluded by decision; their WIT is reference data "
+        "and any registry entry is internal composition only, never support.")
     add("")
     add_all(md_table(
         ["package", "interfaces", "provided", "excluded", "export-only",

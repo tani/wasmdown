@@ -5906,6 +5906,15 @@ interface's versioned import name (`ns:pkg/iface@version')."
                         (wasmdown.wit:wit-world-item-version item))
                 (wasmdown.wit:wit-world-item-interface item))))))
 
+(defparameter +wasi-sockets-unsupported-message+
+  "Network communication (TCP, UDP and DNS) is not supported by this design; there is no wasi:sockets provider for guests. See docs/usage/wasi.md and specs/wasi/MANIFEST.md."
+  "The one canonical refusal text for the `wasi:sockets' guest surface,
+shared by the component-declared-import check and the CLI option check.
+The SOCKETS PROVIDER stays in the runtime because the pinned 0.3.2
+`command' world imports `wasi:sockets/types' and
+`wasi:sockets/ip-name-lookup' itself; it is the GUEST-DECLARED import
+that is refused.")
+
 (defun %wasi-http-import-name-p (name)
   "T when the import NAME belongs to the `wasi:http' package, at any
 version and for any interface (`wasi:http/types@0.3.2', ...). The
@@ -5919,6 +5928,20 @@ know still counts — and a lookalike such as `wasi:http-client/x' or
          (and colon slash (< colon slash)
               (string= "wasi" name :end2 colon)
               (string= "http" (subseq name (1+ colon) slash))))))
+
+(defun %wasi-sockets-import-name-p (name)
+  "T when the import NAME belongs to the `wasi:sockets' package, at any
+version and for any interface (`wasi:sockets/types@0.3.2',
+`wasi:sockets/ip-name-lookup@0.3.2', ...). The namespace and package
+segments are matched structurally and terminated by the `/`, so a
+version suffix or an unknown interface still counts — and a lookalike
+such as `wasi:socketsx/types' or `my:wasi:sockets/types' does not."
+  (and (stringp name)
+       (let ((colon (position #\: name))
+             (slash (position #\/ name)))
+         (and colon slash (< colon slash)
+              (string= "wasi" name :end2 colon)
+              (string= "sockets" (subseq name (1+ colon) slash))))))
 
 (defun %types-only-world-import-p (item)
   "T when ITEM's resolved target is an interface with no functions
@@ -6064,7 +6087,17 @@ release line the component asks for: an exact `@0.2.x' import gets the
 versioned P2 provider table at THAT version (mixed patch versions are
 composed per version), anything else gets the vendored 0.3 command
 world. Choosing from the declared contract — never from the file name
-— is what keeps a 0.2 component from being handed 0.3 providers."
+— is what keeps a 0.2 component from being handed 0.3 providers.
+
+A component that asks for the 0.3 line may not itself IMPORT
+`wasi:sockets' at any interface or version: guests get no sockets
+provider by design, and the refusal is raised from the DECLARED import
+list BEFORE anything composes, as a `LINK-ERROR' carrying the canonical
+message. The 0.2 line is untouched (the P2 sockets facade is a separate
+legacy claim), and a component that ALSO declares a 0.2 import keeps
+the mixed-release-line refusal, which is checked by the same predicate
+it always was: the two refusals never race, because the mixed check
+needs a non-empty `v2' and the sockets check requires `v2' empty."
   (let* ((names (declared-component-imports comp))
          (wasi-names (remove-if-not (lambda (n)
                                       (and (stringp n)
@@ -6078,6 +6111,12 @@ world. Choosing from the declared contract — never from the file name
                      collect (cons n ver))))
     (cond
      ((null v2)
+      ;; the 0.3 path: a guest may not declare a sockets import, even
+      ;; though the pinned command WORLD does (the world is composed,
+      ;; not declared, and its sockets providers stay available)
+      (when (find-if #'%wasi-sockets-import-name-p wasi-names)
+        (error 'wasmdown:link-error
+               :message +wasi-sockets-unsupported-message+))
       (command-provider context))
      ((= (length v2) (length wasi-names))
       ;; every WASI import is a 0.2 release: compose per exact version

@@ -11,9 +11,10 @@ Every host import receives an explicitly built authority object — a
 `wasi-context`, `wasi-preopen`, or `wasi-network` — never an ambient global.
 
 1. **No ambient authority.** An absent stream traps `host-error`; a
-   context with no network authority denies every socket operation;
-   in the CLI, `--dir`, `--env`, `--net`, `--listen`, `--dns` and guest
-   arguments are refused unless `--wasi` is given.
+   context with no network authority denies every socket operation. In the
+   CLI, `--dir`, `--env` and guest arguments are refused unless `--wasi` is
+   given, and `--net`, `--listen` and `--dns` are always refused as usage
+   errors — there is no network authority to build (see below).
 2. **Handle-relative filesystem, no path-prefix filter.** A preopen is
    an already-open host directory handle plus its guest-visible name.
    Every file operation is an `*at` call against a descriptor: there is
@@ -33,7 +34,8 @@ Every host import receives an explicitly built authority object — a
    opened for itself.
 6. **Network policy is consulted per operation** — bind, connect, UDP
    send and name resolution — and refusal rides the interface's own
-   `access-denied` error.
+   `access-denied` error. This is the retained internal provider's
+   behaviour, not a guest-visible interface (see `wasi:sockets` below).
 
 ## Configuring capabilities
 
@@ -44,9 +46,7 @@ Every host import receives an explicitly built authority object — a
 | Environment | `--env K=V` (repeatable) | `:environment` alist |
 | Guest arguments | tokens after `--` | `:arguments` (first is `argv[0]`) |
 | Standard streams | implied by `--wasi` | `:stdin` `:stdout` `:stderr` (NIL = withdrawn) |
-| Outbound network | `--net HOST:PORT` | `make-wasi-network :outbound` |
-| Listen address | `--listen ADDR:PORT` | `:listen` |
-| DNS policy | `--dns NAME` or `--dns *` | `:dns` (`:none`, `:all`, or a name list) |
+| Network (TCP/UDP/DNS) | **Refused:** `--net`, `--listen` and `--dns` are usage errors (exit 2) | **No guest surface.** `make-wasi-network` / `:listen` / `:dns` exist only for the internal 0.3.2 composition; a component-declared `wasi:sockets` import is a link error |
 | Reactor | none | `:reactor` |
 
 A preopen's authority is the permission set the embedder granted —
@@ -65,7 +65,7 @@ dispatch is by the `@0.3.2` suffix of the import name.
 | `wasi:random` | `get-random-bytes`, `get-random-u64`, and the insecure `get-insecure-random-bytes` / `-u64` / `get-insecure-seed` — all from OS entropy, never the Lisp RNG. Zero-length requests return an empty list; a single request is capped at 1 MiB. |
 | `wasi:cli` | `environment` (`get-environment`, `get-arguments`, `get-initial-cwd`), `exit` (`exit`, `exit-with-code` via the `wasi-exit` condition), `stdin`/`stdout`/`stderr` as real streams, the `terminal-*` interfaces (`isatty` answers `some` or `none`, never a fabricated handle), and the command world's `run`. |
 | `wasi:filesystem` | The `descriptor` resource (own/borrow, destructors, non-owning preopens), all non-stream descriptor methods with the errno → `error-code` table, `preopens.get-directories`, `read-via-stream` / `write-via-stream` / `append-via-stream` / `read-directory`, and flag gating that reports `not-permitted` / `read-only` through the interface's `result` rather than throwing. |
-| `wasi:sockets` | The network authority, `tcp-socket` and `udp-socket` (create, bind, connect, listen, accept, send, receive, addresses, knobs), `ip-name-lookup` via `getaddrinfo`, and the errno → `sockets-error-code` table. A socket's handle plus its send/receive/listen streams share one reference count; the fd closes at zero. |
+| `wasi:sockets` | **Unsupported by design — not an implementation gap, not planned.** TCP, UDP and DNS are excluded permanently by user decision (2026-11-02); there is no guest-visible socket or DNS provider. The vendored `specs/wasi/wasi-wit-0.3.2/sockets/sockets.wit` is reference data only. The pinned `wasi:cli/command` world imports `wasi:sockets/types@0.3.2` and `wasi:sockets/ip-name-lookup@0.3.2` itself, so a 0.3.2 sockets provider is retained internally for that composition only; guests cannot reach it. Imports are rejected at link time with the exact message below. See [`../../specs/wasi/MANIFEST.md`](../../specs/wasi/MANIFEST.md) § “Network communication: `wasi:sockets` (excluded)”. |
 | `wasi:http` | **Unsupported by design — not an implementation gap, not planned.** Excluded permanently by user decision (2026-11-02); removed in M17 and recoverable from git history. There is no provider and no transport option. The vendored `specs/wasi/wasi-wit-0.3.2/http/*.wit` files remain reference data only. Imports are rejected at link time with the exact message below. See [`../../specs/wasi/MANIFEST.md`](../../specs/wasi/MANIFEST.md) § “Unsupported by design (not pending)”. |
 
 An import of `wasi:http` is refused with this exact message:
@@ -76,9 +76,20 @@ wasi:http is not supported by this runtime by design (removed in M17); the pinne
 
 This is a deliberate, permanent exclusion — not a pending interface and not a
 missing piece of the declared profile. The declared profile is the pinned
-WASI 0.3.2 surface **minus** `wasi:http`; the unsupported declarations
-(`types`, `handler`, `client`, and the `service`/`middleware` worlds) are
-enumerated in `specs/wasi/MANIFEST.md`.
+WASI 0.3.2 surface **minus** `wasi:http` and `wasi:sockets`; the unsupported
+HTTP declarations (`types`, `handler`, `client`, and the
+`service`/`middleware` worlds) and the unsupported sockets declarations
+(`types`, `ip-name-lookup`, and the `imports` world) are enumerated in
+`specs/wasi/MANIFEST.md`.
+
+An import of `wasi:sockets` is refused with this exact message:
+
+```
+Network communication (TCP, UDP and DNS) is not supported by this design; there is no wasi:sockets provider for guests. See docs/usage/wasi.md and specs/wasi/MANIFEST.md.
+```
+
+Network communication is not a missing interface and not planned. TCP, UDP
+and DNS are permanently out of scope, as are the CLI network options.
 
 Coverage is enforced at construction: an unimplemented function of a
 bound interface is a `host-error`, never a trapping stub.
@@ -87,10 +98,9 @@ bound interface is a `host-error`, never a trapping stub.
 
 | Limit | Effect |
 | --- | --- |
-| No reactor in the default context | The CLI builds no reactor, so `clocks.wait-until` / `wait-for` signal `host-error` and a would-blocked socket operation returns `would-block` with nothing to wake the parked task later. An embedder that supplies `:reactor` gets both. |
+| No reactor in the default context | The CLI builds no reactor, so `clocks.wait-until` / `wait-for` signal `host-error`. An embedder that supplies `:reactor` gets both. |
 | `@unstable` gating | Annotations are parsed and recorded but not enforced as a feature switch; a gated-off interface (`wasi:clocks/timezone`) simply has no provider, so a world importing it is refused. |
 | `proc_raise` (Preview 1) | A valid signal returns `errno::notsup`; an invalid one `errno::inval`. The hosting SBCL process is never signalled. |
-| `shutdown` | Not present in the pinned 0.3.2 `sockets` WIT revision, so it is not provided. |
 
 ## WASI Preview 1
 

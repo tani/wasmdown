@@ -14,9 +14,15 @@
 ;;;; Implemented subset: validate / inspect / compile / run / help.
 ;;;; M16 slice 6: `run' accepts BOTH layers — a component binary is
 ;;;; driven through the WASI command runner (`--wasi', `--dir',
-;;;; `--env', `--net', `--listen', `--dns' and guest arguments), a
-;;;; core module keeps the `--invoke' path. No --mapdir /
-;;;; --profile-conditional / artifact ABI checks yet.
+;;;; `--env' and guest arguments), a core module keeps the `--invoke'
+;;;; path. No --mapdir / --profile-conditional / artifact ABI checks
+;;;; yet.
+;;;;
+;;;; Network communication (TCP, UDP and DNS) is out of scope by
+;;;; design: the network options `--net', `--listen' and `--dns' are
+;;;; refused as a usage error (the canonical message below) before any
+;;;; network authority could be built, and the guest surface carries no
+;;;; `wasi:sockets' provider.
 
 (in-package #:wasmdown.cli)
 
@@ -36,10 +42,12 @@
                   ~4tcompile <file.wasm> --emit-lisp <out.lisp>~%~
                   ~4trun <file> [--invoke <name> <int> ...]~%~
                   ~4trun <component> --wasi [--dir HOST[::GUEST]]~%~
-                  ~10t[--env K=V] [--net HOST:PORT] [--listen ADDR:PORT]~%~
-                  ~10t[--dns NAME] [arg ...]~%~
+                  ~10t[--env K=V] [arg ...]~%~
                   ~4thelp~%~
-                  exit codes: 0 ok, 1 guest/compile error, 2 usage error~%"))
+                  network options (--net/--listen/--dns) are refused:~%~
+                  ~4t~a~%~
+                  exit codes: 0 ok, 1 guest/compile error, 2 usage error~%"
+          wasmdown.wasi::+wasi-sockets-unsupported-message+))
 
 (defun %usage-error (format-control &rest args)
   (error 'usage-error
@@ -234,16 +242,18 @@ functions first)."
 ;;;
 ;;;   --wasi             enable the WASI capability set (the process
 ;;;                      standard streams, the guest arguments after
-;;;                      the component path, --env/--dir/--net/...)
+;;;                      the component path, --env/--dir)
 ;;;   --dir HOST[::GUEST] a preopen (guest-visible name after `::')
 ;;;   --env K=V          one environment variable
-;;;   --net HOST:PORT    declare an outbound endpoint (network policy)
-;;;   --listen ADDR:PORT declare a listen address
-;;;   --dns NAME         allow a name (or `*' for any)
 ;;;
 ;;; HTTP is not supported in this runtime: there is no `wasi:http'
 ;;; provider and no transport option (the `wasi:http' surface was
 ;;; removed at user direction in M17).
+;;;
+;;; Network communication is not supported either: `--net', `--listen'
+;;; and `--dns' are refused with the canonical message while the
+;;; options are parsed, i.e. before any capability context or network
+;;; authority exists.
 
 (defun %parse-run-args (argv)
   "Return (values file invokes options guest-args). INVOKES is a list
@@ -251,7 +261,12 @@ of (name . integer-args) in command-line order (core modules).
 OPTIONS is an alist of the WASI-capability flags (repeats kept, in
 order); GUEST-ARGS are the positional tokens AFTER the input file.
 `--` ends option parsing: every later token reaches the guest
-unchanged, including dash-prefixed ones."
+unchanged, including dash-prefixed ones.
+
+The network options `--net', `--listen' and `--dns' are a usage error
+carrying the canonical sockets refusal, raised here — before the input
+file is even opened — so no network authority can be built by any
+later stage."
   (let ((rest argv) (file nil) (invokes '()) (options '()) (guest '()))
     (loop while rest
           for tok = (pop rest)
@@ -273,8 +288,12 @@ unchanged, including dash-prefixed ones."
                     (push (cons name (nreverse ints)) invokes))))
                ((string= tok "--wasi")
                 (push (cons "--wasi" t) options))
-               ((member tok '("--dir" "--env" "--net" "--listen" "--dns")
-                        :test #'string=)
+               ((member tok '("--net" "--listen" "--dns") :test #'string=)
+                ;; refused as an OPTION, never as a missing endpoint:
+                ;; the canonical message, not a generic provider error
+                (%usage-error "~a"
+                              wasmdown.wasi::+wasi-sockets-unsupported-message+))
+               ((member tok '("--dir" "--env") :test #'string=)
                 (let ((value (pop rest)))
                   (unless value
                     (%usage-error "run: ~a requires a value" tok))
@@ -336,43 +355,25 @@ mutation through the root are denied by the derived ABI rights."
      host :name guest
      :permissions (if read-only '("read") '("read" "write" "mutate-directory")))))
 
-(defun %run-network (options)
-  "The network authority declared by --net/--listen/--dns, or NIL
-(no network authority: every socket operation is refused)."
-  (let ((outgoing (mapcar #'wasmdown.wasi:parse-wasi-endpoint
-                          (%run-collect options "--net")))
-        (listen (mapcar #'wasmdown.wasi:parse-wasi-endpoint
-                        (%run-collect options "--listen")))
-        (dns (%run-collect options "--dns")))
-    (when (or outgoing listen dns)
-      (wasmdown.wasi:make-wasi-network
-       :outbound outgoing
-       :listen listen
-       :dns (cond ((member "*" dns :test #'string=) :all)
-                  (dns dns)
-                  (t :none))))))
-
 (defun %component-context (options guest-args file)
   "The capability context a component run is configured with. Without
 --wasi every capability is withdrawn (docs/design/PLAN.md §9.1: the default is
 empty); with it, the process streams and the guest arguments (the
-component path as argv[0]) are the explicitly configured ones."
+component path as argv[0]) are the explicitly configured ones. The
+context never carries a network authority: network options are already
+refused by `%parse-run-args'."
   (let ((wasi (assoc "--wasi" options)))
     (when (and (not wasi)
                (or (%run-collect options "--dir")
-                   (%run-collect options "--env")
-                   (%run-collect options "--net")
-                   (%run-collect options "--listen")
-                   (%run-collect options "--dns")))
-      (%usage-error "run: --dir/--env/--net/--listen/--dns require --wasi"))
+                   (%run-collect options "--env")))
+      (%usage-error "run: --dir/--env require --wasi"))
     (when (and (not wasi) guest-args)
       (%usage-error "run: guest arguments require --wasi"))
-    (let* ((network (%run-network options))
-           ;; The CLI OWNS its reactor: clock waits and socket readiness
-           ;; are then servable by the store driver, instead of every
-           ;; wait failing for want of a watch. NIL without --wasi
-           ;; (no capabilities, nothing to wait on).
-           (reactor (and wasi (wasmdown.wasi:make-wasi-reactor))))
+    (let (;; The CLI OWNS its reactor: clock waits are then servable by
+          ;; the store driver, instead of every wait failing for want of
+          ;; a watch. NIL without --wasi (no capabilities, nothing to
+          ;; wait on).
+          (reactor (and wasi (wasmdown.wasi:make-wasi-reactor))))
       (values
        (wasmdown.wasi:make-wasi-context
         :arguments (if wasi (cons file guest-args) nil)
@@ -381,7 +382,6 @@ component path as argv[0]) are the explicitly configured ones."
         :stdout (and wasi *standard-output*)
         :stderr (and wasi *error-output*)
         :preopens (mapcar #'%dir-preopen (%run-collect options "--dir"))
-        :networks (and network (list network))
         :reactor reactor)
        reactor))))
 
@@ -445,12 +445,9 @@ component path as argv[0]) are the explicitly configured ones."
                           (%usage-error "run: stray argument ~s (core modules take --invoke)"
                                         (first guest-args)))
                         (when (or (%run-collect options "--dir")
-                                  (%run-collect options "--env")
-                                  (%run-collect options "--net")
-                                  (%run-collect options "--listen")
-                                  (%run-collect options "--dns"))
+                                  (%run-collect options "--env"))
                           (%usage-error
-                           "run: --dir/--env/--net/--listen/--dns require --wasi"))
+                           "run: --dir/--env require --wasi"))
                         (let* ((module (wasmdown:read-module bytes))
                                (inst (wasmdown:instantiate module :mode (%api-mode))))
                           (dolist (inv invokes)

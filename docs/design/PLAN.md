@@ -107,22 +107,25 @@ Support declarations have three distinct values: `conformant` (every applicable 
 ### 2.1 Definition of full support for the declared WASI 0.3.2 profile (2026-11-02)
 
 "Full support" here means **conformant for the DECLARED WASI 0.3.2 profile**:
-the pinned 0.3.2 stable surface with `wasi:http` excluded by user decision
-(2026-11-02). It is a claim about a pinned release, not about any 0.3.x draft.
-The target is permanently this declared profile: the project does **not** aim to
-restore or implement `wasi:http`, and no milestone, gate, release row or
-definition-of-done item makes it pending. The unqualified phrase "full WASI
-0.3.2" in §12.9 is only a definitional boundary — it describes what a claim
-covering every interface would mean — and is **not a project goal**. Because
-HTTP is a permanent exclusion, this project's maximum honest label is
-`conformant for the declared 0.3.2 profile (wasi:http excluded)`, never an
-unqualified "full WASI 0.3.2". Until every condition below holds,
-`docs/status.md` says `partial`.
+the pinned 0.3.2 stable surface with `wasi:http` and `wasi:sockets` excluded
+by user decision (2026-11-02). It is a claim about a pinned release, not about
+any 0.3.x draft. The target is permanently this declared profile: the project
+does **not** aim to restore or implement `wasi:http` or network communication,
+and no milestone, gate, release row or definition-of-done item makes them
+pending. The unqualified phrase "full WASI 0.3.2" in §12.9 is only a
+definitional boundary — it describes what a claim covering every interface
+would mean — and is **not a project goal**. Because HTTP and network
+communication are permanent exclusions, this project's maximum honest label is
+`conformant for the declared 0.3.2 profile (wasi:http and wasi:sockets
+excluded)`, never an unqualified "full WASI 0.3.2". Until every condition
+below holds, `docs/status.md` says `partial`.
 
 1. **Scope is enumerated.** Every stable interface in the pinned 0.3.2 WIT
    packages is either implemented or listed as an explicit exclusion. Current
    exclusions: `wasi:http` (removed at user direction in M17, 2026-11-02,
-   permanent and not pending), guest threads/atomics,
+   permanent and not pending), network communication — `wasi:sockets`
+   TCP/UDP/DNS and the CLI `--net`/`--listen`/`--dns` options (excluded by user
+   decision 2026-11-02, permanent and not pending), guest threads/atomics,
    annotations, and unratified proposals. The claim names the profile
    ("declared 0.3.2 profile") and the exclusions; it never means "including
    excluded interfaces".
@@ -192,7 +195,7 @@ Expose documented ceilings for module/code sizes, memory allocation, instance co
 | `wasmdown.runtime` | Module instances, functions, globals, tables, memories, tags, heap refs, host calls. | WASI interface naming. |
 | `wasmdown.component` | Component types, linking, resources, canonical lift/lower, async state machines. | Concrete Linux syscalls. |
 | `wasmdown.wasi` | WASI 0.3.2 providers, separate 0.2/0.1 providers and world entry points. | Compiler or IR rewriting. |
-| `wasmdown.host` | Capabilities, filesystem handles, sockets, clocks, RNG, TLS adapters, reactor. | Guest-invented ambient privileges. |
+| `wasmdown.host` | Capabilities, filesystem handles, clocks, RNG, reactor, and the retained internal sockets provider (no guest-visible network). | Guest-invented ambient privileges. |
 
 All cross-subsystem interfaces are explicit. A core module never acquires a host capability by symbol lookup, dynamic variable access, FFI or parsing a guest-supplied name. Module instantiation injects a finite import table with checked types and capabilities.
 
@@ -364,7 +367,7 @@ WASI 0.2 keeps its own canonical interfaces and `wasi:io` resource semantics, ma
 | `wasi:clocks` | Wall and monotonic clocks; precision and subscription/sleep behavior per exact WIT; monotonicity and host-clock failure semantics. |
 | `wasi:random` | Secure random bytes via OS entropy, well-specified insecure variants, host resource/length handling; never substitute `CL:RANDOM` for cryptographic randomness. |
 | `wasi:filesystem` | Preopened descriptor authorities, relative paths, file and directory operations, metadata, symlink restrictions, stream reads/writes, rights, deletion/rename, resource closing. |
-| `wasi:sockets` | IP lookup, TCP/UDP creation and connection/binding/listening, address-family and errors, async stream and network capability restrictions. |
+| `wasi:sockets` | **Unsupported by design (guest-visible) — not an implementation gap, not planned.** TCP, UDP and DNS are excluded permanently by user decision (2026-11-02); no guest may declare a `wasi:sockets` import. The pinned `wasi:cli/command` world imports `wasi:sockets/types@0.3.2` and `wasi:sockets/ip-name-lookup@0.3.2` itself, so a 0.3.2 sockets provider is retained **internally** for that composition only; it is an implementation detail, not a deliverable or support evidence. The vendored `specs/wasi/wasi-wit-0.3.2/sockets/*.wit` remain reference data only. |
 | `wasi:http` | **REMOVED at user direction in M17** (M16 slice 5). The outgoing client and incoming service/middleware worlds, header/body/trailer semantics, backpressure and status/errors are no longer a deliverable; the implementation is recoverable from git history and the vendored `specs/wasi/wasi-wit-0.3.2/http/*.wit` remain as reference data only. |
 | Other versioned stable interfaces | Generate required-interface inventory from vendored WASI 0.3.2 release WIT and implement every interface exposed by the selected stable worlds; experimental proposals are feature-gated. |
 
@@ -389,8 +392,11 @@ WASI 0.2 keeps its own canonical interfaces and `wasi:io` resource semantics, ma
 > `src/wit.lisp`; `src/wasi.lisp` supplies the provider framework and
 > the `clocks`, `random`, `cli` (environment/exit/stdio/terminals/`run`),
 > `filesystem` (the `*at` capability model + streams + `read-directory`),
-> `sockets` (the `wasi-network` authority + tcp/udp + `ip-name-lookup`)
-> providers, all under an explicit `wasi-context`. M16 slice 5
+> and a `sockets` provider (`wasi-network` + tcp/udp + `ip-name-lookup`)
+> that is now retained **internally only** — the pinned `wasi:cli/command`
+> world imports sockets itself, but guest-declared sockets imports are
+> refused (see the table above and §9.3). All under an explicit
+> `wasi-context`. M16 slice 5
 > (`wasi:http`, the `types` resources + `client.send` over HTTP/1.1 with
 > a pluggable transport) was **REMOVED at user direction in M17**; the
 > implementation is recoverable from git history and the vendored
@@ -399,22 +405,33 @@ WASI 0.2 keeps its own canonical interfaces and `wasi:io` resource semantics, ma
 > 1,631/0/0/0 (the lane metric; the probe metric retains the pre-existing,
 > machine-load-dependent async flake class). **Superseded beyond the M17
 > close (2026-11-02):** the CLI now OWNS a reactor that serves clock
-> deadlines and socket readiness, so "no socket/timer reactor / wait-until
+> deadlines and stream readiness, so "no timer reactor / wait-until
 > unsupported" no longer describes the tree; the current evidence is the
-> seven-guest P3 CLI lane (21/21 x3, both backends) plus
-> `wasi/reactor-tcp-loopback` and `wasi/sockets-{accept,recv,send}-reactor-
-> readiness`. Remaining residuals are maintained, per row and with exit
-> evidence, in **§9.3**: upstream toolchain/suite evidence, per-interface
-> CLI guest coverage, nested `option<stream<u8>>` ownership, descriptor
-> dtor/lend reclamation, compound error-result lowering, `@unstable` gating,
-> and per-case validator limits. The WASI 0.1/0.2 facades stay separate
-> (§8.4). HTTP residuals remain **out of scope, not pending**.
+> six-guest P3 CLI lane (18/18 x3, both backends). The retained internal
+> sockets provider still has its unit pins (`wasi/reactor-tcp-loopback`,
+> `wasi/sockets-{accept,recv,send}-reactor-readiness`), but they are
+> composition evidence, not network support. Remaining residuals are
+> maintained, per row and with exit evidence, in **§9.3**: upstream
+> toolchain/suite evidence, per-interface CLI guest coverage, nested
+> `option<stream<u8>>` ownership, descriptor dtor/lend reclamation,
+> compound error-result lowering, `@unstable` gating, and per-case
+> validator limits. The WASI 0.1/0.2 facades stay separate (§8.4).
+> HTTP and network communication remain **out of scope, not pending**.
 > See `docs/usage/wasi.md` and ADR-003.
 > `declared_support` stays `partial`.
 
+A **0.3-line** component that declares a `wasi:sockets` import (any 0.3.x
+interface/version) is refused at link time with this exact message; the separate
+0.2 facade is not affected by that check (and the CLI never builds a network
+authority for any run):
+
+```
+Network communication (TCP, UDP and DNS) is not supported by this design; there is no wasi:sockets provider for guests. See docs/usage/wasi.md and specs/wasi/MANIFEST.md.
+```
+
 ### 9.1 Capabilities
 
-Default capabilities are empty except explicitly configured CLI streams/arguments. File roots are established by open host directory handles, not an unchecked string-prefix filter. Where the host supports it, use handle-relative operations (e.g. openat-style primitives) and secure symlink policies that prevent traversal and TOCTOU escape. Allow separately declared outbound network endpoints, listen addresses and DNS policy. A host import must receive an explicitly allocated authority object, not ambient Lisp globals.
+Default capabilities are empty except explicitly configured CLI streams/arguments. File roots are established by open host directory handles, not an unchecked string-prefix filter. Where the host supports it, use handle-relative operations (e.g. openat-style primitives) and secure symlink policies that prevent traversal and TOCTOU escape. Network communication (TCP/UDP/DNS) is out of scope: no outbound endpoint, listen address or DNS policy is exposed to a guest, the CLI `--net`/`--listen`/`--dns` options are refused as usage errors, and the retained internal sockets provider serves only the pinned command world's own composition. A host import must receive an explicitly allocated authority object, not ambient Lisp globals.
 
 ### 9.2 OS integration and the minimal-dependency boundary
 
@@ -427,32 +444,34 @@ Important feasibility condition: zero external Lisp packages is realistic; zero 
 ### 9.3 Declared-profile full-support gap register (2026-11-02)
 
 Current evidence: `docs/status.md`, `docs/conformance/matrix.md`, the P3 lane
-(`make test-wasi-preview3`; seven guests, 21/21 x3 in both backends) and
+(`make test-wasi-preview3`; six guests, 18/18 x3 in both backends) and
 `tools/build-p3-fixtures.lisp` + P3-CHECKSUMS. Rows are classified as
 **defect** (implementation must change), **evidence** (implementation exists,
 guest/gate evidence missing) and **exclusion** (out of scope by decision).
 Only defect rows block a *correctness* claim; evidence rows block the *conformance*
-claim until supplied.
+claim until supplied. Network communication (`wasi:sockets` TCP/UDP/DNS) is an
+exclusion, not an evidence row: there is no guest-visible provider, and a
+component-declared import is refused with the message under §9.
 
 | Area | Current measured state | Exit evidence required for "full" | Class |
 | --- | --- | --- | --- |
-| Upstream toolchain guest | None; all seven lane guests are hand-authored TEXT encoded by `tools/component-encode.lisp`. No toolchain in this environment emits @0.3.2. | A pinned toolchain commit + one generated @0.3.2 command guest, hashed and regenerated reproducibly, green in both backends. | evidence (blocked) |
+| Upstream toolchain guest | None; all six lane guests are hand-authored TEXT encoded by `tools/component-encode.lisp`. No toolchain in this environment emits @0.3.2. | A pinned toolchain commit + one generated @0.3.2 command guest, hashed and regenerated reproducibly, green in both backends. | evidence (blocked) |
 | Upstream WASI 0.3 suite / adapter | Not run; plan §12.5 defines the adapter, none registered yet. | Adapter + pinned suite branch; all applicable cases green, or the claim remains partial with the blocker recorded. | evidence |
 | CLI guest coverage: filesystem | In-process provider/unit tests only; no CLI guest for preopens/open/read-via-stream/write-via-stream/offset/errors. | Command guests for the filesystem surface, both backends. | evidence |
 | CLI guest coverage: random | Provider/unit tests only. | `random`/`insecure`/`insecure-seed` command guest with length/determinism-negative checks. | evidence |
 | CLI guest coverage: clock deadlines | `now()` guest plus a cancel-during-`wait-for` guest; no guest that observes a `wait-until`/`wait-for` **completion** through the CLI reactor. | Deadline completion guest (deterministic bound), both backends. | evidence |
-| CLI guest coverage: sockets | create/connect/send/receive over loopback; no guest `listen`/`accept`, UDP, DNS `ip-name-lookup`, or error-code paths. | Guests for listen/accept + UDP + lookup + refusal/timeout errors; reactor readiness proven in-guest. | evidence |
+| CLI guest coverage: sockets (excluded) | Not applicable: network communication is excluded, so the former TCP loopback guest was removed with the lane (2026-11-02). The retained internal provider keeps unit pins only. | None — excluded interfaces are never evidence rows. Import refusal is pinned by the link-time check. | exclusion |
 | CLI guest coverage: cli/stdio/env/terminal | exit/stdout only. | stdin/stderr, environment(args/env), terminal-* where the host grants them. | evidence |
-| Socket readiness implementation | Reactor serves clock deadlines and socket readiness; `wasi/reactor-tcp-loopback` and `wasi/sockets-{accept,recv,send}-reactor-readiness` pass in-process. Older M17 text claiming "no socket/timer reactor" is superseded. | Guest-level proof (above); audit of thread-affinity/delivery rules against §8.3. | evidence/audit |
-| Blocking DNS/stdio executors | `wasi-context-dns-executor`/`wasi-context-stdio-executor` exist and are used; §status providers row still labels the surface partial. | Audit boundedness/thread-affinity, then correct the status row; guest DNS/stdio evidence. | audit |
+| Socket readiness (internal composition) | The retained internal provider registers readiness; `wasi/reactor-tcp-loopback` and `wasi/sockets-{accept,recv,send}-reactor-readiness` pass in-process. This is composition evidence only — guest sockets are excluded, and no readiness claim is made for the declared profile. | None for the declared profile; the internal provider is not a deliverable. | exclusion |
+| Blocked-stdio executor | `wasi-context-stdio-executor` exists and is used; §status providers row still labels the surface partial. | Audit boundedness/thread-affinity, then correct the status row; guest stdio evidence. | audit |
 | Nested `option<stream<u8>>` host lower | Resolves in the provider's table instead of the caller's (Known gaps). | Fixed owner resolution + regression pin (positive and trap paths). | defect |
 | Descriptor destructor / lend bookkeeping | Destructors and lend lists can accumulate in long-lived hosts (Known gaps). | Reclaim policy + counters/plateau test over repeated instantiations. | defect |
 | Compound error-result lowering | History records `%abi-lower`'s top-level error-result discriminant for compound outer shapes as residual; per-case validator limits remain. | Fixed lowering + ABI matrix cases (nested result/error shapes). | defect (audit) |
 | `@unstable` gating | Parsed/recorded, not enforced; unstable interfaces simply unregistered. | Feature/stability gate enforced; negative tests for unstable use outside the enabled profile. | defect |
 | WIT/validator residual limits | Reader covers include/renaming, implements/@external-id and nominal resource identity with pins; individual validator edge cases remain tracked per fixture. | Per-case closure or documented limit; no blanket "WIT unimplemented" claim. | audit |
 | Deterministic async property suites | Component async suite + P3 fixtures; no dedicated fake-reactor/fake-executor property lane for P3. | Property lane over task/stream/future/cancel state transitions with repeated seeds. | evidence |
-| Compiled backend cost | P3 lane runs compiled; large compiled lanes are reports. Owner accepted compile time/heap (2026-11-02). | A bounded cheap compiled gate for P3 (already the 7-case lane); no reduction required for conformance. | accepted limit |
-| WASI HTTP, threads/atomics, annotations, unratified proposals | Not implemented by decision. | Listed as exclusions in the support declaration; never reported as passes. | exclusion |
+| Compiled backend cost | P3 lane runs compiled; large compiled lanes are reports. Owner accepted compile time/heap (2026-11-02). | A bounded cheap compiled gate for P3 (already the 6-case lane); no reduction required for conformance. | accepted limit |
+| WASI HTTP, network communication (`wasi:sockets` TCP/UDP/DNS and the CLI network options), threads/atomics, annotations, unratified proposals | Not implemented by decision. | Listed as exclusions in the support declaration; never reported as passes. | exclusion |
 
 ## 10. Security, isolation and resource management
 
@@ -647,11 +666,11 @@ Additional compulsory fixtures, even when absent from upstream:
 
 - **WASI 0.1:** `proc_exit`, preopens, `fd_*`, argument/environment transfer, rights, clock and random error paths, directory/path traversal, and large file offsets.
 - **WASI 0.2:** `wasi:io` streams and pollables, resource lifecycle, component-mediated CLI, and behavior of a 0.2 adapter hosted internally by the 0.3 environment.
-- **WASI 0.3.2:** command world `async run`, streaming stdin/stdout, correct completion futures, system/monotonic clocks, random-byte length constraints, filesystem descriptors, DNS, TCP and UDP. WASI HTTP was REMOVED at user direction in M17 (M16 slice 5), so no HTTP fixtures or worlds are mandatory; its vendored WIT remains reference data only.
+- **WASI 0.3.2:** command world `async run`, streaming stdin/stdout, correct completion futures, system/monotonic clocks, random-byte length constraints and filesystem descriptors. WASI HTTP was REMOVED at user direction in M17 (M16 slice 5), so no HTTP fixtures or worlds are mandatory; its vendored WIT remains reference data only. Network communication (`wasi:sockets` TCP/UDP/DNS) is excluded by the same permanent decision, so no TCP/UDP/DNS fixture is a deliverable and a guest-declared sockets import is refused at link time.
 - **Async composition:** A → B → C → host, futures whose completion is delayed, producer/consumer backpressure, zero-byte streams, early close, reader/writer cancellation, dropped owner resources, and error propagation after partial output.
 - **Security:** denied root/network access, symlink/TOCTOU attempts, capability inheritance boundaries, resource quotas, and correct rejection of unsupported providers instead of accidental fallback to ambient host authority.
 
-The normative test matrix includes **each stable WIT package/interface/function in the pinned WASI release, except the M17-removed WASI HTTP surface**. A suite that covers only CLI filesystem functions is not evidence that sockets have been completed. Generate an interface-function checklist automatically from vendored WIT and map every item to executable tests or a reviewed manual conformance argument.
+The normative test matrix includes **each stable WIT package/interface/function in the pinned WASI release, except the M17-removed WASI HTTP surface and the permanently excluded `wasi:sockets` surface**. A suite that covers only CLI filesystem functions is not evidence that the declared profile is complete; network interfaces are exclusions, so no socket completion is claimed. Generate an interface-function checklist automatically from vendored WIT and map every item to executable tests, a reviewed manual conformance argument, or an explicit exclusion.
 
 ### 12.6 Property-based, differential and fuzz testing
 
@@ -754,7 +773,7 @@ Define \(F\) as the **normative inventory** of opcode semantics, type rules, bin
 | G2 — Core 3.0 | `SuitePass(core) = 1` for all applicable cases; zero unreviewed skip/unsupported/xfail; `C = F` for every normative Core 3.0 family; legal limits documented |
 | G3 — Optimizer equivalence | Baseline vs optimized vs interpreter match on all pinned deterministic core tests and differential corpus; zero known semantic regressions; performance results published |
 | G4 — Component Model | All pinned applicable Component Model tests pass and all WASI-adopted Canonical ABI features have positive/negative test coverage, including async resource life cycles |
-| G5 — WASI 0.3.2 | All applicable pinned official P3 tests pass plus `C = F` for every declared stable 0.3.2 interface/world; CLI, filesystem, sockets, stream/future and nested-async tests pass; WASI HTTP is excluded (REMOVED at user direction in M17, recoverable from git history); P1/P2 claims audited separately |
+| G5 — WASI 0.3.2 | All applicable pinned official P3 tests pass plus `C = F` for every declared stable 0.3.2 interface/world; CLI, filesystem, stream/future and nested-async tests pass; WASI HTTP is excluded (REMOVED at user direction in M17, recoverable from git history) and network communication (`wasi:sockets` TCP/UDP/DNS) is excluded (user decision 2026-11-02), so neither is a gate item; P1/P2 claims audited separately |
 | G6 — Release | G2–G5 green on declared platforms; no untriaged critical security defects; isolated hostile-input tests; signed/checksummed reproducible binaries and reports; explicit platform/resource-limit matrix |
 
 An operational **1.0 release** claiming full WebAssembly Core 3.0 + selected published WASI 0.3.2 stable worlds requires **G2, G3, G4, G5 and G6**, with the advertised scope enumerated precisely. If any world/interface/function is omitted, the WASI claim must instead be labeled **partial**. A full *WASI 0.3.2* claim requires all mandatory adopted stable interfaces in the intended standard worlds, not a handpicked CLI subset. Passing these suites documents strong conformance evidence but does not provide a mathematical proof of an implementation's correctness.
@@ -773,7 +792,7 @@ An operational **1.0 release** claiming full WebAssembly Core 3.0 + selected pub
 | M7 | Component suite adapter, exhaustive Canonical ABI matrix and borrow/own lifetime invariants; G4 as soon as async coverage completes |
 | M8 | WASI 0.1 official adapter + explicit WASI 0.2 compatibility suite |
 | M9 | Async state-machine, composition, cancellation and backpressure property suites |
-| M10 | WASI 0.3 official adapter, complete stable WIT-function coverage, world-level integration and network fixtures (WASI HTTP excluded after its M17 removal); G5 |
+| M10 | WASI 0.3 official adapter, complete stable WIT-function coverage and world-level integration for the declared profile (WASI HTTP excluded after its M17 removal; network communication excluded 2026-11-02); G5 |
 | M11 | Hostile-input fuzz budget, capability audit, portability, reproducible artifact/release report; G6 |
 
 At each release tag, archive `CONFORMANCE.md`, machine-readable assertion reports, suite/WIT lockfiles and license notices. This prevents later changes in a floating official suite from retroactively changing the meaning of an earlier published compliance claim.
@@ -786,8 +805,8 @@ for the same source commit/tree; otherwise the label is `partial`.
 
 | Gate item | Evidence artifact | Failure mode that must downgrade the claim |
 | --- | --- | --- |
-| Stable WIT surface implemented in the DECLARED PROFILE (HTTP excluded), exclusions enumerated | Pin `specs/wasi/wasi-wit-0.3.2` checksums; a support table listing every interface/function as implemented or excluded (HTTP, threads/atomics, annotations, proposals) | Any stable interface silently absent; exclusion presented as support |
-| Behavioural coverage per interface | CLI command guests + provider negative tests for fs, random, clocks (incl. deadline completion), sockets (listen/accept/UDP/DNS/errors), cli stdio/env/terminal | Registration-only coverage; missing error/lifetime/cancel paths |
+| Stable WIT surface implemented in the DECLARED PROFILE (HTTP and sockets excluded), exclusions enumerated | Pin `specs/wasi/wasi-wit-0.3.2` checksums; a support table listing every interface/function as implemented or excluded (HTTP, `wasi:sockets`/network, threads/atomics, annotations, proposals) | Any stable interface silently absent; exclusion presented as support |
+| Behavioural coverage per interface | CLI command guests + provider negative tests for fs, random, clocks (incl. deadline completion), cli stdio/env/terminal | Registration-only coverage; missing error/lifetime/cancel paths |
 | Async semantics | Task/stream/future/cancel tests in both backends, including a deterministic fake-reactor property lane (§9.3) | Races or lifetimes serialized away; exactly-once/backpressure unproven |
 | Upstream toolchain guest | Pinned toolchain commit + generated @0.3.2 guest, hash/regeneration script, green in both backends | Hand-authored-only lane used to claim ecosystem compatibility |
 | Upstream suite | Pinned WASI 0.3 suite/adapter run (or documented blocker) | Suite skipped/unavailable but claim left `conformant` |
@@ -841,7 +860,7 @@ Effort is a planning estimate for *one experienced, full-time implementer* with 
 | M7 | 8–12 wk | Component decoder/linker/type system; WIT parser, canonical ABI and resources. | Baseline component samples compose; ownership and ABI tests pass. |
 | M8 | 6–10 wk | WASI 0.1 and 0.2 facades; capability-aware filesystem, clocks, random and stdio. | Legacy official suites and own 0.2 compatibility cases pass. |
 | M9 | 10–16 wk | WASI 0.3.2 async component ABI: task state machine, future/stream, backpressure and wake propagation. | Cross-component suspension/cancellation and async Canonical ABI parity. |
-| M10 | 8–14 wk | Complete 0.3.2 stable world providers, sockets and host adapters (WASI HTTP and its TLS adapter were REMOVED at user direction in M17). | **G5:** applicable pinned WASI 0.3 suites and component-world tests pass. |
+| M10 | 8–14 wk | Complete 0.3.2 stable world providers for the declared profile, plus host adapters (WASI HTTP and its TLS adapter were REMOVED at user direction in M17; network communication is excluded by the 2026-11-02 decision). | **G5:** applicable pinned WASI 0.3 suites and component-world tests pass. |
 | M11 | 6–10 wk | Security hardening, quotas, fuzzing, 2nd-architecture portability, documentation/release. | **G6:** all gates; no open critical defects; reproducible release and support matrix. |
 | M12 (optional) | 8–16 wk | Threads/atomics proposal compatibility, shared memory and atomic backend. | Separate proposal-suite compliance; Core 3.0 label unchanged. |
 
@@ -865,7 +884,7 @@ M0 -> M1 -> M2 -> M3 -> M4 -> M5 -> M6
 | 0.3 | After M5 | Core Wasm 3.0 conformant under published limits, if G2 fully achieved. |
 | 0.5 | After M6–M8 | Optimized Core 3.0 plus partial/complete explicitly versioned legacy WASI. |
 | 0.9 | After M9–M10 | WASI 0.3.2 release candidate; feature coverage documented per world. |
-| 1.0 | After M11 | Core 3.0 + the declared WASI 0.3.2 profile (all pinned stable interfaces except the permanent `wasi:http` exclusion, user decision 2026-11-02), backed by published conformance evidence; no release claims an unqualified "full WASI 0.3.2", and HTTP is never pending or restored. |
+| 1.0 | After M11 | Core 3.0 + the declared WASI 0.3.2 profile (all pinned stable interfaces except the permanent `wasi:http` and `wasi:sockets`/network exclusions, user decision 2026-11-02), backed by published conformance evidence; no release claims an unqualified "full WASI 0.3.2", and HTTP and network communication are never pending or restored. |
 
 ---
 
@@ -880,13 +899,13 @@ completed milestones. Evidence lives in `docs/status.md`,
 | M0 | Implemented: pinned suites/WIT, source-identity artifact contract, `make verify`, `make verify-release` | Upstream 0.3 suite adapter registration (§12.5) |
 | M1–M2 | Implemented: stable func-instance identity, prepare/start ordering, shared call/tail/EH protocol | Preserve regressions; deeper EH/reentry properties are tracked, not blocking P3 |
 | M3 | Recorded green core parity (21,260 matches, 0 refusals) + property/fuzz lane | Independent semantic oracle beyond differential agreement (plan-level) |
-| M4 | P1 46 imports; acceptance lane green incl. compiled | Behavioural audit items stay in their own rows |
+| M4 | P1 46 imports bound; non-network acceptance lane green incl. compiled. The four legacy `sock_*` imports are excluded from the declared support profile (network exclusion, 2026-11-02) | Behavioural audit items stay in their own rows; the claim is explicitly the NON-NETWORK P1 surface |
 | M5 | Component lane 1,702/1,702; canonical ABI/resources/async exercised | §9.3 defects: nested stream owner, dtor/lend reclaim, compound error-result |
 | M6 | P2 behaviour lane green after readiness/permit fixes | Version matrix beyond 0.2.12 is an explicit non-claim today |
 | M7 | Compiled lowering covers interpreter families | Generated/upstream tests remain plan-level; not a P3 blocker |
 | M8 | Reactor/scheduler/borrow checks; resume-safe and cancelled guests pinned | Fake-reactor property lane; executor thread-affinity audit |
-| M9 | Seven hand-authored @0.3.2 CLI guests, 21/21 x3 both backends; text→binary encoder + round-trip guard | Upstream toolchain guest; per-interface guest breadth (fs/random/deadlines/listen-accept/UDP/DNS/stdio/env/terminal) |
-| M10 | Cost data, profiles, release matrix; compile cost accepted by owner | Bounded cheap compiled P3 gate already exists (7-case lane); stress matrix per §12.7 |
+| M9 | Six hand-authored @0.3.2 CLI guests, 18/18 x3 both backends; text→binary encoder + round-trip guard | Upstream toolchain guest; per-interface guest breadth (fs/random/deadlines/stdio/env/terminal); network communication is excluded |
+| M10 | Cost data, profiles, release matrix; compile cost accepted by owner | Bounded cheap compiled P3 gate already exists (6-case lane); stress matrix per §12.7 |
 | M11 | Quick gates + repeated lanes + release matrix checker | Security/portability fuzzing programme remains plan-level |
 | M12 | Not started (threads/atomics option) | Out of scope unless explicitly enabled |
 
@@ -895,10 +914,10 @@ completed milestones. Evidence lives in `docs/status.md`,
 | Step | Work package | Depends on | Exit evidence |
 | --- | --- | --- | --- |
 | F1 | Evidence plumbing: register the `wasi-testsuite` 0.3 adapter (§12.5) and pin a toolchain that emits @0.3.2; add both as explicit `make` targets with source-identity records | §12.5, §12.8 | Adapter/guest runs green, or a recorded blocker that forces `partial` |
-| F2 | Interface completion in the CLI lane: filesystem (preopens, streams, offsets, errors), random, clock deadline completion, sockets listen/accept/UDP/DNS/error codes, cli stdin/stderr/env/terminal | F1 for toolchain evidence; can start in parallel for hand-authored guests | Command guests per family, both backends, 3 repeats, hashes pinned |
+| F2 | Interface completion in the CLI lane: filesystem (preopens, streams, offsets, errors), random, clock deadline completion, cli stdin/stderr/env/terminal. Network communication (`wasi:sockets` TCP/UDP/DNS) is excluded and is not a work item. | F1 for toolchain evidence; can start in parallel for hand-authored guests | Command guests per family, both backends, 3 repeats, hashes pinned |
 | F3 | Defect closure from §9.3: nested `option<stream<u8>>` ownership, descriptor dtor/lend reclamation, compound error-result lowering, `@unstable` enforcement, per-case validator limits | M5/M8 internals | Each with a regression pin that fails before/passes after; register rows closed |
 | F4 | Async assurance: deterministic fake-reactor/fake-executor property lane, cancel/close races, exactly-once and backpressure invariants; executor thread-affinity audit | F3 for lifetime semantics | Repeated property lane green with seeds; audits documented |
-| F5 | Claim flip to `conformant for the declared 0.3.2 profile`: run G5 + §12.11 checklist, regenerate matrix, update `docs/status.md` only if no row is unmet; release notes enumerate worlds/exclusions (HTTP never claimed) | F1–F4 | P3 x both backends green at one commit; support table complete |
+| F5 | Claim flip to `conformant for the declared 0.3.2 profile`: run G5 + §12.11 checklist, regenerate matrix, update `docs/status.md` only if no row is unmet; release notes enumerate worlds/exclusions (HTTP and network communication never claimed) | F1–F4 | P3 x both backends green at one commit; support table complete |
 
 ## 15. Risks, decision records and definition of done
 
@@ -931,7 +950,7 @@ completed milestones. Evidence lives in `docs/status.md`,
 - [ ] Official Core 3.0 tests pass with no semantic skips or hidden missing feature gates, subject to documented permitted limits.
 - [ ] Compiled Lisp source is inspectable; optimized and interpreter paths are differential-equivalent.
 - [ ] Component Model encoding, validation, Canonical ABI, nested composition, resources and required adopted feature gates pass tests.
-- [ ] The declared WASI 0.3.2 profile is implemented and passes applicable conformance tests: every pinned stable interface except the permanent `wasi:http` exclusion (user decision 2026-11-02), with the claim naming that exclusion. `wasi:http` is not pending and not planned; no unqualified "full WASI 0.3.2" claim is made.
+- [ ] The declared WASI 0.3.2 profile is implemented and passes applicable conformance tests: every pinned stable interface except the permanent `wasi:http` exclusion (user decision 2026-11-02) and the permanent network-communication exclusion (`wasi:sockets` TCP/UDP/DNS and the CLI `--net`/`--listen`/`--dns` options, user decision 2026-11-02), with the claim naming both exclusions. `wasi:http` and network communication are not pending and not planned; no unqualified "full WASI 0.3.2" claim is made.
 - [ ] WASI 0.1 and 0.2 compatibility assertions are separately documented and tested.
 - [ ] Host capability/security review passes; hostile programs can be run with meaningful worker-process isolation.
 - [ ] Benchmarks, architecture/platform support, explicit resource limits, build instructions, pinned dependencies and release artifacts are published.
