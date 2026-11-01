@@ -62,6 +62,14 @@ slice 3) — never a path-prefix string."
   ;; socket provider is built from ONE of them; every bind/connect/
   ;; resolve consults it. NIL = no network authority at all.
   (networks nil)
+  ;; M16 slice 5 (restored): the embedder-supplied HTTP transports
+  ;; (docs/design/PLAN.md §9.2: "pluggable system TLS providers or
+  ;; embedder-supplied transport services"). A wasi-http-transport
+  ;; whose SCHEME matches a request's scheme is used instead of the
+  ;; built-in plain TCP transport; no match for an https request is
+  ;; the WIT's `configuration-error', never a silent plaintext
+  ;; fallback.
+  (http-transports nil)
   ;; M17 step 6: the context's REACTOR (a wasi-reactor, or NIL = no
   ;; clock/time capability). monotonic-clock's wait-until/wait-for arm
   ;; their one-shot deadline here; the store driver owns when STEP
@@ -423,7 +431,7 @@ back-pressure tables even for a host callee."
 ;;; The audit enumerated, from the vendored 0.3.2 WIT, every function
 ;;; and resource METHOD of every interface this runtime provides, and
 ;;; compared it with the implementation alist each provider supplies:
-;;; 89 declared, 89 implemented, 0 stubs.
+;;; 125 declared, 125 implemented, 0 stubs.
 ;;;
 ;;;   clocks/monotonic-clock   4    random/random           2
 ;;;   clocks/system-clock      2    random/insecure         2
@@ -432,6 +440,7 @@ back-pressure tables even for a host callee."
 ;;;   cli/stdin|stdout|stderr  1+1+1    filesystem/preopens 1
 ;;;   cli/terminal-*          1+1+1    sockets/types         40
 ;;;                                   sockets/ip-name-lookup 1
+;;;   http/types              35    http/client             1
 ;;;
 ;;; (clocks/types, cli/terminal-input and cli/terminal-output declare
 ;;; no functions.) Every gate on that surface is
@@ -444,12 +453,13 @@ back-pressure tables even for a host callee."
 ;;; (COMPOSE-WORLD-PROVIDERS names the import):
 ;;;   * wasi:clocks/timezone — iana-id, utc-offset, to-debug-string;
 ;;;     all three are `@unstable(feature = clocks-timezone)';
-;;;   * wasi:http/types (35), wasi:http/client (1), wasi:http/handler
-;;;     (1) — WASI HTTP was removed at user direction;
+;;;   * wasi:http/handler (1) — the INCOMING service/middleware
+;;;     direction is a follow-up; the outgoing `types' + `client'
+;;;     surface IS served (M16 slice 5, restored);
 ;;;   * wasi:cli/run — the command world's EXPORT (served by
 ;;;     COMPONENT-RUN-EXPORT), never an import to bind.
 ;;;
-;;; PROVIDER-INSTANCE enforces the 89/89: an alist that does not cover
+;;; PROVIDER-INSTANCE enforces the 125/125: an alist that does not cover
 ;;; a declared function is a construction-time HOST-ERROR naming the
 ;;; interface and the function. There is no stub factory, so the
 ;;; implemented set cannot shrink silently.
@@ -6028,15 +6038,1897 @@ alist, all bound to one network authority."
             (wasmdown.wit:package-interface package "ip-name-lookup"))
            (ip-name-lookup-instance context :network net :package package)))))
 
+;;; ===============================================================
+;;; wasi:http (M16 slice 5) — THE TYPES RESOURCES and client.send
+;;; over HTTP/1.1 with a PLUGGABLE TRANSPORT.
+;;;
+;;; PLAN.md §9: "HTTP outgoing client and incoming service/middleware
+;;; worlds, header/body/trailer semantics, backpressure, status/
+;;; errors; TLS/HTTPS via an explicit host transport abstraction."
+;;; §9.2: "plugin system TLS providers or embedder-supplied transport
+;;; services. Do not write custom cryptographic TLS."
+;;;
+;;; The transport abstraction is the answer to https. A request whose
+;;; scheme is "http" rides the built-in plain TCP transport; any other
+;;; scheme is looked up in the CONTEXT's wasi-http-transport list
+;;; (never an ambient global) and, when absent, the send fails with
+;;; the WIT's `configuration-error' — never a silent plaintext
+;;; fallback, never home-grown TLS.
+;;;
+;;; The client is a PULL-DRIVEN HTTP/1.1 implementation: send()
+;;; writes the head + already-staged request body and parses the
+;;; response head synchronously; the response body is decoded lazily
+;;; by the host stream SOURCE the guest reads from (content-length,
+;;; chunked with trailers, or read-to-close), so no reactor thread is
+;;; needed. Request bodies must be staged (written and closed) before
+;;; send — the residual for streaming uploads is recorded in the
+;;; slice report.
+;;;
+;;; The `fields` resource is the WIT's header map: case-insensitive
+;;; names, ordered values, original casing preserved, mutable vs
+;;; immutable handles, the header-error validation (invalid-syntax,
+;;; forbidden, immutable, size-exceeded).
+
 ;;; ---------------------------------------------------------------
-;;; `wasi:http` was REMOVED at user direction in M17: this runtime
-;;; does not support WASI HTTP. The M16 slice 5 implementation (the
-;;; `types` resources, `client.send`, the pluggable transports and the
-;;; plain HTTP/1.1 client) is recoverable from git history; nothing
-;;; here is stubbed, disabled or shimmed. The vendored WIT under
-;;; `specs/wasi/wasi-wit-0.3.2/http/*.wit` remains reference data
-;;; only — it still parses and validates, but no provider is built
-;;; from it and no `wasi:http` name is exported by this package.
+;;; The WIT packages + functype helpers.
+
+(defun %http-packages (&key (package (wasi-package "http")))
+  "The WIT packages wasi:http functypes resolve against (duration
+comes from wasi:clocks/types)."
+  (list package (wasi-package "clocks")))
+
+(defun http-resource-ct (name &key (package (wasi-package "http")))
+  "The ONE ct object naming the resource NAME in wasi:http/types —
+the handle table's type identity for every handle of that resource."
+  (wasmdown.wit:wit-type->ct
+   (wasmdown.wit:package-interface package "types")
+   (list :resource name)
+   :packages (%http-packages :package package)))
+
+(defun %http-resource-method (resource method
+                              &key (package (wasi-package "http")))
+  (let* ((interface (wasmdown.wit:package-interface package "types"))
+         (res (find resource
+                    (wasmdown.wit:wit-interface-resource-list interface)
+                    :key #'wasmdown.wit:wit-resource-name :test #'string=))
+         (fn (and res
+                  (find method
+                        (wasmdown.wit:wit-resource-methods res)
+                        :key #'wasmdown.wit:wit-func-name :test #'string=))))
+    (unless fn
+      (error 'wasmdown:host-error
+             :message (format nil "wasi:http/types has no ~a.~a"
+                              resource method)))
+    (values interface res fn)))
+
+(defun %http-method-ct (resource method
+                        &key (package (wasi-package "http")))
+  (multiple-value-bind (interface res fn)
+      (%http-resource-method resource method :package package)
+    (%resource-method-ct interface res fn (%http-packages :package package))))
+
+(defun %http-result-ct (resource method
+                        &key (package (wasi-package "http")))
+  (second (wasmdown.component:ct-payload
+           (%http-method-ct resource method :package package))))
+
+(defun %http-future-ct (resource method
+                        &key (package (wasi-package "http")))
+  "The ELEMENT ct of the FIRST future<...> in the method's result."
+  (let ((fc (%ct-find-kind (%http-result-ct resource method
+                                            :package package)
+                           :future)))
+    (unless fc
+      (error 'wasmdown:host-error
+             :message (format nil "~a.~a has no future result"
+                              resource method)))
+    (wasmdown.component:ct-payload fc)))
+
+(defun %http-stream-ct (resource method
+                        &key (package (wasi-package "http")))
+  "The ELEMENT ct of the FIRST stream<...> in the method's result."
+  (let ((sc (%ct-find-kind (%http-result-ct resource method
+                                            :package package)
+                           :stream)))
+    (unless sc
+      (error 'wasmdown:host-error
+             :message (format nil "~a.~a has no stream result"
+                              resource method)))
+    (wasmdown.component:ct-payload sc)))
+
+;;; ---------------------------------------------------------------
+;;; The error-code condition. The CODE is the WIT VARIANT DOMAIN
+;;; value (label . payload), the shape the canonical store accepts
+;;; for a real `error-code'.
+
+(define-condition wasi-http-error (wasmdown:wasmdown-error)
+  ((code :initarg :code
+         :initform (cons "internal-error" (cons :some "wasi:http error"))
+         :reader wasi-http-error-code))
+  (:report (lambda (c s)
+             (format s "wasi:http error: ~a" (wasi-http-error-code c)))))
+
+(defun http-error-code (value)
+  "The case name of an error-code domain value (the CL test view)."
+  (and (consp value) (car value)))
+
+(defun %http-error (code)
+  (error 'wasi-http-error :code code))
+
+(defmacro %http-result (&body body)
+  "Run BODY; a wasi-http-error becomes the WIT's (:err . code)."
+  `(handler-case (progn ,@body)
+     (wasi-http-error (c) (cons :err (wasi-http-error-code c)))))
+
+;;; The variant helpers: a domain value is (label . payload).
+(defun %http-code (label) (cons label nil))
+(defun %http-code-payload (label payload) (cons label payload))
+(defun %http-internal (message)
+  (cons "internal-error" (cons :some message)))
+
+;;; ---------------------------------------------------------------
+;;; fields: the header map.
+
+(defparameter +http-max-field-name-size+ 256)
+(defparameter +http-max-field-value-size+ 65536)
+(defparameter +http-max-fields-total-size+ (* 1024 1024))
+
+;;; RFC 7230 tchar (the token production).
+(defparameter +http-tchar-chars+
+  "!#$%&'*+-.^_`|~0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+  "The HTTP token character set (RFC 7230 §3.2.6).")
+
+(defparameter +http-forbidden-field-names+
+  '("connection" "content-length" "host" "keep-alive" "proxy-connection"
+    "te" "trailer" "transfer-encoding" "upgrade")
+  "The field names the HTTP implementation owns: a guest cannot set
+them (RFC 7230 §6.1 + the wasi:http forbidden set). Case-insensitive.")
+
+(defun %http-token-p (string)
+  (and (stringp string)
+       (plusp (length string))
+       (every (lambda (c) (find c +http-tchar-chars+ :test #'char=)) string)))
+
+(defun %http-forbidden-field-name-p (name)
+  (and (stringp name)
+       (member (string-downcase name)
+               +http-forbidden-field-names+ :test #'string=)))
+
+(defun %field-value-bytes (value)
+  "A field-value's bytes as a list of u8 (a CL string, vector and
+list are all accepted at the host boundary; the ABI produces a list)."
+  (cond ((stringp value) (map 'list #'char-code value))
+        ((vectorp value) (coerce value 'list))
+        ((listp value) value)
+        (t (list value))))
+
+(defun %http-field-value-ok-p (bytes)
+  "field-value = *( HTAB / SP / VCHAR / obs-text ) — CR, LF and other
+CTLs are rejected (§4.2's invalid-syntax)."
+  (and (listp bytes)
+       (every (lambda (b)
+                (and (integerp b) (<= 0 b 255)
+                     (or (= b 9) (<= 32 b 126) (<= 128 b 255))))
+              bytes)))
+
+(defmacro %http-header-error (label)
+  `(cons :err (cons ,label nil)))
+
+(defstruct (wasi-fields (:constructor %make-wasi-fields (entries mutable-p)))
+  "The `fields' resource rep: ENTRIES is the ordered list of
+(original-name . value-bytes) pairs (one pair per value), and
+MUTABLE-P is the WIT's mutability bit (a `fields' returned by
+request.headers / response.headers is immutable)."
+  (entries nil)
+  (mutable-p t))
+
+(defun make-wasi-fields (&key entries (mutable-p t))
+  "A `fields' from (name . value) entries; values may be strings,
+vectors or u8 lists."
+  (%make-wasi-fields
+   (loop for (name . value) in entries
+         collect (cons name (%field-value-bytes value)))
+   mutable-p))
+
+(defun %fields-of (value ct)
+  "The wasi-fields VALUE denotes (a rep, or a handle index resolved
+through the dynamic caller's/provider's handle table)."
+  (let ((f (cond ((wasi-fields-p value) value)
+                 ((integerp value)
+                  (wasmdown.component.runtime:host-resource-rep ct value)))))
+    (unless (wasi-fields-p f)
+      (error 'wasmdown:host-error :message "fields: invalid handle"))
+    f))
+
+(defun %http-take-resource (value ct)
+  "An OWN resource argument: the rep, consuming the handle from the
+dynamic caller's table when VALUE is a handle index. A bare rep (a
+direct CL call) passes through."
+  (cond
+    ((integerp value)
+     (multiple-value-bind (rep found)
+         (wasmdown.component.runtime:host-resource-take ct value)
+       (declare (ignore found))
+       (or rep value)))
+    (t value)))
+
+(defun %fields-values (fields name)
+  (loop for (n . v) in (wasi-fields-entries fields)
+        when (string-equal n name)
+          collect v))
+
+(defun %fields-total-size (fields)
+  (loop for (n . v) in (wasi-fields-entries fields)
+        sum (+ (length n) (length v))))
+
+(defun %fields-replace (fields name values)
+  "Replace every value of NAME (case-insensitively), keeping the
+position of the first old entry; append when absent."
+  (let* ((entries (wasi-fields-entries fields))
+         (pos (position name entries :key #'car :test #'string-equal))
+         (new (loop for v in values collect (cons name v))))
+    (setf (wasi-fields-entries fields)
+          (if pos
+              (append (subseq entries 0 pos) new
+                      (remove name (nthcdr (1+ pos) entries)
+                              :key #'car :test #'string-equal))
+              (append entries new)))))
+
+(defun %fields-append (fields name value)
+  (setf (wasi-fields-entries fields)
+        (append (wasi-fields-entries fields) (list (cons name value)))))
+
+(defun %fields-delete (fields name)
+  (setf (wasi-fields-entries fields)
+        (remove name (wasi-fields-entries fields)
+                :key #'car :test #'string-equal)))
+
+(defun %fields-size-check (fields name values)
+  "The implementation limit check: NAME + VALUES fit the per-field and
+aggregate limits (header-error.size-exceeded otherwise)."
+  (cond
+    ((> (length name) +http-max-field-name-size+)
+     (%http-header-error "size-exceeded"))
+    ((some (lambda (v) (> (length v) +http-max-field-value-size+)) values)
+     (%http-header-error "size-exceeded"))
+    (t
+     (let ((projected
+             (+ (%fields-total-size
+                 (%make-wasi-fields
+                  (remove name (wasi-fields-entries fields)
+                          :key #'car :test #'string-equal)
+                  t))
+                (* (max 1 (length values)) (length name))
+                (reduce #'+ values :key #'length :initial-value 0))))
+       (if (> projected +http-max-fields-total-size+)
+           (%http-header-error "size-exceeded")
+           (cons :ok nil))))))
+
+;;; The WIT methods.
+
+(defun fields-from-list (entries)
+  "fields.from-list: validate every (name, value) entry."
+  (let ((entries (coerce entries 'list)))
+    (loop for entry in entries
+          for name = (first entry)
+          for value = (%field-value-bytes (second entry))
+          do (cond
+               ((not (%http-token-p name))
+                (return-from fields-from-list
+                  (%http-header-error "invalid-syntax")))
+               ((%http-forbidden-field-name-p name)
+                (return-from fields-from-list
+                  (%http-header-error "forbidden")))
+               ((not (%http-field-value-ok-p value))
+                (return-from fields-from-list
+                  (%http-header-error "invalid-syntax")))
+               ((> (length name) +http-max-field-name-size+)
+                (return-from fields-from-list
+                  (%http-header-error "size-exceeded")))
+               ((> (length value) +http-max-field-value-size+)
+                (return-from fields-from-list
+                  (%http-header-error "size-exceeded")))))
+    (let ((fields (make-wasi-fields
+                   :entries (loop for entry in entries
+                                  collect (cons (first entry)
+                                                (%field-value-bytes
+                                                 (second entry)))))))
+      (if (> (%fields-total-size fields) +http-max-fields-total-size+)
+          (%http-header-error "size-exceeded")
+          (list :own-handle (http-resource-ct "fields") fields)))))
+
+(defun fields-get (fields name &key (package (wasi-package "http")))
+  (declare (ignore package))
+  (let ((f (%fields-of fields (http-resource-ct "fields"))))
+    (if (%http-token-p name) (%fields-values f name) '())))
+
+(defun fields-has (fields name &key (package (wasi-package "http")))
+  (declare (ignore package))
+  (let ((f (%fields-of fields (http-resource-ct "fields"))))
+    (and (%http-token-p name) (not (null (%fields-values f name))))))
+
+(defun fields-set (fields name values &key (package (wasi-package "http")))
+  (declare (ignore package))
+  (let* ((f (%fields-of fields (http-resource-ct "fields")))
+         (values (mapcar #'%field-value-bytes (coerce values 'list))))
+    (cond
+      ((not (wasi-fields-mutable-p f)) (%http-header-error "immutable"))
+      ((not (%http-token-p name)) (%http-header-error "invalid-syntax"))
+      ((%http-forbidden-field-name-p name) (%http-header-error "forbidden"))
+      ((not (every #'%http-field-value-ok-p values))
+       (%http-header-error "invalid-syntax"))
+      (t (let ((check (%fields-size-check f name values)))
+           (if (eq (car check) :ok)
+               (progn (%fields-replace f name values) (cons :ok nil))
+               check))))))
+
+(defun fields-delete (fields name &key (package (wasi-package "http")))
+  (declare (ignore package))
+  (let ((f (%fields-of fields (http-resource-ct "fields"))))
+    (if (not (wasi-fields-mutable-p f))
+        (%http-header-error "immutable")
+        (progn (%fields-delete f name) (cons :ok nil)))))
+
+(defun fields-get-and-delete (fields name
+                              &key (package (wasi-package "http")))
+  (declare (ignore package))
+  (let ((f (%fields-of fields (http-resource-ct "fields"))))
+    (if (not (wasi-fields-mutable-p f))
+        (%http-header-error "immutable")
+        (let ((values (if (%http-token-p name) (%fields-values f name) '())))
+          (%fields-delete f name)
+          (cons :ok values)))))
+
+(defun fields-append (fields name value
+                      &key (package (wasi-package "http")))
+  (declare (ignore package))
+  (let* ((f (%fields-of fields (http-resource-ct "fields")))
+         (value (%field-value-bytes value)))
+    (cond
+      ((not (wasi-fields-mutable-p f)) (%http-header-error "immutable"))
+      ((not (%http-token-p name)) (%http-header-error "invalid-syntax"))
+      ((%http-forbidden-field-name-p name) (%http-header-error "forbidden"))
+      ((not (%http-field-value-ok-p value))
+       (%http-header-error "invalid-syntax"))
+      (t (let ((check (%fields-size-check f name (list value))))
+           (if (eq (car check) :ok)
+               (progn (%fields-append f name value) (cons :ok nil))
+               check))))))
+
+(defun fields-copy-all (fields &key (package (wasi-package "http")))
+  (declare (ignore package))
+  (let ((f (%fields-of fields (http-resource-ct "fields"))))
+    (loop for (name . value) in (wasi-fields-entries f)
+          collect (list name (copy-list value)))))
+
+(defun fields-clone (fields &key (package (wasi-package "http")))
+  (declare (ignore package))
+  (let* ((f (%fields-of fields (http-resource-ct "fields")))
+         (copy (make-wasi-fields
+                :entries (loop for (name . value)
+                                 in (wasi-fields-entries f)
+                               collect (cons name (copy-list value))))))
+    (list :own-handle (http-resource-ct "fields") copy)))
+
+(defun fields-constructor (&key (package (wasi-package "http")))
+  (declare (ignore package))
+  (list :own-handle (http-resource-ct "fields") (make-wasi-fields)))
+
+(defun %fields-immutable-view (fields &key (package (wasi-package "http")))
+  "The `headers' a request/response accessor returns: a copy flagged
+immutable so set/append/delete fail with header-error.immutable."
+  (let ((copy (make-wasi-fields
+               :entries (loop for (name . value)
+                                in (wasi-fields-entries fields)
+                              collect (cons name (copy-list value)))
+               :mutable-p nil)))
+    (list :own-handle (http-resource-ct "fields" :package package) copy)))
+
+;;; ---------------------------------------------------------------
+;;; request-options.
+
+(defstruct wasi-http-options
+  "The `request-options' resource rep. Durations are nanoseconds
+(wasi:clocks/types.duration), :none for unset."
+  (connect-timeout :none)
+  (first-byte-timeout :none)
+  (between-bytes-timeout :none)
+  (mutable-p t))
+
+(defun %options-of (value ct)
+  (let ((o (cond ((wasi-http-options-p value) value)
+                 ((integerp value)
+                  (wasmdown.component.runtime:host-resource-rep ct value)))))
+    (unless (wasi-http-options-p o)
+      (error 'wasmdown:host-error :message "request-options: invalid handle"))
+    o))
+
+(defun %http-options-error (label) (cons :err (cons label nil)))
+
+(defun %options-set-timeout (options slot-key duration)
+  "A duration is option<duration> (u64 nanos). A ZERO duration is
+rejected: the WIT's `not-supported' — this implementation cannot
+honour a zero-length transport timeout."
+  (cond
+    ((not (wasi-http-options-mutable-p options))
+     (%http-options-error "immutable"))
+    ((and (consp duration) (integerp (cdr duration)) (zerop (cdr duration)))
+     (%http-options-error "not-supported"))
+    ((and (integerp duration) (zerop duration))
+     (%http-options-error "not-supported"))
+    (t
+     (ecase slot-key
+       (:connect (setf (wasi-http-options-connect-timeout options) duration))
+       (:first-byte
+        (setf (wasi-http-options-first-byte-timeout options) duration))
+       (:between-bytes
+        (setf (wasi-http-options-between-bytes-timeout options) duration)))
+     (cons :ok nil))))
+
+(defun request-options-constructor (&key (package (wasi-package "http")))
+  (declare (ignore package))
+  (list :own-handle (http-resource-ct "request-options")
+        (make-wasi-http-options)))
+
+(defun request-options-get-connect-timeout (options
+                                            &key (package (wasi-package "http")))
+  (declare (ignore package))
+  (wasi-http-options-connect-timeout
+   (%options-of options (http-resource-ct "request-options"))))
+
+(defun request-options-set-connect-timeout (options duration
+                                            &key (package (wasi-package "http")))
+  (declare (ignore package))
+  (%options-set-timeout
+   (%options-of options (http-resource-ct "request-options"))
+   :connect duration))
+
+(defun request-options-get-first-byte-timeout (options
+                                               &key (package (wasi-package "http")))
+  (declare (ignore package))
+  (wasi-http-options-first-byte-timeout
+   (%options-of options (http-resource-ct "request-options"))))
+
+(defun request-options-set-first-byte-timeout (options duration
+                                               &key (package (wasi-package "http")))
+  (declare (ignore package))
+  (%options-set-timeout
+   (%options-of options (http-resource-ct "request-options"))
+   :first-byte duration))
+
+(defun request-options-get-between-bytes-timeout (options
+                                                  &key (package (wasi-package "http")))
+  (declare (ignore package))
+  (wasi-http-options-between-bytes-timeout
+   (%options-of options (http-resource-ct "request-options"))))
+
+(defun request-options-set-between-bytes-timeout (options duration
+                                                  &key (package (wasi-package "http")))
+  (declare (ignore package))
+  (%options-set-timeout
+   (%options-of options (http-resource-ct "request-options"))
+   :between-bytes duration))
+
+(defun request-options-clone (options &key (package (wasi-package "http")))
+  (declare (ignore package))
+  (let ((o (%options-of options (http-resource-ct "request-options"))))
+    (list :own-handle
+          (http-resource-ct "request-options")
+          (make-wasi-http-options
+           :connect-timeout (wasi-http-options-connect-timeout o)
+           :first-byte-timeout (wasi-http-options-first-byte-timeout o)
+           :between-bytes-timeout
+           (wasi-http-options-between-bytes-timeout o)))))
+
+;;; ---------------------------------------------------------------
+;;; method / scheme / authority / path validation.
+
+(defun %http-method-ok-p (method)
+  "A method domain value: a known case, or other(string) whose string
+is a valid token."
+  (and (consp method)
+       (let ((label (car method)))
+         (cond
+           ((string-equal label "other")
+            (%http-token-p (cdr method)))
+           (t
+            (member label
+                    '("get" "head" "post" "put" "delete" "connect"
+                      "options" "trace" "patch")
+                    :test #'string=))))))
+
+(defun %http-scheme-ok-p (scheme)
+  (and (consp scheme)
+       (cond
+         ((string-equal (car scheme) "other")
+          (let ((s (cdr scheme)))
+            (and (stringp s) (plusp (length s))
+                 (alpha-char-p (char s 0))
+                 (every (lambda (c)
+                          (or (alpha-char-p c) (digit-char-p c)
+                              (find c "+-." :test #'char=)))
+                        s))))
+         (t (member (car scheme) '("HTTP" "HTTPS") :test #'string=)))))
+
+(defun %http-path-ok-p (path)
+  "origin-form: \"/\" or \"*\", then visible ASCII (no space, CR, LF,
+NUL; a fragment `#' is not part of a request target)."
+  (and (stringp path)
+       (plusp (length path))
+       (or (char= (char path 0) #\/) (string= path "*"))
+       (every (lambda (c)
+                (let ((code (char-code c)))
+                  (and (<= 33 code 126) (not (char= c #\#)))))
+              path)))
+
+(defun %http-authority-ok-p (authority)
+  "authority = host [ \":\" port ]; userinfo is not accepted."
+  (and (stringp authority)
+       (plusp (length authority))
+       (every (lambda (c)
+                (let ((code (char-code c)))
+                  (and (<= 33 code 126)
+                       (not (find c "/?#@" :test #'char=)))))
+              authority)
+       ;; the port, when present, must be digits
+       (let* ((host-port (if (and (char= (char authority 0) #\[)
+                                  (find #\] authority))
+                             (let ((close (position #\] authority)))
+                               (if (< (1+ close) (length authority))
+                                   (subseq authority (1+ close))
+                                   ""))
+                             (let ((colon (position #\: authority)))
+                               (if colon (subseq authority colon) "")))))
+         (or (string= host-port "")
+             (progn (unless (char= (char host-port 0) #\:) (return-from %http-authority-ok-p nil))
+                    (let ((digits (subseq host-port 1)))
+                      (and (plusp (length digits))
+                           (every #'digit-char-p digits)
+                           (<= (ignore-errors (parse-integer digits)) 65535))))))))
+
+(defun %http-split-authority (authority)
+  "authority -> (values host-without-brackets port)"
+  (if (and (char= (char authority 0) #\[)
+           (find #\] authority))
+      (let* ((close (position #\] authority))
+             (host (subseq authority 1 close))
+             (rest (subseq authority (1+ close))))
+        (values host
+                (if (and (plusp (length rest)) (char= (char rest 0) #\:))
+                    (parse-integer (subseq rest 1))
+                    80)))
+      (let ((colon (position #\: authority)))
+        (if colon
+            (values (subseq authority 0 colon)
+                    (parse-integer (subseq authority (1+ colon))))
+            (values authority 80)))))
+
+(defun %http-method-string (method)
+  (if (string-equal (car method) "other")
+      (string (cdr method))
+      (string-upcase (car method))))
+
+(defun %http-scheme-string (scheme)
+  "The lowercase scheme string; :none means the implementation picks
+the default (http for this transport stack). The field holds an
+option<scheme>, so a (:some . scheme) is unwrapped here."
+  (let ((s (if (and (consp scheme) (eq (car scheme) :some))
+               (cdr scheme)
+               scheme)))
+    (if (eq s :none)
+        "http"
+        (if (string-equal (car s) "other")
+            (string-downcase (string (cdr s)))
+            (string-downcase (car s))))))
+
+;;; ---------------------------------------------------------------
+;;; The request resource.
+
+(defstruct wasi-http-request
+  (method (cons "get" nil))
+  (path-with-query :none)
+  (scheme :none)
+  (authority :none)
+  (headers nil)                       ; wasi-fields
+  (options nil)                       ; wasi-http-options or NIL
+  (body-end nil)                      ; the guest's readable contents end
+  (body-buffer nil)                   ; reversed list of byte-lists
+  (body-length 0)
+  (body-closed-p nil)
+  (body-error nil)
+  (trailers-end nil)                  ; the readable trailers future
+  (transmission-writer nil)           ; request.new's result future
+  (consumed-p nil))
+
+(defun %request-of (value ct)
+  (let ((r (cond ((wasi-http-request-p value) value)
+                 ((integerp value)
+                  (wasmdown.component.runtime:host-resource-rep ct value)))))
+    (unless (wasi-http-request-p r)
+      (error 'wasmdown:host-error :message "request: invalid handle"))
+    r))
+
+(defun %http-end-of (value)
+  "An option<stream> / option<resource> argument."
+  (cond ((null value) nil)
+        ((eq value :none) nil)
+        ((and (consp value) (eq (car value) :some)) (cdr value))
+        ((and (consp value) (member (car value) '("none" "some") :test #'string=))
+         (if (string= (car value) "none") nil (cdr value)))
+        (t value)))
+
+(defun %http-future-value (end)
+  "A non-blocking read of a guest-resolved future end: (values value
+present-p)."
+  (if (and end (wasmdown.component.runtime:async-end-p end))
+      (wasmdown.component.runtime:host-end-read end)
+      (values nil nil)))
+
+(defun %http-request-settle (request value)
+  (let ((w (wasi-http-request-transmission-writer request)))
+    (when w
+      (setf (wasi-http-request-transmission-writer request) nil)
+      (wasmdown.component.runtime:host-future-resolve w value))))
+
+(defun http-request-new (headers contents trailers options
+                         &key (package (wasi-package "http")))
+  "request.new: construct the request, take the contents stream's
+readable end as the body sink, and return (request, transmission
+future). The body is fully staged by the guest before send."
+  (let* ((fields-ct (http-resource-ct "fields" :package package))
+         (request-ct (http-resource-ct "request" :package package))
+         (future-ct (%http-future-ct "request" "new" :package package))
+         (h (%http-take-resource headers fields-ct))
+         (req (make-wasi-http-request
+               :headers (if (wasi-fields-p h) h (make-wasi-fields)))))
+    (unless (wasi-fields-p h)
+      (error 'wasmdown:host-error
+             :message "request.new: headers is not a fields resource"))
+    (let ((body (%http-end-of contents))
+          (trailers-end (%http-end-of trailers))
+          (opts (%http-end-of options)))
+      (when body
+        (unless (wasmdown.component.runtime:async-end-p body)
+          (error 'wasmdown:host-error
+                 :message "request.new: contents is not a stream end"))
+        (setf (wasi-http-request-body-end req) body))
+      (when trailers-end
+        (unless (wasmdown.component.runtime:async-end-p trailers-end)
+          (error 'wasmdown:host-error
+                 :message "request.new: trailers is not a future end"))
+        (setf (wasi-http-request-trailers-end req) trailers-end))
+      (when (and opts (not (wasmdown.component.runtime:async-end-p opts)))
+        (let ((o (%http-take-resource opts
+                                      (http-resource-ct "request-options"
+                                                        :package package))))
+          (unless (wasi-http-options-p o)
+            (error 'wasmdown:host-error
+                   :message "request.new: options is not a request-options"))
+          (setf (wasi-http-request-options req) o)))
+      (multiple-value-bind (future-reader future-writer)
+          (wasmdown.component.runtime:make-host-future-pair future-ct)
+        (setf (wasi-http-request-transmission-writer req) future-writer)
+        (if body
+            (progn
+              (wasmdown.component.runtime:host-end-set-sink
+               body
+               (lambda (octets start end)
+                 (push (coerce (subseq octets start end) 'list)
+                       (wasi-http-request-body-buffer req))
+                 (incf (wasi-http-request-body-length req) (- end start))
+                 (values (- end start) nil)))
+              (wasmdown.component.runtime:host-end-set-on-drop
+               body
+               (lambda (dropped error)
+                 (declare (ignore dropped))
+                 (setf (wasi-http-request-body-closed-p req) t)
+                 (if error
+                     (progn
+                       (setf (wasi-http-request-body-error req) error)
+                       (%http-request-settle req (cons :err error)))
+                     (%http-request-settle req (cons :ok nil)))))
+              (wasmdown.component.runtime:host-end-drain body))
+            (%http-request-settle req (cons :ok nil)))
+        (list (list :own-handle request-ct req) future-reader)))))
+
+(defun http-request-get-method (this &key (package (wasi-package "http")))
+  (declare (ignore package))
+  (wasi-http-request-method (%request-of this (http-resource-ct "request"))))
+
+(defun http-request-set-method (this method
+                                &key (package (wasi-package "http")))
+  (declare (ignore package))
+  (let ((req (%request-of this (http-resource-ct "request"))))
+    (if (%http-method-ok-p method)
+        (progn (setf (wasi-http-request-method req) method) (cons :ok nil))
+        (cons :err nil))))
+
+(defun http-request-get-path-with-query (this
+                                         &key (package (wasi-package "http")))
+  (declare (ignore package))
+  (wasi-http-request-path-with-query
+   (%request-of this (http-resource-ct "request"))))
+
+(defun http-request-set-path-with-query (this path
+                                         &key (package (wasi-package "http")))
+  (declare (ignore package))
+  (let ((req (%request-of this (http-resource-ct "request"))))
+    (cond
+      ((eq path :none) (setf (wasi-http-request-path-with-query req) :none)
+       (cons :ok nil))
+      ((and (consp path) (eq (car path) :some))
+       (if (%http-path-ok-p (cdr path))
+           (progn (setf (wasi-http-request-path-with-query req) path)
+                  (cons :ok nil))
+           (cons :err nil)))
+      (t (if (%http-path-ok-p path)
+             (progn (setf (wasi-http-request-path-with-query req)
+                          (cons :some path))
+                    (cons :ok nil))
+             (cons :err nil))))))
+
+(defun http-request-get-scheme (this &key (package (wasi-package "http")))
+  (declare (ignore package))
+  (wasi-http-request-scheme (%request-of this (http-resource-ct "request"))))
+
+(defun http-request-set-scheme (this scheme
+                                &key (package (wasi-package "http")))
+  (declare (ignore package))
+  (let ((req (%request-of this (http-resource-ct "request"))))
+    (cond
+      ((eq scheme :none) (setf (wasi-http-request-scheme req) :none)
+       (cons :ok nil))
+      ((and (consp scheme) (eq (car scheme) :some))
+       (if (%http-scheme-ok-p (cdr scheme))
+           (progn (setf (wasi-http-request-scheme req) scheme) (cons :ok nil))
+           (cons :err nil)))
+      (t (if (%http-scheme-ok-p scheme)
+             (progn (setf (wasi-http-request-scheme req) (cons :some scheme))
+                    (cons :ok nil))
+             (cons :err nil))))))
+
+(defun http-request-get-authority (this &key (package (wasi-package "http")))
+  (declare (ignore package))
+  (wasi-http-request-authority
+   (%request-of this (http-resource-ct "request"))))
+
+(defun http-request-set-authority (this authority
+                                   &key (package (wasi-package "http")))
+  (declare (ignore package))
+  (let ((req (%request-of this (http-resource-ct "request"))))
+    (cond
+      ((eq authority :none)
+       (setf (wasi-http-request-authority req) :none)
+       (cons :ok nil))
+      ((and (consp authority) (eq (car authority) :some))
+       (if (%http-authority-ok-p (cdr authority))
+           (progn (setf (wasi-http-request-authority req) authority)
+                  (cons :ok nil))
+           (cons :err nil)))
+      (t (if (%http-authority-ok-p authority)
+             (progn (setf (wasi-http-request-authority req)
+                          (cons :some authority))
+                    (cons :ok nil))
+             (cons :err nil))))))
+
+(defun http-request-get-options (this &key (package (wasi-package "http")))
+  (declare (ignore package))
+  (let* ((req (%request-of this (http-resource-ct "request")))
+         (opts (wasi-http-request-options req)))
+    (if opts
+        (list :own-handle
+              (http-resource-ct "request-options")
+              (make-wasi-http-options
+               :connect-timeout (wasi-http-options-connect-timeout opts)
+               :first-byte-timeout
+               (wasi-http-options-first-byte-timeout opts)
+               :between-bytes-timeout
+               (wasi-http-options-between-bytes-timeout opts)
+               :mutable-p nil))
+        :none)))
+
+(defun http-request-get-headers (this &key (package (wasi-package "http")))
+  (declare (ignore package))
+  (let ((req (%request-of this (http-resource-ct "request"))))
+    (%fields-immutable-view (wasi-http-request-headers req))))
+
+(defun http-request-consume-body (this res &key (package (wasi-package "http")))
+  "request.consume-body: serve the request's captured body bytes as a
+stream and resolve the trailers future at EOF. (The provider-built
+INCOMING request side arrives with the handler world.)"
+  (declare (ignore package))
+  (let* ((request-ct (http-resource-ct "request"))
+         (req (%http-take-resource this request-ct))
+         (elem-ct (%http-stream-ct "request" "consume-body"))
+         (future-ct (%http-future-ct "request" "consume-body"))
+         (bytes (apply #'append
+                       (reverse (wasi-http-request-body-buffer
+                                 (%request-of req request-ct))))))
+    (setf (wasi-http-request-consumed-p (%request-of req request-ct)) t)
+    (multiple-value-bind (stream-reader stream-writer)
+        (wasmdown.component.runtime:make-host-stream-pair elem-ct)
+      (multiple-value-bind (future-reader future-writer)
+          (wasmdown.component.runtime:make-host-future-pair future-ct)
+        (let ((pos 0)
+              (settled nil))
+          (flet ((settle (value)
+                   (unless settled
+                     (setf settled t)
+                     (wasmdown.component.runtime:host-future-resolve
+                      future-writer value))))
+            (wasmdown.component.runtime:host-end-set-source
+             stream-writer
+             (lambda (max)
+               (if (>= pos (length bytes))
+                   (values nil t)
+                   (let ((k (min max (- (length bytes) pos))))
+                     (prog1 (values (subseq bytes pos (+ pos k)) nil)
+                       (incf pos k))))))
+            (wasmdown.component.runtime:host-end-set-on-drop
+             stream-writer
+             (lambda (dropped error)
+               (declare (ignore dropped error))
+               (multiple-value-bind (value present)
+                   (%http-future-value res)
+                 (if (and present (consp value) (eq (car value) :err))
+                     (settle value)
+                     (settle (cons :ok :none))))))
+            (list stream-reader future-reader)))))))
+
+;;; ---------------------------------------------------------------
+;;; The response resource.
+
+(defstruct wasi-http-response
+  (status 200)
+  (headers nil)
+  (body nil)                          ; wasi-http-body
+  (consumed-p nil)
+  (transmission-writer nil))
+
+(defun %response-of (value ct)
+  (let ((r (cond ((wasi-http-response-p value) value)
+                 ((integerp value)
+                  (wasmdown.component.runtime:host-resource-rep ct value)))))
+    (unless (wasi-http-response-p r)
+      (error 'wasmdown:host-error :message "response: invalid handle"))
+    r))
+
+(defun http-response-new (headers contents trailers
+                          &key (package (wasi-package "http")))
+  "response.new: the provider-side constructor (the handler world's
+direction); the body bytes supplied through CONTENTS are buffered and
+a transmission future reports completion."
+  (let* ((fields-ct (http-resource-ct "fields" :package package))
+         (response-ct (http-resource-ct "response" :package package))
+         (future-ct (%http-future-ct "response" "new" :package package))
+         (h (%http-take-resource headers fields-ct)))
+    (unless (wasi-fields-p h)
+      (error 'wasmdown:host-error
+             :message "response.new: headers is not a fields resource"))
+    (let ((resp (make-wasi-http-response :headers h))
+          (body (%http-end-of contents)))
+      (declare (ignore trailers))
+      (multiple-value-bind (future-reader future-writer)
+          (wasmdown.component.runtime:make-host-future-pair future-ct)
+        (setf (wasi-http-response-transmission-writer resp) future-writer)
+        (if body
+            (progn
+              (wasmdown.component.runtime:host-end-set-sink
+               body
+               (lambda (octets start end)
+                 (let ((state (or (wasi-http-response-body resp)
+                                  (make-wasi-http-body))))
+                   (setf (wasi-http-response-body resp) state)
+                   (setf (wasi-http-body-buffer state)
+                         (append (wasi-http-body-buffer state)
+                                 (coerce (subseq octets start end) 'list)))
+                   (values (- end start) nil))))
+              (wasmdown.component.runtime:host-end-set-on-drop
+               body
+               (lambda (dropped error)
+                 (declare (ignore dropped error))
+                 (let ((w (wasi-http-response-transmission-writer resp)))
+                   (when w
+                     (setf (wasi-http-response-transmission-writer resp) nil)
+                     (wasmdown.component.runtime:host-future-resolve
+                      w (cons :ok nil))))))
+              (wasmdown.component.runtime:host-end-drain body))
+            (wasmdown.component.runtime:host-future-resolve
+             future-writer (cons :ok nil)))
+        (list (list :own-handle response-ct resp) future-reader)))))
+
+(defun http-response-get-status-code (this
+                                      &key (package (wasi-package "http")))
+  (declare (ignore package))
+  (wasi-http-response-status
+   (%response-of this (http-resource-ct "response"))))
+
+(defun http-response-set-status-code (this status
+                                      &key (package (wasi-package "http")))
+  (declare (ignore package))
+  (let ((resp (%response-of this (http-resource-ct "response"))))
+    (if (and (integerp status) (<= 100 status 599))
+        (progn (setf (wasi-http-response-status resp) status) (cons :ok nil))
+        (cons :err nil))))
+
+(defun http-response-get-headers (this &key (package (wasi-package "http")))
+  (declare (ignore package))
+  (let ((resp (%response-of this (http-resource-ct "response"))))
+    (%fields-immutable-view (wasi-http-response-headers resp))))
+
+(defun http-response-consume-body (this res
+                                   &key (package (wasi-package "http")))
+  (declare (ignore package))
+  (let* ((response-ct (http-resource-ct "response"))
+         (resp (%response-of (%http-take-resource this response-ct)
+                             response-ct))
+         (elem-ct (%http-stream-ct "response" "consume-body"))
+         (future-ct (%http-future-ct "response" "consume-body"))
+         (body (wasi-http-response-body resp)))
+    (setf (wasi-http-response-consumed-p resp) t)
+    (multiple-value-bind (stream-reader stream-writer)
+        (wasmdown.component.runtime:make-host-stream-pair elem-ct)
+      (multiple-value-bind (future-reader future-writer)
+          (wasmdown.component.runtime:make-host-future-pair future-ct)
+        (let ((settled nil))
+          (flet ((settle (value)
+                   (unless settled
+                     (setf settled t)
+                     (wasmdown.component.runtime:host-future-resolve
+                      future-writer value))))
+            ;; the guest's `res' future: a delivered error wins
+            (multiple-value-bind (value present)
+                (%http-future-value res)
+              (when (and present body (consp value) (eq (car value) :err))
+                (setf (wasi-http-body-error body) (cdr value))))
+            (when body
+              (wasmdown.component.runtime:host-end-set-source
+               stream-writer (%http-body-source body)))
+            (wasmdown.component.runtime:host-end-set-on-drop
+             stream-writer
+             (lambda (dropped error)
+               (declare (ignore dropped))
+               (let ((code (or error (and body (wasi-http-body-error body)))))
+                 (cond
+                   (code (settle (cons :err code)))
+                   ((and body (wasi-http-body-trailers body))
+                    (settle
+                     (cons :ok
+                           (cons :some
+                                 (list :own-handle
+                                       (http-resource-ct "fields")
+                                       (wasi-http-body-trailers body))))))
+                   (t (settle (cons :ok :none)))))
+               (%http-body-close body)))
+            (when (and body (eq (wasi-http-body-mode body) :none))
+              (wasmdown.component.runtime:host-end-drop stream-writer))
+            (list stream-reader future-reader)))))))
+
+;;; ---------------------------------------------------------------
+;;; The pluggable transport.
+
+(defstruct wasi-http-connection
+  "A duplex byte channel to one HTTP server. READ-FN: (max timeout-ms)
+-> (values byte-list status) with status :ok/:eof/:timeout or a
+(:error . error-code) cons. WRITE-FN: (byte-list) -> error-code or
+NIL. CLOSE-FN: () -> ignored."
+  (fd -1)
+  (read-fn nil)
+  (write-fn nil)
+  (close-fn nil)
+  (closed-p nil))
+
+(defstruct wasi-http-transport
+  "An embedder-supplied HTTP transport (PLAN §9.2). SCHEME is matched
+case-insensitively against the request's scheme; CONNECT is
+(host port destination timeout-ms) -> wasi-http-connection, where
+DESTINATION is (family address-bytes port) already cleared by the
+network capability. The built-in plain-TCP transport serves http;
+register a TLS transport for https through the CONTEXT's
+http-transports — this file never implements TLS itself."
+  (scheme "https")
+  (tls-p t)
+  (connect nil))
+
+(defun %http-transport-for (context scheme)
+  "The transport for SCHEME: the built-in plain TCP for http, else one
+of the CONTEXT's registered transports (case-insensitive). NIL when
+none is registered — the caller turns that into configuration-error."
+  (cond
+    ((string-equal scheme "http") (%http-plain-transport))
+    (t
+     (find-if (lambda (tr)
+                (and (string-equal (wasi-http-transport-scheme tr) scheme)
+                     (wasi-http-transport-connect tr)))
+              (wasi-context-http-transports context)))))
+
+(defparameter +http-default-connect-timeout-ms+ 30000)
+(defparameter +http-default-first-byte-timeout-ms+ 30000)
+(defparameter +http-default-between-bytes-timeout-ms+ 30000)
+
+;;; errno -> the WIT's error-code cases.
+(defparameter *http-errno->code*
+  '((111 . "connection-refused")        ; ECONNREFUSED
+    (110 . "connection-timeout")        ; ETIMEDOUT
+    (104 . "connection-terminated")     ; ECONNRESET
+    (32 . "connection-terminated")      ; EPIPE
+    (113 . "destination-unavailable")   ; EHOSTUNREACH
+    (101 . "destination-IP-unroutable") ; ENETUNREACH
+    (13 . "HTTP-request-denied")        ; EACCES
+    (22 . "configuration-error")))      ; EINVAL
+
+(defun %http-errno-code (errno)
+  (cons (or (cdr (assoc errno *http-errno->code*)) "internal-error")
+        nil))
+
+(defun %http-connect-fd (fd alien len timeout-ms)
+  "connect(2) with the EINPROGRESS completion wait bounded by
+TIMEOUT-MS (0 = the plain %connect-fd's 5 s)."
+  (sb-alien:set-errno 0)
+  (let ((ret (%libc-connect fd (sb-alien:alien-sap alien) len)))
+    (cond
+      ((zerop ret) t)
+      ((= (sb-alien:get-errno) +einprogress+)
+       (unless (%poll-fd fd +pollout+
+                         (if (and timeout-ms (plusp timeout-ms))
+                             timeout-ms
+                             5000))
+         (%http-error (%http-code "connection-timeout")))
+       (let ((err (%getsockopt-int fd +sol-socket+ +so-error+)))
+         (unless (zerop err)
+           (%http-error (%http-errno-code err)))))
+      (t (%http-error (%http-errno-code (sb-alien:get-errno)))))))
+
+(defun %http-plain-read (fd max timeout-ms)
+  "One recv(2) bounded by POLLIN/TIMEOUT-MS."
+  (let ((buf (sb-alien:make-alien sb-alien:unsigned-char max)))
+    (unwind-protect
+         (loop
+           (sb-alien:set-errno 0)
+           (let ((n (%libc-recv fd (sb-alien:alien-sap buf) max 0)))
+             (cond
+               ((plusp n)
+                (return (values (loop for i below n
+                                      collect (sb-sys:sap-ref-8
+                                               (sb-alien:alien-sap buf) i))
+                                :ok)))
+               ((zerop n) (return (values nil :eof)))
+               (t
+                (let ((errno (sb-alien:get-errno)))
+                  (cond
+                    ((= errno +eintr+) nil)
+                    ((= errno +eagain+)
+                     (unless (%poll-fd fd +pollin+
+                                       (if timeout-ms timeout-ms 30000))
+                       (return (values nil :timeout))))
+                    (t (return (values nil (%http-errno-code errno))))))))))
+      (sb-alien:free-alien buf))))
+
+(defun %http-plain-write (fd bytes)
+  (let ((n (length bytes)))
+    (if (zerop n)
+        nil
+        (let ((buf (%byte-list->alien bytes)))
+          (unwind-protect
+               (block write
+                 (let ((done 0))
+                   (loop while (< done n)
+                         do (let* ((ptr (sb-sys:sap+ (sb-alien:alien-sap buf)
+                                                     done))
+                                   (ret (%libc-send fd ptr (- n done)
+                                                    +msg-nosignal+)))
+                              (cond
+                                ((plusp ret) (incf done ret))
+                                ((zerop ret)
+                                 (return-from write (%http-code
+                                                     "connection-terminated")))
+                                (t
+                                 (let ((errno (sb-alien:get-errno)))
+                                   (cond
+                                     ((= errno +eintr+) nil)
+                                     ((= errno +eagain+)
+                                      (unless (%poll-fd fd +pollout+ 30000)
+                                        (return-from write
+                                          (%http-code
+                                           "connection-write-timeout"))))
+                                     (t (return-from write
+                                          (%http-errno-code errno)))))))))
+                   nil))
+            (sb-alien:free-alien buf))))))
+
+(defun %http-plain-connect (host port destination timeout-ms)
+  "The built-in plain-TCP transport. DESTINATION is
+(family address-bytes port) already checked against the network
+policy."
+  (declare (ignore host port))
+  (destructuring-bind (family address port) destination
+    (multiple-value-bind (alien len)
+        (%make-sockaddr
+         (ecase family (:ipv4 "ipv4") (:ipv6 "ipv6"))
+         (list (cons "port" port) (cons "address" address)))
+      (unwind-protect
+           (let ((fd (%libc-socket
+                      (%family-key family)
+                      (logior +sock-stream+ +sock-nonblock+ +sock-cloexec+)
+                      +ipproto-tcp+)))
+             (when (minusp fd)
+               (%http-error (%http-errno-code (sb-alien:get-errno))))
+             (handler-case
+                 (progn
+                   (%http-connect-fd fd alien len timeout-ms)
+                   (make-wasi-http-connection
+                    :fd fd
+                    :read-fn (lambda (max to) (%http-plain-read fd max to))
+                    :write-fn (lambda (bytes) (%http-plain-write fd bytes))
+                    :close-fn (lambda () (%close-fd fd))))
+               (error (c)
+                 (%close-fd fd)
+                 (error c))))
+        (sb-alien:free-alien alien)))))
+
+(defvar *http-plain-transport* nil)
+
+(defun %http-plain-transport ()
+  "The ONE plain-TCP transport (https never falls back to it)."
+  (or *http-plain-transport*
+      (setf *http-plain-transport*
+            (make-wasi-http-transport
+             :scheme "http" :tls-p nil
+             :connect #'%http-plain-connect))))
+
+(defun %http-connection-close (conn)
+  (when (and conn (not (wasi-http-connection-closed-p conn)))
+    (setf (wasi-http-connection-closed-p conn) t)
+    (when (wasi-http-connection-close-fn conn)
+      (ignore-errors (funcall (wasi-http-connection-close-fn conn))))))
+
+;;; ---------------------------------------------------------------
+;;; The network capability's view of the destination.
+
+(defun %http-resolve-destination (context network host port)
+  "Resolve HOST to (family address-bytes port), consulting the
+network's DNS policy for a name and its OUTBOUND policy for the
+resolved address. Signals wasi-http-error with the WIT's cases."
+  (let* ((literal
+           (cond
+             ((%parse-ipv4-literal host)
+              (list (cons "ipv4" (%parse-ipv4-literal host))))
+             ((find #\: host)
+              (handler-case
+                  (%getaddrinfo-chain host +ai-numerichost+)
+                (wasi-socket-error ()
+                  (%http-error (%http-code "HTTP-request-URI-invalid")))))
+             (t
+              (unless (wasi-network-allows-dns-p network host)
+                (%http-error (%http-code "HTTP-request-denied")))
+              (handler-case (%getaddrinfo-chain host 0)
+                (wasi-socket-error ()
+                  (%http-error (%http-code "destination-not-found")))))))
+         (candidates
+           (loop for value in literal
+                 for family = (if (string= (car value) "ipv4") :ipv4 :ipv6)
+                 collect (list family (cdr value) port))))
+    (or (find-if (lambda (c)
+                   (wasi-network-allows-outbound-p
+                    network (first c) (second c) port))
+                 candidates)
+        (%http-error (%http-code "destination-IP-prohibited")))))
+
+;;; ---------------------------------------------------------------
+;;; The HTTP/1.1 reader and parser.
+
+(defstruct wasi-http-reader
+  "A buffered reader over a connection."
+  (conn nil)
+  (buf (make-array 0 :element-type '(unsigned-byte 8)
+                     :adjustable t :fill-pointer 0))
+  (pos 0)
+  (eof nil)
+  (timeout-ms +http-default-first-byte-timeout-ms+))
+
+(defun %hr-available (r)
+  (- (fill-pointer (wasi-http-reader-buf r)) (wasi-http-reader-pos r)))
+
+(defun %hr-compact (r)
+  (let* ((buf (wasi-http-reader-buf r))
+         (pos (wasi-http-reader-pos r))
+         (n (- (fill-pointer buf) pos)))
+    (when (plusp pos)
+      (replace buf buf :start2 pos :end2 (fill-pointer buf))
+      (setf (fill-pointer buf) n
+            (wasi-http-reader-pos r) 0))))
+
+(defun %hr-fill (r want timeout-ms)
+  "Ensure at least WANT buffered bytes: :ok, :eof, :timeout, or a
+(:error . code) cons."
+  (loop
+    (when (>= (%hr-available r) want) (return :ok))
+    (when (wasi-http-reader-eof r) (return :eof))
+    (%hr-compact r)
+    (multiple-value-bind (bytes status)
+        (funcall (wasi-http-connection-read-fn (wasi-http-reader-conn r))
+                 65536
+                 (or timeout-ms (wasi-http-reader-timeout-ms r)))
+      (cond
+        ((eq status :ok)
+         (if (null bytes)
+             (return :eof)
+             (dolist (b bytes)
+               (vector-push-extend b (wasi-http-reader-buf r)))))
+        ((eq status :eof)
+         (setf (wasi-http-reader-eof r) t)
+         (return :eof))
+        ((eq status :timeout) (return :timeout))
+        (t (return status))))))
+
+(defun %hr-take (r n timeout-ms)
+  "Exactly N bytes as a list, or a wasi-http-error."
+  (let ((st (%hr-fill r n timeout-ms)))
+    (cond
+      ((eq st :ok)
+       (let ((buf (wasi-http-reader-buf r))
+             (pos (wasi-http-reader-pos r)))
+         (prog1 (loop for i below n collect (aref buf (+ pos i)))
+           (setf (wasi-http-reader-pos r) (+ pos n)))))
+      ((eq st :eof)
+       (%http-error (%http-code "HTTP-response-incomplete")))
+      ((eq st :timeout)
+       (%http-error (%http-code "HTTP-response-timeout")))
+      (t (%http-error st)))))
+
+(defun %hr-take-byte (r timeout-ms)
+  (let ((st (%hr-fill r 1 timeout-ms)))
+    (cond
+      ((eq st :ok)
+       (let ((buf (wasi-http-reader-buf r))
+             (pos (wasi-http-reader-pos r)))
+         (prog1 (aref buf pos)
+           (setf (wasi-http-reader-pos r) (1+ pos)))))
+      ((eq st :eof) :eof)
+      ((eq st :timeout) :timeout)
+      (t st))))
+
+(defun %hr-take-upto (r n timeout-ms)
+  "At most N bytes; (values bytes eof-p)."
+  (if (zerop n)
+      (values nil nil)
+      (let ((st (%hr-fill r 1 timeout-ms)))
+        (cond
+          ((eq st :ok)
+           (let ((k (min n (%hr-available r))))
+             (values (%hr-take r k timeout-ms) nil)))
+          ((eq st :eof) (values nil t))
+          ((eq st :timeout)
+           (%http-error (%http-code "HTTP-response-timeout")))
+          (t (%http-error st))))))
+
+(defun %http-bytes->string (bytes)
+  (map 'string #'code-char bytes))
+
+(defun %hr-line (r &key (max 8192) (timeout-ms nil))
+  "One CRLF-terminated line (without the CRLF) as a latin-1 string;
+:eof only when the stream ends with no bytes; anything else is
+HTTP-response-incomplete / HTTP-protocol-error."
+  (let ((bytes '())
+        (cr nil))
+    (loop
+      (let ((b (%hr-take-byte r timeout-ms)))
+        (cond
+          ((eq b :eof)
+           (if (null bytes)
+               (return :eof)
+               (%http-error (%http-code "HTTP-response-incomplete"))))
+          ((eq b :timeout)
+           (%http-error (%http-code "HTTP-response-timeout")))
+          ((consp b) (%http-error b))
+          (cr
+           (unless (= b 10)
+             (%http-error (%http-code "HTTP-protocol-error")))
+           (return (%http-bytes->string (nreverse bytes))))
+          ((= b 13) (setf cr t))
+          (t
+           (push b bytes)
+           (when (> (length bytes) max)
+             (%http-error (%http-code "HTTP-response-header-section-size")))))))))
+
+(defun %http-parse-status-line (line)
+  "HTTP/1.x <code> [reason] -> the status code."
+  (unless (and (stringp line)
+               (>= (length line) 12)
+               (string= (subseq line 0 7) "HTTP/1."))
+    (%http-error (%http-code "HTTP-protocol-error")))
+  (let ((space (position #\Space line)))
+    (unless (and space (>= (- (length line) space) 4))
+      (%http-error (%http-code "HTTP-protocol-error")))
+    (let ((digits (subseq line (1+ space) (+ space 4))))
+      (unless (every #'digit-char-p digits)
+        (%http-error (%http-code "HTTP-protocol-error")))
+      (let ((code (parse-integer digits)))
+        (unless (<= 100 code 599)
+          (%http-error (%http-code "HTTP-protocol-error")))
+        code))))
+
+(defparameter +http-max-header-section-size+ (* 64 1024))
+(defparameter +http-max-header-count+ 128)
+
+(defun %http-read-fields (r &key (timeout-ms nil))
+  "Parse header/trailer lines into an IMMUTABLE fields resource."
+  (let ((entries '())
+        (total 0)
+        (count 0))
+    (loop
+      (let ((line (%hr-line r :timeout-ms timeout-ms)))
+        (when (eq line :eof)
+          (%http-error (%http-code "HTTP-response-incomplete")))
+        (when (zerop (length line))
+          (return))
+        (incf total (+ (length line) 2))
+        (incf count)
+        (when (> total +http-max-header-section-size+)
+          (%http-error (%http-code "HTTP-response-header-section-size")))
+        (when (> count +http-max-header-count+)
+          (%http-error (%http-code "HTTP-response-header-section-size")))
+        (when (or (char= (char line 0) #\Space)
+                  (char= (char line 0) #\Tab))
+          (%http-error (%http-code "HTTP-protocol-error")))
+        (let ((colon (position #\: line)))
+          (unless colon
+            (%http-error (%http-code "HTTP-protocol-error")))
+          (let* ((name (subseq line 0 colon))
+                 (value (string-trim '(#\Space #\Tab)
+                                     (subseq line (1+ colon)))))
+            (unless (%http-token-p name)
+              (%http-error (%http-code "HTTP-protocol-error")))
+            (push (cons name (map 'list #'char-code value)) entries)))))
+    (%make-wasi-fields (nreverse entries) nil)))
+
+(defun %http-read-response-head (r method)
+  "Parse the status line + header section. Returns (values status
+fields)."
+  (declare (ignore method))
+  (let ((line (%hr-line r)))
+    (when (eq line :eof)
+      (%http-error (%http-code "HTTP-response-incomplete")))
+    (let ((status (%http-parse-status-line line)))
+      (values status (%http-read-fields r)))))
+
+(defun %http-te-chunked-p (fields)
+  "The last Transfer-Encoding token is chunked; a TE that is not
+chunked is the WIT's HTTP-response-transfer-coding."
+  (let* ((raw (%fields-values fields "transfer-encoding"))
+         (values (loop for v in raw
+                       append (mapcar (lambda (s)
+                                        (string-downcase
+                                         (string-trim '(#\Space #\Tab) s)))
+                                      (%split-string (%http-bytes->string v)
+                                                     #\,))))
+         (last (car (last values))))
+    (cond
+      ((null values) nil)
+      ((string= last "chunked") t)
+      (t (%http-error
+          (%http-code-payload
+           "HTTP-response-transfer-coding"
+           (cons :some (%http-bytes->string (car (last raw))))))))))
+
+(defun %http-content-length (fields)
+  (let ((values (%fields-values fields "content-length")))
+    (when (null values) (return-from %http-content-length nil))
+    (let ((parsed
+            (mapcar (lambda (v)
+                      (let ((s (string-trim '(#\Space #\Tab)
+                                            (%http-bytes->string v))))
+                        (unless (and (plusp (length s))
+                                     (every #'digit-char-p s))
+                          (%http-error (%http-code "HTTP-protocol-error")))
+                        (parse-integer s)))
+                    values)))
+      (unless (every (lambda (n) (= n (first parsed))) parsed)
+        (%http-error (%http-code "HTTP-protocol-error")))
+      (first parsed))))
+
+(defun %http-response-body-mode (status fields method)
+  "(values mode (length or NIL))."
+  (cond
+    ((or (eq method :head)
+         (and (>= status 100) (< status 200))
+         (member status '(204 304)))
+     (values :none 0))
+    ((%http-te-chunked-p fields) (values :chunked nil))
+    ((%http-content-length fields)
+     (values :length (%http-content-length fields)))
+    (t (values :close nil))))
+
+;;; ---------------------------------------------------------------
+;;; The response body state + the lazy host source.
+
+(defstruct wasi-http-body
+  (reader nil)
+  (mode :none)
+  (remaining 0)
+  (chunk-state :size)
+  (chunk-remaining 0)
+  (trailers nil)
+  (done-p nil)
+  (error nil)
+  (first-byte-p t)
+  (first-timeout +http-default-first-byte-timeout-ms+)
+  (between-timeout +http-default-between-bytes-timeout-ms+)
+  (buffer nil))                        ; response.new's buffered bytes
+
+(defun %http-body-source (body)
+  (lambda (max)
+    (if (or (<= max 0) (wasi-http-body-done-p body))
+        (values nil t)
+        (let ((timeout (if (wasi-http-body-first-byte-p body)
+                           (wasi-http-body-first-timeout body)
+                           (wasi-http-body-between-timeout body))))
+          (setf (wasi-http-body-first-byte-p body) nil)
+          (handler-case
+              (%http-body-read body max timeout)
+            (wasi-http-error (c)
+              (setf (wasi-http-body-error body) (wasi-http-error-code c)
+                    (wasi-http-body-done-p body) t)
+              (values nil t)))))))
+
+(defun %http-body-read (body max timeout)
+  (let ((reader (wasi-http-body-reader body)))
+    (case (wasi-http-body-mode body)
+      (:none
+       (setf (wasi-http-body-done-p body) t)
+       (values nil t))
+      (:length
+       (let ((remaining (wasi-http-body-remaining body)))
+         (when (zerop remaining)
+           (setf (wasi-http-body-done-p body) t)
+           (return-from %http-body-read (values nil t)))
+         (multiple-value-bind (bytes eof)
+             (%hr-take-upto reader (min max remaining) timeout)
+           (cond
+             ((plusp (length bytes))
+              (decf (wasi-http-body-remaining body) (length bytes))
+              (when (zerop (wasi-http-body-remaining body))
+                (setf (wasi-http-body-done-p body) t))
+              (values bytes nil))
+             (eof
+              (%http-error (%http-code "HTTP-response-incomplete")))
+             (t (values nil nil))))))
+      (:chunked (%http-chunked-read body max timeout))
+      (:close
+       (multiple-value-bind (bytes eof)
+           (%hr-take-upto reader max timeout)
+         (when eof (setf (wasi-http-body-done-p body) t))
+         (values bytes eof))))))
+
+(defun %http-chunked-read (body max timeout)
+  (let ((reader (wasi-http-body-reader body)))
+    (loop
+      (case (wasi-http-body-chunk-state body)
+        (:size
+         (let ((line (%hr-line reader :timeout-ms timeout)))
+           (when (eq line :eof)
+             (%http-error (%http-code "HTTP-response-incomplete")))
+           (let* ((semi (position #\; line))
+                  (hex (string-trim '(#\Space #\Tab)
+                                    (if semi (subseq line 0 semi) line))))
+             (unless (and (plusp (length hex))
+                          (every (lambda (c) (digit-char-p c 16)) hex))
+               (%http-error (%http-code "HTTP-protocol-error")))
+             (let ((n (parse-integer hex :radix 16)))
+               (if (zerop n)
+                   (progn
+                     (setf (wasi-http-body-trailers body)
+                           (%http-read-fields reader :timeout-ms timeout)
+                           (wasi-http-body-chunk-state body) :done
+                           (wasi-http-body-done-p body) t)
+                     (return (values nil t)))
+                   (setf (wasi-http-body-chunk-remaining body) n
+                         (wasi-http-body-chunk-state body) :data))))))
+        (:data
+         (let ((n (min max (wasi-http-body-chunk-remaining body))))
+           (multiple-value-bind (bytes eof)
+               (%hr-take-upto reader n timeout)
+             (cond
+               ((plusp (length bytes))
+                (decf (wasi-http-body-chunk-remaining body) (length bytes))
+                (when (zerop (wasi-http-body-chunk-remaining body))
+                  (setf (wasi-http-body-chunk-state body) :data-crlf))
+                (return (values bytes nil)))
+               (eof (%http-error (%http-code "HTTP-response-incomplete")))
+               (t (return (values nil nil)))))))
+        (:data-crlf
+         (let ((crlf (%hr-take reader 2 timeout)))
+           (unless (and (= (first crlf) 13) (= (second crlf) 10))
+             (%http-error (%http-code "HTTP-protocol-error")))
+           (setf (wasi-http-body-chunk-state body) :size)))
+        (:done (return (values nil t)))))))
+
+(defun %http-body-close (body)
+  (when body
+    (let ((reader (wasi-http-body-reader body)))
+      (when (and reader (wasi-http-reader-conn reader))
+        (%http-connection-close (wasi-http-reader-conn reader))))))
+
+;;; ---------------------------------------------------------------
+;;; client.send.
+
+(defun %http-header-bytes (fields name value)
+  (let ((name-bytes (map 'list #'char-code name)))
+    (when (or (not (%http-token-p name))
+              (find 10 (append name-bytes value))
+              (find 13 (append name-bytes value)))
+      (%http-error (%http-code "HTTP-protocol-error")))))
+
+(defun %http-serialize-request-head (method path authority fields extra)
+  "The request line + every header line, as a byte list. EXTRA is a
+list of pre-built \"Name: value\" strings (the implementation's own
+Host/Content-Length/Transfer-Encoding/Connection)."
+  (let ((out (make-string-output-stream)))
+    (format out "~a ~a HTTP/1.1~c~c" method path #\Return #\Newline)
+    (dolist (line extra)
+      (format out "~a~c~c" line #\Return #\Newline))
+    (dolist (entry (wasi-fields-entries fields))
+      (%http-header-bytes fields (car entry) (cdr entry))
+      (format out "~a: ~a~c~c"
+              (car entry) (%http-bytes->string (cdr entry))
+              #\Return #\Newline))
+    (format out "~c~c" #\Return #\Newline)
+    (map 'list #'char-code (get-output-stream-string out))))
+
+(defun %http-timeout-ms (options slot default)
+  (if (null options)
+      default
+      (let ((v (funcall slot options)))
+        (cond
+          ((eq v :none) default)
+          ((and (consp v) (eq (car v) :some) (integerp (cdr v)))
+           (max 1 (ceiling (cdr v) 1000000)))
+          ((integerp v) (max 1 (ceiling v 1000000)))
+          (t default)))))
+
+(defun %http-request-body-bytes (req)
+  (apply #'append (reverse (wasi-http-request-body-buffer req))))
+
+(defun %http-request-trailers (req)
+  "The request's trailers, read non-blockingly: (values trailers
+present-p) where TRAILERS is a wasi-fields or NIL."
+  (multiple-value-bind (value present)
+      (%http-future-value (wasi-http-request-trailers-end req))
+    (if (not present)
+        (values nil nil)
+        (cond
+          ((and (consp value) (eq (car value) :err))
+           (%http-error (cdr value)))
+          ((and (consp value) (eq (car value) :ok))
+           (let ((opt (cdr value)))
+             (cond
+               ((eq opt :none) (values nil t))
+               ((and (consp opt) (eq (car opt) :some))
+                (let ((handle (cdr opt)))
+                  (if (and (consp handle) (eq (car handle) :own-handle))
+                      (values (third handle) t)
+                      (values (and (wasi-fields-p handle) handle) t))))
+               (t (values nil t)))))
+          (t (values nil t))))))
+
+(defun %http-chunk-prefix (length)
+  (map 'list #'char-code (format nil "~x~c~c" length #\Return #\Newline)))
+
+(defun %http-serialize-trailers (trailers)
+  (append
+   (loop for (name . value) in (wasi-fields-entries trailers)
+         append (map 'list #'char-code
+                     (format nil "~a: ~a~c~c" name
+                             (%http-bytes->string value)
+                             #\Return #\Newline)))
+   (list 13 10)))
+
+(defun %http-write-request (conn req body trailers trailers-present)
+  "Write the whole request (head + body framing). Signals
+wasi-http-error on an I/O or serialization failure."
+  (let* ((method (%http-method-string (wasi-http-request-method req)))
+         (authority (let ((a (wasi-http-request-authority req)))
+                      (if (consp a) (cdr a) a)))
+         (path (let ((p (wasi-http-request-path-with-query req)))
+                 (if (and (consp p) (eq (car p) :some)) (cdr p) "/")))
+         (chunked-p trailers-present)
+         (body-present (or (wasi-http-request-body-end req)
+                           (plusp (wasi-http-request-body-length req))))
+         (extra (append
+                 (list (format nil "Host: ~a" authority)
+                       "Connection: close")
+                 (cond
+                   (chunked-p (list "Transfer-Encoding: chunked"))
+                   ((or body-present (plusp (length body)))
+                    (list (format nil "Content-Length: ~d" (length body))))
+                   (t '()))))
+         (write (wasi-http-connection-write-fn conn)))
+    (funcall write
+             (%http-serialize-request-head
+              method path authority (wasi-http-request-headers req) extra))
+    (cond
+      (chunked-p
+       (unless (null body)
+         (%http-error
+          (or (funcall write (append (%http-chunk-prefix (length body))
+                                     body (list 13 10)))
+              nil)))
+       (%http-error
+        (or (funcall write (map 'list #'char-code
+                                (format nil "0~c~c" #\Return #\Newline)))
+            (and trailers (funcall write (%http-serialize-trailers trailers)))))
+       (when (null trailers)
+         ;; the terminating chunk + an empty trailer section
+         (%http-error (funcall write (list 13 10)))))
+      (t
+       (when body (funcall write body))))
+    nil))
+
+(defun http-client-send (context request
+                         &key (network nil) (package (wasi-package "http")))
+  "client.send: write the HTTP/1.1 request over the transport and
+return (:ok own<response>) or (:err . error-code)."
+  (let* ((net (or network (first (wasi-context-networks context))))
+         (request-ct (http-resource-ct "request" :package package)))
+    (handler-case
+        (let* ((req (%request-of (%http-take-resource request request-ct)
+                                 request-ct))
+               (scheme (%http-scheme-string (wasi-http-request-scheme req)))
+               (authority (wasi-http-request-authority req))
+               (method (wasi-http-request-method req)))
+          (when (wasi-http-request-consumed-p req)
+            (%http-error (%http-internal "request already consumed")))
+          (when (eq authority :none)
+            (%http-error (%http-code "HTTP-request-URI-invalid")))
+          (let ((authority-string (if (consp authority) (cdr authority)
+                                      authority)))
+            (unless (%http-authority-ok-p authority-string)
+              (%http-error (%http-code "HTTP-request-URI-invalid")))
+            (multiple-value-bind (host port)
+                (%http-split-authority authority-string)
+              (when (and (string-equal scheme "https") (= port 80))
+                (setf port 443))
+              (let* ((transport (%http-transport-for context scheme))
+                     (destination (%http-resolve-destination
+                                   context net host port))
+                     (options (wasi-http-request-options req))
+                     (connect-timeout
+                       (%http-timeout-ms
+                        options #'wasi-http-options-connect-timeout
+                        +http-default-connect-timeout-ms+)))
+                (unless transport
+                  (%http-error (%http-code "configuration-error")))
+                (let ((conn (funcall (wasi-http-transport-connect transport)
+                                     host port destination connect-timeout)))
+                  (handler-case
+                      (let* ((body (%http-request-body-bytes req))
+                             (body-error (wasi-http-request-body-error req)))
+                        (when body-error
+                          (%http-error body-error))
+                        (when (and (wasi-http-request-body-end req)
+                                   (not (wasi-http-request-body-closed-p req)))
+                          (%http-error
+                           (%http-internal
+                            "request body stream must be closed before client.send (streaming uploads need a reactor)")))
+                        (multiple-value-bind (trailers trailers-present)
+                            (%http-request-trailers req)
+                          (%http-write-request conn req body trailers
+                                               trailers-present))
+                        (let* ((reader
+                                 (make-wasi-http-reader
+                                  :conn conn
+                                  :timeout-ms
+                                  (%http-timeout-ms
+                                   options
+                                   #'wasi-http-options-first-byte-timeout
+                                   +http-default-first-byte-timeout-ms+)))
+                               (head-method
+                                 (if (string-equal
+                                      (%http-method-string method)
+                                      "HEAD")
+                                     :head :other)))
+                          (multiple-value-bind (status fields)
+                              (%http-read-response-head reader head-method)
+                            (multiple-value-bind (mode length)
+                                (%http-response-body-mode
+                                 status fields head-method)
+                              (let* ((body-state
+                                       (make-wasi-http-body
+                                        :reader reader
+                                        :mode mode
+                                        :remaining (or length 0)
+                                        :first-timeout
+                                        (%http-timeout-ms
+                                         options
+                                         #'wasi-http-options-first-byte-timeout
+                                         +http-default-first-byte-timeout-ms+)
+                                        :between-timeout
+                                        (%http-timeout-ms
+                                         options
+                                         #'wasi-http-options-between-bytes-timeout
+                                         +http-default-between-bytes-timeout-ms+)))
+                                     (response
+                                       (make-wasi-http-response
+                                        :status status
+                                        :headers fields
+                                        :body body-state)))
+                                (when (eq mode :none)
+                                  (%http-connection-close conn)
+                                  (setf (wasi-http-body-done-p body-state) t))
+                                (cons :ok
+                                      (list :own-handle
+                                            (http-resource-ct
+                                             "response" :package package)
+                                            response)))))))
+                    (error (c)
+                      (%http-connection-close conn)
+                      (error c))))))))
+      (wasi-http-error (c) (cons :err (wasi-http-error-code c))))))
+
+;;; ---------------------------------------------------------------
+;;; The provider instances.
+
+(defun %http-register-dtors (inst &key (package (wasi-package "http")))
+  "The request/response resources hold stream ends and OS sockets;
+canon resource.drop runs these host finalizers. Each finalizer belongs
+to THIS provider instance (never a ct-keyed global): two http types
+providers never share a release hook."
+  (let ((rt (http-resource-ct "request" :package package))
+        (st (http-resource-ct "response" :package package)))
+    (wasmdown.component.runtime:host-register-resource-dtor
+     inst rt
+     (lambda (rep)
+       (when (wasi-http-request-p rep)
+         (when (wasi-http-request-body-end rep)
+           (ignore-errors
+             (wasmdown.component.runtime:host-end-drop
+              (wasi-http-request-body-end rep)))
+           (setf (wasi-http-request-body-end rep) nil))
+         (%http-request-settle rep (cons :ok nil)))))
+    (wasmdown.component.runtime:host-register-resource-dtor
+     inst st
+     (lambda (rep)
+       (when (wasi-http-response-p rep)
+         (%http-body-close (wasi-http-response-body rep)))))
+    inst))
+
+(defun http-types-instance (context
+                            &key (package (wasi-package "http")))
+  "The wasi:http/types import: the fields/request/request-options/
+response resources."
+  (declare (ignore context))
+  (let ((inst
+          (provider-instance
+           (wasmdown.wit:package-interface package "types")
+           (list
+    (cons "[constructor]fields" (lambda () (fields-constructor
+                                            :package package)))
+    (cons "[static]fields.from-list"
+          (lambda (entries) (fields-from-list entries)))
+    (cons "[method]fields.get"
+          (lambda (self name) (fields-get self name :package package)))
+    (cons "[method]fields.has"
+          (lambda (self name) (fields-has self name :package package)))
+    (cons "[method]fields.set"
+          (lambda (self name values)
+            (fields-set self name values :package package)))
+    (cons "[method]fields.delete"
+          (lambda (self name) (fields-delete self name :package package)))
+    (cons "[method]fields.get-and-delete"
+          (lambda (self name) (fields-get-and-delete self name
+                                                     :package package)))
+    (cons "[method]fields.append"
+          (lambda (self name value)
+            (fields-append self name value :package package)))
+    (cons "[method]fields.copy-all"
+          (lambda (self) (fields-copy-all self :package package)))
+    (cons "[method]fields.clone"
+          (lambda (self) (fields-clone self :package package)))
+    ;; request
+    (cons "[static]request.new"
+          (lambda (headers contents trailers options)
+            (http-request-new headers contents trailers options
+                              :package package)))
+    (cons "[method]request.get-method"
+          (lambda (self) (http-request-get-method self :package package)))
+    (cons "[method]request.set-method"
+          (lambda (self method)
+            (http-request-set-method self method :package package)))
+    (cons "[method]request.get-path-with-query"
+          (lambda (self) (http-request-get-path-with-query
+                          self :package package)))
+    (cons "[method]request.set-path-with-query"
+          (lambda (self path)
+            (http-request-set-path-with-query self path :package package)))
+    (cons "[method]request.get-scheme"
+          (lambda (self) (http-request-get-scheme self :package package)))
+    (cons "[method]request.set-scheme"
+          (lambda (self scheme)
+            (http-request-set-scheme self scheme :package package)))
+    (cons "[method]request.get-authority"
+          (lambda (self) (http-request-get-authority self :package package)))
+    (cons "[method]request.set-authority"
+          (lambda (self authority)
+            (http-request-set-authority self authority :package package)))
+    (cons "[method]request.get-options"
+          (lambda (self) (http-request-get-options self :package package)))
+    (cons "[method]request.get-headers"
+          (lambda (self) (http-request-get-headers self :package package)))
+    (cons "[static]request.consume-body"
+          (lambda (this res)
+            (http-request-consume-body this res :package package)))
+    ;; request-options
+    (cons "[constructor]request-options"
+          (lambda () (request-options-constructor :package package)))
+    (cons "[method]request-options.get-connect-timeout"
+          (lambda (self) (request-options-get-connect-timeout
+                          self :package package)))
+    (cons "[method]request-options.set-connect-timeout"
+          (lambda (self duration)
+            (request-options-set-connect-timeout self duration
+                                                 :package package)))
+    (cons "[method]request-options.get-first-byte-timeout"
+          (lambda (self) (request-options-get-first-byte-timeout
+                          self :package package)))
+    (cons "[method]request-options.set-first-byte-timeout"
+          (lambda (self duration)
+            (request-options-set-first-byte-timeout self duration
+                                                    :package package)))
+    (cons "[method]request-options.get-between-bytes-timeout"
+          (lambda (self) (request-options-get-between-bytes-timeout
+                          self :package package)))
+    (cons "[method]request-options.set-between-bytes-timeout"
+          (lambda (self duration)
+            (request-options-set-between-bytes-timeout self duration
+                                                       :package package)))
+    (cons "[method]request-options.clone"
+          (lambda (self) (request-options-clone self :package package)))
+    ;; response
+    (cons "[static]response.new"
+          (lambda (headers contents trailers)
+            (http-response-new headers contents trailers
+                               :package package)))
+    (cons "[method]response.get-status-code"
+          (lambda (self) (http-response-get-status-code self
+                                                        :package package)))
+    (cons "[method]response.set-status-code"
+          (lambda (self status)
+            (http-response-set-status-code self status :package package)))
+    (cons "[method]response.get-headers"
+          (lambda (self) (http-response-get-headers self :package package)))
+    (cons "[static]response.consume-body"
+          (lambda (this res)
+            (http-response-consume-body this res :package package))))
+           :packages (%http-packages :package package))))
+    (%http-register-dtors inst :package package)
+    inst))
+
+(defun http-client-instance (context
+                             &key network (package (wasi-package "http")))
+  "The wasi:http/client import: send, bound to CONTEXT's transports and
+network authority."
+  (provider-instance
+   (wasmdown.wit:package-interface package "client")
+   (list (cons "send"
+               (lambda (request)
+                 (http-client-send context request
+                                   :network (or network
+                                                (first (wasi-context-networks
+                                                        context)))
+                                   :package package))))
+   :packages (%http-packages :package package)))
+
+(defun http-provider (context
+                      &key network (package (wasi-package "http")))
+  "The wasi:http imports (types + client) as a with-args alist."
+  (list
+   (cons (wasmdown.wit:interface-import-name
+          (wasmdown.wit:package-interface package "types"))
+         (http-types-instance context :package package))
+   (cons (wasmdown.wit:interface-import-name
+          (wasmdown.wit:package-interface package "client"))
+         (http-client-instance context :network network
+                               :package package))))
 
 ;;; ===============================================================
 ;;; THE COMMAND WORLD (`wasi:cli/run`, M16 slice 6) — THE RUNNER.
@@ -6090,17 +7982,18 @@ alist, all bound to one network authority."
 ;;;     unimplemented-function closure) is never installed in place of
 ;;;     a provider the runtime does not have.
 ;;;
-;;; `wasi:http' is not supported by this runtime: the vendored `http'
-;;; package takes part in resolution (reference data only) so such an
-;;; import resolves to a named interface and is refused HERE, with its
-;;; import name, instead of failing to resolve.
+;;; `wasi:http' is served OUTGOING only: `types' and `client' have
+;;; builders (M16 slice 5, restored), so a world or component that
+;;; declares them gets their providers. The INCOMING
+;;; `wasi:http/handler' direction has no provider yet and falls to the
+;;; construction-time error above, with its import name.
 
 (defun %wasi-wit-packages ()
-  "The packages provider composition resolves against: the five WASI
-0.3.2 packages this runtime serves, plus the vendored `http' package
-as REFERENCE DATA (it parses/validates; no provider is built from
-it), so a world importing `wasi:http' names a real interface and is
-then refused by the provider check."
+  "The packages provider composition resolves against: the six WASI
+0.3.2 packages this runtime serves (`cli', `clocks', `random',
+`filesystem', `sockets' and `http'). A world importing any interface
+of them names a real interface and is served or refused by the
+provider check."
   (mapcar #'wasi-package
           '("clocks" "random" "cli" "filesystem" "sockets" "http")))
 
@@ -6154,6 +8047,7 @@ of these entries a component gets is decided by the world."
          (filesystem (wasi-package "filesystem"))
          (random (wasi-package "random"))
          (sockets (wasi-package "sockets"))
+         (http (wasi-package "http"))
          (reactor (wasi-context-reactor context))
          (network (first (wasi-context-networks context)))
          (builders '()))
@@ -6219,6 +8113,17 @@ of these entries a component gets is decided by the world."
             (lambda ()
               (ip-name-lookup-instance context :network network
                                        :package sockets)))
+      ;; wasi:http (M16 slice 5, restored): the OUTGOING surface —
+      ;; the types resources and client.send. The incoming
+      ;; service/middleware world is a follow-up: `handler' has no
+      ;; builder, so a world declaring it still gets the generic
+      ;; no-provider error.
+      (bind http "types"
+            (lambda () (http-types-instance context :package http)))
+      (bind http "client"
+            (lambda ()
+              (http-client-instance context :network network
+                                    :package http)))
       (nreverse builders))))
 
 (defparameter +wasi-unstable-import-message-format+
@@ -6250,11 +8155,13 @@ the feature. Stable and unknown names pass through untouched."
   nil)
 
 (defparameter +wasi-http-unsupported-message+
-  "wasi:http is not supported by this runtime by design (removed in M17); the pinned HTTP WIT is reference data only. See docs/usage/wasi.md and specs/wasi/MANIFEST.md."
-  "The one canonical refusal text for the `wasi:http' package, shared
-by world composition and by every declared-import path. `wasi:http' is
-refused at ANY release line: the pinned HTTP WIT is reference data
-only and no provider is ever built from it.")
+  "wasi:http is not supported by this runtime by design on the WASI 0.2 (Preview2) line; the 0.3.2 `types` + `client` providers are the served HTTP surface. See docs/usage/wasi.md and specs/wasi/MANIFEST.md."
+  "The canonical refusal text for a declared `wasi:http' import on the
+WASI 0.2 (Preview2) line: the P2 provider table has no http provider,
+so a 0.2 declaration is refused with this message (also when it is the
+0.2 subset of a mixed-release component). The 0.3.2 line serves
+`wasi:http/types' + `wasi:http/client' through the provider builders
+and is never refused here.")
 
 (defun compose-world-providers (world context)
   "Compose the provider graph for the RESOLVED WORLD: exactly the
@@ -6274,12 +8181,6 @@ import this runtime has no provider for."
           (setf (gethash name seen) t)
           (let ((builder (cdr (assoc name builders :test #'string=))))
             (cond
-              ((%wasi-http-import-name-p name)
-               ;; refused BEFORE the provider lookup, the types-only
-               ;; branch and the generic no-provider error: an http
-               ;; import must never pass as unbound
-               (error 'wasmdown.wit:wit-error
-                      :message +wasi-http-unsupported-message+))
               (builder
                (push (cons name (funcall builder)) providers))
               ((%types-only-world-import-p item)
@@ -6338,16 +8239,12 @@ naming the import — never a trapping stub. NAME has already passed the
   "The provider alist for the 0.3-line DECLARED imports NAMES, in
 declaration order. The 0.3 gates run FIRST, over exactly these names,
 so no provider is built for a refused import: an @unstable interface
-whose feature is not enabled is refused naming import and feature,
-then `wasi:http' (any line, canonical message). Each surviving name is
-bound to its builder's provider; a types-only interface composes no
-entry. `wasi:sockets' names bind through the network authority's
-providers exactly like the pinned command world's own sockets imports."
+whose feature is not enabled is refused naming import and feature.
+`wasi:sockets' names bind through the network authority's providers,
+and `wasi:http/types'/`wasi:http/client' bind through their builders;
+a types-only interface composes no entry and `wasi:http/handler' (the
+incoming direction) has no builder yet."
   (%refuse-unstable-declared-imports names)
-  (dolist (name names)
-    (when (%wasi-http-import-name-p name)
-      (error 'wasmdown.wit:wit-error
-             :message +wasi-http-unsupported-message+)))
   (let ((builders (%wasi-provider-builders context))
         (providers '()))
     (dolist (name names)
@@ -6407,25 +8304,23 @@ composed per version), anything else gets the vendored 0.3 command
 world. Choosing from the declared contract — never from the file name
 — is what keeps a 0.2 component from being handed 0.3 providers.
 
-A component that asks for the 0.3 line may also IMPORT
-`wasi:sockets/types' and `wasi:sockets/ip-name-lookup': the same
-builders the pinned command world uses bind them under the component's
-own declared names, so the network authority is reachable. The 0.3
-path refuses any declared import whose target interface is `@unstable'
-with a feature the selected (stable) surface does not enable — the
-message names the import and the feature — and `wasi:http' at any
-line. Stable imports are unaffected and unknown names are left alone.
-The 0.2 line is untouched (the P2 sockets facade is a separate legacy
-claim).
+A 0.3-line component may also IMPORT `wasi:sockets/types',
+`wasi:sockets/ip-name-lookup', `wasi:http/types' and `wasi:http/client':
+sockets names bind through the network authority's builders, and the
+declared http names are appended on top of the command set (the pinned
+command world imports no http). `wasi:http/handler' (the incoming
+direction) has no provider yet and is a construction-time error. The
+0.3 path still refuses an @unstable declared import whose feature the
+selected surface does not enable.
 
 A component that declares BOTH lines gets one COMPOSED graph
 (%COMPOSE-MIXED-RELEASE-PROVIDERS): the 0.3 command builders bind
-exactly its 0.3-line declared imports under the same gates a 0.3-only
-component meets (unstable feature, `wasi:http' at any line, including
-the sockets providers), and the P2 tables bind its 0.2-line imports at
-their exact versions, in declaration order. An import that neither
-line can serve is still an error. No feature can be enabled from the
-CLI: the gate is refusal-only."
+exactly its 0.3-line declared imports under the same @unstable gate,
+and the P2 tables bind its 0.2-line imports at their exact versions,
+in declaration order. An import that neither line can serve is still
+an error (a 0.2 `wasi:http' declaration included: that line has no
+http provider). No feature can be enabled from the CLI: the gate is
+refusal-only."
   (let* ((names (declared-component-imports comp))
          (wasi-names (remove-if-not (lambda (n)
                                       (and (stringp n)
@@ -6444,7 +8339,15 @@ CLI: the gate is refusal-only."
       ;; selection does not enable is refused here, naming import and
       ;; feature, before anything composes.
       (%refuse-unstable-declared-imports wasi-names)
-      (command-provider context))
+      (let ((http-names (remove-if-not #'%wasi-http-import-name-p
+                                       wasi-names)))
+        (if (null http-names)
+            (command-provider context)
+            ;; the command world declares no http import, so the
+            ;; component's declared http interfaces are bound on top
+            ;; of it (types + client; handler stays a no-provider error)
+            (append (command-provider context)
+                    (%compose-declared-03-providers context http-names)))))
      ((= (length v2) (length wasi-names))
       ;; every WASI import is a 0.2 release: compose per exact version
       (let ((by-version (make-hash-table :test #'equal))
@@ -6469,8 +8372,9 @@ bound to CONTEXT and composed from the resolved WORLD (default: the
 vendored `wasi:cli/command'). Every import the world declares gets
 its provider; a types-only import the runtime has no entry for
 composes no entry; an unsupported one is a construction-time
-`WIT-ERROR'. `wasi:http' is not supported by this runtime and is
-never bound."
+`WIT-ERROR'. The pinned command world imports no `wasi:http'; a
+component that DECLARES http gets its providers from
+COMPONENT-COMMAND-PROVIDERS."
   (compose-world-providers world context))
 
 (defun component-run-export (instance)
