@@ -16,7 +16,7 @@ links are generated.
 | WASI 0.2 behaviour lane (11 cases) | 11/11 pass | 11/11 pass (11 x ~200 s compile wall time). Each case's manifest entry asserts exact stdout bytes and exact status, so both backends satisfy the SAME byte-level expectations — stronger than a post-hoc sha diff. Per-case records live under `tests/wasi-results/` (`latest/` for interpret, the compiled run's `--output-dir`), distinguished by the `backend` field | `tools/run-wasi-suite.py --abi preview2 [--backend compiled]` |
 | WASI 0.3.2 providers | unit/provider pins, component async suite | same providers; component suite green under `:compiled` | [`inventory.md`](inventory.md), `tests/wasi*.lisp` |
 | 0.3.2 sockets provider (internal composition only) | unit pins incl. `wasi/e2e-tcp-echo-component` PASS | same test binary, host listener + echo thread | `make test-unit`; `tests/wasi.lisp` |
-| Pinned 0.3.2 guests (hand-authored) | 10/10 pass ×3 repeats (30/30): no-import success smoke, a `wasi:cli/exit@0.3.2` importer (exit 7), a `wasi:clocks/monotonic-clock@0.3.2` importer (monotonic `now()`), a resume-safe async command (callback `task.return`), a `write-via-stream` stdout command (`hi`), a cancelled-subtask command, a `wasi:random/random@0.3.2` guest (`insecure`/`insecure-seed`: exact 16-byte lengths, differing secure reads, `u64`/seed calls; `realloc`-lowered lists), a clock-deadline guest (`wait-for` 200 ms completes through the CLI reactor; the 200 ms bound is the liveness-oracle regression proof), a `wasi:cli/{stdin,environment,stderr,terminal-stdout}@0.3.2` guest (argv[0]/marker, `--env` pair, option-typed initial cwd, `terminal-stdout` = `none` on a non-tty, real stdin `stdin-probe\n` with explicit DROPPED EOF and an ok paired future, stderr through `write-via-stream`), and a `wasi:filesystem/{types,preopens}@0.3.2` guest (`/work` preopen, async `open-at` of seeded `hello.txt`, exactly 17 bytes through `read-via-stream`+`stream.read`, missing path = err `no-entry`, every handle dropped) | 10/10 pass, same cases and repeats (30/30); the nested core runs compiled (`backend-entry-count`) | `make test-wasi-preview3`, `tools/build-p3-fixtures.lisp`, `wasi/command-component-runs-the-selected-backend`, `wasi/reactor-pending-deadline-p` |
+| Pinned 0.3.2 guests (hand-authored) | 10/10 pass ×3 repeats (30/30): no-import success smoke, a `wasi:cli/exit@0.3.2` importer (exit 7), a `wasi:clocks/monotonic-clock@0.3.2` importer (monotonic `now()`), a resume-safe async command (callback `task.return`), a `write-via-stream` stdout command (`hi`), a cancelled-subtask command, a `wasi:random/random@0.3.2` guest (`insecure`/`insecure-seed`: exact 16-byte lengths, differing secure reads, `u64`/seed calls; `realloc`-lowered lists), a clock-deadline guest (`wait-for` 200 ms completes through the CLI reactor; the 200 ms bound is the liveness-oracle regression proof), a `wasi:cli/{stdin,environment,stderr,terminal-stdout}@0.3.2` guest (argv[0]/marker, `--env` pair, option-typed initial cwd, `terminal-stdout` = `none` on a non-tty, real stdin `stdin-probe\n` with explicit DROPPED EOF and an ok paired future, stderr through `write-via-stream`), and a `wasi:filesystem/{types,preopens}@0.3.2` guest (`/work` preopen, async `open-at` of seeded `hello.txt`, exactly 17 bytes through `read-via-stream`+`stream.read`, writes at explicit offsets and appends at EOF with `stat` and a byte-exact read-back, err `read-only` (case 32), `create-directory-at`/`stat-at`/`read-directory` enumeration/`rename-at`/`unlink-file-at`/`remove-directory-at`, missing path = err `no-entry`, every handle dropped) | 10/10 pass, same cases and repeats (30/30); the nested core runs compiled (`backend-entry-count`) | `make test-wasi-preview3`, `tools/build-p3-fixtures.lisp`, `wasi/command-component-runs-the-selected-backend`, `wasi/reactor-pending-deadline-p` |
 
 Network communication (TCP, UDP and DNS) is **excluded from the declared
 support profile**: the sockets row above is an internal-composition pin for
@@ -83,7 +83,8 @@ stdout-only and is listed as `n/a` with `make verify` named as its gate.
 - **`values/post-return.wast`** is no longer excluded: post-return isolation
   is implemented, the file passes 71/71, and the component lane denominator
   moved from 1,631 to 1,702 commands.
-- **Deadline completion, cli stdio/env/stderr/terminal, and the filesystem read+write paths.**
+- **Deadline completion, cli stdio/env/stderr/terminal, and the filesystem
+  read/write/directory/error paths.**
   `p3/deadline-wait` (200 ms `wait-for`, and the liveness-oracle fix that
   lets an armed reactor deadline count as possible progress while a bare
   fd-readiness watch does not), `p3/cli-stdin-env-stderr-terminal` (argv/env/
@@ -93,12 +94,21 @@ stdout-only and is listed as `n/a` with `make verify` named as its gate.
   the seeded `hello.txt`, exactly 17 bytes through `read-via-stream` +
   `stream.read`, a missing path as err `no-entry`, every handle dropped)
   joined the P3 lane, now 10/10 ×3 per backend. The filesystem guest also
-  exercises `write-via-stream`/`append-via-stream` at explicit offsets
-  (including zero-fill extension), parked write futures, `stat`
+  exercises `write-via-stream` at explicit offsets (including zero-fill
+  extension) and `append-via-stream` at EOF, parked write futures, `stat`
   (regular-file, link-count 1, size 22), a same-descriptor read-back and a
-  host-side file-contents witness. The deadline and cli rows are closed; the
-  filesystem row stays partial for directory operations, write-side error
-  paths and advanced metadata/time calls.
+  host-side file-contents witness. A write through the read-only
+  `hello.txt` descriptor resolves err `error-code::read-only` (case 32)
+  through the paired future, never a trap. The directory surface is
+  guest-evidenced on the same preopen: `create-directory-at`, `open-at` of
+  the directory, `stat` reporting `directory` (case 2), `read-directory`
+  enumerating `hello.txt`/`out.txt`/`subdir`/`temp.txt` with an ok future,
+  `rename-at` → `moved.txt` followed by `stat-at` (regular-file, size 0),
+  `unlink-file-at`, `remove-directory-at`, and `stat-at(subdir)` err
+  `no-entry`; the suite adds a host-side `absent` witness. The deadline and
+  cli rows are closed; the filesystem row stays partial for link/symlink
+  operations and the stat symlink-follow policy, advanced metadata/time
+  calls and stat timestamps.
 - **Nested `option<stream<u8>>` payload ownership (2026-11-02).** `%abi-load`
   implements the loading spec's `stream`/`future` rows through
   `%lift-async-end`: a memory slot indexes the **loading (caller) instance's**
@@ -117,7 +127,7 @@ stdout-only and is listed as `n/a` with `make verify` named as its gate.
   nothing, and stale/class/element/writable/non-idle/waitable-set traps — and
   by `component/generic-path-five-cases-pin` CASE 2, migrated to the
   end-object contract (the second load traps). Negative controls showed both
-  the load arm and the guard set are load-bearing. Unit 693/0, component
+  the load arm and the guard set are load-bearing. Unit 694/0, component
   1,702/0, P3 10/10 ×3 per backend.
 - **Host borrow reclamation and store-retirement metadata (2026-11-02).**
   A host callee has no Task to adopt the borrow handles a lowering staged, so
@@ -154,19 +164,52 @@ stdout-only and is listed as `n/a` with `make verify` named as its gate.
   `component/abi-compound-result-lowering` was extended with four shapes —
   both arms empty records, mixed-arity tuples, a variant carrying a record,
   and `option`/`option` — and passes unchanged. **No lowering code was
-  changed**; this row was withdrawn as a defect. Per-case validator limits
-  remain a separate open item below.
+  changed**; this row was withdrawn as a defect. The separate validator
+  type-use row is resolved below.
+- **Validator type-use limits (2026-11-02) — resolved, owner-space
+  resolution.** An imported-instance functype whose parameter or result is a
+  compound type brought in by an outer alias used to remap its nested refs in
+  the instance declarator space, so an unrelated same-numbered declarator
+  type could win. `entry-at` now returns `(ct, owner-view)`: an outer alias
+  switches to the owner selected by its de Bruijn count, an eq-bound export
+  propagates the target's owner, and `%materialize-component-ct` materializes
+  a ct against that owner's space (owner-qualified through nested outer
+  aliases and eq bounds), while declarator-local entries still use the
+  declarator remap. Pinned by
+  `component/remap-outer-compound-functype-owner` — the exact diagnostic pair
+  (decoy-first same-numbered type validates with no memory; the real `string`
+  leaf still rejects with a memory requirement), shape checks (`tuple<u32>` vs
+  `tuple<string>`) and result-position companions. Unit 694/0, component
+  1,702/0, P3 10/10 ×3 per backend, `make verify` green.
+- **Validator instance type-index space and encoder s33 valtype indices
+  (2026-11-02).** Two engine correctness fixes exposed by the WIT-shaped
+  filesystem fixture; neither is a §9.3 defect row. `%vis-check-type-use`
+  pushed every import/export declarator inside an INSTANCE type, but
+  Binary.md 274 makes only type-bound declarators introduce a TYPE index
+  (COMPONENT types keep every declarator, Binary.md 415), so a later
+  reference could name an unrelated same-numbered declarator; the walk now
+  pushes type-bound declarators only for instances. In
+  `tools/component-encode.lisp`, valtype type indices are signed s33 per
+  Binary.md 252; the old `u32` wrote 64 as `40` (the FUNC constructor byte),
+  so a component whose valtype reference reached 64 round-tripped malformed.
+  The P3 filesystem fixture/lane (`p3/filesystem-preopens-read`, checksum
+  `a3293778…`) is the regression witness: the previous fixture passed
+  because its references happened to land on slots the validator accepted
+  (it referenced no exported `descriptor-stat`/`directory-entry` slot from a
+  later declarator), and its valtype indices stayed below 64, where `u32`
+  and `s33` agree. Unit 694/0, component
+  1,702/0, P3 30/30 ×3 both backends, `make verify` green.
 
 ## Still open
 
-- **Filesystem directory and advanced paths.** The P3 filesystem guest now
-  covers preopens/open/read/write/append/offsets/stat/error (including a
-  host-side byte witness); directory operations, write-side error paths and
-  advanced metadata/time calls remain uncovered.
-- **Per-case validator limits.** Imported-instance functypes with outer
-  compound refs are rejected by the text/validator front end; individual
-  cases are tracked per fixture, not as a blanket WIT gap and not as an
-  ABI-lowering defect.
+- **Filesystem link/symlink and advanced metadata paths.** The P3 filesystem
+  guest now covers preopens/open/read/write/append/offsets/stat/stat-at/
+  directory operations and the read-only error (including host-side
+  file-contents and absent-object witnesses). Remaining: `link-at`,
+  `symlink-at`, `readlink-at` and the stat symlink-follow policy;
+  `advise`/`sync`/`sync-data`/`set-size`/`set-times`/`get-flags`/`get-type`/
+  `metadata-hash`/`is-same-object` and stat timestamps. Seek does not exist
+  in 0.3.2.
 - **Blocked-stdio executor audit** and upstream toolchain/suite evidence (see
   Blocked below).
 

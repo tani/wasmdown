@@ -776,3 +776,88 @@ The row stays partial: directory operations, write-side error paths
 `get-type`, `stat-at`, `is-same-object`) are provider/unit-tested only; 0.3.2
 has no seek API, offsets are explicit stream arguments. P3 30/30 ×3 both
 backends, `make verify` green, only the filesystem fixture hash changed.
+
+## Validator type-use owner-space resolution (2026-11-02)
+
+The last §9.3 defect row closed. An imported-instance functype whose
+parameter or result is a **compound** type brought in by an outer alias was
+materialized against the wrong type space: `entry-at` found the outer
+compound in the owner, then re-resolved its nested `(:idx . k)` against the
+instance **declarator** space, where an unrelated same-numbered type could
+win. The collision is exact in the pin: owner types `0 = u32`, `1 =
+tuple<u32>`, declarator types `0 = string` (decoy), `1 = outer alias to
+owner 1`. A `param x :idx 1` therefore either demanded memory that
+`tuple<u32>` does not need, or missed the requirement a real `string` leaf
+does.
+
+Fix: `entry-at` now returns `(ct, owner-view)`; an outer alias switches to
+the owner selected by its de Bruijn count, and an eq-bound export propagates
+the target's owner. A ct taken from an outer owner is materialized against
+that owner's space by `%materialize-component-ct`, owner-qualified through
+nested outer aliases and eq bounds, while declarator-local entries keep the
+declarator remap.
+
+Pinned by `component/remap-outer-compound-functype-owner`: the direct
+remap in both directions; the exact end-to-end diagnostic pair (the
+decoy-first text validates with no memory, while the real-`string` text
+still rejects with a message naming `memory`); and result-position
+companions of both. The pin is negative-controlled by construction: the
+decoy-first positive fails under the old remap, and the string negative
+fails if the owner switch silently resolves everything to the decoy.
+
+Unit 694/0, component 1,702/0, P3 30/30 ×3 both backends, `make verify`
+green. This closes the validator-limit row; no §9.3 defect row remains
+open.
+
+## Filesystem directory/error guest; validator walk and s33 encoder fixes (2026-11-02)
+
+The P3 filesystem guest (`p3-fs-guest.wasm`, same suite case
+`p3/filesystem-preopens-read`) grew the directory and error surfaces. The
+WIT-shaped instance type the guest needs then exposed two engine defects that
+the earlier fixture could not reach.
+
+**Directory and error guest.** On the `/work` preopen the guest now:
+`create-directory-at` a `subdir`; `open-at` it as a directory; `stat` it as
+`directory` (case 2); `read-directory` on the preopen and require the
+enumeration to name `hello.txt`, `out.txt`, `subdir` and `temp.txt` with the
+paired future ok; `rename-at` `temp.txt` to `moved.txt` and `stat-at` the
+result as regular-file with size 0; `unlink-file-at` it; `remove-directory-at`
+the `subdir`; and then require `stat-at(subdir)` to return err
+`error-code::no-entry`, never a trap. On the error side, a
+`write-via-stream` through the read-only `hello.txt` descriptor must resolve
+err `error-code::read-only` (case 32) through the paired future, again never a
+trap. The suite adds an `absent` witness (`subdir`, `temp.txt`, `moved.txt`),
+so the cleanup is host-observed, and the guest removes every temporary object
+so the three repeats share the workdir. The builder's scratch dirs use
+pid+counter rather than the random state (SBCL's default `random-state` is
+deterministic), which makes rebuilds idempotent; `P3-CHECKSUMS` was re-pinned
+to `a3293778…` for the new binary.
+
+**Validator instance type-index space.** `%vis-check-type-use` pushed every
+import/export declarator inside an INSTANCE type, but Binary.md 274 says only
+type-bound declarators introduce a TYPE index; an INSTANCE type's imports and
+func/method exports do not. A COMPONENT type keeps every declarator
+(Binary.md 415), and that arm is unchanged. The old walk therefore shifted
+later numeric references onto a same-numbered wrong declarator. The earlier
+fixture passed because its references happened to land on slots the validator
+accepted: it referenced its local `descriptor-stat` definition, not the
+exported slot, from the later method declarators. The new guest references the
+exported `descriptor-stat` and `directory-entry` slots from methods (and
+`read-directory`'s `stream<directory-entry>` element must resolve exactly),
+which makes the shift observable. The walk now pushes only
+`%type-indexing-declarator-p` declarators for instances.
+
+**Encoder s33 valtype indices.** `tools/component-encode.lisp` wrote component
+valtype type indices with `u32`. Binary.md 252 requires signed s33: index 64
+must encode as `C0 00`, but the old writer emitted `40`, which is the FUNC
+constructor byte, so a component with a valtype reference at index 64
+round-tripped malformed and the decoder could not read it back as a type
+index. The new fixture's type space reaches that index, so the round-trip
+guard caught it; the earlier fixture's indices stayed below 64, where the
+`u32` and s33 bytes coincide. A `s33` helper now drives every valtype `:idx`.
+
+Neither fix was filed as a §9.3 defect row (the open row at the time was the
+filesystem evidence row), but both are real correctness fixes with the P3
+filesystem fixture/lane as the regression witness; no separate named pin
+exists for them. Unit 694/0, component 1,702/0, P3 30/30 ×3 both backends,
+`make verify` green; only the filesystem fixture hash changed.
