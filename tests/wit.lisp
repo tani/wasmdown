@@ -562,6 +562,88 @@ interface y {
                 :key #'wasmdown.wit:wit-world-item-interface
                 :test #'string=)))))
 
+(test wit/selection-import-surface-query
+  ;; one principled query over the pinned package set, reusing the
+  ;; selection gate: stable-and-selected, @unstable not enabled, and
+  ;; unknown/not-an-interface are distinguishable without parsing the
+  ;; source a second time.
+  (let ((pkgs (mapcar #'parse-pkg
+                      '("clocks/clocks.wit" "random/random.wit"
+                        "cli/cli.wit" "filesystem/filesystem.wit"
+                        "sockets/sockets.wit" "http/http.wit"))))
+    (multiple-value-bind (status interface feature)
+        (wasmdown.wit:wit-import-surface-status
+         "wasi:clocks/timezone@0.3.2" pkgs)
+      (is (eq :unstable status))
+      (is (string= "timezone" (wasmdown.wit:wit-interface-name interface)))
+      (is (string= "clocks-timezone" feature)))
+    (multiple-value-bind (status interface feature)
+        (wasmdown.wit:wit-import-surface-status
+         "wasi:clocks/timezone@0.3.2" pkgs
+         :selection (wasmdown.wit:make-wit-selection
+                     :enabled-features '("clocks-timezone")))
+      (is (eq :selected status))
+      (is interface)
+      (is (null feature)))
+    (multiple-value-bind (status interface feature)
+        (wasmdown.wit:wit-import-surface-status
+         "wasi:clocks/monotonic-clock@0.3.2" pkgs)
+      (is (eq :selected status))
+      (is (string= "monotonic-clock"
+                   (wasmdown.wit:wit-interface-name interface)))
+      (is (null feature)))
+    ;; an unversioned name matches the package set's only version
+    (multiple-value-bind (status interface feature)
+        (wasmdown.wit:wit-import-surface-status
+         "wasi:clocks/timezone" pkgs)
+      (is (eq :unstable status))
+      (is interface)
+      (is (string= "clocks-timezone" feature)))
+    ;; unknown package, unknown interface, unknown version, and names
+    ;; that are not component-model import names at all
+    (dolist (name '("wasi:nope/types@0.3.2"
+                    "wasi:clocks/nope@0.3.2"
+                    "wasi:clocks/monotonic-clock@9.9.9"
+                    "wasi:clocks"
+                    "not-an-import-name"))
+      (multiple-value-bind (status interface feature)
+          (wasmdown.wit:wit-import-surface-status name pkgs)
+        (is (eq :unknown status))
+        (is (null interface))
+        (is (null feature))))))
+
+(test wit/selection-command-world-timezone-import
+  ;; (a) under the default selection the resolved command world omits
+  ;; the @unstable timezone import by its full component-model name;
+  ;; enabling `clocks-timezone' through the selection brings it back,
+  ;; and the stable neighbours are unaffected either way.
+  (flet ((import-names (world)
+           (loop for item in (wasmdown.wit:wit-world-imports world)
+                 for target = (wasmdown.wit:wit-world-item-target item)
+                 when (wasmdown.wit:wit-interface-p target)
+                   collect (wasmdown.wit:interface-import-name target))))
+    (let* ((pkgs (mapcar #'parse-pkg
+                         '("clocks/clocks.wit" "random/random.wit"
+                           "cli/cli.wit" "filesystem/filesystem.wit"
+                           "sockets/sockets.wit" "http/http.wit")))
+           (cli (find "cli" pkgs :key #'wasmdown.wit:wit-package-basename
+                      :test #'string=))
+           (off (wasmdown.wit:resolve-wit-world cli "command"
+                                               :packages pkgs))
+           (on (wasmdown.wit:resolve-wit-world
+                cli "command" :packages pkgs
+                :selection (wasmdown.wit:make-wit-selection
+                            :enabled-features '("clocks-timezone")))))
+      (is (null (find "wasi:clocks/timezone@0.3.2"
+                      (import-names off) :test #'string=)))
+      (is (find "wasi:clocks/timezone@0.3.2"
+                (import-names on) :test #'string=))
+      (dolist (world (list off on))
+        (is (find "wasi:clocks/monotonic-clock@0.3.2"
+                  (import-names world) :test #'string=))
+        (is (find "wasi:clocks/system-clock@0.3.2"
+                  (import-names world) :test #'string=))))))
+
 (test wit/selection-validate-since-exceeds-container
   (let* ((pkg (wasmdown.wit:parse-wit-string
                "package test:since@0.1.0;

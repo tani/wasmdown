@@ -251,7 +251,15 @@
                                      (coerce (c::instrec-args i) 'list)))))
     (:inline-exports (cat (by 1)
                           (vecb (mapcar (lambda (e)
-                                          (cat (nm (car e)) (enc-sortidx (cdr e))))
+                                          ;; the parser/decoder keep the
+                                          ;; export name as
+                                          ;; (name attrs) (Binary.md's
+                                          ;; nameattributes): unwrap the
+                                          ;; cell and re-emit the 0x00
+                                          ;; attrs prefix
+                                          (let ((n (car e)))
+                                            (cat (na (if (consp n) (car n) n))
+                                                 (enc-sortidx (cdr e)))))
                                         (coerce (c::instrec-exports i) 'list)))))))
 
 (defun enc-import (ir)

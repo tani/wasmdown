@@ -1645,6 +1645,56 @@ TARGET-VERSION; @unstable is kept iff its feature is enabled.
   (%gate-kept-fields-p (%gate-since annotations) (%gate-feature annotations)
                        selection target-version))
 
+(defun wit-import-surface-status (name packages &key selection)
+  "Classify the component-model import NAME (`ns:pkg/iface', the
+`@version' suffix optional) against the package set PACKAGES under
+SELECTION (default: *DEFAULT-WIT-SELECTION*).
+
+Returns (VALUES STATUS INTERFACE FEATURE):
+
+  :SELECTED  the target interface is part of the selected surface;
+  :UNSTABLE  the interface exists but its @unstable feature is not
+             enabled: FEATURE is that feature (or :UNSTABLE when the
+             annotation names none);
+  :EXCLUDED  the interface exists but the selection drops it for a
+             reason other than an @unstable feature (an @since newer
+             than the selected target);
+  :UNKNOWN   NAME is not a package/interface of PACKAGES (or names a
+             version the package set does not contain).
+
+INTERFACE is the target interface for every status but :UNKNOWN; FEATURE
+is non-NIL only for :UNSTABLE. The @unstable/@since reading is the
+selection gate's own (%GATE-KEPT-P), never a second annotation parser."
+  (let* ((colon (and (stringp name) (position #\: name)))
+         (slash (and colon (position #\/ name :start (1+ colon)))))
+    (if (null slash)
+        (values :unknown nil nil)
+        (let* ((namespace (subseq name 0 colon))
+               (basename (subseq name (1+ colon) slash))
+               (tail (subseq name (1+ slash)))
+               (at (position #\@ tail))
+               (interface-name (if at (subseq tail 0 at) tail))
+               (version (and at (subseq tail (1+ at))))
+               (package (%find-package namespace basename version packages))
+               (interface (package-interface package interface-name)))
+          (if (null interface)
+              (values :unknown nil nil)
+              (let* ((selection (or selection *default-wit-selection*))
+                     (target (%selection-target-version package selection))
+                     (annotations (wit-interface-annotations interface)))
+                (cond
+                  ((%gate-kept-p annotations selection target)
+                   (values :selected interface nil))
+                  (t
+                   (let ((feature (%gate-feature annotations)))
+                     (if (and feature
+                              (not (member feature
+                                           (wit-selection-enabled-features
+                                            selection)
+                                           :test #'string=)))
+                         (values :unstable interface feature)
+                         (values :excluded interface nil)))))))))))
+
 (defun %gate-at-least-as-strict-p (child parent)
   "May an item whose own gate is CHILD live inside a container gated
 by PARENT? Availability and feature gates are independent dimensions:

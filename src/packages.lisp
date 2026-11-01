@@ -403,6 +403,7 @@
    #:wit-selection-enabled-features
    #:validate-wit-package
    #:select-wit-package
+   #:wit-import-surface-status
    #:resolve-wit-world))
 
 (defpackage #:wasmdown.wasi

@@ -17,6 +17,11 @@
 ;;;;                          order; prints "hi\n"
 ;;;;   p3-cancel-guest.wasm   lowers the clock's async wait-for, cancels the
 ;;;;                          pending subtask and drops it (asserts cancelled)
+;;;;   p3-random-guest.wasm   imports wasi:random/random@0.3.2 (and the
+;;;;                          insecure/insecure-seed interfaces), lowers the
+;;;;                          list-returning funcs with (memory ...) and
+;;;;                          (realloc ...), and traps unless two 16-byte
+;;;;                          reads have exact lengths and differ
 ;;;;
 ;;;; The importing guest is the provider-importing evidence the no-import
 ;;;; smoke cannot give: the runner composes the provider from the
@@ -488,13 +493,150 @@
            (b-sec 1 core)
            builtins alias-export lower bag m-inst aliases lift compinst export)))
 
+;;; ---------------------------------------------------------------
+;;; Fixture 7: wasi:random. TEXT authored (tools/component-encode) rather
+;;; than byte-assembled: the list results need a memory and a realloc,
+;;; and the text encoder round-trips those options exactly.
+;;;
+;;; The canonical LOWER core signature is derived from CanonicalABI's
+;;; flatten rules (MAX_FLAT_RESULTS = 1) and confirmed by
+;;; validate/link errors:
+;;;
+;;;   get-random-bytes(max-len: u64) -> list<u8>
+;;;     flat params  [i64]; flat results [i32 i32] (ptr,len) > 1
+;;;     => core (param i64 i32)  — the trailing i32 is the caller's
+;;;        retptr; the lowered core func returns nothing and the
+;;;        callee writes ptr@retptr, len@retptr+4.
+;;;   get-random-u64() -> u64
+;;;     one flat result => core (result i64), no memory needed.
+;;;   get-insecure-seed() -> tuple<u64,u64>
+;;;     flat results [i64 i64] > 1 => core (param i32) retptr, the two
+;;;     u64 fields stored at retptr and retptr+8.
+;;;
+;;; The list results are lowered with BOTH (memory (core memory
+;;; $mem "mem")) and (realloc (core func $mem "realloc")); the realloc
+;;; is a bump allocator (i32,i32,i32,i32)->i32 that never returns a
+;;; region below its 1024-byte base, so the caller's retptr slots at
+;;; 0..31 and the two returned buffers cannot alias.
+(defparameter *p3-random-text*
+  (format nil "~{~a~%~}"
+          (list
+           "(component"
+   "  (type $res (result))"
+   "  (import \"wasi:random/random@0.3.2\""
+   "    (instance $random"
+   "      (export \"get-random-bytes\""
+   "        (func (param \"max-len\" u64) (result (list u8))))"
+   "      (export \"get-random-u64\" (func (result u64)))))"
+   "  (import \"wasi:random/insecure@0.3.2\""
+   "    (instance $insecure"
+   "      (export \"get-insecure-random-bytes\""
+   "        (func (param \"max-len\" u64) (result (list u8))))"
+   "      (export \"get-insecure-random-u64\" (func (result u64)))))"
+   "  (import \"wasi:random/insecure-seed@0.3.2\""
+   "    (instance $seed"
+   "      (export \"get-insecure-seed\" (func (result (tuple u64 u64))))))"
+   "  (alias export $random \"get-random-bytes\" (func $bytes))"
+   "  (alias export $random \"get-random-u64\" (func $u64))"
+   "  (alias export $insecure \"get-insecure-random-bytes\" (func $ibytes))"
+   "  (alias export $insecure \"get-insecure-random-u64\" (func $iu64))"
+   "  (alias export $seed \"get-insecure-seed\" (func $seedfn))"
+   "  (core module $Mem"
+   "    (memory (export \"mem\") 1)"
+   "    (global $bump (mut i32) (i32.const 1024))"
+   "    (func (export \"realloc\") (param i32 i32 i32 i32) (result i32)"
+   "      (local $p i32)"
+   "      (local.set $p (global.get $bump))"
+   "      (global.set $bump"
+   "        (i32.and (i32.add (global.get $bump)"
+   "                          (i32.add (local.get 3) (i32.const 7)))"
+   "                 (i32.const -8)))"
+   "      (local.get $p)))"
+   "  (core instance $mem (instantiate $Mem))"
+   "  (core func $bytes-lowered"
+   "    (canon lower (func $bytes)"
+   "      (memory (core memory $mem \"mem\"))"
+   "      (realloc (core func $mem \"realloc\"))))"
+   "  (core func $u64-lowered (canon lower (func $u64)))"
+   "  (core func $ibytes-lowered"
+   "    (canon lower (func $ibytes)"
+   "      (memory (core memory $mem \"mem\"))"
+   "      (realloc (core func $mem \"realloc\"))))"
+   "  (core func $iu64-lowered (canon lower (func $iu64)))"
+   "  (core func $seed-lowered"
+   "    (canon lower (func $seedfn)"
+   "      (memory (core memory $mem \"mem\"))))"
+   "  (core module $M"
+   "    (import \"env\" \"mem\" (memory 1))"
+   "    (import \"env\" \"get-random-bytes\" (func $bytes (param i64 i32)))"
+   "    (import \"env\" \"get-random-u64\" (func $u64 (result i64)))"
+   "    (import \"env\" \"get-insecure-random-bytes\" (func $ibytes (param i64 i32)))"
+   "    (import \"env\" \"get-insecure-random-u64\" (func $iu64 (result i64)))"
+   "    (import \"env\" \"get-insecure-seed\" (func $seed (param i32)))"
+   "    (func $memcmp16 (param $a i32) (param $b i32) (result i32)"
+   "      (local $i i32) (local $diff i32)"
+   "      (block $done"
+   "        (loop $l"
+   "          (br_if $done (i32.ge_u (local.get $i) (i32.const 16)))"
+   "          (if (i32.ne (i32.load8_u (i32.add (local.get $a) (local.get $i)))"
+   "                      (i32.load8_u (i32.add (local.get $b) (local.get $i))))"
+   "              (then (local.set $diff (i32.const 1)) (br $done)))"
+   "          (local.set $i (i32.add (local.get $i) (i32.const 1)))"
+   "          (br $l)))"
+   "      (local.get $diff))"
+   "    (func (export \"run\") (result i32)"
+   "      (local $p1 i32) (local $p2 i32)"
+   "      ;; secure bytes: two 16-byte reads, lengths exact, contents differ"
+   "      (call $bytes (i64.const 16) (i32.const 0))"
+   "      (local.set $p1 (i32.load (i32.const 0)))"
+   "      (if (i32.ne (i32.load (i32.const 4)) (i32.const 16)) (then unreachable))"
+   "      (call $bytes (i64.const 16) (i32.const 0))"
+   "      (local.set $p2 (i32.load (i32.const 0)))"
+   "      (if (i32.ne (i32.load (i32.const 4)) (i32.const 16)) (then unreachable))"
+   "      (if (i32.eqz (call $memcmp16 (local.get $p1) (local.get $p2)))"
+   "          (then unreachable))"
+   "      ;; secure u64 completes"
+   "      (drop (call $u64))"
+   "      ;; insecure bytes: same shape"
+   "      (call $ibytes (i64.const 16) (i32.const 0))"
+   "      (local.set $p1 (i32.load (i32.const 0)))"
+   "      (if (i32.ne (i32.load (i32.const 4)) (i32.const 16)) (then unreachable))"
+   "      (call $ibytes (i64.const 16) (i32.const 0))"
+   "      (local.set $p2 (i32.load (i32.const 0)))"
+   "      (if (i32.ne (i32.load (i32.const 4)) (i32.const 16)) (then unreachable))"
+   "      (if (i32.eqz (call $memcmp16 (local.get $p1) (local.get $p2)))"
+   "          (then unreachable))"
+   "      (drop (call $iu64))"
+   "      ;; insecure-seed: tuple<u64,u64> through the retptr"
+   "      (call $seed (i32.const 16))"
+   "      (i32.const 0)))"
+   "  (core instance $m"
+   "    (instantiate $M"
+   "      (with \"env\""
+   "        (instance"
+   "          (export \"mem\" (memory $mem \"mem\"))"
+   "          (export \"get-random-bytes\" (func $bytes-lowered))"
+   "          (export \"get-random-u64\" (func $u64-lowered))"
+   "          (export \"get-insecure-random-bytes\" (func $ibytes-lowered))"
+   "          (export \"get-insecure-random-u64\" (func $iu64-lowered))"
+   "          (export \"get-insecure-seed\" (func $seed-lowered))))))"
+   "  (type $run (func (result $res)))"
+   "  (func $run (type $run) (canon lift (core func $m \"run\")))"
+   "  (instance $cli-run (export \"run\" (func $run)))"
+   "  (export \"wasi:cli/run@0.3.2\" (instance $cli-run)))")))
+
+(defun p3-random-guest-bytes ()
+  (component-encode:encode-component
+   (wasmdown.component.text::parse-component-text *p3-random-text*)))
+
 (defparameter *fixtures*
   (list (list "p3-guest.wasm" #'p3-sync-guest-bytes 0 "")
         (list "p3-import-guest.wasm" #'p3-import-guest-bytes 7 "")
         (list "p3-clock-guest.wasm" #'p3-clock-guest-bytes 0 "")
         (list "p3-async-guest.wasm" #'p3-async-guest-bytes 0 "")
         (list "p3-stream-guest.wasm" #'p3-stream-guest-bytes 0 (format nil "hi~%"))
-        (list "p3-cancel-guest.wasm" #'p3-cancel-guest-bytes 0 "")))
+        (list "p3-cancel-guest.wasm" #'p3-cancel-guest-bytes 0 "")
+        (list "p3-random-guest.wasm" #'p3-random-guest-bytes 0 "")))
 
 ;;; ---------------------------------------------------------------
 ;;; Verify through this project's own decoder/validator/runner, then

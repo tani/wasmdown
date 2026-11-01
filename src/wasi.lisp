@@ -6030,6 +6030,34 @@ of these entries a component gets is decided by the world."
                                        :package sockets)))
       (nreverse builders))))
 
+(defparameter +wasi-unstable-import-message-format+
+  "~a is @unstable(feature = ~a) and that feature is not enabled; unstable interfaces are outside the selected stable WASI 0.3.2 surface (see docs/usage/wasi.md and specs/wasi/MANIFEST.md)."
+  "The refusal template for a component that DECLARES an @unstable WASI
+0.3.2 import whose feature the selected surface does not enable. The
+first argument is the import name, the second the feature name.")
+
+(defun %wasi-unstable-import-p (name)
+  "The @unstable feature NAME's target interface is gated out by, or
+NIL when NAME is not an @unstable-gated interface of the pinned package
+set. Delegates the whole annotation question to the WIT selection gate
+(WIT-IMPORT-SURFACE-STATUS); unknown names are never assumed unstable."
+  (multiple-value-bind (status interface feature)
+      (wasmdown.wit:wit-import-surface-status name (%wasi-wit-packages))
+    (declare (ignore interface))
+    (and (eq status :unstable) feature)))
+
+(defun %refuse-unstable-declared-imports (wasi-names)
+  "Refuse the first @unstable import in WASI-NAMES whose feature is not
+enabled, in declaration order, as a LINK-ERROR naming the import and
+the feature. Stable and unknown names pass through untouched."
+  (dolist (name wasi-names)
+    (let ((feature (%wasi-unstable-import-p name)))
+      (when feature
+        (error 'wasmdown:link-error
+               :message (format nil +wasi-unstable-import-message-format+
+                                name feature)))))
+  nil)
+
 (defun compose-world-providers (world context)
   "Compose the provider graph for the RESOLVED WORLD: exactly the
 imports WORLD declares, in declaration order, each bound under the
@@ -6093,11 +6121,18 @@ A component that asks for the 0.3 line may not itself IMPORT
 `wasi:sockets' at any interface or version: guests get no sockets
 provider by design, and the refusal is raised from the DECLARED import
 list BEFORE anything composes, as a `LINK-ERROR' carrying the canonical
-message. The 0.2 line is untouched (the P2 sockets facade is a separate
-legacy claim), and a component that ALSO declares a 0.2 import keeps
-the mixed-release-line refusal, which is checked by the same predicate
-it always was: the two refusals never race, because the mixed check
-needs a non-empty `v2' and the sockets check requires `v2' empty."
+message. The same 0.3 path refuses, before the sockets check, any
+declared import whose target interface is `@unstable' with a feature
+the selected (stable) surface does not enable — the message names the
+import and the feature. Stable imports are unaffected and unknown
+names are left alone (the 0.3 path composes the command world exactly
+as before). The 0.2 line is untouched (the
+P2 sockets facade is a separate legacy claim), and a component that
+ALSO declares a 0.2 import keeps the mixed-release-line refusal, which
+is checked by the same predicate it always was: the two refusals never
+race, because the mixed check needs a non-empty `v2' and both 0.3
+refusals require `v2' empty. No feature can be enabled from the CLI:
+the gate is refusal-only."
   (let* ((names (declared-component-imports comp))
          (wasi-names (remove-if-not (lambda (n)
                                       (and (stringp n)
@@ -6111,9 +6146,14 @@ needs a non-empty `v2' and the sockets check requires `v2' empty."
                      collect (cons n ver))))
     (cond
      ((null v2)
-      ;; the 0.3 path: a guest may not declare a sockets import, even
-      ;; though the pinned command WORLD does (the world is composed,
-      ;; not declared, and its sockets providers stay available)
+      ;; the 0.3 path: the declared imports must lie inside the selected
+      ;; STABLE surface. An @unstable interface whose feature the default
+      ;; selection does not enable is refused here, naming import and
+      ;; feature, before anything composes.
+      (%refuse-unstable-declared-imports wasi-names)
+      ;; likewise a guest may not declare a sockets import, even though
+      ;; the pinned command WORLD does (the world is composed, not
+      ;; declared, and its sockets providers stay available)
       (when (find-if #'%wasi-sockets-import-name-p wasi-names)
         (error 'wasmdown:link-error
                :message +wasi-sockets-unsupported-message+))

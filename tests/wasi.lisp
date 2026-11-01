@@ -5200,6 +5200,61 @@ the payloads need no resolvable extern types."
     (is (not (string= (wasmdown:wasmdown-error-message condition)
                       wasmdown.wasi::+wasi-sockets-unsupported-message+)))))
 
+(test wasi/component-unstable-declared-import-is-link-error
+  ;; a 0.3 component DECLARING `wasi:clocks/timezone@0.3.2' is refused
+  ;; before composition: the interface is @unstable(feature =
+  ;; clocks-timezone) and the default selection enables no feature. The
+  ;; message names the import and the feature; it is never the generic
+  ;; no-provider text.
+  (let ((ctx (wasmdown.wasi:make-wasi-context))
+        (condition nil))
+    (handler-case
+        (progn (wasmdown.wasi:component-command-providers
+                ctx (%synthetic-import-comp "wasi:clocks/timezone@0.3.2"))
+               nil)
+      (wasmdown:link-error (c) (setf condition c)))
+    (is condition)
+    (let ((message (wasmdown:wasmdown-error-message condition)))
+      (is (search "wasi:clocks/timezone@0.3.2" message))
+      (is (search "@unstable(feature = clocks-timezone)" message))
+      (is (search "not enabled" message))
+      (is (search "outside the selected stable WASI 0.3.2 surface"
+                  message))
+      (is (not (search "no provider" message))))))
+
+(test wasi/component-stable-declared-import-is-not-gated
+  ;; positive control: the stable clocks interfaces a command genuinely
+  ;; declares are NOT refused; composition equals the plain command
+  ;; provider set, entry for entry.
+  (let ((ctx (wasmdown.wasi:make-wasi-context)))
+    (dolist (name '("wasi:clocks/monotonic-clock@0.3.2"
+                    "wasi:clocks/system-clock@0.3.2"
+                    "wasi:clocks/types@0.3.2"))
+      (let ((providers (wasmdown.wasi:component-command-providers
+                        ctx (%synthetic-import-comp name))))
+        (is (equal (mapcar #'car (wasmdown.wasi:command-provider ctx))
+                   (mapcar #'car providers)))
+        (is (every #'wasmdown.component.runtime:comp-instance-p
+                   (mapcar #'cdr providers)))))))
+
+(test wasi/component-unknown-declared-import-keeps-existing-behavior
+  ;; unknown names are not classified as unstable and are never
+  ;; refused by the surface gate: the 0.3 path composes the command
+  ;; world exactly as before.
+  (let* ((ctx (wasmdown.wasi:make-wasi-context))
+         (expected (mapcar #'car (wasmdown.wasi:command-provider ctx))))
+    (dolist (name '("wasi:clocks/timezone-x@0.3.2"
+                    "nonsense"))
+      (multiple-value-bind (status interface feature)
+          (wasmdown.wit:wit-import-surface-status
+           name (wasmdown.wasi::%wasi-wit-packages))
+        (is (eq :unknown status))
+        (is (null interface))
+        (is (null feature)))
+      (let ((providers (wasmdown.wasi:component-command-providers
+                        ctx (%synthetic-import-comp name))))
+        (is (equal expected (mapcar #'car providers)))))))
+
 (test wasi/cli-network-options-are-refused
   ;; `--net'/`--listen'/`--dns' are refused as a USAGE error carrying
   ;; the canonical message WHILE PARSING: the input file is never

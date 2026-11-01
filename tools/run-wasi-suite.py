@@ -64,7 +64,7 @@ def source_identity():
 P1 = "sqlite3-p1.wasm"
 P2 = "sqlite3-p2.wasm"
 # WASI 0.3.2 (@0.3.2 imports, Component Model async) command guests.
-# Six hand-authored guests are pinned (tools/build-p3-fixtures.lisp and
+# Seven hand-authored guests are pinned (tools/build-p3-fixtures.lisp and
 # P3-CHECKSUMS); no toolchain in the development environment produces the
 # 0.3.2 component ABI, so upstream-toolchain integration is still absent.
 # The lane selects preview3 ONLY when asked, and a missing fixture is a
@@ -75,6 +75,7 @@ P3_CLOCK = "p3-clock-guest.wasm"
 P3_ASYNC = "p3-async-guest.wasm"
 P3_STREAM = "p3-stream-guest.wasm"
 P3_CANCEL = "p3-cancel-guest.wasm"
+P3_RANDOM = "p3-random-guest.wasm"
 
 # ---- the cases -----------------------------------------------------
 # expect.stdout_equals  : exact stdout (list of lines, joined by \n, one
@@ -222,7 +223,7 @@ CASES = [
         "expect": {"exit_nonzero": True, "absent": ["x.db"]},
     },
     # ---------------- WASI 0.3.2 ----------------
-    # Six hand-authored @0.3.2 guests are pinned (tools/build-p3-fixtures.lisp,
+    # Seven hand-authored @0.3.2 guests are pinned (tools/build-p3-fixtures.lisp,
     # P3-CHECKSUMS): a missing fixture is a FAILURE, never a skip, so the P3
     # ABI cannot look covered by absence. This first case is only the
     # no-import smoke; the provider cases below are the coverage.
@@ -286,6 +287,18 @@ CASES = [
         "stdin": "",
         # imports wasi:clocks/monotonic-clock@0.3.2, calls now() twice and
         # traps unless the second call is >= the first.
+        "expect": {"stdout_equals": [], "exit": 0},
+    },
+    {
+        "id": "p3/random-bytes",
+        "abi": "preview3",
+        "fixture": P3_RANDOM,
+        "argv": [],
+        "stdin": "",
+        # imports wasi:random/random@0.3.2 (+ insecure and insecure-seed),
+        # lowers the list-returning funcs with memory+realloc, and exits 0
+        # only when two 16-byte reads have exact lengths and differ and the
+        # u64/seed calls complete (any failure traps -> nonzero exit).
         "expect": {"stdout_equals": [], "exit": 0},
     },
     # ---------------- Preview 1 ----------------
