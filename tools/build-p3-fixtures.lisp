@@ -1,13 +1,18 @@
-;;;; Build the hand-authored WASI 0.3.2 (P3) command fixture.
+;;;; Build the hand-authored WASI 0.3.2 (P3) command fixtures.
 ;;;;
 ;;;; No toolchain in this environment emits the @0.3.2 component ABI, so
-;;;; the P3 guest is ASSEMBLED HERE from the pinned Component binary
+;;;; these guests are ASSEMBLED HERE from the pinned Component binary
 ;;;; grammar (section ids and encodings in specs/Binary.md and
-;;;; src/component.lisp). It is a real command component, not a stub:
+;;;; src/component.lisp). They are real command components:
 ;;;;
-;;;;   no imports; core `run` () -> i32 returning 0
-;;;;   component functype () -> (result<_,_>), canon lift, and the
-;;;;   `wasi:cli/run@0.3.2' export (the command world's success status)
+;;;;   p3-guest.wasm          no imports; run returns result ok (status 0)
+;;;;   p3-import-guest.wasm   imports wasi:cli/exit@0.3.2, lowers
+;;;;                          exit-with-code into its core, calls it with 7,
+;;;;                          so the command's process status is 7
+;;;;
+;;;; The importing guest is the provider-importing evidence the no-import
+;;;; smoke cannot give: the runner composes the provider from the
+;;;; component's DECLARED import and the guest calls through a canon lower.
 ;;;;
 ;;;; A richer stdout-importing async command lives in tests/wasi.lisp
 ;;;; (wasi/e2e-command-component-binary); its body is not resume-safe, so
@@ -15,11 +20,11 @@
 ;;;; guest (see docs/status.md, "Known gaps").
 ;;;;
 ;;;; This is ABI coverage, not evidence of real-toolchain integration:
-;;;; no pinned @0.3.2 guest from an upstream toolchain exists here.
+;;;; no @0.3.2 guest from an upstream toolchain exists here.
 ;;;;
 ;;;; Usage:
-;;;;   sbcl --script tools/build-p3-fixtures.lisp           ; write
-;;;;   sbcl --script tools/build-p3-fixtures.lisp --check   ; verify hash
+;;;;   sbcl --script tools/build-p3-fixtures.lisp           ; write both
+;;;;   sbcl --script tools/build-p3-fixtures.lisp --check   ; verify hashes
 
 (require :asdf)
 
@@ -30,10 +35,8 @@
 
 (asdf:load-system :wasmdown)
 
-(defparameter *out*
-  (merge-pathnames "tests/fixtures/wasi/p3-guest.wasm" *root*))
-(defparameter *sums*
-  (merge-pathnames "tests/fixtures/wasi/P3-CHECKSUMS" *root*))
+(defparameter *dir* (merge-pathnames "tests/fixtures/wasi/" *root*))
+(defparameter *sums* (merge-pathnames "P3-CHECKSUMS" *dir*))
 
 ;;; ---------------------------------------------------------------
 ;;; Byte assembly helpers (component binary encodings).
@@ -55,23 +58,14 @@
   (wasmdown.binary:encode-module (wasmdown.text:parse-wat text)))
 
 ;;; ---------------------------------------------------------------
-;;; The guest.
-
-;;; ---------------------------------------------------------------
-;;; The SYNC command guest the lane drives through the CLI: no imports,
-;;; canonical `result` layout, nested core compiled by the selected
-;;; backend. (The stdout-importing async command above is pinned by
-;;; tests/wasi.lisp at the run-component level; driving an async-lifted
-;;; command through the CLI with a reactor re-enters the core body, which
-;;; is recorded as an open async defect, so the guest LANE uses this one.)
+;;; Fixture 1: no imports, run returns ok.
 
 (defun p3-sync-guest-bytes ()
-  "A command component with no imports: run returns ok."
   (let* ((core (b-wat "(module (func (export \"run\") (result i32)
                                   (i32.const 0)))"))
          (result-type (b-bytes #x6a #x00 #x00))      ; result<_,_>
-         (func-type (b-cat (b-bytes #x40) (b-u32 0)  ; functype () ->
-                           (b-bytes #x00) (b-u32 0))) ;  -> typeidx 0
+         (func-type (b-cat (b-bytes #x40) (b-u32 0)  ; functype () -> type 0
+                           (b-bytes #x00) (b-u32 0)))
          (types (b-vec result-type func-type)))
     (b-cat (b-bytes 0 #x61 #x73 #x6d #x0d 0 1 0)
            (b-sec 7 types)
@@ -87,8 +81,69 @@
                                    (b-bytes #x05 0) (b-bytes 0)))))))
 
 ;;; ---------------------------------------------------------------
+;;; Fixture 2: imports wasi:cli/exit@0.3.2 and exits with code 7.
+
+(defun p3-import-guest-bytes ()
+  (let* ((core
+           (b-wat "(module
+                      (import \"env\" \"exit-with-code\"
+                              (func $exit (param i32)))
+                      (func (export \"run\") (result i32)
+                        (call $exit (i32.const 7))
+                        (i32.const 0)))"))
+         (result-type (b-bytes #x6a #x00 #x00))            ; result<_,_>
+         (exit-ft (b-cat (b-bytes #x40)                     ; functype
+                         (b-vec (b-cat (b-name "status-code") (b-bytes #x7d))) ; param u8
+                         (b-bytes #x01 #x00)))              ; no results
+         (run-ft (b-cat (b-bytes #x40) (b-vec)              ; functype () ->
+                        (b-bytes #x00) (b-bytes 0)))        ; result type 0
+         ;; inside an INSTANCE TYPE the type-index space is the type's
+         ;; own declarations: the func type is declared inline (0x01)
+         ;; and the export declarator references it locally as 0.
+         (exit-itype
+           (b-cat (b-bytes #x42)                            ; instance type
+                  (b-vec (b-cat (b-bytes #x01) exit-ft)     ; local type 0
+                         (b-cat (b-bytes #x04)              ; export decl
+                                (b-nameattrs "exit-with-code")
+                                (b-bytes #x01 0)))))        ; func, local 0
+         (types (b-vec result-type run-ft exit-itype))
+         (import (b-vec (b-cat (b-nameattrs "wasi:cli/exit@0.3.2")
+                               (b-bytes #x05 2))))          ; instance type 2
+         ;; core instance 0: the bag handing the lowered exit to the module
+         (bag (b-cat (b-bytes #x01)                         ; inline exports
+                     (b-vec (b-cat (b-name "exit-with-code")
+                                   (b-bytes #x00 0)))))     ; core func 0
+         ;; core instance 1: instantiate module 0 with env = bag 0
+         (m-inst (b-cat (b-bytes #x00 0)                    ; instantiate module
+                        (b-vec (b-cat (b-name "env")
+                                      (b-bytes #x12 0)))))) ; arg = instance 0
+    (b-cat (b-bytes 0 #x61 #x73 #x6d #x0d 0 1 0)
+           (b-sec 7 types)
+           (b-sec 10 import)
+           (b-sec 1 core)
+           (b-sec 6 (b-vec (b-cat (b-bytes #x01 #x00 0)     ; alias import export
+                                  (b-name "exit-with-code"))))
+           (b-sec 8 (b-vec (b-bytes #x01 #x00 0 0)))        ; lower exit
+           (b-sec 2 (b-vec bag))                            ; hands it to the core
+           (b-sec 2 (b-vec m-inst))
+           (b-sec 6 (b-vec (b-cat (b-bytes #x00 #x00 #x01 1)
+                                  (b-name "run"))))
+           (b-sec 8 (b-vec (b-bytes #x00 #x00 1 0 1)))      ; lift run: type 1
+           (b-sec 5 (b-vec (b-cat (b-bytes #x01)            ; inline exports
+                                  (b-vec (b-cat (b-nameattrs "run")
+                                                (b-bytes #x01 1)))))) ; comp func 1
+           (b-sec 11 (b-vec (b-cat (b-nameattrs "wasi:cli/run@0.3.2")
+                                   ;; imported exit is instance 0, the
+                                   ;; defined run instance is instance 1
+                                   (b-bytes #x05 1) (b-bytes 0)))))))
+
+(defparameter *fixtures*
+  (list (list "p3-guest.wasm" #'p3-sync-guest-bytes 0 "")
+        (list "p3-import-guest.wasm" #'p3-import-guest-bytes 7 "")))
+
+;;; ---------------------------------------------------------------
 ;;; Verify through this project's own decoder/validator/runner, then
-;;; write (or check) the artifact.
+;;; write (or check) the artifacts.
 
 (defun sha256 (path)
   "The FIRST field of sha256sum's output: the digest, without the path."
@@ -97,49 +152,66 @@
                                     :output out :search t))))
     (subseq text 0 64)))
 
-(defun recorded-sha ()
+(defun recorded-sha (name)
   (when (probe-file *sums*)
     (with-open-file (s *sums*)
-      (let ((line (read-line s nil nil)))
-        (when line (subseq line 0 (min 64 (length line))))))))
+      (loop for line = (read-line s nil nil)
+            while line
+            when (search name line)
+              do (return (subseq line 0 (min 64 (length line))))))))
 
-(defun verify (bytes expected-stdout)
+(defun verify (label bytes expected-status expected-stdout)
   (let* ((comp (wasmdown.component:decode-component bytes))
          (_ (wasmdown.component:validate-component comp))
          (sink (make-string-output-stream))
-         (status (wasmdown.wasi:run-component
-                  comp (wasmdown.wasi:make-wasi-context :stdout sink))))
+         (context (wasmdown.wasi:make-wasi-context :stdout sink))
+         (status (wasmdown.wasi:run-component comp context)))
     (declare (ignore _))
-    (unless (eql 0 status)
-      (error "p3 fixture: command returned status ~a, expected 0" status))
+    (unless (eql expected-status status)
+      (error "~a: command returned status ~a, expected ~a"
+             label status expected-status))
     (let ((out (get-output-stream-string sink)))
       (unless (string= expected-stdout out)
-        (error "p3 fixture: stdout ~s, expected ~s" out expected-stdout)))
-    (format t "~&p3 fixture: decoded, validated, ran (status 0, stdout ~s)~%"
-            expected-stdout)))
+        (error "~a: stdout ~s, expected ~s" label out expected-stdout)))
+    (format t "~&~a: decoded, validated, ran (status ~a, stdout ~s)~%"
+            label status expected-stdout)))
+
+;;; ---------------------------------------------------------------
+;;; Main.
 
 (let ((check (and (member "--check" sb-ext:*posix-argv* :test #'string=) t)))
   (if check
+      (let ((bad 0))
+        (dolist (entry *fixtures*)
+          (destructuring-bind (name _ status stdout) entry
+            (declare (ignore _ status stdout))
+            (let ((path (merge-pathnames name *dir*))
+                  (recorded (recorded-sha name)))
+              (if (not (probe-file path))
+                  (progn (format t "~&missing fixture ~a (run without --check)~%" path)
+                         (incf bad))
+                  (let ((actual (sha256 path)))
+                    (if (equal recorded actual)
+                        (format t "~&~a: OK ~a~%" name actual)
+                        (progn (format t "~&~a: STALE (recorded ~a, actual ~a)~%"
+                                       name recorded actual)
+                               (incf bad))))))))
+        (sb-ext:exit :code (if (zerop bad) 0 1)))
       (progn
-        (unless (probe-file *out*)
-          (format t "~&missing fixture ~a (run without --check)~%" *out*)
-          (sb-ext:exit :code 1))
-        (let* ((recorded (recorded-sha))
-               (actual (sha256 *out*)))
-          (cond ((equal recorded actual)
-                 (format t "~&p3 fixture: OK ~a~%" actual))
-                (t
-                 (format t "~&p3 fixture: STALE (recorded ~a, actual ~a)~%"
-                         recorded actual)
-                 (sb-ext:exit :code 1)))))
-      (let ((bytes (p3-sync-guest-bytes)))
-        (verify bytes "")
-        (ensure-directories-exist *out*)
-        (with-open-file (s *out* :direction :output :if-exists :supersede
-                                :element-type '(unsigned-byte 8))
-          (write-sequence bytes s))
-        (let ((sum (sha256 *out*)))
+        (ensure-directories-exist *dir*)
+        (let ((lines '()))
+          (dolist (entry *fixtures*)
+            (destructuring-bind (name builder status stdout) entry
+              (let* ((bytes (funcall builder))
+                     (path (merge-pathnames name *dir*)))
+                (with-open-file (s path :direction :output :if-exists :supersede
+                                        :element-type '(unsigned-byte 8))
+                  (write-sequence bytes s))
+                (verify name bytes status stdout)
+                (push (format nil "~a  ~a" (sha256 path) name) lines)
+                (format t "~&wrote ~a~%" path))))
           (with-open-file (s *sums* :direction :output :if-exists :supersede)
-            (format s "~a  p3-guest.wasm~%" sum))
-          (format t "~&wrote ~a~%wrote ~a~%" *out* *sums*)))))
+            (dolist (line (nreverse lines))
+              (format s "~a~%" line)))
+          (format t "~&wrote ~a~%" *sums*)))))
 (sb-ext:exit :code 0)

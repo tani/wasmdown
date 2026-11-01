@@ -1,9 +1,9 @@
 {
  "schema": "wasmdown.inventory.v1",
- "generated_at": "2026-11-01T12:47:40Z",
+ "generated_at": "2026-11-01T12:52:04Z",
  "sbcl_version": "2.6.4",
- "source_commit": "4dd9f2fd8c4523bb2fbb6629fd207a9c7dc1f158",
- "source_tree": "52ba17a881d81db6477eae8d63be5f35e5adc78c",
+ "source_commit": "b93bdf73bb54dc56085332a25c753707c7841332",
+ "source_tree": "e9bf60cf50f2638e41e630118631fd0ec5e244c9",
  "clean_tree": false,
  "pins": {
   "core_spec_commit": "b0ec1f3f449525c217dbff3f1dfab435a756ea92",

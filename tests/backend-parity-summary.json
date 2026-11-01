@@ -1,9 +1,11 @@
 {"schema":"wasmdown.backend-parity-summary.v1",
- "generated_at":"2026-11-01T10:48:00Z",
+ "generated_at":"2026-11-01T12:52:02Z",
  "mode":"report",
  "files_arg":"tests/spec-core/*.wast",
  "sbcl_version":"2.6.4",
- "source_commit":"5e6ea43ba2ce3d342d0d552585683281040d5ac5",
+ "source_commit":"b93bdf73bb54dc56085332a25c753707c7841332",
+ "source_tree":"e9bf60cf50f2638e41e630118631fd0ec5e244c9",
+ "clean_tree":false,
  "files":[
   {"file":"address.wast","interpret_commands":260,"compiled_commands":260,"match":260,"diverge":0,"refusals":0,"interpret_entries":255,"compiled_entries":255},
   {"file":"align.wast","interpret_commands":165,"compiled_commands":165,"match":165,"diverge":0,"refusals":0,"interpret_entries":48,"compiled_entries":48},
@@ -107,6 +109,6 @@
  "classes":{"match":21260,"compiled-compile-refusal":0,"compiled-only-failure":0,"interpret-only-failure":0,"phase-mismatch":0,"outcome-mismatch":0,"trap-mismatch":0,"detail-mismatch":0},
  "refused_opcodes":[],
  "backend_entry_counts":{"interpret":10882079,"compiled":10882079},
- "elapsed_seconds":101.38,
+ "elapsed_seconds":99.69,
  "files_run":97
 }

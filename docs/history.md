@@ -339,6 +339,25 @@ that is a limitation of this four-instruction fixture, not of the scheduler,
 and it is recorded in `status.md`. The CLI lane uses the sync command until a
 resume-safe async guest is pinned.
 
+## P2 stream readiness and P3 importing guests (2026-11-01)
+
+- **P2 (R1).** Against the pinned `io.wit` / `sockets.wit` for 0.2.12: `read(0)`
+  and an OPEN source with no promptly available bytes now return `ok([])`
+  instead of `closed`; `EAGAIN` maps to an empty read rather than a fake I/O
+  error; `write`/`write-zeroes` trap when the offer exceeds the `check-write`
+  permit, and a partial host write retains the unwritten suffix (200 KB into a
+  nonblocking pipe: 65,536 delivered before, 200,000 after, `pending` 134,464);
+  `send` enforces `check-send` and reports the sent count. Five regressions
+  fail on the pre-change source and pass after; unit tests 667 -> 672.
+- **P3 (R2).** The hand-authored lane gained a provider-importing command:
+  it imports `wasi:cli/exit@0.3.2`, lowers `exit-with-code` into its core, calls
+  it with 7, and the command runner maps the WASI exit to the process status
+  (CLI exit 7). The lane now runs two guests, 3 repeats each, in both
+  backends. The component binary grammar details that mattered: type indices
+  inside an instance type are local to that type's declarations, the lower's
+  core func must be defined before the bag that exports it, and imported
+  instances occupy the instance index space before defined ones.
+
 ## Roadmap-era notes
 
 - Numbering convention: engine-slice loops 18–24 and Component Model milestones M7–M17 ran in parallel; neither series renumbers the other.

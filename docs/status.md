@@ -36,7 +36,7 @@ deliberately incomplete, and what will not be built. Measurements live in
 | WASI | Preview 1 (`wasi_snapshot_preview1`) | Full | All 46 pinned imports are provided over an explicit capability context. The whole acceptance lane (in-memory and on-disk SQLite, rollback, bail, preopen denial, read-only, escape) passes with compiled guest cores too. |
 | WASI | 0.3.2 providers | Partial | The CLI now owns a reactor (clock deadlines and socket readiness are servable); what remains partial is the provider surface itself — blocking DNS/stdio executors and the `@unstable` gates. |
 | WASI | 0.2 facade | Partial | 27 of 31 stable interfaces are bound at exact release names. |
-| WASI | 0.3.2 guest lane | Partial | A hand-authored @0.3.2 command runs through the real CLI in both backends (`make test-wasi-preview3`); no upstream toolchain input exists here, and the async-lifted variant is not resume-safe (see Known gaps). |
+| WASI | 0.3.2 guest lane | Partial | Two hand-authored @0.3.2 commands run through the real CLI in both backends (`make test-wasi-preview3`): a no-import success smoke and a provider-importing guest that lowers `wasi:cli/exit@0.3.2` and exits 7. No upstream toolchain input exists here, and resume-safe async guests remain open. |
 | WASI | `wasi:http` | Out of scope | Removed from the runtime by decision and not planned, recoverable from git history. |
 
 ## Declared limits
@@ -71,12 +71,17 @@ and neither is a validation rule (ADR-005).
   That is a property of the fixture, not of the scheduler: it is green
   through `run-component` without a reactor, and the P3 CLI lane uses the
   sync command until a resume-safe async guest is pinned.
-- WASI 0.2 (shared by both backends, found by the behavioural audit):
-  end-of-input is reported as `stream-error::closed` rather than `ok([])`;
-  `write`/`write-zeroes` do not enforce the `check-write` permit; the UDP
-  `send` path does not enforce `check-send`; `sockets/network-error-code`
-  has helper-level coverage only (it is `@unstable` at 0.2.12 and not
-  exported).
+- WASI 0.2 (shared by both backends, after the readiness/permit audit):
+  end-of-input is still reported as `stream-error::closed` rather than
+  `ok([])` (the open-but-empty vs closed distinction itself is now exact:
+  `read(0)` and an open source with no bytes return `ok([])`, while a
+  closed rep returns `closed`); `check-write`/`check-send` permits are
+  enforced (a write or datagram batch beyond the offer traps) and an
+  unwritten write suffix is retained for the next flush; permit values are
+  host-chosen rather than queried from the socket buffer;
+  `sockets/network-error-code` has helper-level coverage only (it is
+  `@unstable` at 0.2.12 and not exported); a `last-operation-failed`
+  stream does not yet transition to `closed`.
 - Preview 1 `proc_raise` returns `NOTSUP`; a guest cannot signal itself.
 - No **upstream-toolchain** WASI 0.3.2 guest is pinned (no toolchain here
   emits the 0.3.2 component ABI). The lane runs a hand-authored command

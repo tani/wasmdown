@@ -321,6 +321,9 @@
              (a-in (first a-streams))
              (b-out (second b-streams))
              (a-addr (addr a))
+             ;; WIT sockets/udp `send`: "Each call to `send` must be
+             ;; permitted by a preceding `check-send`"
+             (_ (p2-call udp "[method]outgoing-datagram-stream.check-send" b-out))
              (sent (p2-call udp "[method]outgoing-datagram-stream.send" b-out
                             (list (list (cons "data" (list 65 66 67))
                                         (cons "remote-address" (cons :some a-addr)))))))
@@ -686,3 +689,269 @@ reports end-of-directory as a NULL alien, not NIL."
         (sb-thread:join-thread writer :timeout 10 :default nil)
         (sb-posix:close rfd)
         (sb-posix:close wfd)))))
+
+;;; ---------------------------------------------------------------
+;;; M7: 0.2.12 io/streams read/write permit semantics.
+;;;
+;;; Contracts quoted from `specs/wasi/wasi-wit-0.2.12/io/io.wit'
+;;; (`input-stream.read`, `output-stream.check-write'/`write'/
+;;; `write-zeroes'/`flush') and
+;;; `specs/wasi/wasi-wit-0.2.12/sockets/sockets.wit'
+;;; (`outgoing-datagram-stream.check-send'/`send').
+
+(defun p2-test-nonblocking (fd)
+  "Set FD nonblocking (F_GETFL = 3, F_SETFL = 4, O_NONBLOCK)."
+  (not (minusp
+        (wasmdown.wasi::%libc-fcntl
+         fd 4 (logior (wasmdown.wasi::%libc-fcntl fd 3 0)
+                      wasmdown.wasi::+o-nonblock+)))))
+
+(defun p2-test-read-exactly (fd count)
+  "Read COUNT octets from FD into a fresh ub8 vector; (values VECTOR N)."
+  (let ((buf (make-array count :element-type '(unsigned-byte 8)))
+        (done 0))
+    (loop while (< done count)
+          do (let ((n (sb-posix:read
+                       fd (sb-sys:sap+ (sb-sys:vector-sap buf) done)
+                       (- count done))))
+               (when (or (minusp n) (zerop n)) (return))
+               (incf done n)))
+    (values buf done)))
+
+(test wasi-preview2/read-zero-length-does-not-report-closed
+  ;; WIT input-stream.read: "When the caller gives a `len` of 0, it
+  ;; represents a request to read 0 bytes. If the stream is still open,
+  ;; this call should succeed and return an empty list, or otherwise
+  ;; fail with `closed`."
+  ;;
+  ;; Old behaviour: the CL-stream branch answered `listen`'s verdict, so
+  ;; read(0) on an OPEN stream that simply had no bytes at hand answered
+  ;; err(closed) — an empty source looked like a closed stream, and the
+  ;; `listen` probe itself could consume from a pipe-backed stream.
+  (let* ((ctx (wasmdown.wasi:make-wasi-context
+               :stdin (make-string-input-stream "")))
+         (streams (wasmdown.wasi:p2-streams-instance ctx "0.2.12")))
+    ;; an open, empty CL text stream
+    (let ((rep (wasmdown.wasi::%make-p2-input-stream
+                :stream (make-string-input-stream ""))))
+      (is (equal '(:ok) (p2-call streams "[method]input-stream.read" rep 0)))
+      ;; ... and the stream is still OPEN for the next operation
+      (is (eq :err (car (p2-call streams "[method]input-stream.read" rep 1)))))
+    ;; read(0) does not consume from an open source with data waiting
+    (let ((rep (wasmdown.wasi::%make-p2-input-stream
+                :stream (make-string-input-stream "hi"))))
+      (is (equal '(:ok) (p2-call streams "[method]input-stream.read" rep 0)))
+      (is (equal '(104 105)
+                 (cdr (p2-call streams "[method]input-stream.read" rep 4)))))
+    ;; an fd at EOF: read(0) is a 0-byte request, read(n) is the eof
+    (let* ((dir (p2-temp-dir))
+           (path (concatenate 'string dir "e.bin"))
+           (fd (sb-posix:open path (logior sb-posix:o-creat sb-posix:o-rdwr)
+                              #o600)))
+      (unwind-protect
+           (let ((rep (wasmdown.wasi::%make-p2-input-stream :fd fd)))
+             (is (equal '(:ok) (p2-call streams "[method]input-stream.read"
+                                          rep 0)))
+             (is (eq :err (car (p2-call streams "[method]input-stream.read"
+                                        rep 1)))))
+        (sb-posix:close fd)
+        (ignore-errors (delete-file path))))
+    ;; ... and the stream's OWN closed state wins even for len 0
+    (let ((rep (wasmdown.wasi::%make-p2-input-stream
+                :stream (make-string-input-stream "x"))))
+      (setf (wasmdown.wasi::p2-input-stream-closed rep) t)
+      (dolist (len '(0 4))
+        (let ((r (p2-call streams "[method]input-stream.read" rep len)))
+          (is (eq :err (car r)))
+          (is (eq :closed (car (cdr r)))))))))
+
+(test wasi-preview2/read-on-an-empty-open-source-is-ok-empty
+  ;; WIT input-stream.read: "The list is empty when no bytes are
+  ;; available for reading at this time." `input-stream`s are
+  ;; "non-blocking to the extent practical": a nonblocking host fd with
+  ;; nothing queued is a successful empty read, NOT a stream error.
+  ;;
+  ;; Old behaviour: the host read's EAGAIN surfaced as
+  ;; err(last-operation-failed)[errno 11] — every socket-backed
+  ;; input-stream (tcp dup's are O_NONBLOCK) reported a fake I/O error.
+  (multiple-value-bind (rfd wfd) (sb-posix:pipe)
+    (is (p2-test-nonblocking rfd))
+    (let* ((ctx (wasmdown.wasi:make-wasi-context
+                 :stdin (make-string-input-stream "")))
+           (streams (wasmdown.wasi:p2-streams-instance ctx "0.2.12"))
+           (rep (wasmdown.wasi::%make-p2-input-stream :fd rfd))
+           (byte (make-array 1 :element-type '(unsigned-byte 8)
+                               :initial-element 122)))
+      (unwind-protect
+           (progn
+             (is (equal '(:ok) (p2-call streams "[method]input-stream.read"
+                                          rep 4)))
+             ;; `skip' behaves identically to `read': 0 bytes consumed
+             (is (equal '(:ok . 0) (p2-call streams "[method]input-stream.skip"
+                                              rep 4)))
+             ;; the empty read left the source OPEN and unpoisoned
+             (is (= 1 (sb-posix:write wfd (sb-sys:vector-sap byte) 1)))
+             (is (equal '(122) (cdr (p2-call streams
+                                              "[method]input-stream.read"
+                                              rep 4)))))
+        (sb-posix:close rfd)
+        (sb-posix:close wfd)))))
+
+(test wasi-preview2/write-beyond-the-permit-traps
+  ;; WIT output-stream.write: "Precondition: check-write gave permit of
+  ;; Ok(n) and contents has a length of less than or equal to n.
+  ;; Otherwise, this function will trap", and write-zeroes: "should be
+  ;; used precisely like `write` with the exact same preconditions".
+  ;;
+  ;; Old behaviour: `write' ignored the permit entirely — it accepted an
+  ;; arbitrarily long list (the canonical ABI had already copied it) and
+  ;; a short host write dropped the tail, so over-permit writes "worked"
+  ;; while losing data.
+  (let* ((ctx (wasmdown.wasi:make-wasi-context
+               :stdout (make-string-output-stream)))
+         (streams (wasmdown.wasi:p2-streams-instance ctx "0.2.12"))
+         (rep (wasmdown.wasi::%make-p2-output-stream
+               :stream (make-string-output-stream))))
+    (let ((permit (p2-call streams "[method]output-stream.check-write" rep)))
+      (is (eq :ok (car permit)))
+      (is (integerp (cdr permit)))
+      ;; exactly the permit is permitted: allocation-free zeroes
+      (is (eq :ok (car (p2-call streams "[method]output-stream.write-zeroes"
+                                rep (cdr permit)))))
+      ;; one byte more is a trap, for both write shapes
+      (assert-trap :generic
+        (p2-call streams "[method]output-stream.write-zeroes" rep
+                 (1+ (cdr permit))))
+      (assert-trap :generic
+        (p2-call streams "[method]output-stream.write" rep
+                 (make-array (1+ (cdr permit)) :element-type '(unsigned-byte 8)))))
+    ;; the stream is untouched by the trapped calls
+    (is (eq :ok (car (p2-call streams "[method]output-stream.check-write" rep))))))
+
+(test wasi-preview2/partial-write-retains-the-unwritten-suffix
+  ;; WIT output-stream.write: "Precondition ... Otherwise, this
+  ;; function will trap" + "This function never blocks"; flush: "the
+  ;; output which is expected to be flushed is all that has been passed
+  ;; to `write` prior to this call. Upon calling this function, the
+  ;; `output-stream` will not accept any writes (`check-write` will
+  ;; return `ok(0)`) until the flush has completed."
+  ;;
+  ;; Old behaviour: `p2-out-write' discarded the count of the single
+  ;; host write, so a sink that took fewer bytes than offered (a
+  ;; nonblocking pipe, a full socket) silently LOST the rest while
+  ;; `write` reported ok; check-write kept reporting a full permit and
+  ;; `flush` had nothing to flush.
+  (multiple-value-bind (rfd wfd) (sb-posix:pipe)
+    (is (p2-test-nonblocking wfd))
+    (let* ((ctx (wasmdown.wasi:make-wasi-context
+                 :stdout (make-string-output-stream)))
+           (streams (wasmdown.wasi:p2-streams-instance ctx "0.2.12"))
+           (rep (wasmdown.wasi::%make-p2-output-stream :fd wfd))
+           (total 200000)
+           (payload (make-array total :element-type '(unsigned-byte 8))))
+      (dotimes (i total) (setf (aref payload i) (mod i 251)))
+      (unwind-protect
+           (progn
+             ;; the whole list is accepted: some goes to the sink, the
+             ;; rest is buffered, nothing is dropped
+             (is (eq :ok (car (p2-call streams "[method]output-stream.write"
+                                       rep payload))))
+             (let ((pending (wasmdown.wasi::p2-output-stream-pending rep)))
+               ;; the pipe took what it could; the suffix is retained
+               (is (vectorp pending))
+               (is (plusp (length pending)))
+               (is (< (length pending) total)))
+             ;; check-write answers ok(0) until that flush completes
+             (is (equal '(:ok . 0) (p2-call streams
+                                             "[method]output-stream.check-write"
+                                             rep)))
+             ;; ... so any further non-empty offer traps (permit 0)
+             (assert-trap :generic
+               (p2-call streams "[method]output-stream.write" rep
+                        (vector 65)))
+             ;; `splice' caps its read at the permit, so it transfers 0
+             (is (equal '(:ok . 0)
+                        (p2-call streams "[method]output-stream.splice" rep
+                                 (wasmdown.wasi::%make-p2-input-stream
+                                  :stream (make-string-input-stream "abcd"))
+                                 4)))
+             ;; `flush' is a request: it never blocks ...
+             (is (eq :ok (car (p2-call streams "[method]output-stream.flush"
+                                       rep))))
+             ;; ... `blocking-flush' finishes the job while a reader
+             ;; drains the pipe, and then the permit is whole again
+             (let ((reader (sb-thread:make-thread
+                            (lambda ()
+                              (multiple-value-list
+                               (p2-test-read-exactly rfd total))))))
+               (is (eq :ok (car (p2-call streams
+                                          "[method]output-stream.blocking-flush"
+                                          rep))))
+               (let ((out (sb-thread:join-thread reader :timeout 20
+                                                        :default :timeout)))
+                 (is (consp out))
+                 (destructuring-bind (got n) out
+                   ;; every offered byte arrived, in order
+                   (is (= total n))
+                   (is (equalp payload got))))
+               (is (null (wasmdown.wasi::p2-output-stream-pending rep)))
+               (is (eq :ok (car (p2-call streams
+                                          "[method]output-stream.check-write"
+                                          rep))))))
+        (sb-posix:close rfd)
+        (sb-posix:close wfd)))))
+
+(test wasi-preview2/check-send-permit-guards-datagram-send
+  ;; WIT sockets/udp outgoing-datagram-stream.send: "Each call to `send`
+  ;; must be permitted by a preceding `check-send`. Implementations must
+  ;; trap if either `check-send` was not called or `datagrams` contains
+  ;; more items than `check-send` permitted", and "If at least one
+  ;; datagram has been sent successfully, this function never returns an
+  ;; error."
+  ;;
+  ;; Old behaviour: `check-send' was a fixed ok(1) with no session state
+  ;; and `send' accepted any number of datagrams, so neither mandated
+  ;; trap ever happened (an unbounded batch could be handed to the
+  ;; socket).
+  (let* ((ctx (p2-net-ctx))
+         (net (first (wasmdown.wasi:wasi-context-networks ctx)))
+         (create (wasmdown.wasi:p2-udp-create-instance ctx "0.2.12"))
+         (udp (wasmdown.wasi:p2-udp-instance ctx "0.2.12"))
+         (make-sock (lambda ()
+                      (let ((sock (third (cdr (p2-call create "create-udp-socket"
+                                                      "ipv4")))))
+                        (p2-call udp "[method]udp-socket.start-bind" sock net
+                                 (p2-ipv4 '(127 0 0 1) 0))
+                        (p2-call udp "[method]udp-socket.finish-bind" sock)
+                        sock)))
+         (a (funcall make-sock))
+         (b (funcall make-sock))
+         (a-in (first (cdr (p2-call udp "[method]udp-socket.stream" a :none))))
+         (b-out (second (cdr (p2-call udp "[method]udp-socket.stream" b :none))))
+         (a-addr (cdr (p2-call udp "[method]udp-socket.local-address" a)))
+         (dg (lambda (byte)
+               (list (cons "data" (list byte))
+                     (cons "remote-address" (cons :some a-addr))))))
+    ;; no check-send yet: traps
+    (assert-trap :generic
+      (p2-call udp "[method]outgoing-datagram-stream.send" b-out
+               (list (funcall dg 65))))
+    ;; check-send governs the NEXT call's count
+    (is (equal '(:ok . 1)
+               (p2-call udp "[method]outgoing-datagram-stream.check-send"
+                        b-out)))
+    (assert-trap :generic
+      (p2-call udp "[method]outgoing-datagram-stream.send" b-out
+               (list (funcall dg 65) (funcall dg 66))))
+    ;; within the permit: sent, and the peer sees it
+    (is (equal '(:ok . 1)
+               (p2-call udp "[method]outgoing-datagram-stream.send" b-out
+                        (list (funcall dg 65)))))
+    (let ((got (p2-call udp "[method]incoming-datagram-stream.receive" a-in 4)))
+      (is (eq :ok (car got)))
+      (is (equal '(65) (cdr (assoc "data" (first (cdr got))
+                                   :test #'string=)))))
+    ;; the empty list is always ok(0) (WIT: "If the input list is empty,
+    ;; the function returns `ok(0)`")
+    (is (equal '(:ok . 0)
+               (p2-call udp "[method]outgoing-datagram-stream.send" b-out '())))))

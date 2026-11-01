@@ -391,7 +391,16 @@ positional offset (write-via-stream) or append semantics."
   (fd -1 :type fixnum)
   (position-offset nil)
   (appending nil)
-  (closed nil))
+  (closed nil)
+  ;; the permit the last `check-write' granted, i.e. "the number of
+  ;; bytes permitted for the next call to `write'" (io/streams
+  ;; output-stream.check-write); NIL = no check-write yet
+  (permit nil)
+  ;; the unwritten suffix of an offered write whose sink accepted fewer
+  ;; bytes than offered (a short host write, or EWOULDBLOCK). RETAINED,
+  ;; never dropped: `flush'/the blocking operations hand it to the
+  ;; sink, and `check-write' reports 0 while it is non-empty.
+  (pending nil))
 
 (defconstant +p2-io-chunk+ (* 1024 1024)
   "The largest single host buffer a P2 stream operation allocates (1
@@ -402,10 +411,14 @@ host on the SBCL heap instead of answering the guest.")
 
 (defconstant +p2-write-permit+ +p2-io-chunk+
   "The byte count `output-stream.check-write` reports: the largest
-single `write` this host hands to a sink in one call. `write` itself
-stays lenient (it accepts any list the canonical ABI already copied),
-so a guest that ignores the permit still makes progress; a guest that
-honours it chunks at this size.")
+single `write` this host hands to a sink in one call. WIT io/streams
+`output-stream.check-write`: \"Returns the number of bytes permitted for
+the next call to `write` ... Calling `write` with more bytes than this
+function has permitted will trap\", and `output-stream.write`:
+\"Precondition: check-write gave permit of Ok(n) and contents has a
+length of less than or equal to n. Otherwise, this function will trap.\"
+P2-OUT-CHECK-PERMIT enforces that, so an over-permit write is a trap,
+never a silently truncated sink.")
 
 (defun p2-closed-error ()
   "The WIT `stream-error::closed` value."
@@ -453,18 +466,35 @@ truncated (the guest asked for fewer octets than the code point)."
         :closed
         (coerce out '(vector (unsigned-byte 8))))))
 
+(defun p2-would-block-p (errno)
+  "ERRNO is EAGAIN (11) / EWOULDBLOCK: the fd is nonblocking and the
+operation cannot make prompt progress. WIT io/streams: a `read` whose
+source has no bytes \"available for reading at this time\" answers an
+EMPTY list, not `last-operation-failed`; `write` \"never blocks\" either."
+  (and (integerp errno) (or (= errno 11) (= errno 35))))
+
 (defun p2-in-read (rep len)
   "Read at most LEN octets from an input-stream rep, in one bounded
-chunk. Returns an octet vector, :closed at end of input, or
-\(:failed . errno) when the host read itself failed."
+chunk, never blocking. WIT io/streams `input-stream.read`: \"The list is
+empty when no bytes are available for reading at this time\" and \"When
+the caller gives a `len` of 0, it represents a request to read 0 bytes.
+If the stream is still open, this call should succeed and return an
+empty list, or otherwise fail with `closed`.\" So an EMPTY octet vector
+is `ok(list<u8>)` for an OPEN stream with nothing promptly available
+\(a nonblocking fd's EWOULDBLOCK) and for every zero-length request;
+`:closed` is the stream's own ended/closed state. Returns an octet
+vector, :closed, or (:failed . errno) when the host read itself failed."
   (let ((len (min len +p2-io-chunk+)))
     (cond
       ((p2-input-stream-closed rep) :closed)
       ((p2-input-stream-stream rep)
        (let ((stream (p2-input-stream-stream rep)))
          (cond
-           ((zerop len)
-            (if (listen stream) #() :closed))
+           ;; a zero-length read is a request for 0 bytes, never an EOF
+           ;; probe: `listen' on a pipe-backed CL stream may block or
+           ;; consume, and answering `closed' made an OPEN stream look
+           ;; closed to the guest
+           ((zerop len) #())
            ((subtypep (stream-element-type stream) '(unsigned-byte 8))
             (let ((buf (make-array len :element-type '(unsigned-byte 8))))
               (let ((n (read-sequence buf stream)))
@@ -475,7 +505,7 @@ chunk. Returns an octet vector, :closed at end of input, or
            (t (%p2-read-text stream len)))))
       ((not (minusp (p2-input-stream-fd rep)))
        (cond
-         ;; a zero-length read is a liveness probe, not an eof probe
+         ;; a zero-length read is a request for 0 bytes, not an eof probe
          ((zerop len) #())
          (t
           (let* ((buf (make-array len :element-type '(unsigned-byte 8)))
@@ -489,7 +519,14 @@ chunk. Returns an octet vector, :closed at end of input, or
                                        (sb-sys:vector-sap buf) len))))
             (when (and off (plusp n))
               (incf (p2-input-stream-position-offset rep) n))
-            (cond ((minusp n) (cons :failed (sb-alien:get-errno)))
+            (cond ((minusp n)
+                   (let ((errno (sb-alien:get-errno)))
+                     ;; EWOULDBLOCK: the stream is OPEN and simply has no
+                     ;; bytes promptly available — the WIT's empty list,
+                     ;; NOT last-operation-failed
+                     (if (p2-would-block-p errno)
+                         #()
+                         (cons :failed errno))))
                   ((zerop n) :closed)
                   (t (subseq buf 0 n)))))))
       (t :closed))))
@@ -534,26 +571,143 @@ O_APPEND\", whatever the descriptor's own flags are)."
                     (values n :ok))))))
     (t (values 0 :closed))))
 
+(defun p2-out-permit (rep)
+  "The permit REP's `check-write` grants now, recorded for the next
+`write`. WIT io/streams `output-stream.check-write`: \"Returns the number
+of bytes permitted for the next call to `write`, or an error ... When
+this function returns 0 bytes, the `subscribe` pollable will become
+ready when this function will report at least 1 byte, or an error.\"
+While a retained unwritten suffix is still buffered the sink is not
+accepting data (the guest's `flush` has not completed), so the permit
+is 0."
+  (let ((permit (if (p2-output-stream-pending rep) 0 +p2-write-permit+)))
+    (setf (p2-output-stream-permit rep) permit)
+    permit))
+
+(defun p2-out-check-permit (rep len what)
+  "Enforce the `check-write` precondition for an offer of LEN bytes.
+WIT io/streams `output-stream.write`: \"Precondition: check-write gave
+permit of Ok(n) and contents has a length of less than or equal to n.
+Otherwise, this function will trap\", and `write-zeroes`: \"should be
+used precisely like `write` with the exact same preconditions (must use
+check-write first)\". A guest that never called `check-write` is given
+the permit `check-write` would report, so the enforced rule is exactly
+the WIT's: LEN must not exceed the permit."
+  (let ((permit (p2-out-permit rep)))
+    (when (> len permit)
+      (error 'wasmdown:wasm-trap
+             :message
+             (format nil "wasi:io/streams ~a: ~d byte(s) offered but check-write permitted ~d"
+                     what len permit)))
+    t))
+
+(defun p2-out-drain-pending (rep &key block)
+  "Hand REP's retained unwritten suffix to the sink. Non-blocking by
+default (one attempt), so `flush' can honour \"This function never
+blocks\" (WIT `output-stream.flush'); with BLOCK, wait for the sink and
+finish, which is what `blocking-flush' / `blocking-write-and-flush'
+promise. Whatever the sink does not take stays buffered. Returns T,
+:closed, or (:failed . errno)."
+  (let ((buf (p2-output-stream-pending rep)))
+    (when (null buf) (return-from p2-out-drain-pending t))
+    (loop
+      (multiple-value-bind (n state) (p2-out-write-n rep buf)
+        (cond
+          ((eq state :ok)
+           (cond
+             ;; the whole suffix went out
+             ((>= n (length buf))
+              (setf (p2-output-stream-pending rep) nil)
+              (return t))
+             (t
+              ;; a SHORT write: retain exactly the unwritten suffix, so
+              ;; the next attempt (or the next write) continues where
+              ;; the sink stopped instead of dropping guest bytes
+              (setf buf (subseq buf n)
+                    (p2-output-stream-pending rep) buf)
+              (unless block (return t))
+              ;; a sink that accepted nothing while we must block:
+              ;; wait for it rather than spin
+              (when (zerop n)
+                (let ((p (p2-output-subscribe-pollable rep)))
+                  (loop until (funcall (p2-pollable-ready-p p))
+                        do (p2-pollable-wait p +p2-poll-slice-ns+)))))))
+          ((eq state :closed) (return :closed))
+          ((and (consp state) (eq (car state) :failed)
+                (p2-would-block-p (cdr state)))
+           (if block
+               (let ((p (p2-output-subscribe-pollable rep)))
+                 (loop until (funcall (p2-pollable-ready-p p))
+                       do (p2-pollable-wait p +p2-poll-slice-ns+)))
+               (return t)))
+          (t (return state)))))))
+
+(defun p2-out-flush-pending (rep)
+  "Hand REP's buffered suffix to the sink as far as it accepts it right
+now (never blocking). Looping matters for the WIT's readiness contract:
+`check-write` \"returns 0 bytes\" only while the sink is genuinely full,
+so the `subscribe` pollable — a POLLOUT watch on the fd — agreeing with
+it makes a polling guest sleep instead of spin. Returns T, :closed, or
+\(:failed . errno)."
+  (loop
+    (let* ((before (if (p2-output-stream-pending rep)
+                       (length (p2-output-stream-pending rep))
+                       0))
+           (r (p2-out-drain-pending rep)))
+      (unless (eq r t) (return r))
+      (let ((after (if (p2-output-stream-pending rep)
+                       (length (p2-output-stream-pending rep))
+                       0)))
+        (when (or (zerop after) (>= after before))
+          (return t))))))
+
 (defun p2-out-write (rep bytes)
-  "Write BYTES to an output-stream rep (one host write; a short write
-is reported through P2-OUT-WRITE-N). Returns T on success, :closed
-when the stream is already closed, or (:failed . errno) when the HOST
-write itself failed. The two are distinct WIT values (`closed' vs
+  "Offer BYTES to REP without blocking. WIT `output-stream.write`:
+\"This function never blocks.\" Everything the sink accepts is handed
+over; the unwritten suffix is RETAINED in REP's pending buffer instead
+of being dropped, so a short host write never loses guest data and the
+ok result still covers the whole list. The caller has already enforced
+the `check-write` permit. Returns T on success, :closed when the stream
+is already closed, or (:failed . errno) when the HOST write itself
+failed — the two are distinct WIT values (`closed' vs
 `last-operation-failed'), so a broken sink is never reported as a
 closed stream."
-  (multiple-value-bind (n state) (p2-out-write-n rep bytes)
-    (declare (ignore n))
-    (if (eq state :ok) t state)))
+  (cond
+    ((p2-output-stream-closed rep) :closed)
+    (t
+     (let* ((vec (coerce bytes '(vector (unsigned-byte 8))))
+            (pend (p2-output-stream-pending rep))
+            (buf (if pend
+                     (concatenate '(vector (unsigned-byte 8)) pend vec)
+                     vec)))
+       ;; bytes already accepted by the guest stay FIRST, in order
+       (when (plusp (length buf))
+         (setf (p2-output-stream-pending rep) buf))
+       (p2-out-flush-pending rep)))))
 
 (defun p2-out-flush (rep)
-  "Flush REP. Returns T, :closed (stream already closed), or
-\(:failed . errno) when the host flush failed."
+  "Flush REP. WIT `output-stream.flush': \"Request to flush buffered
+output. This function never blocks. ... the output which is expected to
+be flushed is all that has been passed to `write` prior to this call.
+Upon calling this function, the `output-stream' will not accept any
+writes (`check-write` will return `ok(0)`) until the flush has
+completed.\" The retained suffix is offered to the sink now; whatever
+it does not take stays buffered, so check-write keeps answering ok(0)
+and `subscribe` reports readiness when the sink can take more. Returns
+T, :closed (stream already closed), or (:failed . errno) when the host
+flush failed."
   (cond ((p2-output-stream-closed rep) :closed)
-        ((p2-output-stream-stream rep)
-         (let ((stream (p2-output-stream-stream rep)))
-           (handler-case (progn (force-output stream) t)
-             (stream-error () (cons :failed nil)))))
-        (t t)))
+        (t
+         (let ((drained (p2-out-flush-pending rep)))
+           (if (not (eq drained t))
+               drained
+               (cond
+                 ((and (p2-output-stream-stream rep)
+                       (null (p2-output-stream-pending rep)))
+                  (let ((stream (p2-output-stream-stream rep)))
+                    (handler-case (progn (force-output stream) t)
+                      (stream-error () (cons :failed nil)))))
+                 (t t)))))))
 
 (defun p2-out-sink-result (value version what)
   "The `result<_, stream-error>` for an output-stream operation whose
@@ -572,7 +726,13 @@ downcastable error."
 
 (defun p2-out-write-zeroes (rep len)
   "Write LEN zero octets to REP in bounded chunks (never allocating
-LEN). Returns T, :closed, or (:failed . errno)."
+LEN). WIT `output-stream.write-zeroes`: \"This should be used precisely
+like `write` with the exact same preconditions (must use check-write
+first), but instead of passing a list of bytes, you simply pass the
+number of zero-bytes that should be written.\" The permit is enforced
+by the caller; the bytes go through the same retain-the-suffix path as
+`write', so a short host write loses nothing. Returns T, :closed, or
+\(:failed . errno)."
   (let ((chunk (make-array 4096 :element-type '(unsigned-byte 8)
                                 :initial-element 0)))
     (loop with remaining = len
@@ -587,20 +747,26 @@ LEN). Returns T, :closed, or (:failed . errno)."
 
 (defun p2-blocking-in (rep len)
   "The shared body of `blocking-read'/`blocking-skip'/`blocking-splice':
-read LEN octets, waiting for the source when the host fd is
-nonblocking (EAGAIN) instead of reporting `last-operation-failed'. A
-source that has ended still answers :closed."
-  (loop
-    (let ((r (p2-in-read rep len)))
-      (cond
-        ((and (consp r) (eq (car r) :failed)
-              ;; EAGAIN / EWOULDBLOCK: the fd is nonblocking and no
-              ;; bytes are promptly available — wait, then retry
-              (member (cdr r) '(11 35)))
-         (let ((p (p2-input-subscribe-pollable rep)))
-           (loop until (funcall (p2-pollable-ready-p p))
-                 do (p2-pollable-wait p +p2-poll-slice-ns+))))
-        (t (return r))))))
+read LEN octets, waiting for the source instead of reporting the
+nonblocking `read` path's outcomes. WIT `blocking-read`: \"Read bytes
+from a stream, after blocking until at least one byte can be read.
+Except for blocking, behavior is identical to `read`.\" The empty list
+`read` answers for a source with no bytes promptly available is exactly
+that \"no byte yet\" signal, so it waits; a source that has ended still
+answers :closed, and a zero-length request still answers ok with an
+empty list at once."
+  (if (zerop len)
+      #()
+      (loop
+        (let ((r (p2-in-read rep len)))
+          (cond
+            ((or (and (vectorp r) (zerop (length r)))
+                 (and (consp r) (eq (car r) :failed)
+                      (p2-would-block-p (cdr r))))
+             (let ((p (p2-input-subscribe-pollable rep)))
+               (loop until (funcall (p2-pollable-ready-p p))
+                     do (p2-pollable-wait p +p2-poll-slice-ns+))))
+            (t (return r)))))))
 
 (defun p2-blocking-in-skip (rep len)
   "`blocking-skip' / `skip' over the blocking read path."
@@ -610,23 +776,23 @@ source that has ended still answers :closed."
           (t (length data)))))
 
 (defun p2-blocking-out-write (rep bytes)
-  "Write ALL of BYTES to REP: a short write is resumed, and a
-nonblocking sink (EAGAIN) is waited for. `blocking-write-and-flush'
-promises every byte is written before it returns."
-  (let ((vec (coerce bytes '(vector (unsigned-byte 8)))))
-    (loop with offset = 0
-          do (multiple-value-bind (n state)
-                 (p2-out-write-n rep (if (zerop offset) vec (subseq vec offset)))
-               (cond
-                 ((eq state :ok)
-                  (incf offset n)
-                  (when (>= offset (length vec)) (return t)))
-                 ((and (consp state) (eq (car state) :failed)
-                       (member (cdr state) '(11 35)))
-                  (let ((p (p2-output-subscribe-pollable rep)))
-                    (loop until (funcall (p2-pollable-ready-p p))
-                          do (p2-pollable-wait p +p2-poll-slice-ns+))))
-                 (t (return state)))))))
+  "Write ALL of BYTES to REP: the retained suffix plus BYTES is offered
+to the sink until nothing is left, waiting for a nonblocking sink
+\(EWOULDBLOCK). WIT `blocking-write-and-flush`: \"Block until all of
+these operations are complete, or an error occurs\" and \"Returns
+success when all of the contents written are successfully flushed to
+output\", so no byte may be dropped here."
+  (cond
+    ((p2-output-stream-closed rep) :closed)
+    (t
+     (let* ((vec (coerce bytes '(vector (unsigned-byte 8))))
+            (pend (p2-output-stream-pending rep))
+            (buf (if pend
+                     (concatenate '(vector (unsigned-byte 8)) pend vec)
+                     vec)))
+       (setf (p2-output-stream-pending rep)
+             (if (plusp (length buf)) buf nil))
+       (p2-out-drain-pending rep :block t)))))
 
 (defun p2-out-write-zeroes-blocking (rep len)
   "P2-OUT-WRITE-ZEROES with the blocking write path."
@@ -772,11 +938,28 @@ accept bytes again, and is always ready once the stream is closed."
                 (let ((rep (out self "check-write")))
                   (if (p2-output-stream-closed rep)
                       (cons :err (p2-closed-error))
-                      (cons :ok +p2-write-permit+)))))
+                      ;; the permit is 0 until the flush the guest asked
+                      ;; for has completed (WIT flush), so try the
+                      ;; retained suffix first; a sink failure is a
+                      ;; stream error, never a permit
+                      (let ((d (if (p2-output-stream-pending rep)
+                                   (p2-out-flush-pending rep)
+                                   t)))
+                        (if (eq d t)
+                            (cons :ok (p2-out-permit rep))
+                            (p2-out-sink-result d version "check-write")))))))
         (cons "write"
               (lambda (self bytes)
-                (p2-out-sink-result (p2-out-write (out self "write") bytes)
-                                    version "write")))
+                (let ((rep (out self "write")))
+                  (if (p2-output-stream-closed rep)
+                      ;; WIT: "returns Err(closed) without writing if the
+                      ;; stream has closed since the last call to
+                      ;; check-write provided a permit"
+                      (cons :err (p2-closed-error))
+                      (progn
+                        (p2-out-check-permit rep (length bytes) "write")
+                        (p2-out-sink-result (p2-out-write rep bytes)
+                                            version "write"))))))
         (cons "blocking-write-and-flush"
               (lambda (self bytes)
                 (let* ((rep (out self "blocking-write-and-flush"))
@@ -790,17 +973,27 @@ accept bytes again, and is always ready once the stream is closed."
                                     version "flush")))
         (cons "blocking-flush"
               (lambda (self)
-                (p2-out-sink-result (p2-out-flush (out self "blocking-flush"))
-                                    version "flush")))
+                ;; WIT: "Request to flush buffered output, and block
+                ;; until flush completes" — the retained suffix must be
+                ;; OUT before this returns
+                (let* ((rep (out self "blocking-flush"))
+                       (d (p2-out-drain-pending rep :block t)))
+                  (if (eq d t)
+                      (p2-out-sink-result (p2-out-flush rep) version "flush")
+                      (p2-out-sink-result d version "flush")))))
         (cons "[method]output-stream.subscribe"
               (lambda (self)
                 (list :own-handle poll-ct
                       (p2-output-subscribe-pollable (out self "subscribe")))))
         (cons "write-zeroes"
               (lambda (self len)
-                (p2-out-sink-result (p2-out-write-zeroes (out self "write-zeroes")
-                                                         len)
-                                    version "write-zeroes")))
+                (let ((rep (out self "write-zeroes")))
+                  (if (p2-output-stream-closed rep)
+                      (cons :err (p2-closed-error))
+                      (progn
+                        (p2-out-check-permit rep len "write-zeroes")
+                        (p2-out-sink-result (p2-out-write-zeroes rep len)
+                                            version "write-zeroes"))))))
         (cons "blocking-write-zeroes-and-flush"
               (lambda (self len)
                 (let* ((rep (out self "blocking-write-zeroes-and-flush"))
@@ -810,22 +1003,35 @@ accept bytes again, and is always ready once the stream is closed."
                       (p2-out-sink-result w version "write-zeroes")))))
         (cons "splice"
               (lambda (self src len)
+                ;; WIT `output-stream.splice`: "The behavior of splice is
+                ;; equivalent to: 1. calling `check-write` on the
+                ;; `output-stream` 2. calling `read` on the
+                ;; `input-stream` with the smaller of the `check-write`
+                ;; permitted length and the `len` provided to `splice`
+                ;; 3. calling `write` on the `output-stream` with that
+                ;; read data. Any error reported by the call to
+                ;; `check-write`, `read`, or `write` ends the splice and
+                ;; reports that error."
                 (let* ((src-rep (p2-resource-rep in-ct src "splice"))
-                       (dst (out self "splice"))
-                       (data (p2-in-read src-rep len)))
-                  (cond
-                    ;; a source that has just ended transfers 0 bytes;
-                    ;; splice reports a COUNT, not the read's own error
-                    ((eq data :closed) (cons :ok 0))
-                    ((and (consp data) (eq (car data) :failed))
-                     (cons :err (p2-failed-error
-                                 (format nil "splice: read failed (errno ~a)"
-                                         (cdr data))
-                                 version)))
-                    (t (let ((w (p2-out-write dst data)))
-                         (if (eq w t)
-                             (cons :ok (length data))
-                             (p2-out-sink-result w version "splice"))))))))
+                       (dst (out self "splice")))
+                  (if (p2-output-stream-closed dst)
+                      (cons :err (p2-closed-error))
+                      (let ((data (p2-in-read src-rep
+                                              (min len (p2-out-permit dst)))))
+                        (cond
+                          ;; a source that has just ended transfers 0
+                          ;; bytes; splice reports a COUNT, not the
+                          ;; read's own error
+                          ((eq data :closed) (cons :ok 0))
+                          ((and (consp data) (eq (car data) :failed))
+                           (cons :err (p2-failed-error
+                                       (format nil "splice: read failed (errno ~a)"
+                                               (cdr data))
+                                       version)))
+                          (t (let ((w (p2-out-write dst data)))
+                               (if (eq w t)
+                                   (cons :ok (length data))
+                                   (p2-out-sink-result w version "splice"))))))))))
         (cons "blocking-splice"
               (lambda (self src len)
                 (let* ((src-rep (p2-resource-rep in-ct src "blocking-splice"))
@@ -1485,7 +1691,13 @@ whose kind is not a sockets case carries no network information."
 (defstruct (p2-outgoing-dgram (:constructor %make-p2-outgoing-dgram
                                    (&key fd remote)))
   (fd -1 :type fixnum)
-  (remote nil))
+  (remote nil)
+  ;; the datagram count the last `check-send` permitted for the next
+  ;; `send`; NIL = check-send was never called (WIT sockets/udp
+  ;; outgoing-datagram-stream.send: "Implementations must trap if either
+  ;; `check-send` was not called or `datagrams` contains more items than
+  ;; `check-send` permitted")
+  (permit nil))
 
 (defun %p2-pollable-from-fd (fd events)
   "A pollable ready when FD reports EVENTS (POLLIN/POLLOUT). BLOCK
@@ -1839,38 +2051,81 @@ handle the guest was not given can never widen its authority."
                   (cons :ok (nreverse out)))))
         (cons "[method]outgoing-datagram-stream.check-send"
               (lambda (self)
-                (declare (ignore self))
-                (cons :ok 1)))
+                ;; WIT sockets/udp outgoing-datagram-stream.check-send:
+                ;; "Returns the number of datagrams permitted for the next
+                ;; call to `send`, or an error. Calling `send` with more
+                ;; datagrams than this function has permitted will trap.
+                ;; ... Never returns `would-block`."
+                (let ((rep (out-rep self)))
+                  (setf (p2-outgoing-dgram-permit rep) 1)
+                  (cons :ok 1))))
         (cons "[method]outgoing-datagram-stream.send"
               (lambda (self datagrams)
+                ;; WIT sockets/udp outgoing-datagram-stream.send:
+                ;; "This function attempts to send all provided `datagrams`
+                ;; on the socket without blocking and returns how many
+                ;; messages were actually sent (or queued for sending).
+                ;; ... If none of the datagrams were able to be sent,
+                ;; `ok(0)` is returned. ... If at least one datagram has
+                ;; been sent successfully, this function never returns an
+                ;; error. If the input list is empty, the function returns
+                ;; `ok(0)`. Each call to `send` must be permitted by a
+                ;; preceding `check-send`. Implementations must trap if
+                ;; either `check-send` was not called or `datagrams`
+                ;; contains more items than `check-send` permitted."
                 (let* ((rep (out-rep self))
                        (fd (p2-outgoing-dgram-fd rep))
-                       (sent 0))
-                  (handler-case
-                      (progn
-                        (dolist (d datagrams)
-                          (let* ((data (cdr (assoc "data" d :test #'string=)))
-                                 (remote (cdr (assoc "remote-address" d
-                                                     :test #'string=)))
-                                 (addr (cond ((and (consp remote) (eq (car remote) :none))
-                                              (p2-outgoing-dgram-remote rep))
-                                             (remote (cdr remote))
-                                             (t (p2-outgoing-dgram-remote rep)))))
-                            (unless addr
-                              (%socket-error (%socket-code "invalid-argument")))
-                            (multiple-value-bind (alien len family)
-                                (ip-socket-address->sockaddr addr)
-                              (declare (ignore family))
-                              (unwind-protect
-                                   (let ((err (%udp-send-bytes fd data alien len)))
-                                     (when err
-                                       (%socket-error err)))
-                                (sb-alien:free-alien alien)))
-                            (incf sent)))
-                        (cons :ok sent))
-                    (wasi-socket-error (c)
-                      (cons :err (%p2-sock-code-domain
-                                  (wasi-socket-error-code c))))))))
+                       (permit (p2-outgoing-dgram-permit rep))
+                       (count (length datagrams)))
+                  (unless permit
+                    (error 'wasmdown:wasm-trap
+                           :message
+                           "wasi:sockets/udp outgoing-datagram-stream.send: check-send was not called"))
+                  (when (> count permit)
+                    (error 'wasmdown:wasm-trap
+                           :message
+                           (format nil "wasi:sockets/udp outgoing-datagram-stream.send: ~d datagram(s) offered but check-send permitted ~d"
+                                   count permit)))
+                  ;; the permit is not consumed: the WIT mandates exactly
+                  ;; these two traps, and `check-send` re-reports the
+                  ;; count permitted "for the next call to `send`"
+                  (block send
+                    (labels ((stop (result) (return-from send result)))
+                      (loop with sent = 0
+                            for d in datagrams
+                            do (let* ((data (cdr (assoc "data" d :test #'string=)))
+                                      (remote (cdr (assoc "remote-address" d
+                                                          :test #'string=)))
+                                      (addr (cond ((and (consp remote)
+                                                        (eq (car remote) :none))
+                                                   (p2-outgoing-dgram-remote rep))
+                                                  (remote (cdr remote))
+                                                  (t (p2-outgoing-dgram-remote rep)))))
+                                 (unless addr
+                                   (stop (cons :err (%p2-sock-enum
+                                                     "invalid-argument"))))
+                                 (handler-case
+                                     (multiple-value-bind (alien len family)
+                                         (ip-socket-address->sockaddr addr)
+                                       (declare (ignore family))
+                                       (unwind-protect
+                                            (let ((err (%udp-send-bytes fd data alien len)))
+                                              (when err
+                                                (%socket-error err)))
+                                         (sb-alien:free-alien alien)))
+                                   (wasi-socket-error (c)
+                                     ;; nothing sent yet: the error is
+                                     ;; the call's result; otherwise the
+                                     ;; count is (WIT: "If at least one
+                                     ;; datagram has been sent
+                                     ;; successfully, this function never
+                                     ;; returns an error")
+                                     (stop (if (plusp sent)
+                                               (cons :ok sent)
+                                               (cons :err (%p2-sock-code-domain
+                                                           (wasi-socket-error-code c))))))))
+                            (incf sent)
+                            finally (stop (cons :ok sent))))))))
         (cons "[method]incoming-datagram-stream.subscribe"
               (lambda (self)
                 (let ((rep (in-rep self)))

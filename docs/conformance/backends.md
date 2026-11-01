@@ -23,9 +23,9 @@ silent fall back to the interpreter.
 
 - Scripts: pinned core scripts, `tests/spec-core/*.wast`
 - SBCL: `2.6.4`
-- Source commit: `5e6ea43ba2ce3d342d0d552585683281040d5ac5`
+- Source commit: `b93bdf73bb54dc56085332a25c753707c7841332`
 - Files run: 97
-- Wall time: 101.4 s
+- Wall time: 99.7 s
 
 ## Aggregate
 

@@ -50,6 +50,7 @@ P2 = "sqlite3-p2.wasm"
 # selects preview3 ONLY when asked, and a missing fixture is a FAILURE
 # (never a skip), so nothing can pass silently.
 P3 = "p3-guest.wasm"
+P3_IMPORT = "p3-import-guest.wasm"
 
 # ---- the cases -----------------------------------------------------
 # expect.stdout_equals  : exact stdout (list of lines, joined by \n, one
@@ -208,6 +209,16 @@ CASES = [
         # the pinned hand-authored command exports `run` returning ok and
         # writes nothing; regenerate with tools/build-p3-fixtures.lisp
         "expect": {"stdout_equals": [], "exit": 0},
+    },
+    {
+        "id": "p3/import-exit",
+        "abi": "preview3",
+        "fixture": P3_IMPORT,
+        "argv": [],
+        "stdin": "",
+        # imports wasi:cli/exit@0.3.2, lowers exit-with-code, calls it with
+        # 7: the command runner maps the WASI exit to the process status.
+        "expect": {"stdout_equals": [], "exit": 7},
     },
     # ---------------- Preview 1 ----------------
     {
