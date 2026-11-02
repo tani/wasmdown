@@ -138,7 +138,7 @@ stdout-only and is listed as `n/a` with `make verify` named as its gate.
   nothing, and stale/class/element/writable/non-idle/waitable-set traps — and
   by `component/generic-path-five-cases-pin` CASE 2, migrated to the
   end-object contract (the second load traps). Negative controls showed both
-  the load arm and the guard set are load-bearing. Unit 739/0, component
+  the load arm and the guard set are load-bearing. Unit 761/0, component
   1,702/0, P3 10/10 ×3 per backend.
 - **Host borrow reclamation and store-retirement metadata (2026-11-02).**
   A host callee has no Task to adopt the borrow handles a lowering staged, so
@@ -190,7 +190,7 @@ stdout-only and is listed as `n/a` with `make verify` named as its gate.
   `component/remap-outer-compound-functype-owner` — the exact diagnostic pair
   (decoy-first same-numbered type validates with no memory; the real `string`
   leaf still rejects with a memory requirement), shape checks (`tuple<u32>` vs
-  `tuple<string>`) and result-position companions, and the count-2 positive/negative pair. Unit 739/0, component
+  `tuple<string>`) and result-position companions, and the count-2 positive/negative pair. Unit 761/0, component
   1,702/0, P3 10/10 ×3 per backend, `make verify` green.
 - **Validator instance type-index space and encoder s33 valtype indices
   (2026-11-02).** Two engine correctness fixes exposed by the WIT-shaped
@@ -208,7 +208,7 @@ stdout-only and is listed as `n/a` with `make verify` named as its gate.
   because its references happened to land on slots the validator accepted
   (it referenced no exported `descriptor-stat`/`directory-entry` slot from a
   later declarator), and its valtype indices stayed below 64, where `u32`
-  and `s33` agree. Unit 739/0, component
+  and `s33` agree. Unit 761/0, component
   1,702/0, P3 30/30 ×3 both backends, `make verify` green.
 
 ## Still open

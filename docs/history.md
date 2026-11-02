@@ -1193,3 +1193,19 @@ TCP client against a loopback echo and the proxy guest through
 `wasmdown serve` + HTTP GET (21-byte body), both PASS. `make verify`
 includes the lane. This upgrades the P2 facade evidence from host-only to
 real guest execution; two export-only stable entries remain accounted for.
+
+
+**Threads/atomics proposal as an opt-in SBCL-thread extension (2026-11-02).**
+`wasmdown:*threads*` (also CLI `--threads`, `WASMDOWN_WAST_THREADS=1`)
+enables shared memory and 67 atomic instructions while leaving the default
+single-threaded behavior byte-for-byte unchanged. Binary/text/validation
+accept the shared memory flag (maximum required) and the 0xFE atomic family
+with natural-alignment checks; interpreter and codegen lower the same
+runtime primitives. Atomics are serialized by a per-memory SBCL mutex;
+`memory.atomic.wait32/64` block on a per-address waitqueue and
+`memory.atomic.notify` wakes up to N waiters (returns 0 woken / 1 not-equal /
+2 timed-out). The WAST runner spawns real `sb-thread`s for `(thread ...)`,
+shares the referenced module/memory for `(shared (module $M))`, joins on
+`(wait ...)`, and propagates thread failures. Vendored WebAssembly/threads
+`cc535ada…` 13-file suite: **551/551 commands in both interpret and compiled**,
+29 threads, no green scheduler. Atomic lane also 372/372 in both backends.

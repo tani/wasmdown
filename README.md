@@ -6,7 +6,7 @@ Component Model (canonical ABI, resources, async), and WASI hosts — with
 **no third-party Lisp dependencies**.
 
 > **Status: engine/legacy `partial`; declared WASI 0.3.2 profile `conformant`.** Every subsystem listed below is implemented and
-> gated by its own test lane; the engine deliberately omits threads/atomics,
+> gated by its own test lane; the engine exposes threads/atomics as an opt-in SBCL-thread extension,
 > the FASL cache, and a native optimizer. See [`docs/status.md`](docs/status.md)
 > for the per-area matrix and the exact limits.
 
@@ -25,7 +25,7 @@ Component Model (canonical ABI, resources, async), and WASI hosts — with
 | WASI 0.2 component facade | 29 of 31 stable interfaces bound at exact release names (legacy compatibility line) |
 | WASI network | TCP/UDP/DNS via `wasi:sockets/types` + `ip-name-lookup` under declared `--net`/`--listen`/`--dns` authority; upstream network subset 30/30 |
 | `wasi:http` | 0.3.2 `types` + `client.send` (streaming uploads, chunked trailers) and incoming `handler`/`service` via `wasmdown serve`; 0.2.0–0.2.12 outgoing `types` + `outgoing-handler` and incoming `incoming-handler` (proxy world) via the same `serve`; TLS is embedder-only |
-| Threads / atomics, FASL cache, optimized or AOT backend | Not implemented |
+| Threads / atomics | Opt-in extension; FASL cache and optimized/AOT backend not implemented |
 | Annotations proposal | Out of scope |
 
 ## Execution architecture
@@ -91,7 +91,7 @@ reference Wasmtime via `tools/setup-network-tests.sh`), Nix only to rebuild
 the pinned WASI fixtures.
 
 ```sh
-make test-unit                  # unit + integration suite (739 tests, ~8 s)
+make test-unit                  # unit + integration suite (761 tests, ~8 s)
 sbcl --script tools/wasmdown.lisp help
 ```
 
@@ -147,7 +147,7 @@ Every lane is measured, not asserted. Latest numbers (2026-11-02):
 
 | Lane | Kind | Measured | Docs |
 | --- | --- | --- | --- |
-| `make test-unit` | gate | 739 pass / 0 fail | — |
+| `make test-unit` | gate | 761 pass / 0 fail | — |
 | `make test-spec-core` | baseline | 21 187 pass / 0 fail / 73 unsupported of 21 260 | [`core.md`](docs/conformance/core.md) |
 | `make test-component` | gate | 1 702 pass / 0 fail / 0 unsupported | [`component.md`](docs/conformance/component.md) |
 | `make report-component-compiled` | report | 1 702 pass / 0 fail under `:compiled` | `tests/component-compiled/component.md` |

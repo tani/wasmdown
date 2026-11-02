@@ -20,14 +20,14 @@ what will not be built. Measurements live in
 | Frontend | WIT reader | Full (pinned grammar) | World `include`/renaming, named `implements` and positional `@external-id` bindings, and nominal resource identity are parsed, resolved and pinned by tests (`tests/wit.lisp`: include-of-includes, rename equivalence, resource nominal identity across interfaces). Validator handling of aliased compound functypes is resolved; see the `Component type-use limits` row. |
 | Validation | Core validation | Full | Operand/control-stack algorithm with unreachable polymorphism over the declared scope. |
 | Validation | Component validation | Full | Label, index, canon, type-identity and instantiation-matching rules pass the pinned suite. |
-| Validation | Component type-use limits | Full (contract-tested) | Imported-instance functypes whose parameter or result is a compound type brought in by an outer alias now resolve their nested refs in the **owner's** type space: `entry-at` returns `(ct, owner-view)`, an outer alias switches to the owner selected by its de Bruijn count, an eq-bound export propagates the target's owner, and `%materialize-component-ct` materializes against that owner space (owner-qualified through nested outer aliases and eq bounds) while declarator-local entries still use the declarator remap. Pinned by `component/remap-outer-compound-functype-owner`: the exact diagnostic pair at count 1 AND a two-level count-2 ring (a decoy-first same-numbered declarator type validates with no memory, while a real `string` leaf still rejects with a memory requirement), the `tuple<u32>` vs `tuple<string>` shape checks, and the result-position companions, and the count-2 positive/negative pair. Unit 739/0, component 1,702/0, P3 10/10 (30/30) in both backends, `make verify` green. |
+| Validation | Component type-use limits | Full (contract-tested) | Imported-instance functypes whose parameter or result is a compound type brought in by an outer alias now resolve their nested refs in the **owner's** type space: `entry-at` returns `(ct, owner-view)`, an outer alias switches to the owner selected by its de Bruijn count, an eq-bound export propagates the target's owner, and `%materialize-component-ct` materializes against that owner space (owner-qualified through nested outer aliases and eq bounds) while declarator-local entries still use the declarator remap. Pinned by `component/remap-outer-compound-functype-owner`: the exact diagnostic pair at count 1 AND a two-level count-2 ring (a decoy-first same-numbered declarator type validates with no memory, while a real `string` leaf still rejects with a memory requirement), the `tuple<u32>` vs `tuple<string>` shape checks, and the result-position companions, and the count-2 positive/negative pair. Unit 761/0, component 1,702/0, P3 10/10 (30/30) in both backends, `make verify` green. |
 | Validation | Hostile-input preflight | Full | Oversized literals and local counts are rejected as catchable `decode-error`s before allocation. |
 | Backends | Interpreter | Full | Default backend: scalar, SIMD, GC, EH, tail calls, multi-memory and memory64 semantics. |
 | Backends | Baseline codegen | Full for opcode coverage | Compiles every defined function before the start section and lowers every instruction the interpreter implements (scalar, memory, table, control, references, EH, tail calls, SIMD incl. relaxed, GC). An instruction with no lowering is a `codegen-error`, never an interpreter fallback. |
 | Backends | Backend parity (pinned core) | Full | `tools/run-backend-parity.lisp`: 21,260 / 21,260 commands agree in outcome and phase across both explicitly selected backends. |
 | Backends | Optimized or AOT tier | Not implemented | The engine ships an interpreter and a compiled backend only. |
 | Backends | FASL cache | Not implemented | Compiled functions are not persisted across processes. |
-| Backends | Threads and atomics | Not implemented | Shared memory and the atomic instruction family are absent. |
+| Backends | Threads and atomics | Full (opt-in extension) | `wasmdown:*threads*` / `--threads` / `WASMDOWN_WAST_THREADS=1` enables shared memory and the 67 atomic instructions. Atomics use real SBCL threads with per-memory mutexes and per-address wait queues; memory.atomic.wait/notify are real condition-variable waits. The vendored threads suite is 551/551 in both backends (`make test-spec-threads`). Default (threads off) behavior is unchanged. |
 | Backends | Annotations proposal | Out of scope | Excluded permanently by the deliberate-exclusion list in [`design/PLAN.md` §3.3](design/PLAN.md). |
 | Component model | Binary and text decoding | Full | Both front ends build one component IR, including WIT value types and aliases. |
 | Component model | Instantiation and linking | Full | Two-level core-instance linking, component `with`-args and alias projection execute. |
@@ -63,7 +63,7 @@ what will not be built. Measurements live in
   writable/non-idle/waitable-set traps) and the migrated
   `component/generic-path-five-cases-pin` CASE 2 (end-object contract; the
   second load traps). Negative controls confirmed both the load arm and the
-  guard set are load-bearing. Unit 739/0, component 1,702/0, P3 10/10 (30/30)
+  guard set are load-bearing. Unit 761/0, component 1,702/0, P3 10/10 (30/30)
   in both backends.
 - **Resolved (2026-11-02): host borrow reclamation and store-retirement
   metadata.** A host callee has no async task to adopt the borrow handles a
@@ -102,7 +102,7 @@ what will not be built. Measurements live in
   list. WASI evidence: `wasi/fs-descriptor-drop-fd-plateau-pin` runs six
   open→stream→drop→stream-end cycles and keeps the process open-fd count at
   baseline, with a stream that outlives its handle holding the fd until the
-  last release closes it exactly once. Unit 739/0, component 1,702/0, P3
+  last release closes it exactly once. Unit 761/0, component 1,702/0, P3
   10/10 (30/30) in both backends.
 - **Limits of store-retirement-based reclamation.** A caller-owned store
   reused for many top-level instantiations **without** `store-teardown` still
@@ -148,7 +148,7 @@ what will not be built. Measurements live in
   checksum `a3293778…`): the previous fixture passed because its references
   happened to land on slots the validator accepted (it referenced no exported
   `descriptor-stat`/`directory-entry` slot from a later declarator), and no
-  valtype index reached 64, where `u32` and `s33` agree. Unit 739/0,
+  valtype index reached 64, where `u32` and `s33` agree. Unit 761/0,
   component 1,702/0, P3 30/30 ×3 both backends.
 - **Resolved (2026-11-02): the P3 filesystem guest covers the full pinned
   `wasi:filesystem/types@0.3.2` surface.** `p3/filesystem-preopens-read`
