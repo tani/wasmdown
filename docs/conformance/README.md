@@ -25,7 +25,8 @@ together, and a number from one lane says nothing about another.
 | wasi preview3 | gate (explicit) | `make test-wasi-preview3` | `tests/wasi-results/latest/` | The pinned hand-authored @0.3.2 command (`tools/build-p3-fixtures.lisp`) runs through the real CLI in both backends. Not part of `--abi all`; a missing fixture is a failure, never a skip. |
 | wasi all | gate | `make test-wasi` | [`wasi.md`](wasi.md), `tests/wasi-results/latest/` | Both released ABIs (`preview1`, `preview2`) in one run. |
 | upstream | discovery | `make test-upstream` | [`upstream.md`](upstream.md), `tests/upstream-results.jsonl` | Where the engine stands against proposal corpora beyond its declared scope. Never gated. |
-| wasi-testsuite | evidence (blocked) | `make test-wasi-upstream` | [`tests/wasi-upstream-summary.md`](../../tests/wasi-upstream-summary.md), `tests/wasi-upstream-results.json`, `tests/wasi-upstream-expectations.toml` | The pinned upstream precompiled WASI guests (`prod/testsuite-base`, 127 guests) through the registered adapter. Never gated; skips are only the declared http/sockets and legacy `sock_*` exclusions. The lane is **blocked**, not green: see the summary and PLAN §9.3 F1. Requires a checkout (`WASI_TESTSuite_DIR`); exits 2 with the fetch recipe when absent. |
+| wasi-testsuite | evidence (green) | `make test-wasi-upstream` | [`tests/wasi-upstream-summary.md`](../../tests/wasi-upstream-summary.md), `tests/wasi-upstream-results.json`, `tests/wasi-upstream-expectations.toml` | The pinned upstream precompiled WASI guests (`prod/testsuite-base`, 127 guests) through the registered adapter: **127 pass / 0 fail / 0 skip**, HTTP and sockets included. The precompiled-toolchain guest is the substitute for a locally built @0.3.2 command (no such toolchain here), so the lane is evidence, not a release gate. Requires a checkout (`WASI_TESTSuite_DIR`); exits 2 with the fetch recipe when absent. |
+| wasi network | evidence | `tools/setup-network-tests.sh` then `make test-wasi-network` | stdout summary (`/tmp/wasi-network-summary.md`, `/tmp/wasi-network-results.json`) | The http + sockets subset of the same pinned tree: **30/30**. Never gated. `make test-wasi-network-reference` runs the same subset through the upstream Wasmtime adapter as a host-harness smoke (28/30; two known Wasmtime-50 failures, report-only). |
 
 Pins:
 
@@ -73,6 +74,7 @@ nothing fails.
 | [`wasi.md`](wasi.md) | `python3 tools/run-wasi-suite.py --abi all --repeat 30 --commit-summary` |
 | [`upstream.md`](upstream.md) | `make test-upstream` |
 | `tests/wasi-upstream-summary.md` | `WASI_TESTSuite_DIR=<checkout> make test-wasi-upstream` |
+| network subset summary | `tools/setup-network-tests.sh` then `make test-wasi-network` (writes `/tmp/wasi-network-summary.md` and `/tmp/wasi-network-results.json`) |
 
 These files are generated; edit the runner under `tools/`, never the
 report. `make report-backends-bench` also writes

@@ -1032,3 +1032,76 @@ distinct provider instances, nothing undeclared), `...-keep-declaration-order`,
 
 The lane is evidence, never a release gate (it is not part of `verify`), and
 `declared_support` stays `partial`.
+
+## HTTP and network restored, and the full upstream suite (2026-11-02)
+
+The `feat/http` line supersedes the two exclusion sections above (“Network
+communication excluded” and the M17 HTTP removal). HTTP and TCP/UDP/DNS are
+now part of the declared WASI profile. This section is the current record;
+the earlier exclusion text is kept only as history.
+
+**Sockets.** `wasi:sockets/types@0.3.2` (`error-code`, address types, the
+`tcp-socket`/`udp-socket` resources) and `wasi:sockets/ip-name-lookup@0.3.2`
+bind for guest-declared 0.3-line imports. Authority is declared, never
+ambient: the CLI `--net HOST:PORT` / `--listen ADDR:PORT` / `--dns NAME`
+flags (repeatable, `*` wildcards) build a `wasi-network`; an embedder uses
+`make-wasi-network`. With no declaration every bind, connect, UDP send and
+resolve is refused through the interface's own `access-denied`. Readiness is
+a bounded 2 s poll, not a socket reactor. The last legacy P1 gap,
+`sock_shutdown` on a non-socket, was fixed by mapping the filetype check to
+`ENOTSOCK` (Wasmtime's own adapter has the reference behaviour).
+
+**HTTP.** The 0.3.2 `types` surface was restored (`fields`, `request`,
+`request-options`, `response` with header/body/trailer semantics) together
+with `client.send` over HTTP/1.1 on the built-in plain TCP transport.
+Request bodies stream through `client.send` (not just pre-staged bodies) and
+chunked responses carry trailers. The incoming direction is
+`wasi:http/handler` + the `service` world: `serve-component` instantiates the
+world's provider graph, binds a loopback listener, constructs the incoming
+`request` resource (method, path, scheme, authority, headers, buffered body),
+calls the guest handler through `lifted-func-call`, and serializes the
+returned `response` (status, headers, buffered body). The CLI exposes it as
+`wasmdown serve <component> --wasi [--addr HOST:PORT]`, which prints
+`http://HOST:PORT` as its **first stderr line** (default `127.0.0.1:0`,
+kernel-assigned port) and serves until SIGINT. TLS stayed out of the
+runtime: `http` rides the plain transport, and `https` requires an
+embedder-registered `wasi-http-transport` on the context; without one
+`send` returns `configuration-error`, never a plaintext fallback.
+`--http-transport` is refused by the CLI because transports are CL objects,
+not a CLI capability. The `middleware` world's host-supplied `next`
+composition has no runtime evidence and is **not** claimed; the `service`
+world and exported handler are the exercised incoming surface.
+
+**Mixed 0.3/0.2 providers.** The upstream wasip3 fixtures declare both
+release lines. `serve-component-providers` and
+`component-command-providers` compose the 0.3-line declared imports from the
+0.3 builders and the exact-version `0.2.x` imports from the P2 tables under
+one `with-args` alist; HTTP and 0.3 sockets are admitted on the 0.3 line
+while `@unstable` gating and P2 version-exact selection stay in force.
+
+**Network lane.** `tools/setup-network-tests.sh` clones the pinned
+`wasi-testsuite` and fetches a reference Wasmtime into `.cache/`, checks the
+pinned HEAD, installs the upstream runner's Python dependencies and runs a
+loopback/HTTP-framing smoke. `tools/run-wasi-network-tests.py`
+(`make test-wasi-network`) selects the inverse of the old exclusion set —
+every guest whose JSON declares the `http` or `sockets` proposal is
+admitted, every other test is a generated non-network skip — and runs it
+through `adapters/wasmdown.py`: **30/30**. `make
+test-wasi-network-reference` runs the same subset through upstream Wasmtime
+as a host-harness smoke: **28/30**, the two failures being known
+Wasmtime-50 issues, so it is report-only.
+
+**Full upstream suite.** With HTTP and sockets admitted and the
+`ENOTSOCK` fix in place, `tools/run-wasi-testsuite.py`
+(`make test-wasi-upstream`) no longer generates exclusion expectations: at
+the pinned commit `9d84631e427729802085c3d172d0a63cd360a1fa` the lane
+measures **127 pass / 0 fail / 0 skip** (AssemblyScript 12, C 14, Rust
+wasip1 46, Rust wasip3 55). This is the F1 evidence substitute for a locally
+built @0.3.2 guest; no toolchain here emits that component ABI, so
+`declared_support` remains `partial` under §12.11's blocked-by-environment
+rule. The counts previously recorded for this lane (95/0/32 and 70/0/2)
+were real measurements of the exclusion policy and are superseded, not
+rewritten.
+
+Evidence at the change: units 725/0, component 1,702/0, P3 30/30 ×3 in both
+backends, upstream 127/0/0, network subset 30/30, `make verify` green.

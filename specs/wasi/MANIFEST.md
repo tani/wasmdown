@@ -50,12 +50,15 @@ Supported vendored declarations, verified against
 | `wasi:http/types@0.3.2` | interface | supported |
 | `wasi:http/handler@0.3.2` | interface | supported |
 | `wasi:http/client@0.3.2` | interface | supported |
-| `wasi:http/service` | world | supported |
-| `wasi:http/middleware` | world | supported |
+| `wasi:http/service` | world | supported (`serve-component`; incoming `handler.handle`) |
+| `wasi:http/middleware` | world | partial: the world's shape is vendored and resolvable, but composition with a host-supplied `next` handler is not covered by the pinned suite and is not claimed |
 
 There is no `outgoing-handler` / `incoming-handler` in the pinned 0.3.2
 release; the outgoing client is `client.send` and the incoming service is
-`handler.handle` inside the `service`/`middleware` worlds.
+`handler.handle` inside the `service` world. The `service` direction is
+exercised by `wasmdown serve`; the `middleware` world's host-supplied `next`
+composition remains unverified and is therefore marked partial above, not
+claimed as supported.
 
 ### Network communication: `wasi:sockets`
 
