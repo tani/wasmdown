@@ -3674,6 +3674,46 @@ yields every chunk the framing decodes, then EOF)."
               (is (equal '((116))
                          (wasmdown.wasi:fields-get trailers "x-trail"))))))))))
 
+(test wasi/http-chunked-empty-trailer-section-is-none
+  ;; HTTP's empty trailer section (0\r\n\r\n) is the WIT's `none', not
+  ;; an empty Some(fields) — the upstream http-client-chunked contract.
+  (with-http-server
+      (port
+       (format nil "HTTP/1.1 200 OK~c~cTransfer-Encoding: chunked~c~c~c~c1~c~cx~c~c0~c~c~c~c"
+               #\Return #\Newline #\Return #\Newline #\Return #\Newline
+               #\Return #\Newline #\Return #\Newline #\Return #\Newline
+               #\Return #\Newline #\Return #\Newline)
+       got)
+    (let* ((net (http-net))
+           (ctx (http-ctx :net net))
+           (req (http-request :port port))
+           (res (wasmdown.wasi:http-client-send ctx req :network net)))
+      (is (eq :ok (car res)))
+      (multiple-value-bind (body future) (http-body-text (fourth res))
+        (is (string= "x" body))
+        (is (equal (cons :ok :none) future))))))
+
+(test wasi/http-send-future-reports-failed-transmission
+  ;; A send that never reaches the wire must settle request.new's
+  ;; transmission future with an error (upstream http-client-sent).
+  (let* ((net (http-net :outbound
+                        (list (wasmdown.wasi:make-wasi-endpoint
+                               :address '(10 9 9 9)))))
+         (ctx (http-ctx :net net))
+         (pair (wasmdown.wasi:http-request-new
+                (wasmdown.wasi:make-wasi-fields) :none :none :none))
+         (req (third (first pair)))
+         (future (second pair)))
+    (setf (wasmdown.wasi::wasi-http-request-authority req)
+          (cons :some "127.0.0.1:80")
+          (wasmdown.wasi::wasi-http-request-scheme req)
+          (cons :some (cons "HTTP" nil)))
+    (is (eq :err (car (wasmdown.wasi:http-client-send
+                       ctx req :network net))))
+    (let ((value (sock-future future)))
+      (is (consp value))
+      (is (eq :err (car value))))))
+
 ;;; ---------------------------------------------------------------
 ;;; The refusals: https-without-transport, the outbound/DNS policy,
 ;;; and header injection.

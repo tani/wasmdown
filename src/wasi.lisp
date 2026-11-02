@@ -6682,8 +6682,15 @@ option<scheme>, so a (:some . scheme) is unwrapped here."
   (body-length 0)
   (body-closed-p nil)
   (body-error nil)
+  (body-mutex (sb-thread:make-mutex :name "http-request-body"))
+  (body-cond (sb-thread:make-waitqueue :name "http-request-body"))
   (trailers-end nil)                  ; the readable trailers future
+  (trailers-state :absent)            ; :absent :waiting :settled
+  (trailers-value nil)                ; the watch's domain value
+  (trailers-dropped-p nil)
+  (trailers-inst nil)                 ; the guest table own handles resolve in
   (transmission-writer nil)           ; request.new's result future
+  (transmission-mutex (sb-thread:make-mutex :name "http-request-send"))
   (consumed-p nil))
 
 (defun %request-of (value ct)
@@ -6711,16 +6718,23 @@ present-p)."
       (values nil nil)))
 
 (defun %http-request-settle (request value)
-  (let ((w (wasi-http-request-transmission-writer request)))
+  "Resolve request.new's transmission future once VALUE is known. The
+worker and the drop finalizer race; the first settlement wins."
+  (let ((w nil))
+    (sb-thread:with-recursive-lock
+        ((wasi-http-request-transmission-mutex request))
+      (setf w (wasi-http-request-transmission-writer request))
+      (when w
+        (setf (wasi-http-request-transmission-writer request) nil)))
     (when w
-      (setf (wasi-http-request-transmission-writer request) nil)
       (wasmdown.component.runtime:host-future-resolve w value))))
 
 (defun http-request-new (headers contents trailers options
                          &key (package (wasi-package "http")))
-  "request.new: construct the request, take the contents stream's
-readable end as the body sink, and return (request, transmission
-future). The body is fully staged by the guest before send."
+  "request.new: construct the request and take the contents stream's
+readable end as the body sink plus the trailers future's readable
+end as a one-shot watch. The guest may keep writing after this
+returns: client.send drains the body/trailers concurrently."
   (let* ((fields-ct (http-resource-ct "fields" :package package))
          (request-ct (http-resource-ct "request" :package package))
          (future-ct (%http-future-ct "request" "new" :package package))
@@ -6742,7 +6756,13 @@ future). The body is fully staged by the guest before send."
         (unless (wasmdown.component.runtime:async-end-p trailers-end)
           (error 'wasmdown:host-error
                  :message "request.new: trailers is not a future end"))
-        (setf (wasi-http-request-trailers-end req) trailers-end))
+        (setf (wasi-http-request-trailers-end req) trailers-end
+              (wasi-http-request-trailers-state req) :waiting
+              ;; own<fields> handles inside a guest-written async value
+              ;; are raw indices in the LOWERING CALLER's table.
+              (wasi-http-request-trailers-inst req)
+              (or wasmdown.component.runtime::*handle-caller-inst*
+                  wasmdown.component.runtime::*host-provider-inst*)))
       (when (and opts (not (wasmdown.component.runtime:async-end-p opts)))
         (let ((o (%http-take-resource opts
                                       (http-resource-ct "request-options"
@@ -6754,27 +6774,44 @@ future). The body is fully staged by the guest before send."
       (multiple-value-bind (future-reader future-writer)
           (wasmdown.component.runtime:make-host-future-pair future-ct)
         (setf (wasi-http-request-transmission-writer req) future-writer)
-        (if body
-            (progn
-              (wasmdown.component.runtime:host-end-set-sink
-               body
-               (lambda (octets start end)
-                 (push (coerce (subseq octets start end) 'list)
-                       (wasi-http-request-body-buffer req))
-                 (incf (wasi-http-request-body-length req) (- end start))
-                 (values (- end start) nil)))
-              (wasmdown.component.runtime:host-end-set-on-drop
-               body
-               (lambda (dropped error)
-                 (declare (ignore dropped))
-                 (setf (wasi-http-request-body-closed-p req) t)
-                 (if error
-                     (progn
-                       (setf (wasi-http-request-body-error req) error)
-                       (%http-request-settle req (cons :err error)))
-                     (%http-request-settle req (cons :ok nil)))))
-              (wasmdown.component.runtime:host-end-drain body))
-            (%http-request-settle req (cons :ok nil)))
+        (when body
+          (wasmdown.component.runtime:host-end-set-sink
+           body
+           (lambda (octets start end)
+             (let ((n (- end start)))
+               (when (plusp n)
+                 (sb-thread:with-recursive-lock
+                     ((wasi-http-request-body-mutex req))
+                   (push (coerce (subseq octets start end) 'list)
+                         (wasi-http-request-body-buffer req))
+                   (incf (wasi-http-request-body-length req) n)
+                   (sb-thread:condition-broadcast
+                    (wasi-http-request-body-cond req))))
+               (values n nil))))
+          (wasmdown.component.runtime:host-end-set-on-drop
+           body
+           (lambda (dropped error)
+             (declare (ignore dropped))
+             (sb-thread:with-recursive-lock
+                 ((wasi-http-request-body-mutex req))
+               (setf (wasi-http-request-body-closed-p req) t)
+               (when error
+                 (setf (wasi-http-request-body-error req) error))
+               (sb-thread:condition-broadcast
+                (wasi-http-request-body-cond req)))))
+          (wasmdown.component.runtime:host-end-drain body))
+        (when trailers-end
+          (wasmdown.component.runtime:host-future-watch
+           trailers-end
+           (lambda (value dropped-p)
+             (sb-thread:with-recursive-lock
+                 ((wasi-http-request-body-mutex req))
+               (setf (wasi-http-request-trailers-state req) :settled
+                     (wasi-http-request-trailers-value req) value
+                     (wasi-http-request-trailers-dropped-p req)
+                     dropped-p)
+               (sb-thread:condition-broadcast
+                (wasi-http-request-body-cond req))))))
         (list (list :own-handle request-ct req) future-reader)))))
 
 (defun http-request-get-method (this &key (package (wasi-package "http")))
@@ -7591,9 +7628,12 @@ chunked is the WIT's HTTP-response-transfer-coding."
                (%http-error (%http-code "HTTP-protocol-error")))
              (let ((n (parse-integer hex :radix 16)))
                (if (zerop n)
-                   (progn
+                   (let ((trailers (%http-read-fields reader
+                                                      :timeout-ms timeout)))
+                     ;; HTTP's empty trailer section is the WIT's
+                     ;; `none': only a real trailer field is exposed.
                      (setf (wasi-http-body-trailers body)
-                           (%http-read-fields reader :timeout-ms timeout)
+                           (and (wasi-fields-entries trailers) trailers)
                            (wasi-http-body-chunk-state body) :done
                            (wasi-http-body-done-p body) t)
                      (return (values nil t)))
@@ -7664,27 +7704,94 @@ Host/Content-Length/Transfer-Encoding/Connection)."
 (defun %http-request-body-bytes (req)
   (apply #'append (reverse (wasi-http-request-body-buffer req))))
 
+(defun %http-request-body-take (req)
+  "Wait for request body progress and drain every staged byte.
+Returns (values bytes closed-p error-code). CALLER: the send worker.
+The guest's sink appends under the same lock, so the wait neither
+loses a wake nor keeps the guest from writing."
+  (sb-thread:with-recursive-lock ((wasi-http-request-body-mutex req))
+    (loop while (and (null (wasi-http-request-body-buffer req))
+                     (not (wasi-http-request-body-closed-p req))
+                     (not (wasi-http-request-body-error req)))
+          do (sb-thread:condition-wait
+              (wasi-http-request-body-cond req)
+              (wasi-http-request-body-mutex req)))
+    (let ((bytes (%http-request-body-bytes req)))
+      (setf (wasi-http-request-body-buffer req) nil)
+      (values bytes
+              (wasi-http-request-body-closed-p req)
+              (wasi-http-request-body-error req)))))
+
+(defun %http-request-body-wait-closed (req)
+  "Wait until the guest closes the body, then its final length (the
+Content-Length the request head needs when the guest declared none)."
+  (sb-thread:with-recursive-lock ((wasi-http-request-body-mutex req))
+    (loop while (and (not (wasi-http-request-body-closed-p req))
+                     (not (wasi-http-request-body-error req)))
+          do (sb-thread:condition-wait
+              (wasi-http-request-body-cond req)
+              (wasi-http-request-body-mutex req)))
+    (let ((error (wasi-http-request-body-error req)))
+      (when error (%http-error error))
+      (wasi-http-request-body-length req))))
+
+(defun %http-trailer-fields (handle req)
+  "The fields rep behind a trailer future's guest-written
+option<own<fields>> payload. The canonical copy of a NESTED own
+leaves the raw handle index in the value, so transfer it out of the
+guest's table here (once)."
+  (cond
+    ((wasi-fields-p handle) handle)
+    ((and (consp handle) (eq (car handle) :own-handle)) (third handle))
+    ((integerp handle)
+     (let* ((ct (http-resource-ct "fields"))
+            (inst (wasi-http-request-trailers-inst req))
+            (wasmdown.component.runtime::*handle-caller-inst* inst)
+            (wasmdown.component.runtime::*host-provider-inst* nil))
+       (multiple-value-bind (rep found)
+           (wasmdown.component.runtime:host-resource-take ct handle)
+         (declare (ignore found))
+         (and (wasi-fields-p rep) rep))))
+    (t nil)))
+
+(defun %http-trailers-value (req value)
+  "Parse the trailers future's domain VALUE: (values trailers-or-nil
+error-code-or-nil). A dropped future is `none' (the WIT permits a
+request without trailers)."
+  (cond
+    ((null value) (values nil nil))
+    ((and (consp value) (eq (car value) :err))
+     (values nil (cdr value)))
+    ((and (consp value) (eq (car value) :ok))
+     (let ((opt (cdr value)))
+       (cond
+         ((eq opt :none) (values nil nil))
+         ((and (consp opt) (eq (car opt) :some))
+          (values (%http-trailer-fields (cdr opt) req) nil))
+         (t (values nil nil)))))
+    ((wasi-fields-p value) (values value nil))
+    (t (values nil nil))))
+
 (defun %http-request-trailers (req)
-  "The request's trailers, read non-blockingly: (values trailers
-present-p) where TRAILERS is a wasi-fields or NIL."
-  (multiple-value-bind (value present)
-      (%http-future-value (wasi-http-request-trailers-end req))
-    (if (not present)
-        (values nil nil)
-        (cond
-          ((and (consp value) (eq (car value) :err))
-           (%http-error (cdr value)))
-          ((and (consp value) (eq (car value) :ok))
-           (let ((opt (cdr value)))
-             (cond
-               ((eq opt :none) (values nil t))
-               ((and (consp opt) (eq (car opt) :some))
-                (let ((handle (cdr opt)))
-                  (if (and (consp handle) (eq (car handle) :own-handle))
-                      (values (third handle) t)
-                      (values (and (wasi-fields-p handle) handle) t))))
-               (t (values nil t)))))
-          (t (values nil t))))))
+  "Wait for the request's trailers future to resolve:
+(values trailers-or-nil present-p), signalling WASI-HTTP-ERROR for a
+trailers error. PRESENT-P means the future resolved (Some or None);
+TRAILERS is the non-empty fields, or NIL for `none'."
+  (if (or (null (wasi-http-request-trailers-end req))
+          (eq (wasi-http-request-trailers-state req) :absent))
+      (values nil nil)
+      (let ((value nil))
+        (sb-thread:with-recursive-lock
+            ((wasi-http-request-body-mutex req))
+          (loop while (eq (wasi-http-request-trailers-state req) :waiting)
+                do (sb-thread:condition-wait
+                    (wasi-http-request-body-cond req)
+                    (wasi-http-request-body-mutex req)))
+          (setf value (wasi-http-request-trailers-value req)))
+        (multiple-value-bind (trailers error)
+            (%http-trailers-value req value)
+          (when error (%http-error error))
+          (values trailers t)))))
 
 (defun %http-chunk-prefix (length)
   (map 'list #'char-code (format nil "~x~c~c" length #\Return #\Newline)))
@@ -7698,154 +7805,271 @@ present-p) where TRAILERS is a wasi-fields or NIL."
                              #\Return #\Newline)))
    (list 13 10)))
 
-(defun %http-write-request (conn req body trailers trailers-present)
-  "Write the whole request (head + body framing). Signals
-wasi-http-error on an I/O or serialization failure."
+(defun %http-write-request (conn req trailers trailers-present)
+  "Write the whole request: head, then the body bytes as the guest
+produces them (Content-Length or chunked framing), then the chunked
+terminator and trailer section when TRAILERS is non-NIL. Signals
+wasi-http-error on an I/O, body or serialization failure."
   (let* ((method (%http-method-string (wasi-http-request-method req)))
          (authority (let ((a (wasi-http-request-authority req)))
                       (if (consp a) (cdr a) a)))
          (path (let ((p (wasi-http-request-path-with-query req)))
                  (if (and (consp p) (eq (car p) :some)) (cdr p) "/")))
-         (chunked-p trailers-present)
+         ;; chunked framing is required only when a real trailer
+         ;; section will follow; `none' rides Content-Length.
+         (chunked-p (and trailers-present trailers))
          (body-present (or (wasi-http-request-body-end req)
                            (plusp (wasi-http-request-body-length req))))
+         (declared-length (and (not chunked-p)
+                               (%fields-values
+                                (wasi-http-request-headers req)
+                                "content-length")))
          (extra (append
                  (list (format nil "Host: ~a" authority)
                        "Connection: close")
                  (cond
                    (chunked-p (list "Transfer-Encoding: chunked"))
-                   ((and (not (%fields-values
-                               (wasi-http-request-headers req)
-                               "content-length"))
-                         (or body-present (plusp (length body))))
-                    (list (format nil "Content-Length: ~d" (length body))))
+                   ((and body-present (not declared-length))
+                    (list (format nil "Content-Length: ~d"
+                                  (if (wasi-http-request-body-end req)
+                                      (%http-request-body-wait-closed req)
+                                      (wasi-http-request-body-length
+                                       req)))))
                    (t '()))))
          (write (wasi-http-connection-write-fn conn)))
     (funcall write
              (%http-serialize-request-head
               method path authority (wasi-http-request-headers req) extra))
-    (cond
-      (chunked-p
-       (unless (null body)
-         (let ((st (funcall write (append (%http-chunk-prefix (length body))
-                                          body (list 13 10)))))
-           (when st (%http-error st))))
-       (let ((st (funcall write (map 'list #'char-code
-                                     (format nil "0~c~c" #\Return #\Newline)))))
-         (when st (%http-error st)))
-       (when trailers
-         (let ((st (funcall write (%http-serialize-trailers trailers))))
-           (when st (%http-error st))))
-       (when (null trailers)
-         ;; the terminating chunk + an empty trailer section
-         (let ((st (funcall write (list 13 10))))
-           (when st (%http-error st)))))
-      (t
-       (when body
-         (let ((st (funcall write body)))
-           (when st (%http-error st))))))
+    ;; The body is drained in the framing the head announced. The wait
+    ;; is on the guest writer, which the scheduler runs independently
+    ;; while client.send's host call is pending.
+    (if (wasi-http-request-body-end req)
+        (loop
+          (multiple-value-bind (bytes closed error)
+              (%http-request-body-take req)
+            (when (plusp (length bytes))
+              (let ((payload (if chunked-p
+                                 (append (%http-chunk-prefix (length bytes))
+                                         bytes (list 13 10))
+                                 bytes)))
+                (let ((st (funcall write payload)))
+                  (when st (%http-error st)))))
+            (when error (%http-error error))
+            (when closed (return))))
+        ;; a rep with no contents stream (the direct/provider shape)
+        (let ((bytes (%http-request-body-bytes req)))
+          (when bytes
+            (let ((st (funcall write
+                               (if chunked-p
+                                   (append (%http-chunk-prefix
+                                            (length bytes))
+                                           bytes (list 13 10))
+                                   bytes))))
+              (when st (%http-error st))))))
+    (when chunked-p
+      (let ((st (funcall write (map 'list #'char-code
+                                    (format nil "0~c~c" #\Return #\Newline)))))
+        (when st (%http-error st)))
+      (let ((st (funcall write
+                         (if trailers
+                             (%http-serialize-trailers trailers)
+                             ;; the terminator + an empty trailer section
+                             (list 13 10)))))
+        (when st (%http-error st))))
     nil))
+
+(defun %http-guest-context-p ()
+  "T when this call runs on a guest task thread: the async canon-lower
+path expects a host-pending and drives its resolution. NIL for a
+direct CL/host caller (the unit-test surface), which joins instead."
+  (and (boundp 'wasmdown.component.runtime::*current-task*)
+       (not (null (symbol-value
+                   'wasmdown.component.runtime::*current-task*)))))
+
+(defun %http-client-send-worker (req transport host port destination
+                                 connect-timeout options response-ct
+                                 store resolve reject)
+  "The transmission worker: connect, drain the guest's body and
+trailers while it writes them, transmit the request, settle the
+transmission future, and read the response head. Runs outside the
+guest scheduler's right; every expected failure is the WIT's
+(:err . error-code)."
+  (wasmdown.component.runtime:call-with-component-store
+      (store :close-p nil)
+    (handler-case
+        (let ((conn (funcall (wasi-http-transport-connect transport)
+                             host port destination connect-timeout)))
+          (handler-case
+              (let ((keep nil))
+                (unwind-protect
+                     (progn
+                       ;; The guest announces request trailers with the
+                       ;; HTTP `Trailer' header. Only then may the
+                       ;; transmission wait for the trailers future:
+                       ;; an unannounced/never-written future stays
+                       ;; unresolved and must not stall the send (the
+                       ;; WIT request may simply not carry trailers).
+                       (multiple-value-bind (trailers trailers-present)
+                           (if (%fields-values
+                                (wasi-http-request-headers req) "trailer")
+                               (%http-request-trailers req)
+                               (values nil nil))
+                         (%http-write-request conn req trailers
+                                              trailers-present))
+                       ;; the request is on the wire: transmission is
+                       ;; complete even if the response never arrives.
+                       (%http-request-settle req (cons :ok nil))
+                       (let* ((method (wasi-http-request-method req))
+                              (head-method
+                                (if (string-equal
+                                     (%http-method-string method) "HEAD")
+                                    :head :other))
+                              (reader
+                                (make-wasi-http-reader
+                                 :conn conn
+                                 :timeout-ms
+                                 (%http-timeout-ms
+                                  options
+                                  #'wasi-http-options-first-byte-timeout
+                                  +http-default-first-byte-timeout-ms+))))
+                         (multiple-value-bind (status fields)
+                             (%http-read-response-head reader head-method)
+                           (multiple-value-bind (mode length)
+                               (%http-response-body-mode
+                                status fields head-method)
+                             (let* ((body-state
+                                      (make-wasi-http-body
+                                       :reader reader
+                                       :mode mode
+                                       :remaining (or length 0)
+                                       :first-timeout
+                                       (%http-timeout-ms
+                                        options
+                                        #'wasi-http-options-first-byte-timeout
+                                        +http-default-first-byte-timeout-ms+)
+                                       :between-timeout
+                                       (%http-timeout-ms
+                                        options
+                                        #'wasi-http-options-between-bytes-timeout
+                                        +http-default-between-bytes-timeout-ms+)))
+                                    (response
+                                      (make-wasi-http-response
+                                       :status status
+                                       :headers fields
+                                       :body body-state)))
+                               (when (eq mode :none)
+                                 (%http-connection-close conn)
+                                 (setf (wasi-http-body-done-p body-state) t))
+                               (setf keep t)
+                               (funcall resolve
+                                        (cons :ok
+                                              (list :own-handle
+                                                    response-ct
+                                                    response))))))))
+                  (unless keep (%http-connection-close conn))))
+            (error (c)
+              (%http-connection-close conn)
+              (error c))))
+      (wasi-http-error (c)
+        (let ((code (wasi-http-error-code c)))
+          (%http-request-settle req (cons :err code))
+          (funcall resolve (cons :err code))))
+      (error (c)
+        (%http-request-settle
+         req (cons :err (%http-internal (princ-to-string c))))
+        (funcall reject c)))))
+
+(defun %http-client-send-blocking (req transport host port destination
+                                   connect-timeout options package)
+  "The DIRECT (non-guest) client.send: run the transmission on the
+caller's thread. Only a host embedder/unit test takes this path; a
+guest call returns a host-pending so its writer tasks keep running."
+  (let ((response-ct (http-resource-ct "response" :package package))
+        (store wasmdown.component.runtime::*current-component-store*)
+        (result nil))
+    (%http-client-send-worker
+     req transport host port destination connect-timeout options
+     response-ct store
+     (lambda (value) (setf result value))
+     (lambda (failure) (error failure)))
+    result))
+
+(defun %http-client-send-pending (req transport host port destination
+                                  connect-timeout options package)
+  "The ASYNC client.send answer: one worker thread owns the socket, so
+the guest's body writer tasks keep running while the host call is
+pending."
+  (let ((response-ct (http-resource-ct "response" :package package))
+        (store wasmdown.component.runtime::*current-component-store*))
+    (wasmdown.component.runtime:make-host-pending
+     :start
+     (lambda (resolve reject acknowledge-cancel)
+       (declare (ignore acknowledge-cancel))
+       (sb-thread:make-thread
+        (lambda ()
+          (%http-client-send-worker
+           req transport host port destination connect-timeout options
+           response-ct store resolve reject))
+        :name "http-client-send")
+       ;; the transport timeouts bound the work; a cancel cannot
+       ;; interrupt a blocking connect/send mid-call
+       (lambda () nil)))))
 
 (defun http-client-send (context request
                          &key (network nil) (package (wasi-package "http")))
-  "client.send: write the HTTP/1.1 request over the transport and
-return (:ok own<response>) or (:err . error-code)."
+  "client.send: transmit the HTTP/1.1 request over the transport and
+return (:ok own<response>) or (:err . error-code). On a guest thread
+the work runs in a host-pending, so the guest's body writer tasks
+keep running while the request is drained and written."
   (let* ((net (or network (first (wasi-context-networks context))))
-         (request-ct (http-resource-ct "request" :package package)))
+         (request-ct (http-resource-ct "request" :package package))
+         (req nil))
     (handler-case
-        (let* ((req (%request-of (%http-take-resource request request-ct)
+        (progn
+          (setf req (%request-of (%http-take-resource request request-ct)
                                  request-ct))
-               (scheme (%http-scheme-string (wasi-http-request-scheme req)))
-               (authority (wasi-http-request-authority req))
-               (method (wasi-http-request-method req)))
-          (when (wasi-http-request-consumed-p req)
-            (%http-error (%http-internal "request already consumed")))
-          (when (eq authority :none)
-            (%http-error (%http-code "HTTP-request-URI-invalid")))
-          (let ((authority-string (if (consp authority) (cdr authority)
-                                      authority)))
-            (unless (%http-authority-ok-p authority-string)
+          (let* ((scheme (%http-scheme-string
+                          (wasi-http-request-scheme req)))
+                 (authority (wasi-http-request-authority req)))
+            (when (wasi-http-request-consumed-p req)
+              (%http-error (%http-internal "request already consumed")))
+            (when (eq authority :none)
               (%http-error (%http-code "HTTP-request-URI-invalid")))
-            (multiple-value-bind (host port)
-                (%http-split-authority authority-string)
-              (when (and (string-equal scheme "https") (= port 80))
-                (setf port 443))
-              (let* ((transport (%http-transport-for context scheme))
-                     (destination (%http-resolve-destination
-                                   context net host port))
-                     (options (wasi-http-request-options req))
-                     (connect-timeout
-                       (%http-timeout-ms
-                        options #'wasi-http-options-connect-timeout
-                        +http-default-connect-timeout-ms+)))
-                (unless transport
-                  (%http-error (%http-code "configuration-error")))
-                (let ((conn (funcall (wasi-http-transport-connect transport)
-                                     host port destination connect-timeout)))
-                  (handler-case
-                      (let* ((body (%http-request-body-bytes req))
-                             (body-error (wasi-http-request-body-error req)))
-                        (when body-error
-                          (%http-error body-error))
-                        (when (and (wasi-http-request-body-end req)
-                                   (not (wasi-http-request-body-closed-p req)))
-                          (%http-error
-                           (%http-internal
-                            "request body stream must be closed before client.send (streaming uploads need a reactor)")))
-                        (multiple-value-bind (trailers trailers-present)
-                            (%http-request-trailers req)
-                          (%http-write-request conn req body trailers
-                                               trailers-present))
-                        (let* ((reader
-                                 (make-wasi-http-reader
-                                  :conn conn
-                                  :timeout-ms
-                                  (%http-timeout-ms
-                                   options
-                                   #'wasi-http-options-first-byte-timeout
-                                   +http-default-first-byte-timeout-ms+)))
-                               (head-method
-                                 (if (string-equal
-                                      (%http-method-string method)
-                                      "HEAD")
-                                     :head :other)))
-                          (multiple-value-bind (status fields)
-                              (%http-read-response-head reader head-method)
-                            (multiple-value-bind (mode length)
-                                (%http-response-body-mode
-                                 status fields head-method)
-                              (let* ((body-state
-                                       (make-wasi-http-body
-                                        :reader reader
-                                        :mode mode
-                                        :remaining (or length 0)
-                                        :first-timeout
-                                        (%http-timeout-ms
-                                         options
-                                         #'wasi-http-options-first-byte-timeout
-                                         +http-default-first-byte-timeout-ms+)
-                                        :between-timeout
-                                        (%http-timeout-ms
-                                         options
-                                         #'wasi-http-options-between-bytes-timeout
-                                         +http-default-between-bytes-timeout-ms+)))
-                                     (response
-                                       (make-wasi-http-response
-                                        :status status
-                                        :headers fields
-                                        :body body-state)))
-                                (when (eq mode :none)
-                                  (%http-connection-close conn)
-                                  (setf (wasi-http-body-done-p body-state) t))
-                                (cons :ok
-                                      (list :own-handle
-                                            (http-resource-ct
-                                             "response" :package package)
-                                            response)))))))
-                    (error (c)
-                      (%http-connection-close conn)
-                      (error c))))))))
-      (wasi-http-error (c) (cons :err (wasi-http-error-code c))))))
+            (let ((authority-string (if (consp authority)
+                                        (cdr authority) authority)))
+              (unless (%http-authority-ok-p authority-string)
+                (%http-error (%http-code "HTTP-request-URI-invalid")))
+              (multiple-value-bind (host port)
+                  (%http-split-authority authority-string)
+                (when (and (string-equal scheme "https") (= port 80))
+                  (setf port 443))
+                (let* ((transport (%http-transport-for context scheme))
+                       (options (wasi-http-request-options req))
+                       (connect-timeout
+                         (%http-timeout-ms
+                          options #'wasi-http-options-connect-timeout
+                          +http-default-connect-timeout-ms+)))
+                  (unless transport
+                    (%http-error (%http-code "configuration-error")))
+                  (let ((destination
+                          (%http-resolve-destination context net
+                                                     host port)))
+                    (if (%http-guest-context-p)
+                        (%http-client-send-pending
+                         req transport host port destination
+                         connect-timeout options package)
+                        (%http-client-send-blocking
+                         req transport host port destination
+                         connect-timeout options package))))))))
+      (wasi-http-error (c)
+        (let ((code (wasi-http-error-code c)))
+          (when req (%http-request-settle req (cons :err code)))
+          (cons :err code)))
+      (error (c)
+        (when req
+          (%http-request-settle
+           req (cons :err (%http-internal (princ-to-string c)))))
+        (error c)))))
 
 ;;; ---------------------------------------------------------------
 ;;; The provider instances.
@@ -7866,7 +8090,12 @@ providers never share a release hook."
              (wasmdown.component.runtime:host-end-drop
               (wasi-http-request-body-end rep)))
            (setf (wasi-http-request-body-end rep) nil))
-         (%http-request-settle rep (cons :ok nil)))))
+         ;; a request dropped without a successful transmission must
+         ;; never report success (http-client-sent's contract).
+         (%http-request-settle
+          rep
+          (cons :err (%http-internal
+                      "request dropped before transmission"))))))
     (wasmdown.component.runtime:host-register-resource-dtor
      inst st
      (lambda (rep)

@@ -5420,6 +5420,27 @@ consumer must never observe the same value."
         (setf (async-end-host-watch (host-future-watch-end w)) nil)))
     cancelled))
 
+(defun %host-watch-queue-buffer (w buf)
+  "Deliver the value the canonical copy just placed in the host BUF to
+the one-shot watch W. A GUEST-WRITTEN future stages its value in the
+writer's buffer; the copy that consumes it (below, in %END-COPY) is
+the delivery event, exactly as HOST-FUTURE-RESOLVE is for a
+host-written one."
+  (let ((queue nil)
+        (values (host-buffer-values buf)))
+    (sb-thread:with-recursive-lock ((host-future-watch-mutex w))
+      (when (eq (host-future-watch-state w) :waiting)
+        (setf (host-future-watch-state w) :queued
+              (host-future-watch-value w) (first values)
+              (host-future-watch-value-p w) (not (null values))
+              (host-future-watch-dropped-p w) nil
+              queue t)))
+    (when queue
+      (%host-enqueue (lambda () (%host-watch-deliver w))
+                     (or (host-future-watch-store w)
+                         *current-component-store*
+                         *global-host-store*)))))
+
 (defun host-future-watch (end callback)
   "A ONE-SHOT read subscription on the host-owned READABLE future END.
 CALLBACK is (value peer-dropped-p) -> side effect, run ONCE on the
@@ -5568,6 +5589,17 @@ the (memory ptr length progress) list. The 5 cases in order:
          (%host-source-fill end buffer other))
         ((async-end-host-value-p other)
          (%host-value-deliver end buffer other))
+        ;; a HOST-WATCHED readable future is a pending READ: give it a
+        ;; host buffer and let this same copy complete canonically, then
+        ;; hand the value to the watch (the provider observes a value
+        ;; the GUEST wrote through the writable peer).
+        ((and (async-end-host-watch other)
+              (plusp (%buffer-remain buffer)))
+         (let ((hbuf (make-host-buffer 1)))
+           (setf (async-end-buffer other) hbuf)
+           (%end-copy end buffer is-read)
+           (let ((w (async-end-host-watch other)))
+             (when w (%host-watch-queue-buffer w hbuf)))))
         (t (setf (async-end-buffer end) buffer))))
      ;; case 3: both have remain > 0 — copy the min
      ((and (plusp (%buffer-remain buffer))
