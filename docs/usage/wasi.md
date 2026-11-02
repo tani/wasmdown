@@ -71,12 +71,18 @@ dispatch is by the `@0.3.2` suffix of the import name.
 | `wasi:sockets` | **Supported under the declared authority.** `types` provides `error-code`, the address types and the `tcp-socket`/`udp-socket` resources; `ip-name-lookup` provides `resolve-addresses` (DNS). Both bind for guest-declared 0.3-line imports, and every bind, connect, UDP send and resolve is checked against the context's `wasi-network` (CLI `--net`/`--listen`/`--dns`, or `make-wasi-network`). Undeclared destinations are `access-denied`; with no authority every operation is refused. Readiness is a bounded 2 s poll, not a socket reactor. Evidence: the pinned upstream http/sockets subset is 30/30 (`make test-wasi-network`). |
 | `wasi:http` | **Supported (0.3.2).** `types` provides the `fields`, `request`, `request-options` and `response` resources with header/body/trailer semantics; `client.send` speaks HTTP/1.1 on the built-in plain TCP transport, including streaming request uploads and chunked response trailers. The incoming `handler` interface and the `service` world are served by `serve-component` / `wasmdown serve`, which answers requests through the exported handler until SIGINT. A `https` request needs an EMBEDDER-registered `wasi-http-transport`; without one `send` returns `configuration-error` (never a plaintext fallback, and the runtime implements no TLS itself). The `middleware` world's host-supplied `next`-handler composition is implemented by `http-middleware-providers` (embedder API; unit-pinned, no upstream middleware fixture). On the WASI 0.2 (Preview2) legacy line there is still no `wasi:http` provider; the declared HTTP surface is the 0.3.2 one.
 
-The 0.2 line keeps its historical no-`wasi:http` status; a 0.2 (Preview2)
-declaration is refused with this exact message:
-
-```
-wasi:http is not supported by this runtime by design on the WASI 0.2 (Preview2) line; the 0.3.2 `types` + `client` providers are the served HTTP surface. See docs/usage/wasi.md and specs/wasi/MANIFEST.md.
-```
+The 0.2 line serves the **outgoing** HTTP surface: `wasi:http/types@0.2.x`
+(all resource types and methods: `fields`, `incoming-request`,
+`outgoing-request`, `request-options`, `response-outparam`,
+`incoming-response`, `incoming-body`, `future-trailers`, `outgoing-response`,
+`outgoing-body`, `future-incoming-response`, `http-error-code`) and
+`wasi:http/outgoing-handler@0.2.x.handle` are bound at the exact declared
+patch version (`0.2.0` … `0.2.12`). Requests go through the same HTTP/1.1
+transport and `wasi-network` authority as the 0.3 line; bodies are P2
+`input-stream`/`output-stream` resources and the two futures expose
+`subscribe` pollables. `wasi:http/incoming-handler@0.2.x` (the serve side)
+remains unimplemented, so a 0.2 proxy world's exported handler is still the
+embedder's obligation.
 
 ## Serving HTTP
 
@@ -168,7 +174,7 @@ upstream wasip3 fixtures do). The 0.2 line remains a legacy compatibility
 target: it has no `wasi:http` provider, and its `wasi:sockets/*` bindings are
 legacy coverage, not the declared network surface.
 
-`src/wasi-preview2.lisp` binds 27 of the 31 stable interfaces at their
+`src/wasi-preview2.lisp` binds 29 of the 31 stable interfaces at their
 exact release names. The pinned SQLite component for this line decodes,
 validates, instantiates and executes real SQL through
 `wasi:cli/run@0.2.12`, in memory and on disk.

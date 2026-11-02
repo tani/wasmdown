@@ -5934,12 +5934,10 @@ the payloads need no resolvable extern types."
                    (mapcar #'car providers)))))))
 
 (test wasi/component-mixed-http-declared-import
-  ;; In a mixed component the 0.3 `wasi:http' declaration composes its
-  ;; providers (restored slice 5), while the 0.2 declaration still has
-  ;; no P2 provider and keeps the canonical 0.2-line refusal.
+  ;; In a mixed component BOTH release lines compose their HTTP
+  ;; providers: 0.3 through the 0.3 builders, 0.2 through the P2
+  ;; outgoing table (types + outgoing-handler).
   (let ((ctx (wasmdown.wasi:make-wasi-context)))
-    ;; the 0.3 declaration composes: the http types instance is bound
-    ;; next to the P2 streams provider
     (let ((providers
             (wasmdown.wasi:component-command-providers
              ctx (%synthetic-import-comp "wasi:http/types@0.3.2"
@@ -5948,18 +5946,22 @@ the payloads need no resolvable extern types."
                  (mapcar #'car providers)))
       (is (wasmdown.component.runtime:comp-instance-p
            (cdr (assoc "wasi:http/types@0.3.2" providers :test #'string=)))))
-    ;; the 0.2 declaration is refused by the P2 table's own exclusion
-    (let ((message nil))
-      (handler-case
-          (progn (wasmdown.wasi:component-command-providers
-                  ctx (%synthetic-import-comp "wasi:http/types@0.2.12"
-                                              "wasi:clocks/system-clock@0.3.2"))
-                 nil)
-        (wasmdown.wit:wit-error (c)
-          (setf message (wasmdown:wasmdown-error-message c))))
-      (is message)
-      (is (string= wasmdown.wasi::+wasi-http-unsupported-message+ message))
-      (is (not (search "no provider" message))))))
+    (let ((providers
+            (wasmdown.wasi:component-command-providers
+             ctx (%synthetic-import-comp "wasi:http/types@0.2.12"
+                                         "wasi:http/outgoing-handler@0.2.12"
+                                         "wasi:clocks/system-clock@0.3.2"))))
+      (is (equal '("wasi:http/types@0.2.12"
+                   "wasi:http/outgoing-handler@0.2.12"
+                   "wasi:clocks/system-clock@0.3.2")
+                 (mapcar #'car providers)))
+      (is (wasmdown.wasi:provider-instance-function
+           (cdr (assoc "wasi:http/types@0.2.12" providers :test #'string=))
+           "[constructor]fields"))
+      (is (wasmdown.wasi:provider-instance-function
+           (cdr (assoc "wasi:http/outgoing-handler@0.2.12" providers
+                       :test #'string=))
+           "handle")))))
 
 (test wasi/component-mixed-unstable-declared-import-still-refused
   ;; the 0.3 @unstable gate keeps applying to the 0.3 subset of a mixed

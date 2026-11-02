@@ -6074,8 +6074,12 @@ alist, all bound to one network authority."
 
 (defun %http-packages (&key (package (wasi-package "http")))
   "The WIT packages wasi:http functypes resolve against (duration
-comes from wasi:clocks/types)."
-  (list package (wasi-package "clocks")))
+comes from wasi:clocks/types). The clocks package is taken at the
+SAME release as PACKAGE, so the 0.2 facade resolves `duration' against
+wasi:clocks@0.2.x and the 0.3 providers against 0.3.2."
+  (list package
+        (wasi-package "clocks"
+                      :version (wasmdown.wit::wit-package-version package))))
 
 (defun http-resource-ct (name &key (package (wasi-package "http")))
   "The ONE ct object naming the resource NAME in wasi:http/types —
@@ -6302,30 +6306,36 @@ position of the first old entry; append when absent."
         (remove name (wasi-fields-entries fields)
                 :key #'car :test #'string-equal)))
 
-(defun %fields-size-check (fields name values)
+(defun %fields-size-check (fields name values &key (exceeded "size-exceeded"))
   "The implementation limit check: NAME + VALUES fit the per-field and
-aggregate limits (header-error.size-exceeded otherwise)."
-  (cond
-    ((> (length name) +http-max-field-name-size+)
-     (%http-header-error "size-exceeded"))
-    ((some (lambda (v) (> (length v) +http-max-field-value-size+)) values)
-     (%http-header-error "size-exceeded"))
-    (t
-     (let ((projected
-             (+ (%fields-total-size
-                 (%make-wasi-fields
-                  (remove name (wasi-fields-entries fields)
-                          :key #'car :test #'string-equal)
-                  t))
-                (* (max 1 (length values)) (length name))
-                (reduce #'+ values :key #'length :initial-value 0))))
-       (if (> projected +http-max-fields-total-size+)
-           (%http-header-error "size-exceeded")
-           (cons :ok nil))))))
+aggregate limits (header-error.EXCEEDED otherwise). EXCEEDED defaults
+to the 0.3 case `size-exceeded'; the 0.2 releases do not declare that
+case, so their callers pass `invalid-syntax'."
+  (flet ((too-big () (%http-header-error exceeded)))
+    (cond
+      ((> (length name) +http-max-field-name-size+) (too-big))
+      ((some (lambda (v) (> (length v) +http-max-field-value-size+)) values)
+       (too-big))
+      (t
+       (let ((projected
+               (+ (%fields-total-size
+                   (%make-wasi-fields
+                    (remove name (wasi-fields-entries fields)
+                            :key #'car :test #'string-equal)
+                    t))
+                  (* (max 1 (length values)) (length name))
+                  (reduce #'+ values :key #'length :initial-value 0))))
+         (if (> projected +http-max-fields-total-size+)
+             (too-big)
+             (cons :ok nil)))))))
 
 ;;; The WIT methods.
 
-(defun fields-from-list (entries)
+(defun %fields-ct (package)
+  (http-resource-ct "fields" :package package))
+
+(defun fields-from-list (entries &key (package (wasi-package "http"))
+                                   (exceeded "size-exceeded"))
   "fields.from-list: validate every (name, value) entry."
   (let ((entries (coerce entries 'list)))
     (loop for entry in entries
@@ -6343,10 +6353,10 @@ aggregate limits (header-error.size-exceeded otherwise)."
                   (%http-header-error "invalid-syntax")))
                ((> (length name) +http-max-field-name-size+)
                 (return-from fields-from-list
-                  (%http-header-error "size-exceeded")))
+                  (%http-header-error exceeded)))
                ((> (length value) +http-max-field-value-size+)
                 (return-from fields-from-list
-                  (%http-header-error "size-exceeded")))))
+                  (%http-header-error exceeded)))))
     (let ((fields (make-wasi-fields
                    :entries (loop for entry in entries
                                   collect (cons (%fields-canonical-name
@@ -6354,22 +6364,20 @@ aggregate limits (header-error.size-exceeded otherwise)."
                                                 (%field-value-bytes
                                                  (second entry)))))))
       (if (> (%fields-total-size fields) +http-max-fields-total-size+)
-          (%http-header-error "size-exceeded")
-          (list :own-handle (http-resource-ct "fields") fields)))))
+          (%http-header-error exceeded)
+          (list :own-handle (%fields-ct package) fields)))))
 
 (defun fields-get (fields name &key (package (wasi-package "http")))
-  (declare (ignore package))
-  (let ((f (%fields-of fields (http-resource-ct "fields"))))
+  (let ((f (%fields-of fields (%fields-ct package))))
     (if (%http-token-p name) (%fields-values f name) '())))
 
 (defun fields-has (fields name &key (package (wasi-package "http")))
-  (declare (ignore package))
-  (let ((f (%fields-of fields (http-resource-ct "fields"))))
+  (let ((f (%fields-of fields (%fields-ct package))))
     (and (%http-token-p name) (not (null (%fields-values f name))))))
 
-(defun fields-set (fields name values &key (package (wasi-package "http")))
-  (declare (ignore package))
-  (let* ((f (%fields-of fields (http-resource-ct "fields")))
+(defun fields-set (fields name values &key (package (wasi-package "http"))
+                                         (exceeded "size-exceeded"))
+  (let* ((f (%fields-of fields (%fields-ct package)))
          (values (mapcar #'%field-value-bytes (coerce values 'list))))
     (cond
       ((not (wasi-fields-mutable-p f)) (%http-header-error "immutable"))
@@ -6377,14 +6385,13 @@ aggregate limits (header-error.size-exceeded otherwise)."
       ((%http-forbidden-field-name-p name) (%http-header-error "forbidden"))
       ((not (every #'%http-field-value-ok-p values))
        (%http-header-error "invalid-syntax"))
-      (t (let ((check (%fields-size-check f name values)))
+      (t (let ((check (%fields-size-check f name values :exceeded exceeded)))
            (if (eq (car check) :ok)
                (progn (%fields-replace f name values) (cons :ok nil))
                check))))))
 
 (defun fields-delete (fields name &key (package (wasi-package "http")))
-  (declare (ignore package))
-  (let ((f (%fields-of fields (http-resource-ct "fields"))))
+  (let ((f (%fields-of fields (%fields-ct package))))
     (cond
       ((not (wasi-fields-mutable-p f)) (%http-header-error "immutable"))
       ;; HeaderName::try_from: an invalid field-name is
@@ -6396,8 +6403,7 @@ aggregate limits (header-error.size-exceeded otherwise)."
 
 (defun fields-get-and-delete (fields name
                               &key (package (wasi-package "http")))
-  (declare (ignore package))
-  (let ((f (%fields-of fields (http-resource-ct "fields"))))
+  (let ((f (%fields-of fields (%fields-ct package))))
     (cond
       ((not (wasi-fields-mutable-p f)) (%http-header-error "immutable"))
       ((not (%http-token-p name)) (%http-header-error "invalid-syntax"))
@@ -6406,9 +6412,9 @@ aggregate limits (header-error.size-exceeded otherwise)."
            (cons :ok values))))))
 
 (defun fields-append (fields name value
-                      &key (package (wasi-package "http")))
-  (declare (ignore package))
-  (let* ((f (%fields-of fields (http-resource-ct "fields")))
+                      &key (package (wasi-package "http"))
+                        (exceeded "size-exceeded"))
+  (let* ((f (%fields-of fields (%fields-ct package)))
          (value (%field-value-bytes value)))
     (cond
       ((not (wasi-fields-mutable-p f)) (%http-header-error "immutable"))
@@ -6416,29 +6422,27 @@ aggregate limits (header-error.size-exceeded otherwise)."
       ((%http-forbidden-field-name-p name) (%http-header-error "forbidden"))
       ((not (%http-field-value-ok-p value))
        (%http-header-error "invalid-syntax"))
-      (t (let ((check (%fields-size-check f name (list value))))
+      (t (let ((check (%fields-size-check f name (list value)
+                                          :exceeded exceeded)))
            (if (eq (car check) :ok)
                (progn (%fields-append f name value) (cons :ok nil))
                check))))))
 
 (defun fields-copy-all (fields &key (package (wasi-package "http")))
-  (declare (ignore package))
-  (let ((f (%fields-of fields (http-resource-ct "fields"))))
+  (let ((f (%fields-of fields (%fields-ct package))))
     (loop for (name . value) in (wasi-fields-entries f)
           collect (list name (copy-list value)))))
 
 (defun fields-clone (fields &key (package (wasi-package "http")))
-  (declare (ignore package))
-  (let* ((f (%fields-of fields (http-resource-ct "fields")))
+  (let* ((f (%fields-of fields (%fields-ct package)))
          (copy (make-wasi-fields
                 :entries (loop for (name . value)
                                  in (wasi-fields-entries f)
                                collect (cons name (copy-list value))))))
-    (list :own-handle (http-resource-ct "fields") copy)))
+    (list :own-handle (%fields-ct package) copy)))
 
 (defun fields-constructor (&key (package (wasi-package "http")))
-  (declare (ignore package))
-  (list :own-handle (http-resource-ct "fields") (make-wasi-fields)))
+  (list :own-handle (%fields-ct package) (make-wasi-fields)))
 
 (defun %fields-immutable-view (fields &key (package (wasi-package "http")))
   "The `headers' a request/response accessor returns: a copy flagged
@@ -6491,55 +6495,50 @@ honour a zero-length transport timeout."
         (setf (wasi-http-options-between-bytes-timeout options) duration)))
      (cons :ok nil))))
 
+(defun %options-ct (package)
+  (http-resource-ct "request-options" :package package))
+
 (defun request-options-constructor (&key (package (wasi-package "http")))
-  (declare (ignore package))
-  (list :own-handle (http-resource-ct "request-options")
+  (list :own-handle (%options-ct package)
         (make-wasi-http-options)))
 
 (defun request-options-get-connect-timeout (options
                                             &key (package (wasi-package "http")))
-  (declare (ignore package))
   (wasi-http-options-connect-timeout
-   (%options-of options (http-resource-ct "request-options"))))
+   (%options-of options (%options-ct package))))
 
 (defun request-options-set-connect-timeout (options duration
                                             &key (package (wasi-package "http")))
-  (declare (ignore package))
   (%options-set-timeout
-   (%options-of options (http-resource-ct "request-options"))
+   (%options-of options (%options-ct package))
    :connect duration))
 
 (defun request-options-get-first-byte-timeout (options
                                                &key (package (wasi-package "http")))
-  (declare (ignore package))
   (wasi-http-options-first-byte-timeout
-   (%options-of options (http-resource-ct "request-options"))))
+   (%options-of options (%options-ct package))))
 
 (defun request-options-set-first-byte-timeout (options duration
                                                &key (package (wasi-package "http")))
-  (declare (ignore package))
   (%options-set-timeout
-   (%options-of options (http-resource-ct "request-options"))
+   (%options-of options (%options-ct package))
    :first-byte duration))
 
 (defun request-options-get-between-bytes-timeout (options
                                                   &key (package (wasi-package "http")))
-  (declare (ignore package))
   (wasi-http-options-between-bytes-timeout
-   (%options-of options (http-resource-ct "request-options"))))
+   (%options-of options (%options-ct package))))
 
 (defun request-options-set-between-bytes-timeout (options duration
                                                   &key (package (wasi-package "http")))
-  (declare (ignore package))
   (%options-set-timeout
-   (%options-of options (http-resource-ct "request-options"))
+   (%options-of options (%options-ct package))
    :between-bytes duration))
 
 (defun request-options-clone (options &key (package (wasi-package "http")))
-  (declare (ignore package))
-  (let ((o (%options-of options (http-resource-ct "request-options"))))
+  (let ((o (%options-of options (%options-ct package))))
     (list :own-handle
-          (http-resource-ct "request-options")
+          (%options-ct package)
           (make-wasi-http-options
            :connect-timeout (wasi-http-options-connect-timeout o)
            :first-byte-timeout (wasi-http-options-first-byte-timeout o)
@@ -6678,6 +6677,11 @@ option<scheme>, so a (:some . scheme) is unwrapped here."
   (headers nil)                       ; wasi-fields
   (options nil)                       ; wasi-http-options or NIL
   (body-end nil)                      ; the guest's readable contents end
+  ;; T when a body was EXTRACTED from the request but is written through
+  ;; a host-side sink instead of BODY-END (the 0.2 outgoing-body shape):
+  ;; the sender then streams BODY-BUFFER until BODY-CLOSED-P exactly as
+  ;; it does for a request.new contents stream.
+  (body-present-p nil)
   (body-buffer nil)                   ; reversed list of byte-lists
   (body-length 0)
   (body-closed-p nil)
@@ -7819,6 +7823,7 @@ wasi-http-error on an I/O, body or serialization failure."
          ;; section will follow; `none' rides Content-Length.
          (chunked-p (and trailers-present trailers))
          (body-present (or (wasi-http-request-body-end req)
+                           (wasi-http-request-body-present-p req)
                            (plusp (wasi-http-request-body-length req))))
          (declared-length (and (not chunked-p)
                                (%fields-values
@@ -7831,7 +7836,8 @@ wasi-http-error on an I/O, body or serialization failure."
                    (chunked-p (list "Transfer-Encoding: chunked"))
                    ((and body-present (not declared-length))
                     (list (format nil "Content-Length: ~d"
-                                  (if (wasi-http-request-body-end req)
+                                  (if (or (wasi-http-request-body-end req)
+                                          (wasi-http-request-body-present-p req))
                                       (%http-request-body-wait-closed req)
                                       (wasi-http-request-body-length
                                        req)))))
@@ -7843,7 +7849,8 @@ wasi-http-error on an I/O, body or serialization failure."
     ;; The body is drained in the framing the head announced. The wait
     ;; is on the guest writer, which the scheduler runs independently
     ;; while client.send's host call is pending.
-    (if (wasi-http-request-body-end req)
+    (if (or (wasi-http-request-body-end req)
+            (wasi-http-request-body-present-p req))
         (loop
           (multiple-value-bind (bytes closed error)
               (%http-request-body-take req)

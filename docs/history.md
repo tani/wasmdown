@@ -1105,3 +1105,24 @@ rewritten.
 
 Evidence at the change: units 726/0, component 1,702/0, P3 30/30 ×3 in both
 backends, upstream 127/0/0, network subset 30/30, `make verify` green.
+
+**WASI 0.2 outgoing HTTP (2026-11-02).** The Preview2 line now serves the
+outgoing HTTP import surface at every vendored patch release (`0.2.0` …
+`0.2.12`): `wasi:http/types` exposes all resource types and methods
+(`fields`, `incoming-request`, `outgoing-request`, `request-options`,
+`response-outparam`, `incoming-response`, `incoming-body`,
+`future-trailers`, `outgoing-response`, `outgoing-body`,
+`future-incoming-response`, `http-error-code`) and
+`wasi:http/outgoing-handler.handle` returns a pollable
+`future-incoming-response`. The P2 providers reuse the 0.3 HTTP/1.1
+transport, network authority, request validation and body decoder: a P2
+`outgoing-request` rep is the 0.3 request rep, its body writes through a
+host sink into the streamed request contents, and an `incoming-response`
+rep is the 0.3 response rep whose bytes are decoded on a bounded,
+backpressured body pump. The old `wasi:http` refusal is gone; the P2 builder
+table has `types` + `outgoing-handler`, and `preview2-proxy-provider`
+composes the resolved `wasi:http/proxy` world's cli/io/clocks/random +
+HTTP imports. `wasi:http/incoming-handler` (serve side) remains the peer
+slice. Evidence: P2 unit file 38/0, full unit suite 734/0, the generated
+backend inventory now reports `P2 0.2.12 pinned=32 stable=31 bound=29
+unbound_stable=2`, and no 0.3 HTTP/sockets test regressed.

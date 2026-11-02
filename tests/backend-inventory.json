@@ -1,9 +1,9 @@
 {
  "schema": "wasmdown.inventory.v1",
- "generated_at": "2026-11-02T01:01:35Z",
+ "generated_at": "2026-11-02T01:28:45Z",
  "sbcl_version": "2.6.4",
- "source_commit": "7feefb9e0af0947e3616d0af1bc7ee7e42177fc4",
- "source_tree": "65393ce0eba813d115ad576a4da98fb770bdea29",
+ "source_commit": "b2ab7bf583464f3fd9b6a7a05c38d316f6e17bbf",
+ "source_tree": "50fab94870609b9d4d1513984f5937a9a600848a",
  "clean_tree": false,
  "pins": {
   "core_spec_commit": "b0ec1f3f449525c217dbff3f1dfab435a756ea92",
@@ -212,6 +212,8 @@
    "wasi:clocks/wall-clock@0.2.12",
    "wasi:filesystem/preopens@0.2.12",
    "wasi:filesystem/types@0.2.12",
+   "wasi:http/outgoing-handler@0.2.12",
+   "wasi:http/types@0.2.12",
    "wasi:io/error@0.2.12",
    "wasi:io/poll@0.2.12",
    "wasi:io/streams@0.2.12",
@@ -228,9 +230,7 @@
   ],
   "missing": [],
   "excluded": [
-   "wasi:http/incoming-handler@0.2.12",
-   "wasi:http/outgoing-handler@0.2.12",
-   "wasi:http/types@0.2.12"
+   "wasi:http/incoming-handler@0.2.12"
   ],
   "unstable": [
    "wasi:clocks/timezone@0.2.12"
@@ -240,9 +240,7 @@
   ],
   "unbound_stable": [
    "wasi:cli/run@0.2.12",
-   "wasi:http/incoming-handler@0.2.12",
-   "wasi:http/outgoing-handler@0.2.12",
-   "wasi:http/types@0.2.12"
+   "wasi:http/incoming-handler@0.2.12"
   ],
   "releases": [
    {
@@ -328,6 +326,8 @@
      "wasi:clocks/wall-clock@0.2.0",
      "wasi:filesystem/preopens@0.2.0",
      "wasi:filesystem/types@0.2.0",
+     "wasi:http/outgoing-handler@0.2.0",
+     "wasi:http/types@0.2.0",
      "wasi:io/error@0.2.0",
      "wasi:io/poll@0.2.0",
      "wasi:io/streams@0.2.0",
@@ -344,15 +344,11 @@
     ],
     "unbound_stable": [
      "wasi:cli/run@0.2.0",
-     "wasi:http/incoming-handler@0.2.0",
-     "wasi:http/outgoing-handler@0.2.0",
-     "wasi:http/types@0.2.0"
+     "wasi:http/incoming-handler@0.2.0"
     ],
     "missing": [],
     "excluded": [
-     "wasi:http/incoming-handler@0.2.0",
-     "wasi:http/outgoing-handler@0.2.0",
-     "wasi:http/types@0.2.0"
+     "wasi:http/incoming-handler@0.2.0"
     ],
     "unstable": [],
     "export_only": [
@@ -441,12 +437,12 @@
      },
      {
       "interface": "wasi:http/outgoing-handler@0.2.0",
-      "status": "excluded",
+      "status": "bound",
       "stability": "stable"
      },
      {
       "interface": "wasi:http/types@0.2.0",
-      "status": "excluded",
+      "status": "bound",
       "stability": "stable"
      },
      {
@@ -600,6 +596,8 @@
      "wasi:clocks/wall-clock@0.2.1",
      "wasi:filesystem/preopens@0.2.1",
      "wasi:filesystem/types@0.2.1",
+     "wasi:http/outgoing-handler@0.2.1",
+     "wasi:http/types@0.2.1",
      "wasi:io/error@0.2.1",
      "wasi:io/poll@0.2.1",
      "wasi:io/streams@0.2.1",
@@ -616,15 +614,11 @@
     ],
     "unbound_stable": [
      "wasi:cli/run@0.2.1",
-     "wasi:http/incoming-handler@0.2.1",
-     "wasi:http/outgoing-handler@0.2.1",
-     "wasi:http/types@0.2.1"
+     "wasi:http/incoming-handler@0.2.1"
     ],
     "missing": [],
     "excluded": [
-     "wasi:http/incoming-handler@0.2.1",
-     "wasi:http/outgoing-handler@0.2.1",
-     "wasi:http/types@0.2.1"
+     "wasi:http/incoming-handler@0.2.1"
     ],
     "unstable": [
      "wasi:clocks/timezone@0.2.1"
@@ -720,12 +714,12 @@
      },
      {
       "interface": "wasi:http/outgoing-handler@0.2.1",
-      "status": "excluded",
+      "status": "bound",
       "stability": "stable"
      },
      {
       "interface": "wasi:http/types@0.2.1",
-      "status": "excluded",
+      "status": "bound",
       "stability": "stable"
      },
      {
@@ -879,6 +873,8 @@
      "wasi:clocks/wall-clock@0.2.2",
      "wasi:filesystem/preopens@0.2.2",
      "wasi:filesystem/types@0.2.2",
+     "wasi:http/outgoing-handler@0.2.2",
+     "wasi:http/types@0.2.2",
      "wasi:io/error@0.2.2",
      "wasi:io/poll@0.2.2",
      "wasi:io/streams@0.2.2",
@@ -895,15 +891,11 @@
     ],
     "unbound_stable": [
      "wasi:cli/run@0.2.2",
-     "wasi:http/incoming-handler@0.2.2",
-     "wasi:http/outgoing-handler@0.2.2",
-     "wasi:http/types@0.2.2"
+     "wasi:http/incoming-handler@0.2.2"
     ],
     "missing": [],
     "excluded": [
-     "wasi:http/incoming-handler@0.2.2",
-     "wasi:http/outgoing-handler@0.2.2",
-     "wasi:http/types@0.2.2"
+     "wasi:http/incoming-handler@0.2.2"
     ],
     "unstable": [
      "wasi:clocks/timezone@0.2.2"
@@ -999,12 +991,12 @@
      },
      {
       "interface": "wasi:http/outgoing-handler@0.2.2",
-      "status": "excluded",
+      "status": "bound",
       "stability": "stable"
      },
      {
       "interface": "wasi:http/types@0.2.2",
-      "status": "excluded",
+      "status": "bound",
       "stability": "stable"
      },
      {
@@ -1158,6 +1150,8 @@
      "wasi:clocks/wall-clock@0.2.3",
      "wasi:filesystem/preopens@0.2.3",
      "wasi:filesystem/types@0.2.3",
+     "wasi:http/outgoing-handler@0.2.3",
+     "wasi:http/types@0.2.3",
      "wasi:io/error@0.2.3",
      "wasi:io/poll@0.2.3",
      "wasi:io/streams@0.2.3",
@@ -1174,15 +1168,11 @@
     ],
     "unbound_stable": [
      "wasi:cli/run@0.2.3",
-     "wasi:http/incoming-handler@0.2.3",
-     "wasi:http/outgoing-handler@0.2.3",
-     "wasi:http/types@0.2.3"
+     "wasi:http/incoming-handler@0.2.3"
     ],
     "missing": [],
     "excluded": [
-     "wasi:http/incoming-handler@0.2.3",
-     "wasi:http/outgoing-handler@0.2.3",
-     "wasi:http/types@0.2.3"
+     "wasi:http/incoming-handler@0.2.3"
     ],
     "unstable": [
      "wasi:clocks/timezone@0.2.3"
@@ -1278,12 +1268,12 @@
      },
      {
       "interface": "wasi:http/outgoing-handler@0.2.3",
-      "status": "excluded",
+      "status": "bound",
       "stability": "stable"
      },
      {
       "interface": "wasi:http/types@0.2.3",
-      "status": "excluded",
+      "status": "bound",
       "stability": "stable"
      },
      {
@@ -1437,6 +1427,8 @@
      "wasi:clocks/wall-clock@0.2.4",
      "wasi:filesystem/preopens@0.2.4",
      "wasi:filesystem/types@0.2.4",
+     "wasi:http/outgoing-handler@0.2.3",
+     "wasi:http/types@0.2.3",
      "wasi:io/error@0.2.4",
      "wasi:io/poll@0.2.4",
      "wasi:io/streams@0.2.4",
@@ -1453,15 +1445,11 @@
     ],
     "unbound_stable": [
      "wasi:cli/run@0.2.4",
-     "wasi:http/incoming-handler@0.2.3",
-     "wasi:http/outgoing-handler@0.2.3",
-     "wasi:http/types@0.2.3"
+     "wasi:http/incoming-handler@0.2.3"
     ],
     "missing": [],
     "excluded": [
-     "wasi:http/incoming-handler@0.2.3",
-     "wasi:http/outgoing-handler@0.2.3",
-     "wasi:http/types@0.2.3"
+     "wasi:http/incoming-handler@0.2.3"
     ],
     "unstable": [
      "wasi:clocks/timezone@0.2.4"
@@ -1557,12 +1545,12 @@
      },
      {
       "interface": "wasi:http/outgoing-handler@0.2.3",
-      "status": "excluded",
+      "status": "bound",
       "stability": "stable"
      },
      {
       "interface": "wasi:http/types@0.2.3",
-      "status": "excluded",
+      "status": "bound",
       "stability": "stable"
      },
      {
@@ -1716,6 +1704,8 @@
      "wasi:clocks/wall-clock@0.2.5",
      "wasi:filesystem/preopens@0.2.5",
      "wasi:filesystem/types@0.2.5",
+     "wasi:http/outgoing-handler@0.2.5",
+     "wasi:http/types@0.2.5",
      "wasi:io/error@0.2.5",
      "wasi:io/poll@0.2.5",
      "wasi:io/streams@0.2.5",
@@ -1732,15 +1722,11 @@
     ],
     "unbound_stable": [
      "wasi:cli/run@0.2.5",
-     "wasi:http/incoming-handler@0.2.5",
-     "wasi:http/outgoing-handler@0.2.5",
-     "wasi:http/types@0.2.5"
+     "wasi:http/incoming-handler@0.2.5"
     ],
     "missing": [],
     "excluded": [
-     "wasi:http/incoming-handler@0.2.5",
-     "wasi:http/outgoing-handler@0.2.5",
-     "wasi:http/types@0.2.5"
+     "wasi:http/incoming-handler@0.2.5"
     ],
     "unstable": [
      "wasi:clocks/timezone@0.2.5"
@@ -1836,12 +1822,12 @@
      },
      {
       "interface": "wasi:http/outgoing-handler@0.2.5",
-      "status": "excluded",
+      "status": "bound",
       "stability": "stable"
      },
      {
       "interface": "wasi:http/types@0.2.5",
-      "status": "excluded",
+      "status": "bound",
       "stability": "stable"
      },
      {
@@ -1995,6 +1981,8 @@
      "wasi:clocks/wall-clock@0.2.6",
      "wasi:filesystem/preopens@0.2.6",
      "wasi:filesystem/types@0.2.6",
+     "wasi:http/outgoing-handler@0.2.6",
+     "wasi:http/types@0.2.6",
      "wasi:io/error@0.2.6",
      "wasi:io/poll@0.2.6",
      "wasi:io/streams@0.2.6",
@@ -2011,15 +1999,11 @@
     ],
     "unbound_stable": [
      "wasi:cli/run@0.2.6",
-     "wasi:http/incoming-handler@0.2.6",
-     "wasi:http/outgoing-handler@0.2.6",
-     "wasi:http/types@0.2.6"
+     "wasi:http/incoming-handler@0.2.6"
     ],
     "missing": [],
     "excluded": [
-     "wasi:http/incoming-handler@0.2.6",
-     "wasi:http/outgoing-handler@0.2.6",
-     "wasi:http/types@0.2.6"
+     "wasi:http/incoming-handler@0.2.6"
     ],
     "unstable": [
      "wasi:clocks/timezone@0.2.6"
@@ -2115,12 +2099,12 @@
      },
      {
       "interface": "wasi:http/outgoing-handler@0.2.6",
-      "status": "excluded",
+      "status": "bound",
       "stability": "stable"
      },
      {
       "interface": "wasi:http/types@0.2.6",
-      "status": "excluded",
+      "status": "bound",
       "stability": "stable"
      },
      {
@@ -2274,6 +2258,8 @@
      "wasi:clocks/wall-clock@0.2.7",
      "wasi:filesystem/preopens@0.2.7",
      "wasi:filesystem/types@0.2.7",
+     "wasi:http/outgoing-handler@0.2.7",
+     "wasi:http/types@0.2.7",
      "wasi:io/error@0.2.7",
      "wasi:io/poll@0.2.7",
      "wasi:io/streams@0.2.7",
@@ -2290,15 +2276,11 @@
     ],
     "unbound_stable": [
      "wasi:cli/run@0.2.7",
-     "wasi:http/incoming-handler@0.2.7",
-     "wasi:http/outgoing-handler@0.2.7",
-     "wasi:http/types@0.2.7"
+     "wasi:http/incoming-handler@0.2.7"
     ],
     "missing": [],
     "excluded": [
-     "wasi:http/incoming-handler@0.2.7",
-     "wasi:http/outgoing-handler@0.2.7",
-     "wasi:http/types@0.2.7"
+     "wasi:http/incoming-handler@0.2.7"
     ],
     "unstable": [
      "wasi:clocks/timezone@0.2.7"
@@ -2394,12 +2376,12 @@
      },
      {
       "interface": "wasi:http/outgoing-handler@0.2.7",
-      "status": "excluded",
+      "status": "bound",
       "stability": "stable"
      },
      {
       "interface": "wasi:http/types@0.2.7",
-      "status": "excluded",
+      "status": "bound",
       "stability": "stable"
      },
      {
@@ -2553,6 +2535,8 @@
      "wasi:clocks/wall-clock@0.2.8",
      "wasi:filesystem/preopens@0.2.8",
      "wasi:filesystem/types@0.2.8",
+     "wasi:http/outgoing-handler@0.2.8",
+     "wasi:http/types@0.2.8",
      "wasi:io/error@0.2.8",
      "wasi:io/poll@0.2.8",
      "wasi:io/streams@0.2.8",
@@ -2569,15 +2553,11 @@
     ],
     "unbound_stable": [
      "wasi:cli/run@0.2.8",
-     "wasi:http/incoming-handler@0.2.8",
-     "wasi:http/outgoing-handler@0.2.8",
-     "wasi:http/types@0.2.8"
+     "wasi:http/incoming-handler@0.2.8"
     ],
     "missing": [],
     "excluded": [
-     "wasi:http/incoming-handler@0.2.8",
-     "wasi:http/outgoing-handler@0.2.8",
-     "wasi:http/types@0.2.8"
+     "wasi:http/incoming-handler@0.2.8"
     ],
     "unstable": [
      "wasi:clocks/timezone@0.2.8"
@@ -2673,12 +2653,12 @@
      },
      {
       "interface": "wasi:http/outgoing-handler@0.2.8",
-      "status": "excluded",
+      "status": "bound",
       "stability": "stable"
      },
      {
       "interface": "wasi:http/types@0.2.8",
-      "status": "excluded",
+      "status": "bound",
       "stability": "stable"
      },
      {
@@ -2832,6 +2812,8 @@
      "wasi:clocks/wall-clock@0.2.9",
      "wasi:filesystem/preopens@0.2.9",
      "wasi:filesystem/types@0.2.9",
+     "wasi:http/outgoing-handler@0.2.9",
+     "wasi:http/types@0.2.9",
      "wasi:io/error@0.2.9",
      "wasi:io/poll@0.2.9",
      "wasi:io/streams@0.2.9",
@@ -2848,15 +2830,11 @@
     ],
     "unbound_stable": [
      "wasi:cli/run@0.2.9",
-     "wasi:http/incoming-handler@0.2.9",
-     "wasi:http/outgoing-handler@0.2.9",
-     "wasi:http/types@0.2.9"
+     "wasi:http/incoming-handler@0.2.9"
     ],
     "missing": [],
     "excluded": [
-     "wasi:http/incoming-handler@0.2.9",
-     "wasi:http/outgoing-handler@0.2.9",
-     "wasi:http/types@0.2.9"
+     "wasi:http/incoming-handler@0.2.9"
     ],
     "unstable": [
      "wasi:clocks/timezone@0.2.9"
@@ -2952,12 +2930,12 @@
      },
      {
       "interface": "wasi:http/outgoing-handler@0.2.9",
-      "status": "excluded",
+      "status": "bound",
       "stability": "stable"
      },
      {
       "interface": "wasi:http/types@0.2.9",
-      "status": "excluded",
+      "status": "bound",
       "stability": "stable"
      },
      {
@@ -3111,6 +3089,8 @@
      "wasi:clocks/wall-clock@0.2.10",
      "wasi:filesystem/preopens@0.2.10",
      "wasi:filesystem/types@0.2.10",
+     "wasi:http/outgoing-handler@0.2.10",
+     "wasi:http/types@0.2.10",
      "wasi:io/error@0.2.10",
      "wasi:io/poll@0.2.10",
      "wasi:io/streams@0.2.10",
@@ -3127,15 +3107,11 @@
     ],
     "unbound_stable": [
      "wasi:cli/run@0.2.10",
-     "wasi:http/incoming-handler@0.2.10",
-     "wasi:http/outgoing-handler@0.2.10",
-     "wasi:http/types@0.2.10"
+     "wasi:http/incoming-handler@0.2.10"
     ],
     "missing": [],
     "excluded": [
-     "wasi:http/incoming-handler@0.2.10",
-     "wasi:http/outgoing-handler@0.2.10",
-     "wasi:http/types@0.2.10"
+     "wasi:http/incoming-handler@0.2.10"
     ],
     "unstable": [
      "wasi:clocks/timezone@0.2.10"
@@ -3231,12 +3207,12 @@
      },
      {
       "interface": "wasi:http/outgoing-handler@0.2.10",
-      "status": "excluded",
+      "status": "bound",
       "stability": "stable"
      },
      {
       "interface": "wasi:http/types@0.2.10",
-      "status": "excluded",
+      "status": "bound",
       "stability": "stable"
      },
      {
@@ -3390,6 +3366,8 @@
      "wasi:clocks/wall-clock@0.2.11",
      "wasi:filesystem/preopens@0.2.11",
      "wasi:filesystem/types@0.2.11",
+     "wasi:http/outgoing-handler@0.2.11",
+     "wasi:http/types@0.2.11",
      "wasi:io/error@0.2.11",
      "wasi:io/poll@0.2.11",
      "wasi:io/streams@0.2.11",
@@ -3406,15 +3384,11 @@
     ],
     "unbound_stable": [
      "wasi:cli/run@0.2.11",
-     "wasi:http/incoming-handler@0.2.11",
-     "wasi:http/outgoing-handler@0.2.11",
-     "wasi:http/types@0.2.11"
+     "wasi:http/incoming-handler@0.2.11"
     ],
     "missing": [],
     "excluded": [
-     "wasi:http/incoming-handler@0.2.11",
-     "wasi:http/outgoing-handler@0.2.11",
-     "wasi:http/types@0.2.11"
+     "wasi:http/incoming-handler@0.2.11"
     ],
     "unstable": [
      "wasi:clocks/timezone@0.2.11"
@@ -3510,12 +3484,12 @@
      },
      {
       "interface": "wasi:http/outgoing-handler@0.2.11",
-      "status": "excluded",
+      "status": "bound",
       "stability": "stable"
      },
      {
       "interface": "wasi:http/types@0.2.11",
-      "status": "excluded",
+      "status": "bound",
       "stability": "stable"
      },
      {
@@ -3669,6 +3643,8 @@
      "wasi:clocks/wall-clock@0.2.12",
      "wasi:filesystem/preopens@0.2.12",
      "wasi:filesystem/types@0.2.12",
+     "wasi:http/outgoing-handler@0.2.12",
+     "wasi:http/types@0.2.12",
      "wasi:io/error@0.2.12",
      "wasi:io/poll@0.2.12",
      "wasi:io/streams@0.2.12",
@@ -3685,15 +3661,11 @@
     ],
     "unbound_stable": [
      "wasi:cli/run@0.2.12",
-     "wasi:http/incoming-handler@0.2.12",
-     "wasi:http/outgoing-handler@0.2.12",
-     "wasi:http/types@0.2.12"
+     "wasi:http/incoming-handler@0.2.12"
     ],
     "missing": [],
     "excluded": [
-     "wasi:http/incoming-handler@0.2.12",
-     "wasi:http/outgoing-handler@0.2.12",
-     "wasi:http/types@0.2.12"
+     "wasi:http/incoming-handler@0.2.12"
     ],
     "unstable": [
      "wasi:clocks/timezone@0.2.12"
@@ -3789,12 +3761,12 @@
      },
      {
       "interface": "wasi:http/outgoing-handler@0.2.12",
-      "status": "excluded",
+      "status": "bound",
       "stability": "stable"
      },
      {
       "interface": "wasi:http/types@0.2.12",
-      "status": "excluded",
+      "status": "bound",
       "stability": "stable"
      },
      {

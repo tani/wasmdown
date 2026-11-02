@@ -39,21 +39,25 @@
         (wasmdown:link-error (c)
           (search "0.2.99" (wasmdown:wasmdown-error-message c))))))
 
-(test wasi-preview2/http-import-rejected-by-design
-  ;; HTTP is excluded globally; the 0.2 facade must give the canonical
-  ;; by-design message, not the generic "no provider" wording.
+(test wasi-preview2/http-imports-are-provided
+  ;; The 0.2 outgoing surface is served: no by-design refusal remains.
   (let ((ctx (wasmdown.wasi:make-wasi-context)))
     (unwind-protect
-         (dolist (name '("wasi:http/types@0.2.12"
-                         "wasi:http/client@0.2.12"))
-           (is (handler-case
-                   (progn
-                     (wasmdown.wasi:preview2-command-provider
-                      ctx :imports (list name))
-                     nil)
-                 (wasmdown.wit:wit-error (c)
-                   (search "wasi:http is not supported by this runtime by design"
-                           (wasmdown:wasmdown-error-message c))))))
+         (let* ((builders (wasmdown.wasi:p2-builder-table ctx "0.2.12"))
+                (prov (wasmdown.wasi:preview2-command-provider
+                       ctx :imports '("wasi:http/types@0.2.12"
+                                      "wasi:http/outgoing-handler@0.2.12"))))
+           (is (assoc "wasi:http/types@0.2.12" builders :test #'string=))
+           (is (assoc "wasi:http/outgoing-handler@0.2.12" builders
+                      :test #'string=))
+           (is (= 2 (length prov)))
+           (is (wasmdown.wasi:provider-instance-function
+                (cdr (assoc "wasi:http/types@0.2.12" prov :test #'string=))
+                "[constructor]fields"))
+           (is (wasmdown.wasi:provider-instance-function
+                (cdr (assoc "wasi:http/outgoing-handler@0.2.12" prov
+                            :test #'string=))
+                "handle")))
       (wasmdown.wasi:close-wasi-context ctx))))
 
 (test wasi-preview2/clocks-and-random
@@ -972,3 +976,695 @@ reports end-of-directory as a NULL alien, not NIL."
     ;; the function returns `ok(0)`")
     (is (equal '(:ok . 0)
                (p2-call udp "[method]outgoing-datagram-stream.send" b-out '())))))
+
+;;; ===============================================================
+;;; wasi:http@0.2 — the outgoing import surface.
+;;; ===============================================================
+
+(defun p2-http-marker-rep (marker)
+  "The rep behind an OWN-HANDLE marker (:own-handle ct rep)."
+  (third marker))
+
+(defun p2-http-net (&key (outbound (list (wasmdown.wasi:make-wasi-endpoint
+                                          :address '(127 0 0 1)))))
+  (wasmdown.wasi:make-wasi-network :outbound outbound))
+
+(defun p2-http-ctx (&key (net (p2-http-net)))
+  (wasmdown.wasi:make-wasi-context :networks (list net)))
+
+(defun p2-http-fields (types &rest entries)
+  (let ((fields (p2-http-marker-rep (p2-call types "[constructor]fields"))))
+    (dolist (entry entries)
+      (p2-call types "[method]fields.append"
+               fields (first entry) (second entry)))
+    fields))
+
+(defun p2-http-request (types port &key (path "/x") headers)
+  (let* ((fields (or headers (p2-http-fields types)))
+         (request (p2-http-marker-rep
+                   (p2-call types "[constructor]outgoing-request" fields))))
+    (p2-call types "[method]outgoing-request.set-authority"
+             request (cons :some (format nil "127.0.0.1:~d" port)))
+    (p2-call types "[method]outgoing-request.set-path-with-query"
+             request (cons :some path))
+    request))
+
+(defun p2-http-handle (handler request &optional (options :none))
+  (p2-call handler "handle" request options))
+
+(defun p2-http-future-rep (handle-result)
+  (p2-http-marker-rep (cdr handle-result)))
+
+(defun p2-http-future-inner (get-value)
+  "The inner result<incoming-response,error-code> of a
+future-incoming-response get value."
+  (cdr (cdr get-value)))
+
+(defun p2-http-future-wait (types future &key (tries 500))
+  (loop repeat tries
+        for value = (p2-call types
+                             "[method]future-incoming-response.get"
+                             future)
+        unless (eq value :none)
+          return value
+        do (sleep 0.01)
+        finally (error "future-incoming-response did not become ready")))
+
+(defun p2-http-status (types response)
+  (p2-call types "[method]incoming-response.status" response))
+
+(defun p2-http-headers-field (types response name)
+  (let ((fields (p2-http-marker-rep
+                 (p2-call types "[method]incoming-response.headers"
+                          response))))
+    (p2-call types "[method]fields.get" fields name)))
+
+(defun p2-http-body-of (types response)
+  (let ((result (p2-call types "[method]incoming-response.consume" response)))
+    (is (eq :ok (car result)))
+    (p2-http-marker-rep (cdr result))))
+
+(defun p2-http-stream-of (types body)
+  (let ((result (p2-call types "[method]incoming-body.stream" body)))
+    (is (eq :ok (car result)))
+    (p2-http-marker-rep (cdr result))))
+
+(defun p2-http-read-all (ctx stream &optional (want nil))
+  "Read STREAM to its end through BLOCKING-READ (the body pump is a host
+thread, so the guest waits on the input pollable)."
+  (let ((streams (wasmdown.wasi:p2-streams-instance ctx "0.2.12"))
+        (out '()))
+    (loop
+      (let ((result (p2-call streams "[method]input-stream.blocking-read"
+                             stream 65536)))
+        (cond
+          ((and (eq (car result) :ok) (plusp (length (cdr result))))
+           (setf out (append out (cdr result))))
+          ((eq (car result) :ok)
+           (return (coerce out '(vector (unsigned-byte 8)))))
+          ((and (eq (car result) :err)
+                (eq (car (cdr result)) :closed))
+           (return (coerce out '(vector (unsigned-byte 8)))))
+          (t (return out))))
+      (when (and want (>= (length out) want))
+        (return (coerce out '(vector (unsigned-byte 8))))))))
+
+(defun p2-http-bytes-string (bytes)
+  (map 'string #'code-char bytes))
+
+;;; ---- a one-shot loopback server (reads the body a Content-Length
+;;; announces, then answers) -----------------------------------------
+
+(defun p2-http-listener ()
+  (let ((fd (wasmdown.wasi::%libc-socket
+             wasmdown.wasi::+af-inet+
+             wasmdown.wasi::+sock-stream+
+             wasmdown.wasi::+ipproto-tcp+)))
+    (multiple-value-bind (alien len)
+        (wasmdown.wasi::%make-sockaddr
+         "ipv4" (list (cons "port" 0) (cons "address" '(127 0 0 1))))
+      (unwind-protect
+           (progn
+             (when (minusp (wasmdown.wasi::%libc-bind
+                            fd (sb-alien:alien-sap alien) len))
+               (error "p2 http test listener bind failed"))
+             (wasmdown.wasi::%libc-listen fd 4))
+        (sb-alien:free-alien alien)))
+    (values (cdr (assoc "port"
+                        (cdr (wasmdown.wasi::%getsockname-domain fd :local))
+                        :test #'string=))
+            fd)))
+
+(defun p2-http-recv (cfd buffer)
+  (let ((tmp (sb-alien:make-alien sb-alien:unsigned-char 4096)))
+    (unwind-protect
+         (let ((n (wasmdown.wasi::%libc-recv cfd (sb-alien:alien-sap tmp)
+                                            4096 0)))
+           (when (plusp n)
+             (loop for i below n
+                   do (vector-push-extend
+                       (sb-sys:sap-ref-8 (sb-alien:alien-sap tmp) i)
+                       buffer)))
+           n)
+      (sb-alien:free-alien tmp))))
+
+(defun p2-http-read-request (cfd)
+  "Read the request head, then the body its Content-Length announces."
+  (let* ((buffer (make-array 0 :element-type '(unsigned-byte 8)
+                               :adjustable t :fill-pointer 0))
+         (crlfcrlf (format nil "~c~c~c~c"
+                           #\Return #\Newline #\Return #\Newline)))
+    (loop until (search crlfcrlf
+                        (map 'string #'code-char buffer) :test #'char=)
+          do (when (<= (p2-http-recv cfd buffer) 0) (return)))
+    (let* ((head-text (map 'string #'code-char buffer))
+           (head-end (+ 4 (search crlfcrlf head-text :test #'char=)))
+           (line (or (search "Content-Length:" head-text :test #'char-equal)
+                     (search "content-length:" head-text :test #'char-equal)))
+           (length (if line
+                       (parse-integer
+                        (string-trim '(#\Space #\Return #\Newline)
+                                     (subseq head-text
+                                             (+ line (length "Content-Length:"))
+                                             (or (position #\Return head-text
+                                                           :start (+ line 16))
+                                                 (length head-text)))))
+                       0)))
+      (loop while (< (- (fill-pointer buffer) head-end) length)
+            do (when (<= (p2-http-recv cfd buffer) 0) (return)))
+      (map 'string #'code-char buffer))))
+
+(defun p2-http-send-bytes (cfd text)
+  (let* ((bytes (map 'list #'char-code text))
+         (alien (wasmdown.wasi::%byte-list->alien bytes)))
+    (unwind-protect
+         (wasmdown.wasi::%libc-send cfd (sb-alien:alien-sap alien)
+                                    (length bytes) 0)
+      (sb-alien:free-alien alien))))
+
+(defun p2-http-serve-once (response)
+  "A one-shot loopback server emitting RESPONSE; (values port fd thread
+got-cell)."
+  (multiple-value-bind (port fd) (p2-http-listener)
+    (let ((got (list nil)))
+      (values port fd
+              (sb-thread:make-thread
+               (lambda ()
+                 (let ((cfd (wasmdown.wasi::%libc-accept4
+                             fd (sb-sys:int-sap 0) (sb-sys:int-sap 0) 0)))
+                   (unwind-protect
+                        (let ((request (p2-http-read-request cfd)))
+                          (setf (car got) request)
+                          (p2-http-send-bytes cfd response))
+                     (wasmdown.wasi::%close-fd cfd))))
+               :name "p2-http-serve")
+              got))))
+
+(defmacro with-p2-http-server ((port response got) &body body)
+  `(multiple-value-bind (,port fd thread ,got)
+       (p2-http-serve-once ,response)
+     (declare (ignore thread))
+     (unwind-protect (progn ,@body)
+       (ignore-errors (sb-thread:join-thread thread :timeout 3))
+       (wasmdown.wasi::%close-fd fd))))
+
+(defun p2-http-response (status &key body (extra ""))
+  (format nil "HTTP/1.1 ~d X~c~cContent-Length: ~d~c~c~a~c~c~a"
+          status #\Return #\Newline (length body) #\Return #\Newline
+          extra #\Return #\Newline body))
+
+;;; ---- the provider surface -----------------------------------------
+
+(defun p2-http-wit-export-names (iface)
+  "Every export provider-instance must lay down for IFACE: the stable
+functions, every resource + drop, the stable methods, and the defined
+types."
+  (let ((names '()))
+    (dolist (fn (wasmdown.wit:wit-interface-func-list iface))
+      (when (wasmdown.wasi:p2-stable-node-p fn)
+        (push (wasmdown.wit:wit-func-name fn) names)))
+    (dolist (resource (wasmdown.wit:wit-interface-resource-list iface))
+      (when (wasmdown.wasi:p2-stable-node-p resource)
+        (push (wasmdown.wit:wit-resource-name resource) names))
+      (push (format nil "[resource-drop]~a"
+                    (wasmdown.wit:wit-resource-name resource))
+            names)
+      (dolist (method (wasmdown.wit:wit-resource-methods resource))
+        (when (wasmdown.wasi:p2-stable-node-p method)
+          (push (wasmdown.wasi::%resource-method-export-name resource method)
+                names))))
+    (dolist (item (wasmdown.wit:wit-interface-items iface))
+      (when (and (wasmdown.wit:wit-type-p item)
+                 (wasmdown.wasi:p2-stable-node-p item)
+                 (not (and (consp (wasmdown.wit:wit-type-expr item))
+                           (eq (car (wasmdown.wit:wit-type-expr item))
+                               :resource))))
+        (push (wasmdown.wit:wit-type-name item) names)))
+    (nreverse names)))
+
+(test wasi-preview2/http-provider-surface-matches-wit
+  (let ((ctx (wasmdown.wasi:make-wasi-context)))
+    (unwind-protect
+         (dolist (spec '(("types" . wasmdown.wasi:p2-http-types-instance)
+                         ("outgoing-handler"
+                          . wasmdown.wasi:p2-http-outgoing-handler-instance)))
+           (let* ((iface (wasmdown.wasi:p2-interface
+                          "http" (car spec) "0.2.12"))
+                  (instance (funcall (cdr spec) ctx "0.2.12"))
+                  (exports
+                    (wasmdown.component.runtime:comp-instance-exports instance))
+                  (expected (p2-http-wit-export-names iface)))
+             (dolist (name expected)
+               (is (gethash name exports)))
+             (is (= (length expected) (hash-table-count exports))
+                 )))
+      (wasmdown.wasi:close-wasi-context ctx)))
+  ;; the exact outgoing-handler interface is one function
+  (let ((iface (wasmdown.wasi:p2-interface "http" "outgoing-handler"
+                                           "0.2.12")))
+    (is (equal '("handle")
+               (mapcar #'wasmdown.wit:wit-func-name
+                       (wasmdown.wit:wit-interface-func-list iface))))))
+
+(test wasi-preview2/http-proxy-world-providers
+  (let* ((world (wasmdown.wasi:preview2-proxy-world))
+         (names (mapcar (lambda (item)
+                          (wasmdown.wasi::%world-import-name item))
+                        (wasmdown.wit:wit-world-imports world)))
+         (ctx (wasmdown.wasi:make-wasi-context)))
+    (unwind-protect
+         (let ((providers (wasmdown.wasi:preview2-proxy-provider ctx)))
+           (is (string= "proxy" (wasmdown.wit:wit-world-name world)))
+           (is (member "wasi:http/types@0.2.12" names :test #'string=))
+           (is (member "wasi:http/outgoing-handler@0.2.12" names
+                       :test #'string=))
+           (is (member "wasi:cli/stdin@0.2.12" names :test #'string=))
+           (is (equal (sort (copy-list names) #'string<)
+                      (sort (mapcar #'car providers) #'string<)))
+           (is (= 1 (length (wasmdown.wit:wit-world-exports world))))
+           (is (string= "incoming-handler"
+                        (wasmdown.wit:wit-interface-name
+                         (wasmdown.wit:wit-world-item-target
+                          (first (wasmdown.wit:wit-world-exports world))))))
+           (let ((imports (wasmdown.wasi:preview2-http-imports-provider ctx)))
+             (is (= (length names) (length imports)))))
+      (wasmdown.wasi:close-wasi-context ctx))))
+
+;;; ---- fields --------------------------------------------------------
+
+(test wasi-preview2/http-fields-semantics
+  (let ((ctx (wasmdown.wasi:make-wasi-context)))
+    (unwind-protect
+         (let* ((types (wasmdown.wasi:p2-http-types-instance ctx "0.2.12"))
+                (from-list
+                  (p2-call types "[static]fields.from-list"
+                           (list (list "X-Test" (list 104 105))
+                                 (list "x-test" (list 33)))))
+                (fields (third from-list)))
+           (is (eq :own-handle (car from-list)))
+           (is (equal '((104 105) (33))
+                      (p2-call types "[method]fields.get" fields "X-TEST")))
+           (is (p2-call types "[method]fields.has" fields "x-Test"))
+           (is (not (p2-call types "[method]fields.has" fields "bad name")))
+           (is (equal '()
+                      (p2-call types "[method]fields.get" fields "absent")))
+           (is (equal '(:ok)
+                      (p2-call types "[method]fields.set"
+                               fields "x-test" (list (list 49)))))
+           (is (equal '((49))
+                      (p2-call types "[method]fields.get" fields "X-Test")))
+           (is (equal '(("x-test" (49)))
+                      (p2-call types "[method]fields.entries" fields)))
+           (is (equal '(:ok)
+                      (p2-call types "[method]fields.append"
+                               fields "x-test" (list 33))))
+           (is (equal '((49) (33))
+                      (p2-call types "[method]fields.get" fields "x-test")))
+           (is (equal '(:ok)
+                      (p2-call types "[method]fields.delete" fields "x-test")))
+           (is (not (p2-call types "[method]fields.has" fields "x-test")))
+           ;; header-error cases (0.2 has exactly these three)
+           (is (equal '(:err "forbidden")
+                      (p2-call types "[method]fields.set"
+                               fields "Host" (list (list 49)))))
+           (is (equal '(:err "invalid-syntax")
+                      (p2-call types "[method]fields.set"
+                               fields "X Y" (list (list 49)))))
+           (is (equal '(:err "invalid-syntax")
+                      (p2-call types "[method]fields.append"
+                               fields "x" (list 13 10))))
+           ;; 0.2 has no `size-exceeded' case: the host limit is reported
+           ;; as invalid-syntax, never as an undeclared variant case
+           (is (equal '(:err "invalid-syntax")
+                      (p2-call types "[method]fields.set"
+                               fields "x"
+                               (list (make-list 70000 :initial-element 97)))))
+           ;; clone is a deep, mutable copy
+           (let* ((orig (p2-http-fields types '("A" (49))))
+                  (clone (p2-http-marker-rep
+                          (p2-call types "[method]fields.clone" orig))))
+             (is (eq :ok (car (p2-call types "[method]fields.set"
+                                       clone "A" (list (list 50))))))
+             (is (equal '((49))
+                        (p2-call types "[method]fields.get" orig "A")))
+             (is (equal '((50))
+                        (p2-call types "[method]fields.get" clone "A"))))
+           ;; from-list rejects the whole list
+           (is (equal '(:err "invalid-syntax")
+                      (p2-call types "[static]fields.from-list"
+                               (list (list "A" (list 49))
+                                     (list "bad name" (list 49))))))
+           (is (equal '(:err "forbidden")
+                      (p2-call types "[static]fields.from-list"
+                               (list (list "transfer-encoding" (list 49)))))))
+      (wasmdown.wasi:close-wasi-context ctx))))
+
+;;; ---- request / options / bodies ------------------------------------
+
+(test wasi-preview2/http-request-and-options-surface
+  (let ((ctx (wasmdown.wasi:make-wasi-context)))
+    (unwind-protect
+         (let* ((types (wasmdown.wasi:p2-http-types-instance ctx "0.2.12"))
+                (request (p2-http-request types 8080)))
+           (is (equal '("get")
+                      (p2-call types "[method]outgoing-request.method"
+                               request)))
+           (is (equal '(:ok)
+                      (p2-call types "[method]outgoing-request.set-method"
+                               request (cons "other" "PURGE"))))
+           (is (equal '("other" . "PURGE")
+                      (p2-call types "[method]outgoing-request.method"
+                               request)))
+           (is (equal '(:err)
+                      (p2-call types "[method]outgoing-request.set-method"
+                               request (cons "other" "BAD METHOD"))))
+           (is (equal '(:ok)
+                      (p2-call types "[method]outgoing-request.set-scheme"
+                               request (cons :some (list "HTTPS")))))
+           (is (equal (cons :some (list "HTTPS"))
+                      (p2-call types "[method]outgoing-request.scheme"
+                               request)))
+           (is (equal '(:err)
+                      (p2-call types "[method]outgoing-request.set-authority"
+                               request (cons :some "exa mple"))))
+           (is (equal '(:ok)
+                      (p2-call types
+                               "[method]outgoing-request.set-path-with-query"
+                               request (cons :some "/a/b?c=d"))))
+           (is (equal (cons :some "/a/b?c=d")
+                      (p2-call types
+                               "[method]outgoing-request.path-with-query"
+                               request)))
+           ;; headers are an immutable child view
+           (let ((fields (p2-http-marker-rep
+                          (p2-call types "[method]outgoing-request.headers"
+                                   request))))
+             (is (equal '(:err "immutable")
+                        (p2-call types "[method]fields.set"
+                                 fields "A" (list (list 49))))))
+           ;; request-options
+           (let ((options (p2-http-marker-rep
+                           (p2-call types "[constructor]request-options"))))
+             (is (eq :none (p2-call types
+                                   "[method]request-options.connect-timeout"
+                                   options)))
+             (is (equal '(:ok)
+                        (p2-call types
+                                 "[method]request-options.set-connect-timeout"
+                                 options (cons :some 1000000))))
+             (is (equal (cons :some 1000000)
+                        (p2-call types
+                                 "[method]request-options.connect-timeout"
+                                 options)))
+             ;; a zero duration cannot be honoured: result err (no payload)
+             (is (equal '(:err)
+                        (p2-call types
+                                 "[method]request-options.set-first-byte-timeout"
+                                 options (cons :some 0))))
+             (is (eq :none (p2-call types
+                                   "[method]request-options.first-byte-timeout"
+                                   options))))
+           ;; outgoing-body: write/finish and a one-shot stream
+           (let* ((body-result (p2-call types
+                                       "[method]outgoing-request.body"
+                                        request))
+                  (body (p2-http-marker-rep (cdr body-result))))
+             (is (eq :ok (car body-result)))
+             (is (equal '(:err)
+                        (p2-call types "[method]outgoing-request.body"
+                                 request)))
+             (let* ((write-result (p2-call types
+                                           "[method]outgoing-body.write"
+                                           body))
+                    (stream (p2-http-marker-rep (cdr write-result)))
+                    (streams (wasmdown.wasi:p2-streams-instance
+                              ctx "0.2.12")))
+               (is (eq :ok (car write-result)))
+               (let ((permit (p2-call streams "[method]output-stream.check-write"
+                                      stream)))
+                 (is (eq :ok (car permit)))
+                 (is (plusp (cdr permit))))
+               (is (equal '(:ok)
+                          (p2-call streams "[method]output-stream.write"
+                                   stream (list 104 105))))
+               (is (equal '(:err)
+                          (p2-call types "[method]outgoing-body.write"
+                                   body)))
+               (is (equal '(:ok)
+                          (p2-call types "[static]outgoing-body.finish"
+                                   body :none)))
+               (is (eq :err
+                       (car (p2-call types "[static]outgoing-body.finish"
+                                     body :none)))))
+             ;; a Content-Length that disagrees with the bytes written is
+             ;; the WIT's HTTP-request-body-size
+             (let* ((fields (p2-http-fields types
+                                            '("content-length" (49))))
+                    (req2 (p2-http-marker-rep
+                           (p2-call types
+                                    "[constructor]outgoing-request" fields)))
+                    (body2 (p2-http-marker-rep
+                            (cdr (p2-call types
+                                          "[method]outgoing-request.body"
+                                          req2))))
+                    (stream2 (p2-http-marker-rep
+                              (cdr (p2-call types
+                                            "[method]outgoing-body.write"
+                                            body2))))
+                    (streams (wasmdown.wasi:p2-streams-instance
+                              ctx "0.2.12")))
+               (p2-call streams "[method]output-stream.check-write" stream2)
+               (p2-call streams "[method]output-stream.write" stream2
+                        (list 104 105))
+               (let ((finish (p2-call types "[static]outgoing-body.finish"
+                                      body2 :none)))
+                 (is (eq :err (car finish)))
+                 (is (string= "HTTP-request-body-size"
+                              (car (cdr finish))))))))
+      (wasmdown.wasi:close-wasi-context ctx))))
+
+;;; ---- outgoing-handler over a loopback server -----------------------
+
+(test wasi-preview2/http-loopback-get
+  (with-p2-http-server
+      (port
+       (p2-http-response 200 :body "hello"
+                             :extra (format nil "X-Reply: yes~c~c"
+                                            #\Return #\Newline))
+       got)
+    (let* ((net (p2-http-net))
+           (ctx (p2-http-ctx :net net))
+           (types (wasmdown.wasi:p2-http-types-instance ctx "0.2.12"))
+           (handler (wasmdown.wasi:p2-http-outgoing-handler-instance
+                     ctx "0.2.12")))
+      (unwind-protect
+           (let* ((request (p2-http-request types port :path "/hi?x=1"))
+                  (handle (p2-http-handle handler request))
+                  (future (p2-http-future-rep handle)))
+             (is (eq :ok (car handle)))
+             ;; a pollable is exposed and becomes ready with the response
+             (let ((pollable (p2-http-marker-rep
+                              (p2-call types
+                                       "[method]future-incoming-response.subscribe"
+                                       future))))
+               (is (not (null pollable))))
+             (let* ((value (p2-http-future-wait types future))
+                    (inner (p2-http-future-inner value)))
+               (is (eq :some (car value)))
+               (is (eq :ok (car inner)))
+               (let ((response (p2-http-marker-rep (cdr inner))))
+                 (is (= 200 (p2-http-status types response)))
+                 (is (equal '((121 101 115))
+                            (p2-http-headers-field types response "x-reply")))
+                 (let* ((body (p2-http-body-of types response))
+                        (stream (p2-http-stream-of types body)))
+                   (is (string= "hello"
+                                (p2-http-bytes-string
+                                 (p2-http-read-all ctx stream))))
+                   (let* ((trailers-marker
+                            (p2-call types "[static]incoming-body.finish"
+                                     body))
+                          (trailers (p2-http-marker-rep trailers-marker)))
+                     (is (equal (cons :some (cons :ok (cons :ok :none)))
+                                (p2-call types
+                                         "[method]future-trailers.get"
+                                         trailers))))))
+               ;; a second get reports the retrieval error, not the value
+               (is (equal '(:some :err)
+                          (p2-call types
+                                   "[method]future-incoming-response.get"
+                                   future)))
+               (is (search "GET /hi?x=1 HTTP/1.1" (car got)))
+               (is (search (format nil "Host: 127.0.0.1:~d" port) (car got)))))
+        (wasmdown.wasi:close-wasi-context ctx)))))
+
+(test wasi-preview2/http-loopback-request-body
+  (with-p2-http-server
+      (port (p2-http-response 200 :body "ok") got)
+    (let* ((net (p2-http-net))
+           (ctx (p2-http-ctx :net net))
+           (types (wasmdown.wasi:p2-http-types-instance ctx "0.2.12"))
+           (handler (wasmdown.wasi:p2-http-outgoing-handler-instance
+                     ctx "0.2.12"))
+           (streams (wasmdown.wasi:p2-streams-instance ctx "0.2.12")))
+      (unwind-protect
+           (let* ((fields (p2-http-fields types
+                                          '("content-length" (53))))
+                  (request (p2-http-request types port :headers fields
+                                                    :path "/post"))
+                  (_method (p2-call types
+                                    "[method]outgoing-request.set-method"
+                                    request (list "post")))
+                  (body (p2-http-marker-rep
+                         (cdr (p2-call types
+                                       "[method]outgoing-request.body"
+                                       request))))
+                  (stream (p2-http-marker-rep
+                           (cdr (p2-call types
+                                         "[method]outgoing-body.write"
+                                         body)))))
+             (p2-call streams "[method]output-stream.check-write" stream)
+             (is (equal '(:ok)
+                        (p2-call streams "[method]output-stream.write"
+                                 stream (list 104 101 108 108 111))))
+             (is (equal '(:ok)
+                        (p2-call types "[static]outgoing-body.finish"
+                                 body :none)))
+             (let* ((handle (p2-http-handle handler request))
+                    (value (p2-http-future-wait
+                            types (p2-http-future-rep handle)))
+                    (inner (p2-http-future-inner value)))
+               (is (eq :ok (car inner)))
+               (let ((response (p2-http-marker-rep (cdr inner))))
+                 (is (= 200 (p2-http-status types response)))
+                 (let ((body (p2-http-body-of types response)))
+                   (is (string= "ok"
+                                (p2-http-bytes-string
+                                 (p2-http-read-all
+                                  ctx (p2-http-stream-of types body))))))))
+             (is (search "POST /post HTTP/1.1" (car got)))
+             (is (search "hello" (car got))))
+        (wasmdown.wasi:close-wasi-context ctx)))))
+
+(test wasi-preview2/http-loopback-chunked-trailers
+  (let ((response (format nil "HTTP/1.1 200 OK~c~cTransfer-Encoding: chunked~c~c~c~c2~c~cab~c~c2~c~ccd~c~c0~c~cX-Trail: t~c~c~c~c"
+                          #\Return #\Newline #\Return #\Newline
+                          #\Return #\Newline #\Return #\Newline
+                          #\Return #\Newline #\Return #\Newline
+                          #\Return #\Newline #\Return #\Newline
+                          #\Return #\Newline #\Return #\Newline)))
+    (with-p2-http-server (port response got)
+      (let* ((net (p2-http-net))
+             (ctx (p2-http-ctx :net net))
+             (types (wasmdown.wasi:p2-http-types-instance ctx "0.2.12"))
+             (handler (wasmdown.wasi:p2-http-outgoing-handler-instance
+                       ctx "0.2.12")))
+        (unwind-protect
+             (let* ((request (p2-http-request types port))
+                    (value (p2-http-future-wait
+                            types
+                            (p2-http-future-rep
+                             (p2-http-handle handler request))))
+                    (inner (p2-http-future-inner value)))
+               (is (eq :ok (car inner)))
+               (let* ((response (p2-http-marker-rep (cdr inner)))
+                      (body (p2-http-body-of types response))
+                      (stream (p2-http-stream-of types body)))
+                 (is (string= "abcd"
+                              (p2-http-bytes-string
+                               (p2-http-read-all ctx stream))))
+                 (let* ((trailers (p2-http-marker-rep
+                                   (p2-call types
+                                            "[static]incoming-body.finish"
+                                            body)))
+                        (value (p2-call types
+                                        "[method]future-trailers.get"
+                                        trailers)))
+                   (is (eq :some (car value)))
+                   (is (eq :ok (car (cdr value))))
+                   (is (eq :ok (car (cdr (cdr value)))))
+                   (let* ((opt (cddr (cdr value)))
+                          (marker (cdr opt))
+                          (fields (p2-http-marker-rep marker)))
+                     (is (eq :some (car opt)))
+                     (is (equal '((116))
+                                (p2-call types "[method]fields.get"
+                                         fields "x-trail")))))))
+          (wasmdown.wasi:close-wasi-context ctx))))))
+
+;;; ---- error mapping -------------------------------------------------
+
+(test wasi-preview2/http-error-mapping
+  ;; a request without an authority is rejected by handle itself
+  (let ((ctx (wasmdown.wasi:make-wasi-context)))
+    (unwind-protect
+         (let* ((types (wasmdown.wasi:p2-http-types-instance ctx "0.2.12"))
+                (handler (wasmdown.wasi:p2-http-outgoing-handler-instance
+                          ctx "0.2.12"))
+                (request (p2-http-marker-rep
+                          (p2-call types "[constructor]outgoing-request"
+                                   (p2-http-fields types)))))
+           (is (equal '(:err "HTTP-request-URI-invalid")
+                      (p2-http-handle handler request))))
+      (wasmdown.wasi:close-wasi-context ctx)))
+  ;; https without an embedder transport is configuration-error
+  (let ((ctx (wasmdown.wasi:make-wasi-context)))
+    (unwind-protect
+         (let* ((types (wasmdown.wasi:p2-http-types-instance ctx "0.2.12"))
+                (handler (wasmdown.wasi:p2-http-outgoing-handler-instance
+                          ctx "0.2.12"))
+                (request (p2-http-request types 443)))
+           (p2-call types "[method]outgoing-request.set-scheme"
+                    request (cons :some (list "HTTPS")))
+           (is (equal '(:err "configuration-error")
+                      (p2-http-handle handler request))))
+      (wasmdown.wasi:close-wasi-context ctx)))
+  ;; the network authority refuses an undeclared destination THROUGH
+  ;; the future (a protocol error, not a handle error)
+  (let* ((net (p2-http-net
+               :outbound (list (wasmdown.wasi:make-wasi-endpoint
+                                :address '(10 9 9 9)))))
+         (ctx (p2-http-ctx :net net))
+         (types (wasmdown.wasi:p2-http-types-instance ctx "0.2.12"))
+         (handler (wasmdown.wasi:p2-http-outgoing-handler-instance
+                   ctx "0.2.12")))
+    (unwind-protect
+         (let* ((request (p2-http-request types 80))
+                (value (p2-http-future-wait
+                        types
+                        (p2-http-future-rep
+                         (p2-http-handle handler request))))
+                (inner (p2-http-future-inner value)))
+           (is (eq :err (car inner)))
+           (is (string= "destination-IP-prohibited" (car (cdr inner)))))
+      (wasmdown.wasi:close-wasi-context ctx)))
+  ;; a refused connection is connection-refused
+  (multiple-value-bind (port fd) (p2-http-listener)
+    (wasmdown.wasi::%close-fd fd)
+    (let* ((net (p2-http-net))
+           (ctx (p2-http-ctx :net net))
+           (types (wasmdown.wasi:p2-http-types-instance ctx "0.2.12"))
+           (handler (wasmdown.wasi:p2-http-outgoing-handler-instance
+                     ctx "0.2.12")))
+      (unwind-protect
+           (let* ((request (p2-http-request types port))
+                  (value (p2-http-future-wait
+                          types
+                          (p2-http-future-rep
+                           (p2-http-handle handler request))))
+                  (inner (p2-http-future-inner value)))
+             (is (eq :err (car inner)))
+             (is (string= "connection-refused" (car (cdr inner)))))
+        (wasmdown.wasi:close-wasi-context ctx))))
+  ;; http-error-code downcasts the error an HTTP stream failure carries
+  (let ((ctx (wasmdown.wasi:make-wasi-context)))
+    (unwind-protect
+         (let* ((types (wasmdown.wasi:p2-http-types-instance ctx "0.2.12"))
+                (code (cons "HTTP-response-timeout" nil))
+                (err (wasmdown.wasi:p2-error "timeout" "http" code)))
+           (is (equal (cons :some code)
+                      (p2-call types "http-error-code" err)))
+           (is (eq :none
+                   (p2-call types "http-error-code"
+                            (wasmdown.wasi:p2-error "plain")))))
+      (wasmdown.wasi:close-wasi-context ctx))))

@@ -22,9 +22,9 @@ Component Model (canonical ABI, resources, async), and WASI hosts — with
 | Component Model | Full lane green: binary + text, validation, instantiation/linking, canonical ABI, resources, async scheduling |
 | WASI Preview 1 | Full legacy `wasi_snapshot_preview1` surface (46 imports, `sock_*` included; upstream P1 subset 72/72) |
 | WASI 0.3.2 providers | `clocks`, `random`, `cli`, `filesystem`, `sockets` and `http` under an explicit capability model |
-| WASI 0.2 component facade | 27 of 31 stable interfaces bound at exact release names (legacy compatibility line) |
+| WASI 0.2 component facade | 29 of 31 stable interfaces bound at exact release names (legacy compatibility line) |
 | WASI network | TCP/UDP/DNS via `wasi:sockets/types` + `ip-name-lookup` under declared `--net`/`--listen`/`--dns` authority; upstream network subset 30/30 |
-| `wasi:http` | 0.3.2 `types` + `client.send` (streaming uploads, chunked trailers) and incoming `handler`/`service` via `wasmdown serve`; TLS is embedder-only |
+| `wasi:http` | 0.3.2 `types` + `client.send` (streaming uploads, chunked trailers) and incoming `handler`/`service` via `wasmdown serve`; 0.2.0–0.2.12 outgoing `types` + `outgoing-handler` (0.2 incoming-handler not yet); TLS is embedder-only |
 | Threads / atomics, FASL cache, optimized or AOT backend | Not implemented |
 | Annotations proposal | Out of scope |
 

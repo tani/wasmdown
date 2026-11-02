@@ -490,6 +490,28 @@
    #:p2-network-instance
    #:p2-instance-network-instance
    #:p2-ip-name-lookup-instance
+   ;; wasi:http@0.2 — the outgoing import surface and world graphs
+   #:p2-http-package
+   #:p2-http-resource-ct
+   #:p2-http-types-instance
+   #:p2-http-outgoing-handler-instance
+   #:p2-http-handle
+   #:p2-http-world
+   #:preview2-proxy-world
+   #:preview2-http-imports-world
+   #:preview2-world-provider
+   #:preview2-proxy-provider
+   #:preview2-http-imports-provider
+   ;; incoming-handler-side construction helpers (no handler provider yet)
+   #:make-p2-http-incoming-request
+   #:make-p2-http-response-outparam
+   #:p2-http-incoming-request
+   #:p2-http-outgoing-response
+   #:p2-http-outgoing-body-body-bytes
+   #:p2-http-outgoing-body-written
+   #:p2-http-outgoing-body-trailers
+   #:p2-http-outgoing-body-finished-p
+   #:p2-http-response-outparam-set-fn
    ;; clocks
    #:monotonic-now
    #:monotonic-resolution

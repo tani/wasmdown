@@ -88,14 +88,17 @@ package set keeps `use' paths resolvable."
 ;;; INDEX and resolve it through HOST-RESOURCE-REP with the resource's
 ;;; ct (exactly as the 0.3 providers do).
 
-(defstruct (p2-error (:constructor %make-p2-error (message &optional (kind "other"))))
-  "A wasi:io/error error object: a debug string plus the P2 error
-kind it should downcast to."
+(defstruct (p2-error (:constructor %make-p2-error (message &optional (kind "other")
+                                                              code)))
+  "A wasi:io/error error object: a debug string, the P2 error kind it
+should downcast to (a string label), and, for an HTTP stream failure,
+the full `wasi:http/types.error-code' domain value CODE."
   (message "" :type string)
-  (kind "other" :type string))
+  (kind "other" :type string)
+  (code nil))
 
-(defun p2-error (message &optional (kind "other"))
-  (%make-p2-error message kind))
+(defun p2-error (message &optional (kind "other") code)
+  (%make-p2-error message kind code))
 
 (defun p2-error-ct (version)
   (wasmdown.wit:wit-type->ct
@@ -304,7 +307,8 @@ provider instance for CONTEXT at VERSION."
             (lambda () (p2-exit-instance version)))
       (setf builders (p2-register-io-cli context version builders))
       (setf builders (p2-register-filesystem context version builders))
-      (setf builders (p2-register-sockets context version builders)))
+      (setf builders (p2-register-sockets context version builders))
+      (setf builders (p2-register-http context version builders)))
     ;; an interface that declares only types needs a provider with no
     ;; implementations: it exists for its exported type identities
     (dolist (short '("clocks" "random" "cli" "io" "filesystem" "sockets" "http"))
@@ -323,29 +327,20 @@ provider instance for CONTEXT at VERSION."
                         builders))))))))
     (nreverse builders)))
 
-(defun preview2-command-provider (context &key (version "0.2.12") imports)
-  "Bind every import the component DECLARES to a provider of VERSION.
-IMPORTS is the declared contract list of import names; NIL means the
-whole `wasi:cli/command' world. An interface with no provider is a
-link error naming it and the version; a types-only import needs no
-host binding."
+(defun p2-world-import-names (world)
+  "The import names a resolved world declares, in order."
+  (loop for item in (wasmdown.wit:wit-world-imports world)
+        collect (%world-import-name item)))
+
+(defun p2-provider-for-declared (context version declared)
+  "Bind every DECLARED import name to a provider of VERSION. An
+interface with no builder is a link error naming it and the version; a
+types-only import needs no host binding."
   (let* ((builders (p2-builder-table context version))
-         (declared (or imports
-                       (loop for item in
-                             (wasmdown.wit:wit-world-imports
-                              (preview2-command-world :version version))
-                             collect (wasmdown.wit:interface-import-name
-                                      (wasmdown.wit:wit-world-item-target item)))))
          (providers '()))
     (dolist (name declared)
       (let ((hit (assoc name builders :test #'string=)))
         (cond
-          ;; HTTP is excluded globally, not just on the 0.3 path: an
-          ;; exact-version 0.2 import must get the same canonical
-          ;; message instead of a generic "no provider".
-          ((%wasi-http-import-name-p name)
-           (error 'wasmdown.wit:wit-error
-                  :message +wasi-http-unsupported-message+))
           (hit (push (cons name (funcall (cdr hit))) providers))
           ;; a types-only import carries no host binding
           ((let ((iface (p2-interface-by-name name)))
@@ -358,6 +353,37 @@ host binding."
                   :message (format nil "wasi ~a interface `~a` has no provider"
                                    version name))))))
     (nreverse providers)))
+
+(defun preview2-world-provider (context world &key (version "0.2.12") imports)
+  "Bind every import WORLD declares (or IMPORTS, when supplied) to a
+provider of VERSION. This is the generic world -> provider graph used
+by the command, `wasi:http/imports' and `wasi:http/proxy' worlds."
+  (p2-provider-for-declared
+   context version
+   (or imports (p2-world-import-names world))))
+
+(defun preview2-command-provider (context &key (version "0.2.12") imports)
+  "Bind every import the component DECLARES to a provider of VERSION.
+IMPORTS is the declared contract list of import names; NIL means the
+whole `wasi:cli/command' world."
+  (preview2-world-provider
+   context (preview2-command-world :version version)
+   :version version :imports imports))
+
+(defun preview2-proxy-provider (context &key (version "0.2.12") imports)
+  "The provider graph of the `wasi:http/proxy' world: the cli/io/clocks/
+random imports plus `wasi:http/types' and `wasi:http/outgoing-handler'.
+The world's exported incoming-handler is the guest's obligation."
+  (preview2-world-provider
+   context (preview2-proxy-world :version version)
+   :version version :imports imports))
+
+(defun preview2-http-imports-provider (context &key (version "0.2.12")
+                                                 imports)
+  "The provider graph of the `wasi:http/imports' world."
+  (preview2-world-provider
+   context (preview2-http-imports-world :version version)
+   :version version :imports imports))
 
 (defun p2-interface-by-name (name)
   "The parsed interface whose canonical import name is NAME, across
@@ -381,21 +407,34 @@ every vendored package, or NIL."
    :packages (p2-packages version)))
 
 (defstruct (p2-input-stream (:constructor %make-p2-input-stream
-                                  (&key stream fd position-offset)))
-  "An input stream: a CL stream, or a host fd with an optional
-positional offset (a file stream created by read-via-stream)."
+                                  (&key stream fd position-offset read-fn pollable)))
+  "An input stream: a CL stream, a host fd with an optional positional
+offset (a file stream created by read-via-stream), or a host READ-FN
+(an HTTP response body). READ-FN is (max) -> (values octets eof-p
+error-code) where OCTETS is a ub8 vector, EOF-P ends the stream, and
+ERROR-CODE is an HTTP error-code domain value (or NIL), so an HTTP body
+failure reaches the guest as `stream-error.last-operation-failed`.
+POLLABLE, when present, reports readiness for `subscribe'."
   (stream nil)
   (fd -1 :type fixnum)
   (position-offset nil)
+  (read-fn nil)
+  (pollable nil)
   (closed nil))
 
 (defstruct (p2-output-stream (:constructor %make-p2-output-stream
-                                   (&key stream fd position-offset appending)))
-  "An output stream: a CL stream, or a host fd with an optional
-positional offset (write-via-stream) or append semantics."
+                                   (&key stream fd position-offset appending
+                                         sink flush-fn)))
+  "An output stream: a CL stream, a host fd with an optional
+positional offset (write-via-stream) or append semantics, or a host
+SINK (an HTTP request body) whose callable accepts a ub8 vector of
+offered bytes and returns the count accepted (or a (:failed . reason)
+cons). FLUSH-FN, when present, completes buffered output."
   (stream nil)
   (fd -1 :type fixnum)
   (position-offset nil)
+  (sink nil)
+  (flush-fn nil)
   (appending nil)
   (closed nil)
   ;; the permit the last `check-write' granted, i.e. "the number of
@@ -430,12 +469,14 @@ never a silently truncated sink.")
   "The WIT `stream-error::closed` value."
   (cons :closed nil))
 
-(defun p2-failed-error (message version)
+(defun p2-failed-error (message version &optional (kind "other") code)
   "The WIT `stream-error::last-operation-failed` value. Its payload is
 `own<error>', so the domain value is an OWN-HANDLE MARKER (the runtime
-allocates the handle when it lowers the result), never a bare rep."
+allocates the handle when it lowers the result), never a bare rep.
+KIND/CODE carry an HTTP error-code for `http-error-code' to recover."
   (cons :last-operation-failed
-        (list :own-handle (p2-error-ct version) (p2-error message))))
+        (list :own-handle (p2-error-ct version)
+              (p2-error message kind code))))
 
 
 (defun %p2-char->octets (char)
@@ -489,10 +530,20 @@ empty list, or otherwise fail with `closed`.\" So an EMPTY octet vector
 is `ok(list<u8>)` for an OPEN stream with nothing promptly available
 \(a nonblocking fd's EWOULDBLOCK) and for every zero-length request;
 `:closed` is the stream's own ended/closed state. Returns an octet
-vector, :closed, or (:failed . errno) when the host read itself failed."
+vector, :closed, (:failed . errno) when the host read itself failed, or
+(:http-error . error-code) for an HTTP body failure."
   (let ((len (min len +p2-io-chunk+)))
     (cond
       ((p2-input-stream-closed rep) :closed)
+      ((and (p2-input-stream-read-fn rep) (zerop len)) #())
+      ((p2-input-stream-read-fn rep)
+       (multiple-value-bind (bytes eof error)
+           (funcall (p2-input-stream-read-fn rep) len)
+         (cond (error (cons :http-error error))
+               (eof :closed)
+               ((and bytes (plusp (length bytes)))
+                (coerce bytes '(vector (unsigned-byte 8))))
+               (t #()))))
       ((p2-input-stream-stream rep)
        (let ((stream (p2-input-stream-stream rep)))
          (cond
@@ -542,7 +593,8 @@ vector, :closed, or (:failed . errno) when the host read itself failed."
 \(:failed . errno) when the host read itself failed."
   (let ((data (p2-in-read rep len)))
     (cond ((eq data :closed) :closed)
-          ((and (consp data) (eq (car data) :failed)) data)
+          ((and (consp data) (member (car data) '(:failed :http-error)))
+           data)
           (t (length data)))))
 
 (defun p2-out-write-n (rep bytes)
@@ -552,6 +604,12 @@ positions at the end first (append-via-stream is the WIT's \"write with
 O_APPEND\", whatever the descriptor's own flags are)."
   (cond
     ((p2-output-stream-closed rep) (values 0 :closed))
+    ((p2-output-stream-sink rep)
+     (let ((r (funcall (p2-output-stream-sink rep)
+                       (coerce bytes '(vector (unsigned-byte 8))))))
+       (cond ((consp r) (values 0 r))
+             ((integerp r) (values r :ok))
+             (t (values 0 (cons :failed :sink))))))
     ((p2-output-stream-stream rep)
      (let ((stream (p2-output-stream-stream rep))
            (vec (coerce bytes '(vector (unsigned-byte 8)))))
@@ -708,6 +766,12 @@ flush failed."
            (if (not (eq drained t))
                drained
                (cond
+                 ((and (p2-output-stream-flush-fn rep)
+                       (null (p2-output-stream-pending rep)))
+                  (let ((r (funcall (p2-output-stream-flush-fn rep))))
+                    (cond ((consp r) r)
+                          ((null r) (cons :failed nil))
+                          (t t))))
                  ((and (p2-output-stream-stream rep)
                        (null (p2-output-stream-pending rep)))
                   (let ((stream (p2-output-stream-stream rep)))
@@ -874,14 +938,17 @@ output\", so no byte may be dropped here."
 bytes available or reached hangup/error, or when the stream is closed.
 A CL-backed stream has no readiness probe, so it stays always-ready
 (claiming otherwise would deadlock a waiting guest)."
-  (if (or (p2-input-stream-closed rep)
-          (minusp (p2-input-stream-fd rep)))
-      (%make-p2-pollable
-       :ready-p (lambda () t)
-       :block (lambda (timeout) (declare (ignore timeout)) t))
-      (%p2-pollable-from-fd
-       (p2-input-stream-fd rep)
-       (logior +pollin+ +pollhup+ +pollerr+ +pollnval+))))
+  (cond
+    ((p2-input-stream-pollable rep) (p2-input-stream-pollable rep))
+    ((or (p2-input-stream-closed rep)
+         (minusp (p2-input-stream-fd rep)))
+     (%make-p2-pollable
+      :ready-p (lambda () t)
+      :block (lambda (timeout) (declare (ignore timeout)) t)))
+    (t
+     (%p2-pollable-from-fd
+      (p2-input-stream-fd rep)
+      (logior +pollin+ +pollhup+ +pollerr+ +pollnval+)))))
 
 (defun p2-output-subscribe-pollable (rep)
   "A pollable for an output-stream rep: resolves when the sink can
@@ -911,6 +978,10 @@ accept bytes again, and is always ready once the stream is closed."
                   (cons :err (p2-failed-error
                               (format nil "read failed (errno ~a)" (cdr result))
                               version)))
+                 ((and (consp result) (eq (car result) :http-error))
+                  (cons :err (p2-failed-error
+                              (format nil "read failed: ~a" (cdr result))
+                              version "http" (cdr result))))
                  (t (cons :ok (coerce result 'list)))))
              (wrap-skip (result)
                (cond ((eq result :closed) (cons :err (p2-closed-error)))
@@ -918,6 +989,10 @@ accept bytes again, and is always ready once the stream is closed."
                       (cons :err (p2-failed-error
                                   (format nil "skip failed (errno ~a)" (cdr result))
                                   version)))
+                     ((and (consp result) (eq (car result) :http-error))
+                      (cons :err (p2-failed-error
+                                  (format nil "skip failed: ~a" (cdr result))
+                                  version "http" (cdr result))))
                      (t (cons :ok result)))))
       (declare (ignore context))
       (provider-instance
@@ -2255,4 +2330,1070 @@ handle the guest was not given can never widen its authority."
     (bind "udp-create-socket"
           (lambda () (p2-udp-create-instance context version)))
     (bind "udp" (lambda () (p2-udp-instance context version)))
+    builders))
+
+;;; ===============================================================
+;;; wasi:http@0.2.x — the OUTGOING import surface.
+;;;
+;;; The 0.2 HTTP ABI is RESOURCE-shaped and differs from 0.3:
+;;;
+;;;   * `outgoing-request' is constructed from `headers' alone; its
+;;;     body is an `outgoing-body' child obtained (once) with `body'
+;;;     and written through a `wasi:io/streams.output-stream';
+;;;   * `outgoing-body.finish(trailers)' consumes the body and closes
+;;;     the request contents;
+;;;   * `outgoing-handler.handle(request, options)' returns a
+;;;     `future-incoming-response' resource, whose `get' yields an
+;;;     `incoming-response' whose body is an `incoming-body'
+;;;     (input-stream + future-trailers).
+;;;
+;;; This file reuses the 0.3 HTTP/1.1 implementation where the SHAPE is
+;;; compatible:
+;;;
+;;;   * a 0.2 `outgoing-request' rep IS a `wasi-http-request' (the 0.3
+;;;     request rep), so method/scheme/authority/path validation, the
+;;;     serialized head and header semantics are the same code;
+;;;   * sending goes through HTTP-CLIENT-SEND with the context's
+;;;     transport and network authority (the plain TCP transport for
+;;;     http, embedder transports for other schemes);
+;;;   * an `incoming-response' rep IS a `wasi-http-response' (status +
+;;;     fields + `wasi-http-body'), and its bytes are decoded by
+;;;     %HTTP-BODY-READ.
+;;;
+;;; What is NEW here is the P2 resource graph itself: P2-typed
+;;; `fields'/`request-options' handles, the lazy outgoing body, the
+;;; body stream/future pair, and the two pollable futures. Every
+;;; resource ct is built from the P2 `wasi:http/types@<version>'
+;;; interface, never the 0.3 one, so a handle allocated here can only
+;;; ever be resolved by this provider graph.
+;;;
+;;; `wasi:http/incoming-handler' is NOT provided here (the serve side
+;;; is a separate slice); the `response-outparam' resource is exposed
+;;; with a pluggable SET-FN so an incoming handler can be attached
+;;; without changing this ABI.
+
+(defun p2-http-package (version)
+  (p2-package "http" version))
+
+(defun p2-http-resource-ct (version name)
+  "The ONE ct naming resource NAME in wasi:http/types@VERSION."
+  (wasmdown.wit:wit-type->ct
+   (p2-interface "http" "types" version)
+   (list :resource name)
+   :packages (p2-packages version)))
+
+(defun p2-http-take (version value name)
+  "Consume an OWN resource argument of type NAME."
+  (%http-take-resource value (p2-http-resource-ct version name)))
+
+(defun p2-http-borrow (version value name)
+  "Resolve a BORROWED resource argument of type NAME."
+  (p2-resource-rep (p2-http-resource-ct version name) value name))
+
+(defun p2-http-fields-marker (version fields)
+  "An immutable P2 `fields' handle over FIELDS."
+  (%fields-immutable-view fields :package (p2-http-package version)))
+
+;;; ---------------------------------------------------------------
+;;; Condition-backed pollables and futures.
+
+(defun %p2-http-condition-wait (mutex cond ready-p timeout-ns)
+  "Wait on COND until READY-P or TIMEOUT-NS; T when ready."
+  (sb-thread:with-mutex (mutex)
+    (loop until (funcall ready-p)
+          do (when (and timeout-ns
+                        (null (sb-thread:condition-wait
+                               cond mutex
+                               :timeout (/ timeout-ns 1d9))))
+               (return)))
+    (funcall ready-p)))
+
+(defun %p2-http-pollable (mutex cond ready-p)
+  (%make-p2-pollable
+   :ready-p ready-p
+   :block (lambda (timeout-ns)
+            (%p2-http-condition-wait mutex cond ready-p timeout-ns))))
+
+(defstruct (p2-http-future
+            (:constructor %make-p2-http-future
+                (&key state-fn value-fn (once-p t) payload
+                      (mutex (sb-thread:make-mutex :name "p2-http-future"))
+                      (cond (sb-thread:make-waitqueue :name "p2-http-future")))))
+  "A P2 HTTP future: STATE-FN answers readiness (a body-derived future),
+or READY is set by a worker. VALUE-FN produces the INNER
+`result<...>' domain value; GET wraps it in the outer option/result."
+  state-fn
+  value-fn
+  (once-p t)
+  consumed-p
+  dropped-p
+  payload
+  ready
+  mutex
+  cond)
+
+(defun p2-http-future-ready-now (future)
+  (or (p2-http-future-ready future)
+      (and (p2-http-future-state-fn future)
+           (funcall (p2-http-future-state-fn future)))))
+
+(defun p2-http-future-subscribe (version future)
+  (list :own-handle
+        (p2-pollable-ct version)
+        (%p2-http-pollable (p2-http-future-mutex future)
+                           (p2-http-future-cond future)
+                           (lambda () (p2-http-future-ready-now future)))))
+
+(defun p2-http-future-get (future)
+  "The `option<result<result<...>>>' of a P2 HTTP future."
+  (cond
+    ((not (p2-http-future-ready-now future)) :none)
+    ((and (p2-http-future-once-p future)
+          (p2-http-future-consumed-p future))
+     (cons :some (cons :err nil)))
+    (t
+     (when (p2-http-future-once-p future)
+       (setf (p2-http-future-consumed-p future) t))
+     (cons :some (funcall (p2-http-future-value-fn future))))))
+
+(defun %p2-http-future-resolve (future value-fn &optional payload)
+  "Make FUTURE ready with VALUE-FN as its inner result."
+  (sb-thread:with-mutex ((p2-http-future-mutex future))
+    (setf (p2-http-future-value-fn future) value-fn
+          (p2-http-future-payload future) payload
+          (p2-http-future-ready future) t)
+    (sb-thread:condition-broadcast (p2-http-future-cond future)))
+  future)
+
+;;; ---------------------------------------------------------------
+;;; Incoming bodies: a decoded byte queue + trailers.
+
+(defstruct (p2-http-body-state
+            (:constructor %make-p2-http-body-state
+                (&key body (mutex (sb-thread:make-mutex :name "p2-http-body"))
+                      (cond (sb-thread:make-waitqueue :name "p2-http-body")))))
+  body
+  (buffer (make-array 0 :element-type '(unsigned-byte 8)
+                        :adjustable t :fill-pointer 0))
+  (pos 0)
+  (mutex (sb-thread:make-mutex :name "p2-http-body"))
+  (cond (sb-thread:make-waitqueue :name "p2-http-body"))
+  (started-p nil)
+  (done-p nil)
+  (error nil)
+  (trailers nil)
+  (discard-p nil))
+
+(defun %p2-http-body-available (state)
+  (- (fill-pointer (p2-http-body-state-buffer state))
+     (p2-http-body-state-pos state)))
+
+(defun %p2-http-body-ready-p (state)
+  "Readiness probe: LOCK-FREE, because the pollable's wait holds the
+state mutex when it calls this."
+  (or (plusp (%p2-http-body-available state))
+      (p2-http-body-state-done-p state)
+      (p2-http-body-state-error state)))
+
+(defconstant +p2-http-body-high-water+ (* 8 1024 1024)
+  "The decoded-body queue's high-water mark. The pump waits while the
+guest is not reading, so an unread response body applies backpressure
+instead of growing the host heap without bound.")
+
+(defun %p2-http-body-pump (state)
+  "Decode the response body on a host thread, appending bytes to the
+queue and resolving the trailers state at EOF. The pump is the only
+caller of %HTTP-BODY-READ, so the chunked framing state machine is
+never re-entered by a non-blocking guest read."
+  (let ((body (p2-http-body-state-body state)))
+    (unwind-protect
+         (loop
+           (multiple-value-bind (bytes eof error)
+               (handler-case
+                   (let ((timeout (if (wasi-http-body-first-byte-p body)
+                                      (wasi-http-body-first-timeout body)
+                                      (wasi-http-body-between-timeout body))))
+                     (multiple-value-bind (b e)
+                         (%http-body-read body +p2-io-chunk+ timeout)
+                       (values b e nil)))
+                 (wasi-http-error (c)
+                   (values nil t (wasi-http-error-code c)))
+                 (error (c)
+                   (values nil t
+                           (cons "internal-error"
+                                 (cons :some (princ-to-string c))))))
+             (when (and bytes (plusp (length bytes)))
+               (sb-thread:with-mutex ((p2-http-body-state-mutex state))
+                 (setf (wasi-http-body-first-byte-p body) nil)
+                 (unless (p2-http-body-state-discard-p state)
+                   (let ((buf (p2-http-body-state-buffer state)))
+                     ;; backpressure: do not outrun a guest that is not
+                     ;; reading (or has only called finish, which sets
+                     ;; DISCARD-P and wakes this wait)
+                     (loop while (and (not (p2-http-body-state-discard-p state))
+                                      (> (fill-pointer buf)
+                                         +p2-http-body-high-water+))
+                           do (sb-thread:condition-wait
+                               (p2-http-body-state-cond state)
+                               (p2-http-body-state-mutex state)))
+                     (unless (p2-http-body-state-discard-p state)
+                       (dolist (b bytes)
+                         (vector-push-extend b buf)))))
+                 (sb-thread:condition-broadcast
+                  (p2-http-body-state-cond state))))
+             (when (or eof error)
+               (sb-thread:with-mutex ((p2-http-body-state-mutex state))
+                 (setf (p2-http-body-state-done-p state) t
+                       (p2-http-body-state-error state) error
+                       (p2-http-body-state-trailers state)
+                       (wasi-http-body-trailers body))
+                 (sb-thread:condition-broadcast
+                  (p2-http-body-state-cond state)))
+               (return))))
+      (%http-body-close body))))
+
+(defun %p2-http-body-start (state)
+  (unless (p2-http-body-state-started-p state)
+    (setf (p2-http-body-state-started-p state) t)
+    (if (null (p2-http-body-state-body state))
+        (sb-thread:with-mutex ((p2-http-body-state-mutex state))
+          (setf (p2-http-body-state-done-p state) t)
+          (sb-thread:condition-broadcast (p2-http-body-state-cond state)))
+        (sb-thread:make-thread (lambda () (%p2-http-body-pump state))
+                               :name "p2-http-body")))
+  state)
+
+(defun %p2-http-body-source (state max)
+  "Non-blocking source: (values octets eof-p error-code)."
+  (%p2-http-body-start state)
+  (sb-thread:with-mutex ((p2-http-body-state-mutex state))
+    (let* ((buf (p2-http-body-state-buffer state))
+           (pos (p2-http-body-state-pos state))
+           (avail (%p2-http-body-available state)))
+      (cond
+        ((plusp avail)
+         (let* ((n (min max avail))
+                (out (coerce (subseq buf pos (+ pos n))
+                             '(vector (unsigned-byte 8)))))
+           (incf (p2-http-body-state-pos state) n)
+           (when (= (p2-http-body-state-pos state) (fill-pointer buf))
+             (setf (fill-pointer buf) 0
+                   (p2-http-body-state-pos state) 0))
+           (sb-thread:condition-broadcast
+            (p2-http-body-state-cond state))
+           (values out nil nil)))
+        ((p2-http-body-state-error state)
+         (values nil nil (p2-http-body-state-error state)))
+        ((p2-http-body-state-done-p state)
+         (values nil t nil))
+        (t (values #() nil nil))))))
+
+(defun %p2-http-body-pollable (state)
+  (if (null (p2-http-body-state-body state))
+      (%make-p2-pollable :ready-p (lambda () t)
+                         :block (lambda (timeout) (declare (ignore timeout)) t))
+      (%p2-http-pollable (p2-http-body-state-mutex state)
+                         (p2-http-body-state-cond state)
+                         (lambda () (%p2-http-body-ready-p state)))))
+
+(defstruct (p2-http-incoming-body
+            (:constructor %make-p2-http-incoming-body
+                (&key state bytes source explicit-trailers)))
+  "An `incoming-body' rep. STATE is the network body queue; BYTES/SOURCE
+serve a body already in host hands (the incoming-handler side);
+EXPLICIT-TRAILERS is an option<fields rep> for such a body."
+  state
+  bytes
+  source
+  explicit-trailers
+  (stream-taken-p nil)
+  (finished-p nil)
+  (future nil))
+
+(defun %p2-http-bytes-source (bytes)
+  (let ((pos 0))
+    (lambda (max)
+      (if (>= pos (length bytes))
+          (values nil t nil)
+          (let ((n (min max (- (length bytes) pos))))
+            (prog1 (subseq bytes pos (+ pos n))
+              (incf pos n)))))))
+
+(defun %p2-http-incoming-body-from-response (version body)
+  (declare (ignore version))
+  (%make-p2-http-incoming-body
+   :state (and body (%make-p2-http-body-state :body body))))
+
+(defun %p2-http-incoming-body-stream (version body)
+  "incoming-body.stream: the sole input-stream for BODY."
+  (if (p2-http-incoming-body-stream-taken-p body)
+      (cons :err nil)
+      (progn
+        (setf (p2-http-incoming-body-stream-taken-p body) t)
+        (let* ((state (p2-http-incoming-body-state body))
+               (bytes (p2-http-incoming-body-bytes body))
+               (source (or (and state
+                                (lambda (max) (%p2-http-body-source state max)))
+                           (and bytes (%p2-http-bytes-source bytes))
+                           (p2-http-incoming-body-source body)
+                           (lambda (max) (declare (ignore max))
+                             (values nil t nil))))
+               (pollable (if state
+                             (%p2-http-body-pollable state)
+                             (%make-p2-pollable
+                              :ready-p (lambda () t)
+                              :block (lambda (timeout)
+                                       (declare (ignore timeout)) t)))))
+          (when state (%p2-http-body-start state))
+          (let ((rep (%make-p2-input-stream :read-fn source
+                                            :pollable pollable)))
+            (cons :ok (list :own-handle (p2-in-ct version) rep)))))))
+
+(defun %p2-http-incoming-body-finish (version body)
+  "incoming-body.finish: the future-trailers, discarding unread bytes."
+  (unless (p2-http-incoming-body-finished-p body)
+    (setf (p2-http-incoming-body-finished-p body) t)
+    (let ((state (p2-http-incoming-body-state body)))
+      (if state
+          (progn
+            (sb-thread:with-mutex ((p2-http-body-state-mutex state))
+              (setf (p2-http-body-state-discard-p state) t
+                    (p2-http-body-state-buffer state)
+                    (make-array 0 :element-type '(unsigned-byte 8)
+                                  :adjustable t :fill-pointer 0)
+                    (p2-http-body-state-pos state) 0)
+              (sb-thread:condition-broadcast
+               (p2-http-body-state-cond state)))
+            (%p2-http-body-start state)
+            (setf (p2-http-incoming-body-future body)
+                  (%make-p2-http-future
+                   :state-fn (lambda ()
+                               ;; lock-free: the pollable's wait already
+                               ;; holds this state's mutex
+                               (or (p2-http-body-state-done-p state)
+                                   (p2-http-body-state-error state)))
+                   :value-fn
+                   (lambda ()
+                     (sb-thread:with-mutex ((p2-http-body-state-mutex state))
+                       (let ((error (p2-http-body-state-error state))
+                             (trailers (p2-http-body-state-trailers state)))
+                         (cond
+                           (error (cons :ok (cons :err error)))
+                           (trailers
+                            (cons :ok
+                                  (cons :ok
+                                        (cons :some
+                                              (p2-http-fields-marker
+                                               version trailers)))))
+                           (t (cons :ok (cons :ok :none)))))))
+                   :mutex (p2-http-body-state-mutex state)
+                   :cond (p2-http-body-state-cond state))))
+          (let* ((explicit (p2-http-incoming-body-explicit-trailers body))
+                 (future (%make-p2-http-future
+                          :state-fn (lambda () t)
+                          :value-fn (lambda ()
+                                      (cons :ok
+                                            (cons :ok
+                                                  (if explicit
+                                                      (cons :some
+                                                            (p2-http-fields-marker
+                                                             version explicit))
+                                                      :none)))))))
+            (setf (p2-http-incoming-body-future body) future)))))
+  (list :own-handle
+        (p2-http-resource-ct version "future-trailers")
+        (p2-http-incoming-body-future body)))
+
+;;; ---------------------------------------------------------------
+;;; Incoming requests (constructed by the serve side; no handler here).
+
+(defstruct (p2-http-incoming-request
+            (:constructor make-p2-http-incoming-request
+                (&key (method (cons "get" nil)) path-with-query scheme
+                      authority (headers (make-wasi-fields)) body)))
+  method
+  path-with-query
+  scheme
+  authority
+  headers
+  body
+  (consumed-p nil))
+
+(defun %p2-http-incoming-request-of (version value)
+  (let ((req (p2-http-borrow version value "incoming-request")))
+    (unless (p2-http-incoming-request-p req)
+      (error 'wasmdown:host-error
+             :message "incoming-request: invalid handle"))
+    req))
+
+;;; ---------------------------------------------------------------
+;;; Outgoing bodies.
+
+(defstruct (p2-http-outgoing-body
+            (:constructor %make-p2-http-outgoing-body (&key request response)))
+  "An `outgoing-body' rep. It writes into its parent request's body
+buffer (streamed by HTTP-CLIENT-SEND) or, for an outgoing response,
+into BODY-BYTES."
+  request
+  response
+  (stream-taken-p nil)
+  (stream nil)
+  (written 0)
+  (finished-p nil)
+  (trailers nil)
+  (body-bytes nil)
+  (aborted-p nil))
+
+(defun %p2-http-outgoing-body-abort (body)
+  (setf (p2-http-outgoing-body-aborted-p body) t)
+  (let ((request (p2-http-outgoing-body-request body)))
+    (when request
+      (sb-thread:with-recursive-lock ((wasi-http-request-body-mutex request))
+        (when (null (wasi-http-request-body-error request))
+          (setf (wasi-http-request-body-error request)
+                (%http-internal "request body dropped before finish")))
+        (setf (wasi-http-request-body-closed-p request) t)
+        (sb-thread:condition-broadcast
+         (wasi-http-request-body-cond request))))))
+
+(defun %p2-http-outgoing-body-stream (version body)
+  (if (p2-http-outgoing-body-stream-taken-p body)
+      (cons :err nil)
+      (progn
+        (setf (p2-http-outgoing-body-stream-taken-p body) t)
+        (let* ((request (p2-http-outgoing-body-request body))
+             (response (p2-http-outgoing-body-response body))
+             (sink
+               (lambda (bytes)
+                 (let ((n (length bytes)))
+                   (cond
+                     (request
+                      (sb-thread:with-recursive-lock
+                          ((wasi-http-request-body-mutex request))
+                        (push (coerce bytes 'list)
+                              (wasi-http-request-body-buffer request))
+                        (incf (wasi-http-request-body-length request) n)
+                        (sb-thread:condition-broadcast
+                         (wasi-http-request-body-cond request))))
+                     (response
+                      (push (coerce bytes 'list)
+                            (p2-http-outgoing-body-body-bytes body))))
+                   (incf (p2-http-outgoing-body-written body) n)
+                   n)))
+             (rep (%make-p2-output-stream
+                   :sink sink
+                   :flush-fn (lambda ()
+                               (when request
+                                 (sb-thread:with-recursive-lock
+                                     ((wasi-http-request-body-mutex request))
+                                   (sb-thread:condition-broadcast
+                                    (wasi-http-request-body-cond request))))
+                               t))))
+        (setf (p2-http-outgoing-body-stream body) rep)
+        (cons :ok (list :own-handle (p2-out-ct version) rep))))))
+
+(defun %p2-http-declared-content-length (headers)
+  (handler-case (%http-content-length headers)
+    (wasi-http-error () nil)))
+
+(defun %p2-http-outgoing-body-finish (version value trailers-value)
+  "outgoing-body.finish: close the request contents and publish the
+trailers, or fail a Content-Length mismatch."
+  (let ((body (p2-http-take version value "outgoing-body")))
+    (unless (p2-http-outgoing-body-p body)
+      (error 'wasmdown:host-error
+             :message "outgoing-body.finish: invalid handle"))
+    (cond
+      ((p2-http-outgoing-body-finished-p body)
+       (cons :err (%http-internal "body already finished")))
+      (t
+       (setf (p2-http-outgoing-body-finished-p body) t)
+       (let* ((request (p2-http-outgoing-body-request body))
+              (trailers (cond ((null trailers-value) nil)
+                              ((eq trailers-value :none) nil)
+                              ((and (consp trailers-value)
+                                    (eq (car trailers-value) :some))
+                               (p2-http-take version (cdr trailers-value) "fields"))
+                              (t trailers-value)))
+              (declared (and request
+                             (%p2-http-declared-content-length
+                              (wasi-http-request-headers request)))))
+         (when (and declared
+                    (/= declared (p2-http-outgoing-body-written body)))
+           (let ((code (cons "HTTP-request-body-size"
+                             (cons :some (p2-http-outgoing-body-written body)))))
+             (when request
+               (sb-thread:with-recursive-lock
+                   ((wasi-http-request-body-mutex request))
+                 (setf (wasi-http-request-body-error request) code
+                       (wasi-http-request-body-closed-p request) t)
+                 (sb-thread:condition-broadcast
+                  (wasi-http-request-body-cond request))))
+             (return-from %p2-http-outgoing-body-finish
+               (cons :err code))))
+         (setf (p2-http-outgoing-body-trailers body) trailers)
+         (when request
+           (sb-thread:with-recursive-lock
+               ((wasi-http-request-body-mutex request))
+             (setf (wasi-http-request-trailers-state request) :settled
+                   (wasi-http-request-trailers-value request)
+                   (if trailers
+                       (cons :ok
+                             (cons :some
+                                   (list :own-handle
+                                         (p2-http-resource-ct version "fields")
+                                         trailers)))
+                       (cons :ok :none))
+                   (wasi-http-request-body-closed-p request) t)
+             (sb-thread:condition-broadcast
+              (wasi-http-request-body-cond request))))
+         (cons :ok nil))))))
+
+;;; ---------------------------------------------------------------
+;;; Outgoing responses (the serve side's construction half).
+
+(defstruct (p2-http-outgoing-response
+            (:constructor %make-p2-http-outgoing-response
+                (&key (status 200) headers)))
+  status
+  headers
+  (body-taken-p nil)
+  (body nil))
+
+(defun %p2-http-outgoing-response-of (version value)
+  (let ((resp (p2-http-borrow version value "outgoing-response")))
+    (unless (p2-http-outgoing-response-p resp)
+      (error 'wasmdown:host-error
+             :message "outgoing-response: invalid handle"))
+    resp))
+
+(defstruct (p2-http-response-outparam
+            (:constructor make-p2-http-response-outparam (&key set-fn)))
+  "A `response-outparam' rep: SET-FN receives the final
+`(:ok outgoing-response-rep)' or `(:err code)'. The incoming-handler
+slice supplies SET-FN; until then SET is a well-formed no-op."
+  set-fn)
+
+;;; ---------------------------------------------------------------
+;;; Sending.
+
+(defun %p2-http-send (context version request future)
+  "Run the 0.3 HTTP/1.1 client over REQUEST on a host thread and settle
+FUTURE with the incoming-response or error-code. HTTP-CLIENT-SEND takes
+its blocking path on this fresh thread, so the guest keeps running."
+  (handler-case
+      (let ((res (http-client-send context request)))
+        (cond
+          ((eq (car res) :ok)
+           (let ((resp (third (cdr res))))
+             (%p2-http-future-resolve
+              future
+              (lambda ()
+                (cons :ok
+                      (cons :ok
+                            (list :own-handle
+                                  (p2-http-resource-ct version "incoming-response")
+                                  resp))))
+              resp)))
+          (t
+           (let ((code (cdr res)))
+             (%p2-http-future-resolve
+              future (lambda () (cons :ok (cons :err code))))))))
+    (error (c)
+      (%p2-http-future-resolve
+       future
+       (lambda ()
+         (cons :ok
+               (cons :err
+                     (cons "internal-error"
+                           (cons :some (princ-to-string c)))))))))
+  ;; a future dropped before the response was retrieved must not leak
+  ;; the connection
+  (when (and (p2-http-future-dropped-p future)
+             (wasi-http-response-p (p2-http-future-payload future)))
+    (%http-body-close (wasi-http-response-body
+                       (p2-http-future-payload future))))
+  future)
+
+(defun %p2-http-options-take (version options)
+  "The option<request-options> argument: NIL, or the rep."
+  (cond
+    ((or (null options) (eq options :none)) nil)
+    ((and (consp options) (eq (car options) :some))
+     (p2-http-take version (cdr options) "request-options"))
+    ((and (consp options)
+          (member (car options) '("none" "some") :test #'string=))
+     (if (string= (car options) "none")
+         nil
+         (p2-http-take version (cdr options) "request-options")))
+    (t (p2-http-take version options "request-options"))))
+
+(defun p2-http-handle (context version request-value options)
+  "outgoing-handler.handle: validate, then return a future whose worker
+sends the request. A malformed request is an immediate (:err code)."
+  (handler-case
+      (let* ((request (p2-http-take version request-value "outgoing-request"))
+             (req request))
+        (unless (wasi-http-request-p req)
+          (error 'wasmdown:host-error
+                 :message "outgoing-handler.handle: request is not an outgoing-request"))
+        (unless (%http-method-ok-p (wasi-http-request-method req))
+          (%http-error (%http-code-payload
+                        "HTTP-request-method-invalid" nil)))
+        (let ((authority (wasi-http-request-authority req)))
+          (when (eq authority :none)
+            (%http-error (%http-code "HTTP-request-URI-invalid")))
+          (unless (%http-authority-ok-p
+                   (if (consp authority) (cdr authority) authority))
+            (%http-error (%http-code "HTTP-request-URI-invalid"))))
+        (let ((scheme (%http-scheme-string (wasi-http-request-scheme req))))
+          (unless (%http-transport-for context scheme)
+            (%http-error (%http-code "configuration-error"))))
+        (let ((opts (%p2-http-options-take version options)))
+          (when opts
+            (unless (wasi-http-options-p opts)
+              (error 'wasmdown:host-error
+                     :message "outgoing-handler.handle: invalid request-options"))
+            (setf (wasi-http-request-options req) opts)))
+        (let ((future (%make-p2-http-future)))
+          (sb-thread:make-thread
+           (lambda ()
+             (handler-case (%p2-http-send context version req future)
+               (error (c)
+                 (%p2-http-future-resolve
+                  future
+                  (lambda ()
+                    (cons :ok
+                          (cons :err
+                                (cons "internal-error"
+                                      (cons :some (princ-to-string c))))))))))
+           :name "p2-http-send")
+          (cons :ok
+                (list :own-handle
+                      (p2-http-resource-ct version "future-incoming-response")
+                      future))))
+    (wasi-http-error (c)
+      (cons :err (wasi-http-error-code c)))
+    (error (c)
+      (cons :err (cons "internal-error" (cons :some (princ-to-string c)))))))
+
+;;; ---------------------------------------------------------------
+;;; The provider instances.
+
+(defun %p2-http-register-dtors (instance version)
+  (let ((request-ct (p2-http-resource-ct version "outgoing-request"))
+        (body-ct (p2-http-resource-ct version "outgoing-body"))
+        (response-ct (p2-http-resource-ct version "incoming-response"))
+        (future-ct (p2-http-resource-ct version "future-incoming-response")))
+    (wasmdown.component.runtime:host-register-resource-dtor
+     instance request-ct
+     (lambda (rep)
+       (when (and (wasi-http-request-p rep)
+                  (wasi-http-request-body-present-p rep)
+                  (not (wasi-http-request-body-closed-p rep)))
+         (sb-thread:with-recursive-lock ((wasi-http-request-body-mutex rep))
+           (setf (wasi-http-request-body-error rep)
+                 (%http-internal "request dropped before transmission")
+                 (wasi-http-request-body-closed-p rep) t)
+           (sb-thread:condition-broadcast
+            (wasi-http-request-body-cond rep))))))
+    (wasmdown.component.runtime:host-register-resource-dtor
+     instance body-ct
+     (lambda (rep)
+       (when (and (p2-http-outgoing-body-p rep)
+                  (not (p2-http-outgoing-body-finished-p rep)))
+         (%p2-http-outgoing-body-abort rep))))
+    (wasmdown.component.runtime:host-register-resource-dtor
+     instance response-ct
+     (lambda (rep)
+       (when (wasi-http-response-p rep)
+         (%http-body-close (wasi-http-response-body rep)))))
+    (let ((body-state-ct (p2-http-resource-ct version "incoming-body")))
+      (wasmdown.component.runtime:host-register-resource-dtor
+       instance body-state-ct
+       (lambda (rep)
+         (when (p2-http-incoming-body-p rep)
+           (let ((state (p2-http-incoming-body-state rep)))
+             (when state
+               (sb-thread:with-mutex ((p2-http-body-state-mutex state))
+                 (setf (p2-http-body-state-discard-p state) t)
+                 (sb-thread:condition-broadcast
+                  (p2-http-body-state-cond state)))
+               (%p2-http-body-start state)))))))
+    (wasmdown.component.runtime:host-register-resource-dtor
+     instance future-ct
+     (lambda (rep)
+       (when (p2-http-future-p rep)
+         (setf (p2-http-future-dropped-p rep) t)
+         (when (wasi-http-response-p (p2-http-future-payload rep))
+           (%http-body-close
+            (wasi-http-response-body (p2-http-future-payload rep)))))))
+    instance))
+
+(defun p2-http-types-instance (context version)
+  "The wasi:http/types import at VERSION: every resource and method of
+the 0.2 interface, including the incoming-handler-facing ones."
+  (declare (ignore context))
+  (let* ((package (p2-http-package version))
+         (requests (lambda (value)
+                     (p2-http-borrow version value "outgoing-request")))
+         (bodies (lambda (value)
+                   (p2-http-borrow version value "outgoing-body")))
+         (responses (lambda (value)
+                      (p2-http-borrow version value "incoming-response"))))
+    (let ((instance
+            (provider-instance
+             (p2-interface "http" "types" version)
+             (list
+              ;; ---- fields
+              (cons "[constructor]fields"
+                    (lambda () (fields-constructor :package package)))
+              (cons "[static]fields.from-list"
+                    (lambda (entries)
+                      (fields-from-list entries :package package
+                                                :exceeded "invalid-syntax")))
+              (cons "[method]fields.get"
+                    (lambda (self name)
+                      (fields-get self name :package package)))
+              (cons "[method]fields.has"
+                    (lambda (self name)
+                      (fields-has self name :package package)))
+              (cons "[method]fields.set"
+                    (lambda (self name values)
+                      (fields-set self name values :package package
+                                                 :exceeded "invalid-syntax")))
+              (cons "[method]fields.delete"
+                    (lambda (self name)
+                      (fields-delete self name :package package)))
+              (cons "[method]fields.append"
+                    (lambda (self name value)
+                      (fields-append self name value :package package
+                                                    :exceeded "invalid-syntax")))
+              (cons "[method]fields.entries"
+                    (lambda (self)
+                      (fields-copy-all self :package package)))
+              (cons "[method]fields.clone"
+                    (lambda (self)
+                      (fields-clone self :package package)))
+              ;; ---- incoming-request
+              (cons "[method]incoming-request.method"
+                    (lambda (self)
+                      (p2-http-incoming-request-method
+                       (%p2-http-incoming-request-of version self))))
+              (cons "[method]incoming-request.path-with-query"
+                    (lambda (self)
+                      (p2-http-incoming-request-path-with-query
+                       (%p2-http-incoming-request-of version self))))
+              (cons "[method]incoming-request.scheme"
+                    (lambda (self)
+                      (p2-http-incoming-request-scheme
+                       (%p2-http-incoming-request-of version self))))
+              (cons "[method]incoming-request.authority"
+                    (lambda (self)
+                      (p2-http-incoming-request-authority
+                       (%p2-http-incoming-request-of version self))))
+              (cons "[method]incoming-request.headers"
+                    (lambda (self)
+                      (p2-http-fields-marker
+                       version
+                       (p2-http-incoming-request-headers
+                        (%p2-http-incoming-request-of version self)))))
+              (cons "[method]incoming-request.consume"
+                    (lambda (self)
+                      (let ((req (%p2-http-incoming-request-of version self)))
+                        (if (p2-http-incoming-request-consumed-p req)
+                            (cons :err nil)
+                            (progn
+                              (setf (p2-http-incoming-request-consumed-p req) t)
+                              (let* ((body (p2-http-incoming-request-body req))
+                                     (incoming
+                                       (cond
+                                         ((p2-http-incoming-body-p body) body)
+                                         ((wasi-http-body-p body)
+                                          (%p2-http-incoming-body-from-response
+                                           version body))
+                                         ((vectorp body)
+                                          (%make-p2-http-incoming-body
+                                           :bytes body))
+                                         (t (%make-p2-http-incoming-body)))))
+                                (cons :ok
+                                      (list :own-handle
+                                            (p2-http-resource-ct
+                                             version "incoming-body")
+                                            incoming))))))))
+              ;; ---- outgoing-request
+              (cons "[constructor]outgoing-request"
+                    (lambda (headers)
+                      (let ((h (p2-http-take version headers "fields")))
+                        (unless (wasi-fields-p h)
+                          (error 'wasmdown:host-error
+                                 :message "outgoing-request: headers is not a fields resource"))
+                        (list :own-handle
+                              (p2-http-resource-ct version "outgoing-request")
+                              (make-wasi-http-request :headers h)))))
+              (cons "[method]outgoing-request.body"
+                    (lambda (self)
+                      (let ((req (funcall requests self)))
+                        (if (wasi-http-request-body-present-p req)
+                            (cons :err nil)
+                            (progn
+                              (setf (wasi-http-request-body-present-p req) t)
+                              (let ((body (%make-p2-http-outgoing-body
+                                           :request req)))
+                                (cons :ok
+                                      (list :own-handle
+                                            (p2-http-resource-ct
+                                             version "outgoing-body")
+                                            body))))))))
+              (cons "[method]outgoing-request.method"
+                    (lambda (self)
+                      (http-request-get-method (funcall requests self))))
+              (cons "[method]outgoing-request.set-method"
+                    (lambda (self method)
+                      (http-request-set-method (funcall requests self) method)))
+              (cons "[method]outgoing-request.path-with-query"
+                    (lambda (self)
+                      (http-request-get-path-with-query (funcall requests self))))
+              (cons "[method]outgoing-request.set-path-with-query"
+                    (lambda (self path)
+                      (http-request-set-path-with-query (funcall requests self) path)))
+              (cons "[method]outgoing-request.scheme"
+                    (lambda (self)
+                      (http-request-get-scheme (funcall requests self))))
+              (cons "[method]outgoing-request.set-scheme"
+                    (lambda (self scheme)
+                      (http-request-set-scheme (funcall requests self) scheme)))
+              (cons "[method]outgoing-request.authority"
+                    (lambda (self)
+                      (http-request-get-authority (funcall requests self))))
+              (cons "[method]outgoing-request.set-authority"
+                    (lambda (self authority)
+                      (http-request-set-authority (funcall requests self) authority)))
+              (cons "[method]outgoing-request.headers"
+                    (lambda (self)
+                      (p2-http-fields-marker
+                       version
+                       (wasi-http-request-headers (funcall requests self)))))
+              ;; ---- request-options
+              (cons "[constructor]request-options"
+                    (lambda ()
+                      (request-options-constructor :package package)))
+              (cons "[method]request-options.connect-timeout"
+                    (lambda (self)
+                      (request-options-get-connect-timeout
+                       self :package package)))
+              (cons "[method]request-options.set-connect-timeout"
+                    (lambda (self duration)
+                      (let ((r (request-options-set-connect-timeout
+                                self duration :package package)))
+                        (if (eq (car r) :ok) (cons :ok nil) (cons :err nil)))))
+              (cons "[method]request-options.first-byte-timeout"
+                    (lambda (self)
+                      (request-options-get-first-byte-timeout
+                       self :package package)))
+              (cons "[method]request-options.set-first-byte-timeout"
+                    (lambda (self duration)
+                      (let ((r (request-options-set-first-byte-timeout
+                                self duration :package package)))
+                        (if (eq (car r) :ok) (cons :ok nil) (cons :err nil)))))
+              (cons "[method]request-options.between-bytes-timeout"
+                    (lambda (self)
+                      (request-options-get-between-bytes-timeout
+                       self :package package)))
+              (cons "[method]request-options.set-between-bytes-timeout"
+                    (lambda (self duration)
+                      (let ((r (request-options-set-between-bytes-timeout
+                                self duration :package package)))
+                        (if (eq (car r) :ok) (cons :ok nil) (cons :err nil)))))
+              ;; ---- response-outparam
+              (cons "[static]response-outparam.set"
+                    (lambda (param response)
+                      (let* ((p (p2-http-take version param "response-outparam"))
+                             (fn (and (p2-http-response-outparam-p p)
+                                      (p2-http-response-outparam-set-fn p)))
+                             (value
+                               (cond
+                                 ((and (consp response)
+                                       (eq (car response) :ok))
+                                  (let ((r (cdr response)))
+                                    (cons :ok
+                                          (if (and (consp r)
+                                                   (eq (car r) :own-handle))
+                                              (third r)
+                                              r))))
+                                 ((and (consp response)
+                                       (eq (car response) :err))
+                                  (cons :err (cdr response)))
+                                 (t (cons :ok response)))))
+                        (when fn (funcall fn value))
+                        nil)))
+              ;; ---- incoming-response
+              (cons "[method]incoming-response.status"
+                    (lambda (self)
+                      (wasi-http-response-status (funcall responses self))))
+              (cons "[method]incoming-response.headers"
+                    (lambda (self)
+                      (p2-http-fields-marker
+                       version
+                       (or (wasi-http-response-headers (funcall responses self))
+                           (make-wasi-fields)))))
+              (cons "[method]incoming-response.consume"
+                    (lambda (self)
+                      (let ((resp (funcall responses self)))
+                        (if (wasi-http-response-consumed-p resp)
+                            (cons :err nil)
+                            (progn
+                              (setf (wasi-http-response-consumed-p resp) t)
+                              (let ((incoming
+                                      (%p2-http-incoming-body-from-response
+                                       version (wasi-http-response-body resp))))
+                                (cons :ok
+                                      (list :own-handle
+                                            (p2-http-resource-ct
+                                             version "incoming-body")
+                                            incoming))))))))
+              ;; ---- incoming-body
+              (cons "[method]incoming-body.stream"
+                    (lambda (self)
+                      (%p2-http-incoming-body-stream
+                       version
+                       (p2-http-borrow version self "incoming-body"))))
+              (cons "[static]incoming-body.finish"
+                    (lambda (this)
+                      (%p2-http-incoming-body-finish
+                       version
+                       (p2-http-take version this "incoming-body"))))
+              ;; ---- future-trailers
+              (cons "[method]future-trailers.subscribe"
+                    (lambda (self)
+                      (p2-http-future-subscribe
+                       version
+                       (p2-resource-rep
+                        (p2-http-resource-ct version "future-trailers")
+                        self "future-trailers"))))
+              (cons "[method]future-trailers.get"
+                    (lambda (self)
+                      (p2-http-future-get
+                       (p2-resource-rep
+                        (p2-http-resource-ct version "future-trailers")
+                        self "future-trailers"))))
+              ;; ---- outgoing-response
+              (cons "[constructor]outgoing-response"
+                    (lambda (headers)
+                      (let ((h (p2-http-take version headers "fields")))
+                        (unless (wasi-fields-p h)
+                          (error 'wasmdown:host-error
+                                 :message "outgoing-response: headers is not a fields resource"))
+                        (list :own-handle
+                              (p2-http-resource-ct version "outgoing-response")
+                              (%make-p2-http-outgoing-response
+                               :headers h)))))
+              (cons "[method]outgoing-response.status-code"
+                    (lambda (self)
+                      (p2-http-outgoing-response-status
+                       (%p2-http-outgoing-response-of version self))))
+              (cons "[method]outgoing-response.set-status-code"
+                    (lambda (self status)
+                      (let ((resp (%p2-http-outgoing-response-of version self)))
+                        (if (and (integerp status) (<= 100 status 599))
+                            (progn
+                              (setf (p2-http-outgoing-response-status resp)
+                                    status)
+                              (cons :ok nil))
+                            (cons :err nil)))))
+              (cons "[method]outgoing-response.headers"
+                    (lambda (self)
+                      (p2-http-fields-marker
+                       version
+                       (p2-http-outgoing-response-headers
+                        (%p2-http-outgoing-response-of version self)))))
+              (cons "[method]outgoing-response.body"
+                    (lambda (self)
+                      (let ((resp (%p2-http-outgoing-response-of version self)))
+                        (if (p2-http-outgoing-response-body-taken-p resp)
+                            (cons :err nil)
+                            (progn
+                              (setf (p2-http-outgoing-response-body-taken-p resp) t)
+                              (let ((body (%make-p2-http-outgoing-body
+                                           :response resp)))
+                                (setf (p2-http-outgoing-response-body resp) body)
+                                (cons :ok
+                                      (list :own-handle
+                                            (p2-http-resource-ct
+                                             version "outgoing-body")
+                                            body))))))))
+              ;; ---- outgoing-body
+              (cons "[method]outgoing-body.write"
+                    (lambda (self)
+                      (%p2-http-outgoing-body-stream
+                       version (funcall bodies self))))
+              (cons "[static]outgoing-body.finish"
+                    (lambda (this trailers)
+                      (%p2-http-outgoing-body-finish
+                       version this trailers)))
+              ;; ---- future-incoming-response
+              (cons "[method]future-incoming-response.subscribe"
+                    (lambda (self)
+                      (p2-http-future-subscribe
+                       version
+                       (p2-resource-rep
+                        (p2-http-resource-ct
+                         version "future-incoming-response")
+                        self "future-incoming-response"))))
+              (cons "[method]future-incoming-response.get"
+                    (lambda (self)
+                      (p2-http-future-get
+                       (p2-resource-rep
+                        (p2-http-resource-ct
+                         version "future-incoming-response")
+                        self "future-incoming-response"))))
+              ;; ---- types
+              (cons "http-error-code"
+                    (lambda (err)
+                      (let ((rep (p2-resource-rep
+                                  (p2-error-ct version) err "http-error-code")))
+                        ;; only an error carrying an HTTP code downcasts;
+                        ;; a filesystem/socket kind is not an HTTP error
+                        (if (and (p2-error-p rep) (p2-error-code rep))
+                            (cons :some (p2-error-code rep))
+                            :none)))))
+             :packages (p2-packages version)
+             :include #'p2-stable-node-p)))
+      (%p2-http-register-dtors instance version)
+      instance)))
+
+(defun p2-http-outgoing-handler-instance (context version)
+  (provider-instance
+   (p2-interface "http" "outgoing-handler" version)
+   (list (cons "handle"
+               (lambda (request options)
+                 (p2-http-handle context version request options))))
+   :packages (p2-packages version)
+   :include #'p2-stable-node-p))
+
+;;; ---------------------------------------------------------------
+;;; Worlds and registration.
+
+(defun p2-http-world (name &key (version "0.2.12"))
+  "A world of the wasi:http@VERSION package (`imports' or `proxy')."
+  (wasmdown.wit:resolve-wit-world
+   (p2-http-package version) name :packages (p2-packages version)))
+
+(defun preview2-proxy-world (&key (version "0.2.12"))
+  "The resolved `wasi:http/proxy' world of VERSION: the outgoing HTTP
+imports plus the full cli/io/clocks/random surface, and the exported
+incoming-handler."
+  (p2-http-world "proxy" :version version))
+
+(defun preview2-http-imports-world (&key (version "0.2.12"))
+  "The resolved `wasi:http/imports' world of VERSION."
+  (p2-http-world "imports" :version version))
+
+(defun p2-register-http (context version builders)
+  (flet ((bind (iface thunk)
+           (push (cons (p2-interface-name "http" iface version) thunk)
+                 builders)))
+    (bind "types" (lambda () (p2-http-types-instance context version)))
+    (bind "outgoing-handler"
+          (lambda () (p2-http-outgoing-handler-instance context version)))
     builders))
