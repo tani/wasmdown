@@ -313,24 +313,39 @@ complement), so the byte case catches them before the s33 read."
                  (decode-error-at start "unknown type form 0x~x" b)))))))
 
 
-(defun %read-limits (r)
+(defun %read-limits (r &optional (kind :memory))
   "Limits flags (Core 3.0, spec binary/decode.ml `limits`): bit 0 =
 has-max, bit 2 = 64-bit address type (memory64; table64 decodes
 but the validator keeps rejecting tables — out of scope). Legal
 flag sets exactly {0x00,0x01,0x04,0x05}; min/max read as u64
 UNCONDITIONALLY (the spec reads the width-agnostic domain; the
 VALIDATOR imposes the per-addrtype page bounds).
-(logtest flags #xfa) covers all illegal bits (shared + reserved)."
+
+With wasmdown:*threads* bound, bit 1 (0x02) is the threads
+proposal's shared flag: legal for MEMORIES only (KIND :memory), so
+memories accept {0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07}. A shared
+table stays malformed with the spec's own wording ('tables cannot be
+shared (yet)'). Shared-without-max decodes (the validator rejects it
+as 'shared memory must have maximum', like the text form).
+(logtest flags #xfa) covers all other illegal bits."
   (let ((flags (read-byte-at r)))
-    (unless (zerop (logand flags #xfa))
-      (%decode-error r "malformed limits flags 0x~x" flags))
-    (let ((min (read-u64 r))
-          (i64-p (logtest flags #x04)))
-      (if (logtest flags #x01)
-          (make-wasm-limits min (read-u64 r) i64-p)
-          ;; no max: the positional constructor's &aux has-max keys
-          ;; off SUPPLIED-P — use the explicit constructor
-          (wasmdown.types::%make-wasm-limits* min nil nil i64-p)))))
+    (if (and (logtest flags #x02)
+             (not wasmdown:*threads*))
+        (%decode-error r "malformed limits flags 0x~x" flags)
+        (progn
+          (when (and (logtest flags #x02) (eq kind :table))
+            (%decode-error r "tables cannot be shared (yet)"))
+          (unless (zerop (logand flags (logxor #xfa #x02)))
+            (%decode-error r "malformed limits flags 0x~x" flags))
+          (let ((min (read-u64 r))
+                (i64-p (logtest flags #x04))
+                (shared-p (and (logtest flags #x02) t)))
+            (if (logtest flags #x01)
+                (make-wasm-limits min (read-u64 r) i64-p shared-p)
+                ;; no max: the positional constructor's &aux has-max keys
+                ;; off SUPPLIED-P — use the explicit constructor
+                (wasmdown.types::%make-wasm-limits* min nil nil i64-p
+                                                    shared-p)))))))
 
 ;;; ---------------------------------------------------------------
 ;;; Simple (immediate-free) opcodes: opcode byte -> op keyword.
@@ -605,6 +620,28 @@ markers (keywords) for the block terminators."
              (16 (mk :table.size (list :table (read-u32 r))))
              (17 (mk :table.fill (list :table (read-u32 r))))
              (t (%decode-error r "unknown 0xFC opcode ~d" sub)))))
+        ;; threads proposal (opt-in, wasmdown:*threads*): the 0xFE
+        ;; atomic prefix family. Sub-opcode u32 then a memarg for
+        ;; every op except atomic.fence, whose reserved immediate byte
+        ;; must be 0x00. With the gate off the byte stays an illegal
+        ;; opcode, exactly as before.
+        (#xFE
+         (unless wasmdown:*threads*
+           (%decode-error r "illegal opcode 0x~x" b))
+         (let* ((sub (read-u32 r))
+                (op (gethash sub wasmdown.types:*atomic-op-sub*)))
+           (unless op
+             (%decode-error r "unknown 0xFE opcode ~d" sub))
+           (let ((info (wasmdown.types:atomic-op-info-of op)))
+             (case (wasmdown.types:atomic-op-info-kind info)
+               (:fence
+                (let ((imm (read-byte-at r)))
+                  (unless (zerop imm)
+                    (%decode-error r
+                                   "malformed atomic.fence immediate 0x~x"
+                                   imm))
+                  (mk op nil)))
+               (t (mk op (%read-memarg r)))))))
         ;; GC value opcodes (loop 22, the 0xFB prefix family —
         ;; binary/instructions.html). Struct ops:
         ;;   0x00 struct.new t, 0x01 struct.new_default t,
@@ -852,11 +889,11 @@ text parser's comptype FIELDS contract."
                 (case kind
                   (#x00 (make-wasm-import module field :func (read-u32 r)))
                   (#x01 (let ((rt (%read-reftype r))
-                              (limits (%read-limits r)))
+                              (limits (%read-limits r :table)))
                           (make-wasm-import module field :table
                                             (make-wasm-table rt limits))))
                   (#x02 (make-wasm-import module field :memory
-                                          (make-wasm-memory (%read-limits r))))
+                                          (make-wasm-memory (%read-limits r :memory))))
                   (#x03 (let ((type (%read-valtype r))
                               (mut (read-byte-at r)))
                           (unless (or (= mut 0) (= mut 1))
@@ -897,7 +934,7 @@ Returns (values tables-list desugared-elems-list)."
                                            "malformed table entry flags 0x~x"
                                            flags)))
                       (let* ((rt (%read-reftype r))
-                             (limits (%read-limits r))
+                             (limits (%read-limits r :table))
                              (expr (decode-instr-seq r)))
                         ;; tables accumulates in push order; the
                         ;; entry just pushed sits at (1- length) in
@@ -925,7 +962,7 @@ Returns (values tables-list desugared-elems-list)."
                                t)
                               elems)))
                     (let ((tab (make-wasm-table (%read-reftype r)
-                                                 (%read-limits r))))
+                                                 (%read-limits r :table))))
                       (push tab tables))))
               "table")
     (values (coerce (nreverse tables) 'vector)

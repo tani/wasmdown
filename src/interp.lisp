@@ -694,6 +694,63 @@ counts one depth on the block stack). Never returns."
                                              (t value))))
       s2)))
 
+(defun %atomic-op (instr s)
+  "Execute one threads-proposal atomic instruction (validated IR). All
+semantics lives in WASMDOWN.RUNTIME's atomic primitives, so the
+interpreter and compiled backends agree by construction; wait/notify
+additionally consult the WASMDOWN.THREADS hooks."
+  (let* ((op (wasm-instr-op instr))
+         (info (wasmdown.types:atomic-op-info-of op))
+         (kind (wasmdown.types:atomic-op-info-kind info))
+         (width (wasmdown.types:atomic-op-info-width info)))
+    (case kind
+      (:fence
+       ;; Single OS thread: no reordering to prevent.
+       s)
+      (:load
+       (multiple-value-bind (ea memidx s1) (%mem-addr instr s)
+         (push (wasmdown.runtime:atomic-load (%mem-at memidx) ea width)
+               s1)))
+      (:store
+       (multiple-value-bind (value s1) (pop-val s)
+         (multiple-value-bind (ea memidx s2) (%mem-addr instr s1)
+           (wasmdown.runtime:atomic-store (%mem-at memidx) ea width value)
+           s2)))
+      (:rmw
+       (let ((cmpxchg-p (eq (wasmdown.types:atomic-op-info-operation info)
+                            :cmpxchg)))
+         (multiple-value-bind (value s1) (pop-val s)
+           (multiple-value-bind (expected s2)
+               (if cmpxchg-p
+                   (pop-val s1)
+                   (values nil s1))
+             (multiple-value-bind (ea memidx s3) (%mem-addr instr s2)
+               (let ((mem (%mem-at memidx)))
+                 (push (if cmpxchg-p
+                           (wasmdown.runtime:atomic-cmpxchg
+                            mem ea width expected value)
+                           (wasmdown.runtime:atomic-rmw
+                            mem ea width
+                            (wasmdown.types:atomic-op-info-operation info)
+                            value))
+                       s3)))))))
+      (:notify
+       ;; [addr count] -> [i32]
+       (multiple-value-bind (count s1) (pop-val s)
+         (multiple-value-bind (ea memidx s2) (%mem-addr instr s1)
+           (push (wasmdown.runtime:memory-atomic-notify
+                  (%mem-at memidx) ea count)
+                 s2))))
+      (:wait
+       ;; [addr expected timeout] -> [i32]
+       (multiple-value-bind (timeout s1) (pop-val s)
+         (multiple-value-bind (expected s2) (pop-val s1)
+           (multiple-value-bind (ea memidx s3) (%mem-addr instr s2)
+             (push (wasmdown.runtime:memory-atomic-wait
+                    (%mem-at memidx) ea width expected timeout)
+                   s3)))))
+      (t (%trap :generic "unknown atomic kind ~a" kind)))))
+
 (defun %do-call (func s)
   "Pop the callee's args (reverse push order), call through the shared
  trampoline, push the results."
@@ -1144,6 +1201,8 @@ args, apply, and throw to the function frame exactly like :return."
          (wasmdown.runtime:table-set (%table-at (getf imms :table)) idx ref)
          s2)))
     ;; ---- memory ----
+    ((wasmdown.types:atomic-op-p op)
+     (%atomic-op instr s))
     ((gethash op *load-widths*)
      (multiple-value-bind (v s1) (%load-op instr s)
        (push v s1)))

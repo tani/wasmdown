@@ -42,7 +42,12 @@ the types contract exports wasm-limits-has-max-p)."
           (if (%limits-has-max limits)
               (wasm-limits-max limits)
               "none")))
-  t)
+  ;; threads proposal: a shared memory must declare a maximum (the
+  ;; text form `(memory 1 shared)` and the binary flag 0x02 both land
+  ;; here; the spec's assert_invalid message).
+  (when (and (wasm-limits-shared-p limits)
+             (not (%limits-has-max limits)))
+    (verr "shared memory must have maximum")))
 
 (defun numtype-p (t_)
   (member t_ '(:i32 :i64 :f32 :f64
@@ -760,6 +765,73 @@ memory64 (any u64 offset is valid per spec valid.ml check_memop)."
     (unless (and (>= offset 0) (<= offset offset-max))
       (verr "offset out of range (offset ~a): ~a is not within the memory's address range"
             (fv-offset fv) offset))))
+
+(defun %check-atomic-memarg (fv imms info)
+  "Validate an atomic memarg: the alignment must be EXACTLY natural
+(spec threads proposal: atomics require their natural alignment;
+`align=1` on an i32 atomic is 'atomic alignment must be natural'),
+the memory must exist and the offset must fit its address domain."
+  (let* ((natural (wasmdown.types:atomic-op-info-align info))
+         (align (getf imms :align)))
+    (unless (eql align natural)
+      (verr "atomic alignment must be natural (align ~a, natural ~a)"
+            align natural))
+    (%check-memarg fv imms (* 8 (wasmdown.types:atomic-op-info-width info)))))
+
+(defun validate-atomic-instr (fv op imms)
+  "Validate one threads-proposal atomic instruction. Atomics are legal
+on unshared memories (the spec allows them; only memory.atomic.wait
+requires shared memory, as a RUNTIME trap)."
+  (unless wasmdown:*threads*
+    (verr "atomic instruction ~a requires the threads feature (wasmdown:*threads*)"
+          op))
+  (let ((info (wasmdown.types:atomic-op-info-of op)))
+    (unless info
+      (verr "unknown atomic instruction ~a" op))
+    (case (wasmdown.types:atomic-op-info-kind info)
+      (:fence)                          ; [] -> []
+      (:notify
+       (%check-atomic-memarg fv imms info)
+       (let ((at (%mem-addrtype-of (fv-ctx fv)
+                                   (or (getf imms :memidx) 0)
+                                   (string op))))
+         (%pop-val-expect fv :i32)
+         (%pop-val-expect fv at)
+         (%push-val fv :i32)))
+      (:wait
+       (%check-atomic-memarg fv imms info)
+       (let ((at (%mem-addrtype-of (fv-ctx fv)
+                                   (or (getf imms :memidx) 0)
+                                   (string op))))
+         (%pop-val-expect fv :i64)      ; timeout (nanoseconds)
+         (%pop-val-expect fv (wasmdown.types:atomic-op-info-value-type info))
+         (%pop-val-expect fv at)
+         (%push-val fv :i32)))
+      (:load
+       (%check-atomic-memarg fv imms info)
+       (let ((at (%mem-addrtype-of (fv-ctx fv)
+                                   (or (getf imms :memidx) 0)
+                                   (string op))))
+         (%pop-val-expect fv at)
+         (%push-val fv (wasmdown.types:atomic-op-info-value-type info))))
+      (:store
+       (%check-atomic-memarg fv imms info)
+       (let ((at (%mem-addrtype-of (fv-ctx fv)
+                                   (or (getf imms :memidx) 0)
+                                   (string op))))
+         (%pop-val-expect fv (wasmdown.types:atomic-op-info-value-type info))
+         (%pop-val-expect fv at)))
+      (:rmw
+       (%check-atomic-memarg fv imms info)
+       (let ((at (%mem-addrtype-of (fv-ctx fv)
+                                   (or (getf imms :memidx) 0)
+                                   (string op)))
+             (vt (wasmdown.types:atomic-op-info-value-type info)))
+         (%pop-val-expect fv vt)        ; value (cmpxchg: value on top)
+         (when (eq (wasmdown.types:atomic-op-info-operation info) :cmpxchg)
+           (%pop-val-expect fv vt))     ; expected
+         (%pop-val-expect fv at)
+         (%push-val fv vt))))))
 
 (defun %local-type (fv localidx)
   (let ((locals (fv-locals fv)))
@@ -1617,6 +1689,9 @@ bodies of their :end terminator; bodies of :if carry no :else/:end)."
         ;; --- SIMD (loop 24): the full v128/relaxed family ---
         ((wasmdown.simd:simd-op-p op)
          (validate-simd-instr fv op imms module))
+        ;; --- threads proposal atomics (opt-in) ---
+        ((wasmdown.types:atomic-op-p op)
+         (validate-atomic-instr fv op imms))
         ;; --- loads/stores via width table ---
         ((assoc op *mem-op-widths*)
          (let* ((info (assoc op *mem-op-widths*))
@@ -2115,19 +2190,35 @@ REJECTED — funcref (nullable) is not <: (ref func))."
 (defun describe-module-features (module)
   "Return an alist of feature keywords to booleans for CLI inspect.
 SIMD (loop 24): detected from the module's instruction ops (any
-wasmdown.simd opcode)."
+wasmdown.simd opcode). Threads: detected from shared memory types or
+any atomic instruction."
   (let ((simd-p (loop for f across (wasmdown.types:wasm-module-funcs module)
                       thereis (loop for i across
                                      (wasmdown.types:wasm-func-body f)
                                    thereis (wasmdown.simd:simd-op-p
-                                            (wasmdown.types:wasm-instr-op i))))))
+                                            (wasmdown.types:wasm-instr-op i)))))
+        (threads-p
+          (or (loop for mem across (wasmdown.types:wasm-module-mems module)
+                    thereis (wasmdown.types:wasm-limits-shared-p
+                             (wasmdown.types:wasm-memory-limits mem)))
+              (loop for im across (wasmdown.types:wasm-module-imports module)
+                    thereis (and (eq (wasmdown.types:wasm-import-kind im)
+                                     :memory)
+                                 (wasmdown.types:wasm-limits-shared-p
+                                  (wasmdown.types:wasm-memory-limits
+                                   (wasmdown.types:wasm-import-type im)))))
+              (loop for f across (wasmdown.types:wasm-module-funcs module)
+                    thereis (loop for i across
+                                   (wasmdown.types:wasm-func-body f)
+                                 thereis (wasmdown.types:atomic-op-p
+                                          (wasmdown.types:wasm-instr-op i)))))))
     `((:sign-extension-ops . t)
       (:saturating-float-to-int . t)
       (:multi-value . t)
       (:bulk-memory . t)
       (:reference-types . t)
       (:simd . ,simd-p)
-      (:threads . nil)
+      (:threads . ,threads-p)
       (:tail-call . t)
       (:exceptions . t))))
 

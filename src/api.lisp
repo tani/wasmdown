@@ -52,15 +52,21 @@ element is host-error (wrong input type, not a malformed binary)."
                           :message (format nil "~s is not an octet" x))
               do (setf (aref v i) x))
         v)))
-(defun read-module (source)
+(defun read-module (source &key threads)
   "Decode a module from SOURCE — a pathname, a pathname namestring, or
 a (vector (unsigned-byte 8)) — into a wasm-module. Signals decode-error
-(with :offset) on malformed input. No validation happens here."
-  (etypecase source
-    ((or pathname string)
-     (wasmdown.binary:decode-module (%read-file-bytes source)))
-    (vector
-     (wasmdown.binary:decode-module (%coerce-octets source)))))
+(with :offset) on malformed input. No validation happens here.
+
+THREADS opts into the threads proposal (shared memories and the 0xFE
+atomic family); it defaults to the dynamic variable
+WASMDOWN:*THREADS*, so `(let ((wasmdown:*threads* t)) ...)` works the
+same way."
+  (let ((wasmdown:*threads* (or threads wasmdown:*threads*)))
+    (etypecase source
+      ((or pathname string)
+       (wasmdown.binary:decode-module (%read-file-bytes source)))
+      (vector
+       (wasmdown.binary:decode-module (%coerce-octets source))))))
 
 (defun module-bytes (module)
   "The module as a canonical binary byte vector: a re-encoding via
@@ -206,7 +212,8 @@ guest code and no segment mutation happened."
                      (svref compiled i))))
     inst))
 
-(defun instantiate (module &key (imports nil) (mode :interpret) (before-start nil))
+(defun instantiate (module &key (imports nil) (mode :interpret) (before-start nil)
+                           threads)
   "Instantiate MODULE and return the module-instance.
 
 Order: static validation (validation-error) -> import resolution
@@ -215,6 +222,8 @@ backend installation -> active segments (instantiation-error) ->
 exports -> BEFORE-START -> the Wasm start section (wasm-trap
 propagates).
 
+THREADS opts into the threads proposal for validation and execution;
+it defaults to WASMDOWN:*THREADS*.
 MODE is explicit and applies to the functions THIS module defines:
 
   :INTERPRET (default) - the reference interpreter executes them.
@@ -233,16 +242,17 @@ BEFORE-START, when non-NIL, is called once with the allocated instance
 after active segments/exports exist and before the Wasm start section
 (the WASI Preview1 memory gate). It works with imported and defined
 memory and with both modes."
-  (wasmdown.validate:validate-module module)
-  (flet ((prepare (inst)
-           (when (eq mode :compiled) (%install-compiled! module inst))))
-    (let ((inst (wasmdown.runtime:make-module-instance
-                 module (%imports-alist imports)
-                 :before-start before-start
-                 :prepare (and (eq mode :compiled) #'prepare))))
-      (ecase mode
-        (:interpret inst)
-        (:compiled inst)))))
+  (let ((wasmdown:*threads* (or threads wasmdown:*threads*)))
+    (wasmdown.validate:validate-module module)
+    (flet ((prepare (inst)
+             (when (eq mode :compiled) (%install-compiled! module inst))))
+      (let ((inst (wasmdown.runtime:make-module-instance
+                   module (%imports-alist imports)
+                   :before-start before-start
+                   :prepare (and (eq mode :compiled) #'prepare))))
+        (ecase mode
+          (:interpret inst)
+          (:compiled inst))))))
 
 ;;; ---------------------------------------------------------------
 ;;; Invocation and inspection.

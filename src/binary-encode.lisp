@@ -186,10 +186,12 @@ ENC-REFTYPE (0x63/0x64 + heap type)."
         (t (enc-valtype e bt))))
 
 (defun enc-limits (e limits)
-  "Limits flags (Core 3.0, mirror of %read-limits): bit 0 = has-max,
-bit 2 = 64-bit address type (memory64). min/max emit as u64
-(value-driven minimal LEB — byte-stable round-trips)."
+  "Limits flags (Core 3.0 + threads proposal, mirror of %read-limits):
+bit 0 = has-max, bit 1 = shared (memories only, opt-in), bit 2 =
+64-bit address type (memory64). min/max emit as u64 (value-driven
+minimal LEB — byte-stable round-trips)."
   (let ((flags (logior (if (wasm-limits-has-max-p limits) 1 0)
+                       (if (wasm-limits-shared-p limits) 2 0)
                        (if (wasm-limits-i64-p limits) 4 0))))
     (enc-byte e flags)
     (enc-u64 e (wasm-limits-min limits))
@@ -264,6 +266,16 @@ bit 2 = 64-bit address type (memory64). min/max emit as u64
    (cons :table.init 12) (cons :elem.drop 13)
    (cons :table.copy 14) (cons :table.grow 15)
    (cons :table.size 16) (cons :table.fill 17)))
+
+;;; 0xFE sub-opcode table (threads proposal atomics). The reverse map
+;;; is derived from wasmdown.types:*atomic-op-sub* so decoder and
+;;; encoder cannot drift.
+(defparameter *fe-op->sub*
+  (let ((h (make-hash-table :test #'eq)))
+    (maphash (lambda (sub op) (setf (gethash op h) sub))
+             wasmdown.types:*atomic-op-sub*)
+    h)
+  "Atomic op keyword -> binary 0xFE sub-opcode.")
 
 ;;; The set of memarg ops (dedicated decoder clause reading a memarg).
 (defparameter *memarg-ops*
@@ -526,6 +538,18 @@ low word first, then high word."
        (enc-heaptype e (getf imms :dst)))
       (t
        (cond
+        ;; threads proposal (opt-in): the 0xFE atomic prefix family.
+        ;; atomic.fence carries the reserved 0x00 byte; every other
+        ;; atomic op carries a memarg. simd-op-p/atomic-op-p are hash
+        ;; lookups, never case keys (case is EQL).
+        ((wasmdown.types:atomic-op-p op)
+         (enc-byte e #xFE)
+         (enc-u32 e (gethash op *fe-op->sub*))
+         (if (eq (wasmdown.types:atomic-op-info-kind
+                  (wasmdown.types:atomic-op-info-of op))
+                 :fence)
+             (enc-byte e 0)
+             (enc-memarg e imms)))
         ;; SIMD (loop 24, the 0xFD prefix family): simd-op-p is a
         ;; hash lookup, never a case key (case is EQL) — the guard
         ;; lives in the fallback arm. Emit the sub-opcode (u32 LEB;

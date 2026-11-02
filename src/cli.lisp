@@ -50,6 +50,8 @@
                   ~10t[--dir HOST[::GUEST]] [--env K=V] [--net HOST:PORT]~%~
                   ~10t[--listen ADDR:PORT] [--dns NAME]~%~
                   ~4thelp~%~
+                  global options:~%~
+                  ~4t--threads~10tenable the threads proposal (shared memory, atomics)~%~
                   exit codes: 0 ok, 1 guest/compile error, 2 usage error~%"))
 
 (defun %usage-error (format-control &rest args)
@@ -612,13 +614,32 @@ when called with no arguments or with ~\"help\"."
         (cond ((null args) (%usage *standard-output*) (return 2))
               ((string= (first args) "help") (%usage *standard-output*) (return 0))
               (t
-               (let ((cmd (first args)) (rest (rest args)))
-                 (cond ((string= cmd "validate") (return (%cmd-validate rest)))
-                       ((string= cmd "inspect") (return (%cmd-inspect rest)))
-                       ((string= cmd "compile") (return (%cmd-compile rest)))
-                       ((string= cmd "run") (return (%cmd-run rest)))
-                       ((string= cmd "serve") (return (%cmd-serve rest)))
-                       (t
-                        (format *error-output* "wasmdown: unknown command ~s~%" cmd)
-                        (%usage *error-output*)
-                        (return 2))))))))))
+               ;; --threads is a global option: consume it before a
+               ;; subcommand parses its own flags, and bind the
+               ;; opt-in gate for the whole command (decode through
+               ;; execution). Tokens after `--' are guest arguments
+               ;; and are never touched.
+               (let ((threads-p nil)
+                     (kept '())
+                     (guest-tail nil))
+                 (dolist (tok args)
+                   (cond (guest-tail (push tok kept))
+                         ((string= tok "--")
+                          (setf guest-tail t)
+                          (push tok kept))
+                         ((string= tok "--threads")
+                          (setf threads-p t))
+                         (t (push tok kept))))
+                 (setf kept (nreverse kept))
+                 (let ((wasmdown:*threads* threads-p)
+                       (cmd (first kept))
+                       (rest (rest kept)))
+                   (cond ((string= cmd "validate") (return (%cmd-validate rest)))
+                         ((string= cmd "inspect") (return (%cmd-inspect rest)))
+                         ((string= cmd "compile") (return (%cmd-compile rest)))
+                         ((string= cmd "run") (return (%cmd-run rest)))
+                         ((string= cmd "serve") (return (%cmd-serve rest)))
+                         (t
+                          (format *error-output* "wasmdown: unknown command ~s~%" cmd)
+                          (%usage *error-output*)
+                          (return 2)))))))))))

@@ -34,7 +34,11 @@
            #:imports-set-function
            #:instance-export
            #:module-features
-           #:run-string))
+           #:run-string
+           ;; threads proposal (opt-in): bind T to enable shared
+           ;; memories, atomic instructions and wait/notify. NIL keeps
+           ;; the core engine's rejection of those encodings.
+           #:*threads*))
 
 (defpackage #:wasmdown.types
   (:use #:cl)
@@ -46,8 +50,13 @@
    ;; limits
    #:make-wasm-limits #:wasm-limits #:wasm-limits-p
    #:wasm-limits-min #:wasm-limits-max #:wasm-limits-has-max-p
-   #:wasm-limits-i64-p
+   #:wasm-limits-i64-p #:wasm-limits-shared-p
    #:copy-wasm-limits
+   ;; threads proposal atomic instruction metadata
+   #:atomic-op-info #:atomic-op-info-p #:atomic-op-info-kind
+   #:atomic-op-info-operation #:atomic-op-info-width
+   #:atomic-op-info-align #:atomic-op-info-value-type
+   #:atomic-op-info-of #:atomic-op-p #:*atomic-op-sub* #:*atomic-ops*
    ;; table / memory types
    #:make-wasm-table #:wasm-table #:wasm-table-p
    #:wasm-table-type #:wasm-table-limits #:copy-wasm-table
@@ -206,10 +215,13 @@
    #:memory-instance #:memory-instance-p
    #:memory-instance-bytes #:memory-instance-pages
    #:memory-instance-max-pages #:memory-instance-has-max-p
-   #:memory-instance-i64-p
+   #:memory-instance-i64-p #:memory-instance-shared-p
    #:make-memory-instance
    #:memory-load #:memory-store #:memory-size #:memory-grow #:memory-fill
    #:memory-copy #:memory-copy2 #:memory-init
+   ;; threads proposal atomics (single-thread semantics + hook plumbing)
+   #:atomic-load #:atomic-store #:atomic-rmw #:atomic-cmpxchg
+   #:memory-atomic-notify #:memory-atomic-wait
    #:table-instance #:table-instance-p
    #:table-instance-elems #:table-instance-type #:table-instance-max
    #:table-instance-has-max-p
@@ -709,3 +721,4 @@
    #:reactor-pending-deadline-p
    #:reactor-close
    #:reactor-wake))
+

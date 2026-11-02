@@ -39,6 +39,14 @@
 (defparameter *jsonl* (%env "WASMDOWN_WAST_JSONL" "tests/upstream-results.jsonl"))
 (defparameter *label* (%env "WASMDOWN_WAST_LABEL" "upstream"))
 (defparameter *mode* (%env "WASMDOWN_WAST_MODE" "interpret"))
+;; Threads proposal lane: WASMDOWN_WAST_DIR points the runner at a
+;; proposal checkout (e.g. the threads test directory) and
+;; WASMDOWN_WAST_THREADS=1 opts the engine into shared memory and the
+;; atomic instruction family. Both default to the core lane's behavior.
+(defparameter *dir* (%env "WASMDOWN_WAST_DIR" (namestring *root*)))
+(defparameter *threads* (%env "WASMDOWN_WAST_THREADS" ""))
+(setf wasmdown:*threads*
+      (member (string-downcase *threads*) '("1" "t" "true" "yes") :test #'string=))
 (unless (member *mode* '("interpret" "compiled") :test #'string=)
   (format t "~&WASMDOWN_WAST_MODE must be interpret or compiled, got ~s~%" *mode*)
   (sb-ext:exit :code 2))
@@ -46,7 +54,7 @@
       (if (string= *mode* "compiled") :compiled :interpret))
 
 (defparameter *results*
-  (wasmdown.wast:run-directory *root*
+  (wasmdown.wast:run-directory (pathname *dir*)
                                :pattern *pattern*
                                :jsonl-path (merge-pathnames *jsonl* *root*)
                                :suite (if (search "upstream" *label*)
@@ -118,3 +126,19 @@
                                                         (car row)))
                   (cdr row)))))
     (format t "  summary          ~a~%" out)))
+
+;; Strict mode (threads proposal lane, opt-in): measurement lanes always
+;; exit 0, but a lane that pins a known-passing corpus can ask for a
+;; non-zero exit when any command is not a pass. Default off.
+(let ((strict (%env "WASMDOWN_WAST_STRICT" "")))
+  (when (member (string-downcase strict) '("1" "t" "true" "yes")
+                :test #'string=)
+    (let* ((counts (make-hash-table :test #'eq))
+           (pass 0))
+      (dolist (r *results*)
+        (incf (gethash (wasmdown.wast:wast-result-outcome r) counts 0)))
+      (setf pass (or (gethash :pass counts) 0))
+      (unless (= pass (length *results*))
+        (format t "~&STRICT: ~d of ~d commands did not pass~%"
+                (- (length *results*) pass) (length *results*))
+        (sb-ext:exit :code 1)))))

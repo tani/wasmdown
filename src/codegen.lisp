@@ -1077,6 +1077,83 @@ the memory access and the full-span bounds check."
          (%emit cctx `(multiple-value-setq (,@tmps) (values-list ,call)))
          (dolist (tmp tmps) (%push cctx tmp)))))))
 
+(defun %emit-atomic (cctx instr)
+  "Lower one threads-proposal atomic instruction to the audited
+WASMDOWN.RUNTIME atomic primitives (the same functions the reference
+interpreter calls) plus the wait/notify hooks. No interpreter
+fallback: each kind has an explicit lowering."
+  (let* ((op (wasm-instr-op instr))
+         (info (wasmdown.types:atomic-op-info-of op))
+         (kind (wasmdown.types:atomic-op-info-kind info))
+         (width (wasmdown.types:atomic-op-info-width info))
+         (imms (wasm-instr-imms instr))
+         (memidx (getf imms :memidx 0))
+         (offset (getf imms :offset 0)))
+    (flet ((ea-of (addr)
+             (let ((ea (%temp cctx "aea")))
+               (%emit cctx `(setf ,ea (+ ,addr ,offset)))
+               ea)))
+      (case kind
+        (:fence nil)                    ; single OS thread: no barrier
+        (:load
+         (let* ((addr (%pop cctx))
+                (ea (ea-of addr))
+                (out (%result-temp cctx)))
+           (%emit cctx `(setf ,out
+                              (wasmdown.runtime:atomic-load
+                               ,(%mem cctx memidx) ,ea ,width)))
+           (%push cctx out)))
+        (:store
+         (let* ((value (%pop cctx))
+                (addr (%pop cctx))
+                (ea (ea-of addr)))
+           (%emit cctx `(wasmdown.runtime:atomic-store
+                         ,(%mem cctx memidx) ,ea ,width ,value))))
+        (:rmw
+         (let* ((cmpxchg-p (eq (wasmdown.types:atomic-op-info-operation info)
+                               :cmpxchg))
+                (value (%pop cctx))
+                (expected (and cmpxchg-p (%pop cctx)))
+                (addr (%pop cctx))
+                (ea (ea-of addr))
+                (out (%result-temp cctx)))
+           (if cmpxchg-p
+               (%emit cctx `(setf ,out
+                                  (wasmdown.runtime:atomic-cmpxchg
+                                   ,(%mem cctx memidx) ,ea ,width
+                                   ,expected ,value)))
+               (%emit cctx `(setf ,out
+                                  (wasmdown.runtime:atomic-rmw
+                                   ,(%mem cctx memidx) ,ea ,width
+                                   ',(wasmdown.types:atomic-op-info-operation info)
+                                   ,value))))
+           (%push cctx out)))
+        (:notify
+         (let* ((count (%pop cctx))
+                (addr (%pop cctx))
+                (ea (ea-of addr))
+                (out (%result-temp cctx)))
+           (%emit cctx `(setf ,out
+                              (wasmdown.runtime:memory-atomic-notify
+                               ,(%mem cctx memidx) ,ea ,count)))
+           (%push cctx out)))
+        (:wait
+         (let* ((timeout (%pop cctx))
+                (expected (%pop cctx))
+                (addr (%pop cctx))
+                (ea (ea-of addr))
+                (out (%result-temp cctx)))
+           (%emit cctx `(setf ,out
+                              (wasmdown.runtime:memory-atomic-wait
+                               ,(%mem cctx memidx) ,ea ,width
+                               ,expected ,timeout)))
+           (%push cctx out)))
+        (t (error 'wasmdown:codegen-error
+                  :op op
+                  :offset (wasm-instr-offset instr)
+                  :function-index *current-function-index*
+                  :message (format nil "unknown atomic kind ~a" kind)))))))
+
 (defparameter *gc-ops*
   '(:struct.new :struct.new-default
     :struct.get :struct.get-s :struct.get-u :struct.set
@@ -1490,6 +1567,7 @@ WASMDOWN.RUNTIME value-level helper the interpreter uses."
                     :memory.size :memory.grow :memory.fill
                     :memory.copy :memory.init :data.drop))
        (%emit-memory-op cctx instr))
+      ((wasmdown.types:atomic-op-p op) (%emit-atomic cctx instr))
       ((getf *mem-shape* op)
        (if (search "STORE" (symbol-name op))
            (%emit-store cctx instr)

@@ -573,3 +573,150 @@
               :exports (vector (make-wasm-export "f" :func 1)))))
     (let ((inst (make-module-instance mod '())))
       (expect (call-export inst "f") '(9)))))
+
+;;; ================================================================
+;;; Threads proposal (opt-in): shared memory + atomics with real SBCL
+;;; threads. Values/semantics are exercised through the interpreter;
+;;; tests/codegen.lisp pins backend parity for the same shape.
+
+(defparameter *atomic-wat*
+  "(module (memory (export \"mem\") 1 1 shared)
+     (func (export \"store\") (param i32 i32)
+       (i32.atomic.store (local.get 0) (local.get 1)))
+     (func (export \"load\") (param i32) (result i32)
+       (i32.atomic.load (local.get 0)))
+     (func (export \"store8\") (param i32 i32)
+       (i32.atomic.store8 (local.get 0) (local.get 1)))
+     (func (export \"load8u\") (param i32) (result i32)
+       (i32.atomic.load8_u (local.get 0)))
+     (func (export \"add\") (param i32 i32) (result i32)
+       (i32.atomic.rmw.add (local.get 0) (local.get 1)))
+     (func (export \"add8\") (param i32 i32) (result i32)
+       (i32.atomic.rmw8.add_u (local.get 0) (local.get 1)))
+     (func (export \"sub\") (param i32 i32) (result i32)
+       (i32.atomic.rmw.sub (local.get 0) (local.get 1)))
+     (func (export \"and\") (param i32 i32) (result i32)
+       (i32.atomic.rmw.and (local.get 0) (local.get 1)))
+     (func (export \"or\") (param i32 i32) (result i32)
+       (i32.atomic.rmw.or (local.get 0) (local.get 1)))
+     (func (export \"xor\") (param i32 i32) (result i32)
+       (i32.atomic.rmw.xor (local.get 0) (local.get 1)))
+     (func (export \"xchg\") (param i32 i32) (result i32)
+       (i32.atomic.rmw.xchg (local.get 0) (local.get 1)))
+     (func (export \"cmpxchg\") (param i32 i32 i32) (result i32)
+       (i32.atomic.rmw.cmpxchg (local.get 0) (local.get 1) (local.get 2)))
+     (func (export \"cmpxchg8\") (param i32 i32 i32) (result i32)
+       (i32.atomic.rmw8.cmpxchg_u (local.get 0) (local.get 1) (local.get 2)))
+     (func (export \"store64\") (param i32 i64)
+       (i64.atomic.store (local.get 0) (local.get 1)))
+     (func (export \"load64\") (param i32) (result i64)
+       (i64.atomic.load (local.get 0)))
+     (func (export \"wait\") (result i32)
+       (memory.atomic.wait32 (i32.const 4) (i32.const 0) (i64.const -1)))
+     (func (export \"wait0\") (result i32)
+       (memory.atomic.wait32 (i32.const 4) (i32.const 0) (i64.const 0)))
+     (func (export \"notify\") (result i32)
+       (memory.atomic.notify (i32.const 4) (i32.const 1)))
+     (func (export \"unaligned\") (result i32)
+       (i32.atomic.load (i32.const 1)))
+     (func (export \"fence\") (atomic.fence)))")
+
+(wasmdown.test:test interp/atomic-load-store-rmw
+  (let ((wasmdown:*threads* t))
+    (let ((inst (wasmdown:instantiate
+                 (wasmdown.text:parse-wat *atomic-wat*))))
+      ;; store/load full width
+      (wasmdown:invoke inst "store" 0 #x11223344)
+      (expect (wasmdown:invoke inst "load" 0) '(#x11223344))
+      ;; rmw.add returns the OLD value, then wraps at 32 bits
+      (expect (wasmdown:invoke inst "add" 0 1) '(#x11223344))
+      (expect (wasmdown:invoke inst "load" 0) '(#x11223345))
+      (wasmdown:invoke inst "store" 4 #xFFFFFFFF)
+      (expect (wasmdown:invoke inst "add" 4 2) '(#xFFFFFFFF))
+      (expect (wasmdown:invoke inst "load" 4) '(1))
+      ;; sub wraps below zero
+      (wasmdown:invoke inst "store" 8 0)
+      (expect (wasmdown:invoke inst "sub" 8 1) '(0))
+      (expect (wasmdown:invoke inst "load" 8) '(#xFFFFFFFF))
+      ;; and/or/xor/xchg
+      (wasmdown:invoke inst "store" 12 #xF0F0F0F0)
+      (expect (wasmdown:invoke inst "and" 12 #xFF00FF00) '(#xF0F0F0F0))
+      (expect (wasmdown:invoke inst "or" 12 #x000F) '(#xF000F000))
+      (expect (wasmdown:invoke inst "xor" 12 #xFFFFFFFF) '(#xF000F00F))
+      (expect (wasmdown:invoke inst "xchg" 12 #x12345678) '(#x0FFF0FF0))
+      (expect (wasmdown:invoke inst "load" 12) '(#x12345678))
+      ;; 8-bit width truncation + zero-extension
+      (wasmdown:invoke inst "store8" 16 #x1234)
+      (expect (wasmdown:invoke inst "load8u" 16) '(#x34))
+      (expect (wasmdown:invoke inst "add8" 16 255) '(#x34))
+      (expect (wasmdown:invoke inst "load8u" 16) '(#x33))
+      ;; cmpxchg matches on the width-truncated expected/value
+      (wasmdown:invoke inst "store" 20 7)
+      (expect (wasmdown:invoke inst "cmpxchg" 20 7 9) '(7))
+      (expect (wasmdown:invoke inst "load" 20) '(9))
+      (expect (wasmdown:invoke inst "cmpxchg" 20 7 5) '(9))
+      (expect (wasmdown:invoke inst "load" 20) '(9))
+      (wasmdown:invoke inst "store8" 24 #xAA)
+      (expect (wasmdown:invoke inst "cmpxchg8" 24 #xAA #xBB) '(#xAA))
+      (expect (wasmdown:invoke inst "load8u" 24) '(#xBB))
+      ;; 64-bit form (32 is 8-byte aligned)
+      (wasmdown:invoke inst "store64" 32 #x123456789ABCDEF0)
+      (expect (wasmdown:invoke inst "load64" 32) '(#x123456789ABCDEF0))
+      (wasmdown:invoke inst "fence")
+      (wasmdown.test:is t))))
+
+(wasmdown.test:test interp/atomic-wait-notify-single-thread
+  (let ((wasmdown:*threads* t))
+    (let ((inst (wasmdown:instantiate
+                 (wasmdown.text:parse-wat *atomic-wat*))))
+      ;; value at 4 is 0: a zero timeout returns 2 (timed out)
+      (expect (wasmdown:invoke inst "wait0") '(2))
+      ;; not equal -> 1
+      (wasmdown:invoke inst "store" 4 5)
+      (expect (wasmdown:invoke inst "wait0") '(1))
+      ;; notify with no waiter -> 0
+      (expect (wasmdown:invoke inst "notify") '(0)))))
+
+(wasmdown.test:test interp/atomic-unaligned-trap
+  (let ((wasmdown:*threads* t))
+    (let ((inst (wasmdown:instantiate
+                 (wasmdown.text:parse-wat *atomic-wat*))))
+      (wasmdown.test:assert-trap :unaligned-atomic (wasmdown:invoke inst "unaligned")))))
+
+(wasmdown.test:test interp/atomic-wait-requires-shared
+  (let ((wasmdown:*threads* t))
+    (let ((inst (wasmdown:instantiate
+                 (wasmdown.text:parse-wat
+                  "(module (memory 1 1)
+                     (func (export \"wait\") (result i32)
+                       (memory.atomic.wait32 (i32.const 0) (i32.const 0)
+                                             (i64.const 0))))"))))
+      (wasmdown.test:assert-trap :expected-shared-memory (wasmdown:invoke inst "wait")))))
+
+(wasmdown.test:test interp/atomic-rmw-concurrent
+  ;; 4 SBCL threads x 2000 atomic adds through the Wasm export: the
+  ;; per-memory lock makes every increment visible (a torn RMW loses
+  ;; updates and the total shrinks).
+  (let ((wasmdown:*threads* t))
+    (let* ((inst (wasmdown:instantiate
+                  (wasmdown.text:parse-wat *atomic-wat*)))
+           (threads (loop repeat 4 collect
+                          (sb-thread:make-thread
+                           (lambda ()
+                             (dotimes (i 2000)
+                               (wasmdown:invoke inst "add" 0 1)))))))
+      (mapc #'sb-thread:join-thread threads)
+      (expect (wasmdown:invoke inst "load" 0) '(8000)))))
+
+(wasmdown.test:test interp/atomic-wait-notify-across-threads
+  (let ((wasmdown:*threads* t))
+    (let* ((inst (wasmdown:instantiate
+                  (wasmdown.text:parse-wat *atomic-wat*)))
+           (result nil)
+           (th (sb-thread:make-thread
+                (lambda () (setf result (wasmdown:invoke inst "wait"))))))
+      ;; let the waiter block, then wake exactly one
+      (sleep 0.2)
+      (expect (wasmdown:invoke inst "notify") '(1))
+      (sb-thread:join-thread th)
+      (expect result '(0)))))

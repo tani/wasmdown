@@ -1214,6 +1214,8 @@ Returns (values params results typeidx-or-nil)."
     "i32.trunc_sat_f32_s" "i32.trunc_sat_f32_u" "i32.trunc_sat_f64_s"
     "i32.trunc_sat_f64_u" "i64.trunc_sat_f32_s" "i64.trunc_sat_f32_u"
     "i64.trunc_sat_f64_s" "i64.trunc_sat_f64_u"
+    ;; threads proposal: atomic.fence is immediate-free in text.
+    "atomic.fence"
     "ref.is_null"))
 
 (defun %kw (text)
@@ -1313,14 +1315,26 @@ underscore)."
       (setf (gethash s h) (%kw s)))))
 
 (defparameter *memarg-ops*
-  '(("i32.load" 4) ("i64.load" 8) ("f32.load" 4) ("f64.load" 8)
+  `(("i32.load" 4) ("i64.load" 8) ("f32.load" 4) ("f64.load" 8)
     ("i32.load8_s" 1) ("i32.load8_u" 1) ("i32.load16_s" 2)
     ("i32.load16_u" 2) ("i64.load8_s" 1) ("i64.load8_u" 1)
     ("i64.load16_s" 2) ("i64.load16_u" 2) ("i64.load32_s" 4)
     ("i64.load32_u" 4)
     ("i32.store" 4) ("i64.store" 8) ("f32.store" 4) ("f64.store" 8)
     ("i32.store8" 1) ("i32.store16" 2) ("i64.store8" 1)
-    ("i64.store16" 2) ("i64.store32" 4)))
+    ("i64.store16" 2) ("i64.store32" 4)
+    ;; threads proposal (opt-in): every 0xFE op except atomic.fence
+    ;; carries a memarg. The default alignment is the NATURAL width;
+    ;; the validator insists atomics spell exactly that alignment.
+    ,@(let (entries)
+        (maphash (lambda (op info)
+                   (unless (eq (wasmdown.types:atomic-op-info-kind info)
+                               :fence)
+                     (push (list (string-downcase (symbol-name op))
+                                 (wasmdown.types:atomic-op-info-width info))
+                           entries)))
+                 wasmdown.types:*atomic-ops*)
+        (sort entries #'string< :key #'car))))
 
 (defparameter *memarg-op-keywords*
   (let ((h (make-hash-table :test #'equal)))
@@ -1669,6 +1683,11 @@ rest of the plain sequence."
   (let ((op-key (%kw k))
         (bad (lambda ()
                (%text-error pos "bad or missing immediates for ~a" k))))
+    (when (and (wasmdown.types:atomic-op-p op-key)
+               (not wasmdown:*threads*))
+      (%text-error pos
+                   "atomic instruction ~a requires the threads feature (wasmdown:*threads*)"
+                   k))
     (cond
      ;; plain ops: no immediates
      ((gethash k *plain-op-keywords*)
@@ -2393,12 +2412,15 @@ an $id token."
       (values (car items) (cdr items))
       (values nil items)))
 
-(defun %limits-tail (items pos what)
+(defun %limits-tail (items pos what &key allow-shared)
   "Parse [i32|i64]? n | n n limits from ITEMS (Core 3.0 memorytype:
 addrtype then limits — the i64 marker sets the memory64 flag; i32
 is the default and accepted explicitly). The min is a nat token; a
 SECOND nat token is the max (a reftype/id after the min is NOT a
-max). Returns (values limits rest-items)."
+max). Memory positions additionally accept the threads proposal's
+trailing `shared` keyword (ALLOW-SHARED); it is parsed even without a
+max so the validator reports 'shared memory must have maximum' as the
+spec's assert_invalid expects. Returns (values limits rest-items)."
   ;; optional addrtype marker (memory positions only; TABLE callers
   ;; never pass an i64 token here — the table grammar has no
   ;; addrtype, and a 64-bit table would be table64, out of scope)
@@ -2411,16 +2433,33 @@ max). Returns (values limits rest-items)."
             rest (cdr rest)))
     (unless (and (>= (length rest) 1) (tok-p (car rest)))
       (%text-error pos "~a needs limits" what))
-    (let ((min (%parse-nat (tok-text (car rest)) (tok-pos (car rest)))))
-      (if (and (cdr rest) (tok-p (second rest))
-               (eq (tok-kind (second rest)) :nat))
-          (let ((max (%parse-nat (tok-text (second rest))
-                                 (tok-pos (second rest)))))
-            (values (make-wasm-limits min max i64-p) (cddr rest)))
-          ;; no max: the &aux has-max in the positional constructor
-          ;; keys off SUPPLIED-P, so use the explicit constructor
-          (values (wasmdown.types::%make-wasm-limits* min nil nil i64-p)
-                  (cdr rest))))))
+    (let* ((min (%parse-nat (tok-text (car rest)) (tok-pos (car rest))))
+           (max nil)
+           (rest (cdr rest)))
+      (when (and rest (tok-p (car rest))
+                 (eq (tok-kind (car rest)) :nat))
+        (setf max (%parse-nat (tok-text (car rest))
+                              (tok-pos (car rest)))
+              rest (cdr rest)))
+      (let ((shared-p nil))
+        (when (and rest (tok-p (car rest))
+                   (eq (tok-kind (car rest)) :keyword)
+                   (string= (%tok-keyword (car rest)) "shared"))
+          (unless allow-shared
+            (%text-error (tok-pos (car rest)) "tables cannot be shared (yet)"))
+          (unless wasmdown:*threads*
+            (%text-error (tok-pos (car rest))
+                         "shared memory requires the threads feature (wasmdown:*threads*)"))
+          (setf shared-p t
+                rest (cdr rest)))
+        (values
+         (if max
+             (make-wasm-limits min max i64-p shared-p)
+             ;; no max: the &aux has-max in the positional constructor
+             ;; keys off SUPPLIED-P, so use the explicit constructor
+             (wasmdown.types::%make-wasm-limits* min nil nil i64-p
+                                                 shared-p))
+         rest)))))
 
 (defun %comptype-body (node penv what)
   "Parse the comptype BODY of one (type $id? (func|struct|array ...))
@@ -2672,7 +2711,7 @@ typed (ref ...) form), per the text grammar."
   (unless (and rest (tok-p (car rest)))
     (%text-error pos "imported memory needs limits"))
   (multiple-value-bind (limits tail)
-      (%limits-tail rest pos "imported memory")
+      (%limits-tail rest pos "imported memory" :allow-shared t)
     (declare (ignore tail))
     limits))
 
@@ -3165,7 +3204,7 @@ import, then limits (n [n]) or the (data ...) abbreviation."
                             (penv-datas-list penv)))))
                 (progn
                   (multiple-value-bind (limits tail)
-                      (%limits-tail rest pos "memory")
+                      (%limits-tail rest pos "memory" :allow-shared t)
                     (unless (null tail)
                       (%text-error pos "junk after memory limits"))
                     (push (make-wasm-memory limits)

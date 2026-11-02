@@ -12,6 +12,14 @@
 ;;;; - Expressions are (vector instr), terminated by :end.
 (in-package #:wasmdown.types)
 
+(defvar wasmdown:*threads* nil
+  "Opt-in threads-proposal gate. NIL (the default) keeps the core
+engine's behavior: the binary decoder rejects the shared limits flag,
+the text parser rejects `shared`, and atomic instructions do not
+decode/parse/validate. Bind T (or pass the CLI's --threads) to enable
+shared memories, the 0xFE atomic instruction family and the
+memory.atomic.wait/notify host hooks (wasmdown.threads).")
+
 (defstruct (wasm-instr (:constructor make-wasm-instr (op imms &optional body offset)))
   "One decoded instruction."
   (op :nop :type keyword)
@@ -111,8 +119,8 @@ forward-reference bound)."
                 (wasm-func-type-results ty)))))))
 
 (defstruct (wasm-limits
-            (:constructor make-wasm-limits (min &optional (max nil max-p) (i64-p nil) &aux (has-max max-p)))
-            (:constructor %make-wasm-limits* (min max has-max &optional (i64-p nil))))
+            (:constructor make-wasm-limits (min &optional (max nil max-p) (i64-p nil) (shared-p nil) &aux (has-max max-p)))
+            (:constructor %make-wasm-limits* (min max has-max &optional (i64-p nil) (shared-p nil))))
   (min 0 :type (integer 0))
   (max nil :type (or null (integer 0)))
   (has-max nil :type boolean)
@@ -120,11 +128,118 @@ forward-reference bound)."
   ;; 2 in binary; the i64 marker in text). Memory-only semantics:
   ;; a 64-bit TABLE limits flag decodes but the validator keeps
   ;; rejecting tables (table64 out of scope — honest slice).
-  (i64-p nil :type boolean))
+  (i64-p nil :type boolean)
+  ;; threads proposal (opt-in, wasmdown:*threads*): the shared limits
+  ;; flag (binary bit 1 / text `shared`). Shared memories MUST carry a
+  ;; maximum (validator); tables can never be shared.
+  (shared-p nil :type boolean))
 
 (defun wasm-limits-has-max-p (limits)
   "Exported alias for the HAS-MAX slot reader."
   (wasm-limits-has-max limits))
+
+;;; ---------------------------------------------------------------
+;;; Threads proposal: atomic instruction metadata shared by the binary
+;;; decoder/encoder, the text parser, the validator and both backends.
+;;; KIND is :load/:store/:rmw/:notify/:wait/:fence; OPERATION names the
+;;; rmw operation (:add/:sub/:and/:or/:xor/:xchg/:cmpxchg); WIDTH is
+;;; the accessed byte width; ALIGN is the mandatory (natural) alignment
+;;; exponent; VALUE-TYPE is the operand/result numeric type.
+
+(defstruct (atomic-op-info (:constructor %make-atomic-op-info
+                                          (kind width align value-type
+                                           &optional operation)))
+  kind
+  operation
+  width
+  align
+  value-type)
+
+(defparameter *atomic-ops* (make-hash-table :test #'eq))
+
+(flet ((add (op kind width align value-type &optional operation)
+         (setf (gethash (intern (string-upcase op) :keyword) *atomic-ops*)
+               (%make-atomic-op-info kind width align value-type operation))))
+  (loop for (type full-width) in '((:i32 4) (:i64 8))
+        for base = (string-downcase (symbol-name type)) do
+    ;; loads: full-width has no suffix; narrower loads are <n>_u.
+    (loop for width in (if (= full-width 4) '(4 1 2) '(8 1 2 4))
+          do (add (if (= width full-width)
+                      (format nil "~a.atomic.load" base)
+                      (format nil "~a.atomic.load~d_u" base (* 8 width)))
+                  :load width (1- (integer-length width)) type))
+    ;; stores: full-width plain; sub-width stores have no suffix.
+    (loop for width in (if (= full-width 4) '(4 1 2) '(8 1 2 4))
+          do (add (if (= width full-width)
+                      (format nil "~a.atomic.store" base)
+                      (format nil "~a.atomic.store~d" base (* 8 width)))
+                  :store width (1- (integer-length width)) type))
+    ;; rmw families: the sub-width spelling is rmw8/rmw16 (+ _u), the
+    ;; full width is rmw for i32 and rmw32/_u for i64's 4-byte op.
+    (dolist (family '((:add "add") (:sub "sub") (:and "and")
+                      (:or "or") (:xor "xor") (:xchg "xchg")
+                      (:cmpxchg "cmpxchg")))
+      (loop for width in (if (= full-width 4) '(4 1 2) '(8 1 2 4))
+            do (let* ((sub-width-p (< width full-width))
+                      (mid (cond ((= width full-width) "rmw")
+                                 ((= width 1) "rmw8")
+                                 ((= width 2) "rmw16")
+                                 ((= width 4) "rmw32")))
+                      (name (format nil "~a.atomic.~a.~a~@[_u~]"
+                                    base mid (second family)
+                                    (and sub-width-p t))))
+                 (add name :rmw
+                      width (1- (integer-length width)) type
+                      (first family))))))
+  (add "memory.atomic.notify" :notify 4 2 :i32)
+  (add "memory.atomic.wait32" :wait 4 2 :i32)
+  (add "memory.atomic.wait64" :wait 8 3 :i64)
+  (add "atomic.fence" :fence 0 0 nil))
+
+(defun atomic-op-info-of (op)
+  "The atomic-op-info for OP keyword, or NIL when OP is not atomic."
+  (gethash op *atomic-ops*))
+
+(defun atomic-op-p (op)
+  (and (gethash op *atomic-ops*) t))
+
+(defparameter *atomic-op-sub*
+  ;; Binary 0xFE sub-opcode -> op keyword (threads proposal). The
+  ;; wait/notify/fence group is 0x00..0x03; loads 0x10..; stores
+  ;; 0x17..; the seven-op rmw families in order add/sub/and/or/xor/
+  ;; xchg/cmpxchg (0x1E..0x4E).
+  (let* ((h (make-hash-table))
+         (add (lambda (sub op)
+               (setf (gethash sub h) (intern (string-upcase op) :keyword)))))
+    (funcall add #x00 "memory.atomic.notify")
+    (funcall add #x01 "memory.atomic.wait32")
+    (funcall add #x02 "memory.atomic.wait64")
+    (funcall add #x03 "atomic.fence")
+    (funcall add #x10 "i32.atomic.load")
+    (funcall add #x11 "i64.atomic.load")
+    (funcall add #x12 "i32.atomic.load8_u")
+    (funcall add #x13 "i32.atomic.load16_u")
+    (funcall add #x14 "i64.atomic.load8_u")
+    (funcall add #x15 "i64.atomic.load16_u")
+    (funcall add #x16 "i64.atomic.load32_u")
+    (funcall add #x17 "i32.atomic.store")
+    (funcall add #x18 "i64.atomic.store")
+    (funcall add #x19 "i32.atomic.store8")
+    (funcall add #x1A "i32.atomic.store16")
+    (funcall add #x1B "i64.atomic.store8")
+    (funcall add #x1C "i64.atomic.store16")
+    (funcall add #x1D "i64.atomic.store32")
+    (loop for family in '("add" "sub" "and" "or" "xor" "xchg" "cmpxchg")
+          for start in '(#x1E #x25 #x2C #x33 #x3A #x41 #x48)
+          do (funcall add start (format nil "i32.atomic.rmw.~a" family))
+             (funcall add (1+ start) (format nil "i64.atomic.rmw.~a" family))
+             (funcall add (+ start 2) (format nil "i32.atomic.rmw8.~a_u" family))
+             (funcall add (+ start 3) (format nil "i32.atomic.rmw16.~a_u" family))
+             (funcall add (+ start 4) (format nil "i64.atomic.rmw8.~a_u" family))
+             (funcall add (+ start 5) (format nil "i64.atomic.rmw16.~a_u" family))
+             (funcall add (+ start 6) (format nil "i64.atomic.rmw32.~a_u" family)))
+    h)
+  "Binary 0xFE sub-opcode -> atomic op keyword.")
 
 (defstruct (wasm-table (:constructor make-wasm-table (type limits)))
   "Table type: element reference type plus limits."

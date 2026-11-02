@@ -80,6 +80,13 @@ the object itself is shared."
   (backend :interpret :type (member :interpret :compiled))
   compiled-entry)
 
+(defstruct (atomic-wait-entry (:constructor %make-atomic-wait-entry))
+  "One address's wait queue in a shared memory: a condition variable
+and the number of currently blocked threads. All access happens under
+the memory's LOCK."
+  (condvar (sb-thread:make-waitqueue) :read-only t)
+  (waiters 0 :type (integer 0)))
+
 (defstruct (memory-instance (:constructor %make-memory-instance))
   "Linear memory: BYTES is a (vector (unsigned-byte 8)) of PAGES
 pages. I64-P marks the memory64 address type (Core 3.0): loads/
@@ -90,7 +97,18 @@ i64 -1."
   (pages 0 :type (integer 0))
   (max-pages *max-pages* :type (integer 0))
   (has-max-p nil :type boolean)
-  (i64-p nil :type boolean))
+  (i64-p nil :type boolean)
+  ;; threads proposal: shared memory (opt-in). Atomic wait traps on an
+  ;; unshared memory; atomic loads/stores/rmw do NOT require sharing.
+  (shared-p nil :type boolean)
+  ;; Real-SBCL-thread synchronization for shared memory: atomic
+  ;; read-modify-write/cmpxchg/load/store serialize on LOCK, and
+  ;; wait/notify bookkeeping lives in WAIT-TABLE (effective address ->
+  ;; atomic-wait-entry). Plain (non-atomic) loads/stores remain
+  ;; unlocked, per the proposal's data-race semantics.
+  (lock (sb-thread:make-mutex :name "wasmdown shared memory")
+        :read-only t)
+  (wait-table (make-hash-table :test #'eql) :read-only t))
 
 (defstruct (table-instance (:constructor %make-table-instance))
   "A table of references; ELEMS is a simple vector of func-instances /
@@ -530,7 +548,9 @@ arguments and returns a results LIST."
      :max-pages (or max *max-pages*)
      :has-max-p (wasm-limits-has-max-p limits)
      ;; memory64 (Core 3.0): the address type from the limits flag
-     :i64-p (wasm-limits-i64-p limits))))
+     :i64-p (wasm-limits-i64-p limits)
+     ;; threads proposal: sharedness from the limits flag
+     :shared-p (wasm-limits-shared-p limits))))
 
 (defun make-table-instance (type limits)
   "Allocate a table of TYPE (:funcref/:externref) from wasm-limits.
@@ -705,14 +725,7 @@ The single protocol boundary shared by both backends."
 (defun memory-size (mem)
   (memory-instance-pages mem))
 
-(defun memory-grow (mem delta)
-  "Grow by DELTA pages. Returns the old page count on success, -1 in
-the memory's ADDRESS TYPE on failure (4294967295 for i32 memories;
-18446744073709551615 for memory64 — spec exec/intabort.ml's grow
-failure is the index-type -1). On success the byte vector is
-replaced by a larger one that preserves contents and zero-fills.
-The *max-pages* ceiling is the runtime's own allocation bound
-(docs/design/PLAN.md §3.4) — the validator's spec-side bound is separate."
+(defun %memory-grow-locked (mem delta)
   (let* ((old (memory-instance-pages mem))
          (new (+ old delta))
          (fail (if (memory-instance-i64-p mem)
@@ -728,6 +741,22 @@ The *max-pages* ceiling is the runtime's own allocation bound
           (setf (memory-instance-bytes mem) new-bytes)
           (setf (memory-instance-pages mem) new)
           old))))
+
+
+(defun memory-grow (mem delta)
+  "Grow by DELTA pages. Returns the old page count on success, -1 in
+the memory's ADDRESS TYPE on failure (4294967295 for i32 memories;
+18446744073709551615 for memory64 — spec exec/intabort.ml's grow
+failure is the index-type -1). On success the byte vector is
+replaced by a larger one that preserves contents and zero-fills.
+The *max-pages* ceiling is the runtime's own allocation bound
+(docs/design/PLAN.md §3.4) — the validator's spec-side bound is separate.
+A SHARED memory grows under its atomic lock, so a concurrent atomic
+access never observes a half-replaced backing."
+  (if (memory-instance-shared-p mem)
+      (sb-thread:with-mutex ((memory-instance-lock mem))
+        (%memory-grow-locked mem delta))
+      (%memory-grow-locked mem delta)))
 
 (defun %check-mem-span (mem start end)
   "END is exclusive. Traps when [START, END) leaves the memory."
@@ -782,6 +811,133 @@ possible (distinct backings)."
     (%check-mem-span mem dst (+ dst len))
     (let ((bytes (memory-instance-bytes mem)))
       (replace bytes seg-bytes :start1 dst :end1 (+ dst len) :start2 src))))
+
+;;; ---------------------------------------------------------------
+;;; Threads proposal atomics (opt-in), real SBCL threads. Atomic
+;;; load/store/rmw/cmpxchg serialize on the memory's LOCK, so
+;;; read-modify-write and compare-exchange are indivisible across
+;;; guest threads. Plain (non-atomic) memory-load/store stay unlocked
+;;; — the proposal allows data races there. memory.atomic.wait/notify
+;;; use a per-address wait queue (condition variable) in WAIT-TABLE,
+;;; all guarded by LOCK.
+
+(defun %atomic-align-check (ea width)
+  "Atomics require their natural alignment at run time; an unaligned
+effective address traps 'unaligned atomic' (threads/atomic.wast)."
+  (unless (zerop (mod ea width))
+    (%trap :unaligned-atomic "unaligned atomic")))
+
+(defun atomic-load (mem ea width)
+  "Atomic load of WIDTH bytes: alignment check plus an indivisible
+read (the memory lock prevents tearing against atomic stores/rmw)."
+  (%atomic-align-check ea width)
+  (sb-thread:with-mutex ((memory-instance-lock mem))
+    (memory-load mem ea width)))
+
+(defun atomic-store (mem ea width value)
+  "Atomic store of the low WIDTH bytes (alignment-checked, indivisible)."
+  (%atomic-align-check ea width)
+  (sb-thread:with-mutex ((memory-instance-lock mem))
+    (memory-store mem ea width value)))
+
+(defun atomic-rmw (mem ea width operation operand)
+  "Read-modify-write OPERATION (:add/:sub/:and/:or/:xor/:xchg) of the
+WIDTH-bit cell at EA under the memory lock, returning the OLD value
+zero-extended (the spec's rmw result). OPERAND is truncated to the
+cell width first."
+  (%atomic-align-check ea width)
+  (sb-thread:with-mutex ((memory-instance-lock mem))
+    (let* ((old (memory-load mem ea width))
+           (mask (1- (ash 1 (* 8 width))))
+           (v (logand operand mask))
+           (new (case operation
+                  (:add (logand (+ old v) mask))
+                  (:sub (logand (- old v) mask))
+                  (:and (logand old v))
+                  (:or (logand (logior old v) mask))
+                  (:xor (logand (logxor old v) mask))
+                  (:xchg v)
+                  (t (%trap :generic "unknown atomic rmw operation ~a"
+                            operation)))))
+      (memory-store mem ea width new)
+      old)))
+
+(defun atomic-cmpxchg (mem ea width expected value)
+  "Atomic compare-exchange under the memory lock: if the cell at EA
+equals EXPECTED (both truncated to WIDTH), store VALUE there; return
+the OLD value. Compare and store are one indivisible step."
+  (%atomic-align-check ea width)
+  (sb-thread:with-mutex ((memory-instance-lock mem))
+    (let* ((old (memory-load mem ea width))
+           (mask (1- (ash 1 (* 8 width)))))
+      (when (= old (logand expected mask))
+        (memory-store mem ea width (logand value mask)))
+      old)))
+
+(defun memory-atomic-notify (mem ea count)
+  "memory.atomic.notify: bounds/alignment checks, then wake up to
+COUNT threads blocked on EA (never more than the number waiting).
+Returns the number of threads notified (0 when none)."
+  (%atomic-align-check ea 4)
+  (%check-mem-range mem ea 4)
+  (let ((count (logand count #xffffffff)))
+    (sb-thread:with-mutex ((memory-instance-lock mem))
+      (let ((entry (gethash ea (memory-instance-wait-table mem))))
+        (if (or (null entry) (zerop count))
+            0
+            (let ((n (min count (atomic-wait-entry-waiters entry))))
+              (dotimes (i n)
+                (sb-thread:condition-notify (atomic-wait-entry-condvar entry)))
+              n))))))
+
+(defun memory-atomic-wait (mem ea width expected timeout)
+  "memory.atomic.wait32/64: bounds/alignment checks, the
+shared-memory requirement (a RUNTIME trap, spec threads/atomic.wast),
+then a real block on the per-address wait queue.
+
+Returns 0 (woken by notify) / 1 (the cell did not equal EXPECTED at
+entry) / 2 (timed out). TIMEOUT is the i64 nanosecond count; bit 63
+set (i64 -1 and any negative value) waits indefinitely, 0 polls (and
+therefore times out when the value matches). The expected check and
+waiter registration happen under the memory lock, so a notify cannot
+slip between them."
+  (%atomic-align-check ea width)
+  (%check-mem-range mem ea width)
+  (unless (memory-instance-shared-p mem)
+    (%trap :expected-shared-memory "expected shared memory"))
+  (let ((mask (1- (ash 1 (* 8 width))))
+        (infinite-p (>= timeout #x8000000000000000)))
+    (sb-thread:with-mutex ((memory-instance-lock mem))
+      (let ((table (memory-instance-wait-table mem)))
+        (when (/= (memory-load mem ea width) (logand expected mask))
+          (return-from memory-atomic-wait 1))
+        (when (and (not infinite-p) (zerop timeout))
+          (return-from memory-atomic-wait 2))
+        (let ((entry (or (gethash ea table)
+                         (setf (gethash ea table)
+                               (%make-atomic-wait-entry)))))
+          (incf (atomic-wait-entry-waiters entry))
+          (unwind-protect
+               (progn
+                 (loop
+                   (let ((notifiedp
+                           (sb-thread:condition-wait
+                            (atomic-wait-entry-condvar entry)
+                            (memory-instance-lock mem)
+                            :timeout (unless infinite-p
+                                       (coerce (/ timeout 1.0d9)
+                                               'double-float)))))
+                     ;; SBCL returns from a TIMED-OUT wait with the
+                     ;; mutex released; re-grab before touching the
+                     ;; waiter count or the wait table.
+                     (unless (sb-thread:holding-mutex-p
+                              (memory-instance-lock mem))
+                       (sb-thread:grab-mutex
+                        (memory-instance-lock mem)))
+                     (return (if notifiedp 0 2)))))
+            (decf (atomic-wait-entry-waiters entry))
+            (when (zerop (atomic-wait-entry-waiters entry))
+              (remhash ea table))))))))
 
 ;;; ---------------------------------------------------------------
 ;;; Table operations.
@@ -974,6 +1130,11 @@ TABLE-COPY when both indices name the same table)."
     (%link-error "import ~a.~a: expected a memory, got ~s"
                  (wasm-import-module import) (wasm-import-field import)
                  (type-of value)))
+  (unless (eq (wasmdown.types:wasm-limits-shared-p
+               (wasm-memory-limits (wasm-import-type import)))
+              (memory-instance-shared-p value))
+    (%link-error "import ~a.~a: memory sharedness mismatch"
+                 (wasm-import-module import) (wasm-import-field import)))
   (unless (%limits-match-p (wasm-memory-limits (wasm-import-type import))
                            (memory-instance-pages value)
                            (memory-instance-max-pages value)
@@ -1309,3 +1470,4 @@ IMPORTS-ALIST maps ((\"mod\" \"field\") . value)."
             (when (wasm-module-start module)
               (wasm-call (svref all-funcs (wasm-module-start module))))
             inst))))))
+

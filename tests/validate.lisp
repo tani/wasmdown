@@ -573,3 +573,125 @@
                                       (i :if nil
                                         (vector (i :nop)))
                                       (i :end))))))))
+
+;;; ================================================================
+;;; Threads proposal (opt-in): shared memory + atomic instructions.
+;;; The module builders above are reused; the opt-in is the dynamic
+;;; variable WASMDOWN:*THREADS*, bound here so the default lane keeps
+;;; its rejection.
+
+(defun shared-mem (&optional (min 1) (max 1))
+  (make-wasm-memory (make-wasm-limits min max nil t)))
+
+(wasmdown.test:test validate/threads-shared-memory-positive
+  (let ((wasmdown:*threads* t))
+    (ok (wasmdown.validate:validate-module
+         (mmod :types (vector (ft '() '(:i32)) (ft '() '()))
+               :mems (vector (shared-mem))
+               :funcs (vector
+                       (f 0 '() (vector
+                                 (i :i32.const (list :value 0))
+                                 (i :i32.atomic.load (list :align 2 :offset 0))
+                                 (endi)))))))
+    ;; atomics are legal on UNSHARED memory too (only wait requires
+    ;; shared, and that is a runtime trap)
+    (ok (wasmdown.validate:validate-module
+         (mmod :types (ti32)
+               :mems (vector (make-wasm-memory (make-wasm-limits 1 1)))
+               :funcs (vector
+                       (f 0 '() (vector
+                                 (i :i32.const (list :value 0))
+                                 (i :i32.atomic.load (list :align 2 :offset 0))
+                                 (endi)))))))))
+
+(wasmdown.test:test validate/threads-wait-notify-fence
+  (let ((wasmdown:*threads* t))
+    (ok (wasmdown.validate:validate-module
+         (mmod :types (vector (ft '() '(:i32)) (ft '() '()))
+               :mems (vector (shared-mem))
+               :funcs (vector
+                       (f 0 '() (vector
+                                 (i :i32.const (list :value 0))
+                                 (i :i32.const (list :value 0))
+                                 (i :i64.const (list :value 0))
+                                 (i :memory.atomic.wait32
+                                    (list :align 2 :offset 0))
+                                 (endi)))
+                       (f 0 '() (vector
+                                 (i :i32.const (list :value 0))
+                                 (i :i32.const (list :value 0))
+                                 (i :memory.atomic.notify
+                                    (list :align 2 :offset 0))
+                                 (endi)))
+                       ;; atomic.fence needs no memory at all
+                       (f 1 '() (vector (i :atomic.fence) (endi)))))))))
+
+(wasmdown.test:test validate/threads-shared-requires-maximum
+  (let ((wasmdown:*threads* t))
+    (wasmdown.test:assert-raises wasmdown:validation-error
+      (wasmdown.validate:validate-module
+       (mmod :mems (vector
+                    (make-wasm-memory
+                     (wasmdown.types::%make-wasm-limits* 1 nil nil nil t))))))))
+
+(wasmdown.test:test validate/threads-atomic-alignment-natural
+  (let ((wasmdown:*threads* t))
+    ;; align=1 (2 bytes) on a 4-byte atomic is invalid
+    (wasmdown.test:assert-raises wasmdown:validation-error
+      (wasmdown.validate:validate-module
+       (mmod :types (ti32)
+             :mems (vector (shared-mem))
+             :funcs (vector
+                     (f 0 '() (vector
+                               (i :i32.const (list :value 0))
+                               (i :i32.atomic.load (list :align 1 :offset 0))
+                               (endi)))))))
+    ;; 8-byte atomic rmw with the natural align=3 validates
+    (ok (wasmdown.validate:validate-module
+         (mmod :types (vector (ft '() '(:i64)))
+               :mems (vector (shared-mem))
+               :funcs (vector
+                       (f 0 '() (vector
+                                 (i :i32.const (list :value 0))
+                                 (i :i64.const (list :value 1))
+                                 (i :i64.atomic.rmw.add
+                                    (list :align 3 :offset 0))
+                                 (endi)))))))))
+
+(wasmdown.test:test validate/threads-atomic-unknown-memory
+  (let ((wasmdown:*threads* t))
+    (wasmdown.test:assert-raises wasmdown:validation-error
+      (wasmdown.validate:validate-module
+       (mmod :types (ti32)
+             :funcs (vector
+                     (f 0 '() (vector
+                               (i :i32.const (list :value 0))
+                               (i :i32.atomic.load (list :align 2 :offset 0))
+                               (endi)))))))))
+
+(wasmdown.test:test validate/threads-gate-off-rejects-atomics
+  (let ((wasmdown:*threads* nil))
+    (wasmdown.test:assert-raises wasmdown:validation-error
+      (wasmdown.validate:validate-module
+       (mmod :types (ti32)
+             :mems (vector (make-wasm-memory (make-wasm-limits 1 1)))
+             :funcs (vector
+                     (f 0 '() (vector
+                               (i :i32.const (list :value 0))
+                               (i :i32.atomic.load (list :align 2 :offset 0))
+                               (endi)))))))))
+
+;; Typing is enforced: i64.atomic.store with an i32 value operand.
+(wasmdown.test:test validate/threads-atomic-type-mismatch
+  (let ((wasmdown:*threads* t))
+    (wasmdown.test:assert-raises wasmdown:validation-error
+      (wasmdown.validate:validate-module
+       (mmod :types (t0)
+             :mems (vector (shared-mem))
+             :funcs (vector
+                     (f 0 '() (vector
+                               (i :i32.const (list :value 0))
+                               (i :i32.const (list :value 0))
+                               (i :i64.atomic.store
+                                  (list :align 3 :offset 0))
+                               (endi)))))))))

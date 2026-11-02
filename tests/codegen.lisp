@@ -1379,3 +1379,63 @@ byte vectors, which EQUAL would distinguish by identity."
       (let ((r (%parity-modes wat "f")))
         (wasmdown.test:is (eq :ok (first r)))
         (wasmdown.test:is (eql expected (first (second r))))))))
+
+;;; ================================================================
+;;; Threads proposal (opt-in): compiled atomic lowering parity. Both
+;;; backends call the same WASMDOWN.RUNTIME atomic primitives, so the
+;;; fixtures also pin that the emitted code has no interpreter
+;;; fallback and produces identical values/traps.
+
+(wasmdown.test:test codegen/atomic-parity
+  (let ((wasmdown:*threads* t))
+    ;; add returns the old value and leaves the sum in memory
+    (wasmdown.test:is
+     (equalp '(8)
+             (%parity-wat
+              "(module (memory 1 1 shared)
+                 (func (export \"f\") (param i32) (result i32)
+                   (i32.atomic.store (i32.const 64) (local.get 0))
+                   (drop (i32.atomic.rmw.add (i32.const 64) (i32.const 5)))
+                   (i32.atomic.load (i32.const 64))))"
+              3)))
+    ;; 64-bit rmw32 and load32_u truncation
+    (wasmdown.test:is
+     (equalp '(#x11111111AAAAAAAA)
+             (%parity-wat
+              "(module (memory 1 1 shared)
+                 (func (export \"f\") (result i64)
+                   (i64.atomic.store (i32.const 0) (i64.const 0x1111111111111111))
+                   (drop (i64.atomic.rmw32.xchg_u (i32.const 0)
+                                                  (i64.const 0xAAAAAAAAAAAAAAAA)))
+                   (i64.atomic.load (i32.const 0))))")))
+    ;; notify/wait with a non-matching word and a fence
+    (wasmdown.test:is
+     (equalp '(0 1 2)
+             (%parity-wat
+              "(module (memory 1 1 shared)
+                 (func (export \"f\") (result i32 i32 i32)
+                   (memory.atomic.notify (i32.const 0) (i32.const 1))
+                   (memory.atomic.wait32 (i32.const 0) (i32.const 7) (i64.const 0))
+                   (memory.atomic.wait32 (i32.const 0) (i32.const 0) (i64.const 0))
+                   (atomic.fence)))")))))
+
+(wasmdown.test:test codegen/atomic-rmw-concurrent-compiled
+  ;; The compiled backend must serialize RMW through the same memory
+  ;; lock: 4 native threads x 2000 increments lose nothing.
+  (let ((wasmdown:*threads* t))
+    (let* ((m (wasmdown.text:parse-wat
+               "(module (memory 1 1 shared)
+                  (func (export \"add\") (param i32 i32) (result i32)
+                    (i32.atomic.rmw.add (local.get 0) (local.get 1)))
+                  (func (export \"load\") (param i32) (result i32)
+                    (i32.atomic.load (local.get 0))))"))
+           (inst (wasmdown:instantiate m))
+           (compiled (wasmdown.codegen:compile-module-functions m inst)))
+      (%install-compiled! m inst compiled)
+      (let ((threads (loop repeat 4 collect
+                           (sb-thread:make-thread
+                            (lambda ()
+                              (dotimes (i 2000)
+                                (call-export inst "add" 0 1)))))))
+        (mapc #'sb-thread:join-thread threads)
+        (wasmdown.test:is (equalp '(8000) (call-export inst "load" 0)))))))

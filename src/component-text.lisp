@@ -2131,7 +2131,14 @@ substituted for 'core module $id'."
          (text (format nil "(module ~a)"
                        (subseq *component-source*
                                body-start (third node))))
-         (module (wasmdown.text:parse-wat text)))
+         ;; The component text grammar includes shared memory types
+         ;; (instantiation.wast ::47); the component parser therefore
+         ;; opts the CORE text grammar into the threads proposal. The
+         ;; engine's execution gate (WASMDOWN:*THREADS*) still governs
+         ;; the public API, and a core module's atomics still validate
+         ;; only under that gate.
+         (module (let ((wasmdown:*threads* t))
+                   (wasmdown.text:parse-wat text))))
     (%flush-interned scope)
     (%push-def :core-module module)
     (let ((idx (%alloc scope :core-module

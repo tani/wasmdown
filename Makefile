@@ -9,6 +9,7 @@ LISP_FILES := $(wildcard src/*.lisp)
         report-backend-inventory test-backend-inventory \
         report-backends-bench \
         test-upstream test-wasi-preview1 test-wasi-preview2 test-wasi \
+        test-threads-wast \
         report-conformance p3-fixtures test-wasi-preview3 verify \
         test-property test-async-property test-async-property-negative \
         test-p1-repeat setup-network-tests test-wasi-network test-wasi-network-reference \
@@ -229,6 +230,33 @@ test-component-census:
 # runner into tests/upstream-results.jsonl. Never a release gate.
 test-upstream:
 	python3 tools/run-upstream-testsuite.py
+
+# Threads proposal lane (opt-in feature, real SBCL threads): the shared
+# memory + atomic instruction corpus through BOTH backends. The default
+# corpus directory is the local WebAssembly/threads checkout; override
+# THREADS_WAST_DIR / THREADS_WAST_PATTERN. Only files without WAST
+# (thread ...) commands belong here (atomic.wast); the script-level
+# thread scheduler is a separate slice. Strict: a non-pass fails the
+# target. Results: tests/threads-results-{interpret,compiled}.jsonl.
+THREADS_WAST_DIR ?= /tmp/wasm-threads/test/core/threads
+THREADS_WAST_PATTERN ?= atomic.wast
+test-threads-wast:
+	@test -d "$(THREADS_WAST_DIR)" || \
+	  { echo "test-threads-wast: THREADS_WAST_DIR=$(THREADS_WAST_DIR) is not a directory"; exit 2; }
+	WASMDOWN_WAST_DIR=$(THREADS_WAST_DIR) \
+	WASMDOWN_WAST_PATTERN='$(THREADS_WAST_PATTERN)' \
+	WASMDOWN_WAST_THREADS=1 WASMDOWN_WAST_STRICT=1 \
+	WASMDOWN_WAST_LABEL=threads-interpret WASMDOWN_WAST_MODE=interpret \
+	WASMDOWN_WAST_JSONL=tests/threads-results-interpret.jsonl \
+	WASMDOWN_WAST_REPORT=tests/threads-lane/interpret.md \
+	$(SBCL) --control-stack-size 16 --dynamic-space-size 2048 --script tools/run-upstream-wast.lisp
+	WASMDOWN_WAST_DIR=$(THREADS_WAST_DIR) \
+	WASMDOWN_WAST_PATTERN='$(THREADS_WAST_PATTERN)' \
+	WASMDOWN_WAST_THREADS=1 WASMDOWN_WAST_STRICT=1 \
+	WASMDOWN_WAST_LABEL=threads-compiled WASMDOWN_WAST_MODE=compiled \
+	WASMDOWN_WAST_JSONL=tests/threads-results-compiled.jsonl \
+	WASMDOWN_WAST_REPORT=tests/threads-lane/compiled.md \
+	$(SBCL) --control-stack-size 16 --dynamic-space-size 8192 --script tools/run-upstream-wast.lisp
 
 # Hand-authored WASI 0.3.2 command fixture (no @0.3.2 toolchain here).
 # Writes tests/fixtures/wasi/p3-guest.wasm + P3-CHECKSUMS; --check verifies.

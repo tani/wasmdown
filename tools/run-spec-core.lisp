@@ -23,6 +23,16 @@
 (defparameter *jsonl*
   (merge-pathnames "tests/spec-core-results.jsonl" *root*))
 
+;; Opt-in threads proposal gate (default off, the core lane is
+;; unchanged): WASMDOWN_WAST_THREADS=1 enables shared memories and the
+;; 0xFE atomic family for a threads-proposal checkout.
+(let ((flag (uiop:getenv "WASMDOWN_WAST_THREADS")))
+  (setf wasmdown:*threads*
+        (and flag
+             (member (string-downcase flag) '("1" "t" "true" "yes")
+                     :test #'string=)
+             t)))
+
 (defparameter *results*
   (wasmdown.wast:run-directory *root*
                                :pattern "tests/spec-core/*.wast"

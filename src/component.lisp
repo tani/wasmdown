@@ -3766,14 +3766,13 @@ flat params)."
     (and (third lim) t)))
 
 (defun %wasm-memory-shared-p (mem)
-  "The core IR has no shared-memory representation yet (the core
-  text parser rejects `shared'; the binary reader rejects limits
-  flag bit 0x02) — a shared expectation can never be satisfied,
-  which is the honest answer until the core layer grows the flag
-  (instantiation ::47's DECLARED side carries it via the desc
-  limits' third slot)."
-  (declare (ignore mem))
-  nil)
+  "Whether the core memory type MEM carries the threads proposal's
+  shared flag (instantiation ::47's DECLARED side carries it via the
+  desc limits' third slot; the PROVIDED side is a core memory type
+  from the export)."
+  (and (wasmdown.types:wasm-memory-p mem)
+       (wasmdown.types:wasm-limits-shared-p
+        (wasmdown.types:wasm-memory-limits mem))))
 
 (defun %core-sig-equal-p (a b)
   "Two core functypes (params . results) equal. The sequences are

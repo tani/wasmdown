@@ -680,3 +680,61 @@ Returns the canonical encoding."
          :elems (vector (wasmdown.types:make-wasm-elem
                          '(:passive) :funcref
                          (list (ref-func-expr 0)))))))
+
+;;; ================================================================
+;;; Threads proposal (opt-in): shared limits flag (0x02) and the 0xFE
+;;; atomic instruction family. Default behavior stays the core
+;;; rejection; WASMDOWN:*THREADS* opts in.
+
+(defun shared-memory-bytes ()
+  ;; memory section (id 5, size 4): count 1, flags 0x03 (has-max +
+  ;; shared), min 1, max 1.
+  (cat *header* (bv 5 4 1 3 1 1)))
+
+(defun shared-table-bytes ()
+  ;; table section (id 4, size 4): count 1, funcref, flags 0x02
+  ;; (shared), min 0.
+  (cat *header* (bv 4 4 1 #x70 2 0)))
+
+(wasmdown.test:test binary/shared-flag-default-rejected
+  (let ((wasmdown:*threads* nil))
+    (wasmdown.test:assert-raises wasmdown:decode-error
+      (dec (shared-memory-bytes)))))
+
+(wasmdown.test:test binary/shared-flag-decodes-with-threads
+  (let* ((wasmdown:*threads* t)
+         (m (dec (shared-memory-bytes)))
+         (mem (svref (wasmdown.types:wasm-module-mems m) 0))
+         (lim (wasmdown.types:wasm-memory-limits mem)))
+    (wasmdown.test:is (wasmdown.types:wasm-limits-shared-p lim))
+    (wasmdown.test:is (wasmdown.types:wasm-limits-has-max-p lim))
+    (wasmdown.test:is (wasmdown.types:wasm-limits-max lim))
+    ;; canonical re-encoding keeps the shared bit
+    (let ((bytes (wasmdown.binary:encode-module m)))
+      (wasmdown.test:is (equalp bytes (shared-memory-bytes))))))
+
+(wasmdown.test:test binary/shared-table-rejected
+  (let ((wasmdown:*threads* t))
+    (wasmdown.test:assert-raises wasmdown:decode-error
+      (dec (shared-table-bytes)))))
+
+(wasmdown.test:test binary/atomic-op-encode-decode-roundtrip
+  (let ((wasmdown:*threads* t))
+    (let* ((text "(module (memory 1 1 shared)
+        (func (export \"f\") (param i32) (result i32)
+          (i32.atomic.rmw.add align=2 (local.get 0) (i32.const 1)))
+        (func (drop (memory.atomic.notify (i32.const 0) (i32.const 1)))
+              (drop (memory.atomic.wait32 (i32.const 0) (i32.const 0) (i64.const -1)))
+              (atomic.fence)))")
+           (m (wasmdown.text:parse-wat text))
+           (bytes (wasmdown.binary:encode-module m))
+           (m2 (wasmdown.binary:decode-module bytes))
+           (ops (loop for f across (wasmdown.types:wasm-module-funcs m2)
+                      append (loop for ins across (wasmdown.types:wasm-func-body f)
+                                   collect (wasmdown.types:wasm-instr-op ins)))))
+      (dolist (op '(:i32.atomic.rmw.add :memory.atomic.notify
+                    :memory.atomic.wait32 :atomic.fence))
+        (wasmdown.test:is (member op ops)))
+      ;; round-trip is byte-stable
+      (wasmdown.test:is (equalp bytes
+                                (wasmdown.binary:encode-module m2))))))
