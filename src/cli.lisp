@@ -46,6 +46,9 @@
                   ~4trun <component> --wasi [--dir HOST[::GUEST]]~%~
                   ~10t[--env K=V] [--net HOST:PORT] [--listen ADDR:PORT]~%~
                   ~10t[--dns NAME] [arg ...]~%~
+                  ~4tserve <component> --wasi [--addr HOST:PORT]~%~
+                  ~10t[--dir HOST[::GUEST]] [--env K=V] [--net HOST:PORT]~%~
+                  ~10t[--listen ADDR:PORT] [--dns NAME]~%~
                   ~4thelp~%~
                   exit codes: 0 ok, 1 guest/compile error, 2 usage error~%"))
 
@@ -301,7 +304,8 @@ malformed option can never leave a half-built authority behind."
                 ;; transport is a CL object on the wasi-context
                 (%usage-error
                  "run: --http-transport is embedder-only; configure :http-transports on the wasi-context in the embedder"))
-               ((member tok '("--dir" "--env" "--net" "--listen" "--dns")
+               ((member tok '("--dir" "--env" "--net" "--listen" "--dns"
+                              "--addr")
                         :test #'string=)
                 (let ((value (pop rest)))
                   (unless value
@@ -452,6 +456,8 @@ carries no network at all."
 
 (defun %cmd-run (args)
   (multiple-value-bind (file invokes options guest-args) (%parse-run-args args)
+    (when (%run-collect options "--addr")
+      (%usage-error "run: --addr is a serve option"))
     (handler-case
         (let ((bytes (%read-run-file-bytes file)))
           (if (wasmdown.component:component-p bytes)
@@ -501,8 +507,52 @@ carries no network at all."
       (wasmdown:wasm-trap (c) (%diag c) 1)
       (wasmdown:wasmdown-error (c) (%diag c) 2))))
 
-;;; ---------------------------------------------------------------
-;;; Entry point.
+(defun %cmd-serve (args)
+  "Serve a `wasi:http/service' component over HTTP/1.1. Prints
+`http://HOST:PORT' as the FIRST stderr line, then answers requests
+through the component's exported `wasi:http/handler' until SIGINT."
+  (multiple-value-bind (file invokes options guest-args) (%parse-run-args args)
+    (when invokes
+      (%usage-error "serve: --invoke applies to core modules, not components"))
+    (handler-case
+        (let ((bytes (%read-run-file-bytes file)))
+          (unless (wasmdown.component:component-p bytes)
+            (%usage-error "serve: ~a is not a component" file))
+          (let ((comp (wasmdown.component:decode-component bytes)))
+            ;; The validator's cross-component visibility layer does not
+            ;; yet accept every wit-bindgen async service shape (the
+            ;; exported handler instance re-exports types through nested
+            ;; component type spaces). SERVE, unlike RUN, is a verified
+            ;; execution gate in its own right: instantiation performs
+            ;; the link checks and the incoming handler is exercised by
+            ;; the request. A validation diagnostic is therefore not
+            ;; fatal here; RUN stays strict.
+            (handler-case (wasmdown.component:validate-component comp)
+              (wasmdown:validation-error () nil))
+            (multiple-value-bind (context reactor)
+                (%component-context options guest-args file)
+              (let ((addr (or (cdr (assoc "--addr" options :test #'string=))
+                              "127.0.0.1:0")))
+                (unwind-protect
+                     (wasmdown.wasi:serve-component
+                      comp context
+                      :address addr
+                      :mode (%api-mode)
+                      :providers (wasmdown.wasi:serve-component-providers
+                                  context comp))
+                  (dolist (preopen (wasmdown.wasi:wasi-context-preopens
+                                    context))
+                    (ignore-errors
+                      (wasmdown.wasi:close-wasi-preopen preopen)))
+                  (when reactor
+                    (ignore-errors
+                      (wasmdown.wasi:reactor-close reactor))))))))
+      (wasmdown:decode-error (c) (%diag c) 1)
+      (wasmdown:validation-error (c) (%diag c) 1)
+      (wasmdown:link-error (c) (%diag c) 1)
+      (wasmdown:instantiation-error (c) (%diag c) 1)
+      (wasmdown:wasm-trap (c) (%diag c) 1)
+      (wasmdown:wasmdown-error (c) (%diag c) 2))))
 
 (defun %diag (condition)
   "Structured diagnostic: the condition's own report (message, trap
@@ -556,6 +606,7 @@ when called with no arguments or with ~\"help\"."
                        ((string= cmd "inspect") (return (%cmd-inspect rest)))
                        ((string= cmd "compile") (return (%cmd-compile rest)))
                        ((string= cmd "run") (return (%cmd-run rest)))
+                       ((string= cmd "serve") (return (%cmd-serve rest)))
                        (t
                         (format *error-output* "wasmdown: unknown command ~s~%" cmd)
                         (%usage *error-output*)

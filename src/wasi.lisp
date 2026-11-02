@@ -6179,7 +6179,7 @@ the handle table's type identity for every handle of that resource."
   "The HTTP token character set (RFC 7230 §3.2.6).")
 
 (defparameter +http-forbidden-field-names+
-  '("connection" "content-length" "host" "keep-alive" "proxy-connection"
+  '("connection" "host" "keep-alive" "proxy-connection"
     "te" "trailer" "transfer-encoding" "upgrade")
   "The field names the HTTP implementation owns: a guest cannot set
 them (RFC 7230 §6.1 + the wasi:http forbidden set). Case-insensitive.")
@@ -7639,7 +7639,10 @@ wasi-http-error on an I/O or serialization failure."
                        "Connection: close")
                  (cond
                    (chunked-p (list "Transfer-Encoding: chunked"))
-                   ((or body-present (plusp (length body)))
+                   ((and (not (%fields-values
+                               (wasi-http-request-headers req)
+                               "content-length"))
+                         (or body-present (plusp (length body))))
                     (list (format nil "Content-Length: ~d" (length body))))
                    (t '()))))
          (write (wasi-http-connection-write-fn conn)))
@@ -8531,3 +8534,551 @@ HOST-ERROR on a malformed spec."
                                  (format nil "endpoint port ~s is not `*' or an integer"
                                          port-text))))))
       (make-wasi-endpoint :address address :port port))))
+
+;;; ===============================================================
+;;; wasi:http/service — THE INCOMING DIRECTION (the `handler' export).
+;;;
+;;; A service-world component imports the HTTP types/client surface
+;;; plus the CLI/clocks/random capabilities and EXPORTS
+;;; `wasi:http/handler@<version>' (`handle: async func(request) ->
+;;; result<response, error-code>'). This section is the host side:
+;;;
+;;;   * HTTP-SERVICE-WORLD / HTTP-SERVICE-PROVIDERS compose the
+;;;     provider graph from the RESOLVED world (compose-world-
+;;;     providers), exactly as the command world does;
+;;;   * COMPONENT-HANDLER-EXPORT finds the exported `handle' at any
+;;;     supported version, with the same fallbacks the command
+;;;     runner uses for `run';
+;;;   * SERVE-COMPONENT binds a loopback listener, prints the service
+;;;     URL as the FIRST stderr line, reads HTTP/1.1 requests,
+;;;     constructs the INCOMING `request' resource (method, path,
+;;;     scheme, authority, headers and the buffered body), calls the
+;;;     guest handler through `lifted-func-call', then serializes the
+;;;     returned `response' resource (status, headers, body).
+;;;
+;;; The incoming request is fully buffered before the call: the guest
+;;; reads it through `request.consume-body', whose provider already
+;;; serves a buffered body. The response body arrives through
+;;; `response.new''s contents sink; the host waits for that stream's
+;;; guest writer to drop it (the transmission future) before writing
+;;; the reply.
+
+(defun http-service-world (&key (packages (%wasi-wit-packages)) selection)
+  "The RESOLVED `service' world of the vendored `wasi:http' package
+under SELECTION (NIL: the default selection), with PACKAGES supplying
+its cross-package imports."
+  (wasmdown.wit:resolve-wit-world (wasi-package "http") "service"
+                                  :packages packages
+                                  :selection selection))
+
+(defun http-service-providers (context
+                               &key (world (http-service-world)))
+  "The provider graph of the `wasi:http/service' world as a with-args
+alist, bound to CONTEXT: its types/client imports through the
+restored HTTP providers, and its cli/clocks/random imports through
+the command-world builders. A declared import the world does not
+have (a test world adding `wasi:cli/environment') is added by
+SERVE-COMPONENT-PROVIDERS, never silently ignored."
+  (compose-world-providers world context))
+
+;;; ---------------------------------------------------------------
+;;; The exported handler.
+
+(defun %handler-export-value (source)
+  "The `handle' value an exported handler SOURCE denotes: a
+comp-instance's export, a bag's entry, or an already-lifted func."
+  (typecase source
+    (wasmdown.component.runtime:comp-instance
+     (wasmdown.component.runtime:runtime-export-value source "handle"))
+    (hash-table (gethash "handle" source))
+    (wasmdown.component.runtime:lifted-func source)
+    (t nil)))
+
+(defun %handler-version-ok-p (version)
+  (handler-case
+      (progn (wasmdown.wit:wit-version< version version) t)
+    (error () nil)))
+
+(defun component-handler-export (instance)
+  "The `wasi:http/handler' `handle' a service-world component exports:
+the newest exported `wasi:http/handler@<version>' instance's
+`handle' (a comp-instance or an inline bag), then the unversioned
+`wasi:http/handler' instance, then a direct top-level `handle'
+export. NIL when the component exports none."
+  (let ((versioned '())
+        (unversioned nil)
+        (direct nil))
+    (maphash
+     (lambda (name entry)
+       (when (stringp name)
+         (cond
+           ((string= name "handle") (setf direct (cdr entry)))
+           ((let ((p (search "wasi:http/handler" name :test #'char=)))
+              (and p (zerop p)))
+            (if (or (= (length name) 17)
+                    (not (char= (char name 17) #\@)))
+                (setf unversioned (cdr entry))
+                (let ((version (subseq name 18)))
+                  (when (%handler-version-ok-p version)
+                    (push (cons version (cdr entry)) versioned))))))))
+     (wasmdown.component.runtime:comp-instance-exports instance))
+    (or (loop for (version . value) in
+              (stable-sort versioned
+                           (lambda (a b)
+                             (wasmdown.wit:wit-version< (car b) (car a))))
+              when (%handler-export-value value)
+                return (%handler-export-value value))
+        (and unversioned (%handler-export-value unversioned))
+        (and (wasmdown.component.runtime:lifted-func-p direct) direct))))
+
+;;; ---------------------------------------------------------------
+;;; The provider graph for a COMPONENT: the service world plus every
+;;; declared WASI import the world does not itself name.
+
+(defun serve-component-providers (context comp &key (world (http-service-world)))
+  "The with-args alist for the service-world component COMP: the
+service world's own provider graph (HTTP-SERVICE-PROVIDERS) plus a
+provider for each DECLARED WASI import the world does not name. A
+wasip3 guest built by wit-bindgen mixes the 0.3 service surface with
+0.2 compatibility imports (`wasi:io/poll@0.2.9',
+`wasi:cli/environment@0.2.9', ...): those bind through the versioned
+P2 tables exactly as COMPONENT-COMMAND-PROVIDERS binds a mixed
+command component, while the 0.3 names keep their builders. An import
+neither line serves is a construction-time WIT-ERROR naming it."
+  (let* ((names (declared-component-imports comp))
+         (wasi-names (remove-if-not (lambda (n)
+                                      (and (stringp n)
+                                           (eql 0 (search "wasi:" n))))
+                                    names))
+         (v2 (loop for n in wasi-names
+                   for (short iface ver) = (multiple-value-list
+                                            (p2-import-name-parts n))
+                   when (and short ver (p2-version-p ver)
+                             (eql 0 (search "0.2." ver)))
+                     collect (cons n ver)))
+         (providers
+           (if v2
+               (%compose-mixed-release-providers context wasi-names v2)
+               (%compose-declared-03-providers context wasi-names))))
+    ;; the RESOLVED service world supplies the capabilities a guest
+    ;; that uses them declares; bind any the component omitted too
+    ;; (instantiation ignores unused with-args, and this keeps the
+    ;; composed graph the world's contract)
+    (dolist (pair (http-service-providers context :world world))
+      (unless (assoc (car pair) providers :test #'string=)
+        (push pair providers)))
+    providers))
+
+;;; ---------------------------------------------------------------
+;;; The listener and HTTP/1.1 request parsing.
+
+(defparameter +serve-max-body-bytes+ (* 16 1024 1024)
+  "The incoming request body bound (refused with 413 beyond it).")
+
+(defun parse-serve-address (spec)
+  "Parse \"HOST:PORT\" for `serve'. HOST is an IPv4 literal or
+`localhost'; PORT is 0..65535 (0: the OS picks). Returns (values
+HOST-OCTETS PORT). Signals HOST-ERROR on a malformed spec."
+  (let ((colon (position #\: spec :from-end t)))
+    (unless colon
+      (error 'wasmdown:host-error
+             :message (format nil "address ~s is not HOST:PORT" spec)))
+    (let* ((host (subseq spec 0 colon))
+           (port-text (subseq spec (1+ colon)))
+           (octets (cond ((string= host "localhost") '(127 0 0 1))
+                         ((%parse-ipv4-literal host))
+                         (t (error 'wasmdown:host-error
+                                   :message
+                                   (format nil "address host ~s is not an IPv4 literal or `localhost'"
+                                           host)))))
+           (port (unless (and (plusp (length port-text))
+                              (every #'digit-char-p port-text))
+                   (error 'wasmdown:host-error
+                          :message
+                          (format nil "address port ~s is not an integer"
+                                  port-text)))))
+      (let ((n (parse-integer port-text)))
+        (unless (<= 0 n 65535)
+          (error 'wasmdown:host-error
+                 :message (format nil "address port ~d out of range" n)))
+        (values octets n)))))
+
+(defun %serve-open-listener (host-octets port)
+  "Bind AF_INET SOCK_STREAM to HOST-OCTETS:PORT and listen. Returns
+(values FD PORT)."
+  (multiple-value-bind (alien len)
+      (%make-sockaddr "ipv4" (list (cons "port" port)
+                                   (cons "address" host-octets)))
+    (unwind-protect
+         (let ((fd (%libc-socket +af-inet+
+                                 (logior +sock-stream+ +sock-nonblock+
+                                         +sock-cloexec+)
+                                 +ipproto-tcp+)))
+           (when (minusp fd)
+             (error 'wasmdown:host-error
+                    :message (format nil "serve: socket(2) failed (errno ~d)"
+                                     (sb-alien:get-errno))))
+           (handler-case
+               (progn
+                 (%setsockopt-int fd +sol-socket+ +so-reuseaddr+ 1)
+                 (%socket-check (%libc-bind fd (sb-alien:alien-sap alien) len)
+                                "bind")
+                 (%socket-check (%libc-listen fd 128) "listen")
+                 (multiple-value-bind (bound-port bound-len)
+                     (%serve-sockname fd)
+                   (declare (ignore bound-len))
+                   (values fd bound-port)))
+             (error (c)
+               (%close-fd fd)
+               (error c))))
+      (sb-alien:free-alien alien))))
+
+(defun %serve-sockname (fd)
+  "(values PORT LEN) from getsockname."
+  (let ((alien (sb-alien:make-alien
+                (sb-alien:array sb-alien:unsigned-char 128)))
+        (len (sb-alien:make-alien sb-alien:unsigned-int)))
+    (unwind-protect
+         (progn
+           (setf (sb-alien:deref len) +sockaddr-storage-size+)
+           (%socket-check
+            (%libc-getsockname fd (sb-alien:alien-sap alien)
+                               (sb-alien:alien-sap len))
+            "getsockname")
+           (multiple-value-bind (family host port)
+               (%sockaddr-sap->key (sb-alien:alien-sap alien))
+             (declare (ignore family host))
+             (values port (sb-alien:deref len))))
+      (sb-alien:free-alien alien)
+      (sb-alien:free-alien len))))
+
+(defun %serve-method-value (name)
+  "The WIT `method' domain value for the request-line NAME."
+  (let ((lower (string-downcase name)))
+    (if (member lower '("get" "head" "post" "put" "delete" "connect"
+                        "options" "trace" "patch")
+                :test #'string=)
+        (cons lower nil)
+        (cons "other" name))))
+
+(defun %serve-read-chunked-body (r)
+  "Decode a chunked request body; returns the byte list. Chunk
+extensions and trailers are skipped."
+  (let ((out '()))
+    (loop
+      (let* ((line (%hr-line r :timeout-ms 30000))
+             (semi (position #\; line))
+             (hex (string-trim '(#\Space #\Tab)
+                               (if semi (subseq line 0 semi) line))))
+        (unless (and (plusp (length hex))
+                     (every (lambda (c) (digit-char-p c 16)) hex))
+          (%http-error (%http-code "HTTP-protocol-error")))
+        (let ((size (parse-integer hex :radix 16)))
+          (when (zerop size)
+            ;; trailer section
+            (loop for trailer = (%hr-line r :timeout-ms 30000)
+                  until (and (stringp trailer) (zerop (length trailer))))
+            (return out))
+          (when (> (+ (length out) size) +serve-max-body-bytes+)
+            (%http-error (%http-code "HTTP-request-body-size")))
+          (setf out (nconc out (%hr-take r size 30000)))
+          (%hr-take r 2 30000))))))
+
+(defun %serve-read-request (conn)
+  "Read one HTTP/1.1 request from CONN. Returns the
+WASI-HTTP-INCOMING record, or NIL on a clean EOF before any byte.
+Signals WASI-HTTP-ERROR on a malformed request."
+  (let* ((r (make-wasi-http-reader :conn conn :timeout-ms 30000))
+         (line (%hr-line r :timeout-ms 30000)))
+    (when (eq line :eof)
+      (return-from %serve-read-request nil))
+    (let ((parts (%split-string line #\Space)))
+      (unless (and (= 3 (length parts))
+                   (plusp (length (first parts)))
+                   (%http-token-p (first parts))
+                   (plusp (length (second parts)))
+                   (string= (third parts) "HTTP/1.1"))
+        (%http-error (%http-code "HTTP-protocol-error")))
+      (let ((fields (%http-read-fields r :timeout-ms 30000))
+            (method (first parts))
+            (target (second parts)))
+        (let* ((chunked-p
+                 (let ((te (%fields-values fields "transfer-encoding")))
+                   (and te
+                        (string-equal
+                         (string-trim '(#\Space #\Tab)
+                                      (%http-bytes->string (car (last te))))
+                         "chunked"))))
+               (length (%http-content-length fields))
+               (body
+                 (cond
+                   (chunked-p (%serve-read-chunked-body r))
+                   ((and length (plusp length))
+                    (when (> length +serve-max-body-bytes+)
+                      (%http-error (%http-code "HTTP-request-body-size")))
+                    (%hr-take r length 30000))
+                   (t '())))
+               (host (%fields-values fields "host"))
+               (authority (and host
+                               (%http-bytes->string (car (last host))))))
+          (make-wasi-http-incoming
+           :method method
+           :path target
+           :version (third parts)
+           :headers (wasi-fields-entries fields)
+           :authority authority
+           :body body))))))
+
+;;; ---------------------------------------------------------------
+;;; The incoming request resource + the response serializer.
+
+(defstruct (wasi-http-incoming (:constructor make-wasi-http-incoming))
+  "One parsed incoming HTTP/1.1 request (the host side of the WIT's
+incoming `request')."
+  (method "GET")
+  (path "/")
+  (version "HTTP/1.1")
+  (headers nil)                       ; (name . value-bytes) entries
+  (authority nil)
+  (body '()))                         ; u8 list
+
+(defun %serve-request-resource (incoming &key (package (wasi-package "http")))
+  "The wasi-http-request REP holding INCOMING's method/path/scheme/
+authority/headers and its fully buffered body."
+  (declare (ignore package))
+  (let ((req (make-wasi-http-request
+              :method (%serve-method-value
+                       (wasi-http-incoming-method incoming))
+              :path-with-query (cons :some (wasi-http-incoming-path incoming))
+              :scheme (cons :some (cons "HTTP" nil))
+              :authority (let ((a (wasi-http-incoming-authority incoming)))
+                           (if a (cons :some a) :none))
+              :headers (%make-wasi-fields
+                        (loop for (name . value)
+                                in (wasi-http-incoming-headers incoming)
+                              collect (cons name (copy-list value)))
+                        nil)
+              :body-buffer (list (copy-list (wasi-http-incoming-body incoming)))
+              :body-length (length (wasi-http-incoming-body incoming))
+              :body-closed-p t)))
+    req))
+
+(defun %serve-invoke (handler instance request-ct incoming store
+                      &key (package (wasi-package "http")))
+  "Call HANDLER with an OWN incoming request handle. Returns
+(values RESPONSE-REP ERROR-CODE). Waits (bounded) for the guest
+response contents writer to resolve before returning."
+  (let ((req (%serve-request-resource incoming :package package)))
+    (let ((value (wasmdown.component.runtime:lifted-func-call
+                  handler (list :own-handle request-ct req))))
+      (cond
+        ((and (consp value) (eq (car value) :err))
+         (values nil (cdr value)))
+        ((and (consp value) (eq (car value) :ok))
+         (let ((payload (cdr value)))
+           (let ((resp (cond ((wasi-http-response-p payload) payload)
+                             ((and (consp payload)
+                                   (eq (car payload) :own-handle))
+                              (third payload))
+                             ;; the async result lift leaves an OWN
+                             ;; result's handle index in the defining
+                             ;; instance's table when the resource ct
+                             ;; is the provider schema's; read its rep
+                             ((integerp payload)
+                              (let ((h (ignore-errors
+                                         (wasmdown.component.runtime::%handle-resource-at
+                                          instance payload))))
+                                (and h (wasmdown.component.runtime::resource-handle-rep
+                                        h))))
+                             (t nil))))
+             (when resp
+               (let ((writer (wasi-http-response-transmission-writer resp)))
+                 (when writer
+                   (loop repeat 5000
+                         until (wasmdown.component.runtime:host-future-resolved-p
+                                writer)
+                         do (ignore-errors
+                              (wasmdown.component.runtime:store-tick store))
+                            (sleep 0.001)))))
+             (values resp nil))))
+        (t (values nil (cons "internal-error" nil)))))))
+
+(defparameter +serve-reasons+
+  '((200 . "OK") (201 . "Created") (202 . "Accepted")
+    (204 . "No Content") (301 . "Moved Permanently") (302 . "Found")
+    (304 . "Not Modified") (400 . "Bad Request") (401 . "Unauthorized")
+    (403 . "Forbidden") (404 . "Not Found") (405 . "Method Not Allowed")
+    (408 . "Request Timeout") (413 . "Content Too Large")
+    (418 . "I'm a teapot") (500 . "Internal Server Error")
+    (501 . "Not Implemented") (502 . "Bad Gateway")
+    (503 . "Service Unavailable")))
+
+(defun %serve-response-bytes (resp)
+  "The response REP's buffered body as a u8 list."
+  (let ((body (and resp (wasi-http-response-body resp))))
+    (if body (copy-list (wasi-http-body-buffer body)) '())))
+
+(defun %serve-write-response (conn status headers body head-p)
+  "Serialize one HTTP/1.1 response (status + guest headers + the
+buffered body). The connection is closed by the caller."
+  (let* ((out (make-string-output-stream))
+         (entries (or headers '()))
+         (has-length (some (lambda (e)
+                             (string-equal (car e) "content-length"))
+                           entries))
+         (resp-body (if head-p '() body)))
+    (format out "HTTP/1.1 ~d ~a~c~c"
+            status
+            (or (cdr (assoc status +serve-reasons+)) "OK")
+            #\Return #\Newline)
+    (dolist (entry entries)
+      (let ((name (car entry)))
+        (unless (member (string-downcase name)
+                        '("connection" "transfer-encoding" "keep-alive")
+                        :test #'string=)
+          (format out "~a: ~a~c~c" name
+                  (%http-bytes->string (cdr entry))
+                  #\Return #\Newline))))
+    (unless has-length
+      (format out "Content-Length: ~d~c~c" (length resp-body)
+              #\Return #\Newline))
+    (format out "Connection: close~c~c~c~c" #\Return #\Newline
+            #\Return #\Newline)
+    (%http-plain-write (wasi-http-connection-fd conn)
+                       (map 'list #'char-code (get-output-stream-string out)))
+    (when (plusp (length resp-body))
+      (%http-plain-write (wasi-http-connection-fd conn) resp-body))
+    nil))
+
+(defun %serve-error-status (code)
+  "The HTTP status an error-code case maps to."
+  (let ((label (if (consp code) (car code) code)))
+    (cond
+      ((string-equal label "HTTP-request-method-invalid") 400)
+      ((string-equal label "HTTP-request-URI-invalid") 400)
+      ((string-equal label "HTTP-request-URI-too-long") 414)
+      ((string-equal label "HTTP-request-denied") 403)
+      ((string-equal label "HTTP-request-length-required") 411)
+      ((string-equal label "HTTP-request-body-size") 413)
+      ((string-equal label "HTTP-request-header-section-size") 431)
+      ((string-equal label "HTTP-request-header-size") 431)
+      (t 500))))
+
+(defun %serve-connection-handle (conn handler instance request-ct store
+                                 &key (package (wasi-package "http")))
+  "One request/response exchange on an accepted CONN FD."
+  (handler-case
+      (let ((incoming (%serve-read-request conn)))
+        (when incoming
+          (multiple-value-bind (resp code)
+              (%serve-invoke handler instance request-ct incoming store
+                             :package package)
+            (cond
+              (resp
+               (let ((status (wasi-http-response-status resp))
+                     (headers (wasi-fields-entries
+                               (wasi-http-response-headers resp)))
+                     (body (%serve-response-bytes resp)))
+                 (%serve-write-response
+                  conn status headers body
+                  (string-equal (wasi-http-incoming-method incoming) "HEAD"))))
+              (t
+               (%serve-write-response conn (%serve-error-status code) nil nil
+                                      (string-equal
+                                       (wasi-http-incoming-method incoming)
+                                       "HEAD")))))))
+    (wasi-http-error (c)
+      (format *error-output* "serve: bad request: ~a~%" c)
+      (ignore-errors
+        (%serve-write-response conn 400 nil nil nil)))
+    (wasmdown:wasmdown-error (c)
+      (format *error-output* "serve: handler failed: ~a~%" c)
+      (ignore-errors (%serve-write-response conn 500 nil nil nil))))
+  nil)
+
+;;; ---------------------------------------------------------------
+;;; The serve loop.
+
+(defvar *serve-stop* nil
+  "Set by the SIGINT handler; the accept loop exits after it.")
+
+(defun %serve-interrupt (&rest args)
+  (declare (ignore args))
+  (setf *serve-stop* t))
+
+(defun serve-component (comp context
+                        &key providers (address "127.0.0.1:0")
+                          (mode :interpret) (url-stream nil))
+  "Instantiate the validated service-world COMP under CONTEXT, print
+`http://HOST:PORT' as the FIRST line on the URL stream (default: the
+context's stderr, else *ERROR-OUTPUT*), and serve HTTP/1.1 requests
+until SIGINT. Each request is answered by the exported
+`wasi:http/handler' `handle' function. Returns the process status
+(0)."
+  (multiple-value-bind (host-octets port) (parse-serve-address address)
+    (let* ((store (wasmdown.component.runtime:make-component-store
+                   :reactor (wasi-context-reactor context)))
+           (providers (or providers
+                          (serve-component-providers context comp)))
+           (fd nil)
+           (old-handler nil)
+           (*serve-stop* nil))
+      (unwind-protect
+           (progn
+             (setf old-handler
+                   (sb-sys:enable-interrupt sb-unix:sigint
+                                            #'%serve-interrupt))
+             (multiple-value-setq (fd port)
+               (%serve-open-listener host-octets port))
+             (let* ((instance
+                      (wasmdown.component.runtime:instantiate-component
+                       comp :with-args providers :store store :mode mode))
+                    (handler (component-handler-export instance)))
+               (unless handler
+                 (error 'wasmdown:link-error
+                        :message
+                        "component exports no wasi:http/handler `handle' function"))
+               (let* ((request-ct (http-resource-ct "request"))
+                      (stream (or url-stream
+                                  (wasi-context-stderr context)
+                                  *error-output*))
+                      (display-host
+                        (if (equal host-octets '(0 0 0 0))
+                            "127.0.0.1"
+                            (format nil "~{~d~^.~}" host-octets))))
+                 (format stream "http://~a:~d~%" display-host port)
+                 (finish-output stream)
+                 (%serve-accept-loop fd handler instance request-ct store))))
+        0)
+      (when fd
+        (ignore-errors (%close-fd fd)))
+      (when old-handler
+        (ignore-errors
+          (sb-sys:enable-interrupt sb-unix:sigint old-handler)))
+      (ignore-errors
+        (wasmdown.component.runtime:store-teardown store)))))
+
+(defun %serve-accept-loop (fd handler instance request-ct store)
+  "Accept connections until *SERVE-STOP*, handling each one on the
+accepting thread (the guest handler serializes through its store
+anyway)."
+  (loop until *serve-stop*
+        do (let ((revents (%poll-fd fd +pollin+ 100)))
+             (when (and revents (logtest revents +pollin+))
+               (let ((cfd (%libc-accept4 fd (%sock-null) (%sock-null)
+                                         (logior +sock-nonblock+
+                                                 +sock-cloexec+))))
+                 (when (>= cfd 0)
+                   (let ((conn
+                           (make-wasi-http-connection
+                            :fd cfd
+                            :read-fn (lambda (max to)
+                                       (%http-plain-read cfd max to))
+                            :write-fn (lambda (bytes)
+                                        (%http-plain-write cfd bytes))
+                            :close-fn (lambda () (%close-fd cfd)))))
+                     (unwind-protect
+                          (%serve-connection-handle
+                           conn handler instance request-ct store)
+                       (%http-connection-close conn))))))))
+  nil)

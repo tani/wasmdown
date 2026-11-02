@@ -658,6 +658,13 @@
    #:http-response-consume-body
    #:http-client-send
    #:http-types-instance
+   ;; http (M16 slice 6): the INCOMING service world
+   #:http-service-world
+   #:http-service-providers
+   #:serve-component-providers
+   #:component-handler-export
+   #:parse-serve-address
+   #:serve-component
    #:http-client-instance
    #:http-provider
    ;; reactor backend (plan step 6): poll(2) + the monotonic clock +
