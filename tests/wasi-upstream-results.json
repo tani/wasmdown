@@ -9,7 +9,8 @@
       "wasm32-wasip3"
     ],
     "wasi_worlds": [
-      "wasi:cli/command"
+      "wasi:cli/command",
+      "wasi:http/service"
     ]
   },
   "failures": {
@@ -18,210 +19,9 @@
   },
   "schema": "wasmdown.wasi-upstream.v1",
   "skips": {
-    "by_category": {
-      "legacy-network-imports": 2,
-      "proposal-http": 18,
-      "proposal-sockets": 12
-    },
-    "declared_reasons": {
-      "legacy-network-imports": "network communication is outside the declared support profile; the four legacy wasi_snapshot_preview1 sock_* imports are excluded (2026-11-02)",
-      "proposal-http": "wasi:http is unsupported by design (permanent exclusion, 2026-11-02; PLAN.md M16 slice 5 / M17) - not an implementation gap",
-      "proposal-sockets": "network communication (wasi:sockets TCP/UDP/DNS) is outside the declared support profile (permanent exclusion, 2026-11-02)"
-    },
-    "entries": [
-      {
-        "category": "legacy-network-imports",
-        "reason": "network communication is outside the declared support profile; the four legacy wasi_snapshot_preview1 sock_* imports are excluded (2026-11-02)",
-        "suite": "WASI C tests [wasm32-wasip1]",
-        "test": "sock_shutdown-invalid_fd"
-      },
-      {
-        "category": "legacy-network-imports",
-        "reason": "network communication is outside the declared support profile; the four legacy wasi_snapshot_preview1 sock_* imports are excluded (2026-11-02)",
-        "suite": "WASI C tests [wasm32-wasip1]",
-        "test": "sock_shutdown-not_sock"
-      },
-      {
-        "category": "proposal-http",
-        "reason": "wasi:http is unsupported by design (permanent exclusion, 2026-11-02; PLAN.md M16 slice 5 / M17) - not an implementation gap",
-        "suite": "WASI Rust tests [wasm32-wasip3]",
-        "test": "http-client"
-      },
-      {
-        "category": "proposal-http",
-        "reason": "wasi:http is unsupported by design (permanent exclusion, 2026-11-02; PLAN.md M16 slice 5 / M17) - not an implementation gap",
-        "suite": "WASI Rust tests [wasm32-wasip3]",
-        "test": "http-client-chunked"
-      },
-      {
-        "category": "proposal-http",
-        "reason": "wasi:http is unsupported by design (permanent exclusion, 2026-11-02; PLAN.md M16 slice 5 / M17) - not an implementation gap",
-        "suite": "WASI Rust tests [wasm32-wasip3]",
-        "test": "http-client-headers"
-      },
-      {
-        "category": "proposal-http",
-        "reason": "wasi:http is unsupported by design (permanent exclusion, 2026-11-02; PLAN.md M16 slice 5 / M17) - not an implementation gap",
-        "suite": "WASI Rust tests [wasm32-wasip3]",
-        "test": "http-client-method"
-      },
-      {
-        "category": "proposal-http",
-        "reason": "wasi:http is unsupported by design (permanent exclusion, 2026-11-02; PLAN.md M16 slice 5 / M17) - not an implementation gap",
-        "suite": "WASI Rust tests [wasm32-wasip3]",
-        "test": "http-client-path"
-      },
-      {
-        "category": "proposal-http",
-        "reason": "wasi:http is unsupported by design (permanent exclusion, 2026-11-02; PLAN.md M16 slice 5 / M17) - not an implementation gap",
-        "suite": "WASI Rust tests [wasm32-wasip3]",
-        "test": "http-client-path-none"
-      },
-      {
-        "category": "proposal-http",
-        "reason": "wasi:http is unsupported by design (permanent exclusion, 2026-11-02; PLAN.md M16 slice 5 / M17) - not an implementation gap",
-        "suite": "WASI Rust tests [wasm32-wasip3]",
-        "test": "http-client-send-errors"
-      },
-      {
-        "category": "proposal-http",
-        "reason": "wasi:http is unsupported by design (permanent exclusion, 2026-11-02; PLAN.md M16 slice 5 / M17) - not an implementation gap",
-        "suite": "WASI Rust tests [wasm32-wasip3]",
-        "test": "http-client-sent"
-      },
-      {
-        "category": "proposal-http",
-        "reason": "wasi:http is unsupported by design (permanent exclusion, 2026-11-02; PLAN.md M16 slice 5 / M17) - not an implementation gap",
-        "suite": "WASI Rust tests [wasm32-wasip3]",
-        "test": "http-client-status"
-      },
-      {
-        "category": "proposal-http",
-        "reason": "wasi:http is unsupported by design (permanent exclusion, 2026-11-02; PLAN.md M16 slice 5 / M17) - not an implementation gap",
-        "suite": "WASI Rust tests [wasm32-wasip3]",
-        "test": "http-client-trailer-error"
-      },
-      {
-        "category": "proposal-http",
-        "reason": "wasi:http is unsupported by design (permanent exclusion, 2026-11-02; PLAN.md M16 slice 5 / M17) - not an implementation gap",
-        "suite": "WASI Rust tests [wasm32-wasip3]",
-        "test": "http-client-trailers"
-      },
-      {
-        "category": "proposal-http",
-        "reason": "wasi:http is unsupported by design (permanent exclusion, 2026-11-02; PLAN.md M16 slice 5 / M17) - not an implementation gap",
-        "suite": "WASI Rust tests [wasm32-wasip3]",
-        "test": "http-fields"
-      },
-      {
-        "category": "proposal-http",
-        "reason": "wasi:http is unsupported by design (permanent exclusion, 2026-11-02; PLAN.md M16 slice 5 / M17) - not an implementation gap",
-        "suite": "WASI Rust tests [wasm32-wasip3]",
-        "test": "http-request"
-      },
-      {
-        "category": "proposal-http",
-        "reason": "wasi:http is unsupported by design (permanent exclusion, 2026-11-02; PLAN.md M16 slice 5 / M17) - not an implementation gap",
-        "suite": "WASI Rust tests [wasm32-wasip3]",
-        "test": "http-request-options"
-      },
-      {
-        "category": "proposal-http",
-        "reason": "wasi:http is unsupported by design (permanent exclusion, 2026-11-02; PLAN.md M16 slice 5 / M17) - not an implementation gap",
-        "suite": "WASI Rust tests [wasm32-wasip3]",
-        "test": "http-response"
-      },
-      {
-        "category": "proposal-http",
-        "reason": "wasi:http is unsupported by design (permanent exclusion, 2026-11-02; PLAN.md M16 slice 5 / M17) - not an implementation gap",
-        "suite": "WASI Rust tests [wasm32-wasip3]",
-        "test": "http-service"
-      },
-      {
-        "category": "proposal-http",
-        "reason": "wasi:http is unsupported by design (permanent exclusion, 2026-11-02; PLAN.md M16 slice 5 / M17) - not an implementation gap",
-        "suite": "WASI Rust tests [wasm32-wasip3]",
-        "test": "http-service-echo"
-      },
-      {
-        "category": "proposal-http",
-        "reason": "wasi:http is unsupported by design (permanent exclusion, 2026-11-02; PLAN.md M16 slice 5 / M17) - not an implementation gap",
-        "suite": "WASI Rust tests [wasm32-wasip3]",
-        "test": "http-service-uri"
-      },
-      {
-        "category": "proposal-sockets",
-        "reason": "network communication (wasi:sockets TCP/UDP/DNS) is outside the declared support profile (permanent exclusion, 2026-11-02)",
-        "suite": "WASI Rust tests [wasm32-wasip3]",
-        "test": "sockets-echo"
-      },
-      {
-        "category": "proposal-sockets",
-        "reason": "network communication (wasi:sockets TCP/UDP/DNS) is outside the declared support profile (permanent exclusion, 2026-11-02)",
-        "suite": "WASI Rust tests [wasm32-wasip3]",
-        "test": "sockets-tcp-bind"
-      },
-      {
-        "category": "proposal-sockets",
-        "reason": "network communication (wasi:sockets TCP/UDP/DNS) is outside the declared support profile (permanent exclusion, 2026-11-02)",
-        "suite": "WASI Rust tests [wasm32-wasip3]",
-        "test": "sockets-tcp-connect"
-      },
-      {
-        "category": "proposal-sockets",
-        "reason": "network communication (wasi:sockets TCP/UDP/DNS) is outside the declared support profile (permanent exclusion, 2026-11-02)",
-        "suite": "WASI Rust tests [wasm32-wasip3]",
-        "test": "sockets-tcp-listen"
-      },
-      {
-        "category": "proposal-sockets",
-        "reason": "network communication (wasi:sockets TCP/UDP/DNS) is outside the declared support profile (permanent exclusion, 2026-11-02)",
-        "suite": "WASI Rust tests [wasm32-wasip3]",
-        "test": "sockets-tcp-properties"
-      },
-      {
-        "category": "proposal-sockets",
-        "reason": "network communication (wasi:sockets TCP/UDP/DNS) is outside the declared support profile (permanent exclusion, 2026-11-02)",
-        "suite": "WASI Rust tests [wasm32-wasip3]",
-        "test": "sockets-tcp-receive"
-      },
-      {
-        "category": "proposal-sockets",
-        "reason": "network communication (wasi:sockets TCP/UDP/DNS) is outside the declared support profile (permanent exclusion, 2026-11-02)",
-        "suite": "WASI Rust tests [wasm32-wasip3]",
-        "test": "sockets-tcp-send"
-      },
-      {
-        "category": "proposal-sockets",
-        "reason": "network communication (wasi:sockets TCP/UDP/DNS) is outside the declared support profile (permanent exclusion, 2026-11-02)",
-        "suite": "WASI Rust tests [wasm32-wasip3]",
-        "test": "sockets-udp-bind"
-      },
-      {
-        "category": "proposal-sockets",
-        "reason": "network communication (wasi:sockets TCP/UDP/DNS) is outside the declared support profile (permanent exclusion, 2026-11-02)",
-        "suite": "WASI Rust tests [wasm32-wasip3]",
-        "test": "sockets-udp-connect"
-      },
-      {
-        "category": "proposal-sockets",
-        "reason": "network communication (wasi:sockets TCP/UDP/DNS) is outside the declared support profile (permanent exclusion, 2026-11-02)",
-        "suite": "WASI Rust tests [wasm32-wasip3]",
-        "test": "sockets-udp-properties"
-      },
-      {
-        "category": "proposal-sockets",
-        "reason": "network communication (wasi:sockets TCP/UDP/DNS) is outside the declared support profile (permanent exclusion, 2026-11-02)",
-        "suite": "WASI Rust tests [wasm32-wasip3]",
-        "test": "sockets-udp-receive"
-      },
-      {
-        "category": "proposal-sockets",
-        "reason": "network communication (wasi:sockets TCP/UDP/DNS) is outside the declared support profile (permanent exclusion, 2026-11-02)",
-        "suite": "WASI Rust tests [wasm32-wasip3]",
-        "test": "sockets-udp-send"
-      }
-    ]
+    "by_category": {},
+    "declared_reasons": {},
+    "entries": []
   },
   "suites": [
     {
@@ -301,12 +101,12 @@
     {
       "failed": 0,
       "name": "WASI C tests [wasm32-wasip1]",
-      "passed": 12,
+      "passed": 14,
       "runtime": {
         "name": "wasmdown",
         "version": "0.0.1"
       },
-      "skipped": 2,
+      "skipped": 0,
       "tests": [
         {
           "executed": true,
@@ -364,14 +164,14 @@
           "outcome": "pass"
         },
         {
-          "executed": false,
+          "executed": true,
           "name": "sock_shutdown-invalid_fd",
-          "outcome": "skip"
+          "outcome": "pass"
         },
         {
-          "executed": false,
+          "executed": true,
           "name": "sock_shutdown-not_sock",
-          "outcome": "skip"
+          "outcome": "pass"
         },
         {
           "executed": true,
@@ -629,12 +429,12 @@
     {
       "failed": 0,
       "name": "WASI Rust tests [wasm32-wasip3]",
-      "passed": 25,
+      "passed": 55,
       "runtime": {
         "name": "wasmdown",
         "version": "0.0.1"
       },
-      "skipped": 30,
+      "skipped": 0,
       "tests": [
         {
           "executed": true,
@@ -737,94 +537,94 @@
           "outcome": "pass"
         },
         {
-          "executed": false,
+          "executed": true,
           "name": "http-client",
-          "outcome": "skip"
+          "outcome": "pass"
         },
         {
-          "executed": false,
+          "executed": true,
           "name": "http-client-chunked",
-          "outcome": "skip"
+          "outcome": "pass"
         },
         {
-          "executed": false,
+          "executed": true,
           "name": "http-client-headers",
-          "outcome": "skip"
+          "outcome": "pass"
         },
         {
-          "executed": false,
+          "executed": true,
           "name": "http-client-method",
-          "outcome": "skip"
+          "outcome": "pass"
         },
         {
-          "executed": false,
+          "executed": true,
           "name": "http-client-path",
-          "outcome": "skip"
+          "outcome": "pass"
         },
         {
-          "executed": false,
+          "executed": true,
           "name": "http-client-path-none",
-          "outcome": "skip"
+          "outcome": "pass"
         },
         {
-          "executed": false,
+          "executed": true,
           "name": "http-client-send-errors",
-          "outcome": "skip"
+          "outcome": "pass"
         },
         {
-          "executed": false,
+          "executed": true,
           "name": "http-client-sent",
-          "outcome": "skip"
+          "outcome": "pass"
         },
         {
-          "executed": false,
+          "executed": true,
           "name": "http-client-status",
-          "outcome": "skip"
+          "outcome": "pass"
         },
         {
-          "executed": false,
+          "executed": true,
           "name": "http-client-trailer-error",
-          "outcome": "skip"
+          "outcome": "pass"
         },
         {
-          "executed": false,
+          "executed": true,
           "name": "http-client-trailers",
-          "outcome": "skip"
+          "outcome": "pass"
         },
         {
-          "executed": false,
+          "executed": true,
           "name": "http-fields",
-          "outcome": "skip"
+          "outcome": "pass"
         },
         {
-          "executed": false,
+          "executed": true,
           "name": "http-request",
-          "outcome": "skip"
+          "outcome": "pass"
         },
         {
-          "executed": false,
+          "executed": true,
           "name": "http-request-options",
-          "outcome": "skip"
+          "outcome": "pass"
         },
         {
-          "executed": false,
+          "executed": true,
           "name": "http-response",
-          "outcome": "skip"
+          "outcome": "pass"
         },
         {
-          "executed": false,
+          "executed": true,
           "name": "http-service",
-          "outcome": "skip"
+          "outcome": "pass"
         },
         {
-          "executed": false,
+          "executed": true,
           "name": "http-service-echo",
-          "outcome": "skip"
+          "outcome": "pass"
         },
         {
-          "executed": false,
+          "executed": true,
           "name": "http-service-uri",
-          "outcome": "skip"
+          "outcome": "pass"
         },
         {
           "executed": true,
@@ -847,64 +647,64 @@
           "outcome": "pass"
         },
         {
-          "executed": false,
+          "executed": true,
           "name": "sockets-echo",
-          "outcome": "skip"
+          "outcome": "pass"
         },
         {
-          "executed": false,
+          "executed": true,
           "name": "sockets-tcp-bind",
-          "outcome": "skip"
+          "outcome": "pass"
         },
         {
-          "executed": false,
+          "executed": true,
           "name": "sockets-tcp-connect",
-          "outcome": "skip"
+          "outcome": "pass"
         },
         {
-          "executed": false,
+          "executed": true,
           "name": "sockets-tcp-listen",
-          "outcome": "skip"
+          "outcome": "pass"
         },
         {
-          "executed": false,
+          "executed": true,
           "name": "sockets-tcp-properties",
-          "outcome": "skip"
+          "outcome": "pass"
         },
         {
-          "executed": false,
+          "executed": true,
           "name": "sockets-tcp-receive",
-          "outcome": "skip"
+          "outcome": "pass"
         },
         {
-          "executed": false,
+          "executed": true,
           "name": "sockets-tcp-send",
-          "outcome": "skip"
+          "outcome": "pass"
         },
         {
-          "executed": false,
+          "executed": true,
           "name": "sockets-udp-bind",
-          "outcome": "skip"
+          "outcome": "pass"
         },
         {
-          "executed": false,
+          "executed": true,
           "name": "sockets-udp-connect",
-          "outcome": "skip"
+          "outcome": "pass"
         },
         {
-          "executed": false,
+          "executed": true,
           "name": "sockets-udp-properties",
-          "outcome": "skip"
+          "outcome": "pass"
         },
         {
-          "executed": false,
+          "executed": true,
           "name": "sockets-udp-receive",
-          "outcome": "skip"
+          "outcome": "pass"
         },
         {
-          "executed": false,
+          "executed": true,
           "name": "sockets-udp-send",
-          "outcome": "skip"
+          "outcome": "pass"
         },
         {
           "executed": true,
@@ -918,8 +718,8 @@
   ],
   "totals": {
     "failed": 0,
-    "passed": 95,
-    "skipped": 32,
+    "passed": 127,
+    "skipped": 0,
     "xfailed": 0,
     "xpassed": 0
   },

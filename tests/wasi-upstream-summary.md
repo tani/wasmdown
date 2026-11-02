@@ -22,19 +22,16 @@ one run at the pinned upstream commit.
 | Suite | Result |
 | --- | --- |
 | WASI AssemblyScript tests [wasm32-wasip1] | 12 pass / 0 fail / 0 skip / 0 xfail / 0 xpass |
-| WASI C tests [wasm32-wasip1] | 12 pass / 0 fail / 2 skip / 0 xfail / 0 xpass |
+| WASI C tests [wasm32-wasip1] | 14 pass / 0 fail / 0 skip / 0 xfail / 0 xpass |
 | WASI Rust tests [wasm32-wasip1] | 46 pass / 0 fail / 0 skip / 0 xfail / 0 xpass |
-| WASI Rust tests [wasm32-wasip3] | 25 pass / 0 fail / 30 skip / 0 xfail / 0 xpass |
+| WASI Rust tests [wasm32-wasip3] | 55 pass / 0 fail / 0 skip / 0 xfail / 0 xpass |
 
-Total: **95 pass / 0 fail / 32 skip / 0 xfail / 0 xpass** over 127 pinned tests.
+Total: **127 pass / 0 fail / 0 skip / 0 xfail / 0 xpass** over 127 pinned tests.
 
 ## Skips (declared exclusions only)
 
 | Category | Tests | Rationale |
 | --- | --- | --- |
-| `legacy-network-imports` | 2 | network communication is outside the declared support profile; the four legacy wasi_snapshot_preview1 sock_* imports are excluded (2026-11-02) |
-| `proposal-http` | 18 | wasi:http is unsupported by design (permanent exclusion, 2026-11-02; PLAN.md M16 slice 5 / M17) - not an implementation gap |
-| `proposal-sockets` | 12 | network communication (wasi:sockets TCP/UDP/DNS) is outside the declared support profile (permanent exclusion, 2026-11-02) |
 
 The driver regenerates this list from the tree and fails if the actual
 skips differ from it; no failing test is skipped.

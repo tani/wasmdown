@@ -11,7 +11,7 @@ LISP_FILES := $(wildcard src/*.lisp)
         test-upstream test-wasi-preview1 test-wasi-preview2 test-wasi \
         report-conformance p3-fixtures test-wasi-preview3 verify \
         test-property test-async-property test-async-property-negative \
-        test-p1-repeat \
+        test-p1-repeat setup-network-tests test-wasi-network test-wasi-network-reference \
         record-p2 record-p3 record-p3-compiled record-wasi-compiled \
         record-release verify-release \
         clean \
@@ -30,6 +30,22 @@ verify: test-unit test-component test-backend-parity test-backend-inventory \
 ITERATIONS ?= 2000
 test-property:
 	$(SBCL) --control-stack-size 32 --dynamic-space-size 4096 --script tools/fuzz-backends.lisp --iterations $(ITERATIONS)
+
+# Host environment for the upstream network cases (http/sockets):
+# pinned wasi-testsuite checkout + reference Wasmtime under .cache/.
+setup-network-tests:
+	tools/setup-network-tests.sh
+
+# Upstream network subset through the wasmdown adapter (http + sockets).
+# Requires the checkout selected by WASI_TESTSuite_DIR (or the setup target).
+test-wasi-network:
+	python3 tools/run-wasi-network-tests.py
+
+# Reference-runtime smoke for the same subset: proves the host loopback/HTTP
+# harness independently of wasmdown. Report-only (upstream Wasmtime may have
+# its own failures); requires WASMTIME from the setup target.
+test-wasi-network-reference:
+	python3 tools/run-wasi-network-tests.py --reference
 
 # Deterministic async property lane (docs/design/PLAN.md §9.3/F4): the REAL
 # task/subtask, stream/future/cancel and host-pending primitives driven by
