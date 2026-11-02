@@ -1,0 +1,1 @@
+/home/tani/ghq/github.com/tani/wasmdown/tests/toolchain/p2-http-guest/target/wasm32-wasip1/release/p2proxy.wasm: /home/tani/ghq/github.com/tani/wasmdown/tests/toolchain/p2-http-guest/src/bindings.rs /home/tani/ghq/github.com/tani/wasmdown/tests/toolchain/p2-http-guest/src/lib.rs

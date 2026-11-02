@@ -170,7 +170,7 @@ Measured at that point: units 481 / 0. Core and component lanes were unchanged b
 
 - The pinned suite is 97 `.wast` files at `b0ec1f3f449525c217dbff3f1dfab435a756ea92`, run through the stateful runner with failure-phase classification: 21,187 pass / 0 fail / 73 unsupported / 0 harness-error of 21,260 — 99.7 % with unsupported in the denominator. The full run completed in ~3 s and had to stay fast; a slow or hanging run is a bug, not a workload.
 - **Deliberate dip and recovery.** The pass rate fell from 95.2 % to 92.7 % on purpose: the `(module quote …)` wrap began parsing ~543 payloads that had previously "passed" without ever being parsed. It was then fully recovered and exceeded — 95.6 %, above the pre-dip 95.2 % — by fixing the exposed gaps, never by reverting the wrap.
-- **Honest reclassification.** Unsupported rose from 277 to 725 and then settled: actions against genuinely out-of-scope modules classify cleanly instead of crashing as harness errors. The 73 that remain are terminal — the annotations proposal (`@…` forms), unadopted and permanently out of scope per [`design/PLAN.md` §3.3](design/PLAN.md). Every family that used to be unsupported (struct/array declarations, rec groups, typed function references, exception handling, named modules, tail calls) now passes.
+- **Honest reclassification.** Unsupported rose from 277 to 726 and then settled: actions against genuinely out-of-scope modules classify cleanly instead of crashing as harness errors. The 73 that remain are terminal — the annotations proposal (`@…` forms), unadopted and permanently out of scope per [`design/PLAN.md` §3.3](design/PLAN.md). Every family that used to be unsupported (struct/array declarations, rec groups, typed function references, exception handling, named modules, tail calls) now passes.
 - Harness limits recorded then, still true: `annotations.wast` and `inline-module.wast` are spec-test extensions outside the implemented grammar and classify as harness errors; the default linear-memory ceiling is 1,024 pages (64 MiB, [ADR-005](adr/ADR-005-memory-ceiling.md)); a 64 MiB string-literal / assembled-binary ceiling and a 1M-locals-per-function validator preflight in `src/wast.lisp` turn hostile input into catchable `decode-error`s; a failed module command leaves the script's current-instance unset, so later `invoke`/`get` fail, matching the spec harness's observable behaviour.
 
 ## Compiled-backend divergence
@@ -1032,3 +1032,164 @@ distinct provider instances, nothing undeclared), `...-keep-declaration-order`,
 
 The lane is evidence, never a release gate (it is not part of `verify`), and
 `declared_support` stays `partial`.
+
+## HTTP and network restored, and the full upstream suite (2026-11-02)
+
+The `feat/http` line supersedes the two exclusion sections above (“Network
+communication excluded” and the M17 HTTP removal). HTTP and TCP/UDP/DNS are
+now part of the declared WASI profile. This section is the current record;
+the earlier exclusion text is kept only as history.
+
+**Sockets.** `wasi:sockets/types@0.3.2` (`error-code`, address types, the
+`tcp-socket`/`udp-socket` resources) and `wasi:sockets/ip-name-lookup@0.3.2`
+bind for guest-declared 0.3-line imports. Authority is declared, never
+ambient: the CLI `--net HOST:PORT` / `--listen ADDR:PORT` / `--dns NAME`
+flags (repeatable, `*` wildcards) build a `wasi-network`; an embedder uses
+`make-wasi-network`. With no declaration every bind, connect, UDP send and
+resolve is refused through the interface's own `access-denied`. Readiness is
+a bounded 2 s poll, not a socket reactor. The last legacy P1 gap,
+`sock_shutdown` on a non-socket, was fixed by mapping the filetype check to
+`ENOTSOCK` (Wasmtime's own adapter has the reference behaviour).
+
+**HTTP.** The 0.3.2 `types` surface was restored (`fields`, `request`,
+`request-options`, `response` with header/body/trailer semantics) together
+with `client.send` over HTTP/1.1 on the built-in plain TCP transport.
+Request bodies stream through `client.send` (not just pre-staged bodies) and
+chunked responses carry trailers. The incoming direction is
+`wasi:http/handler` + the `service` world: `serve-component` instantiates the
+world's provider graph, binds a loopback listener, constructs the incoming
+`request` resource (method, path, scheme, authority, headers, buffered body),
+calls the guest handler through `lifted-func-call`, and serializes the
+returned `response` (status, headers, buffered body). The CLI exposes it as
+`wasmdown serve <component> --wasi [--addr HOST:PORT]`, which prints
+`http://HOST:PORT` as its **first stderr line** (default `127.0.0.1:0`,
+kernel-assigned port) and serves until SIGINT. TLS stayed out of the
+runtime: `http` rides the plain transport, and `https` requires an
+embedder-registered `wasi-http-transport` on the context; without one
+`send` returns `configuration-error`, never a plaintext fallback.
+`--http-transport` is refused by the CLI because transports are CL objects,
+not a CLI capability. The `middleware` world's host-supplied `next`
+composition has no runtime evidence and is **not** claimed; the `service`
+world and exported handler are the exercised incoming surface.
+
+**Mixed 0.3/0.2 providers.** The upstream wasip3 fixtures declare both
+release lines. `serve-component-providers` and
+`component-command-providers` compose the 0.3-line declared imports from the
+0.3 builders and the exact-version `0.2.x` imports from the P2 tables under
+one `with-args` alist; HTTP and 0.3 sockets are admitted on the 0.3 line
+while `@unstable` gating and P2 version-exact selection stay in force.
+
+**Network lane.** `tools/setup-network-tests.sh` clones the pinned
+`wasi-testsuite` and fetches a reference Wasmtime into `.cache/`, checks the
+pinned HEAD, installs the upstream runner's Python dependencies and runs a
+loopback/HTTP-framing smoke. `tools/run-wasi-network-tests.py`
+(`make test-wasi-network`) selects the inverse of the old exclusion set —
+every guest whose JSON declares the `http` or `sockets` proposal is
+admitted, every other test is a generated non-network skip — and runs it
+through `adapters/wasmdown.py`: **30/30**. `make
+test-wasi-network-reference` runs the same subset through upstream Wasmtime
+as a host-harness smoke: **28/30**, the two failures being known
+Wasmtime-50 issues, so it is report-only.
+
+**Full upstream suite.** With HTTP and sockets admitted and the
+`ENOTSOCK` fix in place, `tools/run-wasi-testsuite.py`
+(`make test-wasi-upstream`) no longer generates exclusion expectations: at
+the pinned commit `9d84631e427729802085c3d172d0a63cd360a1fa` the lane
+measures **127 pass / 0 fail / 0 skip** (AssemblyScript 12, C 14, Rust
+wasip1 46, Rust wasip3 55). This is the F1 evidence substitute for a locally
+built @0.3.2 guest; no toolchain here emits that component ABI, so
+`declared_support` remains `partial` under §12.11's blocked-by-environment
+rule. The counts previously recorded for this lane (95/0/32 and 70/0/2)
+were real measurements of the exclusion policy and are superseded, not
+rewritten.
+
+Evidence at the change: units 726/0, component 1,702/0, P3 30/30 ×3 in both
+backends, upstream 127/0/0, network subset 30/30, `make verify` green.
+
+**WASI 0.2 outgoing HTTP (2026-11-02).** The Preview2 line now serves the
+outgoing HTTP import surface at every vendored patch release (`0.2.0` …
+`0.2.12`): `wasi:http/types` exposes all resource types and methods
+(`fields`, `incoming-request`, `outgoing-request`, `request-options`,
+`response-outparam`, `incoming-response`, `incoming-body`,
+`future-trailers`, `outgoing-response`, `outgoing-body`,
+`future-incoming-response`, `http-error-code`) and
+`wasi:http/outgoing-handler.handle` returns a pollable
+`future-incoming-response`. The P2 providers reuse the 0.3 HTTP/1.1
+transport, network authority, request validation and body decoder: a P2
+`outgoing-request` rep is the 0.3 request rep, its body writes through a
+host sink into the streamed request contents, and an `incoming-response`
+rep is the 0.3 response rep whose bytes are decoded on a bounded,
+backpressured body pump. The old `wasi:http` refusal is gone; the P2 builder
+table has `types` + `outgoing-handler`, and `preview2-proxy-provider`
+composes the resolved `wasi:http/proxy` world's cli/io/clocks/random +
+HTTP imports. `wasi:http/incoming-handler` (serve side) remains the peer
+slice. Evidence: P2 unit file 38/0, full unit suite 734/0, the generated
+backend inventory now reports `P2 0.2.12 pinned=32 stable=31 bound=29
+unbound_stable=2`, and no 0.3 HTTP/sockets test regressed.
+
+
+**WASI 0.2 incoming HTTP and proxy serving (2026-11-02).** The Preview2
+line now serves the incoming side too: the proxy world resolves,
+`preview2-serve-providers` composes its io/clocks/random/cli + HTTP imports
+at each declared exact 0.2.x patch version, `preview2-serve-p` and
+`p2-incoming-handler-export` detect the newest exported
+`wasi:http/incoming-handler@0.2.x` `handle`, and `wasmdown serve`
+dispatches 0.2 proxy components vs 0.3 service components. The server parses
+HTTP/1.1 (Content-Length and chunked bodies with trailers), builds an
+`incoming-request` resource plus a `response-outparam`, invokes the sync
+handler, captures `response-outparam.set`, consumes the outgoing response
+body/trailers through the P2 stream resources, and serializes status,
+headers, body and trailers; malformed requests are 400, unset/trapping
+handlers 500. Inventory records incoming-handler as export-only at every
+release (`P2 bound=29`, two export-only world entries). Evidence: unit
+739/0 (P2 provider completeness, response-outparam capture, chunked
+request/response trailers, loopback request→handler→response), P2 lane
+11/11, P3 10/10, upstream 127/0/0, `make verify` green. No vendored 0.2
+proxy guest binary exists, so the loopback test drives a host handler
+closure; real-guest body streaming under a compiled 0.2 producer remains
+unmeasured.
+
+**Pinned WASI 0.3 toolchain guest (2026-11-02).** The environment now has a
+real generated-guest toolchain: `tools/setup-wasi-toolchain.sh` installs Rust
+`nightly-2026-11-01` (rustc 1.101.0-nightly) with the `wasm32-wasip3` target
+and wasm-tools 1.263.0 under the git-ignored `.cache/`.
+`tests/toolchain/wasi-guest` is a small command guest (argv/env/stdout);
+`make build-toolchain-guest` builds it and `tools/normalize-wasi-version.py`
+rewrites the target std's same-length `@0.3.0` interface labels to the
+vendored `@0.3.2` release before `wasm-tools validate` and hash pinning
+(`tests/fixtures/wasi/toolchain-guest.wasm`, `TOOLCHAIN-CHECKSUMS`).
+`make test-toolchain-guest` runs the tracked artifact in both the interpreter
+and compiled backends with exact stdout. This closes the §12.11 upstream
+toolchain-guest item, so `wasi_0_3_profile = conformant`; global
+`declared_support` stays `partial` for the broader engine/legacy scope. The
+full upstream wasi-testsuite remains 127/0/0. Evidence: `make verify` green,
+including the toolchain guest.
+
+
+**curl as a WASI component (2026-11-02).** `tools/setup-curl-wasm.sh` builds
+real curl 8.22.0 with wasi-sdk 34 (`wasm32-wasip3`, HTTP-only, no TLS/zlib)
+under `.cache/`; it patches curl's optional SIGALRM setjmp include out
+(wasi has no signals) and links `-lwasi-emulated-signal`.
+`make test-curl-wasm` starts a loopback HTTP server and runs the component
+through `wasmdown` with `--net 127.0.0.1:PORT -- ... -sS -v URL`, asserting
+the exact body; the test is green (21 bytes). Residual: quiet mode
+(`-sS` without `-v`/`--trace`) can remain parked after the last body byte in
+the current async scheduler, so the reproducible test uses verbose mode.
+`make verify` remains green; this is an ecosystem smoke, not a new
+conformance claim.
+
+
+**WASI 0.2 real guests for sockets and HTTP (2026-11-02).** The P2 providers
+were host-tested but had no vendored component. Two real guests now exist:
+`tests/toolchain/p2-sock-guest.c` (wasi-sdk 34, `wasm32-wasip2`, TCP connect
++ send + recv) and `tests/toolchain/p2-http-guest` (cargo-component, target
+`wasi:http/proxy@0.2.12`, incoming-handler returning a body). Building them
+exposed two P2 socket defects: the create-socket result carried the 0.3
+resource ct instead of the exact 0.2 `tcp`/`udp` ct (handles then failed
+`host-resource-rep`), and P2 `error-code` is an ENUM while the native
+helpers carry the 0.3 variant shape (the result serializer tried to
+`string` a case list). Both are fixed; `make test-p2-guests` runs the C
+TCP client against a loopback echo and the proxy guest through
+`wasmdown serve` + HTTP GET (21-byte body), both PASS. `make verify`
+includes the lane. This upgrades the P2 facade evidence from host-only to
+real guest execution; two export-only stable entries remain accounted for.

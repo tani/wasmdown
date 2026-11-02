@@ -1,0 +1,17 @@
+[package]
+name = "p2proxy"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+wit-bindgen-rt = { version = "0.44.0", features = ["bitflags"] }
+
+[lib]
+crate-type = ["cdylib"]
+
+[package.metadata.component]
+package = "component:p2proxy"
+target = "wasi:http/proxy@0.2.12"
+proxy = true
+
+[package.metadata.component.dependencies]

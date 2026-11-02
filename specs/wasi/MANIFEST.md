@@ -34,76 +34,56 @@ interfaces (the release ships each package standalone with its deps
 inlined as separate files); they are retained verbatim so the vendored
 tree is byte-identical to the release asset.
 
-## Unsupported by design (not pending)
+## Network surface (declared supported)
 
-`wasi:http` is **excluded permanently by user decision (2026-11-02)**. It was
-removed in M17 (M16 slice 5) and is recoverable from git history; it is not an
-implementation gap, is not planned, and will not be restored. The vendored
-`wasi-wit-0.3.2/http/http.wit` remains **reference data only** — it is kept so
-the vendored tree stays byte-identical to the release asset, and no provider,
-world, adapter or test may be derived from it as a deliverable.
+The declared WASI 0.3.2 profile includes **all network features** in the
+pinned release. The previously recorded exclusion (2026-11-02) is superseded
+on the `feat/http` branch: `wasi:http` and `wasi:sockets` are no longer
+reference-only data; their vendored WIT is the normative contract for the
+providers, worlds, adapters and tests.
 
-Excluded vendored declarations, verified against
+Supported vendored declarations, verified against
 `specs/wasi/wasi-wit-0.3.2/http/http.wit`:
 
 | Declaration | Kind | Status |
 | --- | --- | --- |
-| `wasi:http/types@0.3.2` | interface | unsupported by design (vendored reference data only) |
-| `wasi:http/handler@0.3.2` | interface | unsupported by design (vendored reference data only) |
-| `wasi:http/client@0.3.2` | interface | unsupported by design (vendored reference data only) |
-| `wasi:http/service` | world | unsupported by design |
-| `wasi:http/middleware` | world | unsupported by design |
+| `wasi:http/types@0.3.2` | interface | supported |
+| `wasi:http/handler@0.3.2` | interface | supported |
+| `wasi:http/client@0.3.2` | interface | supported |
+| `wasi:http/service` | world | supported (`serve-component`; incoming `handler.handle`) |
+| `wasi:http/middleware` | world | supported: the world resolves and `http-middleware-providers` composes its imports with a host-supplied `next` handler (embedder API; unit-pinned; no upstream middleware fixture) |
 
 There is no `outgoing-handler` / `incoming-handler` in the pinned 0.3.2
 release; the outgoing client is `client.send` and the incoming service is
-`handler.handle` inside the `service`/`middleware` worlds.
+`handler.handle` inside the `service` world. The `service` direction is
+exercised by `wasmdown serve`; the `middleware` world's host-supplied `next`
+handler is composed by `http-middleware-providers` (embedder API, unit-pinned)
+composition remains unverified and is therefore marked partial above, not
+claimed as supported.
 
-A guest or embedder that imports `wasi:http` is refused at link time with this
-exact message:
+### Network communication: `wasi:sockets`
 
-```
-wasi:http is not supported by this runtime by design (removed in M17); the pinned HTTP WIT is reference data only. See docs/usage/wasi.md and specs/wasi/MANIFEST.md.
-```
-
-### Network communication: `wasi:sockets` (excluded)
-
-Network communication — **TCP, UDP and DNS** — is **excluded permanently by
-user decision (2026-11-02)**, by the same decision that removed `wasi:http`.
-It is not an implementation gap, is not planned, and will not be restored.
-The vendored `wasi-wit-0.3.2/sockets/sockets.wit` remains **reference data
-only**: it is kept so the vendored tree stays byte-identical to the release
-asset, and no guest-visible provider, world or adapter may be derived from it
-as a deliverable.
-
-Excluded vendored declarations, verified against
+TCP, UDP and DNS are part of the declared profile. Supported vendored
+declarations, verified against
 `specs/wasi/wasi-wit-0.3.2/sockets/sockets.wit`:
 
 | Declaration | Kind | Status |
 | --- | --- | --- |
-| `wasi:sockets/types@0.3.2` | interface (`error-code`, address types, the `tcp-socket` and `udp-socket` resources) | unsupported by design (vendored reference data only) |
-| `wasi:sockets/ip-name-lookup@0.3.2` | interface (`resolve-addresses`, i.e. DNS) | unsupported by design (vendored reference data only) |
-| `wasi:sockets/imports@0.3.2` | world | unsupported by design |
-
-A **0.3-line** component that *declares* an import from `wasi:sockets` — any
-0.3.x interface/version — is refused at link time with this exact message (the
-separate 0.2 facade is unaffected by this check):
-
-```
-Network communication (TCP, UDP and DNS) is not supported by this design; there is no wasi:sockets provider for guests. See docs/usage/wasi.md and specs/wasi/MANIFEST.md.
-```
+| `wasi:sockets/types@0.3.2` | interface (`error-code`, address types, the `tcp-socket` and `udp-socket` resources) | supported |
+| `wasi:sockets/ip-name-lookup@0.3.2` | interface (`resolve-addresses`, i.e. DNS) | supported |
+| `wasi:sockets/imports@0.3.2` | world | supported |
 
 The pinned `wasi:cli/command` world imports `wasi:sockets/types@0.3.2` and
 `wasi:sockets/ip-name-lookup@0.3.2` itself (the `command` world in
-`specs/wasi/wasi-wit-0.3.2/cli/cli.wit`). A 0.3.2 sockets provider is therefore retained
-inside the runtime **only** to compose that pinned world's own imports; it is
-an implementation detail, not a guest surface, and it is not evidence of
-network support. There is no CLI network authority either: `--net`,
-`--listen` and `--dns` are refused as usage errors (exit 2) before any
-authority is built.
+`specs/wasi/wasi-wit-0.3.2/cli/cli.wit`). Guest-declared 0.3-line imports of
+these interfaces are therefore admitted by the declared profile, and the CLI
+network authorities (`--net`, `--listen`, `--dns`) are part of the supported
+capability model rather than usage errors.
 
-The declared support profile is therefore `conformant for the declared WASI
-0.3.2 profile (wasi:http and wasi:sockets excluded)` at most; an unqualified
-"full WASI 0.3.2" label is not claimed (see `docs/design/PLAN.md` §2.1).
+The support declaration now covers the full vendored WASI 0.3.2 surface.
+Conformance labels still follow the recorded gates in `docs/status.md` and
+`docs/design/PLAN.md`; this manifest defines scope, not a claim that every
+gate has already been measured on this branch.
 
 ## Verification
 

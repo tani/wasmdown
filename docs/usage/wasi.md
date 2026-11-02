@@ -12,9 +12,11 @@ Every host import receives an explicitly built authority object — a
 
 1. **No ambient authority.** An absent stream traps `host-error`; a
    context with no network authority denies every socket operation. In the
-   CLI, `--dir`, `--env` and guest arguments are refused unless `--wasi` is
-   given, and `--net`, `--listen` and `--dns` are always refused as usage
-   errors — there is no network authority to build (see below).
+   CLI, `--dir`, `--env`, `--net`, `--listen`, `--dns` and guest arguments
+   require `--wasi`. Network authority exists only as far as it is declared:
+   `--net HOST:PORT` (outbound), `--listen ADDR:PORT` (bind) and `--dns NAME`
+   (resolution) are repeatable, `*` is a wildcard, and with none declared the
+   context carries no network at all (see below).
 2. **Handle-relative filesystem, no path-prefix filter.** A preopen is
    an already-open host directory handle plus its guest-visible name.
    Every file operation is an `*at` call against a descriptor: there is
@@ -34,8 +36,8 @@ Every host import receives an explicitly built authority object — a
    opened for itself.
 6. **Network policy is consulted per operation** — bind, connect, UDP
    send and name resolution — and refusal rides the interface's own
-   `access-denied` error. This is the retained internal provider's
-   behaviour, not a guest-visible interface (see `wasi:sockets` below).
+   `access-denied` error. Guest-declared `wasi:sockets` imports bind under
+   this authority (see `wasi:sockets` below).
 
 ## Configuring capabilities
 
@@ -46,7 +48,8 @@ Every host import receives an explicitly built authority object — a
 | Environment | `--env K=V` (repeatable) | `:environment` alist |
 | Guest arguments | tokens after `--` | `:arguments` (the CLI sets the first to the input file's basename, POSIX `argv[0]`) |
 | Standard streams | implied by `--wasi` | `:stdin` `:stdout` `:stderr` (NIL = withdrawn) |
-| Network (TCP/UDP/DNS) | **Refused:** `--net`, `--listen` and `--dns` are usage errors (exit 2) | **No guest surface.** `make-wasi-network` / `:listen` / `:dns` exist only for the internal 0.3.2 composition; a component-declared `wasi:sockets` import is a link error |
+| Network (TCP/UDP/DNS) | `--net HOST:PORT`, `--listen ADDR:PORT`, `--dns NAME` (repeatable; `*` wildcard; require `--wasi`) | `:networks` (`make-wasi-network` with `:outbound` / `:listen` / `:dns`) |
+| HTTP transports | built-in plain TCP serves `http`; `--http-transport` is refused (embedder-only) | `:http-transports` (`wasi-http-transport` CL objects); https is `configuration-error` without one |
 | Reactor | built by `--wasi` (serves clock deadlines and stream readiness) | `:reactor` |
 
 A preopen's authority is the permission set the embedder granted —
@@ -65,31 +68,56 @@ dispatch is by the `@0.3.2` suffix of the import name.
 | `wasi:random` | `get-random-bytes`, `get-random-u64`, and the insecure `get-insecure-random-bytes` / `-u64` / `get-insecure-seed` — all from OS entropy, never the Lisp RNG. Zero-length requests return an empty list; a single request is capped at 1 MiB. |
 | `wasi:cli` | `environment` (`get-environment`, `get-arguments`, `get-initial-cwd`, lowered as `list<string>`/`list<tuple<string,string>>` through guest memory + `realloc`), `exit` (`exit`, `exit-with-code` via the `wasi-exit` condition), `stdin`/`stdout`/`stderr` as real streams, the `terminal-*` interfaces (`isatty` answers `some` or `none`, never a fabricated handle), and the command world's `run`. Guest evidence: `p3/cli-stdin-env-stderr-terminal` asserts argv[0] and an extra argument, a `--env` pair and the option-typed initial cwd, sees `terminal-stdout` as `none` on a captured (non-tty) stdout, reads real stdin (`stdin-probe\n`) through `read-via-stream` requiring the explicit DROPPED EOF result and an ok paired future, and writes to stderr through `write-via-stream`; `p3/import-exit` covers `exit`, `p3/stream-stdout` covers stdout. |
 | `wasi:filesystem` | The `descriptor` resource (own/borrow, destructors, non-owning preopens), all non-stream descriptor methods with the errno → `error-code` table, `preopens.get-directories`, `read-via-stream` / `write-via-stream` / `append-via-stream` / `read-directory`, and flag gating that reports `not-permitted` / `read-only` through the interface's `result` rather than throwing. Guest evidence: `p3/filesystem-preopens-read` lists a `/work` preopen, opens a seeded `hello.txt` through it with an async `open-at` (waited as a subtask), reads exactly 17 bytes with `read-via-stream` + `stream.read`, gets `error-code::no-entry` as an err result (not a trap) for a missing path, creates `out.txt`, writes at explicit offsets and appends at EOF (`stat` regular-file/link-count 1/size 22, byte-exact read-back), gets `error-code::read-only` (case 32) as an err result for a write through the read-only descriptor, and exercises `create-directory-at` / `stat-at` / `read-directory` (enumerating `hello.txt`, `out.txt`, `subdir`, `temp.txt`) / `rename-at` / `unlink-file-at` / `remove-directory-at`, with a host-side witness that the removed objects are absent. Link/symlink operations and the stat symlink-follow policy, the advanced metadata/time calls (`advise`, `sync`, `sync-data`, `set-size`, `set-times`, `get-flags`, `get-type`, `metadata-hash`, `is-same-object`) and stat timestamps are provider/unit-tested but not guest-evidenced; there is no seek API in 0.3.2. |
-| `wasi:sockets` | **Unsupported by design — not an implementation gap, not planned.** TCP, UDP and DNS are excluded permanently by user decision (2026-11-02); there is no guest-visible socket or DNS provider. The vendored `specs/wasi/wasi-wit-0.3.2/sockets/sockets.wit` is reference data only. The pinned `wasi:cli/command` world imports `wasi:sockets/types@0.3.2` and `wasi:sockets/ip-name-lookup@0.3.2` itself, so a 0.3.2 sockets provider is retained internally for that composition only; guests cannot reach it. Imports are rejected at link time with the exact message below. See [`../../specs/wasi/MANIFEST.md`](../../specs/wasi/MANIFEST.md) § “Network communication: `wasi:sockets` (excluded)”. |
-| `wasi:http` | **Unsupported by design — not an implementation gap, not planned.** Excluded permanently by user decision (2026-11-02); removed in M17 and recoverable from git history. There is no provider and no transport option. The vendored `specs/wasi/wasi-wit-0.3.2/http/*.wit` files remain reference data only. Imports are rejected at link time with the exact message below. See [`../../specs/wasi/MANIFEST.md`](../../specs/wasi/MANIFEST.md) § “Unsupported by design (not pending)”. |
+| `wasi:sockets` | **Supported under the declared authority.** `types` provides `error-code`, the address types and the `tcp-socket`/`udp-socket` resources; `ip-name-lookup` provides `resolve-addresses` (DNS). Both bind for guest-declared 0.3-line imports, and every bind, connect, UDP send and resolve is checked against the context's `wasi-network` (CLI `--net`/`--listen`/`--dns`, or `make-wasi-network`). Undeclared destinations are `access-denied`; with no authority every operation is refused. Readiness is a bounded 2 s poll, not a socket reactor. Evidence: the pinned upstream http/sockets subset is 30/30 (`make test-wasi-network`). |
+| `wasi:http` | **Supported (0.3.2).** `types` provides the `fields`, `request`, `request-options` and `response` resources with header/body/trailer semantics; `client.send` speaks HTTP/1.1 on the built-in plain TCP transport, including streaming request uploads and chunked response trailers. The incoming `handler` interface and the `service` world are served by `serve-component` / `wasmdown serve`, which answers requests through the exported handler until SIGINT. A `https` request needs an EMBEDDER-registered `wasi-http-transport`; without one `send` returns `configuration-error` (never a plaintext fallback, and the runtime implements no TLS itself). The `middleware` world's host-supplied `next`-handler composition is implemented by `http-middleware-providers` (embedder API; unit-pinned, no upstream middleware fixture). On the WASI 0.2 (Preview2) legacy line there is still no `wasi:http` provider; the declared HTTP surface is the 0.3.2 one.
 
-An import of `wasi:http` is refused with this exact message:
+The 0.2 line serves the **outgoing** HTTP surface: `wasi:http/types@0.2.x`
+(all resource types and methods: `fields`, `incoming-request`,
+`outgoing-request`, `request-options`, `response-outparam`,
+`incoming-response`, `incoming-body`, `future-trailers`, `outgoing-response`,
+`outgoing-body`, `future-incoming-response`, `http-error-code`) and
+`wasi:http/outgoing-handler@0.2.x.handle` are bound at the exact declared
+patch version (`0.2.0` … `0.2.12`). Requests go through the same HTTP/1.1
+transport and `wasi-network` authority as the 0.3 line; bodies are P2
+`input-stream`/`output-stream` resources and the two futures expose
+`subscribe` pollables. The **incoming** side is served too:
+`wasi:http/incoming-handler@0.2.x.handle` is a synchronous export, so a 0.2
+proxy-world component is instantiated with the exact-version P2 providers
+(io/clocks/random/cli/stdout/stderr/stdin + http/types +
+http/outgoing-handler) and driven by `wasmdown serve`. The host buffers the
+HTTP/1.1 request (Content-Length or chunked, trailers included), builds the
+`incoming-request` resource, calls `handle(request, response-outparam)`,
+captures `response-outparam.set`, then serializes the captured
+`outgoing-response` status, headers, body and trailers. An unset outparam or
+a handler trap answers 500. The inventory records `incoming-handler` as an
+export-only interface (it is a world export, never an import provider).
 
+## Serving HTTP
+
+`serve` dispatches on the component's exports: a service-world component
+exporting `wasi:http/handler` runs the 0.3 path, while a proxy-world
+component exporting `wasi:http/incoming-handler@0.2.x` runs the 0.2 path
+(`serve-preview2-component`). Both serve HTTP/1.1 until SIGINT, and the URL
+is the **first stderr line**, before any guest output:
+
+```sh
+sbcl --script tools/wasmdown.lisp serve service.wasm \
+  --wasi --addr 127.0.0.1:8080 --dir .::/work
+# stderr: http://127.0.0.1:8080
 ```
-wasi:http is not supported by this runtime by design (removed in M17); the pinned HTTP WIT is reference data only. See docs/usage/wasi.md and specs/wasi/MANIFEST.md.
-```
 
-This is a deliberate, permanent exclusion — not a pending interface and not a
-missing piece of the declared profile. The declared profile is the pinned
-WASI 0.3.2 surface **minus** `wasi:http` and `wasi:sockets`; the unsupported
-HTTP declarations (`types`, `handler`, `client`, and the
-`service`/`middleware` worlds) and the unsupported sockets declarations
-(`types`, `ip-name-lookup`, and the `imports` world) are enumerated in
-`specs/wasi/MANIFEST.md`.
-
-An import of `wasi:sockets` is refused with this exact message:
-
-```
-Network communication (TCP, UDP and DNS) is not supported by this design; there is no wasi:sockets provider for guests. See docs/usage/wasi.md and specs/wasi/MANIFEST.md.
-```
-
-Network communication is not a missing interface and not planned. TCP, UDP
-and DNS are permanently out of scope, as are the CLI network options.
+`--addr` defaults to `127.0.0.1:0`, so the printed URL carries the
+kernel-assigned port. The same capability flags as `run` apply (`--dir`,
+`--env`, `--net`, `--listen`, `--dns`); a request body is buffered before the
+guest handler call, and the response status, headers and buffered body are
+serialized from the returned `response` resource (the body is read from the
+response's contents stream after its writer drops it). On the 0.2 path the
+response body is collected from the `outgoing-body` output-stream and
+trailers from `outgoing-body.finish`; a non-empty trailer section switches
+the reply to chunked encoding, and request chunked trailers are exposed
+through `incoming-body.finish`'s `future-trailers`. `--http-transport` is
+refused: TLS transports are embedder-only (`:http-transports` on the
+`wasi-context`).
 
 Coverage is enforced at construction: an unimplemented function of a
 bound interface is a `host-error`, never a trapping stub. Provider values are
@@ -154,10 +182,14 @@ Run it with `run <module> --wasi`, or `wasmdown.wasi:run-preview1`.
 A component importing exact `@0.2.x` release names gets the versioned
 0.2 provider table; anything else gets the vendored 0.3 command world.
 The choice follows the component's **declared imports**, never a file
-name, and a component mixing release lines is a `link-error` before any
-guest code runs.
+name. A component may declare **both** release lines: the mixed graph
+composes its 0.3-line imports from the 0.3 builders and its exact-version
+0.2 imports from the P2 tables under one `with-args` alist (this is what the
+upstream wasip3 fixtures do). The 0.2 line remains a legacy compatibility
+target: it has no `wasi:http` provider, and its `wasi:sockets/*` bindings are
+legacy coverage, not the declared network surface.
 
-`src/wasi-preview2.lisp` binds 27 of the 31 stable interfaces at their
+`src/wasi-preview2.lisp` binds 29 of the 31 stable interfaces at their
 exact release names. The pinned SQLite component for this line decodes,
 validates, instantiates and executes real SQL through
 `wasi:cli/run@0.2.12`, in memory and on disk.

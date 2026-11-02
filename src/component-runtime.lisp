@@ -68,7 +68,14 @@
            #:host-end-generation
            #:host-end-ready
            #:host-future-resolve
+           #:host-future-resolved-p
            #:host-future-watch
+           ;; a host driver's bounded store tick (the CLI's serve loop
+           ;; uses it to keep host work flowing between calls)
+           #:store-tick
+           ;; the service variant: one scheduler quantum (guest async
+           ;; threads) plus the host tick
+           #:store-service-tick
            ;; M17 step 5 — the ASYNCHRONOUS HOST CALL: an async-typed
            ;; host closure returns a pending instead of a value
            #:make-host-pending
@@ -1228,14 +1235,36 @@ type space (the one space the comparison is defined in)."
               ;; comparing the index would trap on a legitimate
               ;; cross-component transfer. `end.t == t' still catches
               ;; every structural difference around the handle.
-              (:own :own)
+              ;; a bare resource type used in a value position and an
+              ;; explicit own<T> denote the same handle class; the
+              ;; WIT provider side and the guest valtype side spell
+              ;; them differently (http body trailers)
+              ((:own :resource) :resource-handle)
               (:borrow :borrow)
-              (:resource :resource)
               (:stream (list :stream (field p)))
               (:future (list :future (field p)))
               ;; the opaque kinds (func/instance/component): compare
               ;; their payloads structurally as-is
               (t (list (wasmdown.component:ct-kind c) p))))))))
+
+(defun %ct-has-unresolved-ref-p (c)
+  "T when the ct C's structure still contains a raw (:idx . n)
+valtype reference. A HOST provider's schema cts (wasmdown.wasi's
+wasi:http futures) live in the package's type space and are lowered
+into a guest's space; those refs are not the guest's indices, so the
+lift_async_value element guard cannot compare them structurally and
+must not trap a host-owned end over that spelling difference."
+  (labels ((walk (x depth)
+             (when (< depth 32)
+               (cond
+                 ((and (consp x) (eq (car x) :idx)) t)
+                 ((and (consp x) (eq (car x) :ct)) (walk (cdr x) (1+ depth)))
+                 ((wasmdown.component:ct-p x) (walk (ct-payload x) (1+ depth)))
+                 ((vectorp x) (some (lambda (e) (walk e (1+ depth))) x))
+                 ((consp x) (or (walk (car x) (1+ depth))
+                                (walk (cdr x) (1+ depth))))
+                 (t nil)))))
+    (and c (walk c 0))))
 
 (defun %abi-discriminant-size (cases)
   "discriminant_type (CanonicalABI.md 2038): the smallest unsigned
@@ -1789,6 +1818,11 @@ WIT names the case with a string (\"closed\"), so the match is on the
 normalised name — the old (string= :closed \"closed\") was a type error
 and the position fell through to case 0, which stored the NIL payload
 of the WRONG case's resource slot."
+  ;; A payload-less variant case is sometimes handed to the outer
+  ;; variant as the case list itself ("connection-refused"); unwrap the
+  ;; one-element case list before stringifying.
+  (when (and (consp tag) (null (cdr tag)) (stringp (car tag)))
+    (setf tag (car tag)))
   (or (position (and tag (string-downcase (string tag)))
                 cases
                 :key (lambda (case) (string-downcase (string (car case))))
@@ -3679,35 +3713,38 @@ TARGET's space."
                                inst fidx component-args)))))
          (if (or core-result result)
              (list
-              (if (and (consp res) (eq (first res) :own-handle))
-                  ;; lower_own: the abstract handle enters THIS
-                  ;; instance's table; the core side gets the INDEX
-                  (%handle-add inst (second res) (third res) t)
-                  (if result
-                      ;; lower_flat_values: FLAT when <= 1 flat slot,
-                      ;; else the result STORED at the [ptr] out-param
-                      ;; (the last core arg). The SAME cx serves both
-                      ;; spaces: its INST (the caller) owns the handle
-                      ;; table a stream/future/own result enters, its
-                      ;; TYPE-INST (FT-INST) resolves the result's
-                      ;; (:idx . n) refs — the two-space split made the
-                      ;; old second rcx redundant.
-                      (let ((rflat (%flat-type-of result ft-inst)))
-                        (let ((result-ct
-                                (%abi-ct result (%abi-type-inst cx))))
-                          (if (> (length rflat) 1)
-                              ;; the SPILLED result: store at the
-                              ;; [ptr] out-param (the LAST core
-                              ;; param; the sig carries NO core
-                              ;; results — the old (if core-result
-                              ;; ...) gate skipped the store
-                              ;; entirely and the caller read an
-                              ;; empty retptr)
-                              (let ((ptr (first (last args))))
-                                (%abi-store cx res result-ct ptr)
-                                nil)
-                              (first (%abi-lower cx res
-                                                 result-ct)))))
+              (if result
+                  (let* ((rflat (%flat-type-of result ft-inst))
+                         (result-ct (%abi-ct result (%abi-type-inst cx))))
+                    (cond
+                      ((> (length rflat) 1)
+                       ;; the SPILLED result: store at the [ptr]
+                       ;; out-param (the LAST core param; the sig
+                       ;; carries NO core results — the old (if
+                       ;; core-result ...) gate skipped the store
+                       ;; entirely and the caller read an empty
+                       ;; retptr). The store walks the result
+                       ;; RECURSIVELY: an own-handle payload
+                       ;; (result<own<R>, E>) enters THIS table from
+                       ;; the store's :own arm — the old top-level
+                       ;; ":own-handle result" shortcut fired FIRST
+                       ;; and returned the index as a core result for
+                       ;; a signature that declares none, so the
+                       ;; caller's retptr stayed zero and its
+                       ;; Resource::from_handle saw handle 0.
+                       (%abi-store cx res result-ct (first (last args)))
+                       nil)
+                      ((and (consp res) (eq (first res) :own-handle))
+                       ;; lower_own: the abstract handle enters THIS
+                       ;; instance's table; the core side gets the
+                       ;; INDEX
+                       (%handle-add inst (second res) (third res) t))
+                      (t (first (%abi-lower cx res result-ct)))))
+                  ;; no declared result: a provider's abstract
+                  ;; own-handle (the implicit post-return shape)
+                  ;; still enters the table
+                  (if (and (consp res) (eq (first res) :own-handle))
+                      (%handle-add inst (second res) (third res) t)
                       res)))
              '()))))))
 
@@ -4060,6 +4097,7 @@ the opts plist, guarded by the scheduler mutex)."
   "The End base (CanonicalABI.md 1617): the readable/writable end
 of a stream or future pair."
   (t-ct nil)                         ; the element type ct (stream<T>)
+  (t-inst nil)  ; the type space t-ct's refs belong to (cross-space guard)
   (state :idle)   ; :idle :copying :cancelling-copy :done
   (other nil)                        ; the paired end (NIL = dropped)
   (buffer nil)    ; (list memory ptr length progress) — the guest buffer
@@ -4126,14 +4164,15 @@ of a stream or future pair."
 ;;; new_{stream,future} (CanonicalABI.md 1907-1920): the linked pair.
 (defun %new-async-pair (t-ct owner event-code future-p)
   "new_stream / new_future: the linked readable+writable ends."
-  (let* ((r-event (if future-p +event-future-read+ +event-stream-read+))
+  (let* ((origin-inst (or owner *host-provider-inst*))
+         (r-event (if future-p +event-future-read+ +event-stream-read+))
          (w-event (if future-p +event-future-write+ +event-stream-write+))
          (reader (make-async-end
-                  :t-ct t-ct :owner owner :event-code r-event
-                  :future-p future-p))
+                  :t-ct t-ct :t-inst origin-inst :owner owner
+                  :event-code r-event :future-p future-p))
          (writer (make-async-end
-                  :t-ct t-ct :owner owner :event-code w-event
-                  :future-p future-p)))
+                  :t-ct t-ct :t-inst origin-inst :owner owner
+                  :event-code w-event :future-p future-p)))
     (setf (async-end-other reader) writer)
     (setf (async-end-other writer) reader)
     (values reader writer)))
@@ -5389,6 +5428,27 @@ consumer must never observe the same value."
         (setf (async-end-host-watch (host-future-watch-end w)) nil)))
     cancelled))
 
+(defun %host-watch-queue-buffer (w buf)
+  "Deliver the value the canonical copy just placed in the host BUF to
+the one-shot watch W. A GUEST-WRITTEN future stages its value in the
+writer's buffer; the copy that consumes it (below, in %END-COPY) is
+the delivery event, exactly as HOST-FUTURE-RESOLVE is for a
+host-written one."
+  (let ((queue nil)
+        (values (host-buffer-values buf)))
+    (sb-thread:with-recursive-lock ((host-future-watch-mutex w))
+      (when (eq (host-future-watch-state w) :waiting)
+        (setf (host-future-watch-state w) :queued
+              (host-future-watch-value w) (first values)
+              (host-future-watch-value-p w) (not (null values))
+              (host-future-watch-dropped-p w) nil
+              queue t)))
+    (when queue
+      (%host-enqueue (lambda () (%host-watch-deliver w))
+                     (or (host-future-watch-store w)
+                         *current-component-store*
+                         *global-host-store*)))))
+
 (defun host-future-watch (end callback)
   "A ONE-SHOT read subscription on the host-owned READABLE future END.
 CALLBACK is (value peer-dropped-p) -> side effect, run ONCE on the
@@ -5436,6 +5496,35 @@ one-shot watch on the readable peer is QUEUED (never run inline)."
                        (async-end-owner reader))
           (%end-notify reader 1)))))
   value)
+
+(defun host-future-resolved-p (end)
+  "T when the host WRITABLE future end END has already been resolved
+(host-future-resolve ran): the host-side driver's non-blocking
+completion probe (the incoming handler reads a response body this
+way)."
+  (and (async-end-p end)
+       (async-end-future-p end)
+       (not (null (async-end-host-value-p end)))))
+
+(defun store-tick (&optional store)
+  "One bounded store-driver tick for a host embedder (the CLI's serve
+loop): pump the reactor and drain the completion queue. An idle store
+does no work."
+  (%store-tick store))
+
+(defun store-service-tick (&optional store)
+  "One SERVICE-driver tick for a host embedder running a component
+export as a long-lived server (the CLI's `serve' loop): spend one
+SCHEDULER quantum so guest async threads spawned by the exported
+handler (a `spawn_local' response-body writer, say) take their turn,
+then pump the store's host work. The quantum runs with STORE bound,
+so any host unit it queues lands on the store's own context. An idle
+store does one bounded scheduler pass and no reactor work. Returns
+the number of host events drained."
+  (let ((store (or store *global-host-store*)))
+    (let ((*current-component-store* store))
+      (async-thread-resume-all))
+    (%store-tick store)))
 
 (defun host-end-read (reader)
   "The provider-side read of a GUEST-RESOLVED value on READER (the
@@ -5518,10 +5607,34 @@ the (memory ptr length progress) list. The 5 cases in order:
               (plusp (%buffer-remain buffer)))
          (setf (async-end-buffer end) buffer)
          (%host-sink-drain end))
+        ;; a ZERO-LENGTH write into a host-sink-backed stream completes
+        ;; at once: there is nothing for the sink to consume, and
+        ;; parking the empty buffer (the general case-2 shape below)
+        ;; would leave the guest write waiter blocked forever — no
+        ;; host drain ever produces its event. End.copy case 5's
+        ;; zero-length acknowledgement is the right answer here (the
+        ;; wit-bindgen `write_all' of an empty body: `stream.write'
+        ;; with an empty buffer must return Complete(0), then the
+        ;; writer drops and the provider's transmission future
+        ;; resolves).
+        ((and (async-end-host-sink other)
+              (zerop (%buffer-remain buffer)))
+         (%end-notify end 0))
         ((async-end-host-source other)
          (%host-source-fill end buffer other))
         ((async-end-host-value-p other)
          (%host-value-deliver end buffer other))
+        ;; a HOST-WATCHED readable future is a pending READ: give it a
+        ;; host buffer and let this same copy complete canonically, then
+        ;; hand the value to the watch (the provider observes a value
+        ;; the GUEST wrote through the writable peer).
+        ((and (async-end-host-watch other)
+              (plusp (%buffer-remain buffer)))
+         (let ((hbuf (make-host-buffer 1)))
+           (setf (async-end-buffer other) hbuf)
+           (%end-copy end buffer is-read)
+           (let ((w (async-end-host-watch other)))
+             (when w (%host-watch-queue-buffer w hbuf)))))
         (t (setf (async-end-buffer end) buffer))))
      ;; case 3: both have remain > 0 — copy the min
      ((and (plusp (%buffer-remain buffer))
@@ -5638,11 +5751,19 @@ whose recorded element type differs from the valtype's traps."
       (error 'wasmdown:wasm-trap :kind :generic
              :message "handle index used with the wrong type"))
     (when elem
-      (unless (equal (%abi-type-key (async-end-t-ct end)
-                                    (%abi-type-inst cx))
-                     (%abi-type-key elem (%abi-type-inst cx)))
-        (error 'wasmdown:wasm-trap :kind :generic
-               :message "stream or future element type mismatch")))
+      (let* ((tinst (%abi-type-inst cx))
+             ;; the END's element ct belongs to the space the pair was
+             ;; CREATED in (an imported provider's end: the provider's
+             ;; own type space); a local pair falls back to the
+             ;; lifting context's TYPE space — %ABI-TYPE-INST, never
+             ;; the bare TYPE-INST slot: the sync/async lower paths
+             ;; leave that slot NIL for a same-space cx
+             (einst (or (async-end-t-inst end) tinst))
+             (ek (%abi-type-key (async-end-t-ct end) einst))
+             (tk (%abi-type-key elem tinst)))
+        (unless (equal ek tk)
+          (error 'wasmdown:wasm-trap :kind :generic
+                 :message "stream or future element type mismatch"))))
     (unless (eq (async-end-state end) :idle)
       (error 'wasmdown:wasm-trap :kind :generic
              :message "cannot lift a stream or future in a non-idle state"))

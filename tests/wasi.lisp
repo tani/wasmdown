@@ -187,7 +187,7 @@ machinery is deliberately not part of the public surface)."
 (defun %wasi-interface-for-import-name (name)
   "The WIT interface whose versioned import name is NAME, over the
 packages this runtime provides."
-  (dolist (short '("clocks" "random" "cli" "filesystem" "sockets"))
+  (dolist (short '("clocks" "random" "cli" "filesystem" "sockets" "http"))
     (let ((found nil))
       (maphash (lambda (key interface)
                  (declare (ignore key))
@@ -244,9 +244,11 @@ declared-surface comparison."
            (builders (wasmdown.wasi::%wasi-provider-builders ctx))
            (declared-total 0)
            (exported-total 0))
-      ;; the audited surface: 20 interface imports (19 of them declare
-      ;; functions; clocks/types is type-only)
-      (is (= 20 (length builders)))
+      ;; the audited surface: 23 interface imports (22 declare functions;
+      ;; clocks/types is type-only). HTTP handler is the middleware world's
+      ;; import; sockets types/ip-name-lookup and http types/client/handler
+      ;; are now guest-visible support.
+      (is (= 23 (length builders)))
       (dolist (entry builders)
         (let* ((import-name (car entry))
                (interface (%wasi-interface-for-import-name import-name))
@@ -274,9 +276,10 @@ declared-surface comparison."
               (is (null (member "unstable" annotations
                                 :key #'wasmdown.wit:wit-annotation-name
                                 :test #'string=)))))))
-      ;; the audit's totals: 89 declared = 89 exported
-      (is (= 89 declared-total))
-      (is (= 89 exported-total))
+      ;; the audit's totals: 126 declared = 126 exported (the HTTP handler
+      ;; import is the one added by the network surface)
+      (is (= 126 declared-total))
+      (is (= 126 exported-total))
       ;; Deliberately-absent names are NOT stubs inside a provider: the
       ;; whole interfaces are absent from the registry, so no trapping
       ;; closure can be bound for them. The refusal itself lives in
@@ -287,7 +290,11 @@ declared-surface comparison."
                             (wasmdown.wasi:make-wasi-context)))))
         (is (not (member "wasi:clocks/timezone@0.3.2" names
                          :test #'string=)))
-        (is (notany (lambda (n) (search "wasi:http/" n)) names))))))
+        ;; the whole HTTP surface is served; only the @unstable timezone
+        ;; interface stays out
+        (is (member "wasi:http/types@0.3.2" names :test #'string=))
+        (is (member "wasi:http/client@0.3.2" names :test #'string=))
+        (is (member "wasi:http/handler@0.3.2" names :test #'string=))))))
 
 (test wasi/provider-instance-refuses-unimplemented-function
   ;; A declared function the alist does not cover is a CONSTRUCTION-TIME
@@ -594,6 +601,30 @@ delivered OUTCOME in the returned cons's CDR (:UNSET until then)."
         (is (eql (%completed 2)
                  (third (rtcall "%WAITABLE-GET-PENDING-EVENT" writer))))
         ;; the stream write end returns to idle after delivery
+        (is (eq :idle (rtcall "ASYNC-END-STATE" writer)))))))
+
+(test wasi/host-sink-zero-length-write
+  ;; Regression (http-service-echo's empty-body POST): a ZERO-LENGTH
+  ;; write into a host-sink-backed stream must complete at once. It
+  ;; used to park the empty buffer on the peer (End.copy case 2) with
+  ;; no sink call ever pending, so the guest's `write_all' of an empty
+  ;; response body waited forever and the provider's transmission
+  ;; future never resolved (the serve loop then timed the response
+  ;; out). The correct acknowledgement is COMPLETED|0<<4 on the
+  ;; writer end, with no sink call.
+  (multiple-value-bind (reader writer)
+      (wasmdown.component.runtime:make-host-stream-pair *u8-ct*)
+    (let ((calls 0))
+      (wasmdown.component.runtime:host-end-set-sink
+       reader (lambda (octets start end)
+                (declare (ignore octets start end))
+                (incf calls)
+                (values 0 nil)))
+      (let ((staged (wasmdown.component.runtime:make-host-buffer 0)))
+        (rtcall "%END-COPY" writer staged nil)
+        (is (zerop calls))
+        (is (eql (%completed 0)
+                 (third (rtcall "%WAITABLE-GET-PENDING-EVENT" writer))))
         (is (eq :idle (rtcall "ASYNC-END-STATE" writer)))))))
 
 (test wasi/host-sink-would-block-retry-keeps-generation
@@ -2771,8 +2802,8 @@ progress is possible, or the end is DROPPED."
                                    nil net server)))
                   (port (sock-value-port local)))
              (is (plusp port))
-             (is (equal "ipv4" (cdr (wasmdown.wasi:tcp-get-address-family
-                                     nil net server))))
+             (is (equal "ipv4" (second (wasmdown.wasi:tcp-get-address-family
+                                        nil net server))))
              (is (null (wasmdown.wasi:tcp-get-is-listening nil net server)))
              ;; listen -> a stream of accepted sockets
              (let ((listening (wasmdown.wasi:tcp-listen nil net server)))
@@ -2977,7 +3008,8 @@ progress is possible, or the end is DROPPED."
              (is (string= "invalid-state"
                           (sock-code (wasmdown.wasi:udp-disconnect nil net b))))
              (is (equal "ipv4"
-                        (cdr (wasmdown.wasi:udp-get-address-family nil net a))))
+                        (second (wasmdown.wasi:udp-get-address-family
+                                 nil net a))))
              ;; unicast hop limit
              (is (equal '(:ok) (wasmdown.wasi::udp-set-unicast-hop-limit
                                 nil net a 5)))
@@ -3366,6 +3398,537 @@ caller closes FD."
         (wasmdown.wasi::%close-fd listen-fd)))))
 
 ;;; ===============================================================
+;;; M16 SLICE 5 — wasi:http: the types resources (fields semantics,
+;;; request/response/request-options), client.send over HTTP/1.1 on a
+;;; loopback server, the pluggable transport, and an e2e component.
+;;; ===============================================================
+
+(defun http-net (&key (outbound :any) (dns :none))
+  (wasmdown.wasi:make-wasi-network :outbound outbound :dns dns))
+
+(defun http-ctx (&key (net (http-net)))
+  (wasmdown.wasi:make-wasi-context :networks (list net)))
+
+(defun http-fields (&rest entries)
+  (let ((f (wasmdown.wasi:make-wasi-fields)))
+    (loop for (name value) on entries by #'cddr
+          do (wasmdown.wasi:fields-append f name value))
+    f))
+
+(defun http-request (&key (port 80) (path "/x") (method (cons "get" nil))
+                          headers (options nil) (scheme :none))
+  "A request rep built directly (the CL side of request.new)."
+  (let* ((f (or headers (wasmdown.wasi:make-wasi-fields)))
+         (req (third (first (wasmdown.wasi:http-request-new
+                             f :none :none :none)))))
+    (setf (wasmdown.wasi::wasi-http-request-authority req)
+          (cons :some (format nil "127.0.0.1:~d" port))
+          (wasmdown.wasi::wasi-http-request-path-with-query req)
+          (cons :some path)
+          (wasmdown.wasi::wasi-http-request-method req) method
+          (wasmdown.wasi::wasi-http-request-scheme req) scheme
+          (wasmdown.wasi::wasi-http-request-options req) options)
+    req))
+
+(defun http-serve-once (response)
+  "A block loopback server emitting RESPONSE after reading the
+request head: (values port listen-fd thread got-cell)."
+  (multiple-value-bind (port fd) (sock-host-listener)
+    (let ((got (list nil)))
+      (values port fd
+              (sb-thread:make-thread
+               (lambda ()
+                 (let ((cfd (wasmdown.wasi::%libc-accept4
+                             fd (sb-sys:int-sap 0) (sb-sys:int-sap 0) 0)))
+                   (unwind-protect
+                        (let ((buf (make-array 0 :element-type '(unsigned-byte 8)
+                                                 :adjustable t :fill-pointer 0))
+                              (done nil))
+                          (loop while (not done)
+                                do (let ((tmp (sb-alien:make-alien
+                                               sb-alien:unsigned-char 4096)))
+                                     (unwind-protect
+                                          (let ((n (wasmdown.wasi::%libc-recv
+                                                    cfd (sb-alien:alien-sap tmp)
+                                                    4096 0)))
+                                            (loop for i below n
+                                                  do (vector-push-extend
+                                                      (sb-sys:sap-ref-8
+                                                       (sb-alien:alien-sap tmp) i)
+                                                      buf)))
+                                       (sb-alien:free-alien tmp)))
+                                   (let ((s (map 'string #'code-char buf)))
+                                     (when (search (format nil "~c~c~c~c"
+                                                           #\Return #\Newline
+                                                           #\Return #\Newline)
+                                                   s)
+                                       (setf done t))))
+                          (setf (car got) (map 'string #'code-char buf))
+                          (let* ((bytes (map 'list #'char-code response))
+                                 (abuf (wasmdown.wasi::%byte-list->alien bytes)))
+                            (unwind-protect
+                                 (wasmdown.wasi::%libc-send
+                                  cfd (sb-alien:alien-sap abuf) (length bytes) 0)
+                              (sb-alien:free-alien abuf))))
+                     (wasmdown.wasi::%close-fd cfd))))
+               :name "http-serve")
+              got))))
+
+(defmacro with-http-server ((port response got) &body body)
+  `(multiple-value-bind (,port fd thread ,got)
+       (http-serve-once ,response)
+     (declare (ignorable thread))
+     (unwind-protect (progn ,@body)
+       (ignore-errors (sb-thread:join-thread thread :timeout 2))
+       (wasmdown.wasi::%close-fd fd))))
+
+(defun http-drain (reader)
+  "Copy READER's values until no progress is left (the body source
+yields every chunk the framing decodes, then EOF)."
+  (let ((out '()))
+    (loop
+      (let* ((buf (wasmdown.component.runtime:make-host-buffer 4096))
+             (vals (progn (rtcall "%END-COPY" reader buf t)
+                          (wasmdown.component.runtime:host-buffer-values buf))))
+        (when (null vals) (return out))
+        (setf out (append out vals))))))
+
+(defun http-body-text (resp)
+  "consume-body + drain the stream through the copy protocol."
+  (let* ((pair (wasmdown.wasi:http-response-consume-body resp :none))
+         (reader (first pair))
+         (bytes (http-drain reader))
+         (future (sock-future (second pair))))
+    (values (map 'string #'code-char bytes) future)))
+
+;;; ---------------------------------------------------------------
+;;; fields: case-insensitive names, ordered values, append vs set,
+;;; the validation errors, copy-all/clone.
+
+(test wasi/http-fields-semantics
+  (let* ((f (wasmdown.wasi:make-wasi-fields)))
+    (is (eq :ok (car (wasmdown.wasi:fields-set f "X-Test" (list (list 104 105))))))
+    (is (eq :ok (car (wasmdown.wasi:fields-append f "x-test" (list 33)))))
+    ;; case-insensitive lookup keeps the insertion order; the stored
+    ;; spelling is CANONICAL (lowercase), as http::HeaderName does
+    (is (equal '((104 105) (33)) (wasmdown.wasi:fields-get f "X-TEST")))
+    (is (equal '(("x-test" (104 105)) ("x-test" (33)))
+               (wasmdown.wasi:fields-copy-all f)))
+    (is (wasmdown.wasi:fields-has f "x-Test"))
+    (is (not (wasmdown.wasi:fields-has f "bad name")))
+    (is (equal '() (wasmdown.wasi:fields-get f "absent")))
+    ;; set replaces every value; the original position is kept
+    (is (eq :ok (car (wasmdown.wasi:fields-set f "x-test" (list (list 49))))))
+    (is (equal '((49)) (wasmdown.wasi:fields-get f "X-Test")))
+    (is (equal '(("x-test" (49))) (wasmdown.wasi:fields-copy-all f)))
+    ;; get-and-delete
+    (let ((del (wasmdown.wasi:fields-get-and-delete f "X-Test")))
+      (is (eq :ok (car del)))
+      (is (equal '((49)) (cdr del)))
+      (is (equal '() (cdr (wasmdown.wasi:fields-get-and-delete f "never")))))
+    (is (not (wasmdown.wasi:fields-has f "x-test")))
+    ;; clone is a DEEP, MUTABLE copy
+    (let* ((g (http-fields "A" (list 49)))
+           (c (third (wasmdown.wasi:fields-clone g))))
+      (is (eq :ok (car (wasmdown.wasi:fields-set c "A" (list (list 50))))))
+      (is (equal '((49)) (wasmdown.wasi:fields-get g "A")))
+      (is (equal '((50)) (wasmdown.wasi:fields-get c "A"))))
+    ;; validation: forbidden names, invalid syntax, immutability
+    (is (equal "forbidden"
+               (second (wasmdown.wasi:fields-set f "Host" (list (list 49))))))
+    (is (equal "invalid-syntax"
+               (second (wasmdown.wasi:fields-set f "X Y" (list (list 49))))))
+    (is (equal "invalid-syntax"
+               (second (wasmdown.wasi:fields-set f "X" (list (list 13 10 65))))))
+    (is (equal "forbidden"
+               (second (wasmdown.wasi:fields-append f "proxy-authorization"
+                                                    (list 48)))))
+    (let ((im (third (wasmdown.wasi::%fields-immutable-view f))))
+      (is (equal "immutable"
+                 (second (wasmdown.wasi:fields-set im "A" (list (list 49))))))
+      (is (equal "immutable"
+                 (second (wasmdown.wasi:fields-delete im "A")))))
+    ;; from-list validates the whole list
+    (is (equal "invalid-syntax"
+               (second (wasmdown.wasi:fields-from-list
+                        (list (list "A" (list 49))
+                              (list "bad name" (list 49)))))))
+    (is (equal "forbidden"
+               (second (wasmdown.wasi:fields-from-list
+                        (list (list "transfer-encoding" (list 49)))))))
+    ;; the size limit is header-error.size-exceeded
+    (is (equal "size-exceeded"
+               (second (wasmdown.wasi:fields-set
+                        f "X" (list (make-list 70000
+                                               :initial-element 97))))))))
+
+;;; ---------------------------------------------------------------
+;;; request: method/scheme/authority/path round-trips + validation,
+;;; the immutable header/options views.
+
+(test wasi/http-request-surface
+  (let ((req (http-request)))
+    (is (equal (cons "get" nil) (wasmdown.wasi:http-request-get-method req)))
+    (is (eq :ok (car (wasmdown.wasi:http-request-set-method
+                      req (cons "other" "PURGE")))))
+    (is (equal (cons "other" "PURGE")
+               (wasmdown.wasi:http-request-get-method req)))
+    (is (eq :err (car (wasmdown.wasi:http-request-set-method
+                       req (cons "other" "BAD METHOD")))))
+    (is (eq :ok (car (wasmdown.wasi:http-request-set-scheme
+                      req (cons :some (cons "HTTPS" nil))))))
+    (is (equal (cons :some (cons "HTTPS" nil))
+               (wasmdown.wasi:http-request-get-scheme req)))
+    (is (eq :err (car (wasmdown.wasi:http-request-set-scheme
+                       req (cons :some (cons "other" "1bad"))))))
+    (is (eq :ok (car (wasmdown.wasi:http-request-set-authority
+                      req (cons :some "example.test:8080")))))
+    (is (equal (cons :some "example.test:8080")
+               (wasmdown.wasi:http-request-get-authority req)))
+    (is (eq :err (car (wasmdown.wasi:http-request-set-authority
+                       req (cons :some "exa mple")))))
+    (is (eq :ok (car (wasmdown.wasi:http-request-set-path-with-query
+                      req (cons :some "/a/b?c=d")))))
+    (is (equal (cons :some "/a/b?c=d")
+               (wasmdown.wasi:http-request-get-path-with-query req)))
+    (is (eq :err (car (wasmdown.wasi:http-request-set-path-with-query
+                       req (cons :some "no-slash")))))
+    ;; the headers/options accessors hand out IMMUTABLE handles
+    (let ((h (third (wasmdown.wasi:http-request-get-headers req))))
+      (is (equal "immutable"
+                 (second (wasmdown.wasi:fields-set h "A" (list (list 49)))))))
+    (is (eq :none (wasmdown.wasi:http-request-get-options req)))
+    (let ((opt (wasmdown.wasi:make-wasi-http-options)))
+      (wasmdown.wasi:request-options-set-connect-timeout opt (cons :some 5))
+      (setf (wasmdown.wasi::wasi-http-request-options req) opt)
+      (let ((view (third (wasmdown.wasi:http-request-get-options req))))
+        (is (equal "immutable"
+                   (second (wasmdown.wasi:request-options-set-first-byte-timeout
+                            view (cons :some 5)))))))))
+
+(test wasi/http-request-options
+  (let ((o (wasmdown.wasi:make-wasi-http-options)))
+    (is (eq :none (wasmdown.wasi:request-options-get-connect-timeout o)))
+    (is (eq :none (wasmdown.wasi:request-options-get-first-byte-timeout o)))
+    (is (eq :none (wasmdown.wasi:request-options-get-between-bytes-timeout o)))
+    (is (eq :ok (car (wasmdown.wasi:request-options-set-connect-timeout
+                      o (cons :some 1000000)))))
+    (is (equal (cons :some 1000000)
+               (wasmdown.wasi:request-options-get-connect-timeout o)))
+    ;; a ZERO duration is not-supported (the WIT's request-options-error)
+    (is (equal '(:err "not-supported")
+               (wasmdown.wasi:request-options-set-first-byte-timeout
+                o (cons :some 0))))
+    (is (equal '(:err "not-supported")
+               (wasmdown.wasi:request-options-set-between-bytes-timeout o 0)))
+    ;; a clone is mutable even when the source was made immutable
+    (let ((im (third (wasmdown.wasi:request-options-clone o))))
+      (setf (wasmdown.wasi::wasi-http-options-mutable-p im) nil)
+      (is (equal "immutable"
+                 (second (wasmdown.wasi:request-options-set-connect-timeout
+                          im (cons :some 5)))))
+      (let ((c (third (wasmdown.wasi:request-options-clone im))))
+        (is (eq :ok (car (wasmdown.wasi:request-options-set-connect-timeout
+                          c (cons :some 7)))))
+        (is (equal (cons :some 7)
+                   (wasmdown.wasi:request-options-get-connect-timeout c)))))))
+
+(test wasi/http-response-surface
+  (let ((r (wasmdown.wasi::make-wasi-http-response
+            :headers (http-fields "A" (list 49)))))
+    (is (= 200 (wasmdown.wasi:http-response-get-status-code r)))
+    (is (eq :ok (car (wasmdown.wasi:http-response-set-status-code r 404))))
+    (is (= 404 (wasmdown.wasi:http-response-get-status-code r)))
+    (is (eq :err (car (wasmdown.wasi:http-response-set-status-code r 99))))
+    (is (equal '(("a" (49)))
+               (wasmdown.wasi:fields-copy-all
+                (third (wasmdown.wasi:http-response-get-headers r)))))))
+
+;;; ---------------------------------------------------------------
+;;; The loopback round trips: content-length and chunked+trailers.
+
+(test wasi/http-loopback-content-length
+  (with-http-server
+      (port
+       (format nil "HTTP/1.1 200 OK~c~cContent-Length: 5~c~cX-Reply: yes~c~c~c~chello"
+               #\Return #\Newline #\Return #\Newline #\Return #\Newline
+               #\Return #\Newline)
+       got)
+    (let* ((net (http-net))
+           (ctx (http-ctx :net net))
+           (req (http-request :port port :path "/hi?x=1"
+                              :headers (http-fields "x-test" (list 104))))
+           (res (wasmdown.wasi:http-client-send ctx req :network net)))
+      (is (eq :ok (car res)))
+      (let* ((resp (fourth res))
+             (head (car got)))
+        (is (= 200 (wasmdown.wasi:http-response-get-status-code resp)))
+        (is (equal '((121 101 115))
+                   (wasmdown.wasi:fields-get
+                    (wasmdown.wasi::wasi-http-response-headers resp) "x-reply")))
+        (multiple-value-bind (body future) (http-body-text resp)
+          (is (string= "hello" body))
+          (is (equal (cons :ok :none) future)))
+        (is (search "GET /hi?x=1 HTTP/1.1" head))
+        (is (search "x-test: h" head))
+        (is (search (format nil "Host: 127.0.0.1:~d" port) head))))))
+
+(test wasi/http-loopback-chunked-trailers
+  (with-http-server
+      (port
+       (format nil "HTTP/1.1 200 OK~c~cTransfer-Encoding: chunked~c~c~c~c2~c~cab~c~c2~c~ccd~c~c0~c~cX-Trail: t~c~c~c~c"
+               #\Return #\Newline #\Return #\Newline #\Return #\Newline
+               #\Return #\Newline #\Return #\Newline #\Return #\Newline
+               #\Return #\Newline #\Return #\Newline #\Return #\Newline
+               #\Return #\Newline #\Return #\Newline)
+       got)
+    (let* ((net (http-net))
+           (ctx (http-ctx :net net))
+           (req (http-request :port port))
+           (res (wasmdown.wasi:http-client-send ctx req :network net)))
+      (is (eq :ok (car res)))
+      (let ((resp (fourth res)))
+        (is (= 200 (wasmdown.wasi:http-response-get-status-code resp)))
+        (multiple-value-bind (body future) (http-body-text resp)
+          (is (string= "abcd" body))
+          ;; the trailers arrive only with the body's completion
+          (is (eq :ok (car future)))
+          (let ((opt (cdr future)))
+            (is (consp opt))
+            (is (eq :some (car opt)))
+            (let ((trailers (third (cdr opt))))
+              (is (equal '((116))
+                         (wasmdown.wasi:fields-get trailers "x-trail"))))))))))
+
+(test wasi/http-chunked-empty-trailer-section-is-none
+  ;; HTTP's empty trailer section (0\r\n\r\n) is the WIT's `none', not
+  ;; an empty Some(fields) — the upstream http-client-chunked contract.
+  (with-http-server
+      (port
+       (format nil "HTTP/1.1 200 OK~c~cTransfer-Encoding: chunked~c~c~c~c1~c~cx~c~c0~c~c~c~c"
+               #\Return #\Newline #\Return #\Newline #\Return #\Newline
+               #\Return #\Newline #\Return #\Newline #\Return #\Newline
+               #\Return #\Newline #\Return #\Newline)
+       got)
+    (let* ((net (http-net))
+           (ctx (http-ctx :net net))
+           (req (http-request :port port))
+           (res (wasmdown.wasi:http-client-send ctx req :network net)))
+      (is (eq :ok (car res)))
+      (multiple-value-bind (body future) (http-body-text (fourth res))
+        (is (string= "x" body))
+        (is (equal (cons :ok :none) future))))))
+
+(test wasi/http-send-future-reports-failed-transmission
+  ;; A send that never reaches the wire must settle request.new's
+  ;; transmission future with an error (upstream http-client-sent).
+  (let* ((net (http-net :outbound
+                        (list (wasmdown.wasi:make-wasi-endpoint
+                               :address '(10 9 9 9)))))
+         (ctx (http-ctx :net net))
+         (pair (wasmdown.wasi:http-request-new
+                (wasmdown.wasi:make-wasi-fields) :none :none :none))
+         (req (third (first pair)))
+         (future (second pair)))
+    (setf (wasmdown.wasi::wasi-http-request-authority req)
+          (cons :some "127.0.0.1:80")
+          (wasmdown.wasi::wasi-http-request-scheme req)
+          (cons :some (cons "HTTP" nil)))
+    (is (eq :err (car (wasmdown.wasi:http-client-send
+                       ctx req :network net))))
+    (let ((value (sock-future future)))
+      (is (consp value))
+      (is (eq :err (car value))))))
+
+;;; ---------------------------------------------------------------
+;;; The refusals: https-without-transport, the outbound/DNS policy,
+;;; and header injection.
+
+(test wasi/http-transport-refusals
+  ;; https without a registered TLS transport is configuration-error
+  (let* ((net (http-net))
+         (ctx (http-ctx :net net))
+         (req (http-request :port 443
+                            :scheme (cons :some (cons "HTTPS" nil)))))
+    (is (equal '("configuration-error")
+               (cdr (wasmdown.wasi:http-client-send ctx req :network net)))))
+  ;; an undeclared destination is destination-IP-prohibited
+  (let* ((net (http-net :outbound (list (wasmdown.wasi:make-wasi-endpoint
+                                          :address '(10 9 9 9)))))
+         (ctx (http-ctx :net net))
+         (req (http-request :port 80)))
+    (is (equal '("destination-IP-prohibited")
+               (cdr (wasmdown.wasi:http-client-send ctx req :network net)))))
+  ;; a DNS-denied host is HTTP-request-denied (no outbound traffic)
+  (let* ((net (http-net))
+         (ctx (http-ctx :net net))
+         (req (third (first (wasmdown.wasi:http-request-new
+                             (wasmdown.wasi:make-wasi-fields)
+                             :none :none :none)))))
+    (setf (wasmdown.wasi::wasi-http-request-authority req)
+          (cons :some "example.test:80"))
+    (is (equal '("HTTP-request-denied")
+               (cdr (wasmdown.wasi:http-client-send ctx req :network net)))))
+  ;; a fields value carrying CRLF can never be serialized (defence in
+  ;; depth behind the fields validation)
+  (let ((f (wasmdown.wasi:make-wasi-fields)))
+    (setf (wasmdown.wasi::wasi-fields-entries f)
+          (list (cons "X" (list 49 13 10 88))))
+    (is (handler-case
+            (progn (wasmdown.wasi::%http-serialize-request-head
+                    "GET" "/" "h" f '())
+                   nil)
+          (wasmdown.wasi:wasi-http-error (c)
+            (wasmdown.wasi:http-error-code
+             (wasmdown.wasi:wasi-http-error-code c)))))))
+
+;;; ---------------------------------------------------------------
+;;; THE PLUGGABLE TRANSPORT: an embedder-supplied in-memory transport
+;;; serves the request without any socket.
+
+(test wasi/http-pluggable-transport
+  (let* ((response
+           (map 'list #'char-code
+                 (format nil "HTTP/1.1 204 No Content~c~cX-Fake: 1~c~c~c~c"
+                         #\Return #\Newline #\Return #\Newline
+                         #\Return #\Newline)))
+         (written (list nil))
+         (read-state (list response 0))
+         (transport
+           (wasmdown.wasi:make-wasi-http-transport
+            :scheme "https" :tls-p t
+            :connect
+            (lambda (host port destination timeout)
+              (declare (ignore host port destination timeout))
+              (wasmdown.wasi:make-wasi-http-connection
+               :read-fn (lambda (max timeout)
+                          (declare (ignore timeout))
+                          (let* ((bytes (first read-state))
+                                 (pos (second read-state))
+                                 (n (min max (- (length bytes) pos))))
+                            (if (zerop n)
+                                (values nil :eof)
+                                (let ((chunk (subseq bytes pos (+ pos n))))
+                                  (incf (second read-state) n)
+                                  (values chunk :ok)))))
+               :write-fn (lambda (bytes)
+                           (setf (car written)
+                                 (append (car written) bytes))
+                           nil)
+               :close-fn (lambda () t)))))
+         (net (http-net))
+         (ctx (wasmdown.wasi:make-wasi-context
+                 :networks (list net)
+                 :http-transports (list transport)))
+         (req (http-request :port 443
+                            :scheme (cons :some (cons "HTTPS" nil)))))
+    (let ((res (wasmdown.wasi:http-client-send ctx req :network net)))
+      (is (eq :ok (car res)))
+      (let ((resp (fourth res)))
+        (is (= 204 (wasmdown.wasi:http-response-get-status-code resp)))
+        (is (equal '((49))
+                   (wasmdown.wasi:fields-get
+                    (wasmdown.wasi::wasi-http-response-headers resp) "x-fake")))
+        (multiple-value-bind (body future) (http-body-text resp)
+          (is (string= "" body))
+          (is (equal (cons :ok :none) future))))
+      ;; the bytes went through the EMBEDDER's write hook
+      (is (search "GET /x HTTP/1.1"
+                  (map 'string #'code-char (car written)))))))
+
+;;; ---------------------------------------------------------------
+;;; The provider surface.
+
+(test wasi/http-middleware-provider-surface
+  (let* ((ctx (http-ctx))
+         (prov (wasmdown.wasi:http-middleware-providers ctx nil))
+         (hname "wasi:http/handler@0.3.2"))
+    ;; the service imports plus the host-supplied handler survive
+    (is (assoc "wasi:http/types@0.3.2" prov :test #'string=))
+    (is (assoc "wasi:http/client@0.3.2" prov :test #'string=))
+    (let* ((hit (assoc hname prov :test #'string=))
+           (handle (and hit
+                        (wasmdown.wasi:provider-instance-function
+                         (cdr hit) "handle"))))
+      (is handle)
+      ;; no downstream handler: a well-formed internal-error result
+      (let ((out (funcall (wasmdown.component.runtime::lifted-func-host handle)
+                          (list :request))))
+        (is (and (consp out) (string= (car out) "internal-error"))))
+      ;; an embedder-supplied next handler is called for the request
+      (let ((prov (wasmdown.wasi:http-middleware-providers
+                   ctx (lambda (req) (declare (ignore req))
+                         (cons :ok :response))))
+            (handle (wasmdown.wasi:provider-instance-function
+                     (cdr (assoc hname
+                                 (wasmdown.wasi:http-middleware-providers
+                                  ctx (lambda (req) (cons :ok req)))
+                                 :test #'string=))
+                     "handle")))
+        (declare (ignore prov))
+        (let ((out (funcall
+                    (wasmdown.component.runtime::lifted-func-host handle)
+                    (list :request))))
+          (is (equal out (cons :ok :request))))))))
+
+(test wasi/http-provider-surface
+  (let* ((ctx (http-ctx))
+         (inst (wasmdown.wasi:http-types-instance ctx))
+         (prov (wasmdown.wasi:http-provider ctx)))
+    (dolist (name '("fields" "request" "request-options" "response"))
+      (is (eq :type (car (gethash name
+                                  (wasmdown.component.runtime:comp-instance-exports
+                                   inst))))))
+    (dolist (name '("[constructor]fields" "[static]fields.from-list"
+                    "[method]fields.get" "[method]fields.set"
+                    "[method]fields.delete" "[method]fields.get-and-delete"
+                    "[method]fields.append" "[method]fields.copy-all"
+                    "[method]fields.clone"
+                    "[static]request.new" "[method]request.get-method"
+                    "[method]request.set-method"
+                    "[method]request.set-authority"
+                    "[method]request.get-headers"
+                    "[method]request.get-options"
+                    "[static]request.consume-body"
+                    "[constructor]request-options"
+                    "[method]request-options.set-connect-timeout"
+                    "[method]request-options.clone"
+                    "[method]response.get-status-code"
+                    "[method]response.set-status-code"
+                    "[static]response.consume-body"))
+      (is (wasmdown.wasi:provider-instance-function inst name)))
+    (is (= 2 (length prov)))
+    (is (assoc "wasi:http/types@0.3.2" prov :test #'string=))
+    (is (assoc "wasi:http/client@0.3.2" prov :test #'string=))
+    ;; the constructor is callable through the lifted-func boundary
+    (let ((v (wasmdown.component.runtime:lifted-func-call
+              (wasmdown.wasi:provider-instance-function
+               inst "[constructor]fields"))))
+      (is (eq :own-handle (car v)))
+      (is (wasmdown.wasi:wasi-fields-p (third v))))))
+
+;;; ---------------------------------------------------------------
+;;; THE END-TO-END COMPONENT is DEFERRED.
+;;;
+;;; tests/http-client-component.wat is restored (the M16 slice-5
+;;; fixture: it imports wasi:http/types + client, builds a GET, sends
+;;; it, reads the status and the first body byte), but the component
+;;; leg does not run on the current tree. M17 step 5 added the
+;;; canonical `end.t == t' guard to %LIFT-ASYNC-END: the element type
+;;; recorded on a GUEST-authored end (`future.new' of a future whose
+;;; element names guest-defined types) is keyed in the guest's type
+;;; space, while the provider's lifted functype is keyed in the
+;;; provider's space; a composite element (the request trailer future
+;;; is `result<option<trailers>, error-code>') therefore cannot be
+;;; compared across the two spaces yet, and the fixture traps with
+;;; "stream or future element type mismatch" before request.new runs.
+;;; The host-side surface above (the fields/request/response
+;;; resources, client.send over the loopback, the pluggable transport,
+;;; the provider instances) is covered without a guest. Re-enabling
+;;; this leg belongs with the incoming service/handler wiring, where
+;;; the cross-space key question is decided.
+
+;;; ===============================================================
 ;;; M16 SLICE 6 — THE COMMAND WORLD, THE TERMINALS, THE RUNNER.
 ;;; ===============================================================
 
@@ -3712,13 +4275,20 @@ ok, and exports `run' (the runner's direct-export fallback)."
            ;; standard output; the guest arguments were plumbed
            (is (string= "hi" out)))
       (when (probe-file path) (delete-file path))))
-  ;; `--net` is a refused option (network is out of scope), so it is a
-  ;; usage error (2), not a malformed endpoint; a component run without
-  ;; `--wasi` but with guest args is likewise a usage error
+  ;; network options are accepted on the component path; a malformed
+  ;; endpoint is a host error (2), and a guest argument without --wasi
+  ;; is likewise a usage error
   (let ((path (%write-temp-bytes "tmp-cli-command2.wasm"
                                  (command-component-binary))))
     (unwind-protect
          (progn
+           (let ((out (with-output-to-string (s)
+                        (let ((*standard-output* s))
+                          (is (eql 0 (wasmdown.cli:main
+                                      (list "run" (namestring path) "--wasi"
+                                            "--net" "127.0.0.1:1"
+                                            "--listen" "*:*" "--dns" "*"))))))))
+             (is (string= "hi" out)))
            (is (eql 2 (wasmdown.cli:main
                        (list "run" (namestring path) "--wasi"
                              "--net" "nonsense"))))
@@ -5199,12 +5769,10 @@ world w {
       (is message)
       (is (search "bogus" message)))))
 
-(test wasi/world-provider-http-import-rejected-by-design
-  ;; `wasi:http' is not supported by this runtime (removed in M17). An
-  ;; http import is refused by its own rule at COMPOSITION time, with
-  ;; the canonical message — before the provider lookup, so it can
-  ;; never fall through as an unbound types-only import or as the
-  ;; generic "no provider" error.
+(test wasi/world-provider-http-import-composed
+  ;; `wasi:http/types' + `wasi:http/client' are served (M16 slice 5,
+  ;; restored): a world that declares them gets their providers from
+  ;; COMPOSE-WORLD-PROVIDERS, under the world's own import names.
   (let* ((ctx (wasmdown.wasi:make-wasi-context))
          (pkgs (wasmdown.wasi::%wasi-wit-packages))
          (pkg (wasmdown.wit:parse-wit-string
@@ -5212,31 +5780,32 @@ world w {
 
 world h {
   import wasi:http/types@0.3.2;
+  import wasi:http/client@0.3.2;
 }
 "))
-         (world (wasmdown.wit:resolve-wit-world pkg "h" :packages pkgs))
-         (message nil))
-    (is (equal '("wasi:http/types@0.3.2")
+         (world (wasmdown.wit:resolve-wit-world pkg "h" :packages pkgs)))
+    (is (equal '("wasi:http/types@0.3.2" "wasi:http/client@0.3.2")
                (mapcar #'wasmdown.wasi::%world-import-name
                        (wasmdown.wit:wit-world-imports world))))
-    (handler-case (wasmdown.wasi:compose-world-providers world ctx)
-      (wasmdown.wit:wit-error (c)
-        (setf message (wasmdown:wasmdown-error-message c))))
-    (is message)
-    (is (search "wasi:http is not supported by this runtime by design"
-                message))
-    ;; the dedicated refusal, not the generic unsupported-import path
-    (is (not (search "no provider" message)))
-    ;; and no wasi:http entry is ever bound by the command provider
+    (multiple-value-bind (providers unbound)
+        (wasmdown.wasi:compose-world-providers world ctx)
+      (is (null unbound))
+      (is (equal '("wasi:http/types@0.3.2" "wasi:http/client@0.3.2")
+                 (mapcar #'car providers)))
+      (dolist (pair providers)
+        (is (wasmdown.component.runtime:comp-instance-p (cdr pair)))))
+    ;; the pinned command world imports no http itself, so the plain
+    ;; command provider still binds none (a DECLARING component gets
+    ;; them from COMPONENT-COMMAND-PROVIDERS instead)
     (is (notany (lambda (name) (eql 0 (search "wasi:http" name)))
                 (mapcar #'car (wasmdown.wasi:command-provider ctx))))))
 
 ;;; -----------------------------------------------------------------
-;;; wasi:sockets is not a guest capability (user decision, 2026-11-02):
-;;; network communication (TCP, UDP, DNS) is out of scope, so a guest
-;;; may not DECLARE a `wasi:sockets' import. The sockets PROVIDER stays
-;;; in the runtime because the pinned 0.3.2 `command' world imports
-;;; sockets itself (composed, never declared by the guest).
+;;; wasi:sockets is a declared guest capability on the 0.3 line: a
+;;; component that declares `wasi:sockets/types' or
+;;; `wasi:sockets/ip-name-lookup' is bound to the same provider the
+;;; pinned command world uses, and every operation is still gated by
+;;; the explicit network authority in its context (no ambient access).
 
 (defun %synthetic-import-comp (&rest names)
   "A decoded-component stand-in declaring exactly NAMES as imports.
@@ -5254,46 +5823,26 @@ the payloads need no resolvable extern types."
                          :offset 0))
           'vector)))
 
-(test wasi/sockets-import-name-is-structural
-  ;; the namespace and package segments are matched structurally: any
-  ;; interface and any version counts, a lookalike does not.
-  (dolist (name '("wasi:sockets/types@0.3.2"
-                  "wasi:sockets/ip-name-lookup@0.3.2"
-                  "wasi:sockets/network@0.2.12"
-                  "wasi:sockets/types"))
-    (is (wasmdown.wasi::%wasi-sockets-import-name-p name)))
-  (dolist (name '("wasi:socketsx/types@0.3.2"
-                  "my:wasi:sockets/types@0.3.2"
-                  "wasi:socket/types@0.3.2"
-                  "wasi:clocks/system-clock@0.3.2"
-                  "wasi:sockets"
-                  "sockets:types"))
-    (is (not (wasmdown.wasi::%wasi-sockets-import-name-p name)))))
-
-(test wasi/component-sockets-declared-import-is-link-error
-  ;; a component asking for the 0.3 line that DECLARES a sockets import
-  ;; is refused from the declared import list, before composition, with
-  ;; the canonical message byte for byte — never the generic
-  ;; unsupported-import ("no provider") text.
-  (let ((ctx (wasmdown.wasi:make-wasi-context)))
+(test wasi/component-sockets-declared-imports-bind-providers
+  ;; a 0.3 component declaring a sockets interface composes without a
+  ;; refusal and gets that name bound to a real provider instance. The
+  ;; whole 0.3 command world is still the graph the path composes, so
+  ;; the check is that the declared names the guest can see are present
+  ;; and usable, not merely that an error is absent.
+  (let ((ctx (wasmdown.wasi:make-wasi-context
+              :networks (list (sock-network)))))
     (dolist (name '("wasi:sockets/types@0.3.2"
                     "wasi:sockets/ip-name-lookup@0.3.2"))
-      (let ((condition nil))
-        (handler-case
-            (progn (wasmdown.wasi:component-command-providers
-                    ctx (%synthetic-import-comp name))
-                   nil)
-          (wasmdown:link-error (c) (setf condition c)))
-        (is condition)
-        (is (string= (wasmdown:wasmdown-error-message condition)
-                     wasmdown.wasi::+wasi-sockets-unsupported-message+))
-        (is (not (search "no provider"
-                         (wasmdown:wasmdown-error-message condition))))))))
+      (let* ((providers (wasmdown.wasi:component-command-providers
+                         ctx (%synthetic-import-comp name)))
+             (provider (cdr (assoc name providers :test #'string=))))
+        (is provider)
+        (is (wasmdown.component.runtime:comp-instance-p provider))))))
 
 (test wasi/component-declared-sockets-check-does-not-overreach
   ;; positive control: a component declaring only `wasi:cli/exit@0.3.2'
   ;; still composes the command world; lookalike package names are not
-  ;; mistaken for `wasi:sockets'.
+  ;; mistaken for `wasi:sockets' declarations.
   (let* ((ctx (wasmdown.wasi:make-wasi-context))
          (expected (length (wasmdown.wasi:command-provider ctx))))
     (dolist (names '(("wasi:cli/exit@0.3.2")
@@ -5366,42 +5915,53 @@ the payloads need no resolvable extern types."
                  "wasi:random/random@0.3.2")
                (mapcar #'car providers)))))
 
-(test wasi/component-mixed-sockets-declared-import-still-refused
-  ;; Admission of the mixed graph does NOT admit a 0.3 sockets
-  ;; declaration: the canonical sockets refusal (never the mixed-line
-  ;; text, never a generic no-provider error) is raised from the 0.3
-  ;; subset, before any provider is built.
-  (let ((ctx (wasmdown.wasi:make-wasi-context)))
+(test wasi/component-mixed-sockets-declared-imports-bind-providers
+  ;; Admission of the mixed graph also admits a 0.3 sockets
+  ;; declaration: the 0.3 subset binds it through the sockets builder
+  ;; while the 0.2 import still comes from the P2 table, in declaration
+  ;; order, under one graph.
+  (let ((ctx (wasmdown.wasi:make-wasi-context
+              :networks (list (sock-network)))))
     (dolist (name '("wasi:sockets/types@0.3.2"
                     "wasi:sockets/ip-name-lookup@0.3.2"))
-      (let ((condition nil))
-        (handler-case
-            (progn (wasmdown.wasi:component-command-providers
-                    ctx (%synthetic-import-comp
-                         name "wasi:io/streams@0.2.9"))
-                   nil)
-          (wasmdown:link-error (c) (setf condition c)))
-        (is condition)
-        (is (string= (wasmdown:wasmdown-error-message condition)
-                     wasmdown.wasi::+wasi-sockets-unsupported-message+))))))
+      (let* ((providers (wasmdown.wasi:component-command-providers
+                         ctx (%synthetic-import-comp
+                              name "wasi:io/streams@0.2.9")))
+             (provider (cdr (assoc name providers :test #'string=))))
+        (is provider)
+        (is (wasmdown.component.runtime:comp-instance-p provider))
+        (is (equal (list name "wasi:io/streams@0.2.9")
+                   (mapcar #'car providers)))))))
 
-(test wasi/component-mixed-http-declared-import-still-refused
-  ;; wasi:http is refused at ANY line in a mixed component: the 0.3
-  ;; declaration by the composed graph's canonical http rule, and the
-  ;; 0.2 declaration by the P2 table's own exclusion.
+(test wasi/component-mixed-http-declared-import
+  ;; In a mixed component BOTH release lines compose their HTTP
+  ;; providers: 0.3 through the 0.3 builders, 0.2 through the P2
+  ;; outgoing table (types + outgoing-handler).
   (let ((ctx (wasmdown.wasi:make-wasi-context)))
-    (dolist (pair '(("wasi:http/types@0.3.2" "wasi:io/streams@0.2.9")
-                    ("wasi:http/types@0.2.12" "wasi:clocks/system-clock@0.3.2")))
-      (let ((message nil))
-        (handler-case
-            (progn (wasmdown.wasi:component-command-providers
-                    ctx (apply #'%synthetic-import-comp pair))
-                   nil)
-          (wasmdown.wit:wit-error (c)
-            (setf message (wasmdown:wasmdown-error-message c))))
-        (is message)
-        (is (string= wasmdown.wasi::+wasi-http-unsupported-message+ message))
-        (is (not (search "no provider" message)))))))
+    (let ((providers
+            (wasmdown.wasi:component-command-providers
+             ctx (%synthetic-import-comp "wasi:http/types@0.3.2"
+                                         "wasi:io/streams@0.2.9"))))
+      (is (equal '("wasi:http/types@0.3.2" "wasi:io/streams@0.2.9")
+                 (mapcar #'car providers)))
+      (is (wasmdown.component.runtime:comp-instance-p
+           (cdr (assoc "wasi:http/types@0.3.2" providers :test #'string=)))))
+    (let ((providers
+            (wasmdown.wasi:component-command-providers
+             ctx (%synthetic-import-comp "wasi:http/types@0.2.12"
+                                         "wasi:http/outgoing-handler@0.2.12"
+                                         "wasi:clocks/system-clock@0.3.2"))))
+      (is (equal '("wasi:http/types@0.2.12"
+                   "wasi:http/outgoing-handler@0.2.12"
+                   "wasi:clocks/system-clock@0.3.2")
+                 (mapcar #'car providers)))
+      (is (wasmdown.wasi:provider-instance-function
+           (cdr (assoc "wasi:http/types@0.2.12" providers :test #'string=))
+           "[constructor]fields"))
+      (is (wasmdown.wasi:provider-instance-function
+           (cdr (assoc "wasi:http/outgoing-handler@0.2.12" providers
+                       :test #'string=))
+           "handle")))))
 
 (test wasi/component-mixed-unstable-declared-import-still-refused
   ;; the 0.3 @unstable gate keeps applying to the 0.3 subset of a mixed
@@ -5514,55 +6074,101 @@ the payloads need no resolvable extern types."
                         ctx (%synthetic-import-comp name))))
         (is (equal expected (mapcar #'car providers)))))))
 
-(test wasi/cli-network-options-are-refused
-  ;; `--net'/`--listen'/`--dns' are refused as a USAGE error carrying
-  ;; the canonical message WHILE PARSING: the input file is never
-  ;; opened and no network authority can be built.
-  (let ((missing "tmp-cli-network-absent.wasm"))
-    (is (not (probe-file missing)))
-    (dolist (tokens '(("--net" "127.0.0.1:1")
-                      ("--listen" "0.0.0.0:0")
-                      ("--dns" "*")))
-      (let ((stderr (with-output-to-string (s)
-                      (let ((*error-output* s))
-                        (is (eql 2 (wasmdown.cli:main
-                                    (append (list "run" missing "--wasi")
-                                            tokens))))))))
-        (is (search wasmdown.wasi::+wasi-sockets-unsupported-message+
-                    stderr))
-        (is (not (search "no provider" stderr)))))
-    ;; the usage-error's own message is the canonical text, exactly
+(test wasi/cli-network-options-parse-into-authority
+  ;; `--net'/`--listen'/`--dns' parse in command-line order and become
+  ;; the context's ONE explicit network authority. A destination the
+  ;; command line did not declare is denied — the policy is not widened
+  ;; by parsing a sibling endpoint.
+  (multiple-value-bind (file invokes options guest-args)
+      (wasmdown.cli::%parse-run-args
+       (list "app.wasm" "--wasi" "--net" "127.0.0.1:8080"
+             "--listen" "*:*" "--dns" "*" "guest-arg"))
+    (declare (ignore invokes))
+    (is (string= "app.wasm" file))
+    (is (equal '("guest-arg") guest-args))
+    (is (equal '(("--wasi" . t)
+                 ("--net" . "127.0.0.1:8080")
+                 ("--listen" . "*:*")
+                 ("--dns" . "*"))
+               options))
+    (multiple-value-bind (context reactor)
+        (wasmdown.cli::%component-context options guest-args file)
+      (unwind-protect
+           (let ((networks (wasmdown.wasi:wasi-context-networks context))
+                 (net (first (wasmdown.wasi:wasi-context-networks context))))
+             (is (= 1 (length networks)))
+             (is net)
+             ;; the declared outbound endpoint is allowed ...
+             (is (wasmdown.wasi:wasi-network-allows-outbound-p
+                  net :ipv4 '(127 0 0 1) 8080))
+             ;; ... while an undeclared port or host is denied
+             (is (not (wasmdown.wasi:wasi-network-allows-outbound-p
+                       net :ipv4 '(127 0 0 1) 8081)))
+             (is (not (wasmdown.wasi:wasi-network-allows-outbound-p
+                       net :ipv4 '(127 0 0 2) 8080)))
+             ;; `*:*' listen and `*' DNS are the explicit grants given
+             (is (wasmdown.wasi:wasi-network-allows-listen-p
+                  net :ipv4 '(0 0 0 0) 0))
+             (is (wasmdown.wasi:wasi-network-allows-dns-p
+                  net "anything.test")))
+        (when reactor (ignore-errors (wasmdown.wasi:reactor-close reactor)))))))
+
+(test wasi/cli-network-options-default-and-errors
+  ;; with no network option the context carries NO authority (deny-all),
+  ;; and --dir/--env keep their behavior
+  (multiple-value-bind (file invokes options guest-args)
+      (wasmdown.cli::%parse-run-args
+       (list "app.wasm" "--wasi" "--env" "HOME=/tmp" "--dir" "/tmp"
+             "guest-arg"))
+    (declare (ignore invokes))
+    (multiple-value-bind (context reactor)
+        (wasmdown.cli::%component-context options guest-args file)
+      (unwind-protect
+           (progn
+             (is (null (wasmdown.wasi:wasi-context-networks context)))
+             (is (equal '("HOME=/tmp")
+                        (mapcar (lambda (pair)
+                                  (format nil "~a=~a"
+                                          (car pair) (cdr pair)))
+                                (wasmdown.wasi:wasi-context-environment
+                                 context))))
+             (is (plusp (length (wasmdown.wasi:wasi-context-preopens
+                                 context)))))
+        (dolist (preopen (wasmdown.wasi:wasi-context-preopens context))
+          (ignore-errors (wasmdown.wasi:close-wasi-preopen preopen)))
+        (when reactor (ignore-errors (wasmdown.wasi:reactor-close reactor))))))
+  ;; a missing option value is a usage error at parse time
+  (handler-case
+      (progn (wasmdown.cli::%parse-run-args
+              (list "run" "app.wasm" "--wasi" "--net"))
+             (is nil "missing --net value was accepted"))
+    (wasmdown.cli::usage-error () t))
+  ;; network options without --wasi are a usage error
+  (multiple-value-bind (file invokes options guest-args)
+      (wasmdown.cli::%parse-run-args
+       (list "app.wasm" "--net" "127.0.0.1:1"))
+    (declare (ignore invokes))
     (handler-case
-        (wasmdown.cli::%parse-run-args
-         (list "run" missing "--wasi" "--net" "127.0.0.1:1"))
-      (wasmdown.cli::usage-error (c)
-        (is (string= wasmdown.wasi::+wasi-sockets-unsupported-message+
-                     (wasmdown.cli::usage-error-message c)))))
-    ;; --dir/--env/--wasi keep their behavior: they parse, and the
-    ;; capability context carries no network authority
-    (multiple-value-bind (file invokes options guest-args)
-        (wasmdown.cli::%parse-run-args
-         (list "app.wasm" "--wasi" "--env" "HOME=/tmp" "--dir" "/tmp"
-               "guest-arg"))
-      (declare (ignore invokes))
-      (is (string= "app.wasm" file))
-      (is (equal '("guest-arg") guest-args))
-      (multiple-value-bind (context reactor)
-          (wasmdown.cli::%component-context options guest-args file)
-        (unwind-protect
-             (progn
-               (is (null (wasmdown.wasi:wasi-context-networks context)))
-               (is (equal '("HOME=/tmp")
-                          (mapcar (lambda (pair)
-                                    (format nil "~a=~a"
-                                            (car pair) (cdr pair)))
-                                  (wasmdown.wasi:wasi-context-environment
-                                   context))))
-               (is (plusp (length (wasmdown.wasi:wasi-context-preopens
-                                   context)))))
-          (dolist (preopen (wasmdown.wasi:wasi-context-preopens context))
-            (ignore-errors (wasmdown.wasi:close-wasi-preopen preopen)))
-          (when reactor (ignore-errors (wasmdown.wasi:reactor-close reactor))))))))
+        (progn (wasmdown.cli::%component-context options guest-args file)
+               (is nil "network options without --wasi were accepted"))
+      (wasmdown.cli::usage-error () t)))
+  ;; a malformed endpoint is rejected while the authority is built
+  (multiple-value-bind (file invokes options guest-args)
+      (wasmdown.cli::%parse-run-args
+       (list "app.wasm" "--wasi" "--net" "nonsense"))
+    (declare (ignore invokes))
+    (handler-case
+        (progn (wasmdown.cli::%component-context options guest-args file)
+               (is nil "malformed endpoint was accepted"))
+      (wasmdown:host-error () t))))
+
+(test wasi/cli-help-documents-network-options
+  (let ((help (with-output-to-string (s)
+                (wasmdown.cli::%usage s))))
+    (is (search "--net HOST:PORT" help))
+    (is (search "--listen ADDR:PORT" help))
+    (is (search "--dns NAME" help))
+    (is (not (search "refused" help)))))
 
 ;;; -----------------------------------------------------------------
 ;;; Backend evidence for a command component (M9): the nested core the

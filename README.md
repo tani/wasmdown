@@ -5,7 +5,7 @@ validation, a reference interpreter, an SBCL-compiling backend, the
 Component Model (canonical ABI, resources, async), and WASI hosts — with
 **no third-party Lisp dependencies**.
 
-> **Status: `partial`.** Every subsystem listed below is implemented and
+> **Status: engine/legacy `partial`; declared WASI 0.3.2 profile `conformant`.** Every subsystem listed below is implemented and
 > gated by its own test lane; the engine deliberately omits threads/atomics,
 > the FASL cache, and a native optimizer. See [`docs/status.md`](docs/status.md)
 > for the per-area matrix and the exact limits.
@@ -20,10 +20,11 @@ Component Model (canonical ABI, resources, async), and WASI hosts — with
 | Interpreter (default backend) | Full: exact i32/i64/f32/f64 semantics, v128, GC, EH, tail calls, multi-memory, memory64 |
 | Compiled backend | Full for opcode coverage: SBCL `COMPILE` of emitted Lisp, including SIMD, GC, EH and `return_call*`; every pinned core command and component command agrees with the interpreter |
 | Component Model | Full lane green: binary + text, validation, instantiation/linking, canonical ABI, resources, async scheduling |
-| WASI Preview 1 | Full legacy `wasi_snapshot_preview1` surface (46 imports; the `sock_*` imports are legacy ABI only — networking is excluded) |
-| WASI 0.3.2 providers | `clocks`, `random`, `cli`, `filesystem` under an explicit capability model (`wasi:http` and `wasi:sockets` excluded by design) |
-| WASI 0.2 component facade | 27 of 31 stable interfaces bound at exact release names |
-| Network communication (TCP/UDP/DNS), `wasi:http` | Out of scope: no guest-visible provider; component imports are refused |
+| WASI Preview 1 | Full legacy `wasi_snapshot_preview1` surface (46 imports, `sock_*` included; upstream P1 subset 72/72) |
+| WASI 0.3.2 providers | `clocks`, `random`, `cli`, `filesystem`, `sockets` and `http` under an explicit capability model |
+| WASI 0.2 component facade | 29 of 31 stable interfaces bound at exact release names (legacy compatibility line) |
+| WASI network | TCP/UDP/DNS via `wasi:sockets/types` + `ip-name-lookup` under declared `--net`/`--listen`/`--dns` authority; upstream network subset 30/30 |
+| `wasi:http` | 0.3.2 `types` + `client.send` (streaming uploads, chunked trailers) and incoming `handler`/`service` via `wasmdown serve`; 0.2.0–0.2.12 outgoing `types` + `outgoing-handler` and incoming `incoming-handler` (proxy world) via the same `serve`; TLS is embedder-only |
 | Threads / atomics, FASL cache, optimized or AOT backend | Not implemented |
 | Annotations proposal | Out of scope |
 
@@ -84,11 +85,13 @@ outermost trap boundary.
 
 ## Quick start
 
-Requires **SBCL** (developed against 2.6.4); Python 3 only for the WASI
-behaviour lane, Nix only to rebuild the pinned WASI fixtures.
+Requires **SBCL** (developed against 2.6.4); Python 3 for the WASI behaviour
+and network lanes (`git`/`curl` fetch the pinned network-test checkout and
+reference Wasmtime via `tools/setup-network-tests.sh`), Nix only to rebuild
+the pinned WASI fixtures.
 
 ```sh
-make test-unit                  # unit + integration suite (694 tests, ~8 s)
+make test-unit                  # unit + integration suite (739 tests, ~8 s)
 sbcl --script tools/wasmdown.lisp help
 ```
 
@@ -109,6 +112,26 @@ printf 'SELECT 6*7;\n' | sbcl --script tools/wasmdown.lisp run \
 # 42
 ```
 
+Declare network authority only when the guest needs it (`--net` outbound,
+`--listen` bind, `--dns` resolution; repeatable, `*` allowed). With none
+declared, every socket operation is refused:
+
+```sh
+sbcl --script tools/wasmdown.lisp run net-guest.wasm \
+  --wasi --net 127.0.0.1:8080 --dns example.test
+```
+
+Serve a `wasi:http/service` component; the URL is the first stderr line:
+
+```sh
+sbcl --script tools/wasmdown.lisp serve service.wasm --wasi --addr 127.0.0.1:8080
+# http://127.0.0.1:8080
+```
+
+`--http-transport` is embedder-only: the CLI serves plain `http` over its
+built-in TCP transport, and an embedder registers a TLS transport
+(`:http-transports`) on the `wasi-context`.
+
 From Lisp:
 
 ```commonlisp
@@ -124,14 +147,15 @@ Every lane is measured, not asserted. Latest numbers (2026-11-02):
 
 | Lane | Kind | Measured | Docs |
 | --- | --- | --- | --- |
-| `make test-unit` | gate | 694 pass / 0 fail | — |
+| `make test-unit` | gate | 739 pass / 0 fail | — |
 | `make test-spec-core` | baseline | 21 187 pass / 0 fail / 73 unsupported of 21 260 | [`core.md`](docs/conformance/core.md) |
 | `make test-component` | gate | 1 702 pass / 0 fail / 0 unsupported | [`component.md`](docs/conformance/component.md) |
 | `make report-component-compiled` | report | 1 702 pass / 0 fail under `:compiled` | `tests/component-compiled/component.md` |
 | `make test-backend-parity` | gate | 21 260 / 21 260 core commands agree across both backends | [`backends.md`](docs/conformance/backends.md) |
 | `make test-wasi` | gate | 450/450 cases over 30 fresh-process runs | [`wasi.md`](docs/conformance/wasi.md) |
 | `make test-wasi-preview3` | gate (explicit) | 10 hand-authored 0.3.2 guests (incl. random, clock deadline, cli stdin/env/stderr/terminal, filesystem preopens/read/write/directory/errors) × 3 repeats (30/30), both backends | — |
-| Network communication (TCP/UDP/DNS) | excluded | not verified, not claimed: component imports are refused at link time; the canonical message is in [`specs/wasi/MANIFEST.md`](specs/wasi/MANIFEST.md) | — |
+| `make test-wasi-upstream` | evidence | 127 pass / 0 fail / 0 skip at pinned `9d84631e`, HTTP and sockets included | [`tests/wasi-upstream-summary.md`](tests/wasi-upstream-summary.md) |
+| `make test-wasi-network` | evidence | 30/30 HTTP + sockets subset (after `tools/setup-network-tests.sh`); Wasmtime reference smoke 28/30, report-only | — |
 | `make test-property` | gate | 2 000 generated modules, both backends agree | — |
 | `make test-upstream` | discovery | aggregated proposal corpus, never a gate | [`upstream.md`](docs/conformance/upstream.md) |
 | `make report-backends-bench` | report | per-backend cost medians | [`performance.md`](docs/conformance/performance.md) |

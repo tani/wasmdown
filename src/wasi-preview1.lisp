@@ -1811,14 +1811,24 @@ from the rights the guest asked for on the new descriptor."
       +p1-success+)))
 
 (%p1-fn %p1-sock-shutdown (state fd how)
-  (let ((entry (%p1-require (%p1-lookup-fd state fd) +p1-right-sock-shutdown+)))
+  ;; POSIX shutdown(2) on a non-socket must report ENOTSOCK even though
+  ;; the fd has no socket rights (the upstream C suite asserts this for
+  ;; STDOUT_FILENO). Only a real socket goes through the rights gate.
+  (let* ((entry (%p1-lookup-fd state fd))
+         (host (p1-fd-fd entry))
+         ;; the guest-visible filetype is authoritative: stdio slots are
+         ;; character devices behind a CL stream and may have no host fd
+         (socket-p (= (p1-fd-filetype entry) +p1-file-socket-stream+)))
     (unless (logtest how (logior +p1-sdflag-rd+ +p1-sdflag-wr+))
       (%p1-abort +p1-inval+))
     (when (logtest how (lognot 3)) (%p1-abort +p1-inval+))
-    (let ((host (cond ((= how 1) +shut-rd+)
-                      ((= how 2) +shut-wr+)
-                      (t 2))))
-      (%p1-check (%libc-shutdown (p1-fd-fd entry) host))
+    (let ((direction (cond ((= how 1) +shut-rd+)
+                           ((= how 2) +shut-wr+)
+                           (t 2))))
+      (unless socket-p
+        (%p1-abort +p1-notsock+))
+      (%p1-require entry +p1-right-sock-shutdown+)
+      (%p1-check (%libc-shutdown host direction))
       +p1-success+)))
 
 ;;; ---- poll_oneoff

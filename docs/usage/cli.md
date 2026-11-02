@@ -16,9 +16,11 @@ commands:
     compile <file.wasm> --emit-lisp <out.lisp>
     run <file> [--invoke <name> <int> ...]
     run <component> --wasi [--dir HOST[::GUEST]]
-          [--env K=V] [arg ...]
-    (the network options --net/--listen/--dns are refused: network
-     communication is out of scope by design)
+          [--env K=V] [--net HOST:PORT] [--listen ADDR:PORT]
+          [--dns NAME] [arg ...]
+    serve <component> --wasi [--addr HOST:PORT]
+          [--dir HOST[::GUEST]] [--env K=V] [--net HOST:PORT]
+          [--listen ADDR:PORT] [--dns NAME]
     help
 exit codes: 0 ok, 1 guest/compile error, 2 usage error
 ```
@@ -31,6 +33,7 @@ exit codes: 0 ok, 1 guest/compile error, 2 usage error
 | `inspect` | exactly one file | Validates, then prints counts, import/export signatures, memory and table limits, start index, and the `module-features` keyword list. |
 | `compile` | one file and `--emit-lisp <out.lisp>` | Validates, instantiates, and runs the code generator, writing Lisp source. A module with no defined functions is refused. |
 | `run` | one file | Executes a core module or a component; grammar below. |
+| `serve` | one component and `--wasi` | Instantiates a `wasi:http/service` component, prints `http://HOST:PORT` as the first stderr line, and answers HTTP/1.1 requests until SIGINT. |
 | `help` | nothing | Usage on stdout, exit 0. No arguments at all also prints usage, but exits 2. |
 
 `validate`, `inspect`, and `compile` write results to stdout, diagnostics
@@ -48,19 +51,19 @@ driven through the WASI command runner, a core module through
 | `--wasi` | Grant the WASI capability set: process streams, guest arguments, and the flags below. |
 | `--dir HOST[::GUEST][:ro]` | Preopen a host directory; `GUEST` defaults to `HOST`. `:ro` grants a read-only root (creation, writing, mutation denied). |
 | `--env K=V` | One environment variable. |
-| `--net` / `--listen` / `--dns` | **Refused (usage error).** Network communication (TCP, UDP and DNS) is out of scope by design; there is no `wasi:sockets` provider for guests and no network authority is ever built. The canonical message is printed by `help` and on refusal. |
+| `--net HOST:PORT` | Declare one outbound endpoint the guest may reach. `HOST` is `*` (any) or a dotted-quad IPv4 address; `PORT` is `*` (any) or 0–65535. Repeatable; undeclared destinations are denied. |
+| `--listen ADDR:PORT` | Declare one address the guest may bind/listen on, same grammar as `--net`. Repeatable. |
+| `--dns NAME` | Allow one DNS name (case-insensitive; `*.suffix`/`**.suffix` wildcards match a suffix). `--dns '*'` allows every name. Repeatable. |
 | `--` | Ends option parsing; every later token reaches the guest unchanged, including dash-prefixed ones. |
 
-The network options are recognised only to refuse them with this exact
-message:
-
-```
-Network communication (TCP, UDP and DNS) is not supported by this design; there is no wasi:sockets provider for guests. See docs/usage/wasi.md and specs/wasi/MANIFEST.md.
-```
-
-It is a permanent, deliberate exclusion, not a pending interface; the
-declaration lives in `specs/wasi/MANIFEST.md` ("Network communication:
-wasi:sockets (excluded)").
+Network authority is declared, never ambient: with no `--net`/`--listen`/
+`--dns` the context carries no network at all and every socket operation is
+refused. A guest that declares `wasi:sockets/types` or
+`wasi:sockets/ip-name-lookup` is bound to the runtime's sockets providers,
+but each bind, connect, send and resolve still consults the declared
+endpoints and DNS policy. A malformed endpoint is a usage/host error before
+any authority object is built; with `--wasi` absent the network options are
+usage errors.
 
 Positional tokens after the file become guest arguments **only** with
 `--wasi`; `argv[0]` is the input file's **file name** (basename, the POSIX
@@ -70,11 +73,31 @@ a guest invoked as `/path/to/cli-env.wasm`. The parser refuses, as
 usage errors: any capability flag or guest argument without `--wasi`,
 `--invoke` on a component, `--invoke` together with a `--wasi` core
 run (which runs `_start` once), guest arguments for a plain core
-module, and any unknown option — this runtime has no `wasi:http`
-provider, so there is no transport option either.
+module, and any unknown option.
+
+HTTP needs no extra CLI flag: a component that declares `wasi:http/types`
+and `wasi:http/client` gets those providers, and a plain `http` request
+rides the built-in TCP transport. `--http-transport` is refused because
+transports are embedder-only — configure `:http-transports` on the
+`wasi-context`; an `https` request without one is the WIT's
+`configuration-error`, never a plaintext fallback.
 
 A WASI run's preopen handles belong to the invocation; the CLI closes
 them after every run, success or not.
+
+## `serve`
+
+```sh
+sbcl --script tools/wasmdown.lisp serve service.wasm --wasi --addr 127.0.0.1:8080
+```
+
+`serve` takes the same capability flags as `run` apart from `--invoke`
+(refused: a service is a component, and the exported `wasi:http/handler`
+is the entry point). `--addr` defaults to `127.0.0.1:0`, so the printed URL
+carries the kernel-assigned port. The URL is written to stderr **before**
+the listener answers anything, then requests are served serially through the
+guest handler until SIGINT. A component exporting no handler is a
+`link-error` (exit 1). `--http-transport` is refused here as well.
 
 ## Backend selection
 
@@ -139,6 +162,21 @@ A component with a writable directory and an environment variable:
 ```sh
 sbcl --script tools/wasmdown.lisp run app.wasm \
   --wasi --dir .::/work --env HOME=/work -- /work/db.sqlite
+```
+
+Serve a `wasi:http/service` component (the URL is the first stderr line):
+
+```sh
+sbcl --script tools/wasmdown.lisp serve service.wasm \
+  --wasi --addr 127.0.0.1:8080 --dir .::/work
+# stderr: http://127.0.0.1:8080
+```
+
+A guest that needs the network declares exactly the endpoints it may reach:
+
+```sh
+sbcl --script tools/wasmdown.lisp run net-guest.wasm \
+  --wasi --net 127.0.0.1:8080 --listen 127.0.0.1:9090 --dns '*.example.test'
 ```
 
 Capabilities and what is refused: [`wasi.md`](wasi.md). Error classes

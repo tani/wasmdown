@@ -422,6 +422,7 @@
    #:wasi-context-stderr
    #:wasi-context-preopens
    #:wasi-context-networks
+   #:wasi-context-http-transports
    #:wasi-context-reactor
    #:wasi-context-closed-p
    #:close-wasi-context
@@ -489,6 +490,33 @@
    #:p2-network-instance
    #:p2-instance-network-instance
    #:p2-ip-name-lookup-instance
+   ;; wasi:http@0.2 — the outgoing import surface and world graphs
+   #:p2-http-package
+   #:p2-http-resource-ct
+   #:p2-http-types-instance
+   #:p2-http-outgoing-handler-instance
+   #:p2-http-handle
+   #:p2-http-world
+   #:preview2-proxy-world
+   #:preview2-http-imports-world
+   #:preview2-world-provider
+   #:preview2-proxy-provider
+   #:preview2-http-imports-provider
+   ;; wasi:http/incoming-handler@0.2 — the serve side
+   #:preview2-serve-p
+   #:preview2-serve-providers
+   #:p2-incoming-handler-export
+   #:serve-preview2-component
+   ;; incoming-handler-side construction helpers (no handler provider yet)
+   #:make-p2-http-incoming-request
+   #:make-p2-http-response-outparam
+   #:p2-http-incoming-request
+   #:p2-http-outgoing-response
+   #:p2-http-outgoing-body-body-bytes
+   #:p2-http-outgoing-body-written
+   #:p2-http-outgoing-body-trailers
+   #:p2-http-outgoing-body-finished-p
+   #:p2-http-response-outparam-set-fn
    ;; clocks
    #:monotonic-now
    #:monotonic-resolution
@@ -596,6 +624,78 @@
    #:sockets-provider
    #:ip-socket-address->sockaddr
    #:sockaddr->ip-socket-address
+   ;; http (M16 slice 5, restored): the types resources + client.send
+   ;; over a pluggable transport
+   #:wasi-fields
+   #:wasi-fields-p
+   #:make-wasi-fields
+   #:wasi-http-request
+   #:wasi-http-request-p
+   #:wasi-http-response
+   #:wasi-http-response-p
+   #:wasi-http-options
+   #:wasi-http-options-p
+   #:make-wasi-http-options
+   #:wasi-http-transport
+   #:wasi-http-transport-p
+   #:make-wasi-http-transport
+   #:wasi-http-transport-scheme
+   #:wasi-http-transport-connect
+   #:wasi-http-connection
+   #:wasi-http-connection-p
+   #:make-wasi-http-connection
+   #:wasi-http-error
+   #:wasi-http-error-code
+   #:http-error-code
+   #:http-resource-ct
+   #:fields-constructor
+   #:fields-from-list
+   #:fields-get
+   #:fields-has
+   #:fields-set
+   #:fields-delete
+   #:fields-get-and-delete
+   #:fields-append
+   #:fields-copy-all
+   #:fields-clone
+   #:request-options-constructor
+   #:request-options-get-connect-timeout
+   #:request-options-set-connect-timeout
+   #:request-options-get-first-byte-timeout
+   #:request-options-set-first-byte-timeout
+   #:request-options-get-between-bytes-timeout
+   #:request-options-set-between-bytes-timeout
+   #:request-options-clone
+   #:http-request-new
+   #:http-request-get-method
+   #:http-request-set-method
+   #:http-request-get-path-with-query
+   #:http-request-set-path-with-query
+   #:http-request-get-scheme
+   #:http-request-set-scheme
+   #:http-request-get-authority
+   #:http-request-set-authority
+   #:http-request-get-options
+   #:http-request-get-headers
+   #:http-request-consume-body
+   #:http-response-new
+   #:http-response-get-status-code
+   #:http-response-set-status-code
+   #:http-response-get-headers
+   #:http-response-consume-body
+   #:http-client-send
+   #:http-types-instance
+   ;; http (M16 slice 6): the INCOMING service world
+   #:http-service-world
+   #:http-service-providers
+   #:http-handler-provider-instance
+   #:http-middleware-providers
+   #:serve-component-providers
+   #:component-handler-export
+   #:parse-serve-address
+   #:serve-component
+   #:http-client-instance
+   #:http-provider
    ;; reactor backend (plan step 6): poll(2) + the monotonic clock +
    ;; the self-pipe wake channel, with injectable time/readiness
    #:wasi-reactor

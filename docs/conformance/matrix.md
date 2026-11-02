@@ -15,20 +15,25 @@ links are generated.
 | WASI Preview 1 acceptance (in-memory and on-disk SQLite) | 14/14 checks pass | 14/14 checks pass: smoke, persistence (two processes), reopen, rollback, bail, no-preopen, read-only, escape — 821 s of compile-heavy wall time. The lane asserts exact stdout/status per case, so both backends meet identical expectations | `tools/wasi-preview1-acceptance.py [--backend compiled]` |
 | WASI 0.2 behaviour lane (11 cases) | 11/11 pass | 11/11 pass (11 x ~200 s compile wall time). Each case's manifest entry asserts exact stdout bytes and exact status, so both backends satisfy the SAME byte-level expectations — stronger than a post-hoc sha diff. Per-case records live under `tests/wasi-results/` (`latest/` for interpret, the compiled run's `--output-dir`), distinguished by the `backend` field | `tools/run-wasi-suite.py --abi preview2 [--backend compiled]` |
 | WASI 0.3.2 providers | unit/provider pins, component async suite | same providers; component suite green under `:compiled` | [`inventory.md`](inventory.md), `tests/wasi*.lisp` |
-| Upstream `wasi-testsuite` (pinned `9d84631e`, 127 precompiled guests) | **green**: 95 pass / 0 fail / 32 declared skips. `wasm32-wasip3`: 25 pass / 0 fail / 30 skips — a component that declares BOTH release lines is admitted by composing its 0.3-line declared imports from the 0.3 command builders with its exact-version 0.2 imports from the P2 tables (HTTP, 0.3 sockets and `@unstable` still refused; no provider invented). `wasm32-wasip1`: 70 pass / 0 fail / 2 skips (AssemblyScript 12, C 12, Rust 46) | not measured; the adapter runs the CLI's default backend, and the admitted tests exercise host providers, not codegen | `tests/wasi-upstream-summary.md`, `tests/wasi-upstream-results.json`, `make test-wasi-upstream` (checkout not vendored) |
-| `wasm32-wasip1` declared profile (non-network) | Same measured lane above: 70 pass / 0 fail / 2 declared skips; the four legacy `sock_*` imports stay outside the declared profile, so the two `sock_shutdown-*` C tests are declared skips | same | `tests/wasi-upstream-expectations.toml` (generated), `docs/status.md` |
+| Upstream `wasi-testsuite` (pinned `9d84631e`, 127 precompiled guests) | **green: 127 pass / 0 fail / 0 skip.** `wasm32-wasip3`: 55 pass / 0 fail / 0 skip — a component that declares BOTH release lines is admitted by composing its 0.3-line declared imports from the 0.3 command builders with its exact-version 0.2 imports from the P2 tables (HTTP and 0.3 sockets admitted; `@unstable` still gated; no provider invented). `wasm32-wasip1`: 72 pass / 0 fail / 0 skip (AssemblyScript 12, C 14, Rust 46) | not measured; the adapter runs the CLI's default backend, and the admitted tests exercise host providers, not codegen | `tests/wasi-upstream-summary.md`, `tests/wasi-upstream-results.json`, `make test-wasi-upstream` (checkout not vendored) |
+| `wasm32-wasip1` declared profile (46 imports incl. legacy `sock_*`) | Same measured lane above: 72 pass / 0 fail / 0 skip; the two `sock_shutdown-*` C tests pass after the ENOTSOCK-from-filetype fix | same | `tests/wasi-upstream-results.json`, `docs/status.md` |
+| Upstream network subset (`http` + `sockets` proposals) | **30/30** through `tools/run-wasi-network-tests.py` (`tools/setup-network-tests.sh` then `make test-wasi-network`); the same subset through upstream Wasmtime is a 28/30 report-only smoke (two known Wasmtime-50 failures) | same adapter/CLI default backend | stdout summary from the runner, `make test-wasi-network`, `make test-wasi-network-reference` |
 | Async property lane (task/subtask, stream/future/cancel, host-pending) | 14,071 checks / 0 failures over 8 fixed seeds x3 (`make test-async-property`); negative control detects an injected double delivery (`make test-async-property-negative`) | same host-side lane (backend-independent: the scheduler/executor is shared by both guest backends) | stdout; `tests/async-property.lisp` |
 | Blocked-stdio / DNS executor audit | fixed 2-worker budgets, worker-only execution and affinity, max active <= budget, close drops queued jobs and refuses new submissions without joining, `close-wasi-context` rejects/detaches; guest stdio green in both backends | same (host-side) | `tests/async-property.lisp`, `tests/wasi.lisp`; P3 lanes |
-| 0.3.2 sockets provider (internal composition only) | unit pins incl. `wasi/e2e-tcp-echo-component` PASS | same test binary, host listener + echo thread | `make test-unit`; `tests/wasi.lisp` |
+| 0.3.2 sockets provider (`types` + `ip-name-lookup`) | Supported under the declared `wasi-network` authority; upstream network subset green (30/30), unit pins incl. `wasi/e2e-tcp-echo-component` PASS | same test binary, host listener + echo thread | `make test-unit`; `tests/wasi.lisp`; `make test-wasi-network` |
+| 0.3.2 HTTP (`types` + `client`; `handler`/`service`) | Supported: outgoing `client.send` over HTTP/1.1 plus the incoming handler served by `wasmdown serve`; upstream HTTP cases are part of the 127/0/0 lane. TLS is embedder-only (`:http-transports`); `middleware` host-supplied-next composition is unit-pinned (no upstream fixture) | same host-side providers | `make test-wasi-upstream`; `make test-wasi-network`; `tests/wasi.lisp` |
+| 0.2 HTTP incoming (`incoming-handler@0.2.x`, proxy world) | Supported: `wasmdown serve` detects a component exporting `wasi:http/incoming-handler`, composes the proxy-world providers at the guest's exact 0.2 patch version(s), buffers HTTP/1.1 request bodies (Content-Length or chunked, request trailers included), calls the sync `handle(request, response-outparam)`, and serializes the captured `outgoing-response` status/headers/body/trailers; an unset outparam or trap answers 500. Host loopback plus provider and response-outparam pins: `tests/wasi-preview2.lisp` | same host-side provider path | `make test-unit` (P2 lane), `tests/wasi-preview2.lisp` |
 | Pinned 0.3.2 guests (hand-authored) | 10/10 pass ×3 repeats (30/30): no-import success smoke, a `wasi:cli/exit@0.3.2` importer (exit 7), a `wasi:clocks/monotonic-clock@0.3.2` importer (monotonic `now()`), a resume-safe async command (callback `task.return`), a `write-via-stream` stdout command (`hi`), a cancelled-subtask command, a `wasi:random/random@0.3.2` guest (`insecure`/`insecure-seed`: exact 16-byte lengths, differing secure reads, `u64`/seed calls; `realloc`-lowered lists), a clock-deadline guest (`wait-for` 200 ms completes through the CLI reactor; the 200 ms bound is the liveness-oracle regression proof), a `wasi:cli/{stdin,environment,stderr,terminal-stdout}@0.3.2` guest (argv[0]/marker, `--env` pair, option-typed initial cwd, `terminal-stdout` = `none` on a non-tty, real stdin `stdin-probe\n` with explicit DROPPED EOF and an ok paired future, stderr through `write-via-stream`), and a `wasi:filesystem/{types,preopens}@0.3.2` guest (`/work` preopen, async `open-at` of seeded `hello.txt`, exactly 17 bytes through `read-via-stream`+`stream.read`, writes at explicit offsets and appends at EOF with `stat` and a byte-exact read-back, err `read-only` (case 32), `create-directory-at`/`stat-at`/`read-directory` enumeration/`rename-at`/`unlink-file-at`/`remove-directory-at`, missing path = err `no-entry`, every handle dropped) | 10/10 pass, same cases and repeats (30/30); the nested core runs compiled (`backend-entry-count`) | `make test-wasi-preview3`, `tools/build-p3-fixtures.lisp`, `wasi/command-component-runs-the-selected-backend`, `wasi/reactor-pending-deadline-p` |
 
-Network communication (TCP, UDP and DNS) is **excluded from the declared
-support profile**: the sockets row above is an internal-composition pin for
-the pinned `wasi:cli/command` world, not a support row and not a P3 guest
-case, and no row here counts a socket case as P3 support. A component-declared
-`wasi:sockets` import is refused at link time (see
+Network communication (TCP, UDP and DNS) and `wasi:http` are **part of the
+declared support profile**: guest-declared 0.3-line sockets imports bind under
+the `wasi-network` authority (`--net`/`--listen`/`--dns` or the embedder API),
+HTTP `types`/`client` are served, and `handler`/`service` are exercised by
+`wasmdown serve`. The upstream network subset is the evidence row (30/30); the
+`middleware` world host-supplied `next` composition is implemented by `http-middleware-providers` and unit-pinned (no upstream fixture)
+by the pinned suite and is not claimed. See
 [`../../specs/wasi/MANIFEST.md`](../../specs/wasi/MANIFEST.md) § “Network
-communication: `wasi:sockets` (excluded)”).
+surface (declared supported)”.
 
 The backend property lives on the function, not on a replacement object: the
 selected mode compiles each defined function's existing `func-instance`
@@ -133,7 +138,7 @@ stdout-only and is listed as `n/a` with `make verify` named as its gate.
   nothing, and stale/class/element/writable/non-idle/waitable-set traps — and
   by `component/generic-path-five-cases-pin` CASE 2, migrated to the
   end-object contract (the second load traps). Negative controls showed both
-  the load arm and the guard set are load-bearing. Unit 694/0, component
+  the load arm and the guard set are load-bearing. Unit 739/0, component
   1,702/0, P3 10/10 ×3 per backend.
 - **Host borrow reclamation and store-retirement metadata (2026-11-02).**
   A host callee has no Task to adopt the borrow handles a lowering staged, so
@@ -185,7 +190,7 @@ stdout-only and is listed as `n/a` with `make verify` named as its gate.
   `component/remap-outer-compound-functype-owner` — the exact diagnostic pair
   (decoy-first same-numbered type validates with no memory; the real `string`
   leaf still rejects with a memory requirement), shape checks (`tuple<u32>` vs
-  `tuple<string>`) and result-position companions, and the count-2 positive/negative pair. Unit 694/0, component
+  `tuple<string>`) and result-position companions, and the count-2 positive/negative pair. Unit 739/0, component
   1,702/0, P3 10/10 ×3 per backend, `make verify` green.
 - **Validator instance type-index space and encoder s33 valtype indices
   (2026-11-02).** Two engine correctness fixes exposed by the WIT-shaped
@@ -203,13 +208,14 @@ stdout-only and is listed as `n/a` with `make verify` named as its gate.
   because its references happened to land on slots the validator accepted
   (it referenced no exported `descriptor-stat`/`directory-entry` slot from a
   later declarator), and its valtype indices stayed below 64, where `u32`
-  and `s33` agree. Unit 694/0, component
+  and `s33` agree. Unit 739/0, component
   1,702/0, P3 30/30 ×3 both backends, `make verify` green.
 
 ## Still open
 
-- No open test row. The upstream suite is green (95/0/32 declared
-  exclusions); only the real-toolchain guest remains blocked (see Blocked).
+- No open test row. The upstream suite is green (127/0/0, including HTTP and
+  sockets) and the network subset is 30/30; only the real-toolchain guest
+  remains blocked (see Blocked).
 
 ## Blocked
 

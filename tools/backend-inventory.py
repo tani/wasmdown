@@ -180,12 +180,14 @@ def p1_section(data):
 def p2_status(name, record, bound, exported):
     if name in bound:
         return "bound"
+    # a world EXPORT is served host-side as an export, never an import
+    # provider, regardless of the package's exclusion policy
+    if name in exported:
+        return "export_only"
     if package_of(name) in EXCLUDED_PACKAGES:
         return "excluded"
     if record[name] == "unstable":
         return "unstable"
-    if name in exported:
-        return "export_only"
     return "missing"
 
 
@@ -253,8 +255,6 @@ def p3_section(data):
                 status = "excluded_internal"
             elif name in bound:
                 status = "bound"
-            elif package in EXCLUDED_PACKAGES:
-                status = "excluded"
             elif rec["stability"] == "unstable":
                 status = "unstable"
             elif name in exported:
@@ -454,8 +454,8 @@ def render_markdown(doc):
     add("")
     add("Per release: interfaces parsed from the vendored tree, and the "
         "`p2-builder-table` registry for that exact version. `stable` drops "
-        "`@unstable` annotations. The documentation claim is 27 of 31 stable "
-        "interfaces bound at exact release names; the table below is the "
+        "`@unstable` annotations. The documentation claim is 29 of 31 stable "
+        "interfaces bound at exact release names (plus 2 export-only world entries); the table below is the "
         "measurement, release by release.")
     add("")
     add_all(md_table(
@@ -497,9 +497,8 @@ def render_markdown(doc):
     add("## P3 — WASI 0.3.2 packages")
     add("")
     add("Interfaces parsed from `specs/wasi/wasi-wit-0.3.2/`; `provided` is the "
-        "`%wasi-provider-builders` registry. `wasi:http` and `wasi:sockets` "
-        "(TCP/UDP/DNS) are excluded by decision; their WIT is reference data "
-        "and any registry entry is internal composition only, never support.")
+        "`%wasi-provider-builders` registry. HTTP and sockets are part of "
+        "the declared profile; every bound interface is guest-visible support.")
     add("")
     add_all(md_table(
         ["package", "interfaces", "provided", "excluded", "export-only",
@@ -592,8 +591,10 @@ def render_markdown(doc):
         for r in rows:
             if r["status"] == "export_only":
                 key = (base(r["interface"]),
-                       "the command world EXPORTS it; the runtime serves the "
-                       "export, so no import provider exists")
+                       "a WASI world EXPORTS it (the CLI command world's "
+                       "`run`, the HTTP proxy world's `incoming-handler`); "
+                       "the runtime serves the export, so no import "
+                       "provider exists")
             elif r["status"] == "types_only":
                 key = (base(r["interface"]),
                        "declares no function and no resource; a guest resolves "

@@ -47,18 +47,7 @@ PIN_SECTION = "suite.wasi-testsuite"
 
 # The only reasons a test may be dropped from the lane. Keyed by category so
 # the summary can count each exclusion separately.
-DECLARED_EXCLUSIONS = {
-    "proposal-http":
-        "wasi:http is unsupported by design (permanent exclusion, "
-        "2026-11-02; PLAN.md M16 slice 5 / M17) - not an implementation gap",
-    "proposal-sockets":
-        "network communication (wasi:sockets TCP/UDP/DNS) is outside the "
-        "declared support profile (permanent exclusion, 2026-11-02)",
-    "legacy-network-imports":
-        "network communication is outside the declared support profile; the "
-        "four legacy wasi_snapshot_preview1 sock_* imports are excluded "
-        "(2026-11-02)",
-}
+DECLARED_EXCLUSIONS = {}
 
 LEGACY_NETWORK_PREFIX = "sock_"
 MIXED_RELEASE = "mixes WASI release lines"
@@ -158,24 +147,9 @@ def test_config(test_dir, test_name):
 
 
 def exclusion_for(version, test_name, config):
-    """The declared category that excludes this test, or None."""
-    proposals = config.get("proposals") or []
-    unknown = set(proposals) - {"http", "sockets"}
-    if unknown:
-        abort(
-            f"{test_name} requests undeclared proposal(s) {sorted(unknown)}; "
-            "add a declared exclusion with a rationale before measuring")
-    if "http" in proposals:
-        return "proposal-http"
-    if "sockets" in proposals:
-        return "proposal-sockets"
-    if version == "wasm32-wasip1" and test_name.startswith(LEGACY_NETWORK_PREFIX):
-        return "legacy-network-imports"
-    world = config.get("world", "wasi:cli/command")
-    if world != "wasi:cli/command":
-        abort(
-            f"{test_name} targets world {world} without a declared exclusion; "
-            "the adapter claims wasi:cli/command only")
+    """No capability is excluded now: HTTP and sockets are supported.
+    Reserved for future declared exclusions with a rationale."""
+    del version, test_name, config
     return None
 
 
