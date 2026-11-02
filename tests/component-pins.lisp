@@ -6979,6 +6979,106 @@ provider can check without closing over the resource identity."
             (is (wasmdown.component.runtime::host-pending-delivered-p pending))
             (is (zerop (%pin-borrows-of caller rt)))))))))
 
+(test component/instance-type-declarator-alias-pins
+  ;; Binary.md line 274: an instance TYPE's import/export declarator of
+  ;; sort `type' introduces a NEW type index that ALIASES its bound
+  ;; type, and an (alias outer ...) declarator names the OUTER ct. A
+  ;; later declarator may reference either. wasi:http/types@0.3.2's
+  ;; `(option 19)' names the exported `duration' alias of an outer
+  ;; u64 (wasm32-wasip3 http-request-options); the walker used to push
+  ;; an opaque marker, and the outer-alias arm scanned INNER first —
+  ;; so `(alias outer 1 $duration)' resolved to INNER's resource at
+  ;; the same index and the option was rejected as "not a defined
+  ;; type".
+  (flet ((run (src)
+           (handler-case
+               (progn (wasmdown.component:validate-component
+                       (wasmdown.component.text::parse-component-text
+                        src))
+                      :ok)
+             (wasmdown:validation-error (c)
+               (wasmdown:wasmdown-error-message c)))))
+    ;; POSITIVE: INNER[0] is a resource (the decoy); the alias must
+    ;; resolve the OUTER u64, the export aliases it, and (option …)
+    ;; resolves through the alias-introduced index.
+    (is (eq :ok
+            (run (concatenate 'string
+                  "(component"
+                  " (type $duration u64)"
+                  " (type $I (instance"
+                  "   (export \"r\" (type (sub resource)))"
+                  "   (alias outer 1 0 (type $d))"
+                  "   (export \"duration\" (type $dur (eq $d)))"
+                  "   (type $o (option $dur))"
+                  "   (export \"f\" (func (param \"x\" $o) (result $o)))))"
+                  " (import \"i\" (instance (type $I))))"))))
+    ;; NEGATIVE: a valtype may not name a RESOURCE — wasm-tools reports
+    ;; the same "type index 0 is not a defined type" for this shape.
+    (let ((msg (run (concatenate 'string
+                     "(component"
+                     " (type $I (instance"
+                     "   (export \"r\" (type $r (sub resource)))"
+                     "   (type $o (option $r))))"
+                     " (import \"i\" (instance (type $I))))"))))
+      (is (and (stringp msg)
+               (search "is not a defined type" msg))))))
+
+(test component/lower-spilled-own-result-pin
+  ;; lower_flat_values with MAX_FLAT_RESULTS: a result whose flat width
+  ;; exceeds one slot is STORED at the [ptr] out-param and the core
+  ;; signature declares NO results. A provider returning an abstract
+  ;; (:own-handle rt rep) for `result<own<R>, E>` (wasi:http/types'
+  ;; fields.from-list) must therefore be stored as a VARIANT whose ok
+  ;; payload is the new handle index — the old top-level ":own-handle
+  ;; result" shortcut fired FIRST, returned the index as a phantom
+  ;; core result and left the caller's retptr zero, so wit-bindgen's
+  ;; Resource::from_handle asserted `handle != 0' (wasi-testsuite
+  ;; http-fields).
+  (let* ((caller (wasmdown.component.runtime:make-comp-instance))
+         (callee (wasmdown.component.runtime:make-comp-instance))
+         (mem (%pin-memory))
+         (rt (wasmdown.component.runtime::make-ct* :resource nil))
+         (err (wasmdown.component.runtime::make-ct*
+               :variant (vector (cons "invalid-syntax" nil))))
+         (result (wasmdown.component.runtime::make-ct*
+                  :result (cons (wasmdown.component.runtime::make-ct*
+                                 :own rt)
+                                err)))
+         (ft (wasmdown.component.runtime::make-ct*
+              :func (list (vector) result nil)))
+         (rep (list :fields)))
+    (wasmdown.component.runtime::%push-core-memory caller mem)
+    (wasmdown.component.runtime::%push-func
+     caller
+     (wasmdown.component.runtime:make-lifted-func
+      :type ft :inst callee
+      :host (lambda (args) (declare (ignore args))
+              (list :own-handle rt rep))))
+    (let* ((canon (wasmdown.component:make-canonrec
+                   :kind :lower :func 0 :opts (list (list :memory 0))))
+           (wrap (wasmdown.component.runtime::%lower-host-func
+                  caller 0 canon))
+           (res (wasmdown.runtime:wasm-call wrap 0))
+           (bytes (wasmdown.runtime:memory-instance-bytes mem))
+           (mem32 (lambda (ptr)
+                    (loop for k below 4
+                          sum (ash (aref bytes (+ ptr k)) (* 8 k))))))
+      ;; no core results: the caller reads the [ptr] out-param
+      (is (equal '(nil) res))
+      ;; discriminant 0 = `ok', the payload handle at the joined offset
+      (is (= 0 (aref bytes 0)))
+      (let* ((idx (funcall mem32 4))
+             (h (and (plusp idx)
+                     (<= idx (length (wasmdown.component.runtime::%inst-handles
+                                      caller)))
+                     (aref (wasmdown.component.runtime::%inst-handles caller)
+                           (1- idx)))))
+        (is (plusp idx))
+        (is (wasmdown.component.runtime::resource-handle-p h))
+        (is (eq rt (wasmdown.component.runtime::resource-handle-rt h)))
+        (is (eq rep (wasmdown.component.runtime::resource-handle-rep h)))
+        (is (wasmdown.component.runtime::resource-handle-own-p h))))))
+
 (defun run-component-pins ()
   "Run the component pins (registered via TEST; returns T)."
   (let ((wasmdown.test::*tests*
@@ -7015,6 +7115,7 @@ provider can check without closing over the resource identity."
                       component/moduletype-outer-alias-pins
                       component/outer-alias-debruijn-pins
                       component/externtype-type-use-pins
+                      component/instance-type-declarator-alias-pins
                       component/abi-string-encoding-pins
                       component/declarator-bind-id-pins
                       component/core-subtype-matching-pins
@@ -7051,6 +7152,7 @@ provider can check without closing over the resource identity."
                       component/cancel-eager-resolve-pins
                       component/granted-park-quantum-pins
                       component/async-lower-result-two-spaces-pins
+                      component/lower-spilled-own-result-pin
                       component/host-resource-dtor-registry-pins
                       component/cancel-window-fire-gate-pins
                       component/import-binding-signature-pins

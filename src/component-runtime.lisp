@@ -1228,9 +1228,12 @@ type space (the one space the comparison is defined in)."
               ;; comparing the index would trap on a legitimate
               ;; cross-component transfer. `end.t == t' still catches
               ;; every structural difference around the handle.
-              (:own :own)
+              ;; a bare resource type used in a value position and an
+              ;; explicit own<T> denote the same handle class; the
+              ;; WIT provider side and the guest valtype side spell
+              ;; them differently (http body trailers)
+              ((:own :resource) :resource-handle)
               (:borrow :borrow)
-              (:resource :resource)
               (:stream (list :stream (field p)))
               (:future (list :future (field p)))
               ;; the opaque kinds (func/instance/component): compare
@@ -3679,35 +3682,38 @@ TARGET's space."
                                inst fidx component-args)))))
          (if (or core-result result)
              (list
-              (if (and (consp res) (eq (first res) :own-handle))
-                  ;; lower_own: the abstract handle enters THIS
-                  ;; instance's table; the core side gets the INDEX
-                  (%handle-add inst (second res) (third res) t)
-                  (if result
-                      ;; lower_flat_values: FLAT when <= 1 flat slot,
-                      ;; else the result STORED at the [ptr] out-param
-                      ;; (the last core arg). The SAME cx serves both
-                      ;; spaces: its INST (the caller) owns the handle
-                      ;; table a stream/future/own result enters, its
-                      ;; TYPE-INST (FT-INST) resolves the result's
-                      ;; (:idx . n) refs — the two-space split made the
-                      ;; old second rcx redundant.
-                      (let ((rflat (%flat-type-of result ft-inst)))
-                        (let ((result-ct
-                                (%abi-ct result (%abi-type-inst cx))))
-                          (if (> (length rflat) 1)
-                              ;; the SPILLED result: store at the
-                              ;; [ptr] out-param (the LAST core
-                              ;; param; the sig carries NO core
-                              ;; results — the old (if core-result
-                              ;; ...) gate skipped the store
-                              ;; entirely and the caller read an
-                              ;; empty retptr)
-                              (let ((ptr (first (last args))))
-                                (%abi-store cx res result-ct ptr)
-                                nil)
-                              (first (%abi-lower cx res
-                                                 result-ct)))))
+              (if result
+                  (let* ((rflat (%flat-type-of result ft-inst))
+                         (result-ct (%abi-ct result (%abi-type-inst cx))))
+                    (cond
+                      ((> (length rflat) 1)
+                       ;; the SPILLED result: store at the [ptr]
+                       ;; out-param (the LAST core param; the sig
+                       ;; carries NO core results — the old (if
+                       ;; core-result ...) gate skipped the store
+                       ;; entirely and the caller read an empty
+                       ;; retptr). The store walks the result
+                       ;; RECURSIVELY: an own-handle payload
+                       ;; (result<own<R>, E>) enters THIS table from
+                       ;; the store's :own arm — the old top-level
+                       ;; ":own-handle result" shortcut fired FIRST
+                       ;; and returned the index as a core result for
+                       ;; a signature that declares none, so the
+                       ;; caller's retptr stayed zero and its
+                       ;; Resource::from_handle saw handle 0.
+                       (%abi-store cx res result-ct (first (last args)))
+                       nil)
+                      ((and (consp res) (eq (first res) :own-handle))
+                       ;; lower_own: the abstract handle enters THIS
+                       ;; instance's table; the core side gets the
+                       ;; INDEX
+                       (%handle-add inst (second res) (third res) t))
+                      (t (first (%abi-lower cx res result-ct)))))
+                  ;; no declared result: a provider's abstract
+                  ;; own-handle (the implicit post-return shape)
+                  ;; still enters the table
+                  (if (and (consp res) (eq (first res) :own-handle))
+                      (%handle-add inst (second res) (third res) t)
                       res)))
              '()))))))
 
@@ -4060,6 +4066,7 @@ the opts plist, guarded by the scheduler mutex)."
   "The End base (CanonicalABI.md 1617): the readable/writable end
 of a stream or future pair."
   (t-ct nil)                         ; the element type ct (stream<T>)
+  (t-inst nil)  ; the type space t-ct's refs belong to (cross-space guard)
   (state :idle)   ; :idle :copying :cancelling-copy :done
   (other nil)                        ; the paired end (NIL = dropped)
   (buffer nil)    ; (list memory ptr length progress) — the guest buffer
@@ -4126,14 +4133,15 @@ of a stream or future pair."
 ;;; new_{stream,future} (CanonicalABI.md 1907-1920): the linked pair.
 (defun %new-async-pair (t-ct owner event-code future-p)
   "new_stream / new_future: the linked readable+writable ends."
-  (let* ((r-event (if future-p +event-future-read+ +event-stream-read+))
+  (let* ((origin-inst (or owner *host-provider-inst*))
+         (r-event (if future-p +event-future-read+ +event-stream-read+))
          (w-event (if future-p +event-future-write+ +event-stream-write+))
          (reader (make-async-end
-                  :t-ct t-ct :owner owner :event-code r-event
-                  :future-p future-p))
+                  :t-ct t-ct :t-inst origin-inst :owner owner
+                  :event-code r-event :future-p future-p))
          (writer (make-async-end
-                  :t-ct t-ct :owner owner :event-code w-event
-                  :future-p future-p)))
+                  :t-ct t-ct :t-inst origin-inst :owner owner
+                  :event-code w-event :future-p future-p)))
     (setf (async-end-other reader) writer)
     (setf (async-end-other writer) reader)
     (values reader writer)))
@@ -5638,11 +5646,19 @@ whose recorded element type differs from the valtype's traps."
       (error 'wasmdown:wasm-trap :kind :generic
              :message "handle index used with the wrong type"))
     (when elem
-      (unless (equal (%abi-type-key (async-end-t-ct end)
-                                    (%abi-type-inst cx))
-                     (%abi-type-key elem (%abi-type-inst cx)))
-        (error 'wasmdown:wasm-trap :kind :generic
-               :message "stream or future element type mismatch")))
+      (let* ((tinst (%abi-type-inst cx))
+             ;; the END's element ct belongs to the space the pair was
+             ;; CREATED in (an imported provider's end: the provider's
+             ;; own type space); a local pair falls back to the
+             ;; lifting context's TYPE space — %ABI-TYPE-INST, never
+             ;; the bare TYPE-INST slot: the sync/async lower paths
+             ;; leave that slot NIL for a same-space cx
+             (einst (or (async-end-t-inst end) tinst))
+             (ek (%abi-type-key (async-end-t-ct end) einst))
+             (tk (%abi-type-key elem tinst)))
+        (unless (equal ek tk)
+          (error 'wasmdown:wasm-trap :kind :generic
+                 :message "stream or future element type mismatch"))))
     (unless (eq (async-end-state end) :idle)
       (error 'wasmdown:wasm-trap :kind :generic
              :message "cannot lift a stream or future in a non-idle state"))

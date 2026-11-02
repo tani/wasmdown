@@ -68,7 +68,7 @@ def get_timeout_seconds() -> float:
     return TIMEOUT_SECONDS
 
 
-_GRANTED_PROPOSALS = {"sockets"}
+_GRANTED_PROPOSALS = {"sockets", "http"}
 
 
 def compute_argv(test_path: str,

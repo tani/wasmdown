@@ -6169,7 +6169,7 @@ the handle table's type identity for every handle of that resource."
 ;;; ---------------------------------------------------------------
 ;;; fields: the header map.
 
-(defparameter +http-max-field-name-size+ 256)
+(defparameter +http-max-field-name-size+ 4096)
 (defparameter +http-max-field-value-size+ 65536)
 (defparameter +http-max-fields-total-size+ (* 1024 1024))
 
@@ -6179,10 +6179,14 @@ the handle table's type identity for every handle of that resource."
   "The HTTP token character set (RFC 7230 §3.2.6).")
 
 (defparameter +http-forbidden-field-names+
-  '("connection" "content-length" "host" "keep-alive" "proxy-connection"
-    "te" "trailer" "transfer-encoding" "upgrade")
+  '("connection" "keep-alive" "proxy-authenticate" "proxy-authorization"
+    "proxy-connection" "transfer-encoding" "upgrade" "host"
+    "http2-settings")
   "The field names the HTTP implementation owns: a guest cannot set
-them (RFC 7230 §6.1 + the wasi:http forbidden set). Case-insensitive.")
+them. The exact wasmtime `DEFAULT_FORBIDDEN_HEADERS' set (WASI #940
+has no spec list yet); `te'/`trailer'/`content-length' are NOT on it
+— the upstream client fixtures append `trailer' to a fresh fields.
+Case-insensitive.")
 
 (defun %http-token-p (string)
   (and (stringp string)
@@ -6214,11 +6218,20 @@ CTLs are rejected (§4.2's invalid-syntax)."
 (defmacro %http-header-error (label)
   `(cons :err (cons ,label nil)))
 
+(defun %fields-canonical-name (name)
+  "The STORED spelling of a field name: lowercase. HTTP field names
+are case-insensitive and the reference implementation parses them
+through http::HeaderName, which lowercases; `copy-all'/`clone' then
+report the lowercase spelling whatever case the caller used
+(wasi-testsuite http-fields' case-insensitivity check)."
+  (string-downcase name))
+
 (defstruct (wasi-fields (:constructor %make-wasi-fields (entries mutable-p)))
   "The `fields' resource rep: ENTRIES is the ordered list of
-(original-name . value-bytes) pairs (one pair per value), and
-MUTABLE-P is the WIT's mutability bit (a `fields' returned by
-request.headers / response.headers is immutable)."
+(canonical-name . value-bytes) pairs (one pair per value; the name is
+stored lowercase — http::HeaderName semantics), and MUTABLE-P is the
+WIT's mutability bit (a `fields' returned by request.headers /
+response.headers is immutable)."
   (entries nil)
   (mutable-p t))
 
@@ -6227,7 +6240,8 @@ request.headers / response.headers is immutable)."
 vectors or u8 lists."
   (%make-wasi-fields
    (loop for (name . value) in entries
-         collect (cons name (%field-value-bytes value)))
+         collect (cons (%fields-canonical-name name)
+                       (%field-value-bytes value)))
    mutable-p))
 
 (defun %fields-of (value ct)
@@ -6265,6 +6279,7 @@ direct CL call) passes through."
   "Replace every value of NAME (case-insensitively), keeping the
 position of the first old entry; append when absent."
   (let* ((entries (wasi-fields-entries fields))
+         (name (%fields-canonical-name name))
          (pos (position name entries :key #'car :test #'string-equal))
          (new (loop for v in values collect (cons name v))))
     (setf (wasi-fields-entries fields)
@@ -6276,7 +6291,8 @@ position of the first old entry; append when absent."
 
 (defun %fields-append (fields name value)
   (setf (wasi-fields-entries fields)
-        (append (wasi-fields-entries fields) (list (cons name value)))))
+        (append (wasi-fields-entries fields)
+                (list (cons (%fields-canonical-name name) value)))))
 
 (defun %fields-delete (fields name)
   (setf (wasi-fields-entries fields)
@@ -6330,7 +6346,8 @@ aggregate limits (header-error.size-exceeded otherwise)."
                   (%http-header-error "size-exceeded")))))
     (let ((fields (make-wasi-fields
                    :entries (loop for entry in entries
-                                  collect (cons (first entry)
+                                  collect (cons (%fields-canonical-name
+                                                 (first entry))
                                                 (%field-value-bytes
                                                  (second entry)))))))
       (if (> (%fields-total-size fields) +http-max-fields-total-size+)
@@ -6365,19 +6382,25 @@ aggregate limits (header-error.size-exceeded otherwise)."
 (defun fields-delete (fields name &key (package (wasi-package "http")))
   (declare (ignore package))
   (let ((f (%fields-of fields (http-resource-ct "fields"))))
-    (if (not (wasi-fields-mutable-p f))
-        (%http-header-error "immutable")
-        (progn (%fields-delete f name) (cons :ok nil)))))
+    (cond
+      ((not (wasi-fields-mutable-p f)) (%http-header-error "immutable"))
+      ;; HeaderName::try_from: an invalid field-name is
+      ;; header-error.invalid-syntax, never a silent no-op (the
+      ;; upstream http-fields suite asserts Err for "", "voilà",
+      ;; "hey ho", ...).
+      ((not (%http-token-p name)) (%http-header-error "invalid-syntax"))
+      (t (progn (%fields-delete f name) (cons :ok nil))))))
 
 (defun fields-get-and-delete (fields name
                               &key (package (wasi-package "http")))
   (declare (ignore package))
   (let ((f (%fields-of fields (http-resource-ct "fields"))))
-    (if (not (wasi-fields-mutable-p f))
-        (%http-header-error "immutable")
-        (let ((values (if (%http-token-p name) (%fields-values f name) '())))
-          (%fields-delete f name)
-          (cons :ok values)))))
+    (cond
+      ((not (wasi-fields-mutable-p f)) (%http-header-error "immutable"))
+      ((not (%http-token-p name)) (%http-header-error "invalid-syntax"))
+      (t (let ((values (%fields-values f name)))
+           (%fields-delete f name)
+           (cons :ok values))))))
 
 (defun fields-append (fields name value
                       &key (package (wasi-package "http")))
@@ -6537,73 +6560,93 @@ is a valid token."
                       "options" "trace" "patch")
                     :test #'string=))))))
 
+(defun %http-scheme-ascii-alpha-p (c)
+  (or (char<= #\a c #\z) (char<= #\A c #\Z)))
+
 (defun %http-scheme-ok-p (scheme)
+  ;; RFC 3986 scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." ); the
+  ;; grammar is ASCII-only, so a Unicode letter is NOT a valid scheme
+  ;; even though SBCL's alpha-char-p would accept it.
   (and (consp scheme)
        (cond
          ((string-equal (car scheme) "other")
           (let ((s (cdr scheme)))
             (and (stringp s) (plusp (length s))
-                 (alpha-char-p (char s 0))
+                 (%http-scheme-ascii-alpha-p (char s 0))
                  (every (lambda (c)
-                          (or (alpha-char-p c) (digit-char-p c)
+                          (or (%http-scheme-ascii-alpha-p c)
+                              (digit-char-p c)
                               (find c "+-." :test #'char=)))
                         s))))
          (t (member (car scheme) '("HTTP" "HTTPS") :test #'string=)))))
 
 (defun %http-path-ok-p (path)
-  "origin-form: \"/\" or \"*\", then visible ASCII (no space, CR, LF,
-NUL; a fragment `#' is not part of a request target)."
+  "origin-form or a query-only target: begins with `/`, `*`, or `?`;
+  visible ASCII (no space/CR/LF/NUL; `#' starts a fragment and is not
+  part of a request target); raw UTF-8 codepoints >= 0x80 are allowed.
+  Empty is normalized to `/` by the setter."
   (and (stringp path)
        (plusp (length path))
-       (or (char= (char path 0) #\/) (string= path "*"))
+       (or (char= (char path 0) #\/) (char= (char path 0) #\?)
+           (string= path "*"))
        (every (lambda (c)
                 (let ((code (char-code c)))
-                  (and (<= 33 code 126) (not (char= c #\#)))))
+                  (or (>= code #x80)
+                      (char<= #\0 c #\9)
+                      (char<= #\a c #\z)
+                      (char<= #\A c #\Z)
+                      (find c "-._~%!$&'()*+,;=:@/?" :test #'char=))))
               path)))
 
+(defun %http-authority-char-p (c)
+  (or (char<= #\0 c #\9) (char<= #\a c #\z)
+      (char<= #\A c #\Z)
+      (find c "-._~%!$&'()*+,;=:" :test #'char=)))
+
 (defun %http-authority-ok-p (authority)
-  "authority = host [ \":\" port ]; userinfo is not accepted."
+  "RFC 3986 authority = [ userinfo \"@\" ] host [ \":\" port ].
+  Userinfo is accepted (the upstream suite asserts user:pass@host);
+  percent/sub-delims/unreserved are legal, a non-numeric or empty port
+  is not, and a second @ or : is rejected. IPv6 literals are not yet
+  accepted (the upstream suite leaves them commented out)."
   (and (stringp authority)
        (plusp (length authority))
-       (every (lambda (c)
-                (let ((code (char-code c)))
-                  (and (<= 33 code 126)
-                       (not (find c "/?#@" :test #'char=)))))
-              authority)
-       ;; the port, when present, must be digits
-       (let* ((host-port (if (and (char= (char authority 0) #\[)
-                                  (find #\] authority))
-                             (let ((close (position #\] authority)))
-                               (if (< (1+ close) (length authority))
-                                   (subseq authority (1+ close))
-                                   ""))
-                             (let ((colon (position #\: authority)))
-                               (if colon (subseq authority colon) "")))))
-         (or (string= host-port "")
-             (progn (unless (char= (char host-port 0) #\:) (return-from %http-authority-ok-p nil))
-                    (let ((digits (subseq host-port 1)))
-                      (and (plusp (length digits))
-                           (every #'digit-char-p digits)
-                           (<= (ignore-errors (parse-integer digits)) 65535))))))))
+       (let ((at (position #\@ authority)))
+         (and (or (null at)
+                  (and (plusp at)
+                       (not (position #\@ authority :start (1+ at)))
+                       (every #'%http-authority-char-p
+                              (subseq authority 0 at))))
+              (let* ((hostport (if at (subseq authority (1+ at)) authority))
+                     (colon (position #\: hostport)))
+                (and (plusp (length hostport))
+                     (or (null colon)
+                         (and (plusp colon)
+                              (not (position #\: hostport :start (1+ colon)))
+                              (plusp (- (length hostport) (1+ colon)))
+                              (every #'digit-char-p
+                                     (subseq hostport (1+ colon)))))
+                     (every (lambda (c)
+                              (or (char= c #\:)
+                                  (and (not (char= c #\@))
+                                       (%http-authority-char-p c))))
+                            hostport)))))))
 
 (defun %http-split-authority (authority)
-  "authority -> (values host-without-brackets port)"
-  (if (and (char= (char authority 0) #\[)
-           (find #\] authority))
-      (let* ((close (position #\] authority))
-             (host (subseq authority 1 close))
-             (rest (subseq authority (1+ close))))
-        (values host
-                (if (and (plusp (length rest)) (char= (char rest 0) #\:))
-                    (parse-integer (subseq rest 1))
-                    80)))
-      (let ((colon (position #\: authority)))
-        (if colon
-            (values (subseq authority 0 colon)
-                    (parse-integer (subseq authority (1+ colon))))
-            (values authority 80)))))
+  "authority -> (values host port): userinfo is stripped and the
+default port is 80. The caller has already validated AUTHORITY with
+%HTTP-AUTHORITY-OK-P (so a port, when present, is digits)."
+  (let* ((at (position #\@ authority))
+         (hostport (if at (subseq authority (1+ at)) authority))
+         (colon (position #\: hostport)))
+    (if colon
+        (values (subseq hostport 0 colon)
+                (parse-integer (subseq hostport (1+ colon))))
+        (values hostport 80))))
 
 (defun %http-method-string (method)
+  "The wire spelling of a request method: other(X) -> X, a known case
+-> its uppercase name."
   (if (string-equal (car method) "other")
       (string (cdr method))
       (string-upcase (car method))))
@@ -6735,10 +6778,23 @@ future). The body is fully staged by the guest before send."
   (declare (ignore package))
   (wasi-http-request-method (%request-of this (http-resource-ct "request"))))
 
+(defun %normalize-http-method (method)
+  "A known other(GET) normalizes to the case `get' (the WIT issue
+  the upstream suite asserts); arbitrary valid tokens stay other."
+  (if (and (consp method) (string-equal (car method) "other")
+           (stringp (cdr method)))
+      (let ((known (member (string-downcase (cdr method))
+                           '("get" "head" "post" "put" "delete" "connect"
+                             "options" "trace" "patch")
+                           :test #'string=)))
+        (if known (list (car known)) method))
+      method))
+
 (defun http-request-set-method (this method
                                 &key (package (wasi-package "http")))
   (declare (ignore package))
-  (let ((req (%request-of this (http-resource-ct "request"))))
+  (let* ((req (%request-of this (http-resource-ct "request")))
+         (method (%normalize-http-method method)))
     (if (%http-method-ok-p method)
         (progn (setf (wasi-http-request-method req) method) (cons :ok nil))
         (cons :err nil))))
@@ -6752,24 +6808,35 @@ future). The body is fully staged by the guest before send."
 (defun http-request-set-path-with-query (this path
                                          &key (package (wasi-package "http")))
   (declare (ignore package))
-  (let ((req (%request-of this (http-resource-ct "request"))))
+  (let* ((req (%request-of this (http-resource-ct "request")))
+         (tagged (and (consp path) (eq (car path) :some)))
+         (raw (if tagged (cdr path) path)))
+    (when (and (stringp raw) (zerop (length raw)))
+      (setf raw "/" tagged t))
     (cond
       ((eq path :none) (setf (wasi-http-request-path-with-query req) :none)
        (cons :ok nil))
-      ((and (consp path) (eq (car path) :some))
-       (if (%http-path-ok-p (cdr path))
-           (progn (setf (wasi-http-request-path-with-query req) path)
-                  (cons :ok nil))
-           (cons :err nil)))
-      (t (if (%http-path-ok-p path)
-             (progn (setf (wasi-http-request-path-with-query req)
-                          (cons :some path))
-                    (cons :ok nil))
-             (cons :err nil))))))
+      ((%http-path-ok-p raw)
+       (setf (wasi-http-request-path-with-query req)
+             (cons :some raw))
+       (cons :ok nil))
+      (t (cons :err nil)))))
+
+(defun %normalize-http-scheme (scheme)
+  "other(http)/other(https) normalize to the named Scheme case; the
+WIT issue behind the upstream assertion. Case-insensitive input,
+canonical HTTP/HTTPS output. Any other value is unchanged."
+  (if (and (consp scheme) (string-equal (car scheme) "other")
+           (stringp (cdr scheme)))
+      (cond ((string-equal (cdr scheme) "http") (list "HTTP"))
+            ((string-equal (cdr scheme) "https") (list "HTTPS"))
+            (t scheme))
+      scheme))
 
 (defun http-request-get-scheme (this &key (package (wasi-package "http")))
   (declare (ignore package))
-  (wasi-http-request-scheme (%request-of this (http-resource-ct "request"))))
+  (wasi-http-request-scheme
+   (%request-of this (http-resource-ct "request"))))
 
 (defun http-request-set-scheme (this scheme
                                 &key (package (wasi-package "http")))
@@ -6779,13 +6846,18 @@ future). The body is fully staged by the guest before send."
       ((eq scheme :none) (setf (wasi-http-request-scheme req) :none)
        (cons :ok nil))
       ((and (consp scheme) (eq (car scheme) :some))
-       (if (%http-scheme-ok-p (cdr scheme))
-           (progn (setf (wasi-http-request-scheme req) scheme) (cons :ok nil))
-           (cons :err nil)))
-      (t (if (%http-scheme-ok-p scheme)
-             (progn (setf (wasi-http-request-scheme req) (cons :some scheme))
+       (let ((normalized (%normalize-http-scheme (cdr scheme))))
+         (if (%http-scheme-ok-p normalized)
+             (progn (setf (wasi-http-request-scheme req)
+                          (cons :some normalized))
                     (cons :ok nil))
-             (cons :err nil))))))
+             (cons :err nil))))
+      (t (let ((normalized (%normalize-http-scheme scheme)))
+           (if (%http-scheme-ok-p normalized)
+               (progn (setf (wasi-http-request-scheme req)
+                            (cons :some normalized))
+                      (cons :ok nil))
+               (cons :err nil)))))))
 
 (defun http-request-get-authority (this &key (package (wasi-package "http")))
   (declare (ignore package))
@@ -7380,7 +7452,7 @@ HTTP-response-incomplete / HTTP-protocol-error."
             (unless (%http-token-p name)
               (%http-error (%http-code "HTTP-protocol-error")))
             (push (cons name (map 'list #'char-code value)) entries)))))
-    (%make-wasi-fields (nreverse entries) nil)))
+    (make-wasi-fields :entries (nreverse entries) :mutable-p nil)))
 
 (defun %http-read-response-head (r method)
   "Parse the status line + header section. Returns (values status

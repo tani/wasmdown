@@ -3483,9 +3483,10 @@ yields every chunk the framing decodes, then EOF)."
   (let* ((f (wasmdown.wasi:make-wasi-fields)))
     (is (eq :ok (car (wasmdown.wasi:fields-set f "X-Test" (list (list 104 105))))))
     (is (eq :ok (car (wasmdown.wasi:fields-append f "x-test" (list 33)))))
-    ;; case-insensitive lookup keeps the ORIGINAL casing and order
+    ;; case-insensitive lookup keeps the insertion order; the stored
+    ;; spelling is CANONICAL (lowercase), as http::HeaderName does
     (is (equal '((104 105) (33)) (wasmdown.wasi:fields-get f "X-TEST")))
-    (is (equal '(("X-Test" (104 105)) ("x-test" (33)))
+    (is (equal '(("x-test" (104 105)) ("x-test" (33)))
                (wasmdown.wasi:fields-copy-all f)))
     (is (wasmdown.wasi:fields-has f "x-Test"))
     (is (not (wasmdown.wasi:fields-has f "bad name")))
@@ -3514,7 +3515,7 @@ yields every chunk the framing decodes, then EOF)."
     (is (equal "invalid-syntax"
                (second (wasmdown.wasi:fields-set f "X" (list (list 13 10 65))))))
     (is (equal "forbidden"
-               (second (wasmdown.wasi:fields-append f "content-length"
+               (second (wasmdown.wasi:fields-append f "proxy-authorization"
                                                     (list 48)))))
     (let ((im (third (wasmdown.wasi::%fields-immutable-view f))))
       (is (equal "immutable"
@@ -3613,7 +3614,7 @@ yields every chunk the framing decodes, then EOF)."
     (is (eq :ok (car (wasmdown.wasi:http-response-set-status-code r 404))))
     (is (= 404 (wasmdown.wasi:http-response-get-status-code r)))
     (is (eq :err (car (wasmdown.wasi:http-response-set-status-code r 99))))
-    (is (equal '(("A" (49)))
+    (is (equal '(("a" (49)))
                (wasmdown.wasi:fields-copy-all
                 (third (wasmdown.wasi:http-response-get-headers r)))))))
 

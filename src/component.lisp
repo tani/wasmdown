@@ -2340,6 +2340,46 @@ declarator-numbering convention inside component/instance types
 \(%CHECK-DEFVALTYPE's push). VALIDATE-COMPONENT binds it to the COMP it
 walks, so a nested component carries its own provenance.")
 
+(defun %cval-type-slot (state i)
+  "The ct at type index I of STATE's type space, or NIL when I is out
+of range or the slot holds no ct (an opaque extern marker)."
+  (and (integerp i) (>= i 0) (< i (length (cval-types state)))
+       (ct-p (aref (cval-types state) i))
+       (aref (cval-types state) i)))
+
+(defun %declarator-bound-ct (inner outer i)
+  "The ct an `(eq I)' TYPE declarator binds. INNER (the type's own
+declarator space) is consulted first, then the ENCLOSING space OUTER
+(the same fallback %check-defvaltype's extern resolution uses). NIL
+when neither space names a ct."
+  (or (%cval-type-slot inner i) (%cval-type-slot outer i)))
+
+(defun %declarator-type-bound-ct (et inner outer)
+  "The ct an import/export declarator of sort `type' INTRODUCES: the
+declarator's new type index ALIASES the bound type (Binary.md line
+274), so a later declarator may reference it — wasi:http/types'
+`(option 19)' names the exported `duration' alias of an outer u64.
+An `(eq i)' binding pushes the TARGET ct (a resource keeps the
+opaque resource marker: its dtor slot belongs to the declaring
+instance); an unresolvable binding and every non-type sort stay
+opaque."
+  (cond
+    ((not (and (consp et) (eq (car et) :type)))
+     (make-ct :kind :prim :payload :imported-or-exported-type
+              :offset 0))
+    ((eq (cdr et) :sub-resource)
+     (make-ct :kind :resource :payload '(0 . nil) :offset 0))
+    ((and (consp (cdr et)) (eq (first (cdr et)) :eq))
+     (let ((ct (%declarator-bound-ct inner outer (second (cdr et)))))
+       (cond ((null ct)
+              (make-ct :kind :prim :payload :imported-or-exported-type
+                       :offset 0))
+             ((ct-resourcetype-p ct)
+              (make-ct :kind :resource :payload '(0 . nil) :offset 0))
+             (t ct))))
+    (t (make-ct :kind :prim :payload :imported-or-exported-type
+                :offset 0))))
+
 (defun %check-defvaltype (c state &optional (type-depth 1) (outer state))
   "Validate one defined (value) type: label rules, non-emptiness, the
 32-flag limit, type-index bounds + defined-ness, own/borrow resource
@@ -2614,43 +2654,59 @@ type's own declarators stay against STATE, the inner space)."
                                 (eq (aliasrec-sort a) :type)
                                 (%outer-state-at inner
                                                  (aliasrec-count a)))))
-                 (if (and tgt
-                          (< (aliasrec-target a)
-                             (length (cval-types tgt)))
-                          (ct-resourcetype-p
-                           (aref (cval-types tgt)
-                                 (aliasrec-target a))))
-                     (make-ct :kind :resource :payload '(0 . nil)
-                              :offset 0)
-                     ;; M9 (linking ::104): the de Bruijn target may
-                     ;; land on a FRESH inner space (a walk whose
-                     ;; *outer-states* head is an empty inner) —
-                     ;; walk the chain past too-short states to the
-                     ;; first where the target index resolves to a
-                     ;; resource; no hit keeps the opaque marker
-                     (let ((hit
-                             (and (eq (aliasrec-kind a) :outer)
-                                  (eq (aliasrec-sort a) :type)
-                                  (loop for st in
-                                        (cons inner
-                                              (if (boundp
-                                                   '*outer-states*)
-                                                  *outer-states*
-                                                  nil))
-                                        thereis (and
-                                                 (< (aliasrec-target a)
-                                                    (length
-                                                     (cval-types st)))
-                                                 (ct-resourcetype-p
-                                                  (aref
-                                                   (cval-types st)
-                                                   (aliasrec-target
-                                                    a))))))))
-                       (if hit
-                           (make-ct :kind :resource
-                                    :payload '(0 . nil) :offset 0)
-                           (make-ct :kind :prim
-                                    :payload :outer-aliased)))))
+                 ;; the target resolves in the DE BRUJIN TARGET
+                 ;; SPACE (TGT), never in INNER: INNER's slot at the
+                 ;; same number names an unrelated type — the first
+                 ;; attempt read INNER[1] (export "request-options",
+                 ;; a resource) for `(alias outer 1 $duration)' and
+                 ;; the duration slot became a resource, so the
+                 ;; sibling `(option 19)' was rejected.
+                 (let* ((resolved (and tgt
+                                       (< (aliasrec-target a)
+                                          (length (cval-types tgt)))
+                                       (%cval-type-slot
+                                        tgt (aliasrec-target a))))
+                        ;; M9 (linking ::104): the de Bruijn target
+                        ;; may land on a FRESH inner space (a walk
+                        ;; whose *outer-states* head is an empty
+                        ;; inner) — when the addressed state cannot
+                        ;; resolve it, scan the chain for a RESOURCE
+                        ;; target; no hit keeps the opaque marker
+                        (hit
+                          (and (null resolved)
+                               (eq (aliasrec-kind a) :outer)
+                               (eq (aliasrec-sort a) :type)
+                               (loop for st in
+                                     (cons inner
+                                           (if (boundp
+                                                '*outer-states*)
+                                               *outer-states*
+                                               nil))
+                                     thereis (and
+                                              (< (aliasrec-target a)
+                                                 (length
+                                                  (cval-types st)))
+                                              (ct-resourcetype-p
+                                               (aref
+                                                (cval-types st)
+                                                (aliasrec-target
+                                                 a))))))))
+                   (cond
+                     ((null resolved)
+                      (if hit
+                          (make-ct :kind :resource
+                                   :payload '(0 . nil) :offset 0)
+                          (make-ct :kind :prim
+                                   :payload :outer-aliased
+                                   :offset 0)))
+                     ((ct-resourcetype-p resolved)
+                      (make-ct :kind :resource
+                               :payload '(0 . nil) :offset 0))
+                     ;; the aliased type itself: a later declarator
+                     ;; referencing this index (the sibling
+                     ;; (option 19) through the export alias of
+                     ;; `duration') resolves the real ct
+                     (t resolved))))
                (cval-types inner))))
            ((:import :export)
             (let* ((payload (typedecl-payload d))
@@ -2747,32 +2803,17 @@ type's own declarators stay against STATE, the inner space)."
                ;; declarators). The TEXT parser's convention (see
                ;; COMP-SOURCE) occupies a slot per declarator.
                (when (eq (car et) :type)
-               (vector-push-extend
-                (if (and (eq (car et) :type)
-                         (eq (cdr et) :sub-resource))
-                    (make-ct :kind :resource :payload '(0 . nil)
-                             :offset 0)
-                    ;; M9 (linking ::125): an (eq i) type export
-                    ;; aliases i — its own/borrow acceptance follows
-                    ;; the TARGET's kind (the eq of a (sub resource)
-                    ;; export IS a resource for the declarator's
-                    ;; functype refs); other/unknown stay opaque
-                    (if (and (eq (car et) :type)
-                             (consp (cdr et))
-                             (eq (first (cdr et)) :eq)
-                             (integerp (second (cdr et)))
-                             (< (second (cdr et))
-                                (length (cval-types inner)))
-                             (ct-p (aref (cval-types inner)
-                                         (second (cdr et))))
-                             (ct-resourcetype-p
-                              (aref (cval-types inner)
-                                    (second (cdr et)))))
-                        (make-ct :kind :resource :payload '(0 . nil)
-                                 :offset 0)
-                        (make-ct :kind :prim
-                                 :payload :imported-or-exported-type)))
-                (cval-types inner))))))))))
+                 ;; M9 (linking ::125): an (eq i) type export
+                 ;; aliases i — its own/borrow acceptance follows
+                 ;; the TARGET's kind, and a later declarator that
+                 ;; REFERENCES this new index must resolve the
+                 ;; aliased ct itself (wasi:http/types' (option 19)
+                 ;; names the exported `duration'); %DECLARATOR-TYPE-
+                 ;; BOUND-CT keeps resources opaque and falls back to
+                 ;; the enclosing space.
+                 (vector-push-extend
+                  (%declarator-type-bound-ct et inner outer)
+                  (cval-types inner))))))))))
        ;; owner-qualified type layers (plan step 1): record, at the
        ;; moment the ct is validated, the view of the space that
        ;; DECLARED it — count 1 = OUTER (this declaring space), 2+ =
