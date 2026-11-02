@@ -241,48 +241,10 @@ they never alias the component runtime's resource handles."
   (module nil)
   (instance nil)
   (memory nil)                         ; the memory-instance
-  (memory-index nil :type (or null integer)) ; its slot in the instance
-  (mode :interpret :type (member :interpret :compiled))
-  (imports '())                        ; caller import entries, reused by child instances
   (fds (make-hash-table :test #'eql))
   (sockets nil)
   (closed-p nil)
-  (initialized-p nil)
-  ;; wasi-threads (opt-in): the spawn import is registered only when
-  ;; WASMDOWN:*THREADS* was bound at instantiation. Child instances and
-  ;; their SBCL threads are tracked here; THREAD-LOCK guards TID
-  ;; allocation, the record list and TERMINATING.
-  (threads-enabled-p nil)
-  (thread-lock (sb-thread:make-mutex :name "wasmdown preview1 thread table"))
-  (threads '())                        ; p1-thread records
-  (next-tid 1 :type (integer 1))
-  (terminating nil)                    ; the first termination condition
-  (spawned-count 0 :type integer))
-
-(defconstant +p1-max-tid+ (1- (ash 1 29))
-  "The largest valid wasi-threads TID (2^29 - 1); 0 is reserved and the
-top three bits are never set.")
-
-(defconstant +p1-thread-spawn-error+ -1
-  "The negative result of a failed `wasi_thread_spawn'. The proposal
-only requires a negative value; wasi-libc maps every negative spawn
-result to EAGAIN.")
-
-(defstruct (p1-thread (:constructor %make-p1-thread))
-  "One spawned guest thread: its TID, its private module instance (the
-proposal's instance-per-thread), the SBCL thread executing the
-instance's `wasi_thread_start', and a done flag the spawner reads."
-  (tid 0 :type (integer 1))
-  (instance nil)
-  (scheduler nil)
-  done-p
-  condition)
-
-(define-condition p1-state-closed (error)
-  ()
-  (:report (lambda (c s)
-             (declare (ignore c))
-             (format s "WASI Preview1 state is closed"))))
+  (initialized-p nil))
 
 (defvar *p1-current-state* nil
   "The state whose import closures are executing on this thread. Set
@@ -2215,18 +2177,6 @@ host socket fd). No socket is ever created or imported implicitly."
          (lambda (&rest args) (apply impl state args))
          params
          (if (string= name "proc_exit") '() '(:i32)))))
-    ;; wasi-threads (opt-in): the host function is registered under the
-    ;; proposal's ABI name (`wasi' / `thread-spawn', what wasi-libc's
-    ;; __wasi_thread_spawn imports) AND under the Preview1-shaped alias
-    ;; (`wasi_snapshot_preview1' / `wasi_thread_spawn'). With the gate
-    ;; off neither is present, so such a module still fails to link.
-    (when (preview1-state-threads-enabled-p state)
-      (flet ((spawn (arg) (%p1-thread-spawn state arg)))
-        (wasmdown:imports-set-function
-         table "wasi" "thread-spawn" #'spawn '(:i32) '(:i32))
-        (wasmdown:imports-set-function
-         table "wasi_snapshot_preview1" "wasi_thread_spawn" #'spawn
-         '(:i32) '(:i32))))
     table))
 
 ;;; ---------------------------------------------------------------
@@ -2251,181 +2201,8 @@ can already call into the host."
     (when (wasmdown.runtime:memory-instance-i64-p memory)
       (error 'wasmdown:instantiation-error
              :message "WASI Preview1 requires a memory32, not memory64"))
-    (setf (preview1-state-memory state) memory
-          (preview1-state-memory-index state)
-          (position memory memories :test #'eq))
+    (setf (preview1-state-memory state) memory)
     memory))
-
-;;; ---------------------------------------------------------------
-;;; wasi-threads: instance-per-thread spawn over a shared ABI memory.
-;;;
-;;; The proposal (WebAssembly/wasi-threads, legacy Phase 1) defines ONE
-;;; import, `thread-spawn (start_arg: u32) -> s32', and requires the
-;;; module to export `wasi_thread_start (tid: i32, start_arg: i32)'.
-;;; On spawn the host instantiates the same module again, imports the
-;;; SAME objects (above all the shared memory), starts a host thread
-;;; and calls the child's `wasi_thread_start'. The parent's `_start' is
-;;; never re-run. Return from `wasi_thread_start' ends only that
-;;; thread; a trap or proc_exit in ANY thread ends all of them.
-
-(defun %p1-request-termination (state condition)
-  "Request termination of every guest thread owned by STATE, recording
-CONDITION as the FIRST termination cause. Wakes threads parked in
-`memory.atomic.wait' on the shared ABI memory: MEMORY-ABORT-WAITERS
-makes that wait signal CONDITION instead of blocking (the condition is
-re-signalled in each waiter). Returns the recorded condition."
-  (let ((first-p nil))
-    (sb-thread:with-mutex ((preview1-state-thread-lock state))
-      (unless (preview1-state-terminating state)
-        (setf (preview1-state-terminating state) condition
-              first-p t)))
-    ;; Even when another thread already recorded the cause, aborting is
-    ;; idempotent and keeps every waiter awake.
-    (let ((mem (preview1-state-memory state)))
-      (when mem
-        (wasmdown.runtime:memory-abort-waiters
-         mem (or (preview1-state-terminating state) condition))))
-    (preview1-state-terminating state)))
-
-(defun %p1-share-memory (state instance)
-  "Bind the ABI memory slot of a freshly allocated child INSTANCE to the
-parent's memory object. The child's own module-defined memory (already
-filled by ITS active data segments, which are deliberately not applied
-to the live shared memory) is replaced and any export naming it is
-rewritten. Imported memories are already the same object because the
-child imports exactly the parent's import entries. Runs in
-BEFORE-START, so the child's start section and every guest function
-already see the shared memory."
-  (let* ((parent (preview1-state-memory state))
-         (idx (preview1-state-memory-index state))
-         (memories (wasmdown.runtime:module-instance-memories instance)))
-    (when (and parent idx (< idx (length memories)))
-      (let ((old (aref memories idx)))
-        (setf (aref memories idx) parent)
-        (when (and (wasmdown.runtime:memory-instance-p old)
-                   (not (eq old parent)))
-          (setf (wasmdown.runtime:module-instance-exports instance)
-                (loop for (name . value)
-                        in (wasmdown.runtime:module-instance-exports instance)
-                      collect (cons name (if (eq value old) parent value)))))))
-    parent))
-
-(defun %p1-instantiate-child (state)
-  "Instantiate STATE's module once more for a new guest thread: the same
-caller import entries, fresh Preview1 host functions closing over the
-SAME state (so fds, context and capabilities are shared authority), and
-the parent's ABI memory installed before any guest code runs."
-  (let* ((table (make-preview1-imports state))
-         (entries (append (wasmdown::imports-table-entries table)
-                          (preview1-state-imports state))))
-    (wasmdown.runtime:make-module-instance
-     (preview1-state-module state) entries
-     :before-start (lambda (instance) (%p1-share-memory state instance))
-     :prepare (when (eq (preview1-state-mode state) :compiled)
-                (lambda (instance)
-                  (wasmdown::%install-compiled!
-                   (preview1-state-module state) instance))))))
-
-(defun %p1-allocate-tid (state)
-  "A free TID in [1, 2^29) under STATE's THREAD-LOCK. Finished threads'
-TIDs may be reused."
-  (loop repeat +p1-max-tid+
-        for tid = (preview1-state-next-tid state)
-        do (setf (preview1-state-next-tid state)
-                 (if (= tid +p1-max-tid+) 1 (1+ tid)))
-        unless (loop for record in (preview1-state-threads state)
-                     thereis (and (not (p1-thread-done-p record))
-                                  (= tid (p1-thread-tid record))))
-          return tid
-        finally (return nil)))
-
-(defun %p1-thread-main (state record start-arg)
-  "SBCL thread body: run the child instance's `wasi_thread_start' with
-the host TID and the opaque START-ARG. Return ends only this thread; a
-trap or a proc_exit ends every thread of STATE."
-  (handler-case
-      (progn
-        (%p1-invoke (p1-thread-instance record) "wasi_thread_start"
-                    (p1-thread-tid record) start-arg)
-        (setf (p1-thread-done-p record) t))
-    (wasi-exit (c)
-      (setf (p1-thread-done-p record) t)
-      (%p1-request-termination state c))
-    (serious-condition (c)
-      (setf (p1-thread-done-p record) t
-            (p1-thread-condition record) c)
-      (%p1-request-termination state c)))
-  nil)
-
-(defun %p1-spawn-check (state)
-  "The module preconditions wasi-threads places on the parent: the
-gate is on, the state is live and the ABI memory is shared."
-  (and (preview1-state-threads-enabled-p state)
-       (not (preview1-state-closed-p state))
-       (let ((mem (preview1-state-memory state)))
-         (and mem (wasmdown.runtime:memory-instance-shared-p mem)))))
-
-(defun %p1-thread-spawn (state start-arg)
-  "`wasi_thread_spawn' (module `wasi', field `thread-spawn'; also the
-`wasi_snapshot_preview1'/`wasi_thread_spawn' alias). START-ARG is the
-opaque u32 handed to `wasi_thread_start'. Returns a unique positive TID
-in [1, 2^29) after the child instance exists and its host thread has
-been started, or a negative error (always -1). Instantiation failures,
-a missing/mistyped `wasi_thread_start' export, a closed state, a
-non-shared memory, a TID exhaustion or a host thread failure all map to
-that error; the guest (wasi-libc) turns any negative into EAGAIN."
-  (handler-case
-      (if (not (%p1-spawn-check state))
-          +p1-thread-spawn-error+
-          (let ((arg (logand start-arg #xffffffff)))
-            ;; Precondition checked before allocating anything: the
-            ;; child must export wasi_thread_start (i32,i32) -> ().
-            (multiple-value-bind (params results)
-                (%p1-module-export-functype
-                 (preview1-state-module state) "wasi_thread_start")
-              (unless (and (equal params '(:i32 :i32)) (null results))
-                (return-from %p1-thread-spawn +p1-thread-spawn-error+)))
-            (let ((child (%p1-instantiate-child state)))
-              (sb-thread:with-mutex ((preview1-state-thread-lock state))
-                (when (or (preview1-state-terminating state)
-                          (preview1-state-closed-p state))
-                  (return-from %p1-thread-spawn +p1-thread-spawn-error+))
-                (let ((tid (%p1-allocate-tid state)))
-                  (unless tid
-                    (return-from %p1-thread-spawn +p1-thread-spawn-error+))
-                  (let* ((record (%make-p1-thread :tid tid :instance child))
-                         (thread
-                           (sb-thread:make-thread
-                            (lambda () (%p1-thread-main state record arg))
-                            :name (format nil "wasmdown-wasi-thread-~d" tid))))
-                    (setf (p1-thread-scheduler record) thread)
-                    (push record (preview1-state-threads state))
-                    (incf (preview1-state-spawned-count state))
-                    tid))))))
-    (serious-condition (c)
-      ;; Link/instantiation/type errors are reported to the guest as the
-      ;; proposal's negative error, never re-signalled into the caller.
-      (declare (ignore c))
-      +p1-thread-spawn-error+)))
-
-(defun %p1-join-threads (state &key (timeout 5))
-  "Join the spawned threads of STATE after termination was requested.
-A thread that ignores the termination (e.g. a pure spin loop that never
-waits) is force-terminated after TIMEOUT seconds so a closed state can
-never leak a host thread."
-  (let ((records (sb-thread:with-mutex ((preview1-state-thread-lock state))
-                   (copy-list (preview1-state-threads state)))))
-    (dolist (record records)
-      (let ((thread (p1-thread-scheduler record)))
-        (when (and thread (not (eq thread sb-thread:*current-thread*)))
-          (handler-case
-              (sb-thread:join-thread thread :timeout timeout :default nil)
-            (serious-condition () nil))
-          (when (sb-thread:thread-alive-p thread)
-            (ignore-errors (sb-thread:terminate-thread thread))
-            (ignore-errors
-             (sb-thread:join-thread thread :timeout 1 :default nil)))))))
-  (values))
 
 (defun make-preview1-instance (module context &key (mode :interpret) imports sockets)
   "Instantiate a core MODULE with the complete `wasi_snapshot_preview1'
@@ -2433,45 +2210,34 @@ import surface bound to CONTEXT's capabilities. Returns
 (values INSTANCE STATE). IMPORTS (an imports table or raw alist) may
 add non-WASI imports; a conflicting WASI name is a link-error rather
 than a silent override. SOCKETS is the explicit fd -> native socket
-alist. MODE is :INTERPRET (default) or :COMPILED.
-
-With WASMDOWN:*THREADS* bound the module may also import
-`thread-spawn' (`wasi' / `thread-spawn', aliased as
-`wasi_snapshot_preview1' / `wasi_thread_spawn') and spawn
-instance-per-thread children over the shared dead memory. The caller's
-import entries are retained so every child instance imports exactly the
-same objects (notably an imported shared memory)."
-  (let* ((state (%make-preview1-state
-                 :context context :module module :sockets sockets
-                 :mode mode
-                 :threads-enabled-p (and wasmdown:*threads* t)))
-         (entries (cond ((null imports) '())
-                        ((wasmdown::imports-table-p imports)
-                         (copy-list (wasmdown::imports-table-entries imports)))
-                        (t (copy-list imports)))))
-    (setf (preview1-state-imports state) entries)
-    (ecase mode
-      (:interpret)
-      (:compiled))
-    (let ((table (make-preview1-imports state)))
-      ;; caller imports: only names the host does not provide may be
-      ;; added. With threads on that includes `wasi'/`thread-spawn'.
+alist. MODE is :INTERPRET (default) or :COMPILED."
+  (let* ((state (%make-preview1-state :context context :module module
+                                      :sockets sockets))
+         (table (make-preview1-imports state)))
+    ;; caller imports: only non-Preview1 names may be added
+    (let ((entries (cond ((null imports) '())
+                         ((wasmdown::imports-table-p imports)
+                          (wasmdown::imports-table-entries imports))
+                         (t imports))))
       (dolist (pair entries)
-        (when (assoc (car pair) (wasmdown::imports-table-entries table)
-                     :test #'equal)
+        (when (and (consp (car pair))
+                   (string= (first (car pair)) "wasi_snapshot_preview1"))
           (error 'wasmdown:link-error
-                 :message (format nil "caller import ~a conflicts with the host provider"
+                 :message (format nil "caller import ~a conflicts with the Preview1 provider"
                                   (car pair))))
-        (push pair (wasmdown::imports-table-entries table)))
-      (setf (wasmdown::imports-table-entries table)
-            (nreverse (wasmdown::imports-table-entries table)))
-      (%p1-install-stdio state context)
+        (push pair (wasmdown::imports-table-entries table))))
+    (setf (wasmdown::imports-table-entries table)
+          (nreverse (wasmdown::imports-table-entries table)))
+    (%p1-install-stdio state context)
     (%p1-install-preopens state context)
     (%p1-install-sockets state sockets)
     ;; MODE is installed in the PREPARE hook, not after instantiation:
     ;; PREPARE runs with every object allocated and no guest code yet, so
     ;; in :COMPILED the START SECTION itself runs compiled. Installing
     ;; afterwards would silently interpret the start section.
+    (ecase mode
+      (:interpret)
+      (:compiled))
     (let ((inst (wasmdown.runtime:make-module-instance
                  module
                  (wasmdown::imports-table-entries table)
@@ -2481,19 +2247,14 @@ same objects (notably an imported shared memory)."
                             (lambda (instance)
                               (wasmdown::%install-compiled! module instance))))))
       (setf (preview1-state-instance state) inst)
-      (values inst state)))))
+      (values inst state))))
 
 (defun close-preview1-state (state)
   "Release the host handles the STATE owns (opened descriptors, never
-the preopens or stdio streams the context lends). Terminates and joins
-any spawned wasi-threads children first, so no guest thread can use a
-descriptor after it is closed. Idempotent."
+the preopens or stdio streams the context lends). Idempotent."
   (when (and (preview1-state-p state)
              (not (preview1-state-closed-p state)))
     (setf (preview1-state-closed-p state) t)
-    (when (preview1-state-threads-enabled-p state)
-      (%p1-request-termination state (make-condition 'p1-state-closed))
-      (%p1-join-threads state))
     (maphash (lambda (fd entry)
                (declare (ignore fd))
                (%p1-close-entry entry))
@@ -2531,23 +2292,8 @@ produces the status; traps and link failures propagate."
            (handler-case
                (progn
                  (%p1-invoke instance "_start")
-                 ;; Returning from `_start' is proc_exit(0): terminate
-                 ;; every spawned thread (the proposal's main-return
-                 ;; rule) before reporting the status. A termination a
-                 ;; child already requested wins: a child proc_exit
-                 ;; supplies the status, a child trap fails the run.
-                 (let ((recorded (preview1-state-terminating state)))
-                   (cond ((typep recorded 'wasi-exit)
-                          (wasi-exit-status recorded))
-                         (recorded
-                          (error recorded))
-                         (t
-                          (%p1-request-termination
-                           state (make-condition 'wasi-exit :status 0))
-                          0))))
-             (wasi-exit (c)
-               (%p1-request-termination state c)
-               (wasi-exit-status c)))
+                 0)
+             (wasi-exit (c) (wasi-exit-status c)))
         (close-preview1-state state))))
 
 (defun %p1-module-export-functype (module name)
