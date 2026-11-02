@@ -534,12 +534,23 @@ through the component's exported `wasi:http/handler' until SIGINT."
               (let ((addr (or (cdr (assoc "--addr" options :test #'string=))
                               "127.0.0.1:0")))
                 (unwind-protect
-                     (wasmdown.wasi:serve-component
-                      comp context
-                      :address addr
-                      :mode (%api-mode)
-                      :providers (wasmdown.wasi:serve-component-providers
-                                  context comp))
+                     (if (wasmdown.wasi:preview2-serve-p comp)
+                         ;; a 0.2 proxy-world guest exports
+                         ;; wasi:http/incoming-handler: drive its sync
+                         ;; handler with the exact-version P2 providers
+                         (wasmdown.wasi:serve-preview2-component
+                          comp context
+                          :address addr
+                          :mode (%api-mode)
+                          :providers
+                          (wasmdown.wasi:preview2-serve-providers
+                           context comp))
+                         (wasmdown.wasi:serve-component
+                          comp context
+                          :address addr
+                          :mode (%api-mode)
+                          :providers (wasmdown.wasi:serve-component-providers
+                                      context comp)))
                   (dolist (preopen (wasmdown.wasi:wasi-context-preopens
                                     context))
                     (ignore-errors

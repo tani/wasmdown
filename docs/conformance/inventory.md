@@ -6,7 +6,7 @@ Pinned: WASI Preview1 at `fae981bae14809d91f9bc2d63852d461f331d161`; WASI 0.2 re
 
 ## Method
 
-Two sources only, and neither is prose. **Pinned:** the generated Preview1 census (`specs/wasi/preview1/INVENTORY.md`, from the pinned WITX) and the vendored WIT trees (`specs/wasi/wasi-wit-<release>/`, parsed by `wasmdown.wit`). **Runtime:** `tools/backend-inventory.lisp` loads the system in SBCL and prints the registration tables that actually bind — `*p1-signatures*` / `*p1-implementations*`, `p2-builder-table` per release, `%wasi-provider-builders` — plus the interfaces the parser reads and the worlds' exports. A vendored file is never evidence of implementation, and a name is `bound` only when it appears in the runtime registry for that exact release. Opcode coverage is not scraped from source: it is read from the backend-parity lane's result records. Generated 2026-11-02T01:28:45Z from commit `b2ab7bf583464f3fd9b6a7a05c38d316f6e17bbf`, SBCL 2.6.4.
+Two sources only, and neither is prose. **Pinned:** the generated Preview1 census (`specs/wasi/preview1/INVENTORY.md`, from the pinned WITX) and the vendored WIT trees (`specs/wasi/wasi-wit-<release>/`, parsed by `wasmdown.wit`). **Runtime:** `tools/backend-inventory.lisp` loads the system in SBCL and prints the registration tables that actually bind — `*p1-signatures*` / `*p1-implementations*`, `p2-builder-table` per release, `%wasi-provider-builders` — plus the interfaces the parser reads and the worlds' exports. A vendored file is never evidence of implementation, and a name is `bound` only when it appears in the runtime registry for that exact release. Opcode coverage is not scraped from source: it is read from the backend-parity lane's result records. Generated 2026-11-02T01:34:15Z from commit `d264a0a69f7dd22f4ebefe5f1f88ebdcc58f4e24`, SBCL 2.6.4.
 
 ## P1 — WASI Preview1 (46 pinned exports)
 
@@ -90,7 +90,7 @@ The 2 unbound STABLE interfaces at `0.2.12` are listed here by name; every one i
 | interface | status |
 |---|---|
 | `wasi:cli/run@0.2.12` | export-only (world export, not an import) |
-| `wasi:http/incoming-handler@0.2.12` | excluded by decision |
+| `wasi:http/incoming-handler@0.2.12` | export-only (world export, not an import) |
 
 ### wasi:*@0.2.0
 
@@ -111,7 +111,7 @@ The 2 unbound STABLE interfaces at `0.2.12` are listed here by name; every one i
 | `wasi:clocks/wall-clock@0.2.0` | bound | stable |
 | `wasi:filesystem/preopens@0.2.0` | bound | stable |
 | `wasi:filesystem/types@0.2.0` | bound | stable |
-| `wasi:http/incoming-handler@0.2.0` | excluded by decision | stable |
+| `wasi:http/incoming-handler@0.2.0` | export-only (world export, not an import) | stable |
 | `wasi:http/outgoing-handler@0.2.0` | bound | stable |
 | `wasi:http/types@0.2.0` | bound | stable |
 | `wasi:io/error@0.2.0` | bound | stable |
@@ -148,7 +148,7 @@ The 2 unbound STABLE interfaces at `0.2.12` are listed here by name; every one i
 | `wasi:clocks/wall-clock@0.2.1` | bound | stable |
 | `wasi:filesystem/preopens@0.2.1` | bound | stable |
 | `wasi:filesystem/types@0.2.1` | bound | stable |
-| `wasi:http/incoming-handler@0.2.1` | excluded by decision | stable |
+| `wasi:http/incoming-handler@0.2.1` | export-only (world export, not an import) | stable |
 | `wasi:http/outgoing-handler@0.2.1` | bound | stable |
 | `wasi:http/types@0.2.1` | bound | stable |
 | `wasi:io/error@0.2.1` | bound | stable |
@@ -185,7 +185,7 @@ The 2 unbound STABLE interfaces at `0.2.12` are listed here by name; every one i
 | `wasi:clocks/wall-clock@0.2.2` | bound | stable |
 | `wasi:filesystem/preopens@0.2.2` | bound | stable |
 | `wasi:filesystem/types@0.2.2` | bound | stable |
-| `wasi:http/incoming-handler@0.2.2` | excluded by decision | stable |
+| `wasi:http/incoming-handler@0.2.2` | export-only (world export, not an import) | stable |
 | `wasi:http/outgoing-handler@0.2.2` | bound | stable |
 | `wasi:http/types@0.2.2` | bound | stable |
 | `wasi:io/error@0.2.2` | bound | stable |
@@ -222,7 +222,7 @@ The 2 unbound STABLE interfaces at `0.2.12` are listed here by name; every one i
 | `wasi:clocks/wall-clock@0.2.3` | bound | stable |
 | `wasi:filesystem/preopens@0.2.3` | bound | stable |
 | `wasi:filesystem/types@0.2.3` | bound | stable |
-| `wasi:http/incoming-handler@0.2.3` | excluded by decision | stable |
+| `wasi:http/incoming-handler@0.2.3` | export-only (world export, not an import) | stable |
 | `wasi:http/outgoing-handler@0.2.3` | bound | stable |
 | `wasi:http/types@0.2.3` | bound | stable |
 | `wasi:io/error@0.2.3` | bound | stable |
@@ -259,7 +259,7 @@ The 2 unbound STABLE interfaces at `0.2.12` are listed here by name; every one i
 | `wasi:clocks/wall-clock@0.2.4` | bound | stable |
 | `wasi:filesystem/preopens@0.2.4` | bound | stable |
 | `wasi:filesystem/types@0.2.4` | bound | stable |
-| `wasi:http/incoming-handler@0.2.3` | excluded by decision | stable |
+| `wasi:http/incoming-handler@0.2.3` | export-only (world export, not an import) | stable |
 | `wasi:http/outgoing-handler@0.2.3` | bound | stable |
 | `wasi:http/types@0.2.3` | bound | stable |
 | `wasi:io/error@0.2.4` | bound | stable |
@@ -296,7 +296,7 @@ The 2 unbound STABLE interfaces at `0.2.12` are listed here by name; every one i
 | `wasi:clocks/wall-clock@0.2.5` | bound | stable |
 | `wasi:filesystem/preopens@0.2.5` | bound | stable |
 | `wasi:filesystem/types@0.2.5` | bound | stable |
-| `wasi:http/incoming-handler@0.2.5` | excluded by decision | stable |
+| `wasi:http/incoming-handler@0.2.5` | export-only (world export, not an import) | stable |
 | `wasi:http/outgoing-handler@0.2.5` | bound | stable |
 | `wasi:http/types@0.2.5` | bound | stable |
 | `wasi:io/error@0.2.5` | bound | stable |
@@ -333,7 +333,7 @@ The 2 unbound STABLE interfaces at `0.2.12` are listed here by name; every one i
 | `wasi:clocks/wall-clock@0.2.6` | bound | stable |
 | `wasi:filesystem/preopens@0.2.6` | bound | stable |
 | `wasi:filesystem/types@0.2.6` | bound | stable |
-| `wasi:http/incoming-handler@0.2.6` | excluded by decision | stable |
+| `wasi:http/incoming-handler@0.2.6` | export-only (world export, not an import) | stable |
 | `wasi:http/outgoing-handler@0.2.6` | bound | stable |
 | `wasi:http/types@0.2.6` | bound | stable |
 | `wasi:io/error@0.2.6` | bound | stable |
@@ -370,7 +370,7 @@ The 2 unbound STABLE interfaces at `0.2.12` are listed here by name; every one i
 | `wasi:clocks/wall-clock@0.2.7` | bound | stable |
 | `wasi:filesystem/preopens@0.2.7` | bound | stable |
 | `wasi:filesystem/types@0.2.7` | bound | stable |
-| `wasi:http/incoming-handler@0.2.7` | excluded by decision | stable |
+| `wasi:http/incoming-handler@0.2.7` | export-only (world export, not an import) | stable |
 | `wasi:http/outgoing-handler@0.2.7` | bound | stable |
 | `wasi:http/types@0.2.7` | bound | stable |
 | `wasi:io/error@0.2.7` | bound | stable |
@@ -407,7 +407,7 @@ The 2 unbound STABLE interfaces at `0.2.12` are listed here by name; every one i
 | `wasi:clocks/wall-clock@0.2.8` | bound | stable |
 | `wasi:filesystem/preopens@0.2.8` | bound | stable |
 | `wasi:filesystem/types@0.2.8` | bound | stable |
-| `wasi:http/incoming-handler@0.2.8` | excluded by decision | stable |
+| `wasi:http/incoming-handler@0.2.8` | export-only (world export, not an import) | stable |
 | `wasi:http/outgoing-handler@0.2.8` | bound | stable |
 | `wasi:http/types@0.2.8` | bound | stable |
 | `wasi:io/error@0.2.8` | bound | stable |
@@ -444,7 +444,7 @@ The 2 unbound STABLE interfaces at `0.2.12` are listed here by name; every one i
 | `wasi:clocks/wall-clock@0.2.9` | bound | stable |
 | `wasi:filesystem/preopens@0.2.9` | bound | stable |
 | `wasi:filesystem/types@0.2.9` | bound | stable |
-| `wasi:http/incoming-handler@0.2.9` | excluded by decision | stable |
+| `wasi:http/incoming-handler@0.2.9` | export-only (world export, not an import) | stable |
 | `wasi:http/outgoing-handler@0.2.9` | bound | stable |
 | `wasi:http/types@0.2.9` | bound | stable |
 | `wasi:io/error@0.2.9` | bound | stable |
@@ -481,7 +481,7 @@ The 2 unbound STABLE interfaces at `0.2.12` are listed here by name; every one i
 | `wasi:clocks/wall-clock@0.2.10` | bound | stable |
 | `wasi:filesystem/preopens@0.2.10` | bound | stable |
 | `wasi:filesystem/types@0.2.10` | bound | stable |
-| `wasi:http/incoming-handler@0.2.10` | excluded by decision | stable |
+| `wasi:http/incoming-handler@0.2.10` | export-only (world export, not an import) | stable |
 | `wasi:http/outgoing-handler@0.2.10` | bound | stable |
 | `wasi:http/types@0.2.10` | bound | stable |
 | `wasi:io/error@0.2.10` | bound | stable |
@@ -518,7 +518,7 @@ The 2 unbound STABLE interfaces at `0.2.12` are listed here by name; every one i
 | `wasi:clocks/wall-clock@0.2.11` | bound | stable |
 | `wasi:filesystem/preopens@0.2.11` | bound | stable |
 | `wasi:filesystem/types@0.2.11` | bound | stable |
-| `wasi:http/incoming-handler@0.2.11` | excluded by decision | stable |
+| `wasi:http/incoming-handler@0.2.11` | export-only (world export, not an import) | stable |
 | `wasi:http/outgoing-handler@0.2.11` | bound | stable |
 | `wasi:http/types@0.2.11` | bound | stable |
 | `wasi:io/error@0.2.11` | bound | stable |
@@ -555,7 +555,7 @@ The 2 unbound STABLE interfaces at `0.2.12` are listed here by name; every one i
 | `wasi:clocks/wall-clock@0.2.12` | bound | stable |
 | `wasi:filesystem/preopens@0.2.12` | bound | stable |
 | `wasi:filesystem/types@0.2.12` | bound | stable |
-| `wasi:http/incoming-handler@0.2.12` | excluded by decision | stable |
+| `wasi:http/incoming-handler@0.2.12` | export-only (world export, not an import) | stable |
 | `wasi:http/outgoing-handler@0.2.12` | bound | stable |
 | `wasi:http/types@0.2.12` | bound | stable |
 | `wasi:io/error@0.2.12` | bound | stable |
@@ -650,7 +650,6 @@ Interfaces parsed from `specs/wasi/wasi-wit-0.3.2/`; `provided` is the `%wasi-pr
 | interface | release dirs | reason |
 |---|---|---|
 | `wasi:clocks/timezone` | 0.2.1-0.2.12, 0.3.2 | `@unstable`, feature-gated off (`specs/lock.toml`) |
-| `wasi:http/incoming-handler` | 0.2.0-0.2.12 | `wasi:http` removed (decision; `specs/lock.toml` [status] wasi-http) |
 
 ### Not implemented
 
@@ -660,8 +659,9 @@ None.
 
 | interface | release dirs | why no provider entry |
 |---|---|---|
-| `wasi:cli/run` | 0.2.0-0.2.12, 0.3.2 | the command world EXPORTS it; the runtime serves the export, so no import provider exists |
+| `wasi:cli/run` | 0.2.0-0.2.12, 0.3.2 | a WASI world EXPORTS it (the CLI command world's `run`, the HTTP proxy world's `incoming-handler`); the runtime serves the export, so no import provider exists |
 | `wasi:cli/types` | 0.3.2 | declares no function and no resource; a guest resolves its types structurally |
+| `wasi:http/incoming-handler` | 0.2.0-0.2.12 | a WASI world EXPORTS it (the CLI command world's `run`, the HTTP proxy world's `incoming-handler`); the runtime serves the export, so no import provider exists |
 
 ## Baseline opcode coverage
 

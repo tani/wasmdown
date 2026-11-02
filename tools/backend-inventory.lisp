@@ -89,16 +89,39 @@
           (when pkg (setf rows (append (interface-records pkg) rows)))))
       (dolist (row (sort (remove-duplicates rows :test #'equal) #'string< :key #'car))
         (emit "P2-VEND" version (first row) (second row))))
-    ;; what the command world EXPORTS at this version (a world export is
-    ;; not an import and therefore never a builder entry)
+    ;; what the worlds EXPORT at this version (a world export is not an
+    ;; import and therefore never a builder entry). The command world
+    ;; exports `run'; the proxy world exports `incoming-handler', which
+    ;; the serve path drives host-side.
     (let ((names '()))
-      (handler-case
-          (dolist (item (wasmdown.wit:wit-world-exports
-                         (wasmdown.wasi::preview2-command-world :version version)))
-            (let ((target (wasmdown.wit:wit-world-item-target item)))
-              (when (wasmdown.wit:wit-interface-p target)
-                (push (wasmdown.wit:interface-import-name target) names))))
-        (error (e) (format *error-output* "P2 world ~a: ~a~%" version e)))
+      (dolist (world (list (handler-case
+                               (wasmdown.wasi::preview2-command-world
+                                :version version)
+                             (error () nil))
+                           (handler-case
+                               (wasmdown.wasi::preview2-proxy-world
+                                :version version)
+                             (error () nil))))
+        (when world
+          (handler-case
+              (dolist (item (wasmdown.wit:wit-world-exports world))
+                (let ((target (wasmdown.wit:wit-world-item-target item)))
+                  (when (wasmdown.wit:wit-interface-p target)
+                    (push (wasmdown.wit:interface-import-name target) names))))
+            (error (e) (format *error-output* "P2 world ~a: ~a~%"
+                               version e)))))
+      ;; A release whose proxy world references dependency patch versions
+      ;; the pinned tree does not vendor (0.2.4's http names 0.2.3 clocks)
+      ;; cannot resolve; its exported `incoming-handler' is still the
+      ;; interface parsed from that release directory.
+      (unless (find-if (lambda (n) (search "/incoming-handler@" n))
+                       names)
+        (let ((iface (handler-case
+                         (wasmdown.wasi:p2-interface
+                          "http" "incoming-handler" version)
+                       (error () nil))))
+          (when iface
+            (push (wasmdown.wit:interface-import-name iface) names))))
       (dolist (n (sort (remove-duplicates names :test #'string=) #'string<))
         (emit "P2-EXPORT" version n)))
     ;; what the builder registry actually binds at this exact version

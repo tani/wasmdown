@@ -9114,9 +9114,10 @@ HOST-OCTETS PORT). Signals HOST-ERROR on a malformed spec."
         (cons lower nil)
         (cons "other" name))))
 
-(defun %serve-read-chunked-body (r)
+(defun %serve-read-chunked-body (r &optional trailers-out)
   "Decode a chunked request body; returns the byte list. Chunk
-extensions and trailers are skipped."
+extensions are skipped. When TRAILERS-OUT is a cons, its car is set to
+the trailer section as (name . value-bytes) entries (else NIL)."
   (let ((out '()))
     (loop
       (let* ((line (%hr-line r :timeout-ms 30000))
@@ -9129,8 +9130,20 @@ extensions and trailers are skipped."
         (let ((size (parse-integer hex :radix 16)))
           (when (zerop size)
             ;; trailer section
-            (loop for trailer = (%hr-line r :timeout-ms 30000)
-                  until (and (stringp trailer) (zerop (length trailer))))
+            (let ((trailers '()))
+              (loop for trailer = (%hr-line r :timeout-ms 30000)
+                    until (and (stringp trailer) (zerop (length trailer)))
+                    do (let ((colon (and (stringp trailer)
+                                         (position #\: trailer))))
+                         (when colon
+                           (let ((name (subseq trailer 0 colon))
+                                 (value (string-trim
+                                         '(#\Space #\Tab)
+                                         (subseq trailer (1+ colon)))))
+                             (when (%http-token-p name)
+                               (push (cons name (map 'list #'char-code value))
+                                     trailers))))))
+              (when trailers-out (setf (car trailers-out) (nreverse trailers))))
             (return out))
           (when (> (+ (length out) size) +serve-max-body-bytes+)
             (%http-error (%http-code "HTTP-request-body-size")))
@@ -9163,9 +9176,10 @@ Signals WASI-HTTP-ERROR on a malformed request."
                                       (%http-bytes->string (car (last te))))
                          "chunked"))))
                (length (%http-content-length fields))
+               (trailers (list nil))
                (body
                  (cond
-                   (chunked-p (%serve-read-chunked-body r))
+                   (chunked-p (%serve-read-chunked-body r trailers))
                    ((and length (plusp length))
                     (when (> length +serve-max-body-bytes+)
                       (%http-error (%http-code "HTTP-request-body-size")))
@@ -9180,6 +9194,7 @@ Signals WASI-HTTP-ERROR on a malformed request."
            :version (third parts)
            :headers (wasi-fields-entries fields)
            :authority authority
+           :trailers (car trailers)
            :body body))))))
 
 ;;; ---------------------------------------------------------------
@@ -9193,6 +9208,7 @@ incoming `request')."
   (version "HTTP/1.1")
   (headers nil)                       ; (name . value-bytes) entries
   (authority nil)
+  (trailers nil)                      ; (name . value-bytes) entries
   (body '()))                         ; u8 list
 
 (defun %serve-request-resource (incoming &key (package (wasi-package "http")))

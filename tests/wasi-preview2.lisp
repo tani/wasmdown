@@ -1668,3 +1668,327 @@ types."
                    (p2-call types "http-error-code"
                             (wasmdown.wasi:p2-error "plain")))))
       (wasmdown.wasi:close-wasi-context ctx))))
+
+;;; ---- the serve side: incoming-handler@0.2.x ------------------------
+
+(defun p2-serve-test-comp (&key (version "0.2.12")
+                                (imports '("wasi:io/poll@0.2.12"
+                                           "wasi:clocks/monotonic-clock@0.2.12"
+                                           "wasi:clocks/wall-clock@0.2.12"
+                                           "wasi:random/random@0.2.12"
+                                           "wasi:io/error@0.2.12"
+                                           "wasi:io/streams@0.2.12"
+                                           "wasi:cli/stdout@0.2.12"
+                                           "wasi:cli/stderr@0.2.12"
+                                           "wasi:cli/stdin@0.2.12"
+                                           "wasi:http/types@0.2.12"
+                                           "wasi:http/outgoing-handler@0.2.12"))
+                                (exports '("wasi:http/incoming-handler@0.2.12")))
+  "A decoded-component stand-in carrying only the import/export names
+the serve composition and dispatch inspect (no binary, no code)."
+  (wasmdown.component:make-comp
+   :defs
+   (coerce
+    (append
+     (loop for name in imports
+           collect (wasmdown.component:make-compdef
+                    :kind :import
+                    :payload (wasmdown.component:make-importrec
+                              :name name :type (cons :func 0))))
+     (loop for name in exports
+           collect (wasmdown.component:make-compdef
+                    :kind :export
+                    :payload (wasmdown.component:make-exportrec
+                              :name name :sortidx (cons :func 0)))))
+    'vector)))
+
+(defun p2-serve-test-handler (ctx version capture
+                              &key (status 200) (body "hello") trailers)
+  "A host `incoming-handler.handle' that consumes the incoming request,
+records method/path/host/body/trailers in CAPTURE, and sets a response
+through the real P2 types provider."
+  (let ((types (wasmdown.wasi:p2-http-types-instance ctx version))
+        (streams (wasmdown.wasi:p2-streams-instance ctx version)))
+    (wasmdown.wasi:provider-instance
+     (wasmdown.wasi:p2-interface "http" "incoming-handler" version)
+     (list
+      (cons "handle"
+            (lambda (request outparam)
+              (let* ((req (p2-http-marker-rep request))
+                     (method (p2-call types
+                                      "[method]incoming-request.method"
+                                      req))
+                     (path (p2-call types
+                                    "[method]incoming-request.path-with-query"
+                                    req))
+                     (header-fields
+                       (p2-http-marker-rep
+                        (p2-call types
+                                 "[method]incoming-request.headers" req)))
+                     (host (p2-call types "[method]fields.get"
+                                    header-fields "host"))
+                     (body-result (p2-call types
+                                           "[method]incoming-request.consume"
+                                           req))
+                     (ibody (p2-http-marker-rep (cdr body-result)))
+                     (stream (p2-http-marker-rep
+                              (cdr (p2-call types
+                                            "[method]incoming-body.stream"
+                                            ibody))))
+                     (bytes (p2-http-read-all ctx stream))
+                     (future (p2-http-marker-rep
+                              (p2-call types
+                                       "[static]incoming-body.finish"
+                                       ibody)))
+                     (trailer-value (p2-call types
+                                             "[method]future-trailers.get"
+                                             future)))
+                (setf (car capture)
+                      (list method path host (p2-http-bytes-string bytes)
+                            trailer-value))
+                (let* ((fields (p2-http-fields types
+                                               '("content-type"
+                                                 (116 101 120 116 47 112 108 97 105 110))))
+                       (response (p2-http-marker-rep
+                                  (p2-call types
+                                           "[constructor]outgoing-response"
+                                           fields))))
+                  (p2-call types "[method]outgoing-response.set-status-code"
+                           response status)
+                  (let* ((obody (p2-http-marker-rep
+                                 (cdr (p2-call types
+                                               "[method]outgoing-response.body"
+                                               response)))))
+                    (when (and body (plusp (length body)))
+                      (let ((out (p2-http-marker-rep
+                                  (cdr (p2-call types
+                                                "[method]outgoing-body.write"
+                                                obody)))))
+                        (p2-call streams "[method]output-stream.check-write" out)
+                        (p2-call streams "[method]output-stream.write" out
+                                 (map 'list #'char-code body))))
+                    (p2-call types "[static]outgoing-body.finish" obody
+                             (if trailers
+                                 (p2-http-fields types
+                                                 (list "x-trail"
+                                                       (list 116)))
+                                 :none))
+                    (p2-call types "[static]response-outparam.set"
+                             outparam (cons :ok response))))))))
+     :packages (wasmdown.wasi::p2-packages version))))
+
+(defun p2-serve-test-request (port text)
+  "Send TEXT over a fresh loopback TCP connection to PORT and return
+the whole response as a string."
+  (let ((conn (wasmdown.wasi::%http-plain-connect
+               "127.0.0.1" port
+               (list :ipv4 '(127 0 0 1) port) 5000)))
+    (unwind-protect
+         (progn
+           (funcall (wasmdown.wasi::wasi-http-connection-write-fn conn)
+                    (map 'list #'char-code text))
+           (let ((out '()))
+             (loop
+               (multiple-value-bind (bytes status)
+                   (funcall (wasmdown.wasi::wasi-http-connection-read-fn conn)
+                            65536 5000)
+                 (cond
+                   ((eq status :ok) (setf out (nconc out bytes)))
+                   (t (return (map 'string #'code-char out))))))))
+      (wasmdown.wasi::%http-connection-close conn))))
+
+(defun p2-serve-test-loopback (handler version request-text)
+  "Run the P2 accept loop over a fresh listener, send REQUEST-TEXT, and
+return the response string."
+  (multiple-value-bind (port fd) (p2-http-listener)
+    (let ((wasmdown.wasi::*serve-stop* nil)
+          (thread
+            (sb-thread:make-thread
+             (lambda ()
+               (wasmdown.wasi::%p2-serve-accept-loop fd handler version))
+             :name "p2-serve-test")))
+      (unwind-protect
+           (p2-serve-test-request port request-text)
+        (setf wasmdown.wasi::*serve-stop* t)
+        (ignore-errors (sb-thread:join-thread thread :timeout 3))
+        (wasmdown.wasi::%close-fd fd)))))
+
+(test wasi-preview2/http-serve-providers-complete
+  (let* ((comp (p2-serve-test-comp))
+         (ctx (wasmdown.wasi:make-wasi-context)))
+    (unwind-protect
+         (let* ((providers (wasmdown.wasi:preview2-serve-providers ctx comp))
+                (names (mapcar #'car providers)))
+           (is (wasmdown.wasi:preview2-serve-p comp))
+           ;; every declared proxy-world import is bound, exactly once
+           (is (= 11 (length names)))
+           (is (member "wasi:http/types@0.2.12" names :test #'string=))
+           (is (member "wasi:http/outgoing-handler@0.2.12" names
+                       :test #'string=))
+           (is (member "wasi:io/streams@0.2.12" names :test #'string=))
+           (is (member "wasi:cli/stdin@0.2.12" names :test #'string=))
+           (is (member "wasi:clocks/monotonic-clock@0.2.12" names
+                       :test #'string=))
+           (is (member "wasi:random/random@0.2.12" names :test #'string=))
+           ;; declaration order is preserved
+           (is (equal names
+                      '("wasi:io/poll@0.2.12"
+                        "wasi:clocks/monotonic-clock@0.2.12"
+                        "wasi:clocks/wall-clock@0.2.12"
+                        "wasi:random/random@0.2.12"
+                        "wasi:io/error@0.2.12"
+                        "wasi:io/streams@0.2.12"
+                        "wasi:cli/stdout@0.2.12"
+                        "wasi:cli/stderr@0.2.12"
+                        "wasi:cli/stdin@0.2.12"
+                        "wasi:http/types@0.2.12"
+                        "wasi:http/outgoing-handler@0.2.12")))
+           ;; the exported handler interface is never an import provider
+           (is (not (member "wasi:http/incoming-handler@0.2.12" names
+                            :test #'string=))))
+      (wasmdown.wasi:close-wasi-context ctx)))
+  ;; mixed patch versions compose per version
+  (let* ((comp (p2-serve-test-comp
+                :imports '("wasi:io/streams@0.2.5"
+                           "wasi:http/types@0.2.9"
+                           "wasi:cli/stdin@0.2.5")))
+         (ctx (wasmdown.wasi:make-wasi-context)))
+    (unwind-protect
+         (let ((names (mapcar #'car
+                              (wasmdown.wasi:preview2-serve-providers
+                               ctx comp))))
+           (is (equal '("wasi:io/streams@0.2.5"
+                        "wasi:http/types@0.2.9"
+                        "wasi:cli/stdin@0.2.5")
+                      names)))
+      (wasmdown.wasi:close-wasi-context ctx))))
+
+(test wasi-preview2/http-response-outparam-capture
+  (let ((ctx (wasmdown.wasi:make-wasi-context)))
+    (unwind-protect
+         (let* ((types (wasmdown.wasi:p2-http-types-instance ctx "0.2.12"))
+                (captured (list :unset))
+                (outparam
+                  (wasmdown.wasi:make-p2-http-response-outparam
+                   :set-fn (lambda (value) (setf (car captured) value))))
+                (fields (p2-http-fields types))
+                (response (p2-http-marker-rep
+                           (p2-call types "[constructor]outgoing-response"
+                                    fields))))
+           ;; a direct host call passes the rep; the provider must
+           ;; capture it, not silently no-op on the marker shape
+           (p2-call types "[static]response-outparam.set"
+                    outparam (cons :ok response))
+           (is (eq :ok (car (car captured))))
+           (is (eq response (cdr (car captured))))
+           ;; an error-code response is captured as err
+           (let ((code (cons "internal-error" nil)))
+             (p2-call types "[static]response-outparam.set"
+                      outparam (cons :err code))
+             (is (equal (cons :err code) (car captured)))))
+      (wasmdown.wasi:close-wasi-context ctx))))
+
+(test wasi-preview2/http-serve-loopback
+  (let ((ctx (wasmdown.wasi:make-wasi-context))
+        (capture (list nil)))
+    (unwind-protect
+         (let* ((version "0.2.12")
+                (instance (p2-serve-test-handler ctx version capture
+                                                 :status 201 :body "world"
+                                                 :trailers t))
+                (handler
+                  (wasmdown.component.runtime:runtime-export-value
+                   instance "handle"))
+                (request
+                  (let ((crlf (format nil "~c~c" #\Return #\Newline)))
+                    (format nil
+                            "POST /echo?x=1 HTTP/1.1~aHost: 127.0.0.1~aTransfer-Encoding: chunked~a~a5~ahello~a0~aX-Req-Trail: v~a~a"
+                            crlf crlf crlf crlf crlf crlf crlf crlf crlf)))
+                (response (p2-serve-test-loopback handler version request)))
+           ;; the guest saw the parsed request and its buffered body
+           (destructuring-bind (method path host body trailers) (car capture)
+             (is (equal '("post") method))
+             (is (equal (cons :some "/echo?x=1") path))
+             (is (equal '((49 50 55 46 48 46 48 46 49)) host))
+             (is (string= "hello" body))
+             ;; the chunked request's trailer section reached
+             ;; incoming-body.finish as a fields resource
+             (is (eq :some (car trailers)))
+             (is (eq :ok (car (cdr trailers))))
+             (let* ((opt (cddr (cdr trailers)))
+                    (fields (p2-http-marker-rep (cdr opt))))
+               (is (eq :some (car opt)))
+               (is (equal '((118))
+                          (p2-call (wasmdown.wasi:p2-http-types-instance
+                                    ctx version)
+                                   "[method]fields.get" fields
+                                   "x-req-trail")))))
+           ;; status, headers and the chunked response body
+           (is (search "HTTP/1.1 201 Created" response))
+           (is (search "content-type: text/plain" response))
+           (is (search "Transfer-Encoding: chunked" response))
+           (is (search "5" response))
+           (is (search "world" response))
+           (is (search "x-trail: t" response))
+           (is (not (search "Content-Length" response))))
+      (wasmdown.wasi:close-wasi-context ctx))))
+
+(test wasi-preview2/http-serve-loopback-unset-outparam
+  ;; the WIT contract: a handler that never sets the outparam makes the
+  ;; host answer 500 (never hang)
+  (let* ((ctx (wasmdown.wasi:make-wasi-context))
+         (version "0.2.12")
+         (instance
+           (wasmdown.wasi:provider-instance
+            (wasmdown.wasi:p2-interface "http" "incoming-handler" version)
+            (list (cons "handle" (lambda (request outparam)
+                                   (declare (ignore request outparam))
+                                   nil)))
+            :packages (wasmdown.wasi::p2-packages version)))
+         (handler
+           (wasmdown.component.runtime:runtime-export-value
+            instance "handle"))
+         (response
+           (p2-serve-test-loopback
+            handler version
+            (let ((crlf (format nil "~c~c" #\Return #\Newline)))
+              (format nil "GET / HTTP/1.1~aHost: h~a~a"
+                      crlf crlf crlf)))))
+    (unwind-protect
+         (progn
+           (is (search "HTTP/1.1 500 Internal Server Error" response))
+           (is (search "Content-Length: 0" response)))
+      (wasmdown.wasi:close-wasi-context ctx))))
+
+(test wasi-preview2/http-incoming-handler-export-lookup
+  (let* ((version "0.2.12")
+         (iface (wasmdown.wasi:p2-interface "http" "incoming-handler" version))
+         (provider
+           (wasmdown.wasi:provider-instance
+            iface
+            (list (cons "handle"
+                        (lambda (request outparam)
+                          (declare (ignore request outparam))
+                          nil)))
+            :packages (wasmdown.wasi::p2-packages version)))
+         (inst (wasmdown.component.runtime:make-comp-instance))
+         (name (format nil "wasi:http/incoming-handler@~a" version)))
+    (setf (gethash name
+                   (wasmdown.component.runtime:comp-instance-exports inst))
+          (cons :instance provider))
+    (multiple-value-bind (handler found-version)
+        (wasmdown.wasi:p2-incoming-handler-export inst)
+      (is (wasmdown.component.runtime:lifted-func-p handler))
+      (is (string= version found-version)))
+    ;; the interface name is only an export: a plain `handle' key is
+    ;; a last-resort direct export, and an empty instance exports none
+    (let ((bare (wasmdown.component.runtime:make-comp-instance)))
+      (setf (gethash "handle"
+                     (wasmdown.component.runtime:comp-instance-exports bare))
+            (cons :func
+                  (wasmdown.wasi:provider-instance-function provider
+                                                            "handle")))
+      (is (wasmdown.component.runtime:lifted-func-p
+           (wasmdown.wasi:p2-incoming-handler-export bare)))
+      (is (null (wasmdown.wasi:p2-incoming-handler-export
+                 (wasmdown.component.runtime:make-comp-instance)))))))

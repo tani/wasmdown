@@ -80,14 +80,25 @@ The 0.2 line serves the **outgoing** HTTP surface: `wasi:http/types@0.2.x`
 patch version (`0.2.0` … `0.2.12`). Requests go through the same HTTP/1.1
 transport and `wasi-network` authority as the 0.3 line; bodies are P2
 `input-stream`/`output-stream` resources and the two futures expose
-`subscribe` pollables. `wasi:http/incoming-handler@0.2.x` (the serve side)
-remains unimplemented, so a 0.2 proxy world's exported handler is still the
-embedder's obligation.
+`subscribe` pollables. The **incoming** side is served too:
+`wasi:http/incoming-handler@0.2.x.handle` is a synchronous export, so a 0.2
+proxy-world component is instantiated with the exact-version P2 providers
+(io/clocks/random/cli/stdout/stderr/stdin + http/types +
+http/outgoing-handler) and driven by `wasmdown serve`. The host buffers the
+HTTP/1.1 request (Content-Length or chunked, trailers included), builds the
+`incoming-request` resource, calls `handle(request, response-outparam)`,
+captures `response-outparam.set`, then serializes the captured
+`outgoing-response` status, headers, body and trailers. An unset outparam or
+a handler trap answers 500. The inventory records `incoming-handler` as an
+export-only interface (it is a world export, never an import provider).
 
 ## Serving HTTP
 
-`serve` instantiates a `wasi:http/service` component and serves HTTP/1.1
-until SIGINT. The URL is the **first stderr line**, before any guest output:
+`serve` dispatches on the component's exports: a service-world component
+exporting `wasi:http/handler` runs the 0.3 path, while a proxy-world
+component exporting `wasi:http/incoming-handler@0.2.x` runs the 0.2 path
+(`serve-preview2-component`). Both serve HTTP/1.1 until SIGINT, and the URL
+is the **first stderr line**, before any guest output:
 
 ```sh
 sbcl --script tools/wasmdown.lisp serve service.wasm \
@@ -100,7 +111,11 @@ kernel-assigned port. The same capability flags as `run` apply (`--dir`,
 `--env`, `--net`, `--listen`, `--dns`); a request body is buffered before the
 guest handler call, and the response status, headers and buffered body are
 serialized from the returned `response` resource (the body is read from the
-response's contents stream after its writer drops it). `--http-transport` is
+response's contents stream after its writer drops it). On the 0.2 path the
+response body is collected from the `outgoing-body` output-stream and
+trailers from `outgoing-body.finish`; a non-empty trailer section switches
+the reply to chunked encoding, and request chunked trailers are exposed
+through `incoming-body.finish`'s `future-trailers`. `--http-transport` is
 refused: TLS transports are embedder-only (`:http-transports` on the
 `wasi-context`).
 

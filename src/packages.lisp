@@ -502,6 +502,11 @@
    #:preview2-world-provider
    #:preview2-proxy-provider
    #:preview2-http-imports-provider
+   ;; wasi:http/incoming-handler@0.2 — the serve side
+   #:preview2-serve-p
+   #:preview2-serve-providers
+   #:p2-incoming-handler-export
+   #:serve-preview2-component
    ;; incoming-handler-side construction helpers (no handler provider yet)
    #:make-p2-http-incoming-request
    #:make-p2-http-response-outparam

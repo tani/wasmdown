@@ -2390,6 +2390,20 @@ handle the guest was not given can never widen its authority."
   "Resolve a BORROWED resource argument of type NAME."
   (p2-resource-rep (p2-http-resource-ct version name) value name))
 
+(defun %p2-http-own-rep (version value name)
+  "Resolve an OWN resource argument to its rep. VALUE is a handle index
+(the canonical ABI), an abstract (:own-handle ct rep) marker (a direct
+host call), or the rep itself. NIL when the handle does not resolve."
+  (let ((ct (p2-http-resource-ct version name)))
+    (cond
+      ((integerp value)
+       (multiple-value-bind (rep found)
+           (wasmdown.component.runtime:host-resource-take ct value)
+         (or (and found rep)
+             (ignore-errors (p2-resource-rep ct value name)))))
+      ((and (consp value) (eq (car value) :own-handle)) (third value))
+      (t value))))
+
 (defun p2-http-fields-marker (version fields)
   "An immutable P2 `fields' handle over FIELDS."
   (%fields-immutable-view fields :package (p2-http-package version)))
@@ -3208,23 +3222,25 @@ the 0.2 interface, including the incoming-handler-facing ones."
               ;; ---- response-outparam
               (cons "[static]response-outparam.set"
                     (lambda (param response)
-                      (let* ((p (p2-http-take version param "response-outparam"))
+                      (let* ((p (%p2-http-own-rep
+                                 version param "response-outparam"))
                              (fn (and (p2-http-response-outparam-p p)
                                       (p2-http-response-outparam-set-fn p)))
                              (value
                                (cond
                                  ((and (consp response)
                                        (eq (car response) :ok))
-                                  (let ((r (cdr response)))
-                                    (cons :ok
-                                          (if (and (consp r)
-                                                   (eq (car r) :own-handle))
-                                              (third r)
-                                              r))))
+                                  (cons :ok
+                                        (%p2-http-own-rep
+                                         version (cdr response)
+                                         "outgoing-response")))
                                  ((and (consp response)
                                        (eq (car response) :err))
                                   (cons :err (cdr response)))
-                                 (t (cons :ok response)))))
+                                 (t (cons :ok
+                                          (%p2-http-own-rep
+                                           version response
+                                           "outgoing-response"))))))
                         (when fn (funcall fn value))
                         nil)))
               ;; ---- incoming-response
@@ -3397,3 +3413,401 @@ incoming-handler."
     (bind "outgoing-handler"
           (lambda () (p2-http-outgoing-handler-instance context version)))
     builders))
+
+;;; ===============================================================
+;;; wasi:http/incoming-handler@0.2.x — THE SERVE SIDE.
+;;;
+;;; A 0.2 proxy-world component IMPORTS the io/clocks/random/cli
+;;; surface plus `wasi:http/types' and `wasi:http/outgoing-handler',
+;;; and EXPORTS `wasi:http/incoming-handler@<version>'. Its `handle'
+;;; is a SYNC function: the host parses one HTTP/1.1 request, builds
+;;; an `incoming-request' resource whose body is already buffered,
+;;; calls `handle(request, response-outparam)', and then serializes
+;;; whatever the guest passed to `response-outparam.set'. The
+;;; response body is collected from the offspring `outgoing-body'
+;;; output-stream; trailers come from `outgoing-body.finish'.
+;;;
+;;; This section reuses the 0.3 serve helpers for listener setup,
+;;; HTTP/1.1 parsing, URL printing, SIGINT handling and status
+;;; mapping. Only the request/response resource shapes are P2's.
+
+(defparameter +p2-incoming-handler-prefix+ "wasi:http/incoming-handler"
+  "The interface name a proxy-world component exports.")
+
+(defun %p2-incoming-handler-name-parts (name)
+  "For an export NAME of `wasi:http/incoming-handler[@<version>]',
+return (values :versioned VERSION) or (values :unversioned NIL).
+NIL for every other name."
+  (when (and (stringp name)
+             (eql 0 (search +p2-incoming-handler-prefix+ name :test #'char=)))
+    (let* ((n (length +p2-incoming-handler-prefix+))
+           (rest (subseq name n)))
+      (cond
+        ((zerop (length rest)) (values :unversioned nil))
+        ((and (char= (char rest 0) #\@)
+              (> (length rest) 1))
+         (let ((version (subseq rest 1)))
+           (when (p2-version-p version)
+             (values :versioned version))))
+        (t nil)))))
+
+(defun preview2-serve-p (comp)
+  "T when COMP's decoded export table names a
+`wasi:http/incoming-handler[@<version>]' interface, i.e. the component
+is a 0.2 proxy-world guest the P2 serve path must drive."
+  (loop for def across (wasmdown.component:comp-defs comp)
+        thereis (and (eq (wasmdown.component:compdef-kind def) :export)
+                     (%p2-incoming-handler-name-parts
+                      (wasmdown.component:exportrec-name
+                       (wasmdown.component:compdef-payload def))))))
+
+(defun p2-component-default-version (comp &key (default "0.2.12"))
+  "The exact 0.2 patch version COMP declares, or DEFAULT. Used as the
+resource-type version when the exported interface name is unversioned."
+  (or (loop for name in (declared-component-imports comp)
+            for (short iface version) = (multiple-value-list
+                                         (p2-import-name-parts name))
+            when (and short iface version (p2-version-p version)
+                      (eql 0 (search "0.2." version)))
+              return version)
+      default))
+
+(defun preview2-serve-providers (context comp)
+  "The provider graph of a P2 proxy-world component: every DECLARED
+`wasi:' import bound at its OWN exact patch version, using the proxy
+world's interface set (io/streams, io/poll, io/error, clocks, random,
+cli stdio, http/types, http/outgoing-handler). Mixed patch versions
+compose per version, exactly as the command path does. A declared
+import outside the 0.2 line is a link error naming it."
+  (let* ((names (declared-component-imports comp))
+         (wasi-names (remove-if-not
+                      (lambda (n) (and (stringp n)
+                                       (eql 0 (search "wasi:" n))))
+                      names))
+         (by-version (make-hash-table :test #'equal))
+         (versions '())
+         (providers '()))
+    (dolist (name wasi-names)
+      (multiple-value-bind (short iface version)
+          (p2-import-name-parts name)
+        (declare (ignore short iface))
+        (unless (and version (p2-version-p version)
+                     (eql 0 (search "0.2." version)))
+          (error 'wasmdown:link-error
+                 :message
+                 (format nil "serve: declared import `~a` is not an exact WASI 0.2 release interface"
+                         name)))
+        (unless (member version versions :test #'string=)
+          (push version versions))
+        (push name (gethash version by-version))))
+    (dolist (version (nreverse versions))
+      ;; P2-PROVIDER-FOR-DECLARED is the proxy world's own registry
+      ;; path; resolving the world would reject a release whose
+      ;; dependencies name patch versions the pinned tree does not
+      ;; vendor (0.2.4), even though every declared interface binds.
+      (dolist (pair
+               (p2-provider-for-declared
+                context version
+                (nreverse (gethash version by-version))))
+        (push pair providers)))
+    ;; declaration order, so instantiation sees the same contract order
+    (loop for name in wasi-names
+          for hit = (assoc name providers :test #'string=)
+          when hit collect hit)))
+
+(defun p2-incoming-handler-export (instance
+                                   &key (fallback-version "0.2.12"))
+  "The exported `wasi:http/incoming-handler' `handle' of INSTANCE and
+the exact version it was exported under. The newest versioned export
+wins; an unversioned export uses FALLBACK-VERSION; a direct top-level
+`handle' is the last resort. NIL when the component exports none."
+  (let ((versioned '())
+        (unversioned nil)
+        (direct nil))
+    (maphash
+     (lambda (name entry)
+       (when (stringp name)
+         (cond
+           ((string= name "handle") (setf direct (cdr entry)))
+           (t
+            (multiple-value-bind (kind version)
+                (%p2-incoming-handler-name-parts name)
+              (case kind
+                (:unversioned (setf unversioned (cdr entry)))
+                (:versioned (push (cons version (cdr entry)) versioned))))))))
+     (wasmdown.component.runtime:comp-instance-exports instance))
+    (flet ((handler-of (source)
+             (and source (%handler-export-value source))))
+      (let ((winner
+              (loop for (version . source) in
+                    (stable-sort versioned
+                                 (lambda (a b)
+                                   (wasmdown.wit:wit-version< (car b) (car a))))
+                    for handler = (handler-of source)
+                    when handler
+                      return (cons handler version))))
+        (cond
+          (winner (values (car winner) (cdr winner)))
+          ((handler-of unversioned)
+           (values (handler-of unversioned) fallback-version))
+          ((wasmdown.component.runtime:lifted-func-p direct)
+           (values direct fallback-version)))))))
+
+;;; ---------------------------------------------------------------
+;;; The incoming request resource and the response capture.
+
+(defun %p2-serve-incoming-request (version incoming)
+  "The `incoming-request' rep for the parsed INCOMING request. The body
+is a buffered P2 incoming-body (bytes + chunked trailers), so the
+guest's `consume' and `stream' are served without touching the socket."
+  (let* ((header-entries (wasi-http-incoming-headers incoming))
+         (trailer-entries (wasi-http-incoming-trailers incoming))
+         (headers (make-wasi-fields :entries header-entries
+                                    :mutable-p nil))
+         (trailers (and trailer-entries
+                        (make-wasi-fields :entries trailer-entries
+                                          :mutable-p nil)))
+         (body (%make-p2-http-incoming-body
+                :bytes (coerce (wasi-http-incoming-body incoming)
+                               'vector)
+                :explicit-trailers trailers))
+         (authority (wasi-http-incoming-authority incoming)))
+    (make-p2-http-incoming-request
+     :method (%serve-method-value (wasi-http-incoming-method incoming))
+     :path-with-query (cons :some (wasi-http-incoming-path incoming))
+     :scheme (cons :some (list "HTTP"))
+     :authority (if authority (cons :some authority) :none)
+     :headers headers
+     :body body)))
+
+(defun %p2-serve-exchange (handler version incoming)
+  "Construct the request/response-outparam pair for INCOMING, call the
+guest HANDLER synchronously, and return (values RESPONSE ERROR-CODE)
+from the captured `response-outparam.set'. An unset outparam is an
+internal error, per the WIT's contract."
+  (let* ((request (%p2-serve-incoming-request version incoming))
+         (captured (list :unset))
+         (outparam
+           (make-p2-http-response-outparam
+            :set-fn (lambda (value) (setf (car captured) value))))
+         (request-ct (p2-http-resource-ct version "incoming-request"))
+         (outparam-ct (p2-http-resource-ct version "response-outparam")))
+    (handler-case
+        (progn
+          (wasmdown.component.runtime:lifted-func-call
+           handler
+           (list :own-handle request-ct request)
+           (list :own-handle outparam-ct outparam))
+          (let ((value (car captured)))
+            (cond
+              ((eq value :unset)
+               (values nil
+                       (cons "internal-error"
+                             (cons :some
+                                   "handler did not set response-outparam"))))
+              ((and (consp value) (eq (car value) :err))
+               (values nil (cdr value)))
+              ((and (consp value) (eq (car value) :ok))
+               (let ((response (cdr value)))
+                 (if (p2-http-outgoing-response-p response)
+                     (values response nil)
+                     (values nil
+                             (cons "internal-error"
+                                   (cons :some
+                                         "response-outparam.set: invalid outgoing-response"))))))
+              (t
+               (values nil
+                       (cons "internal-error"
+                             (cons :some
+                                   "response-outparam.set: invalid value")))))))
+      (error (c)
+        (values nil
+                (cons "internal-error"
+                      (cons :some (princ-to-string c))))))))
+
+(defun %p2-serve-response-body (response)
+  "The response's buffered body bytes, in write order."
+  (let ((body (p2-http-outgoing-response-body response)))
+    (when body
+      (loop for chunk in
+            (reverse (p2-http-outgoing-body-body-bytes body))
+            append (copy-list chunk)))))
+
+(defun %p2-serve-response-trailers (response)
+  "The response's trailer fields object, or NIL."
+  (let ((body (p2-http-outgoing-response-body response)))
+    (and body (p2-http-outgoing-body-trailers body))))
+
+;;; ---------------------------------------------------------------
+;;; Response serialization.
+
+(defun %p2-serve-write-response (conn status headers body trailers head-p)
+  "Serialize one HTTP/1.1 response. Guest hop-by-hop/framing headers are
+replaced by the host's own framing: Content-Length when there are no
+trailers, otherwise chunked encoding plus a trailer section. HEAD sends
+the same head but no body."
+  (let* ((entries (remove-if
+                   (lambda (entry)
+                     (member (string-downcase (car entry))
+                             '("connection" "transfer-encoding"
+                               "content-length" "trailer")
+                             :test #'string=))
+                   (or headers '())))
+         (trailer-entries (and trailers (wasi-fields-entries trailers)))
+         (chunked-p (and trailer-entries (not head-p)))
+         (out (make-string-output-stream)))
+    (format out "HTTP/1.1 ~d ~a~c~c"
+            status
+            (or (cdr (assoc status +serve-reasons+)) "OK")
+            #\Return #\Newline)
+    (dolist (entry entries)
+      (format out "~a: ~a~c~c" (car entry)
+              (%http-bytes->string (cdr entry))
+              #\Return #\Newline))
+    (if chunked-p
+        (progn
+          (format out "Transfer-Encoding: chunked~c~c" #\Return #\Newline)
+          (format out "Trailer: ~{~a~^, ~}~c~c"
+                  (mapcar #'car trailer-entries)
+                  #\Return #\Newline))
+        (format out "Content-Length: ~d~c~c" (length body)
+                #\Return #\Newline))
+    (format out "Connection: close~c~c~c~c" #\Return #\Newline
+            #\Return #\Newline)
+    (%http-plain-write (wasi-http-connection-fd conn)
+                       (map 'list #'char-code
+                            (get-output-stream-string out)))
+    (when (and (not head-p) (plusp (length body)))
+      (if chunked-p
+          (progn
+            (%http-plain-write (wasi-http-connection-fd conn)
+                               (map 'list #'char-code
+                                    (format nil "~x~c~c" (length body)
+                                            #\Return #\Newline)))
+            (%http-plain-write (wasi-http-connection-fd conn) body)
+            (%http-plain-write (wasi-http-connection-fd conn)
+                               (list 13 10)))
+          (%http-plain-write (wasi-http-connection-fd conn) body)))
+    (when chunked-p
+      ;; the final chunk and the trailer section
+      (%http-plain-write (wasi-http-connection-fd conn)
+                         (map 'list #'char-code
+                              (format nil "0~c~c" #\Return #\Newline)))
+      (dolist (entry trailer-entries)
+        (%http-plain-write
+         (wasi-http-connection-fd conn)
+         (map 'list #'char-code
+              (format nil "~a: ~a~c~c" (car entry)
+                      (%http-bytes->string (cdr entry))
+                      #\Return #\Newline))))
+      (%http-plain-write (wasi-http-connection-fd conn)
+                         (list 13 10)))
+    nil))
+
+(defun %p2-serve-connection-handle (conn handler version)
+  "One request/response exchange on an accepted CONN."
+  (handler-case
+      (let ((incoming (%serve-read-request conn)))
+        (when incoming
+          (let ((head-p (string-equal
+                         (wasi-http-incoming-method incoming) "HEAD")))
+            (multiple-value-bind (response code)
+                (%p2-serve-exchange handler version incoming)
+              (if response
+                  (multiple-value-bind (status headers body trailers)
+                      (values (p2-http-outgoing-response-status response)
+                              (wasi-fields-entries
+                               (p2-http-outgoing-response-headers response))
+                              (%p2-serve-response-body response)
+                              (%p2-serve-response-trailers response))
+                    (%p2-serve-write-response conn status headers body
+                                              trailers head-p))
+                  (%p2-serve-write-response conn (%serve-error-status code)
+                                            nil nil nil head-p))))))
+    (wasi-http-error (c)
+      (format *error-output* "serve: bad request: ~a~%" c)
+      (ignore-errors
+        (%p2-serve-write-response conn 400 nil nil nil nil)))
+    (wasmdown:wasmdown-error (c)
+      (format *error-output* "serve: handler failed: ~a~%" c)
+      (ignore-errors (%p2-serve-write-response conn 500 nil nil nil nil))))
+  nil)
+
+(defun %p2-serve-accept-loop (fd handler version)
+  "Accept connections until *SERVE-STOP*, handling each synchronously
+(the guest handler serializes through its store anyway)."
+  (loop until *serve-stop*
+        do (let ((revents (%poll-fd fd +pollin+ 100)))
+             (when (and revents (logtest revents +pollin+))
+               (let ((cfd (%libc-accept4 fd (%sock-null) (%sock-null)
+                                         (logior +sock-nonblock+
+                                                 +sock-cloexec+))))
+                 (when (>= cfd 0)
+                   (let ((conn
+                           (make-wasi-http-connection
+                            :fd cfd
+                            :read-fn (lambda (max to)
+                                       (%http-plain-read cfd max to))
+                            :write-fn (lambda (bytes)
+                                        (%http-plain-write cfd bytes))
+                            :close-fn (lambda () (%close-fd cfd)))))
+                     (unwind-protect
+                          (%p2-serve-connection-handle conn handler version)
+                       (%http-connection-close conn))))))))
+  nil)
+
+(defun serve-preview2-component (comp context
+                                 &key providers
+                                   (address "127.0.0.1:0")
+                                   (mode :interpret) (url-stream nil))
+  "Instantiate the validated 0.2 proxy-world COMP under CONTEXT, print
+`http://HOST:PORT' as the FIRST line on the URL stream (default: the
+context's stderr, else *ERROR-OUTPUT*), and serve HTTP/1.1 requests
+until SIGINT. Each request is answered by the exported
+`wasi:http/incoming-handler' `handle' function. Returns 0."
+  (multiple-value-bind (host-octets port) (parse-serve-address address)
+    (let* ((store (wasmdown.component.runtime:make-component-store
+                   :reactor (wasi-context-reactor context)))
+           (providers (or providers
+                          (preview2-serve-providers context comp)))
+           (fallback-version (p2-component-default-version comp))
+           (fd nil)
+           (old-handler nil)
+           (*serve-stop* nil))
+      (unwind-protect
+           (progn
+             (setf old-handler
+                   (sb-sys:enable-interrupt sb-unix:sigint
+                                            #'%serve-interrupt))
+             (multiple-value-setq (fd port)
+               (%serve-open-listener host-octets port))
+             (let* ((instance
+                      (wasmdown.component.runtime:instantiate-component
+                       comp :with-args providers :store store :mode mode))
+                    (handler-version
+                      (multiple-value-list
+                       (p2-incoming-handler-export
+                        instance :fallback-version fallback-version))))
+               (unless (first handler-version)
+                 (error 'wasmdown:link-error
+                        :message
+                        "component exports no wasi:http/incoming-handler `handle' function"))
+               (let* ((stream (or url-stream
+                                  (wasi-context-stderr context)
+                                  *error-output*))
+                      (display-host
+                        (if (equal host-octets '(0 0 0 0))
+                            "127.0.0.1"
+                            (format nil "~{~d~^.~}" host-octets))))
+                 (format stream "http://~a:~d~%" display-host port)
+                 (finish-output stream)
+                 (%p2-serve-accept-loop fd (first handler-version)
+                                        (second handler-version))
+                 0)))
+        (when fd
+          (ignore-errors (%close-fd fd)))
+        (when old-handler
+          (ignore-errors
+            (sb-sys:enable-interrupt sb-unix:sigint old-handler)))
+        (ignore-errors
+          (wasmdown.component.runtime:store-teardown store))))))
