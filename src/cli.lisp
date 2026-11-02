@@ -51,7 +51,7 @@
                   ~10t[--listen ADDR:PORT] [--dns NAME]~%~
                   ~4thelp~%~
                   global options:~%~
-                  ~4t--threads~10tenable the threads proposal (shared memory, atomics)~%~
+                  ~4t--threads~10tenable the threads proposal (shared memory, atomics, WASI thread spawn)~%~
                   exit codes: 0 ok, 1 guest/compile error, 2 usage error~%"))
 
 (defun %usage-error (format-control &rest args)

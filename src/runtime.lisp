@@ -108,7 +108,13 @@ i64 -1."
   ;; unlocked, per the proposal's data-race semantics.
   (lock (sb-thread:make-mutex :name "wasmdown shared memory")
         :read-only t)
-  (wait-table (make-hash-table :test #'eql) :read-only t))
+  (wait-table (make-hash-table :test #'eql) :read-only t)
+  ;; A host-requested termination of every guest thread using this
+  ;; memory: the condition (a WASI exit or a trap) is signalled by
+  ;; MEMORY-ATOMIC-WAIT instead of blocking, so a thread parked in
+  ;; `memory.atomic.wait' observes a host-side proc_exit/trap that
+  ;; happened in ANOTHER thread. NIL while the memory is live.
+  (abort-condition nil))
 
 (defstruct (table-instance (:constructor %make-table-instance))
   "A table of references; ELEMS is a simple vector of func-instances /
@@ -890,6 +896,24 @@ Returns the number of threads notified (0 when none)."
                 (sb-thread:condition-notify (atomic-wait-entry-condvar entry)))
               n))))))
 
+(defun memory-abort-waiters (mem condition)
+  "Terminate every guest thread parked in MEMORY-ATOMIC-WAIT on MEM:
+store CONDITION as the memory's abort condition and wake all current
+waiters. Subsequent and resumed waits signal CONDITION (a WASI exit or
+a trap) instead of blocking. Idempotent: the FIRST condition wins, so
+a proc_exit racing a trap keeps the exit status that unwound first."
+  (when (and mem condition)
+    (sb-thread:with-mutex ((memory-instance-lock mem))
+      (unless (memory-instance-abort-condition mem)
+        (setf (memory-instance-abort-condition mem) condition)
+        (maphash (lambda (ea entry)
+                   (declare (ignore ea))
+                   (dotimes (i (atomic-wait-entry-waiters entry))
+                     (sb-thread:condition-notify
+                      (atomic-wait-entry-condvar entry))))
+                 (memory-instance-wait-table mem)))))
+  (memory-instance-abort-condition mem))
+
 (defun memory-atomic-wait (mem ea width expected timeout)
   "memory.atomic.wait32/64: bounds/alignment checks, the
 shared-memory requirement (a RUNTIME trap, spec threads/atomic.wast),
@@ -909,6 +933,13 @@ slip between them."
         (infinite-p (>= timeout #x8000000000000000)))
     (sb-thread:with-mutex ((memory-instance-lock mem))
       (let ((table (memory-instance-wait-table mem)))
+        ;; A proc_exit/trap in ANOTHER guest thread terminates this one:
+        ;; MEMORY-ABORT-WAITERS stores the condition and wakes the
+        ;; queues, so both a wait entered afterwards and one resumed
+        ;; here observe it. The check is under the lock, next to waiter
+        ;; registration, so an abort cannot slip between them.
+        (when (memory-instance-abort-condition mem)
+          (error (memory-instance-abort-condition mem)))
         (when (/= (memory-load mem ea width) (logand expected mask))
           (return-from memory-atomic-wait 1))
         (when (and (not infinite-p) (zerop timeout))
@@ -934,6 +965,8 @@ slip between them."
                               (memory-instance-lock mem))
                        (sb-thread:grab-mutex
                         (memory-instance-lock mem)))
+                     (when (memory-instance-abort-condition mem)
+                       (error (memory-instance-abort-condition mem)))
                      (return (if notifiedp 0 2)))))
             (decf (atomic-wait-entry-waiters entry))
             (when (zerop (atomic-wait-entry-waiters entry))

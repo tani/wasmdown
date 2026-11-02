@@ -20,12 +20,12 @@ Component Model (canonical ABI, resources, async), and WASI hosts — with
 | Interpreter (default backend) | Full: exact i32/i64/f32/f64 semantics, v128, GC, EH, tail calls, multi-memory, memory64 |
 | Compiled backend | Full for opcode coverage: SBCL `COMPILE` of emitted Lisp, including SIMD, GC, EH and `return_call*`; every pinned core command and component command agrees with the interpreter |
 | Component Model | Full lane green: binary + text, validation, instantiation/linking, canonical ABI, resources, async scheduling |
-| WASI Preview 1 | Full legacy `wasi_snapshot_preview1` surface (46 imports, `sock_*` included; upstream P1 subset 72/72) |
+| WASI Preview 1 | Full legacy `wasi_snapshot_preview1` surface (46 imports, `sock_*` included; upstream P1 subset 72/72); opt-in `wasi_thread_spawn` (`--threads`) with shared-memory instance-per-thread children |
 | WASI 0.3.2 providers | `clocks`, `random`, `cli`, `filesystem`, `sockets` and `http` under an explicit capability model |
 | WASI 0.2 component facade | 29 of 31 stable interfaces bound at exact release names (legacy compatibility line) |
 | WASI network | TCP/UDP/DNS via `wasi:sockets/types` + `ip-name-lookup` under declared `--net`/`--listen`/`--dns` authority; upstream network subset 30/30 |
 | `wasi:http` | 0.3.2 `types` + `client.send` (streaming uploads, chunked trailers) and incoming `handler`/`service` via `wasmdown serve`; 0.2.0–0.2.12 outgoing `types` + `outgoing-handler` and incoming `incoming-handler` (proxy world) via the same `serve`; TLS is embedder-only |
-| Threads / atomics | Opt-in extension; FASL cache and optimized/AOT backend not implemented |
+| Threads / atomics | Opt-in extension (core threads + wasi-threads spawn); FASL cache and optimized/AOT backend not implemented |
 | Annotations proposal | Out of scope |
 
 ## Execution architecture

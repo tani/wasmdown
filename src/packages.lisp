@@ -221,7 +221,7 @@
    #:memory-copy #:memory-copy2 #:memory-init
    ;; threads proposal atomics (single-thread semantics + hook plumbing)
    #:atomic-load #:atomic-store #:atomic-rmw #:atomic-cmpxchg
-   #:memory-atomic-notify #:memory-atomic-wait
+   #:memory-atomic-notify #:memory-atomic-wait #:memory-abort-waiters
    #:table-instance #:table-instance-p
    #:table-instance-elems #:table-instance-type #:table-instance-max
    #:table-instance-has-max-p

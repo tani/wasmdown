@@ -9,7 +9,7 @@ LISP_FILES := $(wildcard src/*.lisp)
         report-backend-inventory test-backend-inventory \
         report-backends-bench \
         test-upstream test-wasi-preview1 test-wasi-preview2 test-wasi \
-        test-threads-wast \
+        test-threads-wast test-wasi-threads-p1 \
         report-conformance p3-fixtures test-wasi-preview3 verify \
         test-property test-async-property test-async-property-negative \
         test-p1-repeat setup-network-tests test-wasi-network test-wasi-network-reference \
@@ -197,6 +197,14 @@ test-component:
 # exact stdout/status assertions plus the host-side denial cases.
 test-wasi-preview1:
 	python3 tools/wasi-preview1-acceptance.py
+
+# WASI Preview1 wasi-threads spawn lane (opt-in): compiles the
+# hand-authored WAT fixtures with wasm-tools and runs them through the
+# real CLI with --threads. Covers shared-memory visibility, TID/arg
+# passing, the negative spawn error, and child proc_exit/trap plus
+# main-return termination (each under a wall-clock timeout).
+test-wasi-threads-p1:
+	python3 tools/test-wasi-threads-p1.py
 
 # WASI 0.2 behaviour lane (docs/design/PLAN.md 12.7): one fresh SBCL guest process
 # per case against the real CLI. Exact stdout/status, on-disk
