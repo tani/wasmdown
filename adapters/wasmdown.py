@@ -59,7 +59,7 @@ def get_wasi_versions() -> List[str]:
 
 
 def get_wasi_worlds() -> List[str]:
-    return ["wasi:cli/command"]
+    return ["wasi:cli/command", "wasi:http/service"]
 
 
 def get_timeout_seconds() -> float:
@@ -83,17 +83,22 @@ def compute_argv(test_path: str,
             f"{unsupported}, but test {test_path} requested {proposals}; "
             "the driver must exclude it by a declared rule")
     args, env, root = args_env_root
+    command = "serve" if wasi_world == "wasi:http/service" else "run"
     argv = SBCL + [
         "--script", str(ROOT / "tools" / "wasmdown.lisp"),
-        "run", test_path, "--wasi",
+        command, test_path, "--wasi",
     ]
     for key in sorted(env):
         argv += ["--env", f"{key}={env[key]}"]
     if root:
         argv += ["--dir", f"{Path(root).resolve()}::/"]
-    if "sockets" in proposals:
+    if "sockets" in proposals or "http" in proposals:
         # Test-harness grant only (see the module docstring): the upstream
-        # sockets cases use their own loopback endpoints.
+        # network cases use their own loopback endpoints; the HTTP service
+        # cases also need the outbound client to reach the runner's
+        # fixtures and DNS failure semantics for the unresolvable host.
         argv += ["--net", "*:*", "--listen", "*:*", "--dns", "*"]
+    if wasi_world == "wasi:http/service":
+        argv += ["--addr", "127.0.0.1:0"]
     argv += ["--"] + list(args)
     return argv

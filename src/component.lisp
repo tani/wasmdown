@@ -3679,6 +3679,7 @@ appended; cross-abi-calls' task.return16 takes exactly its 16
 flat params)."
   (let* ((kind (first imms))
          (rs (and (eq kind :task-return) (second imms))))
+    (declare (ignore mem-opt))
     (if (and (eq kind :task-return) rs)
         (let* (;; the two parser shapes: the BINARY reader's is a
                ;; LIST holding the one resultlist (NIL when the
@@ -3711,8 +3712,18 @@ flat params)."
                                     (%flat-type-list x state))
                                    '()))
                              results)))
-          (if (and mem-opt (> (length flat) 1))
-              ;; the memory path: the single [ptr] out-param
+          ;; task.return takes the RESULT VALUES as core PARAMETERS:
+          ;; flatten_functype(opts, (func (param $t)?), 'lower') uses
+          ;; MAX_FLAT_PARAMS (16), so the slots are the params and the
+          ;; results stay EMPTY. The sync result rule (a multi-value
+          ;; result collapsing to one out-pointer) does NOT apply —
+          ;; collapsing here produced `[i32]` for every async task
+          ;; returning a payload-carrying variant (the upstream
+          ;; http-service guests' `result<response, error-code>` is 8
+          ;; flat slots, matching the async-lift signature).
+          (if (> (length flat) 16)
+              ;; beyond MAX_FLAT_PARAMS the lowered params collapse to
+              ;; one pointer to the argument tuple
               (cons '(:i32) '())
               (cons (or flat '()) '())))
         (builtin-canon-sig kind imms))))
@@ -4832,8 +4843,7 @@ instead of reading the declarator index against this state."
                                      ids nil
                                      (or (%func-arg-ids-at arg-si)
                                          (cval-type-ids state))
-                                     nil)
-                 ;; slice 5e (resources ::28): a RESOURCE identity
+                                     nil)                 ;; slice 5e (resources ::28): a RESOURCE identity
                  ;; mismatch carries its own fixture message through
                  (wasmdown:validation-error (c)
                    (let ((m (wasmdown:wasmdown-error-message c)))
@@ -6060,7 +6070,15 @@ rejected (instantiation.wast ::57)."
                          (%fresh-resource-id)))
                     ((and (listp (cdr et))
                           (eq (car (cdr et)) :eq))
-                     (cons :ref (second (cdr et))))
+                     ;; the import is an alias of a type the with-arg
+                     ;; supplies: the rebuilt identity is the ARGUMENT's
+                     ;; parent-space identity (a raw (ref i) would
+                     ;; resolve through the rebuilt child space, where
+                     ;; the bound slot may be an opaque export alias —
+                     ;; the async service worlds' error-code imports
+                     ;; took that path and failed the func-arg match)
+                     (or (%parent-identity arg-si state)
+                         (cons :ref (second (cdr et)))))
                     (t '(:opaque)))
                    ids))
                  (:func
@@ -6280,13 +6298,20 @@ encloses it — not in the *OUTER-STATES* chain ambient at walk time."
     (let ((*vis-seen* seen))
       (labels
         ((bad (i)
-           (if (%vis-named-p state i (not import-p))
-               ;; named on the OTHER side: imports may not see
-               ;; exports (::3/::44)
-               (when import-p
-                 (%verr "~a not valid to be used as import" what))
-               (%verr "~a not valid to be used as ~a"
-                      what (if import-p "import" "export"))))
+           (cond
+             ;; named on the OTHER side: imports may not see
+             ;; exports (::3/::44)
+             ((and import-p (%vis-named-p state i nil))
+              (%verr "~a not valid to be used as import" what))
+             ;; an EXPORT may use import-named types too (an export
+             ;; re-exporting an imported instance: the async service
+             ;; worlds' handler instance references the imported
+             ;; wasi:http/types aliases, which are import-named only)
+             ((and (not import-p) (%vis-named-p state i t))
+              nil)
+             (t
+              (%verr "~a not valid to be used as ~a"
+                     what (if import-p "import" "export")))))
          (walk-idx (i)
            (when (and (>= i 0)
                       (not (gethash i seen)))
@@ -8081,13 +8106,36 @@ the number of enclosing component/type scopes (outer aliases)."
                            (vector-push-extend
                             (if (eq (aliasrec-kind payload) :outer)
                                 '(:opaque)
-                                (or (and (eq (aliasrec-kind payload)
-                                             :export)
-                                         (%instance-export-identity
+                                (let ((shape (and (eq (aliasrec-kind payload)
+                                                      :export)
+                                                  (%alias-exported-type-shape
+                                                   payload state))))
+                                  (cond
+                                    ;; a RESOURCE keeps a nominal identity:
+                                    ;; the source instance's export
+                                    ;; identity when known, else a fresh
+                                    ;; generative one
+                                    ((and shape
+                                          (ct-resourcetype-p shape))
+                                     (or (%instance-export-identity
                                           (aliasrec-index payload)
                                           (aliasrec-name payload)
-                                          state))
-                                    (%fresh-resource-id)))
+                                          state)
+                                         (%fresh-resource-id)))
+                                    ;; every other type is STRUCTURAL:
+                                    ;; its identity is its shape, so two
+                                    ;; aliases of equal records/variants
+                                    ;; match (a fresh marker here made the
+                                    ;; async service worlds' error-code/
+                                    ;; payload aliases compare as
+                                    ;; resources against the guest's
+                                    ;; records)
+                                    (shape (cons :ct shape))
+                                    (t (or (%instance-export-identity
+                                            (aliasrec-index payload)
+                                            (aliasrec-name payload)
+                                            state)
+                                           (%fresh-resource-id))))))
                             (cval-type-ids state))
                            ;; M9 (linking ::90): record the component
                            ;; typeidx this export-type alias occupies —

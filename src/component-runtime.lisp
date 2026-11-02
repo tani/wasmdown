@@ -68,7 +68,11 @@
            #:host-end-generation
            #:host-end-ready
            #:host-future-resolve
+           #:host-future-resolved-p
            #:host-future-watch
+           ;; a host driver's bounded store tick (the CLI's serve loop
+           ;; uses it to keep host work flowing between calls)
+           #:store-tick
            ;; M17 step 5 — the ASYNCHRONOUS HOST CALL: an async-typed
            ;; host closure returns a pending instead of a value
            #:make-host-pending
@@ -1239,6 +1243,25 @@ type space (the one space the comparison is defined in)."
               ;; the opaque kinds (func/instance/component): compare
               ;; their payloads structurally as-is
               (t (list (wasmdown.component:ct-kind c) p))))))))
+
+(defun %ct-has-unresolved-ref-p (c)
+  "T when the ct C's structure still contains a raw (:idx . n)
+valtype reference. A HOST provider's schema cts (wasmdown.wasi's
+wasi:http futures) live in the package's type space and are lowered
+into a guest's space; those refs are not the guest's indices, so the
+lift_async_value element guard cannot compare them structurally and
+must not trap a host-owned end over that spelling difference."
+  (labels ((walk (x depth)
+             (when (< depth 32)
+               (cond
+                 ((and (consp x) (eq (car x) :idx)) t)
+                 ((and (consp x) (eq (car x) :ct)) (walk (cdr x) (1+ depth)))
+                 ((wasmdown.component:ct-p x) (walk (ct-payload x) (1+ depth)))
+                 ((vectorp x) (some (lambda (e) (walk e (1+ depth))) x))
+                 ((consp x) (or (walk (car x) (1+ depth))
+                                (walk (cdr x) (1+ depth))))
+                 (t nil)))))
+    (and c (walk c 0))))
 
 (defun %abi-discriminant-size (cases)
   "discriminant_type (CanonicalABI.md 2038): the smallest unsigned
@@ -5444,6 +5467,21 @@ one-shot watch on the readable peer is QUEUED (never run inline)."
                        (async-end-owner reader))
           (%end-notify reader 1)))))
   value)
+
+(defun host-future-resolved-p (end)
+  "T when the host WRITABLE future end END has already been resolved
+(host-future-resolve ran): the host-side driver's non-blocking
+completion probe (the incoming handler reads a response body this
+way)."
+  (and (async-end-p end)
+       (async-end-future-p end)
+       (not (null (async-end-host-value-p end)))))
+
+(defun store-tick (&optional store)
+  "One bounded store-driver tick for a host embedder (the CLI's serve
+loop): pump the reactor and drain the completion queue. An idle store
+does no work."
+  (%store-tick store))
 
 (defun host-end-read (reader)
   "The provider-side read of a GUEST-RESOLVED value on READER (the
