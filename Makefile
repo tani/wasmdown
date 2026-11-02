@@ -13,7 +13,7 @@ LISP_FILES := $(wildcard src/*.lisp)
         test-property test-async-property test-async-property-negative \
         test-p1-repeat setup-network-tests test-wasi-network test-wasi-network-reference \
         setup-wasi-toolchain build-toolchain-guest test-toolchain-guest \
-        setup-curl-wasm test-curl-wasm \
+        setup-curl-wasm test-curl-wasm setup-p2-guests test-p2-guests \
         record-p2 record-p3 record-p3-compiled record-wasi-compiled \
         record-release verify-release \
         clean \
@@ -22,7 +22,7 @@ LISP_FILES := $(wildcard src/*.lisp)
 # Reproducible quick gate: the deterministic lanes that must be green on
 # any change. Compiled large-guest lanes stay report-only. ~2.5 min.
 verify: test-unit test-component test-backend-parity test-backend-inventory \
-	test-wasi test-wasi-preview3 test-property test-async-property test-toolchain-guest
+	test-wasi test-wasi-preview3 test-property test-async-property test-toolchain-guest test-p2-guests
 	$(SBCL) --script tools/build-p3-fixtures.lisp --check
 	@echo "verify: all quick gates green"
 
@@ -51,6 +51,13 @@ setup-curl-wasm:
 
 test-curl-wasm:
 	python3 tools/test-curl-wasm.py
+
+# Real WASI 0.2 guests (sockets + HTTP proxy) through wasi-sdk/cargo-component.
+setup-p2-guests:
+	tools/setup-p2-guests.sh
+
+test-p2-guests:
+	python3 tools/test-p2-guests.py
 
 # Host environment for the upstream network cases (http/sockets):
 # pinned wasi-testsuite checkout + reference Wasmtime under .cache/.

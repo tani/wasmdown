@@ -1689,17 +1689,30 @@ owned descriptor handles plus their guest-visible names."
    (list :resource "network")
    :packages (p2-packages version)))
 
+(defparameter *p2-ct-cache* (make-hash-table :test #'equal))
+(defun p2-cached-ct (key thunk)
+  "Resource cts must be IDENTITY-EQUAL across a provider instance and
+  the canonical lower/upper wrappers: the handle table type-checks the
+  rt object. Rebuilds (wit-type->ct) produce fresh objects, so cache by
+  (version, interface, resource)."
+  (or (gethash key *p2-ct-cache*)
+      (setf (gethash key *p2-ct-cache*) (funcall thunk))))
+
 (defun p2-tcp-ct (version)
-  (wasmdown.wit:wit-type->ct
-   (p2-interface "sockets" "tcp" version)
-   (list :resource "tcp-socket")
-   :packages (p2-packages version)))
+  (p2-cached-ct (list :tcp-socket version)
+   (lambda ()
+     (wasmdown.wit:wit-type->ct
+      (p2-interface "sockets" "tcp" version)
+      (list :resource "tcp-socket")
+      :packages (p2-packages version)))))
 
 (defun p2-udp-ct (version)
-  (wasmdown.wit:wit-type->ct
-   (p2-interface "sockets" "udp" version)
-   (list :resource "udp-socket")
-   :packages (p2-packages version)))
+  (p2-cached-ct (list :udp-socket version)
+   (lambda ()
+     (wasmdown.wit:wit-type->ct
+      (p2-interface "sockets" "udp" version)
+      (list :resource "udp-socket")
+      :packages (p2-packages version)))))
 
 (defun p2-incoming-dgram-ct (version)
   (wasmdown.wit:wit-type->ct
@@ -1720,20 +1733,22 @@ owned descriptor handles plus their guest-visible names."
    :packages (p2-packages version)))
 
 (defun %p2-sock-enum (code)
-  "A sockets error-code value: the WIT VARIANT case with no payload."
-  (cons (string-downcase (string code)) nil))
+  "A sockets error-code value. WASI 0.2 declares error-code as an ENUM,
+so the domain is (:enum \"label\"); the native helpers may carry the
+0.3 variant shape (label . payload), whose label is unwrapped."
+  (%p2-enum (if (consp code) (car code) code)))
 
 (defun %p2-sock-code-domain (code)
-  "A native socket error code as the P2 error-code VARIANT value: the
-native helpers already carry the variant domain, plain labels are
-wrapped."
-  (if (consp code) code (%p2-sock-enum code)))
+  "A native socket error code as the P2 error-code ENUM domain."
+  (%p2-sock-enum code))
 
 (defun %p2-sock-wrap (result)
-  "Native (:ok . v) / (:err . case) -> the P2 sockets domain."
+  "Native (:ok . v) / (:err . case) -> the P2 sockets domain. The native
+helpers may already carry the variant domain (a cons label); only a
+plain label is wrapped, never stringified twice."
   (if (and (consp result) (eq (car result) :ok))
       (cons :ok (cdr result))
-      (cons :err (%p2-sock-enum (cdr result)))))
+      (cons :err (%p2-sock-code-domain (cdr result)))))
 
 (defparameter +p2-net-error-kinds+
   '("access-denied" "not-supported" "invalid-argument" "out-of-memory"
@@ -1815,9 +1830,10 @@ other."
     ;; a direct CL call may pass the own-handle marker itself
     ((and (consp value) (eq (car value) :own-handle)) (third value))
     ((not (integerp value)) value)
-    (t (or (wasmdown.component.runtime:host-resource-rep ct value)
-           (error 'wasmdown:host-error
-                  :message (format nil "~a: no live rep for handle ~a" what value))))))
+    (t (let ((rep (wasmdown.component.runtime:host-resource-rep ct value)))
+         (or rep
+             (error 'wasmdown:host-error
+                    :message (format nil "~a: no live rep for handle ~a" what value)))))))
 
 (defun %p2-network-of (context value version)
   "The network a `borrow<network>' argument denotes. A real call passes
@@ -2293,6 +2309,13 @@ handle the guest was not given can never widen its authority."
    :packages (p2-packages version)
    :include #'p2-stable-node-p))
 
+(defun %p2-rewrite-own-ct (result ct)
+  "Re-key a native (:own-handle rt rep) result to the P2 resource ct CT."
+  (if (and (consp result) (eq (car result) :ok)
+           (consp (cdr result)) (eq (second result) :own-handle))
+      (list :ok :own-handle ct (fourth result))
+      result))
+
 (defun p2-tcp-create-instance (context version)
   (let* ((net (first (wasi-context-networks context))))
     (provider-instance
@@ -2300,7 +2323,8 @@ handle the guest was not given can never widen its authority."
      (list (cons "create-tcp-socket"
                  (lambda (family)
                    (%p2-sock-wrap
-                    (tcp-create context net family)))))
+                    (%p2-rewrite-own-ct
+                     (tcp-create context net family) (p2-tcp-ct version))))))
      :packages (p2-packages version)
      :include #'p2-stable-node-p)))
 
@@ -2311,7 +2335,8 @@ handle the guest was not given can never widen its authority."
      (list (cons "create-udp-socket"
                  (lambda (family)
                    (%p2-sock-wrap
-                    (udp-create context net family)))))
+                    (%p2-rewrite-own-ct
+                     (udp-create context net family) (p2-udp-ct version))))))
      :packages (p2-packages version)
      :include #'p2-stable-node-p)))
 

@@ -304,7 +304,7 @@
          (lookup (wasmdown.wasi:p2-ip-name-lookup-instance ctx "0.2.12"))
          (r (p2-call lookup "resolve-addresses" net "example.invalid")))
     (is (eq (car r) :err))
-    (unless (equal "access-denied" (car (cdr r)))
+    (unless (equal (list :enum "access-denied") (cdr r))
       (error "dns-denial payload was ~s" r)))
   ;; with authority, localhost resolves and yields at least one address
   (let* ((ctx (p2-net-ctx))
@@ -640,8 +640,10 @@ reports end-of-directory as a NULL alien, not NIL."
          (io-err (wasmdown.wasi::p2-error "boom" "other")))
     (is (null (wasmdown.wasi:provider-instance-function
                inst "network-error-code")))
-    ;; the sockets error-code is a VARIANT: the domain value is the case
-    (is (equal (cons :some (list "connection-refused"))
+    ;; WASI 0.2 declares sockets error-code as an ENUM: the domain is
+    ;; (:enum "label"), wrapped in the option. (0.3 spells it as a
+    ;; variant, but this is the 0.2 provider.)
+    (is (equal (cons :some (list :enum "connection-refused"))
                (wasmdown.wasi::p2-network-error-code "0.2.12" net-err)))
     (is (eq :none (wasmdown.wasi::p2-network-error-code "0.2.12" io-err)))))
 

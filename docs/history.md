@@ -1177,3 +1177,19 @@ the exact body; the test is green (21 bytes). Residual: quiet mode
 the current async scheduler, so the reproducible test uses verbose mode.
 `make verify` remains green; this is an ecosystem smoke, not a new
 conformance claim.
+
+
+**WASI 0.2 real guests for sockets and HTTP (2026-11-02).** The P2 providers
+were host-tested but had no vendored component. Two real guests now exist:
+`tests/toolchain/p2-sock-guest.c` (wasi-sdk 34, `wasm32-wasip2`, TCP connect
++ send + recv) and `tests/toolchain/p2-http-guest` (cargo-component, target
+`wasi:http/proxy@0.2.12`, incoming-handler returning a body). Building them
+exposed two P2 socket defects: the create-socket result carried the 0.3
+resource ct instead of the exact 0.2 `tcp`/`udp` ct (handles then failed
+`host-resource-rep`), and P2 `error-code` is an ENUM while the native
+helpers carry the 0.3 variant shape (the result serializer tried to
+`string` a case list). Both are fixed; `make test-p2-guests` runs the C
+TCP client against a loopback echo and the proxy guest through
+`wasmdown serve` + HTTP GET (21-byte body), both PASS. `make verify`
+includes the lane. This upgrades the P2 facade evidence from host-only to
+real guest execution; two export-only stable entries remain accounted for.

@@ -1818,6 +1818,11 @@ WIT names the case with a string (\"closed\"), so the match is on the
 normalised name — the old (string= :closed \"closed\") was a type error
 and the position fell through to case 0, which stored the NIL payload
 of the WRONG case's resource slot."
+  ;; A payload-less variant case is sometimes handed to the outer
+  ;; variant as the case list itself ("connection-refused"); unwrap the
+  ;; one-element case list before stringifying.
+  (when (and (consp tag) (null (cdr tag)) (stringp (car tag)))
+    (setf tag (car tag)))
   (or (position (and tag (string-downcase (string tag)))
                 cases
                 :key (lambda (case) (string-downcase (string (car case))))
