@@ -1164,3 +1164,16 @@ toolchain-guest item, so `wasi_0_3_profile = conformant`; global
 `declared_support` stays `partial` for the broader engine/legacy scope. The
 full upstream wasi-testsuite remains 127/0/0. Evidence: `make verify` green,
 including the toolchain guest.
+
+
+**curl as a WASI component (2026-11-02).** `tools/setup-curl-wasm.sh` builds
+real curl 8.22.0 with wasi-sdk 34 (`wasm32-wasip3`, HTTP-only, no TLS/zlib)
+under `.cache/`; it patches curl's optional SIGALRM setjmp include out
+(wasi has no signals) and links `-lwasi-emulated-signal`.
+`make test-curl-wasm` starts a loopback HTTP server and runs the component
+through `wasmdown` with `--net 127.0.0.1:PORT -- ... -sS -v URL`, asserting
+the exact body; the test is green (21 bytes). Residual: quiet mode
+(`-sS` without `-v`/`--trace`) can remain parked after the last body byte in
+the current async scheduler, so the reproducible test uses verbose mode.
+`make verify` remains green; this is an ecosystem smoke, not a new
+conformance claim.

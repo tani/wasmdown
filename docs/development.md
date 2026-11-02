@@ -13,6 +13,8 @@ to follow.
 | Python 3 | `test-wasi-*`, `test-upstream`, `tools/wasi-inventory.py` | Standard library only; no packages to install. |
 | bash, `curl`, `unzip`, `sha256sum` | `test-component-census`, `wasi-fixtures` | Present on any normal Linux/macOS host. |
 | Nix | rebuilding WASI fixtures only | Pins `zig` 0.17.0 and `wasm-tools` 1.262.0 in [`tools/wasi-toolchain.nix`](../tools/wasi-toolchain.nix); `wasmtime` 50.0.0 is listed there as a comparison executor only. |
+| Rust nightly 2026-11-01 + `wasm32-wasip3`, wasm-tools 1.263.0 | generated toolchain guest | Installed under `.cache/` by `make setup-wasi-toolchain`; `make build-toolchain-guest` and `make test-toolchain-guest`. |
+| wasi-sdk 34.0, curl 8.22.0 | curl-as-WASM network test | Installed/built under `.cache/` by `make setup-curl-wasm`; `make test-curl-wasm` serves a loopback file and asserts the body. |
 
 `make test-unit` needs SBCL and nothing else. The WASI lanes drive the
 **real CLI** (`tools/wasmdown.lisp`) as a subprocess, so they measure the
@@ -45,10 +47,12 @@ upstream lanes drive the WAST runner under SBCL.
 | `test-p1-repeat` | `python3 tools/wasi-preview1-acceptance.py` × `$(RUNS)` | gate | Repeats the P1 acceptance in fresh processes. `RUNS` defaults to 3; interpret mode (the compiled form is report evidence). |
 | `test-wasi-preview1` | `python3 tools/wasi-preview1-acceptance.py` | gate | Preview1 acceptance: real CLI over the pinned SQLite shell fixtures, exact stdout/status, plus the host-side denial cases. Builds nothing. `--backend compiled [--heap-mb N]` runs the same cases with compiled guest cores (report evidence, ~200 s per fresh process). |
 | `test-wasi-preview2` | `python3 tools/run-wasi-suite.py --abi preview2` | gate | WASI 0.2 behaviour: one fresh SBCL guest process per case. |
-| `test-wasi-preview3` | `sbcl --script tools/build-p3-fixtures.lisp` then `python3 tools/run-wasi-suite.py --abi preview3` | gate (explicit) | Hand-authored @0.3.2 command fixture (no upstream toolchain here); both backends. Not in `--abi all`. |
+| `test-wasi-preview3` | `sbcl --script tools/build-p3-fixtures.lisp` then `python3 tools/run-wasi-suite.py --abi preview3` | gate (explicit) | Hand-authored @0.3.2 command fixtures; the generated Rust guest is separate (`test-toolchain-guest`). Both backends. Not in `--abi all`. |
 | `p3-fixtures` | `sbcl --script tools/build-p3-fixtures.lisp` | utility | Writes `tests/fixtures/wasi/p3-guest.wasm` and `P3-CHECKSUMS`; `--check` verifies the recorded hash. |
 | `test-wasi` | `python3 tools/run-wasi-suite.py --abi all` | gate | Both released ABIs (`preview1` + `preview2`); `--abi preview3` is explicit-only and fails on the missing pinned @0.3.2 guest instead of skipping; honours `WASMDOWN_API_MODE=compiled` (the runner's `--backend` flag), which really compiles the guest cores and is much slower. Regenerates [`conformance/wasi.md`](conformance/wasi.md) only with `--commit-summary`, so a gate run cannot clobber the committed artifact. |
 | `test-upstream` | `python3 tools/run-upstream-testsuite.py` | discovery | Fetches the aggregated testsuite mirror at an exact commit and measures it; writes `tests/upstream-results.jsonl` and [`conformance/upstream.md`](conformance/upstream.md). Never a gate. |
+| `setup-wasi-toolchain` / `build-toolchain-guest` / `test-toolchain-guest` | install the pinned Rust wasm32-wasip3 toolchain; build the source guest and pin its hash; run it in both backends | gate/tool | The generated @0.3.2 component is tracked at `tests/fixtures/wasi/toolchain-guest.wasm`. |
+| `setup-curl-wasm` / `test-curl-wasm` | build curl 8.22.0 with wasi-sdk 34; run it against a loopback HTTP server through the CLI with `--net` | tool/test | Real C/WASI network smoke; quiet-mode residual is documented in the script/history. |
 | `wasi-fixtures` | `nix shell nixpkgs#zig nixpkgs#wasm-tools --command bash tools/build-wasi-fixtures.sh` | utility | Development-only fixture build; the script verifies input hashes and records output hashes in `tests/fixtures/wasi/CHECKSUMS`. The script's own header documents the stricter pinned form, `nix shell --inputs-from . tools/wasi-toolchain.nix --command …`; `tools/build-wasi-fixtures.sh --check` verifies the recorded hashes without building. |
 | `report-conformance` | `test-spec-core` | utility | Depends on the core lane and prints where the report went; `core.md` is written by the lane itself. |
 | `load-system` | `sbcl --eval '(asdf:load-system :wasmdown)'` | utility | Compile/load check with the repo on `asdf:*central-registry*`. |
@@ -57,6 +61,23 @@ upstream lanes drive the WAST runner under SBCL.
 
 Backend selection for the engines is `WASMDOWN_API_MODE=interpret|compiled`
 (default `interpret`); the CLI and the WASI runner both read it.
+
+## Generated guests and curl
+
+`tests/toolchain/wasi-guest` is a Rust command guest built with the pinned
+rust-toolchain; `tools/build-toolchain-guest.sh` normalises the target std's
+`@0.3.0` interface labels to the vendored `@0.3.2` release (same-length,
+wasm-tools validated) and pins the artifact hash. The guest runs with exact
+stdout in both backends.
+
+`tools/setup-curl-wasm.sh` builds the real curl 8.22.0 as a
+`wasm32-wasip3` component with wasi-sdk 34 (`-D_WASI_EMULATED_SIGNAL`, no
+TLS/zlib). `make test-curl-wasm` starts a loopback HTTP server and asserts
+that `curl -sS -v` retrieves the body through the real CLI with an explicit
+`--net 127.0.0.1:PORT` authority. Quiet mode without `-v`/`--trace` can
+remain parked after the last body byte in the current async scheduler; the
+verbose run is the reproducible gate, and the residual is recorded in
+`history.md`.
 
 ## Repository layout
 

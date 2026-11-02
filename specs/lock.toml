@@ -105,6 +105,8 @@ wasi_0_3    = "PINNED: Rust nightly-2026-11-01 (rustc 1.101.0-nightly) with the 
 [tooling.dev-only]
 wabt        = "not pinned (test-only wast2json allowed per PLAN.md §12.2)"
 wasm_tools  = "1.263.0 (aarch64/x86_64 release tarball; installed under .cache/tools)"
+wasi_sdk    = "34.0 (aarch64/x86_64 release tarball; development/curl guest tests only)"
+curl_wasi   = "curl 8.22.0 built with wasi-sdk 34 for wasm32-wasip3 (no TLS/zlib; _WASI_EMULATED_SIGNAL); test via make test-curl-wasm"
 wasmtime    = "not pinned"
 
 [status]

@@ -13,6 +13,7 @@ LISP_FILES := $(wildcard src/*.lisp)
         test-property test-async-property test-async-property-negative \
         test-p1-repeat setup-network-tests test-wasi-network test-wasi-network-reference \
         setup-wasi-toolchain build-toolchain-guest test-toolchain-guest \
+        setup-curl-wasm test-curl-wasm \
         record-p2 record-p3 record-p3-compiled record-wasi-compiled \
         record-release verify-release \
         clean \
@@ -43,6 +44,13 @@ build-toolchain-guest:
 # Generated @0.3-line command guest: exact stdout in both backends.
 test-toolchain-guest:
 	python3 tools/run-toolchain-guest.py
+
+# curl built as a WASI 0.3 component with wasi-sdk 34 (dev/test only).
+setup-curl-wasm:
+	tools/setup-curl-wasm.sh
+
+test-curl-wasm:
+	python3 tools/test-curl-wasm.py
 
 # Host environment for the upstream network cases (http/sockets):
 # pinned wasi-testsuite checkout + reference Wasmtime under .cache/.
