@@ -28,7 +28,7 @@ upstream lanes drive the WAST runner under SBCL.
 | `all` | `test` | utility | Default target; alias of `test`. |
 | `verify` | unit, component, parity gate, inventory check, `test-wasi`, P3 lane, P3 fixture hash | gate | Reproducible quick gate: the deterministic lanes that must be green on any change (~2.5 min). Compiled large-guest lanes stay report-only. |
 | `test` | `test-unit` | utility | Alias. |
-| `test-unit` | `sbcl --script tools/run-tests.lisp` | gate | Units and integration tests in one process: ~663 tests, ~8 s. Non-zero exit on any failure. |
+| `test-unit` | `sbcl --script tools/run-tests.lisp` | gate | Units and integration tests in one process: 769 tests, ~15 s. Non-zero exit on any failure; a test file with a compile-time error aborts the run instead of silently shrinking the suite. |
 | `test-spec-core` | `sbcl … --script tools/run-spec-core.lisp` | baseline | Pinned core `.wast` suite through the stateful WAST runner. Regenerates [`conformance/core.md`](conformance/core.md) and `tests/spec-core-results.jsonl`. Runs in ~3 s; a slow or hanging run is a bug. |
 | `test-component` | `sbcl … --script tools/run-component-suite.lisp` | gate | Vendored component suite, `tests/component/{binary,validation,linking,values,async,resources}` minus `nyi.txt`. Regenerates [`conformance/component.md`](conformance/component.md); exits non-zero on any fail, skip, timeout, harness error, or census drift. |
 | `test-component-census` | `bash tools/run-component-census.sh $(RUNS)` | gate | Repeats the component lane in fresh processes and fails unless every run is green at the same command denominator. `RUNS` defaults to 30 (`make test-component-census RUNS=5`). Logs land in `tmp-census/`. |
