@@ -73,6 +73,9 @@
            ;; a host driver's bounded store tick (the CLI's serve loop
            ;; uses it to keep host work flowing between calls)
            #:store-tick
+           ;; the service variant: one scheduler quantum (guest async
+           ;; threads) plus the host tick
+           #:store-service-tick
            ;; M17 step 5 — the ASYNCHRONOUS HOST CALL: an async-typed
            ;; host closure returns a pending instead of a value
            #:make-host-pending
@@ -5504,6 +5507,20 @@ loop): pump the reactor and drain the completion queue. An idle store
 does no work."
   (%store-tick store))
 
+(defun store-service-tick (&optional store)
+  "One SERVICE-driver tick for a host embedder running a component
+export as a long-lived server (the CLI's `serve' loop): spend one
+SCHEDULER quantum so guest async threads spawned by the exported
+handler (a `spawn_local' response-body writer, say) take their turn,
+then pump the store's host work. The quantum runs with STORE bound,
+so any host unit it queues lands on the store's own context. An idle
+store does one bounded scheduler pass and no reactor work. Returns
+the number of host events drained."
+  (let ((store (or store *global-host-store*)))
+    (let ((*current-component-store* store))
+      (async-thread-resume-all))
+    (%store-tick store)))
+
 (defun host-end-read (reader)
   "The provider-side read of a GUEST-RESOLVED value on READER (the
 READABLE future end a guest handed over and later wrote through its
@@ -5585,6 +5602,19 @@ the (memory ptr length progress) list. The 5 cases in order:
               (plusp (%buffer-remain buffer)))
          (setf (async-end-buffer end) buffer)
          (%host-sink-drain end))
+        ;; a ZERO-LENGTH write into a host-sink-backed stream completes
+        ;; at once: there is nothing for the sink to consume, and
+        ;; parking the empty buffer (the general case-2 shape below)
+        ;; would leave the guest write waiter blocked forever — no
+        ;; host drain ever produces its event. End.copy case 5's
+        ;; zero-length acknowledgement is the right answer here (the
+        ;; wit-bindgen `write_all' of an empty body: `stream.write'
+        ;; with an empty buffer must return Complete(0), then the
+        ;; writer drops and the provider's transmission future
+        ;; resolves).
+        ((and (async-end-host-sink other)
+              (zerop (%buffer-remain buffer)))
+         (%end-notify end 0))
         ((async-end-host-source other)
          (%host-source-fill end buffer other))
         ((async-end-host-value-p other)

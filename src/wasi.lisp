@@ -9201,12 +9201,24 @@ response contents writer to resolve before returning."
                              (t nil))))
              (when resp
                (let ((writer (wasi-http-response-transmission-writer resp)))
+                 ;; The guest's response-body writer is a SPAWNED guest
+                 ;; async thread (the `spawn_local' an echo handler uses
+                 ;; to feed its contents stream). The handler call's own
+                 ;; drain has ended, so only a SCHEDULER quantum can run
+                 ;; it: a host-work tick alone never does, and the
+                 ;; transmission future would then stay unresolved until
+                 ;; the wait gave up (the empty-body POST: the writer
+                 ;; writes nothing and drops, so no stream readiness
+                 ;; event ever arrives to wake the old loop). Drive both
+                 ;; lines of work here, bounded so a handler that keeps
+                 ;; its body open cannot wedge the serve loop.
                  (when writer
                    (loop repeat 5000
                          until (wasmdown.component.runtime:host-future-resolved-p
                                 writer)
                          do (ignore-errors
-                              (wasmdown.component.runtime:store-tick store))
+                              (wasmdown.component.runtime:store-service-tick
+                               store))
                             (sleep 0.001)))))
              (values resp nil))))
         (t (values nil (cons "internal-error" nil)))))))

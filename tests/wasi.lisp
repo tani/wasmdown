@@ -601,6 +601,30 @@ delivered OUTCOME in the returned cons's CDR (:UNSET until then)."
         ;; the stream write end returns to idle after delivery
         (is (eq :idle (rtcall "ASYNC-END-STATE" writer)))))))
 
+(test wasi/host-sink-zero-length-write
+  ;; Regression (http-service-echo's empty-body POST): a ZERO-LENGTH
+  ;; write into a host-sink-backed stream must complete at once. It
+  ;; used to park the empty buffer on the peer (End.copy case 2) with
+  ;; no sink call ever pending, so the guest's `write_all' of an empty
+  ;; response body waited forever and the provider's transmission
+  ;; future never resolved (the serve loop then timed the response
+  ;; out). The correct acknowledgement is COMPLETED|0<<4 on the
+  ;; writer end, with no sink call.
+  (multiple-value-bind (reader writer)
+      (wasmdown.component.runtime:make-host-stream-pair *u8-ct*)
+    (let ((calls 0))
+      (wasmdown.component.runtime:host-end-set-sink
+       reader (lambda (octets start end)
+                (declare (ignore octets start end))
+                (incf calls)
+                (values 0 nil)))
+      (let ((staged (wasmdown.component.runtime:make-host-buffer 0)))
+        (rtcall "%END-COPY" writer staged nil)
+        (is (zerop calls))
+        (is (eql (%completed 0)
+                 (third (rtcall "%WAITABLE-GET-PENDING-EVENT" writer))))
+        (is (eq :idle (rtcall "ASYNC-END-STATE" writer)))))))
+
 (test wasi/host-sink-would-block-retry-keeps-generation
   ;; Regression: a WOULD-BLOCK sink parks the copy; the readiness retry
   ;; must REUSE that parked attempt. Clearing it made the retry advance
