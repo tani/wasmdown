@@ -1126,3 +1126,25 @@ HTTP imports. `wasi:http/incoming-handler` (serve side) remains the peer
 slice. Evidence: P2 unit file 38/0, full unit suite 734/0, the generated
 backend inventory now reports `P2 0.2.12 pinned=32 stable=31 bound=29
 unbound_stable=2`, and no 0.3 HTTP/sockets test regressed.
+
+
+**WASI 0.2 incoming HTTP and proxy serving (2026-11-02).** The Preview2
+line now serves the incoming side too: the proxy world resolves,
+`preview2-serve-providers` composes its io/clocks/random/cli + HTTP imports
+at each declared exact 0.2.x patch version, `preview2-serve-p` and
+`p2-incoming-handler-export` detect the newest exported
+`wasi:http/incoming-handler@0.2.x` `handle`, and `wasmdown serve`
+dispatches 0.2 proxy components vs 0.3 service components. The server parses
+HTTP/1.1 (Content-Length and chunked bodies with trailers), builds an
+`incoming-request` resource plus a `response-outparam`, invokes the sync
+handler, captures `response-outparam.set`, consumes the outgoing response
+body/trailers through the P2 stream resources, and serializes status,
+headers, body and trailers; malformed requests are 400, unset/trapping
+handlers 500. Inventory records incoming-handler as export-only at every
+release (`P2 bound=29`, two export-only world entries). Evidence: unit
+739/0 (P2 provider completeness, response-outparam capture, chunked
+request/response trailers, loopback request→handler→response), P2 lane
+11/11, P3 10/10, upstream 127/0/0, `make verify` green. No vendored 0.2
+proxy guest binary exists, so the loopback test drives a host handler
+closure; real-guest body streaming under a compiled 0.2 producer remains
+unmeasured.

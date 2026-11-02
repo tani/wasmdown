@@ -91,7 +91,7 @@ reference Wasmtime via `tools/setup-network-tests.sh`), Nix only to rebuild
 the pinned WASI fixtures.
 
 ```sh
-make test-unit                  # unit + integration suite (726 tests, ~8 s)
+make test-unit                  # unit + integration suite (739 tests, ~8 s)
 sbcl --script tools/wasmdown.lisp help
 ```
 
@@ -147,7 +147,7 @@ Every lane is measured, not asserted. Latest numbers (2026-11-02):
 
 | Lane | Kind | Measured | Docs |
 | --- | --- | --- | --- |
-| `make test-unit` | gate | 726 pass / 0 fail | — |
+| `make test-unit` | gate | 739 pass / 0 fail | — |
 | `make test-spec-core` | baseline | 21 187 pass / 0 fail / 73 unsupported of 21 260 | [`core.md`](docs/conformance/core.md) |
 | `make test-component` | gate | 1 702 pass / 0 fail / 0 unsupported | [`component.md`](docs/conformance/component.md) |
 | `make report-component-compiled` | report | 1 702 pass / 0 fail under `:compiled` | `tests/component-compiled/component.md` |
