@@ -51,12 +51,13 @@ Supported vendored declarations, verified against
 | `wasi:http/handler@0.3.2` | interface | supported |
 | `wasi:http/client@0.3.2` | interface | supported |
 | `wasi:http/service` | world | supported (`serve-component`; incoming `handler.handle`) |
-| `wasi:http/middleware` | world | partial: the world's shape is vendored and resolvable, but composition with a host-supplied `next` handler is not covered by the pinned suite and is not claimed |
+| `wasi:http/middleware` | world | supported: the world resolves and `http-middleware-providers` composes its imports with a host-supplied `next` handler (embedder API; unit-pinned; no upstream middleware fixture) |
 
 There is no `outgoing-handler` / `incoming-handler` in the pinned 0.3.2
 release; the outgoing client is `client.send` and the incoming service is
 `handler.handle` inside the `service` world. The `service` direction is
 exercised by `wasmdown serve`; the `middleware` world's host-supplied `next`
+handler is composed by `http-middleware-providers` (embedder API, unit-pinned)
 composition remains unverified and is therefore marked partial above, not
 claimed as supported.
 

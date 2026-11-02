@@ -244,9 +244,11 @@ declared-surface comparison."
            (builders (wasmdown.wasi::%wasi-provider-builders ctx))
            (declared-total 0)
            (exported-total 0))
-      ;; the audited surface: 22 interface imports (21 of them declare
-      ;; functions; clocks/types is type-only)
-      (is (= 22 (length builders)))
+      ;; the audited surface: 23 interface imports (22 declare functions;
+      ;; clocks/types is type-only). HTTP handler is the middleware world's
+      ;; import; sockets types/ip-name-lookup and http types/client/handler
+      ;; are now guest-visible support.
+      (is (= 23 (length builders)))
       (dolist (entry builders)
         (let* ((import-name (car entry))
                (interface (%wasi-interface-for-import-name import-name))
@@ -274,9 +276,10 @@ declared-surface comparison."
               (is (null (member "unstable" annotations
                                 :key #'wasmdown.wit:wit-annotation-name
                                 :test #'string=)))))))
-      ;; the audit's totals: 125 declared = 125 exported
-      (is (= 125 declared-total))
-      (is (= 125 exported-total))
+      ;; the audit's totals: 126 declared = 126 exported (the HTTP handler
+      ;; import is the one added by the network surface)
+      (is (= 126 declared-total))
+      (is (= 126 exported-total))
       ;; Deliberately-absent names are NOT stubs inside a provider: the
       ;; whole interfaces are absent from the registry, so no trapping
       ;; closure can be bound for them. The refusal itself lives in
@@ -287,12 +290,11 @@ declared-surface comparison."
                             (wasmdown.wasi:make-wasi-context)))))
         (is (not (member "wasi:clocks/timezone@0.3.2" names
                          :test #'string=)))
-        ;; the outgoing HTTP surface is served; the incoming handler
-        ;; direction is not
+        ;; the whole HTTP surface is served; only the @unstable timezone
+        ;; interface stays out
         (is (member "wasi:http/types@0.3.2" names :test #'string=))
         (is (member "wasi:http/client@0.3.2" names :test #'string=))
-        (is (not (member "wasi:http/handler@0.3.2" names
-                         :test #'string=)))))))
+        (is (member "wasi:http/handler@0.3.2" names :test #'string=))))))
 
 (test wasi/provider-instance-refuses-unimplemented-function
   ;; A declared function the alist does not cover is a CONSTRUCTION-TIME
@@ -3836,6 +3838,38 @@ yields every chunk the framing decodes, then EOF)."
 
 ;;; ---------------------------------------------------------------
 ;;; The provider surface.
+
+(test wasi/http-middleware-provider-surface
+  (let* ((ctx (http-ctx))
+         (prov (wasmdown.wasi:http-middleware-providers ctx nil))
+         (hname "wasi:http/handler@0.3.2"))
+    ;; the service imports plus the host-supplied handler survive
+    (is (assoc "wasi:http/types@0.3.2" prov :test #'string=))
+    (is (assoc "wasi:http/client@0.3.2" prov :test #'string=))
+    (let* ((hit (assoc hname prov :test #'string=))
+           (handle (and hit
+                        (wasmdown.wasi:provider-instance-function
+                         (cdr hit) "handle"))))
+      (is handle)
+      ;; no downstream handler: a well-formed internal-error result
+      (let ((out (funcall (wasmdown.component.runtime::lifted-func-host handle)
+                          (list :request))))
+        (is (and (consp out) (string= (car out) "internal-error"))))
+      ;; an embedder-supplied next handler is called for the request
+      (let ((prov (wasmdown.wasi:http-middleware-providers
+                   ctx (lambda (req) (declare (ignore req))
+                         (cons :ok :response))))
+            (handle (wasmdown.wasi:provider-instance-function
+                     (cdr (assoc hname
+                                 (wasmdown.wasi:http-middleware-providers
+                                  ctx (lambda (req) (cons :ok req)))
+                                 :test #'string=))
+                     "handle")))
+        (declare (ignore prov))
+        (let ((out (funcall
+                    (wasmdown.component.runtime::lifted-func-host handle)
+                    (list :request))))
+          (is (equal out (cons :ok :request))))))))
 
 (test wasi/http-provider-surface
   (let* ((ctx (http-ctx))

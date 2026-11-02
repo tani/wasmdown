@@ -8435,6 +8435,12 @@ of these entries a component gets is decided by the world."
             (lambda ()
               (http-client-instance context :network network
                                     :package http)))
+      ;; the middleware world's imported `handler'; an embedder that
+      ;; wants to forward supplies http-middleware-providers' explicit
+      ;; provider, otherwise the default answers internal-error.
+      (bind http "handler"
+            (lambda ()
+              (http-handler-provider-instance nil :package http)))
       (nreverse builders))))
 
 (defparameter +wasi-unstable-import-message-format+
@@ -8888,6 +8894,38 @@ the command-world builders. A declared import the world does not
 have (a test world adding `wasi:cli/environment') is added by
 SERVE-COMPONENT-PROVIDERS, never silently ignored."
   (compose-world-providers world context))
+
+(defun http-handler-provider-instance (next &key (package (wasi-package "http")))
+  "The `wasi:http/handler' import as a provider instance. NEXT is a CL
+function of the component-domain request returning the domain
+result<response,error-code>; NIL means the embedder supplied no
+downstream handler and every call resolves to an internal-error result.
+This is the middleware world's host-supplied `next' handler."
+  (provider-instance
+   (wasmdown.wit:package-interface package "handler")
+   (list
+    (cons "handle"
+          (lambda (request)
+            (if next
+                (funcall next request)
+                (%http-internal
+                 "middleware handler has no downstream handler bound")))))
+   :packages (%http-packages :package package)))
+
+(defun http-middleware-providers (context next
+                                 &key (package (wasi-package "http")))
+  "The with-args alist for a `wasi:http/middleware' component: the
+service world's imports (types/client/cli/clocks/random) plus the
+host-supplied `handler' NEXT the middleware forwards to. The component
+exports its own handler; use COMPONENT-HANDLER-EXPORT/SERVE-COMPONENT to
+run it. NEXT is a domain-level CL function, so an embedder can chain a
+downstream guest handler or an in-process host handler."
+  (let ((name (wasmdown.wit:interface-import-name
+               (wasmdown.wit:package-interface package "handler"))))
+    (append (http-service-providers context)
+            (list (cons name
+                        (http-handler-provider-instance
+                         next :package package))))))
 
 ;;; ---------------------------------------------------------------
 ;;; The exported handler.

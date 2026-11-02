@@ -170,7 +170,7 @@ Measured at that point: units 481 / 0. Core and component lanes were unchanged b
 
 - The pinned suite is 97 `.wast` files at `b0ec1f3f449525c217dbff3f1dfab435a756ea92`, run through the stateful runner with failure-phase classification: 21,187 pass / 0 fail / 73 unsupported / 0 harness-error of 21,260 — 99.7 % with unsupported in the denominator. The full run completed in ~3 s and had to stay fast; a slow or hanging run is a bug, not a workload.
 - **Deliberate dip and recovery.** The pass rate fell from 95.2 % to 92.7 % on purpose: the `(module quote …)` wrap began parsing ~543 payloads that had previously "passed" without ever being parsed. It was then fully recovered and exceeded — 95.6 %, above the pre-dip 95.2 % — by fixing the exposed gaps, never by reverting the wrap.
-- **Honest reclassification.** Unsupported rose from 277 to 725 and then settled: actions against genuinely out-of-scope modules classify cleanly instead of crashing as harness errors. The 73 that remain are terminal — the annotations proposal (`@…` forms), unadopted and permanently out of scope per [`design/PLAN.md` §3.3](design/PLAN.md). Every family that used to be unsupported (struct/array declarations, rec groups, typed function references, exception handling, named modules, tail calls) now passes.
+- **Honest reclassification.** Unsupported rose from 277 to 726 and then settled: actions against genuinely out-of-scope modules classify cleanly instead of crashing as harness errors. The 73 that remain are terminal — the annotations proposal (`@…` forms), unadopted and permanently out of scope per [`design/PLAN.md` §3.3](design/PLAN.md). Every family that used to be unsupported (struct/array declarations, rec groups, typed function references, exception handling, named modules, tail calls) now passes.
 - Harness limits recorded then, still true: `annotations.wast` and `inline-module.wast` are spec-test extensions outside the implemented grammar and classify as harness errors; the default linear-memory ceiling is 1,024 pages (64 MiB, [ADR-005](adr/ADR-005-memory-ceiling.md)); a 64 MiB string-literal / assembled-binary ceiling and a 1M-locals-per-function validator preflight in `src/wast.lisp` turn hostile input into catchable `decode-error`s; a failed module command leaves the script's current-instance unset, so later `invoke`/`get` fail, matching the spec harness's observable behaviour.
 
 ## Compiled-backend divergence
@@ -1103,5 +1103,5 @@ rule. The counts previously recorded for this lane (95/0/32 and 70/0/2)
 were real measurements of the exclusion policy and are superseded, not
 rewritten.
 
-Evidence at the change: units 725/0, component 1,702/0, P3 30/30 ×3 in both
+Evidence at the change: units 726/0, component 1,702/0, P3 30/30 ×3 in both
 backends, upstream 127/0/0, network subset 30/30, `make verify` green.

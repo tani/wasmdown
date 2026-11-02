@@ -253,8 +253,6 @@ def p3_section(data):
                 status = "excluded_internal"
             elif name in bound:
                 status = "bound"
-            elif package in EXCLUDED_PACKAGES:
-                status = "excluded"
             elif rec["stability"] == "unstable":
                 status = "unstable"
             elif name in exported:
@@ -497,9 +495,8 @@ def render_markdown(doc):
     add("## P3 — WASI 0.3.2 packages")
     add("")
     add("Interfaces parsed from `specs/wasi/wasi-wit-0.3.2/`; `provided` is the "
-        "`%wasi-provider-builders` registry. `wasi:http` and `wasi:sockets` "
-        "(TCP/UDP/DNS) are excluded by decision; their WIT is reference data "
-        "and any registry entry is internal composition only, never support.")
+        "`%wasi-provider-builders` registry. HTTP and sockets are part of "
+        "the declared profile; every bound interface is guest-visible support.")
     add("")
     add_all(md_table(
         ["package", "interfaces", "provided", "excluded", "export-only",

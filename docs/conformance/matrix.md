@@ -21,7 +21,7 @@ links are generated.
 | Async property lane (task/subtask, stream/future/cancel, host-pending) | 14,071 checks / 0 failures over 8 fixed seeds x3 (`make test-async-property`); negative control detects an injected double delivery (`make test-async-property-negative`) | same host-side lane (backend-independent: the scheduler/executor is shared by both guest backends) | stdout; `tests/async-property.lisp` |
 | Blocked-stdio / DNS executor audit | fixed 2-worker budgets, worker-only execution and affinity, max active <= budget, close drops queued jobs and refuses new submissions without joining, `close-wasi-context` rejects/detaches; guest stdio green in both backends | same (host-side) | `tests/async-property.lisp`, `tests/wasi.lisp`; P3 lanes |
 | 0.3.2 sockets provider (`types` + `ip-name-lookup`) | Supported under the declared `wasi-network` authority; upstream network subset green (30/30), unit pins incl. `wasi/e2e-tcp-echo-component` PASS | same test binary, host listener + echo thread | `make test-unit`; `tests/wasi.lisp`; `make test-wasi-network` |
-| 0.3.2 HTTP (`types` + `client`; `handler`/`service`) | Supported: outgoing `client.send` over HTTP/1.1 plus the incoming handler served by `wasmdown serve`; upstream HTTP cases are part of the 127/0/0 lane. TLS is embedder-only (`:http-transports`); `middleware` world composition is not covered | same host-side providers | `make test-wasi-upstream`; `make test-wasi-network`; `tests/wasi.lisp` |
+| 0.3.2 HTTP (`types` + `client`; `handler`/`service`) | Supported: outgoing `client.send` over HTTP/1.1 plus the incoming handler served by `wasmdown serve`; upstream HTTP cases are part of the 127/0/0 lane. TLS is embedder-only (`:http-transports`); `middleware` host-supplied-next composition is unit-pinned (no upstream fixture) | same host-side providers | `make test-wasi-upstream`; `make test-wasi-network`; `tests/wasi.lisp` |
 | Pinned 0.3.2 guests (hand-authored) | 10/10 pass ×3 repeats (30/30): no-import success smoke, a `wasi:cli/exit@0.3.2` importer (exit 7), a `wasi:clocks/monotonic-clock@0.3.2` importer (monotonic `now()`), a resume-safe async command (callback `task.return`), a `write-via-stream` stdout command (`hi`), a cancelled-subtask command, a `wasi:random/random@0.3.2` guest (`insecure`/`insecure-seed`: exact 16-byte lengths, differing secure reads, `u64`/seed calls; `realloc`-lowered lists), a clock-deadline guest (`wait-for` 200 ms completes through the CLI reactor; the 200 ms bound is the liveness-oracle regression proof), a `wasi:cli/{stdin,environment,stderr,terminal-stdout}@0.3.2` guest (argv[0]/marker, `--env` pair, option-typed initial cwd, `terminal-stdout` = `none` on a non-tty, real stdin `stdin-probe\n` with explicit DROPPED EOF and an ok paired future, stderr through `write-via-stream`), and a `wasi:filesystem/{types,preopens}@0.3.2` guest (`/work` preopen, async `open-at` of seeded `hello.txt`, exactly 17 bytes through `read-via-stream`+`stream.read`, writes at explicit offsets and appends at EOF with `stat` and a byte-exact read-back, err `read-only` (case 32), `create-directory-at`/`stat-at`/`read-directory` enumeration/`rename-at`/`unlink-file-at`/`remove-directory-at`, missing path = err `no-entry`, every handle dropped) | 10/10 pass, same cases and repeats (30/30); the nested core runs compiled (`backend-entry-count`) | `make test-wasi-preview3`, `tools/build-p3-fixtures.lisp`, `wasi/command-component-runs-the-selected-backend`, `wasi/reactor-pending-deadline-p` |
 
 Network communication (TCP, UDP and DNS) and `wasi:http` are **part of the
@@ -29,7 +29,7 @@ declared support profile**: guest-declared 0.3-line sockets imports bind under
 the `wasi-network` authority (`--net`/`--listen`/`--dns` or the embedder API),
 HTTP `types`/`client` are served, and `handler`/`service` are exercised by
 `wasmdown serve`. The upstream network subset is the evidence row (30/30); the
-`middleware` world (host-supplied `next` handler composition) is not covered
+`middleware` world host-supplied `next` composition is implemented by `http-middleware-providers` and unit-pinned (no upstream fixture)
 by the pinned suite and is not claimed. See
 [`../../specs/wasi/MANIFEST.md`](../../specs/wasi/MANIFEST.md) § “Network
 surface (declared supported)”.
@@ -137,7 +137,7 @@ stdout-only and is listed as `n/a` with `make verify` named as its gate.
   nothing, and stale/class/element/writable/non-idle/waitable-set traps — and
   by `component/generic-path-five-cases-pin` CASE 2, migrated to the
   end-object contract (the second load traps). Negative controls showed both
-  the load arm and the guard set are load-bearing. Unit 725/0, component
+  the load arm and the guard set are load-bearing. Unit 726/0, component
   1,702/0, P3 10/10 ×3 per backend.
 - **Host borrow reclamation and store-retirement metadata (2026-11-02).**
   A host callee has no Task to adopt the borrow handles a lowering staged, so
@@ -189,7 +189,7 @@ stdout-only and is listed as `n/a` with `make verify` named as its gate.
   `component/remap-outer-compound-functype-owner` — the exact diagnostic pair
   (decoy-first same-numbered type validates with no memory; the real `string`
   leaf still rejects with a memory requirement), shape checks (`tuple<u32>` vs
-  `tuple<string>`) and result-position companions, and the count-2 positive/negative pair. Unit 725/0, component
+  `tuple<string>`) and result-position companions, and the count-2 positive/negative pair. Unit 726/0, component
   1,702/0, P3 10/10 ×3 per backend, `make verify` green.
 - **Validator instance type-index space and encoder s33 valtype indices
   (2026-11-02).** Two engine correctness fixes exposed by the WIT-shaped
@@ -207,7 +207,7 @@ stdout-only and is listed as `n/a` with `make verify` named as its gate.
   because its references happened to land on slots the validator accepted
   (it referenced no exported `descriptor-stat`/`directory-entry` slot from a
   later declarator), and its valtype indices stayed below 64, where `u32`
-  and `s33` agree. Unit 725/0, component
+  and `s33` agree. Unit 726/0, component
   1,702/0, P3 30/30 ×3 both backends, `make verify` green.
 
 ## Still open

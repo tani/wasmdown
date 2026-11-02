@@ -661,6 +661,8 @@
    ;; http (M16 slice 6): the INCOMING service world
    #:http-service-world
    #:http-service-providers
+   #:http-handler-provider-instance
+   #:http-middleware-providers
    #:serve-component-providers
    #:component-handler-export
    #:parse-serve-address
