@@ -454,8 +454,8 @@ def render_markdown(doc):
     add("")
     add("Per release: interfaces parsed from the vendored tree, and the "
         "`p2-builder-table` registry for that exact version. `stable` drops "
-        "`@unstable` annotations. The documentation claim is 27 of 31 stable "
-        "interfaces bound at exact release names; the table below is the "
+        "`@unstable` annotations. The documentation claim is 29 of 31 stable "
+        "interfaces bound at exact release names (plus 2 export-only world entries); the table below is the "
         "measurement, release by release.")
     add("")
     add_all(md_table(
