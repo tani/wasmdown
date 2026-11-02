@@ -6141,7 +6141,7 @@ the payloads need no resolvable extern types."
   (handler-case
       (progn (wasmdown.cli::%parse-run-args
               (list "run" "app.wasm" "--wasi" "--net"))
-             (is nil "missing --net value was accepted"))
+             (error "missing --net value was accepted"))
     (wasmdown.cli::usage-error () t))
   ;; network options without --wasi are a usage error
   (multiple-value-bind (file invokes options guest-args)
@@ -6150,7 +6150,7 @@ the payloads need no resolvable extern types."
     (declare (ignore invokes))
     (handler-case
         (progn (wasmdown.cli::%component-context options guest-args file)
-               (is nil "network options without --wasi were accepted"))
+               (error "network options without --wasi were accepted"))
       (wasmdown.cli::usage-error () t)))
   ;; a malformed endpoint is rejected while the authority is built
   (multiple-value-bind (file invokes options guest-args)
@@ -6159,7 +6159,7 @@ the payloads need no resolvable extern types."
     (declare (ignore invokes))
     (handler-case
         (progn (wasmdown.cli::%component-context options guest-args file)
-               (is nil "malformed endpoint was accepted"))
+               (error "malformed endpoint was accepted"))
       (wasmdown:host-error () t))))
 
 (test wasi/cli-help-documents-network-options
