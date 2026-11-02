@@ -1,0 +1,1 @@
+/home/tani/ghq/github.com/tani/wasmdown/tests/toolchain/wasi-guest/target/wasm32-wasip3/release/wmd-toolchain-guest.wasm: /home/tani/ghq/github.com/tani/wasmdown/tests/toolchain/wasi-guest/src/main.rs

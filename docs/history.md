@@ -1148,3 +1148,19 @@ request/response trailers, loopback request→handler→response), P2 lane
 proxy guest binary exists, so the loopback test drives a host handler
 closure; real-guest body streaming under a compiled 0.2 producer remains
 unmeasured.
+
+**Pinned WASI 0.3 toolchain guest (2026-11-02).** The environment now has a
+real generated-guest toolchain: `tools/setup-wasi-toolchain.sh` installs Rust
+`nightly-2026-11-01` (rustc 1.101.0-nightly) with the `wasm32-wasip3` target
+and wasm-tools 1.263.0 under the git-ignored `.cache/`.
+`tests/toolchain/wasi-guest` is a small command guest (argv/env/stdout);
+`make build-toolchain-guest` builds it and `tools/normalize-wasi-version.py`
+rewrites the target std's same-length `@0.3.0` interface labels to the
+vendored `@0.3.2` release before `wasm-tools validate` and hash pinning
+(`tests/fixtures/wasi/toolchain-guest.wasm`, `TOOLCHAIN-CHECKSUMS`).
+`make test-toolchain-guest` runs the tracked artifact in both the interpreter
+and compiled backends with exact stdout. This closes the §12.11 upstream
+toolchain-guest item, so `wasi_0_3_profile = conformant`; global
+`declared_support` stays `partial` for the broader engine/legacy scope. The
+full upstream wasi-testsuite remains 127/0/0. Evidence: `make verify` green,
+including the toolchain guest.

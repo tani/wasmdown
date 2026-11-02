@@ -8559,6 +8559,25 @@ naming the import — never a trapping stub. NAME has already passed the
               (format nil "component declares import `~a`, for which this runtime has no provider"
                       name))))))
 
+(defun %wasi-interface-base (name)
+  "The version-less interface prefix of a canonical import name."
+  (let ((at (position #\@ name)))
+    (if at (subseq name 0 at) name)))
+
+(defun %alias-provider-graph (providers declared)
+  "Re-key PROVIDERS (canonical names, normally @0.3.2) to the DECLARED
+names of a component when only the release PATCH/MINOR differs. A
+generated guest built by a toolchain whose std imports @0.3.0 is
+structurally the same command world as the vendored @0.3.2 one; the
+provider instance is unchanged, only the with-args key changes. A
+provider whose base is not declared keeps its canonical key."
+  (loop for (name . provider) in providers
+        for base = (%wasi-interface-base name)
+        for declared-name = (find base declared
+                                  :key #'%wasi-interface-base
+                                  :test #'string=)
+        collect (cons (or declared-name name) provider)))
+
 (defun %compose-declared-03-providers (context names)
   "The provider alist for the 0.3-line DECLARED imports NAMES, in
 declaration order. The 0.3 gates run FIRST, over exactly these names,
@@ -8572,7 +8591,12 @@ incoming direction) has no builder yet."
   (let ((builders (%wasi-provider-builders context))
         (providers '()))
     (dolist (name names)
-      (let ((provider (%declared-03-provider name builders)))
+      (let ((provider (or (%declared-03-provider name builders)
+                          (let ((base (%wasi-interface-base name)))
+                            (loop for (canonical . thunk) in builders
+                                  when (string= (%wasi-interface-base canonical)
+                                                base)
+                                    do (return (funcall thunk)))))))
         (when provider
           (push (cons name provider) providers))))
     (nreverse providers)))
@@ -8665,13 +8689,15 @@ refusal-only."
       (%refuse-unstable-declared-imports wasi-names)
       (let ((http-names (remove-if-not #'%wasi-http-import-name-p
                                        wasi-names)))
-        (if (null http-names)
-            (command-provider context)
-            ;; the command world declares no http import, so the
-            ;; component's declared http interfaces are bound on top
-            ;; of it (types + client; handler stays a no-provider error)
-            (append (command-provider context)
-                    (%compose-declared-03-providers context http-names)))))
+        (let ((base (%alias-provider-graph (command-provider context)
+                                           wasi-names)))
+          (if (null http-names)
+              base
+              ;; the command world declares no http import, so the
+              ;; component's declared http interfaces are bound on top
+              ;; of it (types + client; handler stays a no-provider error)
+              (append base
+                      (%compose-declared-03-providers context http-names))))))
      ((= (length v2) (length wasi-names))
       ;; every WASI import is a 0.2 release: compose per exact version
       (let ((by-version (make-hash-table :test #'equal))

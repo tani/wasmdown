@@ -5,7 +5,7 @@ validation, a reference interpreter, an SBCL-compiling backend, the
 Component Model (canonical ABI, resources, async), and WASI hosts — with
 **no third-party Lisp dependencies**.
 
-> **Status: `partial`.** Every subsystem listed below is implemented and
+> **Status: engine/legacy `partial`; declared WASI 0.3.2 profile `conformant`.** Every subsystem listed below is implemented and
 > gated by its own test lane; the engine deliberately omits threads/atomics,
 > the FASL cache, and a native optimizer. See [`docs/status.md`](docs/status.md)
 > for the per-area matrix and the exact limits.

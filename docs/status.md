@@ -1,8 +1,10 @@
 # Status
 
-The runtime declares `declared_support = partial` in `specs/lock.toml`. This
-page is the per-area reading of that word: what is complete, what is
-deliberately incomplete, and what will not be built. Measurements live in
+The runtime declares `declared_support = partial` for the engine/legacy
+surface in `specs/lock.toml`; the **declared WASI 0.3.2 profile** is
+`conformant` (`wasi_0_3_profile`), with the evidence below. This page is the
+per-area reading: what is complete, what is deliberately incomplete, and
+what will not be built. Measurements live in
 [`conformance/`](conformance/README.md); scope decisions live in
 [`design/PLAN.md`](design/PLAN.md) and the [`adr/`](adr/README.md).
 
@@ -34,7 +36,7 @@ deliberately incomplete, and what will not be built. Measurements live in
 | Component model | Async execution | Partial | The task/subtask state machine, cancellations and resource lifetimes run the whole async suite in both backends. Live-borrow accounting traps `task.return`/`task.cancel` with outstanding borrows. A deterministic property lane (`make test-async-property`, 14,071 checks over fixed seeds 1,2,3,5,8,13,21,34 x3, plus a negative control) drives the real host-pending, stream/future/cancel, task/subtask and backpressure primitives and checks exactly-once delivery, no double resolve, monotone states, work accounting and cancel/close races; no wall-clock sleeps. The store-retirement limits under Known gaps still bound long-lived reuse. |
 | Component model | Backend parity | Full | The whole component lane (1,702 commands) is green with every defined core compiled before its start section (`make report-component-compiled`). |
 | WASI | Preview 1 (`wasi_snapshot_preview1`) | Full (46 imports) | All 46 pinned imports are provided over an explicit capability context; the whole acceptance lane (in-memory and on-disk SQLite, rollback, bail, preopen denial, read-only, escape) passes with compiled guest cores too. The legacy `sock_*` imports are implemented and now exercised by the pinned upstream C suite: the two `sock_shutdown-*` cases pass after the ENOTSOCK-from-filetype fix, and the P1 subset of the upstream lane is 72 pass / 0 fail / 0 skip. |
-| WASI | 0.3.2 providers | Partial | The CLI owns a reactor (clock deadlines and stream readiness are servable; a 200 ms `wait-for` completion is guest-evidenced by `p3/deadline-wait`); what remains partial is the provider surface itself — the store-retirement limits listed under Known gaps. The blocked-stdio executor audit is closed (2026-11-02): separate fixed 2-worker DNS/stdio services, worker affinity, bounded active jobs, close refuses new work and detaches without joining, and the span is copied to the worker; evidenced by `tests/async-property.lisp`, the `tests/wasi.lisp` executor/stdio pins, and guest stdio through `p3/cli-stdin-env-stderr-terminal`/`p3/stream-stdout`. Declared `@unstable` imports are refused at link time (see Known gaps), so stability gating is no longer a missing piece. `wasi:http` (types/client/handler/service) and `wasi:sockets` are implemented, not missing pieces; see their support rows. |
+| WASI | 0.3.2 providers | Conformant (declared 0.3.2 profile) | The CLI owns a reactor (clock deadlines and stream readiness are servable; a 200 ms `wait-for` completion is guest-evidenced by `p3/deadline-wait`); the store-retirement limits under Known gaps are accepted limits, not unmet gate items. The blocked-stdio executor audit is closed (2026-11-02): separate fixed 2-worker DNS/stdio services, worker affinity, bounded active jobs, close refuses new work and detaches without joining, and the span is copied to the worker; evidenced by `tests/async-property.lisp`, the `tests/wasi.lisp` executor/stdio pins, and guest stdio through `p3/cli-stdin-env-stderr-terminal`/`p3/stream-stdout`. Declared `@unstable` imports are refused at link time (see Known gaps), so stability gating is no longer a missing piece. `wasi:http` (types/client/handler/service) and `wasi:sockets` are implemented, not missing pieces; see their support rows. |
 | WASI | 0.2 facade | Partial (legacy compatibility line) | 29 of 31 stable interfaces are bound at exact release names; the other two (`wasi:cli/run`, `wasi:http/incoming-handler`) are export-only world entries, so every stable interface is accounted for. The 0.2 line is a **legacy compatibility target**: `wasi:sockets/*`, `wasi:http/types`, `outgoing-handler` and the exported `incoming-handler`/proxy world are implemented at each exact patch version, and `wasmdown serve` dispatches 0.2 proxy components. The declared network service surface remains the 0.3.2 one. |
 | WASI | `wasi:http` | Supported (0.3.2; outgoing + incoming) | The 0.3.2 `types` resources (`fields`, `request`, `request-options`, `response` with header/body/trailer semantics) and `client.send` over HTTP/1.1 on the built-in plain TCP transport, including streaming uploads and chunked trailers. The incoming `handler` interface and the `service` world are served by `serve-component` / `wasmdown serve`, which prints `http://HOST:PORT` as the first stderr line and answers requests until SIGINT. TLS is embedder-only (`:http-transports`); an https request without a transport is `configuration-error`, never plaintext. `middleware` world composition with a host-supplied `next` handler is implemented by `http-middleware-providers` and unit-pinned; the pinned suite has no middleware fixture. The pinned upstream suite admits the HTTP cases (127/0/0 overall). |
 | WASI | `wasi:sockets@0.3.2` | Supported (declared authority) | `types` (`tcp-socket`/`udp-socket`, errno → `error-code`) and `ip-name-lookup` are bound for guest-declared 0.3-line imports under an explicit `wasi-network` authority: the CLI `--net HOST:PORT`, `--listen ADDR:PORT` and `--dns NAME` flags (repeatable; `*` wildcards), or `make-wasi-network` in an embedder. With no declaration every bind, connect, send and resolve is refused. The pinned network subset is 30/30 (`tools/setup-network-tests.sh` then `make test-wasi-network`); the upstream-Wasmtime reference smoke is 28/30 (two known Wasmtime-50 failures). Readiness is a bounded 2 s poll, not a socket reactor. |
@@ -232,14 +234,16 @@ deliberately incomplete, and what will not be built. Measurements live in
   reader to race). Encoding note: lowering an async function needs the
   `async` canon option — it flattens to `(i64)->i32`; without it the lower
   flattens to `(i64)->()` and fails the core-import signature check.
-- No **locally built** upstream-toolchain WASI 0.3.2 guest is pinned (no
-  toolchain here emits the 0.3.2 component ABI). The behaviour lane runs
-  hand-authored commands generated by `tools/build-p3-fixtures.lisp` and
-  pinned by `P3-CHECKSUMS` (the binary itself is untracked and regenerated);
-  `--abi preview3` is explicit-only and `--abi all` covers the two released
-  ABIs. The **upstream precompiled** wasip3 guests do run now (see the lane
-  bullet below), so 0.3.2 provider coverage is measured both by the component
-  lane/unit pins and by the pinned upstream suite.
+- **Generated upstream-toolchain guest (2026-11-02).** The pinned Rust
+  `nightly-2026-11-01` + `wasm32-wasip3` toolchain builds
+  `tests/toolchain/wasi-guest`; Rust std labels the 0.3 line `@0.3.0`, so the
+  reproducible build normalizes those same-length interface labels to the
+  vendored `@0.3.2` release and runs `wasm-tools validate`. The tracked
+  artifact (`tests/fixtures/wasi/toolchain-guest.wasm`, hash in
+  `TOOLCHAIN-CHECKSUMS`) runs with exact stdout in **both** backends via
+  `make test-toolchain-guest`. The hand-authored P3 commands remain under
+  `tools/build-p3-fixtures.lisp`/`P3-CHECKSUMS`; the upstream precompiled
+  wasip3 suite is still green at 127/0/0.
 - **Upstream `wasi-testsuite` lane (2026-11-02, F1): registered, measured,
   GREEN at the pinned commit.** `adapters/wasmdown.py` +
   `tools/run-wasi-testsuite.py` (`make test-wasi-upstream`) run the

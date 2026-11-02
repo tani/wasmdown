@@ -16,3 +16,4 @@ tests/component-compiled/
 tests/upstream-results.jsonl
 tests/wasi-results/
 tests/fixtures/wasi/*.wasm
+!tests/fixtures/wasi/toolchain-guest.wasm

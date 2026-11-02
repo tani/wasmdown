@@ -12,6 +12,7 @@ LISP_FILES := $(wildcard src/*.lisp)
         report-conformance p3-fixtures test-wasi-preview3 verify \
         test-property test-async-property test-async-property-negative \
         test-p1-repeat setup-network-tests test-wasi-network test-wasi-network-reference \
+        setup-wasi-toolchain build-toolchain-guest test-toolchain-guest \
         record-p2 record-p3 record-p3-compiled record-wasi-compiled \
         record-release verify-release \
         clean \
@@ -20,7 +21,7 @@ LISP_FILES := $(wildcard src/*.lisp)
 # Reproducible quick gate: the deterministic lanes that must be green on
 # any change. Compiled large-guest lanes stay report-only. ~2.5 min.
 verify: test-unit test-component test-backend-parity test-backend-inventory \
-	test-wasi test-wasi-preview3 test-property test-async-property
+	test-wasi test-wasi-preview3 test-property test-async-property test-toolchain-guest
 	$(SBCL) --script tools/build-p3-fixtures.lisp --check
 	@echo "verify: all quick gates green"
 
@@ -30,6 +31,18 @@ verify: test-unit test-component test-backend-parity test-backend-inventory \
 ITERATIONS ?= 2000
 test-property:
 	$(SBCL) --control-stack-size 32 --dynamic-space-size 4096 --script tools/fuzz-backends.lisp --iterations $(ITERATIONS)
+
+# Pinned Rust nightly + wasm32-wasip3 guest toolchain (git-ignored .cache/).
+setup-wasi-toolchain:
+	tools/setup-wasi-toolchain.sh
+
+# Build tests/toolchain/wasi-guest and pin the generated component hash.
+build-toolchain-guest:
+	tools/build-toolchain-guest.sh
+
+# Generated @0.3-line command guest: exact stdout in both backends.
+test-toolchain-guest:
+	python3 tools/run-toolchain-guest.py
 
 # Host environment for the upstream network cases (http/sockets):
 # pinned wasi-testsuite checkout + reference Wasmtime under .cache/.
