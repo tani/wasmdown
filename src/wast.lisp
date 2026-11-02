@@ -26,7 +26,7 @@
            #:wast-result-message
            #:summarize-results #:write-jsonl #:result-outcome-counts
            #:*jsonl-source-commit* #:*jsonl-source-tree*
-           #:*jsonl-clean-tree*
+           #:*jsonl-clean-tree* #:*jsonl-suite*
            ;; M7 slice 2: the token-tree contract the component TEXT
            ;; parser walks (stoken kinds/text + the (:list start end
            ;; . children) node shape). The CORE text parser keeps its
@@ -423,7 +423,10 @@ end the closing ) char, so (source start end) slices the whole form."
   message                               ; expected-failure message
   named-form                            ; :definition / :instance for the
                                         ; Core 3.0 named module forms
-  component-p)                          ; M7: a (component ...) command —
+  component-p                           ; M7: a (component ...) command —
+  ;; threads proposal script commands:
+  shared                                ; (thread $T (shared (module $M))): $M
+  body)                                 ; (thread ...): its command list
 
 (defun %parse-int-token (tk)
   "An integer token's value (sign-aware, dec or hex, _ separators)."
@@ -954,6 +957,13 @@ implicit (module ...) command (inline-module.wast)."
        (member head '("type" "import" "func" "table" "memory"
                       "global" "export" "start" "elem" "data")
                :test #'string=)))
+(defvar *nested-cmd-index* 0
+  "Index source for commands nested inside a (thread ...) body. Such
+commands still have their own outcome, but they are not top-level
+command positions; they get unique NEGATIVE indexes (decremented from
+0) so they never collide with the 0-based top-level indexes yet remain
+distinguishable in the JSONL lane output. parse-script rebinds it.")
+
 (defun parse-script (source)
   "Parse script source into a list of wast-cmd."
   ;; Implicit-module short form: a run of consecutive top-level module
@@ -961,7 +971,8 @@ implicit (module ...) command (inline-module.wast)."
   ;; grammar, parser.mly `script : list(cmd) EOF | inline_module1 EOF`,
   ;; `inline_module : module_fields`; the implicit text is the raw
   ;; source span of the whole run re-wrapped as "(module ...)").
-  (let* ((tokens (%tokenize source))
+  (let* ((*nested-cmd-index* 0)
+         (tokens (%tokenize source))
          (nodes (%parse-tree tokens source))
          (cmds '())
          (implicit-start nil)               ; first node of pending run
@@ -992,6 +1003,26 @@ implicit (module ...) command (inline-module.wast)."
                    (setf cmds (parse-command-node node idx source cmds))))))
       (flush-implicit))
     (nreverse cmds)))
+
+(defun %thread-shared-module (shared-node)
+  "Parse a thread's (shared (module $M)) clause, returning \"$M\": the
+module instance the thread shares with its spawning script (the SAME
+instance object — and therefore the same linear memory — never a
+copy)."
+  (let ((items (rest (%node-children shared-node))))
+    (unless (= (length items) 1)
+      (%werr (second shared-node) "expected (shared (module $id))"))
+    (let* ((mod (first items))
+           (kids (and (%node-p mod) (%node-children mod))))
+      (unless (and kids
+                   (stoken-p (first kids))
+                   (string= (string-downcase (stoken-text (first kids)))
+                            "module")
+                   (second kids)
+                   (stoken-p (second kids))
+                   (eq (stoken-kind (second kids)) :id))
+        (%werr (second shared-node) "expected (shared (module $id))"))
+      (stoken-text (second kids)))))
 
 (defun parse-command-node (node idx source cmds)
   "Parse one top-level COMMAND node, returning CMDS extended with its
@@ -1086,6 +1117,36 @@ command shape."
             (let ((first (%action-or-module node)))
               (mk :module-arg first
                   :message (stoken-text msg)))))
+         ((string= head "thread")
+          ;; threads proposal: (thread $T [(shared (module $M))] cmd*).
+          ;; The body is a script command sequence in its own right; it
+          ;; is parsed now and EXECUTED on a real OS thread at run time.
+          (let* ((items (rest (%node-children node)))
+                 (id (first items)))
+            (unless (and id (stoken-p id) (eq (stoken-kind id) :id))
+              (%werr (second node) "thread needs an $id"))
+            (let ((rest (rest items))
+                  (shared nil))
+              (when (and rest (%node-p (first rest))
+                         (string= (or (%head-keyword (first rest)) "")
+                                  "shared"))
+                (setf shared (%thread-shared-module (first rest))
+                      rest (rest rest)))
+              (let ((body '()))
+                (dolist (child rest)
+                  (setf body
+                        (parse-command-node child
+                                            (decf *nested-cmd-index*)
+                                            source body)))
+                (mk :id (stoken-text id) :shared shared
+                    :body (nreverse body))))))
+         ((string= head "wait")
+          ;; threads proposal: (wait $T) joins thread $T and propagates
+          ;; its body's failures as this command's outcome.
+          (let ((id (second (%node-children node))))
+            (unless (and id (stoken-p id) (eq (stoken-kind id) :id))
+              (%werr (second node) "wait needs an $id"))
+            (mk :id (stoken-text id))))
          (t (%werr (second node) "unknown script command ~a"
                    head)))))))
 
@@ -1202,7 +1263,12 @@ behavior."
   ;; to (component instance $I $C); each instance command
   ;; re-parse+validate+instantiate a FRESH instance (instantiation is
   ;; generative, like the module analog).
-  (comp-definitions (make-hash-table :test #'equal) :type hash-table))
+  (comp-definitions (make-hash-table :test #'equal) :type hash-table)
+  ;; threads proposal: the (thread ...) commands spawned by THIS state.
+  ;; A thread's own script state has its own table, so a nested thread
+  ;; is joined by the thread that spawned it.
+  (threads (make-hash-table :test #'equal) :type hash-table)
+  (file "<script>" :type t))
 
 (defun %register-unsupported (state name)
   "Record that registered name NAME holds an out-of-scope-unsupported
@@ -2391,10 +2457,187 @@ it); the core path is unchanged."
   "The source of the script being executed (for slicing embedded
 module text out of assertion forms).")
 
-(defun run-script (source &key (file "<script>") (stream nil))
+;;; ---------------------------------------------------------------
+;;; Threads proposal script commands (script grammar:
+;;;   cmd ::= (thread $id [(shared (module $id))] cmd*)
+;;;         | (wait $id)
+;;; ). THREAD spawns a REAL SBCL thread that executes its body against
+;;; a THREAD-LOCAL script state; WAIT joins it. The thread-local state
+;;; starts with an EMPTY registry (registrations never leak between the
+;;; parent and a thread — threads/unlinkable.wast pins that), while the
+;;; (shared (module $M)) clause binds $M's EXISTING parent instance
+;;; into the thread state's named instances: (register "mem" $M) then
+;;; aliases the SAME module instance, hence the same linear memory
+;;; object, never a copy. No cooperative/green scheduler is involved.
+
+(defvar *thread-join-timeout* 30
+  "Seconds WAIT (and end-of-script cleanup) will join a thread before
+terminating it and reporting a harness failure, so a waiting thread
+that can never be woken cannot hang the whole measurement lane.")
+
+(defvar *result-sink* nil
+  "The active result consumer: a function of one wast-result. Bound by
+run-script (append to the script's results, and to the JSONL stream
+when one was requested); a thread binds its OWN local list, whose
+results WAIT splices into the script's stream in body order.")
+
+(defun %emit-result (result)
+  (when *result-sink* (funcall *result-sink* result))
+  result)
+
+(defun %make-wast-result (file cmd outcome phase detail message)
+  (make-wast-result
+   :file file
+   :command-index (wast-cmd-index cmd)
+   :command-name (wast-cmd-name cmd)
+   :outcome outcome
+   :phase phase
+   :detail detail
+   :elapsed 0.0
+   :message message))
+
+(defstruct wast-thread
+  id                                    ; "$T1"
+  cmd                                   ; the (thread ...) wast-cmd
+  thread                                ; the sb-thread
+  (joined nil)
+  (results '())                         ; body results, body order
+  (failure nil))                        ; failure detail string or nil
+
+(defun %thread-failure (results)
+  "The failure detail of a thread body's RESULTS: nil when every command
+outcome is observable success (pass/unsupported/skip), else a message
+naming the first failing command — the detail WAIT propagates."
+  (let ((bad (find-if (lambda (r)
+                        (member (wast-result-outcome r)
+                                '(:fail :harness-error :timeout)))
+                      results)))
+    (when bad
+      (format nil "thread command ~a ~a: ~a"
+              (string-downcase (string (wast-result-command-name bad)))
+              (string-downcase (string (wast-result-outcome bad)))
+              (or (wast-result-detail bad)
+                  (wast-result-message bad)
+                  "failed")))))
+
+(defun %start-thread (state cmd)
+  "Spawn CMD's thread body on a real SBCL thread and return its
+wast-thread record. Signals an error (caught as a harness error by the
+caller) when the $id is taken or the shared module does not exist."
+  (let* ((id (wast-cmd-id cmd))
+         (shared-id (wast-cmd-shared cmd))
+         (file (wast-state-file state))
+         (mode *instantiate-mode*)
+         (threads-p wasmdown:*threads*)
+         (source *script-source*)
+         (tstate (make-wast-state
+                  :spectest (wast-state-spectest state)
+                  :file file)))
+    (when (gethash id (wast-state-threads state))
+      (error "thread ~a already exists" id))
+    (when shared-id
+      (let ((inst (gethash shared-id
+                           (wast-state-named-instances state))))
+        (unless inst
+          (error "shared module ~a is not a live named instance"
+                 shared-id))
+        (setf (gethash shared-id
+                       (wast-state-named-instances tstate))
+              inst)
+        (when (gethash shared-id
+                       (wast-state-unsupported-named state))
+          (setf (gethash shared-id
+                         (wast-state-unsupported-named tstate))
+                t))))
+    (let ((wt (make-wast-thread :id id :cmd cmd)))
+      (setf (wast-thread-thread wt)
+            (sb-thread:make-thread
+             (lambda () (%run-thread-body wt tstate source file
+                                          mode threads-p))
+             :name (format nil "wast-thread ~a" id)))
+      wt)))
+
+(defun %run-thread-body (wt tstate source file mode threads-p)
+  "The thread function: run the body commands against TSTATE with all
+runner dynamics bound (SBCL threads start from global bindings, never
+the spawner's), collecting results locally. Returns (RESULTS . FAILURE)
+for the joining thread."
+  (let ((*current-wast-state* tstate)
+        (*script-source* source)
+        (*spectest-calls* '())
+        (*instantiate-mode* mode)
+        (wasmdown:*threads* threads-p)
+        (local '()))
+    (let ((*result-sink* (lambda (r) (push r local))))
+      (flet ((record (cmd outcome phase detail message)
+               (%emit-result
+                (%make-wast-result file cmd outcome phase detail message))))
+        (handler-case
+            (progn
+              (dolist (c (wast-cmd-body (wast-thread-cmd wt)))
+                (%execute-command tstate c #'record))
+              (%finish-threads tstate #'record))
+          (error (c)
+            (record (wast-thread-cmd wt) :harness-error nil
+                    (format nil "thread ~a: unexpected error: ~a"
+                            (wast-thread-id wt) c)
+                    nil)))))
+    (let ((results (nreverse local)))
+      (cons results (%thread-failure results)))))
+
+(defun %join-thread (wt)
+  "Join WT once, returning (values RESULTS FAILURE). A body still
+running after *THREAD-JOIN-TIMEOUT* is terminated and reported as a
+harness failure instead of hanging the lane."
+  (unless (wast-thread-joined wt)
+    (let ((payload
+            (sb-thread:join-thread
+             (wast-thread-thread wt)
+             :timeout *thread-join-timeout*
+             :default :wast-timeout)))
+      (setf (wast-thread-joined wt) t)
+      (if (eq payload :wast-timeout)
+          (progn
+            (ignore-errors
+              (sb-thread:terminate-thread (wast-thread-thread wt)))
+            (setf (wast-thread-results wt) '()
+                  (wast-thread-failure wt)
+                  (format nil "thread ~a did not finish within ~a s"
+                          (wast-thread-id wt) *thread-join-timeout*)))
+          (setf (wast-thread-results wt) (car payload)
+                (wast-thread-failure wt) (cdr payload)))))
+  (values (wast-thread-results wt) (wast-thread-failure wt)))
+
+(defun %finish-threads (state sink)
+  "End-of-script boundary: join every still-unjoined thread, splice its
+body results through SINK, and surface its failure at the thread
+command. Keeps a script that forgot WAIT from leaking live threads
+into the next script (or a blocked wait into the rest of the lane)."
+  (maphash
+   (lambda (id wt)
+     (declare (ignore id))
+     (unless (wast-thread-joined wt)
+       (multiple-value-bind (results failure) (%join-thread wt)
+         (dolist (r results) (funcall sink r))
+         (when failure
+           (funcall sink
+                    (%make-wast-result (wast-state-file state)
+                                       (wast-thread-cmd wt)
+                                       :fail nil failure nil))))))
+   (wast-state-threads state)))
+
+
+(defun run-script (source &key (file "<script>") (stream nil)
+                             (threads wasmdown:*threads*))
   "Execute a .wast script (string or pathname) against fresh state.
 Returns the list of wast-result records, one per command. STREAM, when
-given, receives a JSONL line per result (docs/design/PLAN.md 12.8)."
+given, receives a JSONL line per result (docs/design/PLAN.md 12.8).
+THREADS enables the threads proposal for the whole script (shared
+memories, atomics, the (thread ...)/(wait ...) commands); it binds
+WASMDOWN:*THREADS* for the script and every thread it spawns. Its
+default is the current WASMDOWN:*THREADS* value, so both an explicit
+:THREADS T and a global opt-in work; the shipped default (NIL) keeps
+the core engine's non-threads behavior."
   (let ((*print-circle* t)
         (*print-level* 4)
         (*print-length* 8))
@@ -2406,23 +2649,20 @@ given, receives a JSONL line per result (docs/design/PLAN.md 12.8)."
                          (get-output-stream-string out)))
                      source))
            (state (make-wast-state
-                    :spectest (make-spectest-instance)))
+                    :spectest (make-spectest-instance)
+                    :file file))
            (results '()))
     (let ((*script-source* text)
           (*current-wast-state* state)
-          (*spectest-calls* '()))
+          (*spectest-calls* '())
+          (wasmdown:*threads* threads)
+          (*result-sink*
+            (lambda (r)
+              (push r results)
+              (when stream (write-jsonl-line stream r)))))
       (flet ((record (cmd outcome phase detail message)
-               (let ((r (make-wast-result
-                          :file file
-                          :command-index (wast-cmd-index cmd)
-                          :command-name (wast-cmd-name cmd)
-                          :outcome outcome
-                          :phase phase
-                          :detail detail
-                          :elapsed 0.0
-                          :message message)))
-                 (push r results)
-                 (when stream (write-jsonl-line stream r)))))
+               (%emit-result
+                (%make-wast-result file cmd outcome phase detail message))))
         (let ((cmds nil) (parse-error nil))
           (handler-case
               (setf cmds (parse-script text))
@@ -2442,13 +2682,18 @@ given, receives a JSONL line per result (docs/design/PLAN.md 12.8)."
             ;; command is usable by a later one and nothing leaks
             ;; into the next script.
             (flet ((run-commands ()
-                     (dolist (cmd cmds)
-                       (handler-case
-                           (%execute-command state cmd #'record)
-                         (error (c)
-                           (record cmd :harness-error nil
-                                   (format nil "unexpected error: ~a" c)
-                                   nil))))))
+                     (unwind-protect
+                          (dolist (cmd cmds)
+                            (handler-case
+                                (%execute-command state cmd #'record)
+                              (error (c)
+                                (record cmd :harness-error nil
+                                        (format nil "unexpected error: ~a" c)
+                                        nil))))
+                       ;; never leak a live (or blocked) thread into
+                       ;; the next script; a script that forgot WAIT
+                       ;; still reports its thread's failures
+                       (%finish-threads state *result-sink*))))
               (if *store-run-hook*
                   (funcall *store-run-hook* #'run-commands)
                   (run-commands)))))))
@@ -2563,6 +2808,47 @@ given, receives a JSONL line per result (docs/design/PLAN.md 12.8)."
      ((member name '(:assert_malformed :assert_invalid :assert_unlinkable
                      :assert_trap :assert_exhaustion))
       (%exec-assert-failure state cmd record))
+     ((eq name :thread)
+      ;; spawn a real SBCL thread; its command results are collected on
+      ;; that thread and spliced in by WAIT (or the script boundary).
+      ;; Without the threads feature the command is out of scope.
+      (if (not wasmdown:*threads*)
+          (funcall record cmd :unsupported nil
+                   "threads proposal not enabled" nil)
+          (handler-case
+              (let ((wt (%start-thread state cmd)))
+                (setf (gethash (wast-cmd-id cmd)
+                               (wast-state-threads state))
+                      wt)
+                (funcall record cmd :pass nil "thread started" nil))
+            (error (c)
+              (funcall record cmd :harness-error nil
+                       (format nil "thread start: ~a" c) nil)))))
+     ((eq name :wait)
+      (if (not wasmdown:*threads*)
+          (funcall record cmd :unsupported nil
+                   "threads proposal not enabled" nil)
+          (let ((wt (gethash (wast-cmd-id cmd)
+                             (wast-state-threads state))))
+            (cond
+             ((null wt)
+              (funcall record cmd :harness-error nil
+                       (format nil "wait for unknown thread ~a"
+                               (wast-cmd-id cmd))
+                       nil))
+             ((wast-thread-joined wt)
+              (funcall record cmd :harness-error nil
+                       (format nil "thread ~a was already waited"
+                               (wast-cmd-id cmd))
+                       nil))
+             (t
+              ;; JOIN, splice the body's results in body order, then
+              ;; PROPAGATE the thread failure as this command's outcome.
+              (multiple-value-bind (results failure) (%join-thread wt)
+                (dolist (r results) (%emit-result r))
+                (if failure
+                    (funcall record cmd :fail nil failure nil)
+                    (funcall record cmd :pass nil "ok" nil))))))))
      (t (funcall record cmd :harness-error nil
                  (format nil "unhandled command ~a" name) nil)))))
 
@@ -2817,9 +3103,11 @@ carries the source FILE, so a consumer need not parse CASE-ID. When
 ;;; Directory driver.
 
 (defun run-directory (dir &key (pattern "*.wast") (jsonl-path nil)
-                           (suite *jsonl-suite*))
+                           (suite *jsonl-suite*)
+                           (threads wasmdown:*threads*))
   "Run every matching .wast file under DIR (sorted). Returns the
-aggregated results list; writes JSONL when JSONL-PATH is given."
+aggregated results list; writes JSONL when JSONL-PATH is given.
+THREADS enables the threads proposal for every file's run-script."
   (let* ((files (sort (directory
                        (merge-pathnames pattern
                                        (pathname-as-directory dir)))
@@ -2827,7 +3115,7 @@ aggregated results list; writes JSONL when JSONL-PATH is given."
          (all '()))
     (dolist (f files)
       (let* ((name (file-namestring f))
-             (results (run-script f :file name)))
+             (results (run-script f :file name :threads threads)))
         (setf all (append all results))))
     (when jsonl-path (write-jsonl all jsonl-path suite))
     all))

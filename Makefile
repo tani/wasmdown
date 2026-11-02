@@ -4,7 +4,7 @@ SBCL ?= sbcl
 ROOT := $(patsubst %/,%,$(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
 LISP_FILES := $(wildcard src/*.lisp)
 
-.PHONY: all test test-unit test-spec-core test-component test-component-census report-component-compiled \
+.PHONY: all test test-unit test-spec-core test-spec-threads test-component test-component-census report-component-compiled \
         test-backend-parity report-backend-parity \
         report-backend-inventory test-backend-inventory \
         report-backends-bench \
@@ -21,7 +21,7 @@ LISP_FILES := $(wildcard src/*.lisp)
 
 # Reproducible quick gate: the deterministic lanes that must be green on
 # any change. Compiled large-guest lanes stay report-only. ~2.5 min.
-verify: test-unit test-component test-backend-parity test-backend-inventory \
+verify: test-unit test-spec-threads test-component test-backend-parity test-backend-inventory \
 	test-wasi test-wasi-preview3 test-property test-async-property test-toolchain-guest test-p2-guests
 	$(SBCL) --script tools/build-p3-fixtures.lisp --check
 	@echo "verify: all quick gates green"
@@ -148,6 +148,14 @@ test-unit:
 # feature files are classified, never silently passed.
 test-spec-core:
 	$(SBCL) --control-stack-size 16 --dynamic-space-size 2048 --script tools/run-spec-core.lisp
+
+# Threads proposal lane: the vendored tests/spec-core/threads suite run with
+# the threads feature ON and REAL SBCL threads — (thread ...) spawns an
+# sb-thread, (wait ...) joins it. Both backends run in one process; the lane
+# exits non-zero on any non-pass command. Includes atomic.wast (single-thread
+# wait/notify) plus thread/wait/notify and the message-passing/litmus scripts.
+test-spec-threads:
+	$(SBCL) --control-stack-size 16 --dynamic-space-size 4096 --script tools/run-spec-threads.lisp
 
 # Backend parity gate: every pinned core script once through :interpret and
 # once through :compiled, paired by case id. Exits non-zero on any divergence,

@@ -753,6 +753,7 @@ The repository should implement the following targets as **new project commands*
 # Proposed WASMDOWN developer targets, to be implemented:
 make test-unit
 make test-spec-core       # original Core .wast suite, all execution engines
+make test-spec-threads    # threads-proposal suite with real SBCL threads
 make test-component       # component-model .wast + Canonical ABI corpus
 make test-wasi-p1
 make test-wasi-p2         # WASMDOWN compatibility corpus

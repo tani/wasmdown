@@ -1881,3 +1881,67 @@
                         (func (memory.init 1 (i32.const 0) (i32.const 0) (i32.const 0))))
                 \"unknown memory\")")))
     (wasmdown.test:is (equal '(:pass :pass :pass) os))))
+
+(wasmdown.test:test wast/thread-wait-require-threads-feature
+  ;; The threads-proposal script commands are out of scope unless the
+  ;; feature is on: (thread ...) and (wait ...) classify :unsupported,
+  ;; and the body is not executed.
+  (let ((os (%outcomes
+             "(thread $T1
+                (module (func (export \"f\")))
+                (invoke \"f\"))
+              (wait $T1)")))
+    (wasmdown.test:is (equal '(:unsupported :unsupported) os))))
+
+(wasmdown.test:test wast/thread-shares-module-instance-memory
+  ;; (shared (module $M)) binds the SAME instance/memory into the
+  ;; thread's state; registrations inside a thread stay thread-local
+  ;; (the parent registry is untouched), and the body runs to
+  ;; completion before WAIT returns.
+  (let ((rs (wasmdown.wast:run-script
+             "(module $Mem (memory (export \"shared\") 1 1 shared))
+              (thread $T1 (shared (module $Mem))
+                (register \"mem\" $Mem)
+                (module
+                  (memory (import \"mem\" \"shared\") 1 1 shared)
+                  (func (export \"run\")
+                    (i32.store (i32.const 0) (i32.const 42))))
+                (invoke \"run\"))
+              (wait $T1)
+              (thread $T2 (shared (module $Mem))
+                (register \"mem\" $Mem)
+                (module
+                  (memory (import \"mem\" \"shared\") 1 1 shared)
+                  (func (export \"read\") (result i32)
+                    (i32.load (i32.const 0))))
+                (assert_return (invoke \"read\") (i32.const 42)))
+              (wait $T2)"
+             :threads t)))
+    (wasmdown.test:is
+     (every (lambda (r)
+              (eq (wasmdown.wast:wast-result-outcome r) :pass))
+            rs))
+    ;; top-level outcomes: module, thread, wait, thread, wait — the
+    ;; nested body results are spliced in by WAIT
+    (wasmdown.test:is (= 11 (length rs)))
+    (wasmdown.test:is
+     (equal '(:module :thread :register :module :invoke :wait
+              :thread :register :module :assert_return :wait)
+            (mapcar #'wasmdown.wast:wast-result-command-name rs)))))
+
+(wasmdown.test:test wast/wait-propagates-thread-failure
+  ;; A failing command inside a thread makes WAIT itself fail; the body
+  ;; result and the wait result are both in the script's result list.
+  (let* ((rs (wasmdown.wast:run-script
+              "(thread $T1
+                 (module (func (export \"f\") (result i32) (i32.const 1)))
+                 (assert_return (invoke \"f\") (i32.const 2)))
+               (wait $T1)"
+              :threads t))
+         (wait (car (last rs)))
+         (names (mapcar #'wasmdown.wast:wast-result-command-name rs))
+         (outcomes (mapcar #'wasmdown.wast:wast-result-outcome rs)))
+    (wasmdown.test:is (equal '(:thread :module :assert_return :wait) names))
+    (wasmdown.test:is (eq (wasmdown.wast:wast-result-command-name wait) :wait))
+    (wasmdown.test:is (eq (wasmdown.wast:wast-result-outcome wait) :fail))
+    (wasmdown.test:is (equal '(:pass :pass :fail :fail) outcomes))))

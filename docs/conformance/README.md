@@ -11,6 +11,7 @@ together, and a number from one lane says nothing about another.
 | --- | --- | --- | --- | --- |
 | unit | gate | `make test-unit` | stdout | Every unit and integration test passes; exits non-zero on any failure. |
 | spec-core | baseline | `make test-spec-core` | [`core.md`](core.md), `tests/spec-core-results.jsonl` | The pinned core spec suite executes end to end through the stateful WAST runner, with every non-pass outcome classified. |
+| threads | gate | `make test-spec-threads` | stdout | The vendored threads-proposal suite (`atomic.wast` plus the thread/wait/notify and litmus scripts) runs with the threads feature ON and **real SBCL threads**: `(thread …)` spawns an sb-thread, `(wait …)` joins it, and `(shared (module $M))` shares the same instance/memory. Both backends must execute every command with no fail, unsupported, timeout, or harness error. |
 | component | gate | `make test-component` | [`component.md`](component.md), `tests/component-results.jsonl` | The vendored component suite runs with no fail, skip, timeout, or harness error, and its census is intact. |
 | component-compiled | report | `make report-component-compiled` | `tests/component-compiled/component.md`, `tests/component-compiled-results.jsonl` | The same component corpus with every defined core function compiled before its start section; a compile refusal is data here, and the released gate is the interpret run. |
 | component-census | gate | `make test-component-census` | `tmp-census/run-N.log`, rewrites [`component.md`](component.md) | The component gate stays green over repeated fresh-process runs at the pinned denominator. |
@@ -33,6 +34,7 @@ Pins:
 | Suite | Revision |
 | --- | --- |
 | WebAssembly/spec (core) | `b0ec1f3f449525c217dbff3f1dfab435a756ea92` |
+| WebAssembly/threads | `cc535ada1aa21cfaa3cabf3ac73b89acef78a0a0` (`test/core/threads`, vendored in `tests/spec-core/threads/`) |
 | WebAssembly/component-model | `d095e2f60ddae1f9a1e9b1e2fb547ec1114da677` |
 | WebAssembly/wasi-testsuite (precompiled guests) | `9d84631e427729802085c3d172d0a63cd360a1fa` (`prod/testsuite-base`) |
 | WASI WIT | v0.3.2 |
