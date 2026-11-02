@@ -22,6 +22,11 @@ result:
                        -> status 0, no hang
   threads-off          without --threads the shared-memory module is
                        rejected (default behavior unchanged)
+  pthread-create       a REAL wasi-libc pthread guest built with
+                       wasi-sdk's wasm32-wasip1-threads target: pthread_create
+                       reaches wasi_thread_spawn, the child writes an atomic
+                       flag in shared memory, pthread_join completes
+                       (skipped when the SDK target is unavailable)
 
 Every case runs under a wall-clock timeout, so a broken termination path
 shows up as a bounded failure instead of a hung test run. WASMDOWN_API_MODE
@@ -55,6 +60,33 @@ def find_wasm_tools():
         if os.access(path, os.X_OK):
             return path
     return None
+
+
+def find_wasi_clang():
+    env = os.environ.get("WASI_SDK_CLANG")
+    if env:
+        return env
+    matches = sorted(glob.glob(os.path.join(
+        ROOT, ".cache", "tools", "wasi-sdk-*", "bin", "clang")))
+    for path in reversed(matches):
+        if os.access(path, os.X_OK):
+            return path
+    return None
+
+
+def compile_c(clang, name, out_dir):
+    source = os.path.join(FIXTURES, name + ".c")
+    target = os.path.join(out_dir, name + ".wasm")
+    # The wasip1-threads libc is built with atomics; the shared memory
+    # needs room for pthread stacks, so pin a 2 MiB initial=max heap.
+    proc = subprocess.run(
+        [clang, "--target=wasm32-wasip1-threads", "-O2",
+         "-Wl,--initial-memory=2097152", "-Wl,--max-memory=2097152",
+         source, "-o", target],
+        capture_output=True, text=True, timeout=TIMEOUT)
+    if proc.returncode != 0:
+        raise RuntimeError(f"clang {name}: {proc.stderr}")
+    return target
 
 
 def compile_wat(wasm_tools, name, out_dir):
@@ -152,6 +184,18 @@ def main():
                       proc.stderr)
         if "main-return" in wasm:
             expect("main-return", wasm["main-return"], 0, "")
+        clang = find_wasi_clang()
+        if clang:
+            try:
+                wasm["pthread-create"] = compile_c(
+                    clang, "pthread-create", work)
+            except Exception as exc:  # noqa: BLE001 - report as a case
+                check("compile/pthread-create", False, str(exc))
+            if "pthread-create" in wasm:
+                expect("pthread-create", wasm["pthread-create"], 0,
+                       "thread:42\n")
+        else:
+            print("SKIP pthread-create (no cached wasi-sdk wasm32-wasip1-threads target)")
         # The gate: the same shared-memory module is rejected without
         # --threads (decode/validation error, never a guest run).
         if "spawn-shared-memory" in wasm:

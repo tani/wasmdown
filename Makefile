@@ -201,8 +201,9 @@ test-wasi-preview1:
 # WASI Preview1 wasi-threads spawn lane (opt-in): compiles the
 # hand-authored WAT fixtures with wasm-tools and runs them through the
 # real CLI with --threads. Covers shared-memory visibility, TID/arg
-# passing, the negative spawn error, and child proc_exit/trap plus
-# main-return termination (each under a wall-clock timeout).
+# passing, the negative spawn error, child proc_exit/trap, main-return
+# termination, and (when cached) a real wasi-sdk pthread C guest (each
+# under a wall-clock timeout).
 test-wasi-threads-p1:
 	python3 tools/test-wasi-threads-p1.py
 

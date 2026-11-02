@@ -1242,5 +1242,10 @@ force-terminate fallback for a guest that never waits. Test evidence:
 fixtures with wasm-tools and runs the real CLI over shared-memory
 visibility, TID/arg passing, the negative spawn error, child
 proc_exit(99), child trap (status 1) and main-return teardown, each
-under a wall-clock timeout. The 46-import Preview1 census and all
-default (threads-off) behavior are unchanged.
+under a wall-clock timeout. The lane also builds `pthread-create.c`
+with wasi-sdk's `wasm32-wasip1-threads` target (and a 2 MiB shared
+memory for pthread stacks): a REAL wasi-libc `pthread_create` reaches
+`wasi_thread_spawn`, the child stores 42 to a shared atomic, and
+`pthread_join` completes; stdout is `thread:42` in both backends. The
+46-import Preview1 census and all default (threads-off) behavior are
+unchanged.
